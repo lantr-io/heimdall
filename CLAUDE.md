@@ -140,3 +140,4 @@ Coordinator aggregates: `z = sum(zp)`, producing final signature `(R, z)`.
 - All FROST operations must support identifiable abort
 - DKG and signing are off-chain; only results posted on-chain
 - Treasury handoff transactions must be atomic with epoch transitions
+- Never include "Co-Authored-By" or "Co-authored-by" lines in commit messages
