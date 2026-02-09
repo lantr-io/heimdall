@@ -1,0 +1,16 @@
+[package]
+name = "bifrost-spot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dusk-plonk = { version = "0.22.0-rc.0", default-features = false, features = ["alloc"] }
+dusk-bls12_381 = "0.14"
+dusk-jubjub = "0.15"
+dusk-bytes = "0.1"
+frost-secp256k1-tr = "3.0.0-rc.0"
+ff = "0.13"
+rayon = "1.10"
+rand = "0.8"
+rand_core = "0.6"
+hex = "0.4"
