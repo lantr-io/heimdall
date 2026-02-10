@@ -14,9 +14,9 @@ use dusk_plonk::prelude::*;
 use crate::gadgets::nonnative::NonNativeWitness;
 use crate::gadgets::secp256k1::Secp256k1PointWitness;
 
-/// Maximum number of polynomial coefficients (= threshold t) supported.
-/// For 400-of-500, the polynomial has 400 coefficients.
-pub const MAX_COEFFICIENTS: usize = 400;
+/// Maximum number of signers (N). The circuit is compiled once for this size
+/// and works for any threshold M ≤ N by zero-padding unused commitment slots.
+pub const MAX_SIGNERS: usize = 500;
 
 /// Precomputed values the prover provides to the circuit.
 /// The prover runs the actual secp256k1 math externally and feeds results as witnesses.
@@ -48,8 +48,8 @@ impl Default for CommitmentCheckWitness {
             lhs_y: [0; 4],
             rhs_x: [1; 4], // different from lhs so the "not equal" check has a valid inverse
             rhs_y: [1; 4],
-            commitments_x: vec![[0; 4]; MAX_COEFFICIENTS],
-            commitments_y: vec![[0; 4]; MAX_COEFFICIENTS],
+            commitments_x: vec![[0; 4]; MAX_SIGNERS],
+            commitments_y: vec![[0; 4]; MAX_SIGNERS],
             participant_index: 1,
         }
     }
@@ -77,7 +77,7 @@ impl Circuit for CommitmentMisbehaviorCircuit {
 
         // 4. Register commitment points and participant index as public inputs.
         // This binds the proof to specific commitments that were broadcast during DKG.
-        let num_commitments = w.commitments_x.len().min(MAX_COEFFICIENTS);
+        let num_commitments = w.commitments_x.len().min(MAX_SIGNERS);
         for k in 0..num_commitments {
             for limb_idx in 0..4 {
                 composer.append_public(BlsScalar::from(w.commitments_x[k][limb_idx]));
@@ -85,7 +85,7 @@ impl Circuit for CommitmentMisbehaviorCircuit {
             }
         }
         // Pad unused commitment slots with zeros (fixed circuit size)
-        for _ in num_commitments..MAX_COEFFICIENTS {
+        for _ in num_commitments..MAX_SIGNERS {
             for _ in 0..8 {
                 composer.append_public(BlsScalar::zero());
             }

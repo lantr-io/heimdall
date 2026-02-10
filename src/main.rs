@@ -1,4 +1,4 @@
-/// Bifrost SPO Tool — FROST DKG with PLONK cheating detection demo.
+/// Heimdall — FROST DKG with PLONK cheating detection demo.
 ///
 /// Demonstrates:
 /// 1. 400-of-500 DKG using frost-secp256k1-tr
@@ -10,8 +10,8 @@ use dusk_bytes::Serializable;
 use dusk_plonk::prelude::*;
 use rand::rngs::OsRng;
 
-use bifrost_spot::circuits::commitment::{CommitmentCheckWitness, CommitmentMisbehaviorCircuit};
-use bifrost_spot::frost::dkg;
+use heimdall::circuits::commitment::{CommitmentCheckWitness, CommitmentMisbehaviorCircuit, MAX_SIGNERS as MAX_CIRCUIT_SIGNERS};
+use heimdall::frost::dkg;
 
 const MIN_SIGNERS: u16 = 400;
 const MAX_SIGNERS: u16 = 500;
@@ -19,7 +19,7 @@ const CHEATER_IDX: u16 = 300;
 const VICTIM_IDX: u16 = 1;
 
 fn main() {
-    println!("=== Bifrost SPO Tool: FROST DKG + PLONK Misbehavior Proof ===");
+    println!("=== Heimdall: FROST DKG + PLONK Misbehavior Proof ===");
     println!("=== {MIN_SIGNERS}-of-{MAX_SIGNERS} threshold ===\n");
 
     // --- Step 1: Honest DKG ---
@@ -97,7 +97,7 @@ fn main() {
     println!("--- Step 3: Generating PLONK misbehavior proof ---");
     println!("  Proving: SPO #{CHEATER_IDX}'s share does NOT match their published commitments");
     println!(
-        "  Polynomial coefficients: {MIN_SIGNERS} (degree {})",
+        "  Polynomial coefficients: {MIN_SIGNERS} (degree {}), circuit max: {MAX_CIRCUIT_SIGNERS}",
         MIN_SIGNERS - 1
     );
 

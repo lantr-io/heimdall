@@ -42,22 +42,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
 
 [[package]]
-name = "bifrost-spot"
-version = "0.1.0"
-dependencies = [
- "dusk-bls12_381",
- "dusk-bytes",
- "dusk-jubjub",
- "dusk-plonk",
- "ff",
- "frost-secp256k1-tr",
- "hex",
- "rand",
- "rand_core",
- "rayon",
-]
-
-[[package]]
 name = "bitvec"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -469,6 +453,22 @@ dependencies = [
  "serde",
  "spin",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "heimdall"
+version = "0.1.0"
+dependencies = [
+ "dusk-bls12_381",
+ "dusk-bytes",
+ "dusk-jubjub",
+ "dusk-plonk",
+ "ff",
+ "frost-secp256k1-tr",
+ "hex",
+ "rand",
+ "rand_core",
+ "rayon",
 ]
 
 [[package]]

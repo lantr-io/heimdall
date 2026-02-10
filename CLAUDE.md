@@ -1,8 +1,8 @@
-# Bifrost SPO Tool (bifrost-spot)
+# Heimdall
 
 ## Project Goal
 
-Build the **SPO (Stake Pool Operator) program** for the Bifrost Bridge — a Bitcoin-Cardano bridge that uses Cardano SPOs as distributed custodians to secure BTC transfers between chains.
+Build **Heimdall**, the SPO (Stake Pool Operator) program for the Bifrost Bridge — a Bitcoin-Cardano bridge that uses Cardano SPOs as distributed custodians to secure BTC transfers between chains.
 
 This program is responsible for:
 
@@ -32,7 +32,7 @@ Reference: [FluidTokens/ft-bifrost-bridge](https://github.com/FluidTokens/ft-bif
 ### Participants
 
 - **Depositors/Withdrawers**: users moving BTC <-> fBTC
-- **SPOs**: distributed custodians running this program (bifrost-spot)
+- **SPOs**: distributed custodians running this program (Heimdall)
 - **Watchtowers**: permissionless monitors posting Bitcoin block headers and proofs
 
 ## Peg-In Flow (Bitcoin -> Cardano)
