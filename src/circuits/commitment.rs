@@ -16,7 +16,7 @@ use crate::gadgets::secp256k1::Secp256k1PointWitness;
 
 /// Maximum number of signers (N). The circuit is compiled once for this size
 /// and works for any threshold M ≤ N by zero-padding unused commitment slots.
-pub const MAX_SIGNERS: usize = 500;
+pub const MAX_SIGNERS: usize = 200;
 
 /// Precomputed values the prover provides to the circuit.
 /// The prover runs the actual secp256k1 math externally and feeds results as witnesses.

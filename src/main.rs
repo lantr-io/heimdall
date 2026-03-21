@@ -1,107 +1,166 @@
-/// Heimdall — FROST DKG with PLONK cheating detection demo.
+/// Heimdall — FROST DKG + Signing + Misbehavior Proofs demo.
 ///
 /// Demonstrates:
-/// 1. 400-of-500 DKG using frost-secp256k1-tr
-/// 2. Cheating DKG where SPO #300 sends a bad share to SPO #1
-/// 3. PLONK proof of misbehavior (verifiable on Cardano via BLS12-381)
+/// 1. Full 150-of-200 DKG (all 200 SPOs)
+/// 2. Honest FROST signing (150 signers)
+/// 3. Cheating signing (SPO #42 submits bad share, aggregate detects it)
+/// 4. PLONK signature misbehavior proof
+/// 5. PLONK DKG commitment misbehavior proof
 use std::time::Instant;
 
 use dusk_bytes::Serializable;
 use dusk_plonk::prelude::*;
 use rand::rngs::OsRng;
 
-use heimdall::circuits::commitment::{CommitmentCheckWitness, CommitmentMisbehaviorCircuit, MAX_SIGNERS as MAX_CIRCUIT_SIGNERS};
-use heimdall::frost::dkg;
+use heimdall::circuits::commitment::{
+    CommitmentCheckWitness, CommitmentMisbehaviorCircuit, MAX_SIGNERS as MAX_CIRCUIT_SIGNERS,
+};
+use heimdall::circuits::signature::{SignatureShareCheckWitness, SignatureMisbehaviorCircuit};
+use heimdall::frost::{dkg, signing};
+use heimdall::gadgets::nonnative::bytes_to_limbs;
 
-const MIN_SIGNERS: u16 = 400;
-const MAX_SIGNERS: u16 = 500;
-const CHEATER_IDX: u16 = 300;
-const VICTIM_IDX: u16 = 1;
+const MIN_SIGNERS: u16 = 150;
+const MAX_SIGNERS: u16 = 200;
+const CHEATER_SIGNER_IDX: u16 = 42;
+const CHEATER_DKG_IDX: u16 = 100;
+const VICTIM_DKG_IDX: u16 = 1;
 
 fn main() {
-    println!("=== Heimdall: FROST DKG + PLONK Misbehavior Proof ===");
+    println!("=== Heimdall: FROST DKG + Signing + Misbehavior Proofs ===");
     println!("=== {MIN_SIGNERS}-of-{MAX_SIGNERS} threshold ===\n");
 
-    // --- Step 1: Honest DKG ---
-    println!("--- Step 1: Running honest {MIN_SIGNERS}-of-{MAX_SIGNERS} DKG (single SPO completion) ---");
     let t_total = Instant::now();
+
+    // --- Step 1: Full DKG ---
+    println!("--- Step 1: Full {MIN_SIGNERS}-of-{MAX_SIGNERS} DKG (all {MAX_SIGNERS} SPOs) ---");
     let t0 = Instant::now();
-    let (result, _round1_pkgs) =
-        dkg::run_dkg_single_completion(MIN_SIGNERS, MAX_SIGNERS, VICTIM_IDX);
+    let dkg_result = dkg::run_dkg_all_completions(MIN_SIGNERS, MAX_SIGNERS);
     let dkg_elapsed = t0.elapsed();
-    let group_key = result.public_key_package.verifying_key();
-    println!("  Honest DKG completed in {dkg_elapsed:.2?}");
+    let group_key = dkg_result.public_key_package.verifying_key();
+    println!("  DKG completed in {dkg_elapsed:.2?}");
     println!("  Group public key: {:?}", group_key);
+    println!("  Key packages: {} participants", dkg_result.key_packages.len());
     println!();
 
-    // --- Step 2: Cheating DKG ---
+    // --- Step 2: Honest FROST signing ---
+    println!("--- Step 2: Honest FROST signing ({MIN_SIGNERS} signers) ---");
+    let message = b"bifrost treasury tx";
+    let t0 = Instant::now();
+    let sign_result = signing::run_signing(
+        &dkg_result.key_packages,
+        &dkg_result.public_key_package,
+        message,
+        MIN_SIGNERS,
+    );
+    let sign_elapsed = t0.elapsed();
+    let sig_bytes = sign_result.signature.serialize().unwrap();
+    println!("  Signing completed in {sign_elapsed:.2?}");
+    println!("  Signature: {}", hex::encode(&sig_bytes));
+    println!("  Message: \"{}\"", std::str::from_utf8(message).unwrap());
+    println!();
+
+    // --- Step 3: Cheating signing ---
     println!(
-        "--- Step 2: Running DKG with SPO #{CHEATER_IDX} cheating (bad share to SPO #{VICTIM_IDX}) ---"
+        "--- Step 3: Cheating signing (SPO #{CHEATER_SIGNER_IDX} submits bad share) ---"
     );
     let t0 = Instant::now();
-    let cheating = dkg::run_cheating_dkg(MIN_SIGNERS, MAX_SIGNERS, CHEATER_IDX, VICTIM_IDX);
-    let cheat_dkg_elapsed = t0.elapsed();
-    println!("  Cheating DKG round1+round2 completed in {cheat_dkg_elapsed:.2?}");
-
-    // Victim tries part3 — should fail
-    let victim_id = frost_secp256k1_tr::Identifier::try_from(VICTIM_IDX).unwrap();
-
-    let round1_others: std::collections::BTreeMap<_, _> = cheating
-        .round1_packages
-        .iter()
-        .filter(|&(k, _)| *k != victim_id)
-        .map(|(k, v)| (*k, v.clone()))
-        .collect();
-
-    let round2_for_victim: std::collections::BTreeMap<_, _> = cheating
-        .round2_packages
-        .iter()
-        .filter(|&(k, _)| *k != victim_id)
-        .map(|(sender_id, packages)| (*sender_id, packages[&victim_id].clone()))
-        .collect();
-
-    // Need a fresh round2 secret for the victim
-    let (victim_r1_secret, _) = frost_secp256k1_tr::keys::dkg::part1(
-        victim_id,
-        MAX_SIGNERS,
+    let cheat_sign = signing::run_cheating_signing(
+        &dkg_result.key_packages,
+        &dkg_result.public_key_package,
+        message,
         MIN_SIGNERS,
-        &mut OsRng,
-    )
-    .unwrap();
-
-    let victim_round1_others: std::collections::BTreeMap<_, _> = cheating
-        .round1_packages
-        .iter()
-        .filter(|&(k, _)| *k != victim_id)
-        .map(|(k, v)| (*k, v.clone()))
-        .collect();
-
-    let (victim_r2_secret, _) =
-        frost_secp256k1_tr::keys::dkg::part2(victim_r1_secret, &victim_round1_others).unwrap();
-
-    println!("  SPO #{VICTIM_IDX} running part3 (verifying 499 shares)...");
-    let t0 = Instant::now();
-    match frost_secp256k1_tr::keys::dkg::part3(
-        &victim_r2_secret,
-        &round1_others,
-        &round2_for_victim,
-    ) {
-        Ok(_) => println!("  DKG unexpectedly succeeded"),
-        Err(e) => println!("  SPO #{VICTIM_IDX} detects misbehavior: {e}"),
-    }
-    let detect_elapsed = t0.elapsed();
-    println!("  Detection took {detect_elapsed:.2?}");
+        CHEATER_SIGNER_IDX,
+    );
+    let cheat_sign_elapsed = t0.elapsed();
+    println!("  Cheating signing completed in {cheat_sign_elapsed:.2?}");
     println!();
 
-    // --- Step 3: Generate PLONK misbehavior proof ---
-    println!("--- Step 3: Generating PLONK misbehavior proof ---");
-    println!("  Proving: SPO #{CHEATER_IDX}'s share does NOT match their published commitments");
+    // --- Step 4: PLONK signature misbehavior proof ---
+    println!("--- Step 4: PLONK signature misbehavior proof ---");
+    println!(
+        "  Proving: SPO #{CHEATER_SIGNER_IDX}'s signature share z*G != expected point"
+    );
+
+    let t0 = Instant::now();
+    let (lhs_x, lhs_y, rhs_x, rhs_y) = signing::compute_misbehavior_witness(
+        &cheat_sign.honest_share_bytes,
+        &cheat_sign.corrupted_share_bytes,
+    );
+    let witness_elapsed = t0.elapsed();
+    println!("  EC witness computation: {witness_elapsed:.2?}");
+
+    let corrupted_limbs = bytes_to_limbs(&cheat_sign.corrupted_share_bytes);
+
+    let sig_witness = SignatureShareCheckWitness {
+        share_limbs: corrupted_limbs,
+        lhs_x,
+        lhs_y,
+        rhs_x,
+        rhs_y,
+        z_p_limbs: corrupted_limbs,
+        lhs_pub_x: lhs_x,
+        lhs_pub_y: lhs_y,
+        rhs_pub_x: rhs_x,
+        rhs_pub_y: rhs_y,
+    };
+
+    let sig_circuit = SignatureMisbehaviorCircuit {
+        witness: sig_witness,
+    };
+
+    let sig_circuit_power = 13;
+    println!("  Setting up public parameters (2^{sig_circuit_power})...");
+    let t0 = Instant::now();
+    let sig_label = b"bifrost-frost-sig-misbehavior";
+    let sig_pp = PublicParameters::setup(1 << sig_circuit_power, &mut OsRng).unwrap();
+    let sig_pp_elapsed = t0.elapsed();
+    println!("  PP setup: {sig_pp_elapsed:.2?}");
+
+    println!("  Compiling circuit...");
+    let t0 = Instant::now();
+    let (sig_prover, sig_verifier) =
+        Compiler::compile::<SignatureMisbehaviorCircuit>(&sig_pp, sig_label).unwrap();
+    let sig_compile_elapsed = t0.elapsed();
+    println!("  Compilation: {sig_compile_elapsed:.2?}");
+
+    println!("  Generating proof...");
+    let t0 = Instant::now();
+    let (sig_proof, sig_public_inputs) = sig_prover.prove(&mut OsRng, &sig_circuit).unwrap();
+    let sig_prove_elapsed = t0.elapsed();
+    let sig_proof_bytes = sig_proof.to_bytes();
+    println!("  Proof generation: {sig_prove_elapsed:.2?}");
+    println!("    Proof size:    {} bytes", sig_proof_bytes.len());
+    println!(
+        "    Public inputs: {} field elements",
+        sig_public_inputs.len()
+    );
+
+    println!("  Verifying proof...");
+    let t0 = Instant::now();
+    match sig_verifier.verify(&sig_proof, &sig_public_inputs) {
+        Ok(()) => {
+            let sig_verify_elapsed = t0.elapsed();
+            println!("  Verification: {sig_verify_elapsed:.2?}");
+            println!(
+                "  PROOF VERIFIED! SPO #{CHEATER_SIGNER_IDX}'s signature misbehavior is proven."
+            );
+        }
+        Err(e) => {
+            println!("  Verification FAILED: {e:?}");
+        }
+    }
+    println!();
+
+    // --- Step 5: PLONK DKG commitment misbehavior proof ---
+    println!("--- Step 5: PLONK DKG commitment misbehavior proof ---");
+    println!(
+        "  Proving: SPO #{CHEATER_DKG_IDX}'s DKG share does NOT match their published commitments"
+    );
     println!(
         "  Polynomial coefficients: {MIN_SIGNERS} (degree {}), circuit max: {MAX_CIRCUIT_SIGNERS}",
         MIN_SIGNERS - 1
     );
 
-    // Generate synthetic commitment points for the cheater's polynomial
     let mut commitments_x = Vec::with_capacity(MIN_SIGNERS as usize);
     let mut commitments_y = Vec::with_capacity(MIN_SIGNERS as usize);
     for k in 0..MIN_SIGNERS as u64 {
@@ -119,67 +178,83 @@ fn main() {
         ]);
     }
 
-    let lhs_x: [u64; 4] = [
-        0x1111111111111111, 0x2222222222222222, 0x3333333333333333, 0x4444444444444444,
+    let commit_lhs_x: [u64; 4] = [
+        0x1111111111111111,
+        0x2222222222222222,
+        0x3333333333333333,
+        0x4444444444444444,
     ];
-    let lhs_y: [u64; 4] = [
-        0x5555555555555555, 0x6666666666666666, 0x7777777777777777, 0x0888888888888888,
+    let commit_lhs_y: [u64; 4] = [
+        0x5555555555555555,
+        0x6666666666666666,
+        0x7777777777777777,
+        0x0888888888888888,
     ];
-    let rhs_x: [u64; 4] = [
-        0xAAAAAAAAAAAAAAAA, 0xBBBBBBBBBBBBBBBB, 0xCCCCCCCCCCCCCCCC, 0x0DDDDDDDDDDDDDDD,
+    let commit_rhs_x: [u64; 4] = [
+        0xAAAAAAAAAAAAAAAA,
+        0xBBBBBBBBBBBBBBBB,
+        0xCCCCCCCCCCCCCCCC,
+        0x0DDDDDDDDDDDDDDD,
     ];
-    let rhs_y: [u64; 4] = [
-        0xEEEEEEEEEEEEEEEE, 0x0FFFFFFFFFFFFFFF, 0x0000000000000001, 0x0000000000000002,
+    let commit_rhs_y: [u64; 4] = [
+        0xEEEEEEEEEEEEEEEE,
+        0x0FFFFFFFFFFFFFFF,
+        0x0000000000000001,
+        0x0000000000000002,
     ];
 
-    let witness = CommitmentCheckWitness {
+    let commit_witness = CommitmentCheckWitness {
         share_limbs: [42, 0, 0, 0],
-        lhs_x,
-        lhs_y,
-        rhs_x,
-        rhs_y,
+        lhs_x: commit_lhs_x,
+        lhs_y: commit_lhs_y,
+        rhs_x: commit_rhs_x,
+        rhs_y: commit_rhs_y,
         commitments_x,
         commitments_y,
-        participant_index: VICTIM_IDX as u64,
+        participant_index: VICTIM_DKG_IDX as u64,
     };
 
-    let circuit = CommitmentMisbehaviorCircuit { witness };
+    let commit_circuit = CommitmentMisbehaviorCircuit {
+        witness: commit_witness,
+    };
 
-    // Public parameters
-    let circuit_power = 14;
-    println!("  Setting up public parameters (2^{circuit_power})...");
+    let commit_circuit_power = 15;
+    println!("  Setting up public parameters (2^{commit_circuit_power})...");
     let t0 = Instant::now();
-    let label = b"bifrost-frost-misbehavior-400-500";
-    let pp = PublicParameters::setup(1 << circuit_power, &mut OsRng).unwrap();
-    let pp_elapsed = t0.elapsed();
-    println!("  PP setup: {pp_elapsed:.2?}");
+    let commit_label = b"bifrost-frost-commit-misbehavior";
+    let commit_pp = PublicParameters::setup(1 << commit_circuit_power, &mut OsRng).unwrap();
+    let commit_pp_elapsed = t0.elapsed();
+    println!("  PP setup: {commit_pp_elapsed:.2?}");
 
-    // Compile
     println!("  Compiling circuit...");
     let t0 = Instant::now();
-    let (prover, verifier) =
-        Compiler::compile::<CommitmentMisbehaviorCircuit>(&pp, label).unwrap();
-    let compile_elapsed = t0.elapsed();
-    println!("  Compilation: {compile_elapsed:.2?}");
+    let (commit_prover, commit_verifier) =
+        Compiler::compile::<CommitmentMisbehaviorCircuit>(&commit_pp, commit_label).unwrap();
+    let commit_compile_elapsed = t0.elapsed();
+    println!("  Compilation: {commit_compile_elapsed:.2?}");
 
-    // Prove
     println!("  Generating proof...");
     let t0 = Instant::now();
-    let (proof, public_inputs) = prover.prove(&mut OsRng, &circuit).unwrap();
-    let prove_elapsed = t0.elapsed();
-    let proof_bytes = proof.to_bytes();
-    println!("  Proof generation: {prove_elapsed:.2?}");
-    println!("    Proof size:    {} bytes", proof_bytes.len());
-    println!("    Public inputs: {} field elements", public_inputs.len());
+    let (commit_proof, commit_public_inputs) =
+        commit_prover.prove(&mut OsRng, &commit_circuit).unwrap();
+    let commit_prove_elapsed = t0.elapsed();
+    let commit_proof_bytes = commit_proof.to_bytes();
+    println!("  Proof generation: {commit_prove_elapsed:.2?}");
+    println!("    Proof size:    {} bytes", commit_proof_bytes.len());
+    println!(
+        "    Public inputs: {} field elements",
+        commit_public_inputs.len()
+    );
 
-    // Verify
     println!("  Verifying proof...");
     let t0 = Instant::now();
-    match verifier.verify(&proof, &public_inputs) {
+    match commit_verifier.verify(&commit_proof, &commit_public_inputs) {
         Ok(()) => {
-            let verify_elapsed = t0.elapsed();
-            println!("  Verification: {verify_elapsed:.2?}");
-            println!("  PROOF VERIFIED! SPO #{CHEATER_IDX}'s misbehavior is proven.");
+            let commit_verify_elapsed = t0.elapsed();
+            println!("  Verification: {commit_verify_elapsed:.2?}");
+            println!(
+                "  PROOF VERIFIED! SPO #{CHEATER_DKG_IDX}'s DKG commitment misbehavior is proven."
+            );
         }
         Err(e) => {
             println!("  Verification FAILED: {e:?}");
@@ -189,14 +264,21 @@ fn main() {
     let total_elapsed = t_total.elapsed();
     println!();
     println!("=== Timing Summary ({MIN_SIGNERS}-of-{MAX_SIGNERS} SPOs) ===");
-    println!("  DKG (honest, 1 SPO):      {dkg_elapsed:.2?}");
-    println!("  DKG (cheating, r1+r2):     {cheat_dkg_elapsed:.2?}");
-    println!("  Misbehavior detection:      {detect_elapsed:.2?}");
-    println!("  PLONK PP setup:            {pp_elapsed:.2?}");
-    println!("  PLONK circuit compilation: {compile_elapsed:.2?}");
-    println!("  PLONK proof generation:    {prove_elapsed:.2?}");
-    println!("  Proof size:                {} bytes", proof_bytes.len());
-    println!("  Public inputs:             {} field elements", public_inputs.len());
-    println!("  Total wall time:           {total_elapsed:.2?}");
+    println!("  DKG (all {MAX_SIGNERS} SPOs):       {dkg_elapsed:.2?}");
+    println!("  Honest signing ({MIN_SIGNERS}):      {sign_elapsed:.2?}");
+    println!("  Cheating signing:            {cheat_sign_elapsed:.2?}");
+    println!("  --- Signature proof ---");
+    println!("    PP setup:                  {sig_pp_elapsed:.2?}");
+    println!("    Circuit compilation:       {sig_compile_elapsed:.2?}");
+    println!("    Proof generation:          {sig_prove_elapsed:.2?}");
+    println!("    Proof size:                {} bytes", sig_proof_bytes.len());
+    println!("    Public inputs:             {} field elements", sig_public_inputs.len());
+    println!("  --- Commitment proof ---");
+    println!("    PP setup:                  {commit_pp_elapsed:.2?}");
+    println!("    Circuit compilation:       {commit_compile_elapsed:.2?}");
+    println!("    Proof generation:          {commit_prove_elapsed:.2?}");
+    println!("    Proof size:                {} bytes", commit_proof_bytes.len());
+    println!("    Public inputs:             {} field elements", commit_public_inputs.len());
+    println!("  Total wall time:             {total_elapsed:.2?}");
     println!("  Verifiable on Cardano via Plutus V3 BLS12-381 builtins");
 }

@@ -100,6 +100,74 @@ fn run_part2(
     (round2_secrets, round2_packages)
 }
 
+/// Result of a completed DKG for all participants.
+pub struct FullDkgResult {
+    pub key_packages: BTreeMap<Identifier, frost::keys::KeyPackage>,
+    pub public_key_package: frost::keys::PublicKeyPackage,
+}
+
+/// Run DKG rounds 1+2+3 (parallelized) for all N participants.
+/// Returns key packages for every participant and the shared public key package.
+pub fn run_dkg_all_completions(min_signers: u16, max_signers: u16) -> FullDkgResult {
+    let identifiers: Vec<Identifier> = (1..=max_signers)
+        .map(|i| Identifier::try_from(i).unwrap())
+        .collect();
+
+    let (round1_secrets, round1_packages) = run_part1(&identifiers, max_signers, min_signers);
+    let (mut round2_secrets, round2_all_packages) =
+        run_part2(&identifiers, round1_secrets, &round1_packages, max_signers);
+
+    // Part 3: parallel for all participants
+    let t2 = Instant::now();
+    let n = max_signers as usize;
+    let counter = AtomicUsize::new(0);
+
+    let secrets_vec: Vec<_> = identifiers
+        .iter()
+        .map(|id| (*id, round2_secrets.remove(id).unwrap()))
+        .collect();
+
+    let results: Vec<_> = secrets_vec
+        .into_par_iter()
+        .map(|(id, secret2)| {
+            let round1_others: BTreeMap<_, _> = round1_packages
+                .iter()
+                .filter(|&(k, _)| *k != id)
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+
+            let round2_for_me: BTreeMap<_, _> = round2_all_packages
+                .iter()
+                .filter(|&(k, _)| *k != id)
+                .map(|(sender_id, packages)| (*sender_id, packages[&id].clone()))
+                .collect();
+
+            let (key_package, public_key_package) =
+                dkg::part3(&secret2, &round1_others, &round2_for_me).unwrap();
+
+            let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if c % 50 == 0 || c == n {
+                println!("    part3: {}/{} ({:.2?}) [parallel]", c, n, t2.elapsed());
+            }
+
+            (id, key_package, public_key_package)
+        })
+        .collect();
+
+    let mut key_packages = BTreeMap::new();
+    let mut last_pubkey_pkg = None;
+    for (id, kp, pkp) in results {
+        key_packages.insert(id, kp);
+        last_pubkey_pkg = Some(pkp);
+    }
+    println!("    part3: done ({:.2?}) [parallel]", t2.elapsed());
+
+    FullDkgResult {
+        key_packages,
+        public_key_package: last_pubkey_pkg.unwrap(),
+    }
+}
+
 /// Run DKG rounds 1+2 (parallelized) then part3 for a single participant.
 pub fn run_dkg_single_completion(
     min_signers: u16,
