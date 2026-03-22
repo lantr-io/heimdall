@@ -22,6 +22,7 @@ fn run_part1(
     BTreeMap<Identifier, dkg::round1::SecretPackage>,
     BTreeMap<Identifier, dkg::round1::Package>,
 ) {
+    println!("    part1: each SPO generates a random polynomial and publishes commitments + proof-of-knowledge");
     let t0 = Instant::now();
     let results: Vec<_> = identifiers
         .par_iter()
@@ -39,7 +40,7 @@ fn run_part1(
         packages.insert(id, package);
     }
     println!(
-        "    part1: {}/{} ({:.2?}) [parallel]",
+        "    part1: {}/{} done ({:.2?}) [parallel]",
         max_signers, max_signers, t0.elapsed()
     );
     (secrets, packages)
@@ -56,6 +57,7 @@ fn run_part2(
     BTreeMap<Identifier, dkg::round2::SecretPackage>,
     BTreeMap<Identifier, BTreeMap<Identifier, dkg::round2::Package>>,
 ) {
+    println!("    part2: each SPO evaluates their polynomial at every other SPO's index and sends encrypted secret shares");
     let t1 = Instant::now();
 
     // Pre-extract secrets into a vec so we can consume them in parallel
@@ -118,6 +120,7 @@ pub fn run_dkg_all_completions(min_signers: u16, max_signers: u16) -> FullDkgRes
         run_part2(&identifiers, round1_secrets, &round1_packages, max_signers);
 
     // Part 3: parallel for all participants
+    println!("    part3: each SPO verifies all received shares against published commitments (Feldman VSS), derives combined signing share and group public key");
     let t2 = Instant::now();
     let n = max_signers as usize;
     let counter = AtomicUsize::new(0);

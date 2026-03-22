@@ -1,9 +1,12 @@
 /// Heimdall — FROST DKG + Signing + Misbehavior Proofs demo.
 ///
+/// Usage: heimdall [min_signers] [max_signers]
+///   Defaults: 350 400
+///
 /// Demonstrates:
-/// 1. Full 150-of-200 DKG (all 200 SPOs)
-/// 2. Honest FROST signing (150 signers)
-/// 3. Cheating signing (SPO #42 submits bad share, aggregate detects it)
+/// 1. Full M-of-N DKG (all N SPOs)
+/// 2. Honest FROST signing (M signers)
+/// 3. Cheating signing (one SPO submits bad share, aggregate detects it)
 /// 4. PLONK signature misbehavior proof
 /// 5. PLONK DKG commitment misbehavior proof
 use std::time::Instant;
@@ -12,29 +15,34 @@ use dusk_bytes::Serializable;
 use dusk_plonk::prelude::*;
 use rand::rngs::OsRng;
 
-use heimdall::circuits::commitment::{
-    CommitmentCheckWitness, CommitmentMisbehaviorCircuit, MAX_SIGNERS as MAX_CIRCUIT_SIGNERS,
-};
+use heimdall::circuits::commitment::{CommitmentCheckWitness, CommitmentMisbehaviorCircuit};
 use heimdall::circuits::signature::{SignatureShareCheckWitness, SignatureMisbehaviorCircuit};
 use heimdall::frost::{dkg, signing};
 use heimdall::gadgets::nonnative::bytes_to_limbs;
 
-const MIN_SIGNERS: u16 = 150;
-const MAX_SIGNERS: u16 = 200;
-const CHEATER_SIGNER_IDX: u16 = 42;
-const CHEATER_DKG_IDX: u16 = 100;
-const VICTIM_DKG_IDX: u16 = 1;
-
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let min_signers: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(350);
+    let max_signers: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(400);
+
+    assert!(
+        min_signers >= 2 && min_signers <= max_signers,
+        "need 2 <= min_signers <= max_signers, got {min_signers}/{max_signers}"
+    );
+
+    let cheater_signer_idx: u16 = 42.min(min_signers);
+    let cheater_dkg_idx: u16 = 100.min(max_signers);
+    let victim_dkg_idx: u16 = 1;
+
     println!("=== Heimdall: FROST DKG + Signing + Misbehavior Proofs ===");
-    println!("=== {MIN_SIGNERS}-of-{MAX_SIGNERS} threshold ===\n");
+    println!("=== {min_signers}-of-{max_signers} threshold ===\n");
 
     let t_total = Instant::now();
 
     // --- Step 1: Full DKG ---
-    println!("--- Step 1: Full {MIN_SIGNERS}-of-{MAX_SIGNERS} DKG (all {MAX_SIGNERS} SPOs) ---");
+    println!("--- Step 1: Full {min_signers}-of-{max_signers} DKG (all {max_signers} SPOs) ---");
     let t0 = Instant::now();
-    let dkg_result = dkg::run_dkg_all_completions(MIN_SIGNERS, MAX_SIGNERS);
+    let dkg_result = dkg::run_dkg_all_completions(min_signers, max_signers);
     let dkg_elapsed = t0.elapsed();
     let group_key = dkg_result.public_key_package.verifying_key();
     println!("  DKG completed in {dkg_elapsed:.2?}");
@@ -43,14 +51,14 @@ fn main() {
     println!();
 
     // --- Step 2: Honest FROST signing ---
-    println!("--- Step 2: Honest FROST signing ({MIN_SIGNERS} signers) ---");
+    println!("--- Step 2: Honest FROST signing ({min_signers} signers) ---");
     let message = b"bifrost treasury tx";
     let t0 = Instant::now();
     let sign_result = signing::run_signing(
         &dkg_result.key_packages,
         &dkg_result.public_key_package,
         message,
-        MIN_SIGNERS,
+        min_signers,
     );
     let sign_elapsed = t0.elapsed();
     let sig_bytes = sign_result.signature.serialize().unwrap();
@@ -61,15 +69,15 @@ fn main() {
 
     // --- Step 3: Cheating signing ---
     println!(
-        "--- Step 3: Cheating signing (SPO #{CHEATER_SIGNER_IDX} submits bad share) ---"
+        "--- Step 3: Cheating signing (SPO #{cheater_signer_idx} submits bad share) ---"
     );
     let t0 = Instant::now();
     let cheat_sign = signing::run_cheating_signing(
         &dkg_result.key_packages,
         &dkg_result.public_key_package,
         message,
-        MIN_SIGNERS,
-        CHEATER_SIGNER_IDX,
+        min_signers,
+        cheater_signer_idx,
     );
     let cheat_sign_elapsed = t0.elapsed();
     println!("  Cheating signing completed in {cheat_sign_elapsed:.2?}");
@@ -78,7 +86,7 @@ fn main() {
     // --- Step 4: PLONK signature misbehavior proof ---
     println!("--- Step 4: PLONK signature misbehavior proof ---");
     println!(
-        "  Proving: SPO #{CHEATER_SIGNER_IDX}'s signature share z*G != expected point"
+        "  Proving: SPO #{cheater_signer_idx}'s signature share z*G != expected point"
     );
 
     let t0 = Instant::now();
@@ -142,7 +150,7 @@ fn main() {
             let sig_verify_elapsed = t0.elapsed();
             println!("  Verification: {sig_verify_elapsed:.2?}");
             println!(
-                "  PROOF VERIFIED! SPO #{CHEATER_SIGNER_IDX}'s signature misbehavior is proven."
+                "  PROOF VERIFIED! SPO #{cheater_signer_idx}'s signature misbehavior is proven."
             );
         }
         Err(e) => {
@@ -154,16 +162,18 @@ fn main() {
     // --- Step 5: PLONK DKG commitment misbehavior proof ---
     println!("--- Step 5: PLONK DKG commitment misbehavior proof ---");
     println!(
-        "  Proving: SPO #{CHEATER_DKG_IDX}'s DKG share does NOT match their published commitments"
-    );
-    println!(
-        "  Polynomial coefficients: {MIN_SIGNERS} (degree {}), circuit max: {MAX_CIRCUIT_SIGNERS}",
-        MIN_SIGNERS - 1
+        "  Proving: SPO #{cheater_dkg_idx}'s DKG share does NOT match their published commitments"
     );
 
-    let mut commitments_x = Vec::with_capacity(MIN_SIGNERS as usize);
-    let mut commitments_y = Vec::with_capacity(MIN_SIGNERS as usize);
-    for k in 0..MIN_SIGNERS as u64 {
+    let circuit_signers = max_signers as usize;
+    println!(
+        "  Polynomial coefficients: {min_signers} (degree {}), circuit slots: {circuit_signers}",
+        min_signers - 1
+    );
+
+    let mut commitments_x = Vec::with_capacity(min_signers as usize);
+    let mut commitments_y = Vec::with_capacity(min_signers as usize);
+    for k in 0..min_signers as u64 {
         commitments_x.push([
             0x59F2815B16F81798u64.wrapping_add(k * 1000),
             0x029BFCDB2DCE28D9,
@@ -211,25 +221,31 @@ fn main() {
         rhs_y: commit_rhs_y,
         commitments_x,
         commitments_y,
-        participant_index: VICTIM_DKG_IDX as u64,
+        participant_index: victim_dkg_idx as u64,
     };
 
     let commit_circuit = CommitmentMisbehaviorCircuit {
         witness: commit_witness,
+        max_signers: circuit_signers,
     };
 
-    let commit_circuit_power = 15;
+    // Circuit needs: max_signers*8 + 17 public inputs, each ~1 gate, plus witness/constraint gates
+    // Pick smallest power of 2 that fits
+    let commit_gates_estimate = circuit_signers * 8 + 500; // generous overhead
+    let commit_circuit_power = (commit_gates_estimate as f64).log2().ceil() as u32 + 1;
     println!("  Setting up public parameters (2^{commit_circuit_power})...");
     let t0 = Instant::now();
     let commit_label = b"bifrost-frost-commit-misbehavior";
-    let commit_pp = PublicParameters::setup(1 << commit_circuit_power, &mut OsRng).unwrap();
+    let commit_pp =
+        PublicParameters::setup(1 << commit_circuit_power, &mut OsRng).unwrap();
     let commit_pp_elapsed = t0.elapsed();
     println!("  PP setup: {commit_pp_elapsed:.2?}");
 
     println!("  Compiling circuit...");
     let t0 = Instant::now();
+    let dummy = CommitmentMisbehaviorCircuit::dummy(circuit_signers);
     let (commit_prover, commit_verifier) =
-        Compiler::compile::<CommitmentMisbehaviorCircuit>(&commit_pp, commit_label).unwrap();
+        Compiler::compile_with_circuit(&commit_pp, commit_label, &dummy).unwrap();
     let commit_compile_elapsed = t0.elapsed();
     println!("  Compilation: {commit_compile_elapsed:.2?}");
 
@@ -253,7 +269,7 @@ fn main() {
             let commit_verify_elapsed = t0.elapsed();
             println!("  Verification: {commit_verify_elapsed:.2?}");
             println!(
-                "  PROOF VERIFIED! SPO #{CHEATER_DKG_IDX}'s DKG commitment misbehavior is proven."
+                "  PROOF VERIFIED! SPO #{cheater_dkg_idx}'s DKG commitment misbehavior is proven."
             );
         }
         Err(e) => {
@@ -263,9 +279,9 @@ fn main() {
 
     let total_elapsed = t_total.elapsed();
     println!();
-    println!("=== Timing Summary ({MIN_SIGNERS}-of-{MAX_SIGNERS} SPOs) ===");
-    println!("  DKG (all {MAX_SIGNERS} SPOs):       {dkg_elapsed:.2?}");
-    println!("  Honest signing ({MIN_SIGNERS}):      {sign_elapsed:.2?}");
+    println!("=== Timing Summary ({min_signers}-of-{max_signers} SPOs) ===");
+    println!("  DKG (all {max_signers} SPOs):       {dkg_elapsed:.2?}");
+    println!("  Honest signing ({min_signers}):      {sign_elapsed:.2?}");
     println!("  Cheating signing:            {cheat_sign_elapsed:.2?}");
     println!("  --- Signature proof ---");
     println!("    PP setup:                  {sig_pp_elapsed:.2?}");

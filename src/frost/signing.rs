@@ -29,6 +29,7 @@ pub fn run_signing(
     let signer_ids: Vec<Identifier> = key_packages.keys().take(num_signers as usize).copied().collect();
 
     // Round 1: commitments (parallel)
+    println!("    Round 1: each signer generates a nonce pair (d,e) and publishes curve points (D,E)");
     let t0 = Instant::now();
     let round1_results: Vec<_> = signer_ids
         .par_iter()
@@ -46,12 +47,13 @@ pub fn run_signing(
         nonces_map.insert(id, nonces);
         commitments_map.insert(id, commitments);
     }
-    println!("    Round 1 (commitments): {num_signers} signers ({:.2?}) [parallel]", t0.elapsed());
+    println!("    Round 1: {num_signers} signers done ({:.2?}) [parallel]", t0.elapsed());
 
     // Build signing package
     let signing_package = frost::SigningPackage::new(commitments_map, message);
 
     // Round 2: signature shares (parallel)
+    println!("    Round 2: each signer computes z_p = d_p + rho_p*e_p + lambda_p*s_p*c (signature share)");
     let t1 = Instant::now();
     let nonces_vec: Vec<_> = nonces_map.into_iter().collect();
     let sign_results: Vec<_> = nonces_vec
@@ -67,20 +69,22 @@ pub fn run_signing(
     for (id, share) in sign_results {
         signature_shares.insert(id, share);
     }
-    println!("    Round 2 (sign shares): {num_signers} signers ({:.2?}) [parallel]", t1.elapsed());
+    println!("    Round 2: {num_signers} signers done ({:.2?}) [parallel]", t1.elapsed());
 
     // Aggregate
+    println!("    Aggregate: coordinator sums z = Σz_p, verifies each share against verification shares Y_p");
     let t2 = Instant::now();
     let signature = frost::aggregate(&signing_package, &signature_shares, public_key_package).unwrap();
-    println!("    Aggregation: ({:.2?})", t2.elapsed());
+    println!("    Aggregate: done ({:.2?})", t2.elapsed());
 
     // Verify
+    println!("    Verify: check (R, z) is a valid Schnorr/BIP-340 signature under the group public key");
     let t3 = Instant::now();
     public_key_package
         .verifying_key()
         .verify(message, &signature)
         .unwrap();
-    println!("    Signature verified: ({:.2?})", t3.elapsed());
+    println!("    Verify: done ({:.2?})", t3.elapsed());
 
     SigningResult {
         signature,
