@@ -33,6 +33,29 @@ fn run_part1(
         })
         .collect();
 
+    // get list of active SPOs
+    // simplify to Alice, Bob, Carol: hardcoded pool_id, keys whatever.
+
+    // Phase 1: each SPO generates a random polynomial and publishes commitments + proof-of-knowledge.
+    // expose results in API
+
+    // until Phase 1 deadline (5 minutes) try to get all results from other SPOs.
+    // For each result, verify proof-of-knowledge and store commitments for later.
+
+    // Phase 2: each SPO evaluates their polynomial at every other SPO's index and sends encrypted secret shares.
+    // until Phase 2 deadline (5 minutes) try to get all shares from other SPOs.
+    // For each share, verify it against the sender's commitments and store for later.
+
+    // Signing: each SPO publishes their nonce commitments
+
+    // Each SPO computes their signature share and publishes it
+
+    // Each SPO verifies all shares against commitments,
+    // derives combined signing share and group public key, and computes final signature.
+
+    // print results
+    // print that signature verification succeeded with the group public key
+
     let mut secrets = BTreeMap::new();
     let mut packages = BTreeMap::new();
     for (id, secret, package) in results {
