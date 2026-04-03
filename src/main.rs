@@ -1,29 +1,284 @@
-/// Heimdall — FROST DKG + Signing + Misbehavior Proofs demo.
-///
-/// Usage: heimdall [min_signers] [max_signers]
-///   Defaults: 350 400
-///
-/// Demonstrates:
-/// 1. Full M-of-N DKG (all N SPOs)
-/// 2. Honest FROST signing (M signers)
-/// 3. Cheating signing (one SPO submits bad share, aggregate detects it)
-/// 4. PLONK signature misbehavior proof
-/// 5. PLONK DKG commitment misbehavior proof
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use dusk_bytes::Serializable;
-use dusk_plonk::prelude::*;
-use rand::rngs::OsRng;
+use clap::{Parser, Subcommand};
+use frost_secp256k1_tr::Identifier;
 
-use heimdall::circuits::commitment::{CommitmentCheckWitness, CommitmentMisbehaviorCircuit};
-use heimdall::circuits::signature::{SignatureShareCheckWitness, SignatureMisbehaviorCircuit};
-use heimdall::frost::{dkg, signing};
-use heimdall::gadgets::nonnative::bytes_to_limbs;
+use heimdall::demo::orchestrator::SpoOrchestrator;
+use heimdall::http::client::PeerInfo;
+
+#[derive(Parser)]
+#[command(name = "heimdall", about = "Bifrost Bridge SPO program")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run one SPO instance (use 3 terminals for a full demo)
+    Demo {
+        /// This SPO's 1-based index
+        #[arg(long)]
+        index: u16,
+        /// Minimum signers (threshold)
+        #[arg(long, default_value = "2")]
+        min_signers: u16,
+        /// Maximum signers (total SPOs)
+        #[arg(long, default_value = "3")]
+        max_signers: u16,
+        /// Comma-separated peer URLs (e.g. http://localhost:8471,http://localhost:8472)
+        #[arg(long, value_delimiter = ',')]
+        peers: Vec<String>,
+        /// Port to listen on
+        #[arg(long)]
+        port: u16,
+    },
+    /// Run all SPOs in a single process (for easy testing)
+    DemoLocal {
+        /// Minimum signers (threshold)
+        #[arg(long, default_value = "2")]
+        min_signers: u16,
+        /// Maximum signers (total SPOs)
+        #[arg(long, default_value = "3")]
+        max_signers: u16,
+    },
+    /// Run the original PLONK misbehavior proof demo
+    ProofDemo {
+        /// Minimum signers
+        #[arg(default_value = "350")]
+        min_signers: u16,
+        /// Maximum signers
+        #[arg(default_value = "400")]
+        max_signers: u16,
+    },
+}
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let min_signers: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(350);
-    let max_signers: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(400);
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Demo {
+            index,
+            min_signers,
+            max_signers,
+            peers,
+            port,
+        } => {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(run_demo(index, min_signers, max_signers, peers, port));
+        }
+        Commands::DemoLocal {
+            min_signers,
+            max_signers,
+        } => {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(run_demo_local(min_signers, max_signers));
+        }
+        Commands::ProofDemo {
+            min_signers,
+            max_signers,
+        } => {
+            run_proof_demo(min_signers, max_signers);
+        }
+    }
+}
+
+async fn run_demo(
+    index: u16,
+    min_signers: u16,
+    max_signers: u16,
+    peer_urls: Vec<String>,
+    port: u16,
+) {
+    assert!(
+        index >= 1 && index <= max_signers,
+        "index must be in 1..={max_signers}"
+    );
+    assert!(
+        peer_urls.len() == (max_signers - 1) as usize,
+        "need exactly {} peer URLs, got {}",
+        max_signers - 1,
+        peer_urls.len()
+    );
+
+    // Build peer list: assign identifiers 1..=max_signers, skipping our own index
+    let mut peers = Vec::new();
+    let mut peer_idx = 0;
+    for i in 1..=max_signers {
+        if i == index {
+            continue;
+        }
+        peers.push(PeerInfo {
+            identifier: Identifier::try_from(i).unwrap(),
+            base_url: peer_urls[peer_idx].clone(),
+        });
+        peer_idx += 1;
+    }
+
+    let mut spo = SpoOrchestrator::new(
+        Identifier::try_from(index).unwrap(),
+        port,
+        peers,
+    );
+
+    let _server = spo.start_server().await;
+    println!("SPO #{index} listening on port {port}");
+
+    let timeout = Duration::from_secs(60);
+
+    // DKG
+    println!("--- DKG ({min_signers}-of-{max_signers}) ---");
+    let t0 = Instant::now();
+    spo.run_dkg(min_signers, max_signers, timeout).await.unwrap();
+    println!(
+        "DKG complete ({:.2?}). Group public key: {:?}",
+        t0.elapsed(),
+        spo.group_public_key().unwrap()
+    );
+
+    // Sign
+    let message = b"bifrost treasury handoff tx";
+    println!("--- Signing message: \"{}\" ---", std::str::from_utf8(message).unwrap());
+    let t0 = Instant::now();
+    let signature = spo.run_signing(message, timeout).await.unwrap();
+    let sig_bytes = signature.serialize().unwrap();
+    println!(
+        "Signing complete ({:.2?}). Signature: {}",
+        t0.elapsed(),
+        hex::encode(&sig_bytes)
+    );
+
+    // Verify
+    spo.group_public_key()
+        .unwrap()
+        .verify(message, &signature)
+        .expect("signature verification failed");
+    println!("Signature verified successfully.");
+}
+
+async fn run_demo_local(min_signers: u16, max_signers: u16) {
+    assert!(
+        min_signers >= 2 && min_signers <= max_signers,
+        "need 2 <= min_signers <= max_signers"
+    );
+
+    let base_port = 18500u16;
+    let n = max_signers as usize;
+
+    println!("=== Heimdall: {min_signers}-of-{max_signers} Local Demo ===");
+    println!("Spawning {n} SPOs on ports {base_port}..{}", base_port + max_signers - 1);
+
+    // Build all orchestrators
+    let ports: Vec<(u16, u16)> = (1..=max_signers)
+        .map(|i| (i, base_port + i - 1))
+        .collect();
+
+    let mut spos: Vec<SpoOrchestrator> = ports
+        .iter()
+        .map(|&(idx, port)| {
+            let peers: Vec<PeerInfo> = ports
+                .iter()
+                .filter(|(i, _)| *i != idx)
+                .map(|&(i, p)| PeerInfo {
+                    identifier: Identifier::try_from(i).unwrap(),
+                    base_url: format!("http://127.0.0.1:{p}"),
+                })
+                .collect();
+            SpoOrchestrator::new(Identifier::try_from(idx).unwrap(), port, peers)
+        })
+        .collect();
+
+    // Start all servers
+    for spo in &spos {
+        spo.start_server().await;
+    }
+    println!("All servers started.");
+
+    let timeout = Duration::from_secs(30);
+
+    // Run DKG concurrently
+    println!("\n--- DKG ---");
+    let t0 = Instant::now();
+    let mut dkg_handles = Vec::new();
+    // We need to move each spo into its own task. Use channels to get them back.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(n);
+    for mut spo in spos.drain(..) {
+        let tx = tx.clone();
+        dkg_handles.push(tokio::spawn(async move {
+            spo.run_dkg(min_signers, max_signers, timeout)
+                .await
+                .unwrap();
+            tx.send(spo).await.unwrap();
+        }));
+    }
+    drop(tx);
+    while let Some(spo) = rx.recv().await {
+        spos.push(spo);
+    }
+    // Sort by identifier for deterministic output
+    spos.sort_by_key(|s| {
+        let bytes = s.identifier.serialize();
+        bytes
+    });
+
+    println!("DKG complete ({:.2?})", t0.elapsed());
+    let group_key = spos[0].group_public_key().unwrap();
+    println!("Group public key: {:?}", group_key);
+
+    // Verify all SPOs got the same key
+    for spo in &spos[1..] {
+        assert_eq!(group_key, spo.group_public_key().unwrap());
+    }
+    println!("All {n} SPOs derived the same group public key.");
+
+    // Sign with all SPOs
+    let message = b"bifrost treasury handoff tx";
+    println!(
+        "\n--- Signing: \"{}\" ---",
+        std::str::from_utf8(message).unwrap()
+    );
+    let t0 = Instant::now();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(n);
+    let mut sign_handles = Vec::new();
+    for mut spo in spos.drain(..) {
+        let tx = tx.clone();
+        let msg = message.to_vec();
+        sign_handles.push(tokio::spawn(async move {
+            let sig = spo.run_signing(&msg, timeout).await.unwrap();
+            tx.send((spo, sig)).await.unwrap();
+        }));
+    }
+    drop(tx);
+    let mut signatures = Vec::new();
+    while let Some((spo, sig)) = rx.recv().await {
+        signatures.push(sig);
+        spos.push(spo);
+    }
+
+    let signature = &signatures[0];
+    for sig in &signatures[1..] {
+        assert_eq!(signature, sig);
+    }
+
+    let sig_bytes = signature.serialize().unwrap();
+    println!("Signing complete ({:.2?})", t0.elapsed());
+    println!("Signature: {}", hex::encode(&sig_bytes));
+
+    group_key
+        .verify(message, signature)
+        .expect("verification failed");
+    println!("Signature verified successfully.");
+    println!("\n=== Demo complete ===");
+}
+
+fn run_proof_demo(min_signers: u16, max_signers: u16) {
+    use dusk_bytes::Serializable;
+    use dusk_plonk::prelude::*;
+    use rand::rngs::OsRng;
+
+    use heimdall::circuits::commitment::{CommitmentCheckWitness, CommitmentMisbehaviorCircuit};
+    use heimdall::circuits::signature::{SignatureShareCheckWitness, SignatureMisbehaviorCircuit};
+    use heimdall::frost::{dkg, signing};
+    use heimdall::gadgets::nonnative::bytes_to_limbs;
 
     assert!(
         min_signers >= 2 && min_signers <= max_signers,
@@ -47,7 +302,10 @@ fn main() {
     let group_key = dkg_result.public_key_package.verifying_key();
     println!("  DKG completed in {dkg_elapsed:.2?}");
     println!("  Group public key: {:?}", group_key);
-    println!("  Key packages: {} participants", dkg_result.key_packages.len());
+    println!(
+        "  Key packages: {} participants",
+        dkg_result.key_packages.len()
+    );
     println!();
 
     // --- Step 2: Honest FROST signing ---
@@ -64,13 +322,14 @@ fn main() {
     let sig_bytes = sign_result.signature.serialize().unwrap();
     println!("  Signing completed in {sign_elapsed:.2?}");
     println!("  Signature: {}", hex::encode(&sig_bytes));
-    println!("  Message: \"{}\"", std::str::from_utf8(message).unwrap());
+    println!(
+        "  Message: \"{}\"",
+        std::str::from_utf8(message).unwrap()
+    );
     println!();
 
     // --- Step 3: Cheating signing ---
-    println!(
-        "--- Step 3: Cheating signing (SPO #{cheater_signer_idx} submits bad share) ---"
-    );
+    println!("--- Step 3: Cheating signing (SPO #{cheater_signer_idx} submits bad share) ---");
     let t0 = Instant::now();
     let cheat_sign = signing::run_cheating_signing(
         &dkg_result.key_packages,
@@ -85,9 +344,7 @@ fn main() {
 
     // --- Step 4: PLONK signature misbehavior proof ---
     println!("--- Step 4: PLONK signature misbehavior proof ---");
-    println!(
-        "  Proving: SPO #{cheater_signer_idx}'s signature share z*G != expected point"
-    );
+    println!("  Proving: SPO #{cheater_signer_idx}'s signature share z*G != expected point");
 
     let t0 = Instant::now();
     let (lhs_x, lhs_y, rhs_x, rhs_y) = signing::compute_misbehavior_witness(
@@ -229,15 +486,12 @@ fn main() {
         max_signers: circuit_signers,
     };
 
-    // Circuit needs: max_signers*8 + 17 public inputs, each ~1 gate, plus witness/constraint gates
-    // Pick smallest power of 2 that fits
-    let commit_gates_estimate = circuit_signers * 8 + 500; // generous overhead
+    let commit_gates_estimate = circuit_signers * 8 + 500;
     let commit_circuit_power = (commit_gates_estimate as f64).log2().ceil() as u32 + 1;
     println!("  Setting up public parameters (2^{commit_circuit_power})...");
     let t0 = Instant::now();
     let commit_label = b"bifrost-frost-commit-misbehavior";
-    let commit_pp =
-        PublicParameters::setup(1 << commit_circuit_power, &mut OsRng).unwrap();
+    let commit_pp = PublicParameters::setup(1 << commit_circuit_power, &mut OsRng).unwrap();
     let commit_pp_elapsed = t0.elapsed();
     println!("  PP setup: {commit_pp_elapsed:.2?}");
 
@@ -288,13 +542,22 @@ fn main() {
     println!("    Circuit compilation:       {sig_compile_elapsed:.2?}");
     println!("    Proof generation:          {sig_prove_elapsed:.2?}");
     println!("    Proof size:                {} bytes", sig_proof_bytes.len());
-    println!("    Public inputs:             {} field elements", sig_public_inputs.len());
+    println!(
+        "    Public inputs:             {} field elements",
+        sig_public_inputs.len()
+    );
     println!("  --- Commitment proof ---");
     println!("    PP setup:                  {commit_pp_elapsed:.2?}");
     println!("    Circuit compilation:       {commit_compile_elapsed:.2?}");
     println!("    Proof generation:          {commit_prove_elapsed:.2?}");
-    println!("    Proof size:                {} bytes", commit_proof_bytes.len());
-    println!("    Public inputs:             {} field elements", commit_public_inputs.len());
+    println!(
+        "    Proof size:                {} bytes",
+        commit_proof_bytes.len()
+    );
+    println!(
+        "    Public inputs:             {} field elements",
+        commit_public_inputs.len()
+    );
     println!("  Total wall time:             {total_elapsed:.2?}");
     println!("  Verifiable on Cardano via Plutus V3 BLS12-381 builtins");
 }
