@@ -277,9 +277,9 @@ dependencies = [
 
 [[package]]
 name = "dusk-plonk"
-version = "0.22.0-rc.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5bc834a6dbda93813268eb1df189712f07c1380ba9060b159157dd618cc6b1e"
+checksum = "949ec126023c47910d93a0fcb35ef20243f75eb7a726fcaa6541d8c44fadb66d"
 dependencies = [
  "blake2b_simd",
  "cfg-if",
@@ -484,7 +484,6 @@ version = "0.1.0"
 dependencies = [
  "dusk-bls12_381",
  "dusk-bytes",
- "dusk-jubjub",
  "dusk-plonk",
  "ff",
  "frost-secp256k1-tr",
