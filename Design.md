@@ -116,10 +116,8 @@ heimdall/
     |
     +-- bitcoin/                   -- Bitcoin transaction handling
     |   +-- mod.rs
-    |   +-- treasury.rs            -- Treasury Taproot address derivation
-    |   +-- pegin.rs               -- Peg-in Taproot address reconstruction
-    |   +-- tm_builder.rs          -- Deterministic TM transaction construction
-    |   +-- sighash.rs             -- BIP-341 sighash computation per input
+    |   +-- taproot.rs             -- Treasury + peg-in Taproot address derivation
+    |   +-- tm_builder.rs          -- Deterministic TM transaction construction + sighash
     |
     +-- http/                      -- HTTP server and client
     |   +-- mod.rs
@@ -265,6 +263,20 @@ Merkle root: tagged_hash("TapBranch", leaf1_hash || leaf2_hash)
 Q_pegin = Y_51 + tagged_hash("TapTweak", Y_51 || merkle_root) * G
 ```
 
+**Implementation** (`src/bitcoin/taproot.rs`):
+
+| Function | Description |
+|----------|-------------|
+| `treasury_spend_info(secp, y_51, y_67, y_federation, federation_timeout)` | Builds treasury `TaprootSpendInfo` |
+| `pegin_spend_info(secp, y_51, y_federation, federation_timeout, depositor_pubkey_hash, depositor_refund_timeout)` | Builds peg-in `TaprootSpendInfo` |
+
+Both return `TaprootSpendInfo` — the caller uses `.output_key()` for the on-chain address and `.merkle_root()` for the sighash tweak.
+
+Script builders (internal):
+- `build_checksig_script(pubkey)` — `<pubkey> OP_CHECKSIG`
+- `build_csv_checksig_script(timeout, pubkey)` — `<timeout> OP_CSV OP_DROP <pubkey> OP_CHECKSIG`
+- `build_depositor_refund_script(pubkey_hash, timeout)` — `OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY OP_CHECKSIGVERIFY <timeout> OP_CSV`
+
 ### 6.2 Treasury Movement Transaction
 
 Deterministic construction from shared Cardano state:
@@ -285,6 +297,40 @@ Outputs:
 Fee: tx_vsize * fee_rate_sat_per_vb (protocol parameter)
 ```
 
+**Implementation** (`src/bitcoin/tm_builder.rs`):
+
+The `build_tm()` function is a pure, deterministic builder. Same inputs always produce the same `txid`.
+
+Input types:
+
+| Type | Fields |
+|------|--------|
+| `TreasuryInput` | `outpoint: OutPoint`, `value: Amount`, `spend_info: TaprootSpendInfo` |
+| `PegInInput` | `outpoint: OutPoint`, `value: Amount`, `spend_info: TaprootSpendInfo` |
+| `PegOutRequest` | `script_pubkey: ScriptBuf`, `amount: Amount` |
+| `FeeParams` | `fee_rate_sat_per_vb: u64`, `per_pegout_fee: Amount` |
+
+Output type:
+
+| Type | Fields |
+|------|--------|
+| `UnsignedTm` | `tx: Transaction`, `txid: Txid`, `prevouts: Vec<TxOut>`, `input_spend_info: Vec<TaprootSpendInfo>` |
+
+Construction rules:
+
+1. **Validate** — each peg-out amount must exceed `per_pegout_fee`
+2. **Sort inputs** — peg-ins sorted by 36-byte key: `txid_bytes || vout_le_bytes`
+3. **Sort outputs** — peg-out outputs sorted by raw `script_pubkey` bytes
+4. **Deduct per-pegout fee** — each peg-out output value = `request.amount - per_pegout_fee`
+5. **Estimate vsize** — from input/output counts assuming key-path Taproot witnesses
+6. **Compute miner fee** — `vsize * fee_rate_sat_per_vb`
+7. **Compute change** — `sum(inputs) - sum(pegout_outputs) - miner_fee`
+8. **Dust check** — all outputs must be ≥ 330 sat (P2TR dust threshold)
+
+Error cases: `InsufficientFunds`, `NoPegOutAmountAfterFee`, `DustOutput`.
+
+Edge cases supported: no peg-ins (pure peg-out), no peg-outs (pure sweep/consolidation), no peg-ins and no peg-outs (epoch handoff only).
+
 ### 6.3 Per-Input FROST Signing
 
 Each TM input requires a separate FROST signing round because:
@@ -292,6 +338,28 @@ Each TM input requires a separate FROST signing round because:
 - Different Taproot tweak per input (treasury vs. each peg-in has different script tree)
 
 For $k+1$ inputs, SPOs run $k+1$ parallel signing rounds. All nonce commitments and partial signatures are arrays indexed by input position.
+
+**Implementation** (`src/bitcoin/tm_builder.rs`):
+
+`compute_sighashes(unsigned_tm)` returns one 32-byte sighash per input using `SighashCache::taproot_key_spend_signature_hash` with `Prevouts::All` and `TapSighashType::Default`.
+
+Each sighash is passed directly to FROST `run_signing()` as the signing message. The resulting 64-byte FROST `Signature` (R || z) maps directly to a BIP-340 Schnorr signature for the Taproot key-path spend witness.
+
+### 6.4 Vsize Estimation
+
+For fee calculation, the transaction vsize is estimated before assembly:
+
+```
+Fixed overhead:   version(4) + marker(1) + flag(1) + locktime(4) = 10 bytes
+Per input (non-witness): outpoint(36) + scriptSig_len(1) + sequence(4) = 41 bytes
+Per input (witness):     items_count(1) + sig_len(1) + sig(64) = 66 bytes
+Per P2TR output:         value(8) + scriptPubKey_len(1) + scriptPubKey(34) = 43 bytes
+Plus varint sizes for input/output counts.
+
+vsize = ceil((non_witness_bytes * 4 + witness_bytes) / 4)
+```
+
+This assumes all inputs use key-path spends (single 64-byte Schnorr signature). Script-path spends (used in cascade fallbacks) would have larger witnesses — vsize estimation for those cases will be added when the signing cascade is implemented.
 
 ## 7. Cardano Chain Interaction
 
