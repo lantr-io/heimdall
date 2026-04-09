@@ -109,6 +109,7 @@ fn test_sign1_payload_json_roundtrip() {
     let payload = Sign1Payload {
         epoch: 42,
         identifier: id,
+        input_index: 0,
         commitments,
     };
     let json = serde_json::to_string(&payload).unwrap();
@@ -141,6 +142,7 @@ fn test_sign2_payload_json_roundtrip() {
     let payload = Sign2Payload {
         epoch: 42,
         identifier: id,
+        input_index: 0,
         share,
     };
     let json = serde_json::to_string(&payload).unwrap();

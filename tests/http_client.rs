@@ -11,8 +11,10 @@ use tokio::sync::RwLock;
 
 /// Spawn an SPO server on a random port, return (shared_state, base_url).
 async fn spawn_spo(id: Identifier, dkg1: Dkg1Payload) -> (SharedState, String) {
+    let mut dkg1_map = BTreeMap::new();
+    dkg1_map.insert(dkg1.epoch, dkg1);
     let state: SharedState = Arc::new(RwLock::new(AppState {
-        dkg1: Some(dkg1),
+        dkg1: dkg1_map,
         ..Default::default()
     }));
     let app = router(state.clone());
@@ -60,7 +62,7 @@ async fn test_client_fetches_dkg1_from_two_peers() {
     ]);
 
     let packages = client
-        .fetch_dkg1_packages(Duration::from_secs(5))
+        .fetch_dkg1_packages(1, Duration::from_secs(5))
         .await
         .unwrap();
 
@@ -101,17 +103,27 @@ async fn test_client_fetches_dkg2_packages_for_me() {
     let my_id = ids[2]; // SPO 3
 
     // Set up servers for SPO 1 and SPO 2
-    let state1: SharedState = Arc::new(RwLock::new(AppState {
-        dkg1: Some(Dkg1Payload {
+    let mut dkg1_map_a = BTreeMap::new();
+    dkg1_map_a.insert(
+        1,
+        Dkg1Payload {
             epoch: 1,
             identifier: ids[0],
             package: round1_packages[&ids[0]].clone(),
-        }),
-        dkg2: Some(Dkg2Payload {
+        },
+    );
+    let mut dkg2_map_a = BTreeMap::new();
+    dkg2_map_a.insert(
+        1,
+        Dkg2Payload {
             epoch: 1,
             identifier: ids[0],
             packages: round2_per_sender[&ids[0]].clone(),
-        }),
+        },
+    );
+    let state1: SharedState = Arc::new(RwLock::new(AppState {
+        dkg1: dkg1_map_a,
+        dkg2: dkg2_map_a,
         ..Default::default()
     }));
     let app1 = router(state1);
@@ -119,17 +131,27 @@ async fn test_client_fetches_dkg2_packages_for_me() {
     let addr1 = listener1.local_addr().unwrap();
     tokio::spawn(async { axum::serve(listener1, app1).await.unwrap() });
 
-    let state2: SharedState = Arc::new(RwLock::new(AppState {
-        dkg1: Some(Dkg1Payload {
+    let mut dkg1_map_b = BTreeMap::new();
+    dkg1_map_b.insert(
+        1,
+        Dkg1Payload {
             epoch: 1,
             identifier: ids[1],
             package: round1_packages[&ids[1]].clone(),
-        }),
-        dkg2: Some(Dkg2Payload {
+        },
+    );
+    let mut dkg2_map_b = BTreeMap::new();
+    dkg2_map_b.insert(
+        1,
+        Dkg2Payload {
             epoch: 1,
             identifier: ids[1],
             packages: round2_per_sender[&ids[1]].clone(),
-        }),
+        },
+    );
+    let state2: SharedState = Arc::new(RwLock::new(AppState {
+        dkg1: dkg1_map_b,
+        dkg2: dkg2_map_b,
         ..Default::default()
     }));
     let app2 = router(state2);
@@ -149,7 +171,7 @@ async fn test_client_fetches_dkg2_packages_for_me() {
     ]);
 
     let packages = client
-        .fetch_dkg2_packages(my_id, Duration::from_secs(5))
+        .fetch_dkg2_packages(1, my_id, Duration::from_secs(5))
         .await
         .unwrap();
 
@@ -184,15 +206,18 @@ async fn test_client_retries_until_data_available() {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let mut s = state2.write().await;
-        s.dkg1 = Some(Dkg1Payload {
-            epoch: 1,
-            identifier: id1,
-            package: pkg_clone,
-        });
+        s.dkg1.insert(
+            1,
+            Dkg1Payload {
+                epoch: 1,
+                identifier: id1,
+                package: pkg_clone,
+            },
+        );
     });
 
     let packages = client
-        .fetch_dkg1_packages(Duration::from_secs(5))
+        .fetch_dkg1_packages(1, Duration::from_secs(5))
         .await
         .unwrap();
 

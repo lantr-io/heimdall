@@ -38,7 +38,7 @@ async fn test_dkg1_not_found_then_found() {
     let base = spawn_server(state.clone()).await;
 
     // Not published yet -> 404
-    let resp = reqwest::get(format!("{base}/dkg/round1")).await.unwrap();
+    let resp = reqwest::get(format!("{base}/dkg/1/round1/1")).await.unwrap();
     assert_eq!(resp.status(), 404);
 
     // Publish DKG round 1 data
@@ -52,11 +52,11 @@ async fn test_dkg1_not_found_then_found() {
     };
     {
         let mut s = state.write().await;
-        s.dkg1 = Some(payload.clone());
+        s.dkg1.insert(1, payload.clone());
     }
 
     // Now should return 200
-    let resp = reqwest::get(format!("{base}/dkg/round1")).await.unwrap();
+    let resp = reqwest::get(format!("{base}/dkg/1/round1/1")).await.unwrap();
     assert_eq!(resp.status(), 200);
     let back: Dkg1Payload = resp.json().await.unwrap();
     assert_eq!(back.epoch, payload.epoch);
@@ -69,7 +69,7 @@ async fn test_dkg2_not_found_then_found() {
     let state = make_shared_state();
     let base = spawn_server(state.clone()).await;
 
-    let resp = reqwest::get(format!("{base}/dkg/round2")).await.unwrap();
+    let resp = reqwest::get(format!("{base}/dkg/1/round2/1")).await.unwrap();
     assert_eq!(resp.status(), 404);
 
     // Generate real DKG round 2 data
@@ -100,10 +100,10 @@ async fn test_dkg2_not_found_then_found() {
     };
     {
         let mut s = state.write().await;
-        s.dkg2 = Some(payload.clone());
+        s.dkg2.insert(1, payload.clone());
     }
 
-    let resp = reqwest::get(format!("{base}/dkg/round2")).await.unwrap();
+    let resp = reqwest::get(format!("{base}/dkg/1/round2/1")).await.unwrap();
     assert_eq!(resp.status(), 200);
     let back: Dkg2Payload = resp.json().await.unwrap();
     assert_eq!(back.epoch, 1);
@@ -116,9 +116,9 @@ async fn test_sign_endpoints_404_when_empty() {
     let state = make_shared_state();
     let base = spawn_server(state).await;
 
-    let resp = reqwest::get(format!("{base}/sign/round1")).await.unwrap();
+    let resp = reqwest::get(format!("{base}/sign/0/round1/0/1")).await.unwrap();
     assert_eq!(resp.status(), 404);
 
-    let resp = reqwest::get(format!("{base}/sign/round2")).await.unwrap();
+    let resp = reqwest::get(format!("{base}/sign/0/round2/0/1")).await.unwrap();
     assert_eq!(resp.status(), 404);
 }

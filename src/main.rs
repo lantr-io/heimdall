@@ -1,10 +1,15 @@
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use frost_secp256k1_tr::Identifier;
 
-use heimdall::demo::orchestrator::SpoOrchestrator;
-use heimdall::http::client::PeerInfo;
+use heimdall::epoch::mocks::{MockCardanoChain, SystemClock};
+use heimdall::epoch::run_epoch_loop;
+use heimdall::epoch::state::{EpochConfig, SpoIdentity};
+use heimdall::epoch::traits::{CardanoChain, Clock, PeerNetwork};
+use heimdall::http::peer_network::HttpPeerNetwork;
+use heimdall::http::server::router;
 
 #[derive(Parser)]
 #[command(name = "heimdall", about = "Bifrost Bridge SPO program")]
@@ -15,32 +20,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run one SPO instance (use 3 terminals for a full demo)
+    /// Run one SPO instance. Start `max-signers` of these in separate
+    /// terminals — each one points at the same chain and discovers the
+    /// roster (and thus its own listen port) from it.
+    ///
+    /// TODO: add a `--chain` flag (once a real `CardanoChain` impl
+    /// exists) to select between `mock` and a live Cardano follower.
+    /// Today the demo is hardwired to `MockCardanoChain`, and the
+    /// `--min-signers`, `--max-signers`, `--base-port` flags are only
+    /// used to parameterize that mock chain — a real deployment would
+    /// read none of those from the CLI.
     Demo {
-        /// This SPO's 1-based index
+        /// This SPO's 1-based index in the roster.
         #[arg(long)]
         index: u16,
-        /// Minimum signers (threshold)
+        /// Minimum signers (threshold). Mock-chain only.
         #[arg(long, default_value = "2")]
         min_signers: u16,
-        /// Maximum signers (total SPOs)
+        /// Maximum signers (total SPOs in the roster). Mock-chain only.
         #[arg(long, default_value = "3")]
         max_signers: u16,
-        /// Comma-separated peer URLs (e.g. http://localhost:8471,http://localhost:8472)
-        #[arg(long, value_delimiter = ',')]
-        peers: Vec<String>,
-        /// Port to listen on
-        #[arg(long)]
-        port: u16,
-    },
-    /// Run all SPOs in a single process (for easy testing)
-    DemoLocal {
-        /// Minimum signers (threshold)
-        #[arg(long, default_value = "2")]
-        min_signers: u16,
-        /// Maximum signers (total SPOs)
-        #[arg(long, default_value = "3")]
-        max_signers: u16,
+        /// Base port: SPO `i` listens on `base_port + i - 1`. Mock-chain only.
+        #[arg(long, default_value = "18500")]
+        base_port: u16,
     },
     /// Run the original PLONK misbehavior proof demo
     ProofDemo {
@@ -60,18 +62,10 @@ fn main() {
             index,
             min_signers,
             max_signers,
-            peers,
-            port,
+            base_port,
         } => {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_demo(index, min_signers, max_signers, peers, port));
-        }
-        Commands::DemoLocal {
-            min_signers,
-            max_signers,
-        } => {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_demo_local(min_signers, max_signers));
+            rt.block_on(run_demo(index, min_signers, max_signers, base_port));
         }
         Commands::ProofDemo {
             min_signers,
@@ -82,192 +76,78 @@ fn main() {
     }
 }
 
-async fn run_demo(
-    index: u16,
-    min_signers: u16,
-    max_signers: u16,
-    peer_urls: Vec<String>,
-    port: u16,
-) {
-    assert!(
-        index >= 1 && index <= max_signers,
-        "index must be in 1..={max_signers}"
-    );
-    assert!(
-        peer_urls.len() == (max_signers - 1) as usize,
-        "need exactly {} peer URLs, got {}",
-        max_signers - 1,
-        peer_urls.len()
-    );
+async fn run_demo(index: u16, min_signers: u16, max_signers: u16, base_port: u16) {
+    let id = Identifier::try_from(index).unwrap();
 
-    // Build peer list: assign identifiers 1..=max_signers, skipping our own index
-    let mut peers = Vec::new();
-    let mut peer_idx = 0;
-    for i in 1..=max_signers {
-        if i == index {
-            continue;
-        }
-        peers.push(PeerInfo {
-            identifier: Identifier::try_from(i).unwrap(),
-            base_url: peer_urls[peer_idx].clone(),
-        });
-        peer_idx += 1;
-    }
+    // Construct a mock in-memory chain.
+    let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::demo(
+        min_signers,
+        max_signers,
+        base_port,
+    ));
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-    let mut spo = SpoOrchestrator::new(
-        Identifier::try_from(index).unwrap(),
-        port,
-        peers,
-    );
+    // Use the chain to understand which demo user is us (and thus which port to listen on). 
 
-    let _server = spo.start_server().await;
-    println!("SPO #{index} listening on port {port}");
+    let roster = chain
+        .query_roster(0)
+        .await
+        .expect("query initial roster");
+    let me = roster
+        .participants
+        .get(&id)
+        .unwrap_or_else(|| panic!("identifier {index} not in roster"));
+    let port = port_from_url(&me.bifrost_url);
 
-    let timeout = Duration::from_secs(60);
-
-    // DKG
-    println!("--- DKG ({min_signers}-of-{max_signers}) ---");
-    let t0 = Instant::now();
-    spo.run_dkg(min_signers, max_signers, timeout).await.unwrap();
-    println!(
-        "DKG complete ({:.2?}). Group public key: {:?}",
-        t0.elapsed(),
-        spo.group_public_key().unwrap()
-    );
-
-    // Sign
-    let message = b"bifrost treasury handoff tx";
-    println!("--- Signing message: \"{}\" ---", std::str::from_utf8(message).unwrap());
-    let t0 = Instant::now();
-    let signature = spo.run_signing(message, timeout).await.unwrap();
-    let sig_bytes = signature.serialize().unwrap();
-    println!(
-        "Signing complete ({:.2?}). Signature: {}",
-        t0.elapsed(),
-        hex::encode(&sig_bytes)
-    );
-
-    // Verify
-    spo.group_public_key()
-        .unwrap()
-        .verify(message, &signature)
-        .expect("signature verification failed");
-    println!("Signature verified successfully.");
-}
-
-async fn run_demo_local(min_signers: u16, max_signers: u16) {
-    assert!(
-        min_signers >= 2 && min_signers <= max_signers,
-        "need 2 <= min_signers <= max_signers"
-    );
-
-    let base_port = 18500u16;
-    let n = max_signers as usize;
-
-    println!("=== Heimdall: {min_signers}-of-{max_signers} Local Demo ===");
-    println!("Spawning {n} SPOs on ports {base_port}..{}", base_port + max_signers - 1);
-
-    // Build all orchestrators
-    let ports: Vec<(u16, u16)> = (1..=max_signers)
-        .map(|i| (i, base_port + i - 1))
-        .collect();
-
-    let mut spos: Vec<SpoOrchestrator> = ports
-        .iter()
-        .map(|&(idx, port)| {
-            let peers: Vec<PeerInfo> = ports
-                .iter()
-                .filter(|(i, _)| *i != idx)
-                .map(|&(i, p)| PeerInfo {
-                    identifier: Identifier::try_from(i).unwrap(),
-                    base_url: format!("http://127.0.0.1:{p}"),
-                })
-                .collect();
-            SpoOrchestrator::new(Identifier::try_from(idx).unwrap(), port, peers)
-        })
-        .collect();
-
-    // Start all servers
-    for spo in &spos {
-        spo.start_server().await;
-    }
-    println!("All servers started.");
-
-    let timeout = Duration::from_secs(30);
-
-    // Run DKG concurrently
-    println!("\n--- DKG ---");
-    let t0 = Instant::now();
-    let mut dkg_handles = Vec::new();
-    // We need to move each spo into its own task. Use channels to get them back.
-    let (tx, mut rx) = tokio::sync::mpsc::channel(n);
-    for mut spo in spos.drain(..) {
-        let tx = tx.clone();
-        dkg_handles.push(tokio::spawn(async move {
-            spo.run_dkg(min_signers, max_signers, timeout)
-                .await
-                .unwrap();
-            tx.send(spo).await.unwrap();
-        }));
-    }
-    drop(tx);
-    while let Some(spo) = rx.recv().await {
-        spos.push(spo);
-    }
-    // Sort by identifier for deterministic output
-    spos.sort_by_key(|s| {
-        let bytes = s.identifier.serialize();
-        bytes
+    // Spin up this SPO's HTTP server on the port the roster advertises.
+    let net = Arc::new(HttpPeerNetwork::new());
+    let app = router(net.shared_state());
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .expect("bind");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
     });
 
-    println!("DKG complete ({:.2?})", t0.elapsed());
-    let group_key = spos[0].group_public_key().unwrap();
-    println!("Group public key: {:?}", group_key);
-
-    // Verify all SPOs got the same key
-    for spo in &spos[1..] {
-        assert_eq!(group_key, spo.group_public_key().unwrap());
-    }
-    println!("All {n} SPOs derived the same group public key.");
-
-    // Sign with all SPOs
-    let message = b"bifrost treasury handoff tx";
     println!(
-        "\n--- Signing: \"{}\" ---",
-        std::str::from_utf8(message).unwrap()
+        "=== Heimdall SPO #{index} ({}-of-{}) ===",
+        roster.min_signers, roster.max_signers
     );
+    println!("Listening on 127.0.0.1:{port}");
+    println!(
+        "Waiting for the other {} SPOs to come online...",
+        roster.max_signers - 1
+    );
+
+    let peers: Arc<dyn PeerNetwork> = net;
+    let config = EpochConfig::demo_default(SpoIdentity {
+        identifier: id,
+        port,
+    });
+
     let t0 = Instant::now();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(n);
-    let mut sign_handles = Vec::new();
-    for mut spo in spos.drain(..) {
-        let tx = tx.clone();
-        let msg = message.to_vec();
-        sign_handles.push(tokio::spawn(async move {
-            let sig = spo.run_signing(&msg, timeout).await.unwrap();
-            tx.send((spo, sig)).await.unwrap();
-        }));
-    }
-    drop(tx);
-    let mut signatures = Vec::new();
-    while let Some((spo, sig)) = rx.recv().await {
-        signatures.push(sig);
-        spos.push(spo);
-    }
+    let tm = run_epoch_loop(chain, peers, clock, &config)
+        .await
+        .expect("epoch loop");
+    println!("Cycle complete ({:.2?})", t0.elapsed());
 
-    let signature = &signatures[0];
-    for sig in &signatures[1..] {
-        assert_eq!(signature, sig);
-    }
+    println!("Agreed txid: {}", tm.txid);
+    let signed_bytes = bitcoin::consensus::encode::serialize(&tm.unsigned_tx);
+    println!("Witnessed Bitcoin tx ({} bytes):", signed_bytes.len());
+    println!("  {}", hex::encode(&signed_bytes));
+    println!("\n=== SPO #{index} cycle complete ===");
 
-    let sig_bytes = signature.serialize().unwrap();
-    println!("Signing complete ({:.2?})", t0.elapsed());
-    println!("Signature: {}", hex::encode(&sig_bytes));
+    // Stay up serving the published payloads so peers can still fetch
+    // our round shares after we've finished our own cycle.
+    println!("Server still running on 127.0.0.1:{port}; press Ctrl-C to exit.");
+    tokio::signal::ctrl_c().await.ok();
+}
 
-    group_key
-        .verify(message, signature)
-        .expect("verification failed");
-    println!("Signature verified successfully.");
-    println!("\n=== Demo complete ===");
+fn port_from_url(url: &str) -> u16 {
+    url.rsplit(':')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("cannot parse port from bifrost_url {url:?}"))
 }
 
 fn run_proof_demo(min_signers: u16, max_signers: u16) {

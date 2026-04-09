@@ -140,9 +140,10 @@ fn outpoint_sort_key(op: &OutPoint) -> [u8; 36] {
 
 /// Build a deterministic unsigned Treasury Movement transaction.
 ///
-/// Construction rules (from Bifrost spec §6.2):
+/// Every honest SPO must produce byte-identical bytes for the same
+/// inputs, so construction follows a canonical recipe:
 ///
-/// - **Version:** 2 (for OP_CSV)
+/// - **Version:** 2 (needed for OP_CSV in leaf scripts)
 /// - **Locktime:** 0
 /// - **Inputs:** `[0]` = treasury, `[1..k]` = peg-ins sorted by `(txid || vout_le)`
 /// - **Outputs:** `[0..m-1]` = peg-out payments sorted by `script_pubkey` bytes,
