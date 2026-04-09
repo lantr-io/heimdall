@@ -4,10 +4,10 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use frost_secp256k1_tr::Identifier;
 
-use heimdall::epoch::mocks::{MockCardanoChain, SystemClock};
+use heimdall::epoch::mocks::{MockCardanoChain, OsRngSource, SeededRngSource, SystemClock};
 use heimdall::epoch::run_epoch_loop;
 use heimdall::epoch::state::{EpochConfig, SpoIdentity};
-use heimdall::epoch::traits::{CardanoChain, Clock, PeerNetwork};
+use heimdall::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use heimdall::http::peer_network::HttpPeerNetwork;
 use heimdall::http::server::router;
 
@@ -43,6 +43,10 @@ enum Commands {
         /// Base port: SPO `i` listens on `base_port + i - 1`. Mock-chain only.
         #[arg(long, default_value = "18500")]
         base_port: u16,
+        /// Use a deterministic seeded RNG so the cycle is bit-for-bit
+        /// reproducible across runs. Demo-only.
+        #[arg(long)]
+        deterministic: bool,
     },
     /// Run the original PLONK misbehavior proof demo
     ProofDemo {
@@ -63,9 +67,10 @@ fn main() {
             min_signers,
             max_signers,
             base_port,
+            deterministic,
         } => {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_demo(index, min_signers, max_signers, base_port));
+            rt.block_on(run_demo(index, min_signers, max_signers, base_port, deterministic));
         }
         Commands::ProofDemo {
             min_signers,
@@ -76,7 +81,13 @@ fn main() {
     }
 }
 
-async fn run_demo(index: u16, min_signers: u16, max_signers: u16, base_port: u16) {
+async fn run_demo(
+    index: u16,
+    min_signers: u16,
+    max_signers: u16,
+    base_port: u16,
+    deterministic: bool,
+) {
     let id = Identifier::try_from(index).unwrap();
 
     // Construct a mock in-memory chain.
@@ -86,6 +97,13 @@ async fn run_demo(index: u16, min_signers: u16, max_signers: u16, base_port: u16
         base_port,
     ));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let rng: Arc<dyn RngSource> = if deterministic {
+        // Fixed demo seed — every run of `--deterministic` produces
+        // the same DKG polynomials and signing nonces.
+        Arc::new(SeededRngSource::new(*b"heimdall-demo-seed-v1-0123456789"))
+    } else {
+        Arc::new(OsRngSource)
+    };
 
     // Use the chain to understand which demo user is us (and thus which port to listen on). 
 
@@ -126,7 +144,7 @@ async fn run_demo(index: u16, min_signers: u16, max_signers: u16, base_port: u16
     });
 
     let t0 = Instant::now();
-    let tm = run_epoch_loop(chain, peers, clock, &config)
+    let tm = run_epoch_loop(chain, peers, clock, rng, &config)
         .await
         .expect("epoch loop");
     println!("Cycle complete ({:.2?})", t0.elapsed());

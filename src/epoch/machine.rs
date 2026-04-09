@@ -44,7 +44,7 @@ use crate::epoch::state::{
     CascadeLevel, DkgCollected, DkgRound, EpochConfig, EpochError, EpochPhase, EpochResult,
     GroupKeys, Roster, SignCollected, SigningRound, TreasuryMovement,
 };
-use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork};
+use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 
 /// Run the epoch state machine for one full cycle and return the
 /// witnessed `TreasuryMovement` once the cycle reaches `AwaitConfirm`.
@@ -57,6 +57,7 @@ pub async fn run_epoch_loop(
     chain: Arc<dyn CardanoChain>,
     peers: Arc<dyn PeerNetwork>,
     clock: Arc<dyn Clock>,
+    rng: Arc<dyn RngSource>,
     config: &EpochConfig,
 ) -> EpochResult<TreasuryMovement> {
     let me = config.identity.identifier;
@@ -74,7 +75,7 @@ pub async fn run_epoch_loop(
                 round,
                 roster,
                 collected,
-            } => dkg_phase(&peers, &clock, config, epoch, round, roster, collected).await?,
+            } => dkg_phase(&peers, &clock, &rng, config, epoch, round, roster, collected).await?,
 
             EpochPhase::PublishKeys {
                 epoch,
@@ -98,7 +99,7 @@ pub async fn run_epoch_loop(
                 collected,
             } => {
                 sign_phase(
-                    &peers, &clock, config, epoch, roster, cascade, group_keys, tm, round,
+                    &peers, &clock, &rng, config, epoch, roster, cascade, group_keys, tm, round,
                     collected,
                 )
                 .await?

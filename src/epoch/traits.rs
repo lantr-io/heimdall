@@ -151,3 +151,53 @@ pub trait Clock: Send + Sync {
         self.now() + duration
     }
 }
+
+/// Factory for fresh cryptographic RNGs, one per call site.
+///
+/// `context` is a byte tag naming the call site (e.g. `b"dkg1"`,
+/// `b"sign1:input=0"`). The seeded impl derives a stream from
+/// `hash(seed || context)`, so different call sites never collide
+/// and reordering code cannot silently reshuffle nonces. `OsRngSource`
+/// ignores `context`.
+///
+/// Returns a concrete [`CycleRng`] (not a boxed trait object) because
+/// `frost-secp256k1-tr`'s `round1::commit` requires `Sized`.
+pub trait RngSource: Send + Sync {
+    fn rng(&self, context: &[u8]) -> CycleRng;
+}
+
+/// Concrete RNG handed out by [`RngSource`]. Either wraps `OsRng`
+/// directly, or a seeded `ChaCha20Rng` for deterministic demo runs.
+pub enum CycleRng {
+    Os(rand::rngs::OsRng),
+    Seeded(rand_chacha::ChaCha20Rng),
+}
+
+impl rand_core::RngCore for CycleRng {
+    fn next_u32(&mut self) -> u32 {
+        match self {
+            CycleRng::Os(r) => r.next_u32(),
+            CycleRng::Seeded(r) => r.next_u32(),
+        }
+    }
+    fn next_u64(&mut self) -> u64 {
+        match self {
+            CycleRng::Os(r) => r.next_u64(),
+            CycleRng::Seeded(r) => r.next_u64(),
+        }
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        match self {
+            CycleRng::Os(r) => r.fill_bytes(dest),
+            CycleRng::Seeded(r) => r.fill_bytes(dest),
+        }
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        match self {
+            CycleRng::Os(r) => r.try_fill_bytes(dest),
+            CycleRng::Seeded(r) => r.try_fill_bytes(dest),
+        }
+    }
+}
+
+impl rand_core::CryptoRng for CycleRng {}
