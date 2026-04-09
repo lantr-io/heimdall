@@ -59,6 +59,22 @@ impl Roster {
             .map(|(_, info)| info)
             .collect()
     }
+
+    /// Designated leader for the given attempt. Today this is just the
+    /// lowest-identifier participant; future cuts will rotate on
+    /// `leader_attempt` so a stuck leader can be replaced.
+    ///
+    /// TODO: real leader rotation. The right rule is something like
+    /// `participants[(epoch + attempt) mod n]` so a stuck leader is
+    /// deterministically replaced after `leader_timeout`. The signature
+    /// already takes `attempt` so callers don't need to change.
+    pub fn leader(&self, _attempt: u8) -> Identifier {
+        *self
+            .participants
+            .keys()
+            .next()
+            .expect("roster has at least one participant")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,12 +257,15 @@ pub enum EpochPhase {
     },
     Submit {
         epoch: u64,
+        roster: Roster,
         tm: TreasuryMovement,
-        // TODO: leader election is unimplemented. `leader_attempt` is
-        // plumbed through the enum so a future cut can rotate the
-        // designated submitter on `leader_timeout` expiry, but today
-        // every SPO hands the witnessed tx to its own chain mock and
-        // nothing coordinates which SPO is "the" submitter.
+        /// Which leader-rotation attempt this is. `Roster::leader` maps
+        /// it to the designated submitter for the round.
+        ///
+        /// TODO: a `leader_timeout`-driven rotation is not implemented:
+        /// today the leader is always `Roster::leader(0)` and a stuck
+        /// leader is not replaced. Bumping `leader_attempt` is the
+        /// right knob, but nothing currently bumps it.
         leader_attempt: u8,
     },
     AwaitConfirm {
@@ -318,7 +337,11 @@ impl EpochConfig {
             federation_timeout: Duration::from_secs(30),
             leader_timeout: Duration::from_secs(10),
             identity,
-            pegin_policy_id: [0u8; 28],
+            // Hardcoded to the always-OK native script policy ID for
+            // demo runs against a real Cardano node — the operator can
+            // mint test peg-in tokens under it without deploying any
+            // Bifrost contract.
+            pegin_policy_id: crate::cardano::always_ok::always_ok_script_hash(),
             pegin_collection_window: Duration::from_secs(5),
             pegin_poll_interval: Duration::from_millis(200),
         }

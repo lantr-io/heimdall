@@ -129,9 +129,10 @@ pub async fn run_epoch_loop(
 
             EpochPhase::Submit {
                 epoch,
+                roster,
                 tm,
                 leader_attempt,
-            } => submit_phase(&chain, me, epoch, tm, leader_attempt).await?,
+            } => submit_phase(&chain, me, epoch, roster, tm, leader_attempt).await?,
 
             EpochPhase::AwaitConfirm { tm, .. } => {
                 // First-cycle terminal: return the signed TM.
@@ -410,18 +411,22 @@ async fn build_tm_phase(
 // submit
 // ---------------------------------------------------------------------------
 
-// TODO: leader election and leader-timeout cascade. Currently, every SPO
-// submits the tx from their own process (via their own chain mock);
-// in production one designated SPO broadcasts the Bitcoin tx and, if
-// `leader_timeout` expires without confirmation, `leader_attempt`
-// increments and a new leader is selected. `_leader_attempt` is
-// parked in the phase enum for exactly this purpose but ignored here.
+// All SPOs verify and assemble the witnessed transaction, but only the
+// designated leader for `leader_attempt` actually broadcasts it via
+// `chain.submit_signed_tm`. Today the leader is always
+// `Roster::leader(0)` (lowest identifier).
+//
+// TODO: leader-timeout cascade. If the leader stalls, `leader_attempt`
+// should increment and a new leader take over after `leader_timeout`.
+// Nothing currently bumps `leader_attempt`, so a stuck leader hangs the
+// cycle. The phase enum already plumbs the field for this.
 async fn submit_phase(
     chain: &Arc<dyn CardanoChain>,
     me: frost_secp256k1_tr::Identifier,
     epoch: u64,
+    roster: Roster,
     mut tm: TreasuryMovement,
-    _leader_attempt: u8,
+    leader_attempt: u8,
 ) -> EpochResult<EpochPhase> {
     let secp = Secp256k1::new();
 
@@ -469,18 +474,32 @@ async fn submit_phase(
     }
 
     let tx_bytes = bitcoin::consensus::encode::serialize(&signed_tx);
-    chain.submit_signed_tm(&tx_bytes).await?;
+
+    // Only the designated leader broadcasts. Everyone else assembles
+    // the witnessed tx, holds it, and waits — they'd take over on a
+    // future leader-timeout cascade.
+    let leader = roster.leader(leader_attempt);
+    if me == leader {
+        crate::epoch_log!(
+            me, epoch,
+            "Submit: leader (attempt {leader_attempt}) — broadcasting signed tx; \
+             txid = {} ({} bytes)",
+            tm.txid,
+            tx_bytes.len()
+        );
+        chain.submit_signed_tm(&tx_bytes).await?;
+    } else {
+        crate::epoch_log!(
+            me, epoch,
+            "Submit: follower (leader = {:?}, attempt {leader_attempt}); \
+             holding witnessed tx ({} bytes), not broadcasting",
+            leader,
+            tx_bytes.len()
+        );
+    }
 
     // Persist the witnessed tx back into `tm` so callers can inspect it.
     tm.unsigned_tx = signed_tx;
-
-    crate::epoch_log!(
-        me, epoch,
-        "Submit: signed tx assembled and handed to chain mock; \
-         txid = {} ({} bytes)",
-        tm.txid,
-        tx_bytes.len()
-    );
 
     Ok(EpochPhase::AwaitConfirm {
         epoch,

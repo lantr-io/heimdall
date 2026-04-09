@@ -1016,6 +1016,7 @@ dependencies = [
  "k256",
  "pallas-addresses",
  "pallas-codec",
+ "pallas-crypto",
  "pallas-network",
  "pallas-primitives",
  "rand",

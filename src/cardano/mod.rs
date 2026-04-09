@@ -9,6 +9,7 @@
 //! through the `CardanoPegInSource` trait, so swapping mock ↔ real is
 //! a one-line change at the demo entry point.
 
+pub mod always_ok;
 pub mod mock;
 pub mod pallas_source;
 pub mod pegin_datum;

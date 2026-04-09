@@ -4,6 +4,7 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use frost_secp256k1_tr::Identifier;
 
+use heimdall::cardano::always_ok::always_ok_testnet_address_bech32;
 use heimdall::cardano::mock::MockCardanoPegInSource;
 use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
 use heimdall::cardano::pegin_source::CardanoPegInSource;
@@ -158,30 +159,30 @@ async fn run_demo(args: DemoArgs) {
         let magic = args
             .cardano_magic
             .expect("--cardano-magic required with --cardano-socket");
-        let bech32 = args
+        // Default the script address to the always-OK testnet address
+        // if the operator didn't override it.
+        let bech32: String = args
             .pegin_script_address
-            .as_deref()
-            .expect("--pegin-script-address required with --cardano-socket");
+            .clone()
+            .unwrap_or_else(|| always_ok_testnet_address_bech32().to_string());
         Arc::new(
-            PallasPegInSource::from_bech32(socket, NetworkMagic(magic), bech32)
+            PallasPegInSource::from_bech32(socket, NetworkMagic(magic), &bech32)
                 .expect("pallas source"),
         )
     } else {
         Arc::new(MockCardanoPegInSource::new())
     };
 
-    // Parse the policy ID hex (if provided) — the epoch config carries
-    // it into `CollectPegins` for the source filter.
-    let pegin_policy_id_bytes: [u8; 28] = match args.pegin_policy_id.as_deref() {
-        Some(hex_str) => {
+    // Parse the policy ID hex if the operator provided one. Otherwise
+    // leave `EpochConfig::demo_default`'s always-OK hash in place.
+    let pegin_policy_id_override: Option<[u8; 28]> =
+        args.pegin_policy_id.as_deref().map(|hex_str| {
             let v = hex::decode(hex_str).expect("--pegin-policy-id must be hex");
             assert_eq!(v.len(), 28, "policy id must be 28 bytes (56 hex chars)");
             let mut out = [0u8; 28];
             out.copy_from_slice(&v);
             out
-        }
-        None => [0u8; 28],
-    };
+        });
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let rng: Arc<dyn RngSource> = if args.deterministic {
         // Fixed demo seed — every run of `--deterministic` produces
@@ -229,7 +230,9 @@ async fn run_demo(args: DemoArgs) {
         identifier: id,
         port,
     });
-    config.pegin_policy_id = pegin_policy_id_bytes;
+    if let Some(pid) = pegin_policy_id_override {
+        config.pegin_policy_id = pid;
+    }
     if let Some(secs) = args.pegin_window_secs {
         config.pegin_collection_window = std::time::Duration::from_secs(secs);
     }
