@@ -4,6 +4,9 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use frost_secp256k1_tr::Identifier;
 
+use heimdall::cardano::mock::MockCardanoPegInSource;
+use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
+use heimdall::cardano::pegin_source::CardanoPegInSource;
 use heimdall::epoch::mocks::{MockCardanoChain, OsRngSource, SeededRngSource, SystemClock};
 use heimdall::epoch::run_epoch_loop;
 use heimdall::epoch::state::{EpochConfig, SpoIdentity};
@@ -47,6 +50,32 @@ enum Commands {
         /// reproducible across runs. Demo-only.
         #[arg(long)]
         deterministic: bool,
+        /// Path to a running Cardano node's Unix socket. If set, the
+        /// peg-in source is the live node via pallas N2C. If omitted,
+        /// an empty in-memory `MockCardanoPegInSource` is used and the
+        /// cycle produces a TM with no peg-in inputs.
+        #[arg(long)]
+        cardano_socket: Option<String>,
+        /// Cardano network magic (`764824073` mainnet, `1` preprod,
+        /// `2` preview). Required with `--cardano-socket`.
+        #[arg(long)]
+        cardano_magic: Option<u64>,
+        /// Bech32 address of the peg-in script. Required with
+        /// `--cardano-socket`.
+        #[arg(long)]
+        pegin_script_address: Option<String>,
+        /// Peg-in policy ID as 56 hex chars (28 bytes). Required with
+        /// `--cardano-socket`.
+        #[arg(long)]
+        pegin_policy_id: Option<String>,
+        /// How long (seconds) `CollectPegins` polls the source before
+        /// freezing the observed set.
+        #[arg(long)]
+        pegin_window_secs: Option<u64>,
+        /// Interval (ms) between successive peg-in polls inside the
+        /// collection window.
+        #[arg(long)]
+        pegin_poll_ms: Option<u64>,
     },
     /// Run the original PLONK misbehavior proof demo
     ProofDemo {
@@ -68,9 +97,27 @@ fn main() {
             max_signers,
             base_port,
             deterministic,
+            cardano_socket,
+            cardano_magic,
+            pegin_script_address,
+            pegin_policy_id,
+            pegin_window_secs,
+            pegin_poll_ms,
         } => {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_demo(index, min_signers, max_signers, base_port, deterministic));
+            rt.block_on(run_demo(DemoArgs {
+                index,
+                min_signers,
+                max_signers,
+                base_port,
+                deterministic,
+                cardano_socket,
+                cardano_magic,
+                pegin_script_address,
+                pegin_policy_id,
+                pegin_window_secs,
+                pegin_poll_ms,
+            }));
         }
         Commands::ProofDemo {
             min_signers,
@@ -81,23 +128,62 @@ fn main() {
     }
 }
 
-async fn run_demo(
+struct DemoArgs {
     index: u16,
     min_signers: u16,
     max_signers: u16,
     base_port: u16,
     deterministic: bool,
-) {
-    let id = Identifier::try_from(index).unwrap();
+    cardano_socket: Option<String>,
+    cardano_magic: Option<u64>,
+    pegin_script_address: Option<String>,
+    pegin_policy_id: Option<String>,
+    pegin_window_secs: Option<u64>,
+    pegin_poll_ms: Option<u64>,
+}
+
+async fn run_demo(args: DemoArgs) {
+    let id = Identifier::try_from(args.index).unwrap();
 
     // Construct a mock in-memory chain.
     let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::demo(
-        min_signers,
-        max_signers,
-        base_port,
+        args.min_signers,
+        args.max_signers,
+        args.base_port,
     ));
+
+    // Peg-in source: real pallas-backed if `--cardano-socket` is set,
+    // otherwise an empty in-memory mock (cycle produces zero peg-ins).
+    let pegin_source: Arc<dyn CardanoPegInSource> = if let Some(socket) = args.cardano_socket {
+        let magic = args
+            .cardano_magic
+            .expect("--cardano-magic required with --cardano-socket");
+        let bech32 = args
+            .pegin_script_address
+            .as_deref()
+            .expect("--pegin-script-address required with --cardano-socket");
+        Arc::new(
+            PallasPegInSource::from_bech32(socket, NetworkMagic(magic), bech32)
+                .expect("pallas source"),
+        )
+    } else {
+        Arc::new(MockCardanoPegInSource::new())
+    };
+
+    // Parse the policy ID hex (if provided) — the epoch config carries
+    // it into `CollectPegins` for the source filter.
+    let pegin_policy_id_bytes: [u8; 28] = match args.pegin_policy_id.as_deref() {
+        Some(hex_str) => {
+            let v = hex::decode(hex_str).expect("--pegin-policy-id must be hex");
+            assert_eq!(v.len(), 28, "policy id must be 28 bytes (56 hex chars)");
+            let mut out = [0u8; 28];
+            out.copy_from_slice(&v);
+            out
+        }
+        None => [0u8; 28],
+    };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let rng: Arc<dyn RngSource> = if deterministic {
+    let rng: Arc<dyn RngSource> = if args.deterministic {
         // Fixed demo seed — every run of `--deterministic` produces
         // the same DKG polynomials and signing nonces.
         Arc::new(SeededRngSource::new(*b"heimdall-demo-seed-v1-0123456789"))
@@ -105,8 +191,9 @@ async fn run_demo(
         Arc::new(OsRngSource)
     };
 
-    // Use the chain to understand which demo user is us (and thus which port to listen on). 
+    // Use the chain to understand which demo user is us (and thus which port to listen on).
 
+    let index = args.index;
     let roster = chain
         .query_roster(0)
         .await
@@ -138,13 +225,20 @@ async fn run_demo(
     );
 
     let peers: Arc<dyn PeerNetwork> = net;
-    let config = EpochConfig::demo_default(SpoIdentity {
+    let mut config = EpochConfig::demo_default(SpoIdentity {
         identifier: id,
         port,
     });
+    config.pegin_policy_id = pegin_policy_id_bytes;
+    if let Some(secs) = args.pegin_window_secs {
+        config.pegin_collection_window = std::time::Duration::from_secs(secs);
+    }
+    if let Some(ms) = args.pegin_poll_ms {
+        config.pegin_poll_interval = std::time::Duration::from_millis(ms);
+    }
 
     let t0 = Instant::now();
-    let tm = run_epoch_loop(chain, peers, clock, rng, &config)
+    let tm = run_epoch_loop(chain, pegin_source, peers, clock, rng, &config)
         .await
         .expect("epoch loop");
     println!("Cycle complete ({:.2?})", t0.elapsed());

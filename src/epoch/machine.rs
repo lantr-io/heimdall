@@ -1,31 +1,31 @@
 //! Epoch state machine driver.
 //!
 //! `run_epoch_loop` repeatedly matches on `EpochPhase` and dispatches to
-//! the right phase function. The remaining "glue" phases that are not
-//! big enough to deserve their own module live here:
+//! the right phase function. Glue phases that are not big enough to
+//! deserve their own module live here:
 //!
-//! TODO: nothing in this module (or anywhere in the codebase) touches
-//! the watchtower / Binocular oracle path. A real SPO must verify
-//! peg-in deposits have ≥100 Bitcoin confirmations before sweeping
-//! them, and produce merkle inclusion proofs for the Cardano oracle.
-//! Today `BuildTm` blindly trusts whatever `query_pegin_requests`
-//! returns. CLAUDE.md describes the watchtower architecture; the
-//! state machine needs to grow phases (or pre-`BuildTm` checks) for
-//! header validation and inclusion proof construction.
-//!
-//! - `idle_phase`         — block until the chain reports an epoch boundary
-//! - `epoch_start_phase`  — snapshot the roster
-//! - `publish_keys_phase` — log the group key (no-op for the first cycle)
-//! - `build_tm_phase`     — pull treasury / pegins / pegouts and build the
-//!                          unsigned Bitcoin tx + sighashes
-//! - `submit_phase`       — assemble the witnessed tx, verify each
-//!                          per-input signature under the on-chain
-//!                          output key, hand bytes to the chain
-//! - `await_confirm_phase`— terminal for the first cycle: returns the
-//!                          signed `TreasuryMovement` to the caller
+//! - `idle_phase`          — block until the chain reports an epoch boundary
+//! - `epoch_start_phase`   — snapshot the roster
+//! - `publish_keys_phase`  — log the group key (no-op for the first cycle)
+//! - `collect_pegins_phase`— poll the Cardano peg-in source over a
+//!                           configured collection window, parse each
+//!                           datum into a validated `ParsedPegIn`, and
+//!                           freeze the set for `BuildTm`
+//! - `build_tm_phase`      — pull treasury + pegouts (frozen pegins
+//!                           come from `CollectPegins`) and build the
+//!                           unsigned Bitcoin tx + sighashes
+//! - `submit_phase`        — assemble the witnessed tx, verify each
+//!                           per-input signature under the on-chain
+//!                           output key, hand bytes to the chain
+//! - `await_confirm_phase` — terminal for the first cycle: returns the
+//!                           signed `TreasuryMovement` to the caller
 //!
 //! `Dkg` and `Sign` are dispatched to `dkg::dkg_phase` and
 //! `signing::sign_phase` respectively.
+//!
+//! Note: peg-ins returned by the `CardanoPegInSource` are guaranteed
+//! ≥100 Bitcoin blocks deep because they come from oracle-owned
+//! UTxOs on Cardano. The SPO does NOT re-verify BTC confirmations.
 
 use std::sync::Arc;
 
@@ -38,6 +38,8 @@ use crate::bitcoin::taproot::treasury_spend_info;
 use crate::bitcoin::tm_builder::{
     build_tm, compute_sighashes, FeeParams, PegInInput, PegOutRequest, TreasuryInput,
 };
+use crate::cardano::pegin_datum::{parse_pegin_request, ParsedPegIn};
+use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInSource};
 use crate::epoch::dkg::dkg_phase;
 use crate::epoch::signing::sign_phase;
 use crate::epoch::state::{
@@ -45,6 +47,7 @@ use crate::epoch::state::{
     GroupKeys, Roster, SignCollected, SigningRound, TreasuryMovement,
 };
 use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
+use std::collections::BTreeMap;
 
 /// Run the epoch state machine for one full cycle and return the
 /// witnessed `TreasuryMovement` once the cycle reaches `AwaitConfirm`.
@@ -55,6 +58,7 @@ use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 /// boundary.
 pub async fn run_epoch_loop(
     chain: Arc<dyn CardanoChain>,
+    pegin_source: Arc<dyn CardanoPegInSource>,
     peers: Arc<dyn PeerNetwork>,
     clock: Arc<dyn Clock>,
     rng: Arc<dyn RngSource>,
@@ -83,11 +87,29 @@ pub async fn run_epoch_loop(
                 group_keys,
             } => publish_keys_phase(epoch, roster, group_keys).await?,
 
+            EpochPhase::CollectPegins {
+                epoch,
+                roster,
+                group_keys,
+            } => {
+                collect_pegins_phase(
+                    &chain,
+                    &pegin_source,
+                    &clock,
+                    config,
+                    epoch,
+                    roster,
+                    group_keys,
+                )
+                .await?
+            }
+
             EpochPhase::BuildTm {
                 epoch,
                 roster,
                 group_keys,
-            } => build_tm_phase(&chain, epoch, roster, group_keys).await?,
+                frozen_pegins,
+            } => build_tm_phase(&chain, epoch, roster, group_keys, frozen_pegins).await?,
 
             EpochPhase::Sign {
                 epoch,
@@ -173,10 +195,94 @@ async fn publish_keys_phase(
         "PublishKeys: group_key = {} (no on-chain publish in first cycle)",
         hex::encode(&vk)
     );
+    Ok(EpochPhase::CollectPegins {
+        epoch,
+        roster,
+        group_keys,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// collect_pegins
+// ---------------------------------------------------------------------------
+
+/// Poll the Cardano peg-in source over `config.pegin_collection_window`,
+/// parsing each observed request against the current treasury scriptPubKey.
+/// Parse failures are logged and dropped. The deduped, parsed set is
+/// frozen into the next `BuildTm` phase.
+async fn collect_pegins_phase(
+    chain: &Arc<dyn CardanoChain>,
+    pegin_source: &Arc<dyn CardanoPegInSource>,
+    clock: &Arc<dyn Clock>,
+    config: &EpochConfig,
+    epoch: u64,
+    roster: Roster,
+    group_keys: GroupKeys,
+) -> EpochResult<EpochPhase> {
+    let me = *group_keys.key_package.identifier();
+
+    // Compute the current treasury scriptPubKey so the parser can locate
+    // the unique output in each submitted BTC tx that pays to us.
+    let treasury = chain.query_treasury().await?;
+    let secp = Secp256k1::new();
+    let y_51 = frost_vk_to_xonly(&group_keys.verifying_key)?;
+    let treasury_spend = treasury_spend_info(
+        &secp,
+        y_51,
+        treasury.y_67,
+        treasury.y_fed,
+        treasury.federation_csv_blocks as u16,
+    );
+    let treasury_script = bitcoin::ScriptBuf::new_p2tr_tweaked(treasury_spend.output_key());
+
+    let deadline = clock.deadline(config.pegin_collection_window);
+    let mut accepted: BTreeMap<CardanoOutRef, ParsedPegIn> = BTreeMap::new();
+
+    crate::epoch_log!(
+        me, epoch,
+        "CollectPegins: polling source for {:?} (poll interval {:?})",
+        config.pegin_collection_window, config.pegin_poll_interval
+    );
+
+    loop {
+        let batch = pegin_source
+            .query_pegin_requests(&config.pegin_policy_id)
+            .await?;
+        for req in batch {
+            if accepted.contains_key(&req.cardano_utxo) {
+                continue;
+            }
+            match parse_pegin_request(&req, &treasury_script) {
+                Ok(parsed) => {
+                    accepted.insert(req.cardano_utxo.clone(), parsed);
+                }
+                Err(e) => {
+                    crate::epoch_log!(
+                        me, epoch,
+                        "  dropped peg-in {:?}: {}",
+                        req.cardano_utxo, e
+                    );
+                }
+            }
+        }
+        if clock.now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(config.pegin_poll_interval).await;
+    }
+
+    let frozen_pegins: Vec<ParsedPegIn> = accepted.into_values().collect();
+    crate::epoch_log!(
+        me, epoch,
+        "  -> froze {} peg-in(s) for BuildTm",
+        frozen_pegins.len()
+    );
+
     Ok(EpochPhase::BuildTm {
         epoch,
         roster,
         group_keys,
+        frozen_pegins,
     })
 }
 
@@ -189,17 +295,17 @@ async fn build_tm_phase(
     epoch: u64,
     roster: Roster,
     group_keys: GroupKeys,
+    frozen_pegins: Vec<ParsedPegIn>,
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
-    crate::epoch_log!(me, epoch, "BuildTm: querying chain for treasury / pegins / pegouts");
+    crate::epoch_log!(me, epoch, "BuildTm: querying chain for treasury / pegouts");
     let treasury = chain.query_treasury().await?;
-    let pegins = chain.query_pegin_requests().await?;
     let pegouts = chain.query_pegout_requests().await?;
     crate::epoch_log!(
         me, epoch,
-        "  chain query: treasury={} sat, {} pegins, {} pegouts, fee_rate={}sat/vb",
+        "  chain query: treasury={} sat, {} frozen pegins, {} pegouts, fee_rate={}sat/vb",
         treasury.value.to_sat(),
-        pegins.len(),
+        frozen_pegins.len(),
         pegouts.len(),
         treasury.fee_rate_sat_per_vb,
     );
@@ -229,10 +335,13 @@ async fn build_tm_phase(
 
     // TODO: real peg-ins use `pegin_spend_info(...)` with a per-depositor
     // pubkey hash + refund timeout, not the treasury script tree.
-    let pegin_inputs: Vec<PegInInput> = pegins
+    let pegin_inputs: Vec<PegInInput> = frozen_pegins
         .into_iter()
         .map(|p| PegInInput {
-            outpoint: p.outpoint,
+            outpoint: bitcoin::OutPoint {
+                txid: p.btc_txid,
+                vout: p.btc_vout,
+            },
             value: p.value,
             spend_info: treasury_spend_info(
                 &secp,
@@ -410,6 +519,7 @@ fn current_epoch(phase: &EpochPhase) -> u64 {
         EpochPhase::EpochStart { epoch }
         | EpochPhase::Dkg { epoch, .. }
         | EpochPhase::PublishKeys { epoch, .. }
+        | EpochPhase::CollectPegins { epoch, .. }
         | EpochPhase::BuildTm { epoch, .. }
         | EpochPhase::Sign { epoch, .. }
         | EpochPhase::Submit { epoch, .. }

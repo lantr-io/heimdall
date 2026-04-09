@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use frost_secp256k1_tr::Identifier;
 
+use heimdall::cardano::mock::MockCardanoPegInSource;
+use heimdall::cardano::pegin_source::CardanoPegInSource;
 use heimdall::epoch::fixture::demo_static_fixture;
 use heimdall::epoch::mocks::{MockCardanoChain, OsRngSource, SystemClock};
 use heimdall::epoch::run_epoch_loop;
@@ -53,15 +55,19 @@ async fn full_cycle_3_spos_over_http() {
         let port = base_port + i as u16;
         let chain: Arc<dyn CardanoChain> =
             Arc::new(MockCardanoChain::new(fixture.clone()));
+        let pegin_source: Arc<dyn CardanoPegInSource> =
+            Arc::new(MockCardanoPegInSource::new());
         let clock = clock.clone();
         let peers: Arc<dyn PeerNetwork> = net;
         let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
         handles.push(tokio::spawn(async move {
-            let config = EpochConfig::demo_default(SpoIdentity {
+            let mut config = EpochConfig::demo_default(SpoIdentity {
                 identifier: id,
                 port,
             });
-            run_epoch_loop(chain, peers, clock, rng, &config).await
+            config.pegin_collection_window = Duration::from_millis(100);
+            config.pegin_poll_interval = Duration::from_millis(20);
+            run_epoch_loop(chain, pegin_source, peers, clock, rng, &config).await
         }));
     }
 

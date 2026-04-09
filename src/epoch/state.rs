@@ -13,6 +13,8 @@ use frost_secp256k1_tr as frost;
 use frost::Identifier;
 use serde::{Deserialize, Serialize};
 
+use crate::cardano::pegin_datum::ParsedPegIn;
+
 // ---------------------------------------------------------------------------
 // Roster
 // ---------------------------------------------------------------------------
@@ -213,10 +215,20 @@ pub enum EpochPhase {
         roster: Roster,
         group_keys: GroupKeys,
     },
+    /// Poll the Cardano peg-in source over a collection window, then
+    /// freeze the observed set and advance to `BuildTm`.
+    CollectPegins {
+        epoch: u64,
+        roster: Roster,
+        group_keys: GroupKeys,
+    },
     BuildTm {
         epoch: u64,
         roster: Roster,
         group_keys: GroupKeys,
+        /// Frozen peg-in set from `CollectPegins`. Every SPO consumes
+        /// the same list to build byte-identical unsigned TM bytes.
+        frozen_pegins: Vec<ParsedPegIn>,
     },
     Sign {
         epoch: u64,
@@ -254,6 +266,7 @@ impl EpochPhase {
             EpochPhase::Dkg { round: DkgRound::Round2, .. } => "Dkg(Round2)",
             EpochPhase::Dkg { round: DkgRound::Part3, .. } => "Dkg(Part3)",
             EpochPhase::PublishKeys { .. } => "PublishKeys",
+            EpochPhase::CollectPegins { .. } => "CollectPegins",
             EpochPhase::BuildTm { .. } => "BuildTm",
             EpochPhase::Sign { round: SigningRound::Round1, .. } => "Sign(Round1)",
             EpochPhase::Sign { round: SigningRound::Round2, .. } => "Sign(Round2)",
@@ -282,6 +295,12 @@ pub struct EpochConfig {
     pub federation_timeout: Duration,
     pub leader_timeout: Duration,
     pub identity: SpoIdentity,
+    /// Cardano policy ID (script hash) identifying peg-in request UTxOs.
+    pub pegin_policy_id: [u8; 28],
+    /// How long `CollectPegins` polls the peg-in source before freezing.
+    pub pegin_collection_window: Duration,
+    /// Interval between successive peg-in polls inside the window.
+    pub pegin_poll_interval: Duration,
 }
 
 impl EpochConfig {
@@ -299,6 +318,9 @@ impl EpochConfig {
             federation_timeout: Duration::from_secs(30),
             leader_timeout: Duration::from_secs(10),
             identity,
+            pegin_policy_id: [0u8; 28],
+            pegin_collection_window: Duration::from_secs(5),
+            pegin_poll_interval: Duration::from_millis(200),
         }
     }
 }

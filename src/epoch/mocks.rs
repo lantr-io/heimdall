@@ -29,7 +29,7 @@ use tokio::sync::Notify;
 
 use crate::epoch::state::{EpochError, EpochResult, Roster, SpoInfo};
 use crate::epoch::traits::{
-    CardanoChain, Clock, CycleRng, EpochBoundaryEvent, PegInUtxo, PegOutRequestUtxo, PeerNetwork,
+    CardanoChain, Clock, CycleRng, EpochBoundaryEvent, PegOutRequestUtxo, PeerNetwork,
     RngSource, TreasuryUtxo,
 };
 use crate::http::payloads::{Dkg1Payload, Dkg2Payload, Sign1Payload, Sign2Payload};
@@ -185,18 +185,6 @@ impl CardanoChain for MockCardanoChain {
             fee_rate_sat_per_vb: self.fixture.fee_rate_sat_per_vb,
             per_pegout_fee: self.fixture.per_pegout_fee,
         })
-    }
-
-    async fn query_pegin_requests(&self) -> EpochResult<Vec<PegInUtxo>> {
-        Ok(self
-            .fixture
-            .pegins
-            .iter()
-            .map(|p| PegInUtxo {
-                outpoint: p.outpoint,
-                value: p.value,
-            })
-            .collect())
     }
 
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>> {

@@ -1,10 +1,14 @@
 //! Trait abstractions over external systems.
 //!
-//! `CardanoChain` and `PeerNetwork` are the seams the state machine
-//! tests against. Today the codebase only ships mock implementations
-//! plus an HTTP-backed peer network; a real Cardano N2C-backed chain
-//! will slot in behind `CardanoChain` later without touching the state
-//! machine.
+//! `CardanoChain` models the *chain-hosted oracle views* the epoch
+//! state machine consumes: the SPO registry snapshot (roster), the
+//! current treasury UTxO (delivered by a watchtower-maintained oracle,
+//! NOT by a Bitcoin node directly), and pending peg-out requests. The
+//! peg-in discovery path is separate — `CardanoPegInSource` in the
+//! `cardano` module polls a real Cardano node via pallas N2C.
+//!
+//! `PeerNetwork` is the pull-only HTTP surface between SPOs, used for
+//! DKG and signing round data.
 
 use std::time::{Duration, Instant};
 
@@ -24,18 +28,6 @@ pub struct EpochBoundaryEvent {
     pub epoch: u64,
 }
 
-/// A peg-in UTxO ready to sweep into the treasury.
-///
-/// Carries raw leaf material rather than a built `TaprootSpendInfo`
-/// because the internal key (`Y_51`) is only known after DKG — the
-/// `BuildTm` phase assembles the spend info from `group_keys`
-/// and these fields.
-#[derive(Debug, Clone)]
-pub struct PegInUtxo {
-    pub outpoint: bitcoin::OutPoint,
-    pub value: bitcoin::Amount,
-}
-
 /// A pending peg-out request.
 #[derive(Debug, Clone)]
 pub struct PegOutRequestUtxo {
@@ -43,12 +35,20 @@ pub struct PegOutRequestUtxo {
     pub amount: bitcoin::Amount,
 }
 
-/// The current treasury UTxO controlled by the previous epoch's roster.
+/// The current treasury UTxO state, as reported by the Cardano-side
+/// oracle (Binocular / watchtower). The SPO never queries Bitcoin
+/// directly for this — a trusted oracle UTxO on Cardano carries the
+/// outpoint, value, and fee parameters, and the SPO reads it from
+/// there.
 ///
-/// Like `PegInUtxo`, the Taproot spend info is reconstructed in
-/// `BuildTm` from the group key — v0.2's bootstrap has no prior
-/// epoch so the "current treasury" is synthetic and reuses the
-/// newly-derived group key as its internal key.
+/// The Taproot spend info is reconstructed in `BuildTm` from the
+/// group key: v0.2's bootstrap has no prior epoch so the "current
+/// treasury" is synthetic and reuses the newly-derived group key as
+/// its internal key.
+///
+/// TODO: wire this to a real Cardano oracle UTxO reader. Today the
+/// mock hands back a hardcoded fixture; the real impl pulls a
+/// well-known oracle UTxO via pallas and decodes its datum.
 ///
 /// TODO: in steady state the treasury input is controlled by epoch
 /// N-1's group key, not epoch N's just-derived key. The state machine
@@ -78,11 +78,8 @@ pub trait CardanoChain: Send + Sync {
     /// In v0.2 the mock returns a hardcoded roster.
     async fn query_roster(&self, epoch: u64) -> EpochResult<Roster>;
 
-    /// Current treasury UTxO state.
+    /// Current treasury UTxO state, as reported by the Cardano oracle.
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo>;
-
-    /// Confirmed peg-in deposits to sweep.
-    async fn query_pegin_requests(&self) -> EpochResult<Vec<PegInUtxo>>;
 
     /// Pending peg-out requests to fulfil.
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>>;
