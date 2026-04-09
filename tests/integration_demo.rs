@@ -1,96 +1,87 @@
+//! End-to-end integration test over real HTTP.
+//!
+//! Spins up 3 SPOs in one process, each with its own `HttpPeerNetwork`
+//! and axum server bound to a localhost port. Drives `run_epoch_loop`
+//! on three tasks and asserts they all converge on the same signed
+//! Treasury Movement, going through the same JSON/HTTP wire path that
+//! the `demo` subcommand uses in production.
+
+use std::sync::Arc;
 use std::time::Duration;
 
 use frost_secp256k1_tr::Identifier;
-use heimdall::demo::orchestrator::SpoOrchestrator;
-use heimdall::http::client::PeerInfo;
 
-fn make_spo(index: u16, port: u16, all_ports: &[(u16, u16)]) -> SpoOrchestrator {
-    let id = Identifier::try_from(index).unwrap();
-    let peers: Vec<PeerInfo> = all_ports
-        .iter()
-        .filter(|(idx, _)| *idx != index)
-        .map(|(idx, p)| PeerInfo {
-            identifier: Identifier::try_from(*idx).unwrap(),
-            base_url: format!("http://127.0.0.1:{p}"),
-        })
-        .collect();
-    SpoOrchestrator::new(id, port, peers)
-}
+use heimdall::epoch::fixture::demo_static_fixture;
+use heimdall::epoch::mocks::{MockCardanoChain, SystemClock};
+use heimdall::epoch::run_epoch_loop;
+use heimdall::epoch::state::{EpochConfig, SpoIdentity};
+use heimdall::epoch::traits::{CardanoChain, Clock, PeerNetwork};
+use heimdall::http::peer_network::HttpPeerNetwork;
+use heimdall::http::server::router;
 
-#[tokio::test]
-async fn test_3_spo_dkg_over_http() {
-    let ports = [(1u16, 18470u16), (2, 18471), (3, 18472)];
-    let mut spo1 = make_spo(1, 18470, &ports);
-    let mut spo2 = make_spo(2, 18471, &ports);
-    let mut spo3 = make_spo(3, 18472, &ports);
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_cycle_3_spos_over_http() {
+    let min_signers = 2u16;
+    let max_signers = 3u16;
+    let base_port = 18460u16; // distinct from other test files
 
-    // Start all servers
-    let _h1 = spo1.start_server().await;
-    let _h2 = spo2.start_server().await;
-    let _h3 = spo3.start_server().await;
+    let fixture = demo_static_fixture(min_signers, max_signers, base_port);
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-    let timeout = Duration::from_secs(10);
+    // Build per-SPO HTTP layer + spawn the axum server.
+    let mut nets: Vec<Arc<HttpPeerNetwork>> = Vec::with_capacity(max_signers as usize);
+    for i in 0..max_signers {
+        let net = Arc::new(HttpPeerNetwork::new());
+        let port = base_port + i;
+        let app = router(net.shared_state());
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        nets.push(net);
+    }
+    // Give servers a beat to start accepting connections.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Run DKG concurrently
-    let (r1, r2, r3) = tokio::join!(
-        spo1.run_dkg(2, 3, timeout),
-        spo2.run_dkg(2, 3, timeout),
-        spo3.run_dkg(2, 3, timeout),
-    );
-    r1.unwrap();
-    r2.unwrap();
-    r3.unwrap();
+    // Spawn one epoch loop per SPO. Each gets its own MockCardanoChain
+    // (the mock's "fire boundary once" flag is per-instance).
+    let mut handles = Vec::with_capacity(max_signers as usize);
+    for (i, net) in nets.into_iter().enumerate() {
+        let id = Identifier::try_from((i as u16) + 1).unwrap();
+        let port = base_port + i as u16;
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(fixture.clone()));
+        let clock = clock.clone();
+        let peers: Arc<dyn PeerNetwork> = net;
+        handles.push(tokio::spawn(async move {
+            let config = EpochConfig::demo_default(SpoIdentity {
+                identifier: id,
+                port,
+            });
+            run_epoch_loop(chain, peers, clock, &config).await
+        }));
+    }
 
-    // All 3 must derive the same group public key
-    let gk1 = spo1.group_public_key().unwrap();
-    let gk2 = spo2.group_public_key().unwrap();
-    let gk3 = spo3.group_public_key().unwrap();
-    assert_eq!(gk1, gk2);
-    assert_eq!(gk2, gk3);
-    println!("DKG complete. Group public key: {:?}", gk1);
-}
+    let mut tms = Vec::with_capacity(max_signers as usize);
+    for h in handles {
+        tms.push(h.await.unwrap().expect("epoch loop"));
+    }
 
-#[tokio::test]
-async fn test_3_spo_dkg_and_signing_over_http() {
-    let ports = [(1u16, 18480u16), (2, 18481), (3, 18482)];
-    let mut spo1 = make_spo(1, 18480, &ports);
-    let mut spo2 = make_spo(2, 18481, &ports);
-    let mut spo3 = make_spo(3, 18482, &ports);
+    // All SPOs must have agreed on the same txid.
+    let txid0 = tms[0].txid;
+    for tm in &tms[1..] {
+        assert_eq!(tm.txid, txid0, "txid mismatch across SPOs");
+    }
 
-    let _h1 = spo1.start_server().await;
-    let _h2 = spo2.start_server().await;
-    let _h3 = spo3.start_server().await;
-
-    let timeout = Duration::from_secs(10);
-
-    // DKG
-    let (r1, r2, r3) = tokio::join!(
-        spo1.run_dkg(2, 3, timeout),
-        spo2.run_dkg(2, 3, timeout),
-        spo3.run_dkg(2, 3, timeout),
-    );
-    r1.unwrap();
-    r2.unwrap();
-    r3.unwrap();
-
-    let group_key = spo1.group_public_key().unwrap();
-
-    // Signing: all 3 SPOs sign (3-of-3 satisfies 2-of-3 threshold)
-    let message = b"bifrost treasury handoff tx";
-    let (s1, s2, s3) = tokio::join!(
-        spo1.run_signing(message, timeout),
-        spo2.run_signing(message, timeout),
-        spo3.run_signing(message, timeout),
-    );
-    let sig1 = s1.unwrap();
-    let sig2 = s2.unwrap();
-    let sig3 = s3.unwrap();
-
-    // All must produce the same signature
-    assert_eq!(sig1, sig2);
-    assert_eq!(sig2, sig3);
-
-    // Verify the signature
-    group_key.verify(message, &sig1).expect("signature must verify against group public key");
-    println!("Signing complete. Signature verified.");
+    // Witnessed Bitcoin tx must be a valid BIP-341 key-path spend on
+    // every input: 1-element witness, 64-byte schnorr sig (default
+    // sighash).
+    let tm = &tms[0];
+    for (i, txin) in tm.unsigned_tx.input.iter().enumerate() {
+        assert_eq!(txin.witness.len(), 1, "input {i} witness should have 1 element");
+        let elem = txin.witness.iter().next().unwrap();
+        assert_eq!(elem.len(), 64, "input {i} witness should be 64-byte schnorr sig");
+    }
 }
