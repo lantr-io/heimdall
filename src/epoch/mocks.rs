@@ -29,8 +29,8 @@ use tokio::sync::Notify;
 
 use crate::epoch::state::{EpochError, EpochResult, Roster, SpoInfo};
 use crate::epoch::traits::{
-    CardanoChain, Clock, EpochBoundaryEvent, PegInUtxo, PegOutRequestUtxo, PeerNetwork,
-    TreasuryUtxo,
+    CardanoChain, Clock, CycleRng, EpochBoundaryEvent, PegInUtxo, PegOutRequestUtxo, PeerNetwork,
+    RngSource, TreasuryUtxo,
 };
 use crate::http::payloads::{Dkg1Payload, Dkg2Payload, Sign1Payload, Sign2Payload};
 
@@ -70,6 +70,47 @@ impl FakeClock {
 impl Clock for FakeClock {
     fn now(&self) -> Instant {
         *self.inner.lock().unwrap()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RngSources
+// ---------------------------------------------------------------------------
+
+/// Production `RngSource` — hands out `OsRng` and ignores `context`.
+#[derive(Debug, Default, Clone)]
+pub struct OsRngSource;
+
+impl RngSource for OsRngSource {
+    fn rng(&self, _context: &[u8]) -> CycleRng {
+        CycleRng::Os(rand::rngs::OsRng)
+    }
+}
+
+/// Demo-only deterministic `RngSource`. Each call derives a fresh
+/// `ChaCha20Rng` from `sha256(seed || context)`, so different call
+/// sites get different streams and the cycle is bit-for-bit
+/// reproducible from the seed.
+#[derive(Debug, Clone)]
+pub struct SeededRngSource {
+    seed: [u8; 32],
+}
+
+impl SeededRngSource {
+    pub fn new(seed: [u8; 32]) -> Self {
+        Self { seed }
+    }
+}
+
+impl RngSource for SeededRngSource {
+    fn rng(&self, context: &[u8]) -> CycleRng {
+        use bitcoin::hashes::{sha256, Hash, HashEngine};
+        use rand_core::SeedableRng;
+        let mut eng = sha256::Hash::engine();
+        eng.input(&self.seed);
+        eng.input(context);
+        let stream_seed: [u8; 32] = sha256::Hash::from_engine(eng).to_byte_array();
+        CycleRng::Seeded(rand_chacha::ChaCha20Rng::from_seed(stream_seed))
     }
 }
 

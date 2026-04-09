@@ -10,7 +10,7 @@ use crate::epoch::log::{id_short, short_hex};
 use crate::epoch::state::{
     DkgCollected, DkgRound, EpochConfig, EpochError, EpochPhase, EpochResult, GroupKeys, Roster,
 };
-use crate::epoch::traits::{Clock, PeerNetwork};
+use crate::epoch::traits::{Clock, PeerNetwork, RngSource};
 use crate::frost::participant;
 use crate::http::payloads::{Dkg1Payload, Dkg2Payload};
 
@@ -27,6 +27,7 @@ use crate::http::payloads::{Dkg1Payload, Dkg2Payload};
 pub async fn dkg_phase(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
+    rng: &Arc<dyn RngSource>,
     config: &EpochConfig,
     epoch: u64,
     round: DkgRound,
@@ -43,13 +44,12 @@ pub async fn dkg_phase(
                 roster.max_signers, roster.min_signers
             );
             
-            // TODO: abstract away the RNG to allow deterministic testing
-            let mut rng = rand::rngs::OsRng;
+            let mut dkg_rng = rng.rng(b"dkg1");
             let (secret, package) = participant::dkg_part1(
                 me,
                 roster.max_signers,
                 roster.min_signers,
-                &mut rng,
+                &mut dkg_rng,
             )
             .map_err(|e| EpochError::Frost(format!("dkg_part1: {e}")))?;
 
@@ -277,7 +277,7 @@ async fn poll_dkg_round1(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::epoch::mocks::{MockPeerHub, MockPeerNetwork, SystemClock};
+    use crate::epoch::mocks::{MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock};
     use crate::epoch::state::{EpochConfig, SpoIdentity, SpoInfo};
     use std::time::Duration;
 
@@ -308,6 +308,7 @@ mod tests {
         config: EpochConfig,
         roster: Roster,
     ) -> EpochResult<GroupKeys> {
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
         let mut phase = EpochPhase::Dkg {
             epoch: 0,
             round: DkgRound::Round1,
@@ -317,7 +318,7 @@ mod tests {
         loop {
             phase = match phase {
                 EpochPhase::Dkg { epoch, round, roster, collected } => {
-                    dkg_phase(&peers, &clock, &config, epoch, round, roster, collected).await?
+                    dkg_phase(&peers, &clock, &rng, &config, epoch, round, roster, collected).await?
                 }
                 EpochPhase::PublishKeys { group_keys, .. } => return Ok(group_keys),
                 other => panic!("unexpected phase: {}", other.name()),

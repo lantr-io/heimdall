@@ -18,7 +18,7 @@ use crate::epoch::state::{
     CascadeLevel, EpochConfig, EpochError, EpochPhase, EpochResult, GroupKeys, Roster,
     SignCollected, SigningRound, TreasuryMovement,
 };
-use crate::epoch::traits::{Clock, PeerNetwork};
+use crate::epoch::traits::{Clock, PeerNetwork, RngSource};
 use crate::frost::participant;
 use crate::http::payloads::{Sign1Payload, Sign2Payload};
 
@@ -40,6 +40,7 @@ use crate::http::payloads::{Sign1Payload, Sign2Payload};
 pub async fn sign_phase(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
+    rng: &Arc<dyn RngSource>,
     config: &EpochConfig,
     epoch: u64,
     roster: Roster,
@@ -59,12 +60,12 @@ pub async fn sign_phase(
                 "Sign round1: generating nonce commitments for {} input(s)",
                 num_inputs
             );
-            let mut rng = rand::rngs::OsRng;
-
             // Generate and publish this SPO's nonce commitments for every input.
             for i in 0..num_inputs as u32 {
+                let ctx = format!("sign1:epoch={epoch}:input={i}");
+                let mut sign_rng = rng.rng(ctx.as_bytes());
                 let (nonces, commitments) =
-                    participant::sign_round1(&group_keys.key_package, &mut rng);
+                    participant::sign_round1(&group_keys.key_package, &mut sign_rng);
                 collected.nonces.insert(i, nonces);
                 collected
                     .round1
@@ -304,7 +305,7 @@ mod tests {
         build_tm, compute_sighashes, FeeParams, PegInInput, PegOutRequest, TreasuryInput,
     };
     use crate::epoch::dkg::dkg_phase;
-    use crate::epoch::mocks::{MockPeerHub, MockPeerNetwork, SystemClock};
+    use crate::epoch::mocks::{MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock};
     use crate::epoch::state::{
         DkgCollected, DkgRound, EpochConfig, SignCollected, SpoIdentity, SpoInfo,
     };
@@ -339,6 +340,7 @@ mod tests {
         config: EpochConfig,
         roster: Roster,
     ) -> GroupKeys {
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
         let mut phase = EpochPhase::Dkg {
             epoch: 0,
             round: DkgRound::Round1,
@@ -352,7 +354,7 @@ mod tests {
                     round,
                     roster,
                     collected,
-                } => dkg_phase(&peers, &clock, &config, epoch, round, roster, collected)
+                } => dkg_phase(&peers, &clock, &rng, &config, epoch, round, roster, collected)
                     .await
                     .unwrap(),
                 EpochPhase::PublishKeys { group_keys, .. } => return group_keys,
@@ -472,6 +474,7 @@ mod tests {
             let id = *gk.key_package.identifier();
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock = clock.clone();
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
             let config = EpochConfig::demo_default(SpoIdentity {
                 identifier: id,
                 port: 0,
@@ -501,6 +504,7 @@ mod tests {
                         } => sign_phase(
                             &peers,
                             &clock,
+                            &rng,
                             &config,
                             epoch,
                             roster,
