@@ -58,6 +58,20 @@ pub fn sign_round2(
     frost::round2::sign(signing_package, nonces, key_package)
 }
 
+/// Round-2 signing with a BIP-341 Taproot tweak applied before share
+/// generation. `merkle_root` is the Taproot script-tree root bytes, or
+/// `None` for a key-only output. After aggregation (via
+/// [`sign_aggregate_with_tweak`]) the resulting signature verifies
+/// under the *tweaked* output key that the on-chain scriptPubKey uses.
+pub fn sign_round2_with_tweak(
+    signing_package: &frost::SigningPackage,
+    nonces: &frost::round1::SigningNonces,
+    key_package: &frost::keys::KeyPackage,
+    merkle_root: Option<&[u8]>,
+) -> Result<frost::round2::SignatureShare, frost::Error> {
+    frost::round2::sign_with_tweak(signing_package, nonces, key_package, merkle_root)
+}
+
 /// Aggregate signature shares into a final signature.
 pub fn sign_aggregate(
     signing_package: &frost::SigningPackage,
@@ -65,4 +79,15 @@ pub fn sign_aggregate(
     public_key_package: &frost::keys::PublicKeyPackage,
 ) -> Result<frost::Signature, frost::Error> {
     frost::aggregate(signing_package, shares, public_key_package)
+}
+
+/// Aggregate shares produced by [`sign_round2_with_tweak`]. Must pass
+/// the same `merkle_root` that each signer used for their share.
+pub fn sign_aggregate_with_tweak(
+    signing_package: &frost::SigningPackage,
+    shares: &BTreeMap<Identifier, frost::round2::SignatureShare>,
+    public_key_package: &frost::keys::PublicKeyPackage,
+    merkle_root: Option<&[u8]>,
+) -> Result<frost::Signature, frost::Error> {
+    frost::aggregate_with_tweak(signing_package, shares, public_key_package, merkle_root)
 }
