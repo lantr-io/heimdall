@@ -10,9 +10,14 @@
 //! a one-line change at the demo entry point.
 
 pub mod always_ok;
+pub mod blockfrost_chain;
+pub mod blockfrost_source;
 pub mod mock;
 pub mod pallas_source;
 pub mod pegin_datum;
 pub mod pegin_source;
+pub mod publish;
+pub mod treasury_datum;
+pub mod wallet;
 
 pub use pegin_source::{CardanoOutRef, CardanoPegInRequest, CardanoPegInSource};

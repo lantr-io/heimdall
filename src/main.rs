@@ -5,6 +5,9 @@ use clap::{Parser, Subcommand};
 use frost_secp256k1_tr::Identifier;
 
 use heimdall::cardano::always_ok::always_ok_testnet_address_bech32;
+use heimdall::cardano::blockfrost_chain::BlockfrostCardanoChain;
+use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
+use heimdall::cardano::treasury_datum::TreasuryConfig;
 use heimdall::cardano::mock::MockCardanoPegInSource;
 use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
 use heimdall::cardano::pegin_source::CardanoPegInSource;
@@ -51,10 +54,14 @@ enum Commands {
         /// reproducible across runs. Demo-only.
         #[arg(long)]
         deterministic: bool,
+        /// Blockfrost project ID (e.g. `preprodXXXXXX`). Network is
+        /// auto-detected from the key prefix. If set, UTxOs are
+        /// queried from Blockfrost instead of a local node.
+        #[arg(long)]
+        blockfrost_project_id: Option<String>,
         /// Path to a running Cardano node's Unix socket. If set, the
-        /// peg-in source is the live node via pallas N2C. If omitted,
-        /// an empty in-memory `MockCardanoPegInSource` is used and the
-        /// cycle produces a TM with no peg-in inputs.
+        /// peg-in source is the live node via pallas N2C. Ignored if
+        /// `--blockfrost-project-id` is given.
         #[arg(long)]
         cardano_socket: Option<String>,
         /// Cardano network magic (`764824073` mainnet, `1` preprod,
@@ -77,6 +84,26 @@ enum Commands {
         /// collection window.
         #[arg(long)]
         pegin_poll_ms: Option<u64>,
+        /// Bech32 address holding the treasury oracle UTxO. Defaults
+        /// to the always-OK testnet address.
+        #[arg(long)]
+        treasury_address: Option<String>,
+        /// Treasury marker token policy ID (56 hex chars). Defaults to
+        /// the always-OK script hash.
+        #[arg(long)]
+        treasury_policy_id: Option<String>,
+        /// Treasury marker token asset name as hex. Defaults to "TMTx"
+        /// (`544d5478`).
+        #[arg(long)]
+        treasury_asset_name: Option<String>,
+        /// BIP-39 mnemonic (12/15/24 words, space-separated) for the
+        /// Cardano wallet that pays fees and signs the oracle-update tx.
+        /// The payment key is derived at `m/1852'/1815'/0'/0/0`
+        /// (CIP-1852), the wallet address is derived from that key, and
+        /// UTxOs are queried from Blockfrost automatically. Without
+        /// this, the demo runs in dry-run mode (no Cardano publish).
+        #[arg(long)]
+        cardano_mnemonic: Option<String>,
     },
     /// Run the original PLONK misbehavior proof demo
     ProofDemo {
@@ -98,12 +125,17 @@ fn main() {
             max_signers,
             base_port,
             deterministic,
+            blockfrost_project_id,
             cardano_socket,
             cardano_magic,
             pegin_script_address,
             pegin_policy_id,
             pegin_window_secs,
             pegin_poll_ms,
+            treasury_address,
+            treasury_policy_id,
+            treasury_asset_name,
+            cardano_mnemonic,
         } => {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(run_demo(DemoArgs {
@@ -112,12 +144,17 @@ fn main() {
                 max_signers,
                 base_port,
                 deterministic,
+                blockfrost_project_id,
                 cardano_socket,
                 cardano_magic,
                 pegin_script_address,
                 pegin_policy_id,
                 pegin_window_secs,
                 pegin_poll_ms,
+                treasury_address,
+                treasury_policy_id,
+                treasury_asset_name,
+                cardano_mnemonic,
             }));
         }
         Commands::ProofDemo {
@@ -135,42 +172,95 @@ struct DemoArgs {
     max_signers: u16,
     base_port: u16,
     deterministic: bool,
+    blockfrost_project_id: Option<String>,
     cardano_socket: Option<String>,
     cardano_magic: Option<u64>,
     pegin_script_address: Option<String>,
     pegin_policy_id: Option<String>,
     pegin_window_secs: Option<u64>,
     pegin_poll_ms: Option<u64>,
+    treasury_address: Option<String>,
+    treasury_policy_id: Option<String>,
+    treasury_asset_name: Option<String>,
+    cardano_mnemonic: Option<String>,
 }
 
 async fn run_demo(args: DemoArgs) {
     let id = Identifier::try_from(args.index).unwrap();
 
-    // Construct a mock in-memory chain.
-    let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::demo(
+    // The fixture provides a fallback roster (SPO identities + ports)
+    // until the on-chain SPO registry is wired.
+    let fixture = heimdall::epoch::fixture::demo_static_fixture(
         args.min_signers,
         args.max_signers,
         args.base_port,
-    ));
+    );
 
-    // Peg-in source: real pallas-backed if `--cardano-socket` is set,
-    // otherwise an empty in-memory mock (cycle produces zero peg-ins).
-    let pegin_source: Arc<dyn CardanoPegInSource> = if let Some(socket) = args.cardano_socket {
+    let always_ok_hash = hex::encode(heimdall::cardano::always_ok::always_ok_script_hash());
+    let script_address: String = args
+        .pegin_script_address
+        .clone()
+        .unwrap_or_else(|| always_ok_testnet_address_bech32().to_string());
+    let treasury_address: String = args
+        .treasury_address
+        .clone()
+        .unwrap_or_else(|| always_ok_testnet_address_bech32().to_string());
+    let treasury_policy_id: String = args
+        .treasury_policy_id
+        .clone()
+        .unwrap_or_else(|| always_ok_hash.clone());
+    let treasury_asset_name: String = args
+        .treasury_asset_name
+        .clone()
+        .unwrap_or_else(|| hex::encode("TMTx"));
+
+    // Chain + pegin source selection:
+    // --blockfrost-project-id → Blockfrost for both chain + pegin source
+    // --cardano-socket        → pallas N2C for pegin source, mock chain
+    // neither                 → full mock
+    let chain: Arc<dyn CardanoChain>;
+    let pegin_source: Arc<dyn CardanoPegInSource>;
+
+    if let Some(project_id) = args.blockfrost_project_id.as_deref() {
+        let treasury_config = TreasuryConfig {
+            y_67: fixture.y_67,
+            y_fed: fixture.y_fed,
+            federation_csv_blocks: fixture.federation_csv_blocks,
+            fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
+            per_pegout_fee: fixture.per_pegout_fee,
+        };
+        let mut bf_chain = BlockfrostCardanoChain::new(
+            project_id,
+            &treasury_address,
+            &treasury_policy_id,
+            &treasury_asset_name,
+            treasury_config,
+            fixture.roster.clone(),
+        );
+
+        // If a mnemonic is provided, enable publishing. The payment
+        // key, wallet address, and UTxOs are derived/queried
+        // automatically.
+        if let Some(mnemonic) = &args.cardano_mnemonic {
+            bf_chain = bf_chain
+                .with_mnemonic(mnemonic)
+                .expect("--cardano-mnemonic must be a valid BIP-39 mnemonic");
+        }
+
+        chain = Arc::new(bf_chain);
+        pegin_source = Arc::new(BlockfrostPegInSource::new(project_id, &script_address));
+    } else if let Some(socket) = args.cardano_socket {
         let magic = args
             .cardano_magic
             .expect("--cardano-magic required with --cardano-socket");
-        // Default the script address to the always-OK testnet address
-        // if the operator didn't override it.
-        let bech32: String = args
-            .pegin_script_address
-            .clone()
-            .unwrap_or_else(|| always_ok_testnet_address_bech32().to_string());
-        Arc::new(
-            PallasPegInSource::from_bech32(socket, NetworkMagic(magic), &bech32)
+        chain = Arc::new(MockCardanoChain::new(fixture.clone()));
+        pegin_source = Arc::new(
+            PallasPegInSource::from_bech32(socket, NetworkMagic(magic), &script_address)
                 .expect("pallas source"),
-        )
+        );
     } else {
-        Arc::new(MockCardanoPegInSource::new())
+        chain = Arc::new(MockCardanoChain::new(fixture.clone()));
+        pegin_source = Arc::new(MockCardanoPegInSource::new());
     };
 
     // Parse the policy ID hex if the operator provided one. Otherwise

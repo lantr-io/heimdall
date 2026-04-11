@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use bitcoin::hashes::Hash;
 use bitcoin::key::{Secp256k1, UntweakedPublicKey};
 use bitcoin::secp256k1::SecretKey;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Txid, WPubkeyHash};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
 use frost_secp256k1_tr::Identifier;
 
 use crate::epoch::state::{Roster, SpoInfo};
@@ -114,17 +114,8 @@ pub fn demo_static_fixture(
             vout: 0,
         },
         treasury_value: Amount::from_sat(10_000_000),
-        pegins: vec![StaticPegIn {
-            outpoint: OutPoint {
-                txid: Txid::from_byte_array([0xBB; 32]),
-                vout: 0,
-            },
-            value: Amount::from_sat(500_000),
-        }],
-        pegouts: vec![StaticPegOut {
-            script_pubkey: ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0xCD; 20])),
-            amount: Amount::from_sat(250_000),
-        }],
+        pegins: vec![],
+        pegouts: vec![],
         fee_rate_sat_per_vb: 1,
         per_pegout_fee: Amount::from_sat(1_000),
     }
