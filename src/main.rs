@@ -105,6 +105,12 @@ enum Commands {
         #[arg(long)]
         cardano_mnemonic: Option<String>,
     },
+    /// Print the bootstrap treasury Taproot address.
+    BootstrapTreasury {
+        /// Federation CSV timeout in blocks.
+        #[arg(long, default_value = "144")]
+        federation_csv_blocks: u16,
+    },
     /// Run the original PLONK misbehavior proof demo
     ProofDemo {
         /// Minimum signers
@@ -156,6 +162,11 @@ fn main() {
                 treasury_asset_name,
                 cardano_mnemonic,
             }));
+        }
+        Commands::BootstrapTreasury {
+            federation_csv_blocks,
+        } => {
+            print_bootstrap_treasury(federation_csv_blocks);
         }
         Commands::ProofDemo {
             min_signers,
@@ -354,6 +365,42 @@ fn port_from_url(url: &str) -> u16 {
         .next()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("cannot parse port from bifrost_url {url:?}"))
+}
+
+fn print_bootstrap_treasury(federation_csv_blocks: u16) {
+    use bitcoin::key::{Secp256k1, UntweakedPublicKey};
+    use bitcoin::secp256k1::SecretKey;
+    use bitcoin::{Address, Network, ScriptBuf};
+    use heimdall::bitcoin::taproot::treasury_spend_info;
+
+    let secp = Secp256k1::new();
+
+    // Same deterministic keys as demo_static_fixture.
+    let y_67 = UntweakedPublicKey::from_slice(
+        &SecretKey::from_slice(&[0x67u8; 32])
+            .unwrap()
+            .x_only_public_key(&secp)
+            .0
+            .serialize(),
+    )
+    .unwrap();
+    let y_fed = UntweakedPublicKey::from_slice(
+        &SecretKey::from_slice(&[0xFEu8; 32])
+            .unwrap()
+            .x_only_public_key(&secp)
+            .0
+            .serialize(),
+    )
+    .unwrap();
+
+    // At bootstrap Y_51 = Y_fed.
+    let spend_info = treasury_spend_info(&secp, y_fed, y_67, y_fed, federation_csv_blocks);
+    let output_key = spend_info.output_key();
+    let script_pubkey = ScriptBuf::new_p2tr_tweaked(output_key);
+    let address = Address::from_script(&script_pubkey, Network::Bitcoin)
+        .expect("valid P2TR address");
+
+    println!("{address}");
 }
 
 fn run_proof_demo(min_signers: u16, max_signers: u16) {
