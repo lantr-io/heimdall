@@ -213,12 +213,22 @@ impl CardanoChain for BlockfrostCardanoChain {
         Ok(TreasuryUtxo {
             outpoint: bitcoin::OutPoint { txid, vout: 0 },
             value: out.value,
+            y_51: self.treasury_config.y_51,
             y_67: self.treasury_config.y_67,
             y_fed: self.treasury_config.y_fed,
             federation_csv_blocks: self.treasury_config.federation_csv_blocks,
             fee_rate_sat_per_vb: self.treasury_config.fee_rate_sat_per_vb,
             per_pegout_fee: self.treasury_config.per_pegout_fee,
         })
+    }
+
+    async fn publish_group_key(&self, _y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()> {
+        // TODO: in steady state, post the new group key to the on-chain
+        // treasury oracle so subsequent query_treasury calls return the
+        // updated Y_51. For now the Blockfrost impl uses the static
+        // TreasuryConfig.y_51, which must be set to the correct key for
+        // the current treasury.
+        Ok(())
     }
 
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>> {

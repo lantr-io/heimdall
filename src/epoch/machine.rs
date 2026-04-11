@@ -85,7 +85,7 @@ pub async fn run_epoch_loop(
                 epoch,
                 roster,
                 group_keys,
-            } => publish_keys_phase(epoch, roster, group_keys).await?,
+            } => publish_keys_phase(&chain, epoch, roster, group_keys).await?,
 
             EpochPhase::CollectPegins {
                 epoch,
@@ -175,27 +175,22 @@ async fn epoch_start_phase(
 // ---------------------------------------------------------------------------
 
 async fn publish_keys_phase(
+    chain: &Arc<dyn CardanoChain>,
     epoch: u64,
     roster: Roster,
     group_keys: GroupKeys,
 ) -> EpochResult<EpochPhase> {
-    // No on-chain publication in the first cycle. Just log so the demo
-    // shows the derived group key, then move on.
-    //
-    // TODO: real PublishKeys should post the new group verifying key
-    // and the derived treasury Taproot address to Cardano, atomic with
-    // the epoch transition, so the next roster knows where to sweep.
-    // This is the "treasury handoff" step — see `TreasuryUtxo` docs.
-    let vk = group_keys
-        .verifying_key
-        .serialize()
-        .map_err(|e| EpochError::Frost(format!("verifying_key serialize: {e}")))?;
     let me = *group_keys.key_package.identifier();
+    let y_51 = frost_vk_to_xonly(&group_keys.verifying_key)?;
+
     crate::epoch_log!(
         me, epoch,
-        "PublishKeys: group_key = {} (no on-chain publish in first cycle)",
-        hex::encode(&vk)
+        "PublishKeys: group_key = {}",
+        hex::encode(y_51.serialize())
     );
+
+    chain.publish_group_key(y_51).await?;
+
     Ok(EpochPhase::CollectPegins {
         epoch,
         roster,
@@ -226,10 +221,9 @@ async fn collect_pegins_phase(
     // the unique output in each submitted BTC tx that pays to us.
     let treasury = chain.query_treasury().await?;
     let secp = Secp256k1::new();
-    let y_51 = frost_vk_to_xonly(&group_keys.verifying_key)?;
     let treasury_spend = treasury_spend_info(
         &secp,
-        y_51,
+        treasury.y_51,
         treasury.y_67,
         treasury.y_fed,
         treasury.federation_csv_blocks as u16,
@@ -312,27 +306,29 @@ async fn build_tm_phase(
     );
 
     let secp = Secp256k1::new();
-    let y_51 = frost_vk_to_xonly(&group_keys.verifying_key)?;
 
-    // Build the spend info for the current treasury and for every peg-in
-    // input. The leaf keys (`y_67`, `y_fed`) come from the chain query;
-    // the internal key Y_51 is the just-derived FROST group key. Peg-ins
-    // for the first cycle reuse the treasury script tree shape — there
-    // is no per-depositor refund leaf yet.
-    //
-    // FIXME: this is bootstrap-only. In steady state the treasury
-    // *input* is locked under epoch N-1's group key while the *change
-    // output* uses epoch N's. We need to thread the previous epoch's
-    // verifying key through `EpochPhase` (or query it from the chain)
-    // and use it here for the input spend info.
-    let treasury_spend = treasury_spend_info(
+    // Treasury *input* spend info: the current treasury is locked under
+    // `treasury.y_51` (at bootstrap this is Y_fed; in steady state it
+    // is the previous epoch's FROST group key).
+    let treasury_input_spend = treasury_spend_info(
         &secp,
-        y_51,
+        treasury.y_51,
         treasury.y_67,
         treasury.y_fed,
         treasury.federation_csv_blocks as u16,
     );
-    let change_script = bitcoin::ScriptBuf::new_p2tr_tweaked(treasury_spend.output_key());
+
+    // Treasury *change output*: send to the new roster's Taproot address,
+    // using the just-derived FROST group key as the internal key.
+    let new_y_51 = frost_vk_to_xonly(&group_keys.verifying_key)?;
+    let change_spend = treasury_spend_info(
+        &secp,
+        new_y_51,
+        treasury.y_67,
+        treasury.y_fed,
+        treasury.federation_csv_blocks as u16,
+    );
+    let change_script = bitcoin::ScriptBuf::new_p2tr_tweaked(change_spend.output_key());
 
     // TODO: real peg-ins use `pegin_spend_info(...)` with a per-depositor
     // pubkey hash + refund timeout, not the treasury script tree.
@@ -346,7 +342,7 @@ async fn build_tm_phase(
             value: p.value,
             spend_info: treasury_spend_info(
                 &secp,
-                y_51,
+                treasury.y_51,
                 treasury.y_67,
                 treasury.y_fed,
                 treasury.federation_csv_blocks as u16,
@@ -366,7 +362,7 @@ async fn build_tm_phase(
         TreasuryInput {
             outpoint: treasury.outpoint,
             value: treasury.value,
-            spend_info: treasury_spend,
+            spend_info: treasury_input_spend,
         },
         pegin_inputs,
         pegout_requests,

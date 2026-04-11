@@ -14,8 +14,14 @@ use bitcoin::{transaction, Amount, OutPoint, ScriptBuf, Sequence, Transaction, T
 /// Dust threshold for P2TR outputs (330 sat).
 const DUST_THRESHOLD: Amount = Amount::from_sat(330);
 
-/// Sequence value for all TM inputs: enables CSV, disables RBF (0xFFFFFFFD).
-const TM_SEQUENCE: Sequence = Sequence::ENABLE_LOCKTIME_NO_RBF;
+/// Sequence value for all TM inputs (0xFFFFFFFD): signals RBF
+/// (< 0xFFFFFFFE) and enables nLockTime (< 0xFFFFFFFF).
+///
+/// Note: this does NOT satisfy OP_CSV (bit 31 is set, so BIP 112
+/// treats the relative locktime as disabled). For the federation
+/// script-path leaf, the spender must replace this with the actual
+/// relative locktime value at signing time.
+const TM_SEQUENCE: Sequence = Sequence(0xFFFFFFFD);
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -146,8 +152,8 @@ fn outpoint_sort_key(op: &OutPoint) -> [u8; 36] {
 /// - **Version:** 2 (needed for OP_CSV in leaf scripts)
 /// - **Locktime:** 0
 /// - **Inputs:** `[0]` = treasury, `[1..k]` = peg-ins sorted by `(txid || vout_le)`
-/// - **Outputs:** `[0..m-1]` = peg-out payments sorted by `script_pubkey` bytes,
-///   `[m]` = treasury change
+/// - **Outputs:** `[0]` = treasury change, `[1..m]` = peg-out payments sorted
+///   by `script_pubkey` bytes
 /// - **Fee:** `vsize * fee_rate_sat_per_vb`
 /// - **Change:** `sum(inputs) - sum(peg_out_outputs) - miner_fee`
 pub fn build_tm(
@@ -216,9 +222,9 @@ pub fn build_tm(
     // --- Compute total input value ---
     let total_input: Amount = prevouts.iter().map(|p| p.value).sum();
 
-    // --- Build peg-out outputs ---
-    let mut outputs = Vec::with_capacity(num_outputs);
+    // --- Compute peg-out totals ---
     let mut total_pegout = Amount::ZERO;
+    let mut pegout_outputs = Vec::with_capacity(num_pegout_outputs);
 
     for (i, po) in pegouts.iter().enumerate() {
         let net_amount = po
@@ -227,12 +233,12 @@ pub fn build_tm(
             .expect("checked above");
         if net_amount < DUST_THRESHOLD {
             return Err(TmBuildError::DustOutput {
-                index: i,
+                index: i + 1, // +1 because output 0 is change
                 value: net_amount,
             });
         }
         total_pegout = total_pegout.checked_add(net_amount).expect("no overflow");
-        outputs.push(TxOut {
+        pegout_outputs.push(TxOut {
             value: net_amount,
             script_pubkey: po.script_pubkey.clone(),
         });
@@ -250,13 +256,15 @@ pub fn build_tm(
         });
     }
 
-    // --- Change output ---
+    // --- Build outputs: [0] = change, [1..m] = peg-outs ---
+    let mut outputs = Vec::with_capacity(num_outputs);
+
     let change_value = total_input.checked_sub(required).expect("checked above");
     // Change can be zero only if there's nothing left — but that would mean
     // the treasury is empty. Allow dust-or-above change, error on sub-dust non-zero.
     if change_value > Amount::ZERO && change_value < DUST_THRESHOLD {
         return Err(TmBuildError::DustOutput {
-            index: num_pegout_outputs,
+            index: 0,
             value: change_value,
         });
     }
@@ -265,6 +273,7 @@ pub fn build_tm(
         value: change_value,
         script_pubkey: change_script_pubkey,
     });
+    outputs.extend(pegout_outputs);
 
     // --- Assemble transaction ---
     let tx = Transaction {
@@ -458,12 +467,12 @@ mod tests {
         )
         .unwrap();
 
-        // First 3 outputs are peg-outs sorted by scriptPubKey
+        // Output 0 is change
+        assert_eq!(tm.tx.output[0].script_pubkey, change);
+        // Outputs 1..3 are peg-outs sorted by scriptPubKey
         for (i, expected) in expected_order.iter().enumerate() {
-            assert_eq!(&tm.tx.output[i].script_pubkey, expected, "output {i} wrong order");
+            assert_eq!(&tm.tx.output[i + 1].script_pubkey, expected, "output {} wrong order", i + 1);
         }
-        // Last output is change
-        assert_eq!(tm.tx.output[3].script_pubkey, change);
     }
 
     // --- Accounting ---
@@ -505,9 +514,9 @@ mod tests {
         )
         .unwrap();
 
-        // First output is the pegout (sorted, only one)
+        // Output 0 is change; output 1 is the pegout
         assert_eq!(
-            tm.tx.output[0].value.to_sat(),
+            tm.tx.output[1].value.to_sat(),
             requested - fee_params.per_pegout_fee.to_sat()
         );
     }

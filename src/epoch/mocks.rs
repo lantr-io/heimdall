@@ -124,6 +124,10 @@ pub struct MockCardanoChain {
     fixture: crate::epoch::fixture::StaticFixture,
     boundary_fired: Mutex<bool>,
     submitted_txs: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// After DKG, `publish_group_key` stores the FROST group key here.
+    /// `query_treasury` returns this as Y_51 so the FROST group can
+    /// sign the treasury input.
+    treasury_y_51: Mutex<Option<bitcoin::key::UntweakedPublicKey>>,
 }
 
 impl MockCardanoChain {
@@ -132,6 +136,7 @@ impl MockCardanoChain {
             fixture,
             boundary_fired: Mutex::new(false),
             submitted_txs: Arc::new(Mutex::new(Vec::new())),
+            treasury_y_51: Mutex::new(None),
         }
     }
 
@@ -176,15 +181,26 @@ impl CardanoChain for MockCardanoChain {
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {
+        let y_51 = self
+            .treasury_y_51
+            .lock()
+            .unwrap()
+            .unwrap_or(self.fixture.y_51);
         Ok(TreasuryUtxo {
             outpoint: self.fixture.treasury_outpoint,
             value: self.fixture.treasury_value,
+            y_51,
             y_67: self.fixture.y_67,
             y_fed: self.fixture.y_fed,
             federation_csv_blocks: self.fixture.federation_csv_blocks,
             fee_rate_sat_per_vb: self.fixture.fee_rate_sat_per_vb,
             per_pegout_fee: self.fixture.per_pegout_fee,
         })
+    }
+
+    async fn publish_group_key(&self, y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()> {
+        *self.treasury_y_51.lock().unwrap() = Some(y_51);
+        Ok(())
     }
 
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>> {

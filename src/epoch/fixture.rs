@@ -1,15 +1,9 @@
 //! Static demo fixture: roster + pre-seeded treasury state.
 //!
-//! The treasury's Taproot internal key (`Y_51`) is not known until
-//! after DKG has run, so the fixture doesn't bake the treasury
-//! `TaprootSpendInfo` in. Instead it holds the placeholder leaf keys
-//! (`Y_67`, `Y_fed`) and the UTxO parameters; the `BuildTm` phase
-//! computes the final spend info using the DKG output's verifying key.
-//!
-//! TODO: this whole file is throw-away. Once a real `CardanoChain`
-//! impl exists, the demo will pull the roster, treasury UTXO,
-//! peg-ins, peg-outs, and fee parameters from a live node — none of
-//! the values constructed here are valid on a real network.
+//! At bootstrap the treasury's internal key `y_51` is set to `y_fed`
+//! (the federation key). After DKG, `publish_group_key` replaces it
+//! with the FROST group key so the signing phase can produce valid
+//! key-path signatures.
 
 use std::collections::BTreeMap;
 
@@ -25,6 +19,9 @@ use crate::epoch::state::{Roster, SpoInfo};
 #[derive(Debug, Clone)]
 pub struct StaticFixture {
     pub roster: Roster,
+    /// Internal key (Y_51) of the current treasury. At bootstrap this
+    /// equals `y_fed`.
+    pub y_51: UntweakedPublicKey,
     /// Placeholder Y_67 x-only key — not used for key-path spends but
     /// committed to in the Taproot script tree.
     pub y_67: UntweakedPublicKey,
@@ -106,6 +103,7 @@ pub fn demo_static_fixture(
 
     StaticFixture {
         roster,
+        y_51: y_fed, // bootstrap: internal key = federation
         y_67,
         y_fed,
         federation_csv_blocks: 144,

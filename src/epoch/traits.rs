@@ -41,24 +41,19 @@ pub struct PegOutRequestUtxo {
 /// outpoint, value, and fee parameters, and the SPO reads it from
 /// there.
 ///
-/// The Taproot spend info is reconstructed in `BuildTm` from the
-/// group key: v0.2's bootstrap has no prior epoch so the "current
-/// treasury" is synthetic and reuses the newly-derived group key as
-/// its internal key.
-///
-/// TODO: wire this to a real Cardano oracle UTxO reader. Today the
-/// mock hands back a hardcoded fixture; the real impl pulls a
-/// well-known oracle UTxO via pallas and decodes its datum.
-///
-/// TODO: in steady state the treasury input is controlled by epoch
-/// N-1's group key, not epoch N's just-derived key. The state machine
-/// needs to remember (or query) the previous epoch's `Y_51` to build
-/// the spend info for the *input* while using the new key for the
-/// *change output*. This is the treasury handoff problem.
+/// `y_51` is the internal key of the *current* treasury — the key it
+/// was locked under. `BuildTm` uses `y_51` for the treasury *input*
+/// spend info, and the new FROST group key for the *change output*.
+/// At bootstrap `y_51 = y_fed`; after `publish_group_key` it is the
+/// active FROST group key.
 #[derive(Debug, Clone)]
 pub struct TreasuryUtxo {
     pub outpoint: bitcoin::OutPoint,
     pub value: bitcoin::Amount,
+    /// The Taproot internal key of the *current* treasury (the Y_51 it
+    /// was locked under). At bootstrap this equals `y_fed`; after the
+    /// first DKG it is the previous epoch's FROST group x-only key.
+    pub y_51: bitcoin::key::UntweakedPublicKey,
     /// The Taproot script-tree leaf key for the 67%-quorum script path.
     pub y_67: bitcoin::key::UntweakedPublicKey,
     /// The Taproot script-tree leaf key for the federation fallback.
@@ -83,6 +78,15 @@ pub trait CardanoChain: Send + Sync {
 
     /// Pending peg-out requests to fulfil.
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>>;
+
+    /// Publish the new FROST group key after DKG. The key becomes the
+    /// internal key (Y_51) of the next treasury Taproot address.
+    ///
+    /// In the mock this updates the treasury Y_51 so subsequent
+    /// `query_treasury` calls return a treasury the FROST group can
+    /// sign for. In production this posts the key to the on-chain
+    /// treasury oracle.
+    async fn publish_group_key(&self, y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()>;
 
     /// Submit a Bitcoin tx (in v0.2 the mock just records it).
     ///

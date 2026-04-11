@@ -24,6 +24,10 @@ use crate::epoch::traits::TreasuryUtxo;
 /// on-chain datum. These are protocol constants for a given epoch.
 #[derive(Debug, Clone)]
 pub struct TreasuryConfig {
+    /// The internal key of the current treasury. At bootstrap this
+    /// equals `y_fed`; in steady state it is the previous epoch's FROST
+    /// group x-only key.
+    pub y_51: bitcoin::key::UntweakedPublicKey,
     pub y_67: bitcoin::key::UntweakedPublicKey,
     pub y_fed: bitcoin::key::UntweakedPublicKey,
     pub federation_csv_blocks: u32,
@@ -76,6 +80,7 @@ pub fn treasury_from_btc_tx_bytes(
     Ok(TreasuryUtxo {
         outpoint: OutPoint { txid, vout: 0 },
         value: out.value,
+        y_51: config.y_51,
         y_67: config.y_67,
         y_fed: config.y_fed,
         federation_csv_blocks: config.federation_csv_blocks,
@@ -131,6 +136,7 @@ pub fn parse_treasury_datum(
     Ok(TreasuryUtxo {
         outpoint: OutPoint { txid, vout: 0 },
         value: out.value,
+        y_51: config.y_51,
         y_67: config.y_67,
         y_fed: config.y_fed,
         federation_csv_blocks: config.federation_csv_blocks,
@@ -164,6 +170,7 @@ mod tests {
         )
         .unwrap();
         TreasuryConfig {
+            y_51: y_fed, // bootstrap: internal key = federation
             y_67,
             y_fed,
             federation_csv_blocks: 144,

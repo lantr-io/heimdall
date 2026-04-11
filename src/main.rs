@@ -223,6 +223,7 @@ async fn run_demo(args: DemoArgs) {
 
     if let Some(project_id) = args.blockfrost_project_id.as_deref() {
         let treasury_config = TreasuryConfig {
+            y_51: fixture.y_51,
             y_67: fixture.y_67,
             y_fed: fixture.y_fed,
             federation_csv_blocks: fixture.federation_csv_blocks,
