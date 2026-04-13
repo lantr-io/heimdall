@@ -397,7 +397,7 @@ fn print_bootstrap_treasury(federation_csv_blocks: u16) {
     let spend_info = treasury_spend_info(&secp, y_fed, y_67, y_fed, federation_csv_blocks);
     let output_key = spend_info.output_key();
     let script_pubkey = ScriptBuf::new_p2tr_tweaked(output_key);
-    let address = Address::from_script(&script_pubkey, Network::Bitcoin)
+    let address = Address::from_script(&script_pubkey, Network::Testnet4)
         .expect("valid P2TR address");
 
     println!("{address}");
