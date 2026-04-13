@@ -186,9 +186,25 @@ impl CardanoChain for BlockfrostCardanoChain {
             .await
             .map_err(|e| EpochError::Chain(format!("blockfrost datum fetch: {e}")))?;
 
-        let btc_tx_hex = datum_json
+        let json_value = datum_json
             .get("json_value")
-            .and_then(|jv| jv.get("fields"))
+            .ok_or_else(|| {
+                EpochError::Chain(format!(
+                    "unexpected datum JSON shape: {}",
+                    serde_json::to_string_pretty(&datum_json).unwrap_or_default()
+                ))
+            })?;
+
+        // todo: constr(1, <tx>) is a temporary simplification, the actual logic is going to involve
+        // a validator that verifies the inclusion proof, and thus we won't have to check anything here (probably)
+        let constructor = json_value
+            .get("constructor")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
+        let btc_confirmed = constructor == 1;
+
+        let btc_tx_hex = json_value
+            .get("fields")
             .and_then(|f| f.as_array())
             .and_then(|arr| arr.first())
             .and_then(|field| field.get("bytes"))
@@ -219,6 +235,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             federation_csv_blocks: self.treasury_config.federation_csv_blocks,
             fee_rate_sat_per_vb: self.treasury_config.fee_rate_sat_per_vb,
             per_pegout_fee: self.treasury_config.per_pegout_fee,
+            btc_confirmed,
         })
     }
 

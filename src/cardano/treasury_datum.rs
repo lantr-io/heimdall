@@ -1,13 +1,8 @@
 //! Parse the treasury oracle datum.
 //!
 //! The treasury UTxO on Cardano carries an inline datum wrapping the
-//! most recent Bitcoin treasury movement transaction:
-//!
-//! ```text
-//! Constr(0, [
-//!     BoundedBytes(raw_btc_tx),   -- full signed Bitcoin transaction
-//! ])
-//! ```
+//! most recent Bitcoin treasury movement transaction. Constr(0) means
+//! the BTC tx is unconfirmed on Bitcoin; Constr(1) means confirmed.
 //!
 //! We deserialize the BTC tx to find the treasury output (output 0),
 //! which gives us the outpoint (txid:0) and value. The remaining
@@ -48,8 +43,8 @@ pub enum TreasuryDatumError {
 impl std::fmt::Display for TreasuryDatumError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotConstr => write!(f, "expected Constr(0, [...])"),
-            Self::WrongTag(t) => write!(f, "expected Constr tag 121, got {t}"),
+            Self::NotConstr => write!(f, "expected Constr"),
+            Self::WrongTag(t) => write!(f, "unexpected Constr tag {t}"),
             Self::FieldCount { expected, got } => {
                 write!(f, "expected {expected} field(s), got {got}")
             }
@@ -69,6 +64,7 @@ impl std::error::Error for TreasuryDatumError {}
 /// issues) and hands us the raw bytes.
 pub fn treasury_from_btc_tx_bytes(
     tx_bytes: &[u8],
+    btc_confirmed: bool,
     config: &TreasuryConfig,
 ) -> Result<TreasuryUtxo, TreasuryDatumError> {
     let tx: Transaction = deserialize(tx_bytes)
@@ -86,21 +82,25 @@ pub fn treasury_from_btc_tx_bytes(
         federation_csv_blocks: config.federation_csv_blocks,
         fee_rate_sat_per_vb: config.fee_rate_sat_per_vb,
         per_pegout_fee: config.per_pegout_fee,
+        btc_confirmed,
     })
 }
 
-/// Extract the raw BTC transaction bytes from the datum's single
-/// `BoundedBytes` field.
-fn extract_btc_tx_bytes(data: &PlutusData) -> Result<Vec<u8>, TreasuryDatumError> {
+/// Extract the raw BTC transaction bytes and confirmation status.
+///
+/// Tag 121 = Constr(0) = unconfirmed, tag 122 = Constr(1) = confirmed.
+fn extract_btc_tx_bytes(data: &PlutusData) -> Result<(Vec<u8>, bool), TreasuryDatumError> {
     let (tag, fields) = match data {
         PlutusData::Constr(constr) => (constr.tag, &constr.fields),
         _ => return Err(TreasuryDatumError::NotConstr),
     };
 
-    // Constr(0, ...) in PlutusData CBOR uses tag 121.
-    if tag != 121 {
-        return Err(TreasuryDatumError::WrongTag(tag));
-    }
+    let btc_confirmed = match tag {
+        121 => false,
+        122 => true,
+        other => return Err(TreasuryDatumError::WrongTag(other)),
+    };
+
     if fields.len() != 1 {
         return Err(TreasuryDatumError::FieldCount {
             expected: 1,
@@ -109,7 +109,7 @@ fn extract_btc_tx_bytes(data: &PlutusData) -> Result<Vec<u8>, TreasuryDatumError
     }
 
     match &fields[0] {
-        PlutusData::BoundedBytes(b) => Ok(b.clone().into()),
+        PlutusData::BoundedBytes(b) => Ok((b.clone().into(), btc_confirmed)),
         other => Err(TreasuryDatumError::NotBytes(format!(
             "got {:?}",
             std::mem::discriminant(other)
@@ -126,7 +126,7 @@ pub fn parse_treasury_datum(
     data: &PlutusData,
     config: &TreasuryConfig,
 ) -> Result<TreasuryUtxo, TreasuryDatumError> {
-    let tx_bytes = extract_btc_tx_bytes(data)?;
+    let (tx_bytes, btc_confirmed) = extract_btc_tx_bytes(data)?;
     let tx: Transaction = deserialize(&tx_bytes)
         .map_err(|e| TreasuryDatumError::BtcDeserialize(e.to_string()))?;
 
@@ -142,6 +142,7 @@ pub fn parse_treasury_datum(
         federation_csv_blocks: config.federation_csv_blocks,
         fee_rate_sat_per_vb: config.fee_rate_sat_per_vb,
         per_pegout_fee: config.per_pegout_fee,
+        btc_confirmed,
     })
 }
 
@@ -187,7 +188,7 @@ mod tests {
     fn parse_preprod_btc_tx() {
         let tx_bytes = hex::decode(PREPROD_BTC_TX_HEX).unwrap();
         let config = demo_config();
-        let treasury = treasury_from_btc_tx_bytes(&tx_bytes, &config).unwrap();
+        let treasury = treasury_from_btc_tx_bytes(&tx_bytes, true, &config).unwrap();
 
         assert_eq!(treasury.value, Amount::from_sat(10_000_000));
         assert_eq!(treasury.outpoint.vout, 0);

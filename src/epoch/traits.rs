@@ -61,6 +61,9 @@ pub struct TreasuryUtxo {
     pub federation_csv_blocks: u32,
     pub fee_rate_sat_per_vb: u64,
     pub per_pegout_fee: bitcoin::Amount,
+    /// Whether the Bitcoin transaction in the oracle datum has been
+    /// confirmed on Bitcoin. A new treasury movement can only begin once the previous one is confirmed.
+    pub btc_confirmed: bool,
 }
 
 #[async_trait]

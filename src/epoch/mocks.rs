@@ -195,6 +195,7 @@ impl CardanoChain for MockCardanoChain {
             federation_csv_blocks: self.fixture.federation_csv_blocks,
             fee_rate_sat_per_vb: self.fixture.fee_rate_sat_per_vb,
             per_pegout_fee: self.fixture.per_pegout_fee,
+            btc_confirmed: true,
         })
     }
 

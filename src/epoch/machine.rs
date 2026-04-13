@@ -294,7 +294,20 @@ async fn build_tm_phase(
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
     crate::epoch_log!(me, epoch, "BuildTm: querying chain for treasury / pegouts");
-    let treasury = chain.query_treasury().await?;
+
+    // Poll until the previous treasury movement is confirmed on Bitcoin.
+    let treasury = loop {
+        let t = chain.query_treasury().await?;
+        if t.btc_confirmed {
+            break t;
+        }
+        crate::epoch_log!(
+            me, epoch,
+            "BuildTm: previous treasury movement not yet confirmed on Bitcoin, waiting…"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    };
+
     let pegouts = chain.query_pegout_requests().await?;
     crate::epoch_log!(
         me, epoch,
