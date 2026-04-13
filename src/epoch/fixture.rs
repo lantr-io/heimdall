@@ -13,6 +13,7 @@ use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
 use frost_secp256k1_tr::Identifier;
 
+use crate::config::HeimdallConfig;
 use crate::epoch::state::{Roster, SpoInfo};
 
 /// Everything the demo `MockCardanoChain` needs to answer chain queries.
@@ -116,5 +117,72 @@ pub fn demo_static_fixture(
         pegouts: vec![],
         fee_rate_sat_per_vb: 1,
         per_pegout_fee: Amount::from_sat(1_000),
+    }
+}
+
+/// Build a demo fixture from the merged `HeimdallConfig`.
+pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
+    let secp = Secp256k1::new();
+
+    let y_67_seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_67_seed_hex)
+        .expect("bitcoin.y_67_seed_hex must be valid hex")
+        .try_into()
+        .expect("bitcoin.y_67_seed_hex must be 32 bytes");
+    let y_fed_seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_fed_seed_hex)
+        .expect("bitcoin.y_fed_seed_hex must be valid hex")
+        .try_into()
+        .expect("bitcoin.y_fed_seed_hex must be 32 bytes");
+
+    let y_67 = UntweakedPublicKey::from_slice(
+        &SecretKey::from_slice(&y_67_seed)
+            .unwrap()
+            .x_only_public_key(&secp)
+            .0
+            .serialize(),
+    )
+    .unwrap();
+    let y_fed = UntweakedPublicKey::from_slice(
+        &SecretKey::from_slice(&y_fed_seed)
+            .unwrap()
+            .x_only_public_key(&secp)
+            .0
+            .serialize(),
+    )
+    .unwrap();
+
+    let mut participants = BTreeMap::new();
+    for i in 1..=cfg.demo.max_signers {
+        let id = Identifier::try_from(i).unwrap();
+        let port = cfg.http.base_port + (i - 1);
+        participants.insert(
+            id,
+            SpoInfo {
+                identifier: id,
+                bifrost_url: format!("http://{}:{}", cfg.http.bind_address, port),
+                bifrost_id_pk: vec![],
+            },
+        );
+    }
+
+    StaticFixture {
+        roster: Roster {
+            epoch: 0,
+            min_signers: cfg.demo.min_signers,
+            max_signers: cfg.demo.max_signers,
+            participants,
+        },
+        y_51: y_fed, // bootstrap: internal key = federation
+        y_67,
+        y_fed,
+        federation_csv_blocks: cfg.bitcoin.federation_csv_blocks,
+        treasury_outpoint: OutPoint {
+            txid: Txid::from_byte_array([0xAA; 32]),
+            vout: 0,
+        },
+        treasury_value: Amount::from_sat(10_000_000),
+        pegins: vec![],
+        pegouts: vec![],
+        fee_rate_sat_per_vb: cfg.bitcoin.fee_rate_sat_per_vb,
+        per_pegout_fee: Amount::from_sat(cfg.bitcoin.per_pegout_fee_sat),
     }
 }

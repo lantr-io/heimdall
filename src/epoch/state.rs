@@ -330,20 +330,20 @@ impl EpochConfig {
     /// round-trip times, not arbitrary 30s picks.
     pub fn demo_default(identity: SpoIdentity) -> Self {
         Self {
-            dkg_round_timeout: Duration::from_secs(30),
-            poll_interval: Duration::from_millis(50),
-            quorum67_timeout: Duration::from_secs(30),
-            quorum51_timeout: Duration::from_secs(30),
-            federation_timeout: Duration::from_secs(30),
-            leader_timeout: Duration::from_secs(10),
+            dkg_round_timeout: Duration::from_secs(300),
+            poll_interval: Duration::from_millis(5000),
+            quorum67_timeout: Duration::from_secs(300),
+            quorum51_timeout: Duration::from_secs(300),
+            federation_timeout: Duration::from_secs(300),
+            leader_timeout: Duration::from_secs(10000),
             identity,
             // Hardcoded to the always-OK native script policy ID for
             // demo runs against a real Cardano node — the operator can
             // mint test peg-in tokens under it without deploying any
             // Bifrost contract.
             pegin_policy_id: crate::cardano::always_ok::always_ok_script_hash(),
-            pegin_collection_window: Duration::from_millis(100),
-            pegin_poll_interval: Duration::from_millis(200),
+            pegin_collection_window: Duration::from_secs(5),
+            pegin_poll_interval: Duration::from_millis(1000),
         }
     }
 }

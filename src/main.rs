@@ -11,9 +11,10 @@ use heimdall::cardano::treasury_datum::TreasuryConfig;
 use heimdall::cardano::mock::MockCardanoPegInSource;
 use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
 use heimdall::cardano::pegin_source::CardanoPegInSource;
+use heimdall::config::HeimdallConfig;
 use heimdall::epoch::mocks::{MockCardanoChain, OsRngSource, SeededRngSource, SystemClock};
 use heimdall::epoch::run_epoch_loop;
-use heimdall::epoch::state::{EpochConfig, SpoIdentity};
+use heimdall::epoch::state::SpoIdentity;
 use heimdall::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use heimdall::http::peer_network::HttpPeerNetwork;
 use heimdall::http::server::router;
@@ -38,18 +39,22 @@ enum Commands {
     /// used to parameterize that mock chain — a real deployment would
     /// read none of those from the CLI.
     Demo {
+        /// Path to a TOML configuration file. Omitted fields use
+        /// compiled defaults. CLI flags override TOML values.
+        #[arg(long)]
+        config: Option<String>,
         /// This SPO's 1-based index in the roster.
         #[arg(long)]
         index: u16,
         /// Minimum signers (threshold). Mock-chain only.
-        #[arg(long, default_value = "2")]
-        min_signers: u16,
+        #[arg(long)]
+        min_signers: Option<u16>,
         /// Maximum signers (total SPOs in the roster). Mock-chain only.
-        #[arg(long, default_value = "3")]
-        max_signers: u16,
+        #[arg(long)]
+        max_signers: Option<u16>,
         /// Base port: SPO `i` listens on `base_port + i - 1`. Mock-chain only.
-        #[arg(long, default_value = "18500")]
-        base_port: u16,
+        #[arg(long)]
+        base_port: Option<u16>,
         /// Use a deterministic seeded RNG so the cycle is bit-for-bit
         /// reproducible across runs. Demo-only.
         #[arg(long)]
@@ -107,9 +112,12 @@ enum Commands {
     },
     /// Print the bootstrap treasury Taproot address.
     BootstrapTreasury {
-        /// Federation CSV timeout in blocks.
-        #[arg(long, default_value = "144")]
-        federation_csv_blocks: u16,
+        /// Path to a TOML configuration file.
+        #[arg(long)]
+        config: Option<String>,
+        /// Federation CSV timeout in blocks (overrides TOML).
+        #[arg(long)]
+        federation_csv_blocks: Option<u16>,
     },
     /// Run the original PLONK misbehavior proof demo
     ProofDemo {
@@ -122,10 +130,21 @@ enum Commands {
     },
 }
 
+fn load_config(path: Option<&str>) -> HeimdallConfig {
+    match path {
+        Some(p) => HeimdallConfig::from_file(std::path::Path::new(p)).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }),
+        None => HeimdallConfig::default(),
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Demo {
+            config,
             index,
             min_signers,
             max_signers,
@@ -143,30 +162,58 @@ fn main() {
             treasury_asset_name,
             cardano_mnemonic,
         } => {
+            let mut cfg = load_config(config.as_deref());
+
+            // CLI flags override TOML values.
+            if let Some(v) = min_signers { cfg.demo.min_signers = v; }
+            if let Some(v) = max_signers { cfg.demo.max_signers = v; }
+            if let Some(v) = base_port { cfg.http.base_port = v; }
+            if let Some(ref v) = blockfrost_project_id {
+                cfg.cardano.blockfrost_project_id = Some(v.clone());
+            }
+            if let Some(ref v) = cardano_socket {
+                cfg.cardano.socket_path = Some(v.clone());
+            }
+            if let Some(v) = cardano_magic {
+                cfg.cardano.network_magic = Some(v);
+            }
+            if let Some(ref v) = pegin_script_address {
+                cfg.cardano.pegin_script_address = Some(v.clone());
+            }
+            if let Some(ref v) = pegin_policy_id {
+                cfg.cardano.pegin_policy_id = Some(v.clone());
+            }
+            if let Some(v) = pegin_window_secs {
+                cfg.protocol.pegin_collection_window_secs = v;
+            }
+            if let Some(v) = pegin_poll_ms {
+                cfg.protocol.pegin_poll_interval_ms = v;
+            }
+            if let Some(ref v) = treasury_address {
+                cfg.cardano.treasury_address = Some(v.clone());
+            }
+            if let Some(ref v) = treasury_policy_id {
+                cfg.cardano.treasury_policy_id = Some(v.clone());
+            }
+            if let Some(ref v) = treasury_asset_name {
+                cfg.cardano.treasury_asset_name = Some(v.clone());
+            }
+            if let Some(ref v) = cardano_mnemonic {
+                cfg.cardano.mnemonic = Some(v.clone());
+            }
+
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_demo(DemoArgs {
-                index,
-                min_signers,
-                max_signers,
-                base_port,
-                deterministic,
-                blockfrost_project_id,
-                cardano_socket,
-                cardano_magic,
-                pegin_script_address,
-                pegin_policy_id,
-                pegin_window_secs,
-                pegin_poll_ms,
-                treasury_address,
-                treasury_policy_id,
-                treasury_asset_name,
-                cardano_mnemonic,
-            }));
+            rt.block_on(run_demo(cfg, index, deterministic));
         }
         Commands::BootstrapTreasury {
+            config,
             federation_csv_blocks,
         } => {
-            print_bootstrap_treasury(federation_csv_blocks);
+            let mut cfg = load_config(config.as_deref());
+            if let Some(v) = federation_csv_blocks {
+                cfg.bitcoin.federation_csv_blocks = v as u32;
+            }
+            print_bootstrap_treasury(&cfg);
         }
         Commands::ProofDemo {
             min_signers,
@@ -177,62 +224,43 @@ fn main() {
     }
 }
 
-struct DemoArgs {
-    index: u16,
-    min_signers: u16,
-    max_signers: u16,
-    base_port: u16,
-    deterministic: bool,
-    blockfrost_project_id: Option<String>,
-    cardano_socket: Option<String>,
-    cardano_magic: Option<u64>,
-    pegin_script_address: Option<String>,
-    pegin_policy_id: Option<String>,
-    pegin_window_secs: Option<u64>,
-    pegin_poll_ms: Option<u64>,
-    treasury_address: Option<String>,
-    treasury_policy_id: Option<String>,
-    treasury_asset_name: Option<String>,
-    cardano_mnemonic: Option<String>,
-}
-
-async fn run_demo(args: DemoArgs) {
-    let id = Identifier::try_from(args.index).unwrap();
+async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
+    let id = Identifier::try_from(index).unwrap();
 
     // The fixture provides a fallback roster (SPO identities + ports)
     // until the on-chain SPO registry is wired.
-    let fixture = heimdall::epoch::fixture::demo_static_fixture(
-        args.min_signers,
-        args.max_signers,
-        args.base_port,
-    );
+    let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(&cfg);
 
     let always_ok_hash = hex::encode(heimdall::cardano::always_ok::always_ok_script_hash());
-    let script_address: String = args
+    let script_address: String = cfg
+        .cardano
         .pegin_script_address
         .clone()
         .unwrap_or_else(|| always_ok_testnet_address_bech32().to_string());
-    let treasury_address: String = args
+    let treasury_address: String = cfg
+        .cardano
         .treasury_address
         .clone()
         .unwrap_or_else(|| always_ok_testnet_address_bech32().to_string());
-    let treasury_policy_id: String = args
+    let treasury_policy_id: String = cfg
+        .cardano
         .treasury_policy_id
         .clone()
         .unwrap_or_else(|| always_ok_hash.clone());
-    let treasury_asset_name: String = args
+    let treasury_asset_name: String = cfg
+        .cardano
         .treasury_asset_name
         .clone()
         .unwrap_or_else(|| hex::encode("TMTx"));
 
     // Chain + pegin source selection:
-    // --blockfrost-project-id → Blockfrost for both chain + pegin source
-    // --cardano-socket        → pallas N2C for pegin source, mock chain
-    // neither                 → full mock
+    // blockfrost_project_id → Blockfrost for both chain + pegin source
+    // socket_path           → pallas N2C for pegin source, mock chain
+    // neither               → full mock
     let chain: Arc<dyn CardanoChain>;
     let pegin_source: Arc<dyn CardanoPegInSource>;
 
-    if let Some(project_id) = args.blockfrost_project_id.as_deref() {
+    if let Some(project_id) = cfg.cardano.blockfrost_project_id.as_deref() {
         let treasury_config = TreasuryConfig {
             y_51: fixture.y_51,
             y_67: fixture.y_67,
@@ -250,21 +278,19 @@ async fn run_demo(args: DemoArgs) {
             fixture.roster.clone(),
         );
 
-        // If a mnemonic is provided, enable publishing. The payment
-        // key, wallet address, and UTxOs are derived/queried
-        // automatically.
-        if let Some(mnemonic) = &args.cardano_mnemonic {
+        if let Some(mnemonic) = &cfg.cardano.mnemonic {
             bf_chain = bf_chain
                 .with_mnemonic(mnemonic)
-                .expect("--cardano-mnemonic must be a valid BIP-39 mnemonic");
+                .expect("cardano.mnemonic must be a valid BIP-39 mnemonic");
         }
 
         chain = Arc::new(bf_chain);
         pegin_source = Arc::new(BlockfrostPegInSource::new(project_id, &script_address));
-    } else if let Some(socket) = args.cardano_socket {
-        let magic = args
-            .cardano_magic
-            .expect("--cardano-magic required with --cardano-socket");
+    } else if let Some(socket) = cfg.cardano.socket_path.clone() {
+        let magic = cfg
+            .cardano
+            .network_magic
+            .expect("cardano.network_magic required with cardano.socket_path");
         chain = Arc::new(MockCardanoChain::new(fixture.clone()));
         pegin_source = Arc::new(
             PallasPegInSource::from_bech32(socket, NetworkMagic(magic), &script_address)
@@ -275,28 +301,13 @@ async fn run_demo(args: DemoArgs) {
         pegin_source = Arc::new(MockCardanoPegInSource::new());
     };
 
-    // Parse the policy ID hex if the operator provided one. Otherwise
-    // leave `EpochConfig::demo_default`'s always-OK hash in place.
-    let pegin_policy_id_override: Option<[u8; 28]> =
-        args.pegin_policy_id.as_deref().map(|hex_str| {
-            let v = hex::decode(hex_str).expect("--pegin-policy-id must be hex");
-            assert_eq!(v.len(), 28, "policy id must be 28 bytes (56 hex chars)");
-            let mut out = [0u8; 28];
-            out.copy_from_slice(&v);
-            out
-        });
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let rng: Arc<dyn RngSource> = if args.deterministic {
-        // Fixed demo seed — every run of `--deterministic` produces
-        // the same DKG polynomials and signing nonces.
+    let rng: Arc<dyn RngSource> = if deterministic {
         Arc::new(SeededRngSource::new(*b"heimdall-demo-seed-v1-0123456789"))
     } else {
         Arc::new(OsRngSource)
     };
 
-    // Use the chain to understand which demo user is us (and thus which port to listen on).
-
-    let index = args.index;
     let roster = chain
         .query_roster(0)
         .await
@@ -307,10 +318,10 @@ async fn run_demo(args: DemoArgs) {
         .unwrap_or_else(|| panic!("identifier {index} not in roster"));
     let port = port_from_url(&me.bifrost_url);
 
-    // Spin up this SPO's HTTP server on the port the roster advertises.
     let net = Arc::new(HttpPeerNetwork::new());
     let app = router(net.shared_state());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+    let bind_addr = &cfg.http.bind_address;
+    let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
         .await
         .expect("bind");
     tokio::spawn(async move {
@@ -321,26 +332,17 @@ async fn run_demo(args: DemoArgs) {
         "=== Heimdall SPO #{index} ({}-of-{}) ===",
         roster.min_signers, roster.max_signers
     );
-    println!("Listening on 127.0.0.1:{port}");
+    println!("Listening on {bind_addr}:{port}");
     println!(
         "Waiting for the other {} SPOs to come online...",
         roster.max_signers - 1
     );
 
     let peers: Arc<dyn PeerNetwork> = net;
-    let mut config = EpochConfig::demo_default(SpoIdentity {
+    let config = cfg.to_epoch_config(SpoIdentity {
         identifier: id,
         port,
     });
-    if let Some(pid) = pegin_policy_id_override {
-        config.pegin_policy_id = pid;
-    }
-    if let Some(secs) = args.pegin_window_secs {
-        config.pegin_collection_window = std::time::Duration::from_secs(secs);
-    }
-    if let Some(ms) = args.pegin_poll_ms {
-        config.pegin_poll_interval = std::time::Duration::from_millis(ms);
-    }
 
     let t0 = Instant::now();
     let tm = run_epoch_loop(chain, pegin_source, peers, clock, rng, &config)
@@ -354,9 +356,7 @@ async fn run_demo(args: DemoArgs) {
     println!("  {}", hex::encode(&signed_bytes));
     println!("\n=== SPO #{index} cycle complete ===");
 
-    // Stay up serving the published payloads so peers can still fetch
-    // our round shares after we've finished our own cycle.
-    println!("Server still running on 127.0.0.1:{port}; press Ctrl-C to exit.");
+    println!("Server still running on {bind_addr}:{port}; press Ctrl-C to exit.");
     tokio::signal::ctrl_c().await.ok();
 }
 
@@ -367,17 +367,25 @@ fn port_from_url(url: &str) -> u16 {
         .unwrap_or_else(|| panic!("cannot parse port from bifrost_url {url:?}"))
 }
 
-fn print_bootstrap_treasury(federation_csv_blocks: u16) {
+fn print_bootstrap_treasury(cfg: &HeimdallConfig) {
     use bitcoin::key::{Secp256k1, UntweakedPublicKey};
     use bitcoin::secp256k1::SecretKey;
-    use bitcoin::{Address, Network, ScriptBuf};
+    use bitcoin::{Address, ScriptBuf};
     use heimdall::bitcoin::taproot::treasury_spend_info;
 
     let secp = Secp256k1::new();
 
-    // Same deterministic keys as demo_static_fixture.
+    let y_67_seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_67_seed_hex)
+        .expect("bitcoin.y_67_seed_hex must be valid hex")
+        .try_into()
+        .expect("bitcoin.y_67_seed_hex must be 32 bytes");
+    let y_fed_seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_fed_seed_hex)
+        .expect("bitcoin.y_fed_seed_hex must be valid hex")
+        .try_into()
+        .expect("bitcoin.y_fed_seed_hex must be 32 bytes");
+
     let y_67 = UntweakedPublicKey::from_slice(
-        &SecretKey::from_slice(&[0x67u8; 32])
+        &SecretKey::from_slice(&y_67_seed)
             .unwrap()
             .x_only_public_key(&secp)
             .0
@@ -385,7 +393,7 @@ fn print_bootstrap_treasury(federation_csv_blocks: u16) {
     )
     .unwrap();
     let y_fed = UntweakedPublicKey::from_slice(
-        &SecretKey::from_slice(&[0xFEu8; 32])
+        &SecretKey::from_slice(&y_fed_seed)
             .unwrap()
             .x_only_public_key(&secp)
             .0
@@ -393,11 +401,14 @@ fn print_bootstrap_treasury(federation_csv_blocks: u16) {
     )
     .unwrap();
 
+    let network = cfg.bitcoin.parsed_network();
+    let csv_blocks = cfg.bitcoin.federation_csv_blocks as u16;
+
     // At bootstrap Y_51 = Y_fed.
-    let spend_info = treasury_spend_info(&secp, y_fed, y_67, y_fed, federation_csv_blocks);
+    let spend_info = treasury_spend_info(&secp, y_fed, y_67, y_fed, csv_blocks);
     let output_key = spend_info.output_key();
     let script_pubkey = ScriptBuf::new_p2tr_tweaked(output_key);
-    let address = Address::from_script(&script_pubkey, Network::Testnet4)
+    let address = Address::from_script(&script_pubkey, network)
         .expect("valid P2TR address");
 
     println!("{address}");

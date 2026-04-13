@@ -48,6 +48,10 @@ pub struct BlockfrostCardanoChain {
     payment_key: Option<PrivateKey>,
     /// Cached oracle UTxO info from the last `query_treasury` call.
     cached_oracle: Mutex<Option<OracleUtxoInfo>>,
+    /// After DKG, `publish_group_key` stores the FROST group key here.
+    /// `query_treasury` returns this as Y_51 so the FROST group can
+    /// sign the treasury input (same pattern as MockCardanoChain).
+    treasury_y_51: Mutex<Option<bitcoin::key::UntweakedPublicKey>>,
 }
 
 impl BlockfrostCardanoChain {
@@ -72,6 +76,7 @@ impl BlockfrostCardanoChain {
             script_cbor_hex: hex::encode(script_cbor),
             payment_key: None,
             cached_oracle: Mutex::new(None),
+            treasury_y_51: Mutex::new(None),
         }
     }
 
@@ -233,10 +238,16 @@ impl CardanoChain for BlockfrostCardanoChain {
         })?;
         let txid = tx.compute_txid();
 
+        let y_51 = self
+            .treasury_y_51
+            .lock()
+            .unwrap()
+            .unwrap_or(self.treasury_config.y_51);
+
         Ok(TreasuryUtxo {
             outpoint: bitcoin::OutPoint { txid, vout: 0 },
             value: out.value,
-            y_51: self.treasury_config.y_51,
+            y_51,
             y_67: self.treasury_config.y_67,
             y_fed: self.treasury_config.y_fed,
             federation_csv_blocks: self.treasury_config.federation_csv_blocks,
@@ -246,12 +257,10 @@ impl CardanoChain for BlockfrostCardanoChain {
         })
     }
 
-    async fn publish_group_key(&self, _y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()> {
-        // TODO: in steady state, post the new group key to the on-chain
-        // treasury oracle so subsequent query_treasury calls return the
-        // updated Y_51. For now the Blockfrost impl uses the static
-        // TreasuryConfig.y_51, which must be set to the correct key for
-        // the current treasury.
+    async fn publish_group_key(&self, y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()> {
+        *self.treasury_y_51.lock().unwrap() = Some(y_51);
+        // TODO: in steady state, also post the new group key on-chain so
+        // the oracle datum reflects the updated Y_51 for the next epoch.
         Ok(())
     }
 

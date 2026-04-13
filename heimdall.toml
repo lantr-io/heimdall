@@ -1,0 +1,41 @@
+# Heimdall configuration.
+# All values shown are compiled defaults — omit a field to use its default.
+
+[protocol]
+dkg_round_timeout_secs = 300
+poll_interval_ms = 5000
+quorum67_timeout_secs = 300
+quorum51_timeout_secs = 300
+federation_timeout_secs = 300
+leader_timeout_secs = 10000
+pegin_collection_window_secs = 5
+pegin_poll_interval_ms = 1000
+
+[bitcoin]
+network = "regtest"
+fee_rate_sat_per_vb = 1
+per_pegout_fee_sat = 1000
+federation_csv_blocks = 144
+# 32-byte hex seeds for deterministic demo keys.
+# In production these come from the on-chain treasury oracle.
+y_67_seed_hex = "6767676767676767676767676767676767676767676767676767676767676767"
+y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe"
+
+[cardano]
+# blockfrost_project_id = "preprodXXXXXX"
+# socket_path = "/run/cardano-node/node.socket"
+# network_magic = 1
+# pegin_script_address = "addr_test1..."
+# pegin_policy_id = "abcdef..."
+# treasury_address = "addr_test1..."
+# treasury_policy_id = "abcdef..."
+# treasury_asset_name = "544d5478"
+# mnemonic = "word1 word2 ... word24"
+
+[http]
+bind_address = "127.0.0.1"
+base_port = 18500
+
+[demo]
+min_signers = 2
+max_signers = 3
