@@ -146,7 +146,8 @@ impl CardanoChain for BlockfrostCardanoChain {
             .await
             .map_err(|e| EpochError::Chain(format!("blockfrost treasury query: {e}")))?;
 
-        let utxo = utxos.first().ok_or_else(|| {
+
+        let utxo = utxos.last().ok_or_else(|| {
             EpochError::Chain(format!(
                 "no UTxO carrying asset {} at {}",
                 self.treasury_asset, self.treasury_address
@@ -194,6 +195,12 @@ impl CardanoChain for BlockfrostCardanoChain {
                     serde_json::to_string_pretty(&datum_json).unwrap_or_default()
                 ))
             })?;
+
+        // Log the full datum structure so we can see what keys are encoded
+        eprintln!(
+            "[blockfrost] treasury datum JSON:\n{}",
+            serde_json::to_string_pretty(&json_value).unwrap_or_default()
+        );
 
         // todo: constr(1, <tx>) is a temporary simplification, the actual logic is going to involve
         // a validator that verifies the inclusion proof, and thus we won't have to check anything here (probably)

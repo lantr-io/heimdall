@@ -342,7 +342,7 @@ impl EpochConfig {
             // mint test peg-in tokens under it without deploying any
             // Bifrost contract.
             pegin_policy_id: crate::cardano::always_ok::always_ok_script_hash(),
-            pegin_collection_window: Duration::from_secs(5),
+            pegin_collection_window: Duration::from_millis(100),
             pegin_poll_interval: Duration::from_millis(200),
         }
     }
