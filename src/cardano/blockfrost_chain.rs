@@ -17,7 +17,8 @@ use async_trait::async_trait;
 use bitcoin::consensus::deserialize;
 use bitcoin::Transaction;
 use blockfrost::{BlockFrostSettings, BlockfrostAPI, Pagination};
-
+use pallas_codec::minicbor;
+use pallas_primitives::conway::PlutusData;
 use pallas_wallet::PrivateKey;
 
 use crate::cardano::btc_rpc::{broadcast_btc_tx, BtcRpcConfig};
@@ -205,37 +206,31 @@ impl CardanoChain for BlockfrostCardanoChain {
                 ))
             })?;
 
-        let inline_datum_str = utxo.inline_datum.as_deref().unwrap();
-        let json_value: serde_json::Value = serde_json::from_str(inline_datum_str)
-            .map_err(|e| EpochError::Chain(format!("inline datum JSON parse: {e}")))?;
+        let inline_datum_hex = utxo.inline_datum.as_deref().unwrap();
+        let datum_cbor = hex::decode(inline_datum_hex)
+            .map_err(|e| EpochError::Chain(format!("inline datum hex decode: {e}")))?;
+        let datum: PlutusData = minicbor::decode(&datum_cbor)
+            .map_err(|e| EpochError::Chain(format!("inline datum CBOR decode: {e}")))?;
 
-        eprintln!(
-            "[blockfrost] treasury datum JSON:\n{}",
-            serde_json::to_string_pretty(&json_value).unwrap_or_default()
-        );
+        let constr = match &datum {
+            PlutusData::Constr(c) => c,
+            _ => return Err(EpochError::Chain("treasury datum is not a Constr".into())),
+        };
 
-        // constructor 0 = unsigned/unconfirmed, constructor 1 = confirmed.
-        let constructor = json_value
-            .get("constructor")
-            .and_then(|c| c.as_u64())
-            .unwrap_or(0);
+        // tag 121 = constructor 0 (unconfirmed), tag 122 = constructor 1 (confirmed).
+        let constructor = constr.tag.saturating_sub(121);
         let btc_confirmed = constructor == 1;
+        eprintln!("[blockfrost] treasury datum: constructor={constructor} btc_confirmed={btc_confirmed}");
 
-        let btc_tx_hex = json_value
-            .get("fields")
-            .and_then(|f| f.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|field| field.get("bytes"))
-            .and_then(|b| b.as_str())
-            .ok_or_else(|| {
-                EpochError::Chain(format!(
-                    "unexpected datum JSON shape: {}",
-                    serde_json::to_string_pretty(&json_value).unwrap_or_default()
-                ))
-            })?;
-
-        let tx_bytes = hex::decode(btc_tx_hex)
-            .map_err(|e| EpochError::Chain(format!("datum BTC tx hex: {e}")))?;
+        let tx_bytes = match constr.fields.first() {
+            Some(PlutusData::BoundedBytes(bb)) => {
+                let v: Vec<u8> = bb.clone().into();
+                v
+            }
+            _ => return Err(EpochError::Chain(
+                "treasury datum Constr has no BoundedBytes field".into(),
+            )),
+        };
         let tx: Transaction = deserialize(&tx_bytes)
             .map_err(|e| EpochError::Chain(format!("BTC tx deserialize: {e}")))?;
 
