@@ -271,12 +271,13 @@ impl CardanoChain for BlockfrostCardanoChain {
     }
 
     async fn submit_signed_tm(&self, tx_bytes: &[u8]) -> EpochResult<()> {
-        // Debug path: broadcast the signed BTC tx directly to a local
-        // bitcoind node via JSON-RPC, skipping the Cardano oracle post.
+        // Broadcast the signed BTC tx to a local bitcoind node if configured.
         if let Some(rpc) = &self.btc_rpc {
-            return broadcast_btc_tx(rpc, tx_bytes).await;
+            broadcast_btc_tx(rpc, tx_bytes).await?;
         }
 
+        // Publish the oracle update to Cardano: creates a new UTxO at the
+        // treasury address with the signed BTC tx as a Constr(0, ...) datum.
         let key = match &self.payment_key {
             Some(k) => k,
             None => {
