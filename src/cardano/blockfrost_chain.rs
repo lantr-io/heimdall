@@ -240,18 +240,20 @@ impl CardanoChain for BlockfrostCardanoChain {
         })?;
         let txid = tx.compute_txid();
 
-        let y_51 = self
-            .treasury_y_51
-            .lock()
-            .unwrap()
-            .unwrap_or(self.treasury_config.y_51);
+        let maybe_key = *self.treasury_y_51.lock().unwrap();
+        let y_51 = maybe_key.unwrap_or(self.treasury_config.y_51);
+        // After DKG: Y_fed = Y_67 = Y_51 = FROST group key (same key everywhere).
+        let (y_67, y_fed) = match maybe_key {
+            Some(k) => (k, k),
+            None => (self.treasury_config.y_67, self.treasury_config.y_fed),
+        };
 
         Ok(TreasuryUtxo {
             outpoint: bitcoin::OutPoint { txid, vout: 0 },
             value: out.value,
             y_51,
-            y_67: self.treasury_config.y_67,
-            y_fed: self.treasury_config.y_fed,
+            y_67,
+            y_fed,
             federation_csv_blocks: self.treasury_config.federation_csv_blocks,
             fee_rate_sat_per_vb: self.treasury_config.fee_rate_sat_per_vb,
             per_pegout_fee: self.treasury_config.per_pegout_fee,
