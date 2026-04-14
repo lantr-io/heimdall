@@ -20,6 +20,14 @@ federation_csv_blocks = 144
 # In production these come from the on-chain treasury oracle.
 y_67_seed_hex = "6767676767676767676767676767676767676767676767676767676767676767"
 y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe"
+rpc_url = "http://127.0.0.1:18443"
+rpc_user = "bitcoin"
+rpc_pass = "bitcoin"
+# FROST treasury UTXO: funded at the all-same-key address (Y_fed=Y_67=Y_51=FROST group key)
+# (bcrt1p8009hhk29r067ygrd0xw42dp4ltg0ensn5wrxcngf0qkmv090atssrem7f)
+treasury_txid = "b54d117749214d40a033cd6b780a76f9f300d53f53d20e3d1d0031f20363de8c"
+treasury_vout = 0
+treasury_amount_sat = 10000000
 
 [cardano]
 # blockfrost_project_id = "preprodXXXXXX"
@@ -30,7 +38,7 @@ y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 # treasury_address = "addr_test1..."
 # treasury_policy_id = "abcdef..."
 # treasury_asset_name = "544d5478"
-# mnemonic = "word1 word2 ... word24"
+mnemonic = "REDACTED_MNEMONIC"
 
 [http]
 bind_address = "127.0.0.1"

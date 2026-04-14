@@ -175,11 +175,20 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
         y_67,
         y_fed,
         federation_csv_blocks: cfg.bitcoin.federation_csv_blocks,
-        treasury_outpoint: OutPoint {
-            txid: Txid::from_byte_array([0xAA; 32]),
-            vout: 0,
+        treasury_outpoint: {
+            // bitcoin.treasury_txid is in display (reversed) byte order as shown by bitcoind.
+            let txid: Txid = cfg
+                .bitcoin
+                .treasury_txid
+                .as_deref()
+                .map(|s| s.parse::<Txid>().expect("bitcoin.treasury_txid must be a valid txid"))
+                .unwrap_or_else(|| Txid::from_byte_array([0xAA; 32]));
+            OutPoint {
+                txid,
+                vout: cfg.bitcoin.treasury_vout.unwrap_or(0),
+            }
         },
-        treasury_value: Amount::from_sat(10_000_000),
+        treasury_value: Amount::from_sat(cfg.bitcoin.treasury_amount_sat.unwrap_or(10_000_000)),
         pegins: vec![],
         pegouts: vec![],
         fee_rate_sat_per_vb: cfg.bitcoin.fee_rate_sat_per_vb,

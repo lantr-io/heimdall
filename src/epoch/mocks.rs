@@ -181,17 +181,19 @@ impl CardanoChain for MockCardanoChain {
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {
-        let y_51 = self
-            .treasury_y_51
-            .lock()
-            .unwrap()
-            .unwrap_or(self.fixture.y_51);
+        let maybe_key = *self.treasury_y_51.lock().unwrap();
+        let y_51 = maybe_key.unwrap_or(self.fixture.y_51);
+        // After DKG: Y_fed = Y_67 = Y_51 = FROST group key (same key everywhere).
+        let (y_67, y_fed) = match maybe_key {
+            Some(k) => (k, k),
+            None => (self.fixture.y_67, self.fixture.y_fed),
+        };
         Ok(TreasuryUtxo {
             outpoint: self.fixture.treasury_outpoint,
             value: self.fixture.treasury_value,
             y_51,
-            y_67: self.fixture.y_67,
-            y_fed: self.fixture.y_fed,
+            y_67,
+            y_fed,
             federation_csv_blocks: self.fixture.federation_csv_blocks,
             fee_rate_sat_per_vb: self.fixture.fee_rate_sat_per_vb,
             per_pegout_fee: self.fixture.per_pegout_fee,

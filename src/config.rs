@@ -79,6 +79,18 @@ pub struct BitcoinConfig {
     pub y_67_seed_hex: String,
     /// 32-byte hex seed for the Y_federation key.
     pub y_fed_seed_hex: String,
+    /// Optional bitcoind JSON-RPC endpoint for direct tx broadcast.
+    /// When set, `submit_signed_tm` sends the signed BTC tx here instead
+    /// of (or in addition to) posting to the Cardano oracle.
+    pub rpc_url: Option<String>,
+    pub rpc_user: Option<String>,
+    pub rpc_pass: Option<String>,
+    /// Override the demo mock treasury UTXO with a real on-chain UTXO.
+    /// Set these to the txid/vout/amount of the UTXO the FROST group can spend.
+    /// The UTXO must be at the P2TR address for the configured keys.
+    pub treasury_txid: Option<String>,
+    pub treasury_vout: Option<u32>,
+    pub treasury_amount_sat: Option<u64>,
 }
 
 impl Default for BitcoinConfig {
@@ -90,6 +102,12 @@ impl Default for BitcoinConfig {
             federation_csv_blocks: 144,
             y_67_seed_hex: hex::encode([0x67u8; 32]),
             y_fed_seed_hex: hex::encode([0xFEu8; 32]),
+            rpc_url: None,
+            rpc_user: None,
+            rpc_pass: None,
+            treasury_txid: None,
+            treasury_vout: None,
+            treasury_amount_sat: None,
         }
     }
 }
