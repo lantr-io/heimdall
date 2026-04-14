@@ -40,13 +40,21 @@ pub struct WalletUtxo {
     pub lovelace: u64,
 }
 
-/// Encode the treasury oracle datum: `Constr(0, [BoundedBytes(btc_tx)])`.
-/// Constructor 0 = unconfirmed TM tx (Binocular sets constructor 1 on
-/// Bitcoin confirmation).
-fn encode_datum_hex(btc_tx: &[u8]) -> String {
+/// Encode the treasury oracle datum: `Constr(constructor, [BoundedBytes(btc_tx)])`.
+///
+/// CBOR tags for Plutus constructors 0–6 are 121–127; constructors 7+
+/// use tag 102 with an explicit `any_constructor` field.
+/// Constructor 0 (tag 121) = unconfirmed TM tx.
+/// Constructor 1 (tag 122) = confirmed (set by Binocular after Bitcoin proof).
+fn encode_datum_hex(btc_tx: &[u8], constructor: u8) -> String {
+    let (tag, any_constructor) = if constructor <= 6 {
+        (121u64 + constructor as u64, None)
+    } else {
+        (102u64, Some(constructor as u64))
+    };
     let datum = PlutusData::Constr(Constr {
-        tag: 121, // constructor 0
-        any_constructor: None,
+        tag,
+        any_constructor,
         fields: MaybeIndefArray::Def(vec![PlutusData::BoundedBytes(BoundedBytes::from(
             btc_tx.to_vec(),
         ))]),
@@ -57,7 +65,7 @@ fn encode_datum_hex(btc_tx: &[u8]) -> String {
 
 /// Build the Cardano transaction that updates the treasury oracle by
 /// creating a new UTxO at the treasury address with:
-/// - inline datum: `Constr(0, [BoundedBytes(signed_btc_tx)])`
+/// - inline datum: `Constr(constructor, [BoundedBytes(signed_btc_tx)])`
 /// - 1 freshly-minted treasury marker token
 ///
 /// The old oracle UTxO is NOT spent.
@@ -69,11 +77,12 @@ pub fn build_oracle_update_tx(
     treasury_policy_id: &str,
     treasury_asset_name_hex: &str,
     signed_btc_tx: &[u8],
+    constructor: u8,
     wallet_utxos: &[WalletUtxo],
     key: &PrivateKey,
 ) -> EpochResult<String> {
     let pkh = pub_key_hash_hex(key);
-    let datum_hex = encode_datum_hex(signed_btc_tx);
+    let datum_hex = encode_datum_hex(signed_btc_tx, constructor);
     let asset_unit = format!("{treasury_policy_id}{treasury_asset_name_hex}");
 
     // Pick the richest wallet UTxO as the fee-paying input.
@@ -204,7 +213,7 @@ mod tests {
     #[test]
     fn encode_datum_is_constr_0() {
         let btc_tx = vec![0x02, 0x00, 0x00, 0x00];
-        let hex_str = encode_datum_hex(&btc_tx);
+        let hex_str = encode_datum_hex(&btc_tx, 0);
         let cbor = hex::decode(&hex_str).unwrap();
         let decoded: PlutusData =
             pallas_codec::minicbor::decode(&cbor).expect("decode");

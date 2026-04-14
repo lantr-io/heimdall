@@ -309,6 +309,12 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
             );
         }
 
+        bf_chain = bf_chain.with_submit_config(
+            cfg.bitcoin.submit,
+            cfg.cardano.submit_oracle,
+            cfg.cardano.oracle_constructor,
+        );
+
         chain = Arc::new(bf_chain);
         pegin_source = Arc::new(BlockfrostPegInSource::new(project_id, &script_address));
     } else if let Some(socket) = cfg.cardano.socket_path.clone() {

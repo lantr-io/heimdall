@@ -80,14 +80,13 @@ pub struct BitcoinConfig {
     /// 32-byte hex seed for the Y_federation key.
     pub y_fed_seed_hex: String,
     /// Optional bitcoind JSON-RPC endpoint for direct tx broadcast.
-    /// When set, `submit_signed_tm` sends the signed BTC tx here instead
-    /// of (or in addition to) posting to the Cardano oracle.
     pub rpc_url: Option<String>,
     pub rpc_user: Option<String>,
     pub rpc_pass: Option<String>,
+    /// Whether to broadcast the signed BTC tx to the Bitcoin node via
+    /// `sendrawtransaction`. Requires `rpc_url`. Default: true (when rpc_url set).
+    pub submit: bool,
     /// Override the demo mock treasury UTXO with a real on-chain UTXO.
-    /// Set these to the txid/vout/amount of the UTXO the FROST group can spend.
-    /// The UTXO must be at the P2TR address for the configured keys.
     pub treasury_txid: Option<String>,
     pub treasury_vout: Option<u32>,
     pub treasury_amount_sat: Option<u64>,
@@ -105,6 +104,7 @@ impl Default for BitcoinConfig {
             rpc_url: None,
             rpc_user: None,
             rpc_pass: None,
+            submit: true,
             treasury_txid: None,
             treasury_vout: None,
             treasury_amount_sat: None,
@@ -138,6 +138,13 @@ pub struct CardanoConfig {
     pub treasury_policy_id: Option<String>,
     pub treasury_asset_name: Option<String>,
     pub mnemonic: Option<String>,
+    /// Whether to publish an oracle-update UTxO to Cardano after signing.
+    /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
+    pub submit_oracle: bool,
+    /// Constructor tag to use in the oracle datum.
+    /// 0 = unconfirmed TM tx (Binocular will update to 1 on Bitcoin confirmation).
+    /// Default: 0.
+    pub oracle_constructor: u8,
 }
 
 impl Default for CardanoConfig {
@@ -152,6 +159,8 @@ impl Default for CardanoConfig {
             treasury_policy_id: None,
             treasury_asset_name: None,
             mnemonic: None,
+            submit_oracle: true,
+            oracle_constructor: 0,
         }
     }
 }

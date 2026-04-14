@@ -53,9 +53,13 @@ pub struct BlockfrostCardanoChain {
     /// sign the treasury input (same pattern as MockCardanoChain).
     treasury_y_51: Mutex<Option<bitcoin::key::UntweakedPublicKey>>,
     /// Optional bitcoind JSON-RPC config for direct BTC tx broadcast.
-    /// When set, `submit_signed_tm` sends the signed BTC tx via
-    /// `sendrawtransaction` instead of posting to the Cardano oracle.
     btc_rpc: Option<BtcRpcConfig>,
+    /// Whether to broadcast the signed BTC tx to Bitcoin (requires btc_rpc).
+    submit_btc: bool,
+    /// Whether to publish an oracle-update UTxO to Cardano after signing.
+    submit_oracle: bool,
+    /// Constructor tag used in the oracle datum (0 = unconfirmed, 1 = confirmed).
+    oracle_constructor: u8,
 }
 
 impl BlockfrostCardanoChain {
@@ -79,7 +83,18 @@ impl BlockfrostCardanoChain {
             wallet_base_address: None,
             treasury_y_51: Mutex::new(None),
             btc_rpc: None,
+            submit_btc: true,
+            submit_oracle: true,
+            oracle_constructor: 0,
         }
+    }
+
+    /// Override submission flags from config.
+    pub fn with_submit_config(mut self, submit_btc: bool, submit_oracle: bool, oracle_constructor: u8) -> Self {
+        self.submit_btc = submit_btc;
+        self.submit_oracle = submit_oracle;
+        self.oracle_constructor = oracle_constructor;
+        self
     }
 
     /// Configure direct Bitcoin RPC broadcast. When set,
@@ -271,13 +286,18 @@ impl CardanoChain for BlockfrostCardanoChain {
     }
 
     async fn submit_signed_tm(&self, tx_bytes: &[u8]) -> EpochResult<()> {
-        // Broadcast the signed BTC tx to a local bitcoind node if configured.
-        if let Some(rpc) = &self.btc_rpc {
-            broadcast_btc_tx(rpc, tx_bytes).await?;
+        // Broadcast the signed BTC tx to Bitcoin if configured and enabled.
+        if self.submit_btc {
+            if let Some(rpc) = &self.btc_rpc {
+                broadcast_btc_tx(rpc, tx_bytes).await?;
+            }
         }
 
-        // Publish the oracle update to Cardano: creates a new UTxO at the
-        // treasury address with the signed BTC tx as a Constr(0, ...) datum.
+        // Publish the oracle update to Cardano if enabled.
+        if !self.submit_oracle {
+            return Ok(());
+        }
+
         let key = match &self.payment_key {
             Some(k) => k,
             None => {
@@ -308,12 +328,18 @@ impl CardanoChain for BlockfrostCardanoChain {
             total_lovelace,
         );
 
+        eprintln!(
+            "[blockfrost] publishing oracle update (constructor={}) to {}",
+            self.oracle_constructor, self.treasury_address
+        );
+
         let signed_tx_hex = build_oracle_update_tx(
             &self.treasury_address,
             wallet_addr,
             &self.treasury_policy_id,
             &self.treasury_asset_name_hex,
             tx_bytes,
+            self.oracle_constructor,
             &wallet_utxos,
             key,
         )?;

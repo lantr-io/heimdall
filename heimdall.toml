@@ -23,22 +23,25 @@ y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 rpc_url = "http://127.0.0.1:18443"
 rpc_user = "bitcoin"
 rpc_pass = "bitcoin"
+submit = true          # broadcast signed BTC tx to rpc_url
 # FROST treasury UTXO: funded at the all-same-key address (Y_fed=Y_67=Y_51=FROST group key)
 # (bcrt1p8009hhk29r067ygrd0xw42dp4ltg0ensn5wrxcngf0qkmv090atssrem7f)
-treasury_txid = "b54d117749214d40a033cd6b780a76f9f300d53f53d20e3d1d0031f20363de8c"
+treasury_txid = "478b7ae50b71603aca16c97d3ee974f98e4ecc55b875fe34fe3cd6afc97f1317"
 treasury_vout = 0
-treasury_amount_sat = 10000000
+treasury_amount_sat = 9999887
 
 [cardano]
-# blockfrost_project_id = "preprodXXXXXX"
+blockfrost_project_id = "preprodsTOaoyjcqGmy4SOSazxuHkbuXFOOkp8f"
 # socket_path = "/run/cardano-node/node.socket"
 # network_magic = 1
 # pegin_script_address = "addr_test1..."
 # pegin_policy_id = "abcdef..."
-# treasury_address = "addr_test1..."
-# treasury_policy_id = "abcdef..."
-# treasury_asset_name = "544d5478"
+treasury_address = "addr_test1wqvxuvh64q9zdqgrjt76d42eclk5wgdxtnsun4808cwg0dqxy2mj0"
+treasury_policy_id = "186e32faa80a26810392fda6d559c7ed4721a65ce1c9d4ef3e1c87b4"
+treasury_asset_name = "544d5478"
 mnemonic = "REDACTED_MNEMONIC"
+submit_oracle = true   # publish oracle-update UTxO to Cardano after signing
+oracle_constructor = 0 # 0 = unconfirmed TM tx (Binocular sets 1 on BTC confirmation)
 
 [http]
 bind_address = "127.0.0.1"
