@@ -337,11 +337,7 @@ impl EpochConfig {
             federation_timeout: Duration::from_secs(300),
             leader_timeout: Duration::from_secs(10000),
             identity,
-            // Hardcoded to the always-OK native script policy ID for
-            // demo runs against a real Cardano node — the operator can
-            // mint test peg-in tokens under it without deploying any
-            // Bifrost contract.
-            pegin_policy_id: crate::cardano::always_ok::always_ok_script_hash(),
+            pegin_policy_id: [0u8; 28],
             pegin_collection_window: Duration::from_secs(5),
             pegin_poll_interval: Duration::from_millis(1000),
         }

@@ -4,7 +4,6 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use frost_secp256k1_tr::Identifier;
 
-use heimdall::cardano::always_ok::always_ok_testnet_address_bech32;
 use heimdall::cardano::blockfrost_chain::BlockfrostCardanoChain;
 use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
 use heimdall::cardano::treasury_datum::TreasuryConfig;
@@ -249,18 +248,17 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
         .cardano
         .pegin_script_address
         .clone()
-        .unwrap_or_else(|| always_ok_testnet_address_bech32().to_string());
-    let always_ok_hash = hex::encode(heimdall::cardano::always_ok::always_ok_script_hash());
+        .unwrap_or_default();
     let treasury_address: String = cfg
         .cardano
         .treasury_address
         .clone()
-        .unwrap_or_else(|| always_ok_testnet_address_bech32().to_string());
+        .unwrap_or_default();
     let treasury_policy_id: String = cfg
         .cardano
         .treasury_policy_id
         .clone()
-        .unwrap_or_else(|| always_ok_hash.clone());
+        .unwrap_or_default();
     let treasury_asset_name_hex: String = cfg
         .cardano
         .treasury_asset_name
@@ -381,10 +379,33 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
         .expect("epoch loop");
     println!("Cycle complete ({:.2?})", t0.elapsed());
 
-    println!("Agreed txid: {}", tm.txid);
+    // ── Bitcoin TM transaction summary ──────────────────────────────────────
+    println!("\n── Bitcoin Treasury Movement ──");
+    println!("  txid:    {}", tm.txid);
+    println!("  inputs:  {}", tm.unsigned_tx.input.len());
+    for (i, (inp, prevout)) in tm.unsigned_tx.input.iter().zip(tm.prevouts.iter()).enumerate() {
+        println!(
+            "    [{}] {}:{} — {} sat  script={}",
+            i,
+            inp.previous_output.txid,
+            inp.previous_output.vout,
+            prevout.value.to_sat(),
+            hex::encode(prevout.script_pubkey.as_bytes()),
+        );
+    }
+    println!("  outputs: {}", tm.unsigned_tx.output.len());
+    for (i, out) in tm.unsigned_tx.output.iter().enumerate() {
+        println!(
+            "    [{}] {} sat  script={}",
+            i,
+            out.value.to_sat(),
+            hex::encode(out.script_pubkey.as_bytes()),
+        );
+    }
     let signed_bytes = bitcoin::consensus::encode::serialize(&tm.unsigned_tx);
-    println!("Witnessed Bitcoin tx ({} bytes):", signed_bytes.len());
-    println!("  {}", hex::encode(&signed_bytes));
+    println!("  size:    {} bytes", signed_bytes.len());
+    println!("  hex:     {}", hex::encode(&signed_bytes));
+
     println!("\n=== SPO #{index} cycle complete ===");
 
     println!("Server still running on {bind_addr}:{port}; press Ctrl-C to exit.");

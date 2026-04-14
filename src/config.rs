@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::cardano::always_ok::always_ok_script_hash;
 use crate::epoch::state::{EpochConfig, SpoIdentity};
 
 // ── Root ────────────────────────────────────────────────────────────
@@ -225,7 +224,7 @@ impl HeimdallConfig {
                 out.copy_from_slice(&v);
                 out
             })
-            .unwrap_or_else(always_ok_script_hash);
+            .unwrap_or([0u8; 28]);
 
         EpochConfig {
             dkg_round_timeout: Duration::from_secs(self.protocol.dkg_round_timeout_secs),

@@ -181,44 +181,33 @@ impl CardanoChain for BlockfrostCardanoChain {
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {
-        // Fetch all UTxOs at the treasury address; pick the most recent
-        // one that carries a datum (either inline or hash-referenced).
         let utxos = self
             .api
             .addresses_utxos(&self.treasury_address, Pagination::all())
             .await
             .map_err(|e| EpochError::Chain(format!("blockfrost treasury query: {e}")))?;
 
+        let asset_unit = format!(
+            "{}{}",
+            self.treasury_policy_id, self.treasury_asset_name_hex
+        );
         let utxo = utxos
             .iter()
             .rev()
-            .find(|u| u.data_hash.is_some() || u.inline_datum.is_some())
+            .find(|u| {
+                u.inline_datum.is_some()
+                    && u.amount.iter().any(|a| a.unit == asset_unit)
+            })
             .ok_or_else(|| {
                 EpochError::Chain(format!(
-                    "no UTxO with a datum at treasury address {}",
+                    "no UTxO with an inline datum and marker token ({asset_unit}) at treasury address {}",
                     self.treasury_address
                 ))
             })?;
 
-        // Resolve the datum JSON via the hash endpoint (works for both
-        // hash-referenced and inline datums — Blockfrost indexes both).
-        let datum_hash = utxo.data_hash.as_deref().ok_or_else(|| {
-            EpochError::Chain("treasury UTxO has no data_hash".into())
-        })?;
-        let datum_json = self
-            .api
-            .scripts_datum_hash(datum_hash)
-            .await
-            .map_err(|e| EpochError::Chain(format!("blockfrost datum fetch: {e}")))?;
-
-        let json_value = datum_json
-            .get("json_value")
-            .ok_or_else(|| {
-                EpochError::Chain(format!(
-                    "unexpected datum JSON shape: {}",
-                    serde_json::to_string_pretty(&datum_json).unwrap_or_default()
-                ))
-            })?;
+        let inline_datum_str = utxo.inline_datum.as_deref().unwrap();
+        let json_value: serde_json::Value = serde_json::from_str(inline_datum_str)
+            .map_err(|e| EpochError::Chain(format!("inline datum JSON parse: {e}")))?;
 
         eprintln!(
             "[blockfrost] treasury datum JSON:\n{}",
@@ -241,7 +230,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             .ok_or_else(|| {
                 EpochError::Chain(format!(
                     "unexpected datum JSON shape: {}",
-                    serde_json::to_string_pretty(&datum_json).unwrap_or_default()
+                    serde_json::to_string_pretty(&json_value).unwrap_or_default()
                 ))
             })?;
 
@@ -286,25 +275,32 @@ impl CardanoChain for BlockfrostCardanoChain {
     }
 
     async fn submit_signed_tm(&self, tx_bytes: &[u8]) -> EpochResult<()> {
+        eprintln!(
+            "[submit] signed BTC tx: {} bytes, hex: {}",
+            tx_bytes.len(),
+            hex::encode(tx_bytes)
+        );
+
         // Broadcast the signed BTC tx to Bitcoin if configured and enabled.
         if self.submit_btc {
-            if let Some(rpc) = &self.btc_rpc {
-                broadcast_btc_tx(rpc, tx_bytes).await?;
+            match &self.btc_rpc {
+                Some(rpc) => broadcast_btc_tx(rpc, tx_bytes).await?,
+                None => eprintln!("[submit] bitcoin.submit=true but rpc_url not set — skipping BTC broadcast"),
             }
+        } else {
+            eprintln!("[submit] bitcoin.submit=false — skipping BTC broadcast");
         }
 
         // Publish the oracle update to Cardano if enabled.
         if !self.submit_oracle {
+            eprintln!("[submit] cardano.submit_oracle=false — skipping Cardano oracle publish");
             return Ok(());
         }
 
         let key = match &self.payment_key {
             Some(k) => k,
             None => {
-                eprintln!(
-                    "[blockfrost] submit_signed_tm: no mnemonic configured, \
-                     skipping Cardano publish (dry run)"
-                );
+                eprintln!("[submit] no mnemonic configured — skipping Cardano oracle publish (dry run)");
                 return Ok(());
             }
         };
@@ -314,6 +310,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             .as_deref()
             .ok_or_else(|| EpochError::Chain("no wallet base address".into()))?;
 
+        eprintln!("[submit] querying wallet UTxOs at {wallet_addr}");
         let wallet_utxos = self.query_wallet_utxos().await?;
         if wallet_utxos.is_empty() {
             return Err(EpochError::Chain(format!(
@@ -323,14 +320,12 @@ impl CardanoChain for BlockfrostCardanoChain {
 
         let total_lovelace: u64 = wallet_utxos.iter().map(|u| u.lovelace).sum();
         eprintln!(
-            "[blockfrost] wallet has {} UTxOs ({} lovelace total)",
-            wallet_utxos.len(),
-            total_lovelace,
+            "[submit] wallet: {} UTxO(s), {} lovelace total",
+            wallet_utxos.len(), total_lovelace,
         );
-
         eprintln!(
-            "[blockfrost] publishing oracle update (constructor={}) to {}",
-            self.oracle_constructor, self.treasury_address
+            "[submit] building Cardano oracle-update tx: treasury={} constructor={} policy={}",
+            self.treasury_address, self.oracle_constructor, self.treasury_policy_id
         );
 
         let signed_tx_hex = build_oracle_update_tx(
@@ -348,7 +343,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             .map_err(|e| EpochError::Chain(format!("tx hex decode: {e}")))?;
 
         eprintln!(
-            "[blockfrost] submitting oracle update tx ({} bytes CBOR)",
+            "[submit] submitting Cardano oracle-update tx ({} bytes CBOR) via Blockfrost",
             cardano_tx_cbor.len()
         );
 
@@ -358,7 +353,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             .await
             .map_err(|e| EpochError::Chain(format!("blockfrost tx submit: {e}")))?;
 
-        eprintln!("[blockfrost] oracle update submitted: {tx_hash}");
+        eprintln!("[submit] Cardano oracle-update submitted: tx_hash={tx_hash}");
 
         Ok(())
     }
