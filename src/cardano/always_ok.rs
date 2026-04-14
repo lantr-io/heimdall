@@ -64,6 +64,15 @@ pub fn always_ok_testnet_address_bech32() -> &'static str {
     })
 }
 
+/// CBOR hex of the minimal Plutus V3 always-succeeds script used as
+/// the treasury oracle minting policy. Encoding: bytes(5) wrapping a
+/// flat-encoded UPLC program at version 1.1.0.
+pub const ALWAYS_OK_PLUTUS_CBOR_HEX: &str = "450101002499";
+
+/// Redeemer for an always-succeeds Plutus script: unit `()` encoded as
+/// `Constr(0, [])` = CBOR tag 121, empty array = `d87980`.
+pub const UNIT_REDEEMER_HEX: &str = "d87980";
+
 #[cfg(test)]
 mod tests {
     use super::*;

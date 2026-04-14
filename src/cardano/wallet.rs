@@ -1,14 +1,11 @@
 //! BIP-39 mnemonic → Cardano payment key derivation (CIP-1852).
 //!
 //! Derives the external payment key at path
-//! `m/1852'/1815'/0'/0/0` using the Icarus (V2) scheme, via
+//! `m/1852'/1815'/0'/0/0` and the staking key at
+//! `m/1852'/1815'/0'/2/0` using the Icarus (V2) scheme, via
 //! `pallas_wallet::hd::Bip32PrivateKey`. The resulting key is an
 //! **extended** ed25519 key (64 bytes), as used by all Cardano HD
 //! wallets.
-//!
-//! We derive:
-//! - the `PrivateKey` used to sign the oracle-update transaction, and
-//! - the testnet enterprise bech32 address for querying wallet UTxOs.
 
 use pallas_addresses::{Address, Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
 use pallas_crypto::hash::Hasher;
@@ -33,8 +30,49 @@ pub fn derive_payment_key(mnemonic: &str) -> Result<PrivateKey, String> {
     Ok(key)
 }
 
+/// Derive the full CIP-1852 base address from a mnemonic:
+/// payment key at `m/1852'/1815'/0'/0/0` + staking key at
+/// `m/1852'/1815'/0'/2/0`. This matches what Daedalus/Yoroi/cardano-cli
+/// show as the wallet's receive address.
+pub fn wallet_address_from_mnemonic(mnemonic: &str) -> Result<String, String> {
+    let root = Bip32PrivateKey::from_bip39_mnenomic(mnemonic.to_string(), String::new())
+        .map_err(|e| format!("mnemonic parse: {e:?}"))?;
+
+    let payment_key = root
+        .derive(HARDENED | 1852)
+        .derive(HARDENED | 1815)
+        .derive(HARDENED | 0)
+        .derive(0)
+        .derive(0)
+        .to_ed25519_private_key();
+
+    let staking_key = root
+        .derive(HARDENED | 1852)
+        .derive(HARDENED | 1815)
+        .derive(HARDENED | 0)
+        .derive(2) // staking chain
+        .derive(0)
+        .to_ed25519_private_key();
+
+    let pay_pk: [u8; 32] = payment_key.public_key().into();
+    let pkh: [u8; 28] = (*Hasher::<224>::hash(&pay_pk)).into();
+
+    let stk_pk: [u8; 32] = staking_key.public_key().into();
+    let skh: [u8; 28] = (*Hasher::<224>::hash(&stk_pk)).into();
+
+    let shelley = ShelleyAddress::new(
+        Network::Testnet,
+        ShelleyPaymentPart::key_hash(pkh.into()),
+        ShelleyDelegationPart::key_hash(skh.into()),
+    );
+    Ok(Address::Shelley(shelley)
+        .to_bech32()
+        .expect("bech32 encode wallet address"))
+}
+
 /// Testnet enterprise (no staking part) bech32 address for a payment
-/// key.
+/// key. Used for Blockfrost UTxO queries when only the payment key is
+/// available.
 pub fn wallet_address(key: &PrivateKey) -> String {
     let pk_bytes: [u8; 32] = key.public_key().into();
     let hash = Hasher::<224>::hash(&pk_bytes);
@@ -80,6 +118,13 @@ mod tests {
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
         let addr = wallet_address(&key);
         assert!(addr.starts_with("addr_test1"), "got {addr}");
+    }
+
+    #[test]
+    fn wallet_address_from_mnemonic_is_base_address() {
+        let addr = wallet_address_from_mnemonic(TEST_MNEMONIC).unwrap();
+        // Base address prefix for testnet is addr_test1q
+        assert!(addr.starts_with("addr_test1q"), "got {addr}");
     }
 
     #[test]
