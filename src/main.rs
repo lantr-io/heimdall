@@ -316,13 +316,13 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
             .cardano
             .network_magic
             .expect("cardano.network_magic required with cardano.socket_path");
-        chain = Arc::new(MockCardanoChain::new(fixture.clone()));
+        chain = Arc::new(mock_chain_with_rpc(&cfg, fixture.clone()));
         pegin_source = Arc::new(
             PallasPegInSource::from_bech32(socket, NetworkMagic(magic), &script_address)
                 .expect("pallas source"),
         );
     } else {
-        chain = Arc::new(MockCardanoChain::new(fixture.clone()));
+        chain = Arc::new(mock_chain_with_rpc(&cfg, fixture.clone()));
         pegin_source = Arc::new(MockCardanoPegInSource::new());
     };
 
@@ -383,6 +383,23 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
 
     println!("Server still running on {bind_addr}:{port}; press Ctrl-C to exit.");
     tokio::signal::ctrl_c().await.ok();
+}
+
+/// Build a `MockCardanoChain` from the fixture, wiring up the Bitcoin
+/// RPC if `bitcoin.rpc_url` is set in the config.
+fn mock_chain_with_rpc(
+    cfg: &HeimdallConfig,
+    fixture: heimdall::epoch::fixture::StaticFixture,
+) -> MockCardanoChain {
+    let mut chain = MockCardanoChain::new(fixture);
+    if let Some(rpc_url) = &cfg.bitcoin.rpc_url {
+        chain = chain.with_btc_rpc(
+            rpc_url,
+            cfg.bitcoin.rpc_user.clone(),
+            cfg.bitcoin.rpc_pass.clone(),
+        );
+    }
+    chain
 }
 
 fn port_from_url(url: &str) -> u16 {

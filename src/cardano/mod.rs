@@ -11,6 +11,7 @@
 
 pub mod always_ok;
 pub mod blockfrost_chain;
+pub mod btc_rpc;
 pub mod blockfrost_source;
 pub mod mock;
 pub mod pallas_source;

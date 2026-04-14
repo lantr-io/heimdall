@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use frost_secp256k1_tr::Identifier;
 use tokio::sync::Notify;
 
+use crate::cardano::btc_rpc::{broadcast_btc_tx, BtcRpcConfig};
 use crate::epoch::state::{EpochError, EpochResult, Roster, SpoInfo};
 use crate::epoch::traits::{
     CardanoChain, Clock, CycleRng, EpochBoundaryEvent, PegOutRequestUtxo, PeerNetwork,
@@ -128,6 +129,9 @@ pub struct MockCardanoChain {
     /// `query_treasury` returns this as Y_51 so the FROST group can
     /// sign the treasury input.
     treasury_y_51: Mutex<Option<bitcoin::key::UntweakedPublicKey>>,
+    /// Optional Bitcoin RPC config. When set, `submit_signed_tm` also
+    /// broadcasts the signed BTC tx to the node via `sendrawtransaction`.
+    btc_rpc: Option<BtcRpcConfig>,
 }
 
 impl MockCardanoChain {
@@ -137,7 +141,25 @@ impl MockCardanoChain {
             boundary_fired: Mutex::new(false),
             submitted_txs: Arc::new(Mutex::new(Vec::new())),
             treasury_y_51: Mutex::new(None),
+            btc_rpc: None,
         }
+    }
+
+    /// Configure direct Bitcoin RPC broadcast. When set,
+    /// `submit_signed_tm` sends the signed BTC tx to bitcoind via
+    /// `sendrawtransaction` in addition to storing it locally.
+    pub fn with_btc_rpc(
+        mut self,
+        url: impl Into<String>,
+        user: Option<String>,
+        pass: Option<String>,
+    ) -> Self {
+        self.btc_rpc = Some(BtcRpcConfig {
+            url: url.into(),
+            user,
+            pass,
+        });
+        self
     }
 
     /// Construct a demo mock chain that synthesizes its roster /
@@ -220,6 +242,9 @@ impl CardanoChain for MockCardanoChain {
 
     async fn submit_signed_tm(&self, tx_bytes: &[u8]) -> EpochResult<()> {
         self.submitted_txs.lock().unwrap().push(tx_bytes.to_vec());
+        if let Some(rpc) = &self.btc_rpc {
+            broadcast_btc_tx(rpc, tx_bytes).await?;
+        }
         Ok(())
     }
 }

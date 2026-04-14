@@ -17,10 +17,10 @@ use async_trait::async_trait;
 use bitcoin::consensus::deserialize;
 use bitcoin::Transaction;
 use blockfrost::{BlockFrostSettings, BlockfrostAPI, Pagination};
-use reqwest;
 
 use pallas_wallet::PrivateKey;
 
+use crate::cardano::btc_rpc::{broadcast_btc_tx, BtcRpcConfig};
 use crate::cardano::publish::{build_oracle_update_tx, WalletUtxo};
 use crate::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 use crate::cardano::treasury_datum::TreasuryConfig;
@@ -56,13 +56,6 @@ pub struct BlockfrostCardanoChain {
     /// When set, `submit_signed_tm` sends the signed BTC tx via
     /// `sendrawtransaction` instead of posting to the Cardano oracle.
     btc_rpc: Option<BtcRpcConfig>,
-}
-
-#[derive(Clone)]
-struct BtcRpcConfig {
-    url: String,
-    user: Option<String>,
-    pass: Option<String>,
 }
 
 impl BlockfrostCardanoChain {
@@ -342,49 +335,3 @@ impl CardanoChain for BlockfrostCardanoChain {
     }
 }
 
-/// Broadcast a raw Bitcoin transaction to a bitcoind node via JSON-RPC
-/// (`sendrawtransaction`). Used for direct regtest debugging instead of
-/// routing through the Cardano oracle.
-async fn broadcast_btc_tx(rpc: &BtcRpcConfig, tx_bytes: &[u8]) -> EpochResult<()> {
-    let tx_hex = hex::encode(tx_bytes);
-    eprintln!(
-        "[btc-rpc] broadcasting tx ({} bytes) to {}",
-        tx_bytes.len(),
-        rpc.url
-    );
-
-    let body = serde_json::json!({
-        "jsonrpc": "1.0",
-        "id": "heimdall",
-        "method": "sendrawtransaction",
-        "params": [tx_hex]
-    });
-
-    let mut req = reqwest::Client::new().post(&rpc.url).json(&body);
-    if let (Some(user), Some(pass)) = (&rpc.user, &rpc.pass) {
-        req = req.basic_auth(user, Some(pass));
-    }
-
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| EpochError::Chain(format!("btc rpc request: {e}")))?;
-
-    let status = resp.status();
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| EpochError::Chain(format!("btc rpc response parse: {e}")))?;
-
-    if let Some(err) = json.get("error").filter(|e| !e.is_null()) {
-        return Err(EpochError::Chain(format!("btc rpc error: {err}")));
-    }
-
-    if !status.is_success() {
-        return Err(EpochError::Chain(format!("btc rpc HTTP {status}: {json}")));
-    }
-
-    let txid = json.get("result").and_then(|r| r.as_str()).unwrap_or("?");
-    eprintln!("[btc-rpc] broadcast accepted: txid = {txid}");
-    Ok(())
-}
