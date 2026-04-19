@@ -210,6 +210,16 @@ fn main() {
             if let Some(ref v) = cardano_mnemonic {
                 cfg.cardano.mnemonic = Some(v.clone());
             }
+            // Env var fallback: keep the real seed out of heimdall.toml
+            // and the repo. Precedence: CLI --cardano-mnemonic > TOML
+            // cardano.mnemonic > $HEIMDALL_MNEMONIC.
+            if cfg.cardano.mnemonic.is_none() {
+                if let Ok(v) = std::env::var("HEIMDALL_MNEMONIC") {
+                    if !v.trim().is_empty() {
+                        cfg.cardano.mnemonic = Some(v);
+                    }
+                }
+            }
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(run_demo(cfg, index, deterministic));
