@@ -16,6 +16,9 @@ network = "regtest"
 fee_rate_sat_per_vb = 1
 per_pegout_fee_sat = 1000
 federation_csv_blocks = 144
+# Depositor refund timelock in BTC blocks (peg-in Taproot refund leaf).
+# Spec default 4320 (~30 days); reduce for testnet4/preprod.
+pegin_refund_timeout_blocks = 4320
 # 32-byte hex seeds for deterministic demo keys.
 # In production these come from the on-chain treasury oracle.
 y_67_seed_hex = "6767676767676767676767676767676767676767676767676767676767676767"

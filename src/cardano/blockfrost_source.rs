@@ -2,12 +2,12 @@
 //!
 //! Uses the `blockfrost` crate's `BlockfrostAPI` client and OpenAPI
 //! types. Server-side asset filtering via `addresses_utxos_asset`
-//! keeps bandwidth low; inline datum decoding uses the same pallas
-//! `PlutusData::BoundedBytes` path as the N2C source.
+//! keeps bandwidth low. The source does NOT decode the inline datum —
+//! it hands the raw CBOR bytes to `parse_pegin_request`, which knows
+//! the `PegInDatum` Constr shape.
 
 use async_trait::async_trait;
 use blockfrost::{BlockFrostSettings, BlockfrostAPI, Pagination};
-use pallas_primitives::PlutusData;
 
 use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInRequest, CardanoPegInSource};
 use crate::epoch::state::{EpochError, EpochResult};
@@ -60,20 +60,14 @@ impl CardanoPegInSource for BlockfrostPegInSource {
         let mut out = Vec::new();
         for utxo in utxos {
             // Inline datum: Blockfrost returns the CBOR as a hex string.
+            // We pass the raw bytes through — the parser decodes the
+            // Constr shape.
             let Some(datum_hex) = &utxo.inline_datum else {
                 continue;
             };
-            let datum_bytes = match hex::decode(datum_hex) {
+            let datum_cbor = match hex::decode(datum_hex) {
                 Ok(b) => b,
                 Err(_) => continue,
-            };
-            let plutus: PlutusData = match pallas_codec::minicbor::decode(&datum_bytes) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let btc_tx_bytes: Vec<u8> = match plutus {
-                PlutusData::BoundedBytes(b) => b.into(),
-                _ => continue,
             };
 
             let tx_hash_bytes = match hex::decode(&utxo.tx_hash) {
@@ -90,7 +84,7 @@ impl CardanoPegInSource for BlockfrostPegInSource {
                     tx_hash: tx_hash_bytes,
                     output_index: utxo.output_index as u32,
                 },
-                btc_tx_bytes,
+                datum_cbor,
             });
         }
 

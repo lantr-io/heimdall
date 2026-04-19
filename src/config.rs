@@ -89,6 +89,10 @@ pub struct BitcoinConfig {
     pub treasury_txid: Option<String>,
     pub treasury_vout: Option<u32>,
     pub treasury_amount_sat: Option<u64>,
+    /// Depositor refund timelock (BTC blocks) in the peg-in Taproot's
+    /// refund leaf. Spec default 4320 (~30 days); override for
+    /// testnet4/preprod which use shorter timeouts.
+    pub pegin_refund_timeout_blocks: u16,
 }
 
 impl Default for BitcoinConfig {
@@ -107,6 +111,7 @@ impl Default for BitcoinConfig {
             treasury_txid: None,
             treasury_vout: None,
             treasury_amount_sat: None,
+            pegin_refund_timeout_blocks: 4320,
         }
     }
 }
@@ -239,6 +244,7 @@ impl HeimdallConfig {
                 self.protocol.pegin_collection_window_secs,
             ),
             pegin_poll_interval: Duration::from_millis(self.protocol.pegin_poll_interval_ms),
+            pegin_refund_timeout_blocks: self.bitcoin.pegin_refund_timeout_blocks,
         }
     }
 }
@@ -336,5 +342,9 @@ fee_rate_sat_per_vb = 5
             demo.pegin_collection_window
         );
         assert_eq!(epoch.pegin_poll_interval, demo.pegin_poll_interval);
+        assert_eq!(
+            epoch.pegin_refund_timeout_blocks,
+            demo.pegin_refund_timeout_blocks
+        );
     }
 }

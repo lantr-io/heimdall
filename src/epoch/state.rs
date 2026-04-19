@@ -320,6 +320,10 @@ pub struct EpochConfig {
     pub pegin_collection_window: Duration,
     /// Interval between successive peg-in polls inside the window.
     pub pegin_poll_interval: Duration,
+    /// Depositor refund timelock (BTC blocks) baked into the peg-in
+    /// Taproot's depositor refund leaf. Spec default is 4320 (~30 days);
+    /// testnet4/preprod typically use a smaller value.
+    pub pegin_refund_timeout_blocks: u16,
 }
 
 impl EpochConfig {
@@ -340,6 +344,7 @@ impl EpochConfig {
             pegin_policy_id: [0u8; 28],
             pegin_collection_window: Duration::from_secs(5),
             pegin_poll_interval: Duration::from_millis(1000),
+            pegin_refund_timeout_blocks: 4320,
         }
     }
 }

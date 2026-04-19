@@ -3,8 +3,8 @@
 //! Connects to a local Cardano node's Unix socket, runs
 //! `LocalStateQuery::GetUTxOByAddress` against the configured peg-in
 //! script address, filters the returned UTxOs by policy ID, and
-//! extracts each inline datum's `PlutusData::BoundedBytes` payload as
-//! the raw Bitcoin tx bytes.
+//! hands each inline datum's raw CBOR bytes to the parser (which
+//! decodes the `PegInDatum` Constr shape).
 //!
 //! See `tests/pallas_spike.rs` for the compile-time API shape this
 //! module mirrors.
@@ -19,7 +19,6 @@ use pallas_network::facades::NodeClient;
 use pallas_network::miniprotocols::localstate::queries_v16::{
     self, Addrs, TransactionOutput, Value,
 };
-use pallas_primitives::PlutusData;
 use tokio::sync::Mutex;
 
 use crate::cardano::pegin_source::{
@@ -127,20 +126,13 @@ impl CardanoPegInSource for PallasPegInSource {
             }
 
             // Inline datum: `(Era, TagWrap<Bytes, 24>)`; the tag-wrapped
-            // bytes are CBOR-encoded `PlutusData`.
+            // bytes are CBOR-encoded `PlutusData`. We pass them through
+            // raw — the parser knows the `PegInDatum` Constr shape.
             let Some((_datum_era, tag_wrap)) = &post.inline_datum else {
                 continue;
             };
-            let datum_cbor: &[u8] = tag_wrap.as_ref();
-            let plutus: PlutusData = match pallas_codec::minicbor::decode(datum_cbor) {
-                Ok(p) => p,
-                Err(_) => continue, // malformed datum — drop
-            };
-            let btc_tx_bytes: Vec<u8> = match plutus {
-                PlutusData::BoundedBytes(b) => b.into(),
-                // Any other datum shape is not a v0.2 peg-in payload.
-                _ => continue,
-            };
+            let datum_slice: &[u8] = tag_wrap.as_ref();
+            let datum_cbor: Vec<u8> = datum_slice.to_vec();
 
             let tx_hash: [u8; 32] = (*utxo.transaction_id).into();
             let output_index: u64 = (&utxo.index).into();
@@ -156,7 +148,7 @@ impl CardanoPegInSource for PallasPegInSource {
                     tx_hash,
                     output_index,
                 },
-                btc_tx_bytes,
+                datum_cbor,
             });
         }
 

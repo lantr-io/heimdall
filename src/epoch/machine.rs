@@ -203,7 +203,8 @@ async fn publish_keys_phase(
 // ---------------------------------------------------------------------------
 
 /// Poll the Cardano peg-in source over `config.pegin_collection_window`,
-/// parsing each observed request against the current treasury scriptPubKey.
+/// parsing each observed request against the spec-derived peg-in
+/// Taproot for the current (Y_51, Y_fed, timeouts, depositor_pkh).
 /// Parse failures are logged and dropped. The deduped, parsed set is
 /// frozen into the next `BuildTm` phase.
 async fn collect_pegins_phase(
@@ -217,18 +218,12 @@ async fn collect_pegins_phase(
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
 
-    // Compute the current treasury scriptPubKey so the parser can locate
-    // the unique output in each submitted BTC tx that pays to us.
+    // Pull current Y_51 / Y_fed / fed-timeout from the on-chain
+    // treasury state. The peg-in Taproot Q is derived per-depositor
+    // inside `parse_pegin_request` using the OP_RETURN beacon pkh.
     let treasury = chain.query_treasury().await?;
-    let secp = Secp256k1::new();
-    let treasury_spend = treasury_spend_info(
-        &secp,
-        treasury.y_51,
-        treasury.y_67,
-        treasury.y_fed,
-        treasury.federation_csv_blocks as u16,
-    );
-    let treasury_script = bitcoin::ScriptBuf::new_p2tr_tweaked(treasury_spend.output_key());
+    let fed_timeout = treasury.federation_csv_blocks as u16;
+    let refund_timeout = config.pegin_refund_timeout_blocks;
 
     let deadline = clock.deadline(config.pegin_collection_window);
     let mut accepted: BTreeMap<CardanoOutRef, ParsedPegIn> = BTreeMap::new();
@@ -247,7 +242,13 @@ async fn collect_pegins_phase(
             if accepted.contains_key(&req.cardano_utxo) {
                 continue;
             }
-            match parse_pegin_request(&req, &treasury_script) {
+            match parse_pegin_request(
+                &req,
+                treasury.y_51,
+                treasury.y_fed,
+                fed_timeout,
+                refund_timeout,
+            ) {
                 Ok(parsed) => {
                     accepted.insert(req.cardano_utxo.clone(), parsed);
                 }

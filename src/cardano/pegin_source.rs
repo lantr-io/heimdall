@@ -27,17 +27,18 @@ pub struct CardanoOutRef {
 }
 
 /// A peg-in request as seen on Cardano: the UTxO that carries it and
-/// the raw datum payload (a serialized `bitcoin::Transaction`).
+/// the raw CBOR bytes of its inline datum (`PegInDatum` Constr).
 #[derive(Debug, Clone)]
 pub struct CardanoPegInRequest {
     /// The Cardano UTxO carrying this request. Used for dedupe across
     /// poll rounds and, eventually, for spending the request UTxO
     /// when the peg-in completes.
     pub cardano_utxo: CardanoOutRef,
-    /// Raw bytes of the depositor's Bitcoin transaction, extracted
-    /// verbatim from the datum. The parser in `pegin_datum.rs` is
-    /// responsible for turning these into a validated `ParsedPegIn`.
-    pub btc_tx_bytes: Vec<u8>,
+    /// Raw CBOR-encoded inline datum. `parse_pegin_request` in
+    /// `pegin_datum.rs` decodes this as a Plutus `Constr 0 [...]`
+    /// matching the Aiken `PegInDatum` type and extracts the raw BTC
+    /// tx from field index 1 (`source_chain_peg_in_raw_tx`).
+    pub datum_cbor: Vec<u8>,
 }
 
 #[async_trait]

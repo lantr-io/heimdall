@@ -75,7 +75,7 @@ mod tests {
                 tx_hash: [tag; 32],
                 output_index: 0,
             },
-            btc_tx_bytes: vec![tag],
+            datum_cbor: vec![tag],
         }
     }
 
