@@ -26,7 +26,7 @@ y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 rpc_url = "http://127.0.0.1:18443"
 rpc_user = "bitcoin"
 rpc_pass = "bitcoin"
-submit = true          # broadcast signed BTC tx to rpc_url
+submit = false          # broadcast signed BTC tx to rpc_url
 # FROST treasury UTXO: funded at the all-same-key address (Y_fed=Y_67=Y_51=FROST group key)
 # (bcrt1p8009hhk29r067ygrd0xw42dp4ltg0ensn5wrxcngf0qkmv090atssrem7f)
 treasury_txid = "478b7ae50b71603aca16c97d3ee974f98e4ecc55b875fe34fe3cd6afc97f1317"
@@ -39,8 +39,8 @@ blockfrost_project_id = "preprodsTOaoyjcqGmy4SOSazxuHkbuXFOOkp8f"
 # network_magic = 1
 # pegin_script_address = "addr_test1..."
 # pegin_policy_id = "abcdef..."
-treasury_address = "addr_test1wqvxuvh64q9zdqgrjt76d42eclk5wgdxtnsun4808cwg0dqxy2mj0"
-treasury_policy_id = "186e32faa80a26810392fda6d559c7ed4721a65ce1c9d4ef3e1c87b4"
+treasury_address = "addr_test1wr40m3xewve8t5lqdnl9le22z0ll8wjm42xk2cmzvpfhjpcum5nzx"
+treasury_policy_id = "eafdc4d9733275d3e06cfe5fe54a13fff3ba5baa8d65636260537907"
 treasury_asset_name = "544d5478"
 # mnemonic is loaded from $HEIMDALL_MNEMONIC (see .env, gitignored).
 # Setting mnemonic here would override the env var.
