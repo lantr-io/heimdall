@@ -41,7 +41,6 @@ impl Default for HeimdallConfig {
 pub struct ProtocolConfig {
     pub dkg_round_timeout_secs: u64,
     pub poll_interval_ms: u64,
-    pub quorum67_timeout_secs: u64,
     pub quorum51_timeout_secs: u64,
     pub federation_timeout_secs: u64,
     pub leader_timeout_secs: u64,
@@ -54,7 +53,6 @@ impl Default for ProtocolConfig {
         Self {
             dkg_round_timeout_secs: 300,
             poll_interval_ms: 5000,
-            quorum67_timeout_secs: 300,
             quorum51_timeout_secs: 300,
             federation_timeout_secs: 300,
             leader_timeout_secs: 10000,
@@ -74,8 +72,6 @@ pub struct BitcoinConfig {
     pub fee_rate_sat_per_vb: u64,
     pub per_pegout_fee_sat: u64,
     pub federation_csv_blocks: u32,
-    /// 32-byte hex seed for the Y_67 placeholder key.
-    pub y_67_seed_hex: String,
     /// 32-byte hex seed for the Y_federation key.
     pub y_fed_seed_hex: String,
     /// Optional bitcoind JSON-RPC endpoint for direct tx broadcast.
@@ -102,7 +98,6 @@ impl Default for BitcoinConfig {
             fee_rate_sat_per_vb: 1,
             per_pegout_fee_sat: 1000,
             federation_csv_blocks: 144,
-            y_67_seed_hex: hex::encode([0x67u8; 32]),
             y_fed_seed_hex: hex::encode([0xFEu8; 32]),
             rpc_url: None,
             rpc_user: None,
@@ -234,7 +229,6 @@ impl HeimdallConfig {
         EpochConfig {
             dkg_round_timeout: Duration::from_secs(self.protocol.dkg_round_timeout_secs),
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
-            quorum67_timeout: Duration::from_secs(self.protocol.quorum67_timeout_secs),
             quorum51_timeout: Duration::from_secs(self.protocol.quorum51_timeout_secs),
             federation_timeout: Duration::from_secs(self.protocol.federation_timeout_secs),
             leader_timeout: Duration::from_secs(self.protocol.leader_timeout_secs),
@@ -332,7 +326,6 @@ fee_rate_sat_per_vb = 5
 
         assert_eq!(epoch.dkg_round_timeout, demo.dkg_round_timeout);
         assert_eq!(epoch.poll_interval, demo.poll_interval);
-        assert_eq!(epoch.quorum67_timeout, demo.quorum67_timeout);
         assert_eq!(epoch.quorum51_timeout, demo.quorum51_timeout);
         assert_eq!(epoch.federation_timeout, demo.federation_timeout);
         assert_eq!(epoch.leader_timeout, demo.leader_timeout);

@@ -320,7 +320,6 @@ async fn build_tm_phase(
     let treasury_input_spend = treasury_spend_info(
         &secp,
         treasury.y_51,
-        treasury.y_67,
         treasury.y_fed,
         treasury.federation_csv_blocks as u16,
     );
@@ -331,7 +330,6 @@ async fn build_tm_phase(
     let change_spend = treasury_spend_info(
         &secp,
         new_y_51,
-        treasury.y_67,
         treasury.y_fed,
         treasury.federation_csv_blocks as u16,
     );
@@ -350,7 +348,6 @@ async fn build_tm_phase(
             spend_info: treasury_spend_info(
                 &secp,
                 treasury.y_51,
-                treasury.y_67,
                 treasury.y_fed,
                 treasury.federation_csv_blocks as u16,
             ),
@@ -402,7 +399,7 @@ async fn build_tm_phase(
     Ok(EpochPhase::Sign {
         epoch,
         roster,
-        cascade: CascadeLevel::Quorum67,
+        cascade: CascadeLevel::Quorum51,
         group_keys,
         tm,
         round: SigningRound::Round1,

@@ -21,15 +21,13 @@ src/bitcoin/
 pub fn treasury_spend_info(
     secp: &Secp256k1<All>,
     y_51: UntweakedPublicKey,
-    y_67: UntweakedPublicKey,
     y_federation: UntweakedPublicKey,
     federation_timeout: u16,
 ) -> TaprootSpendInfo
 ```
 
 Script tree:
-- Leaf 1 (depth 1): `<Y_67> OP_CHECKSIG`
-- Leaf 2 (depth 1): `<federation_timeout> OP_CSV OP_DROP <Y_federation> OP_CHECKSIG`
+- Leaf 1 (depth 0): `<federation_timeout> OP_CSV OP_DROP <Y_federation> OP_CHECKSIG`
 - Internal key: `Y_51`
 
 ### Peg-in Taproot tree
@@ -228,7 +226,7 @@ No other new dependencies. The `bitcoin` crate bundles `bitcoin_hashes` and `sec
 
 ## 1. Approach Rationale
 
-The epoch orchestrator must track which phase an SPO is in across a ~5-day Cardano epoch, enforce per-phase deadlines, handle the 67%→51%→federation signing cascade, and abstract external dependencies for testability.
+The epoch orchestrator must track which phase an SPO is in across a ~5-day Cardano epoch, enforce per-phase deadlines, handle the 51%→federation signing cascade, and abstract external dependencies for testability.
 
 > **Note:** Persistent state storage (sled) and crash recovery are deferred to Specification v0.3.
 
@@ -303,7 +301,7 @@ pub enum EpochPhase {
 pub enum DkgRound { Round1, Round2, Part3 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CascadeLevel { Quorum67, Quorum51, Federation }
+pub enum CascadeLevel { Quorum51, Federation }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SigningRound { Round1, Round2 }
@@ -438,7 +436,6 @@ The signing cascade handles progressive fallback when quorum thresholds are not 
 ```rust
 async fn sign_phase(..., cascade: CascadeLevel, ...) -> EpochPhase {
     let (signers, timeout) = match cascade {
-        Quorum67 => (roster.signers_67(), config.quorum67_timeout),
         Quorum51 => (roster.signers_51(), config.quorum51_timeout),
         Federation => (roster.federation(), config.federation_timeout),
     };
@@ -452,7 +449,6 @@ async fn sign_phase(..., cascade: CascadeLevel, ...) -> EpochPhase {
         }
         _ = tokio::time::sleep_until(clock.deadline(timeout)) => {
             match cascade {
-                Quorum67 => EpochPhase::Sign { cascade: Quorum51, round: Round1, .. },
                 Quorum51 => EpochPhase::Sign { cascade: Federation, round: Round1, .. },
                 Federation => panic!("federation timeout -- critical failure"),
             }
@@ -521,7 +517,6 @@ FROST nonces MUST NOT be reused. In v0.2, nonces are held in memory only — gen
 pub struct EpochConfig {
     pub dkg_round_timeout: Duration,      // 5 min per round
     pub poll_interval: Duration,           // 500ms
-    pub quorum67_timeout: Duration,        // ~24h
     pub quorum51_timeout: Duration,        // ~24h
     pub federation_timeout: Duration,      // ~24h (CSV timelock)
     pub leader_timeout: Duration,          // 60s per cascade level
@@ -573,7 +568,7 @@ pub struct EpochConfig {
 
 **Files**: `src/epoch/signing.rs`
 
-- `sign_phase()` with cascade levels (67% → 51% → federation)
+- `sign_phase()` with cascade levels (51% → federation)
 - `run_frost_signing()` with JoinSet for parallel per-input rounds
 - Uses existing `frost::participant::sign_round1/2/aggregate`
 - **Test**: happy path signing, cascade timeout fallback

@@ -554,3 +554,42 @@ One TM per epoch. It sweeps all confirmed peg-ins, fulfills all pending peg-outs
 ### Trade-off
 
 Depositors and withdrawers wait up to one full epoch (~5 days) plus Bitcoin confirmation time (~17 hours) for their operations to complete. This is acceptable per Bifrost's design goal of prioritizing security over speed.
+
+---
+
+## DEC-021: Remove 67% Quorum Tier from Signing Cascade
+
+**Date:** 2026-04-22
+**Decision:** Signing cascade is two-mode (51% → federation); drop `Y_67` leaf, `CascadeLevel::Quorum67`, and `quorum67_timeout`.
+**Status:** Accepted
+
+### Context
+
+The Bifrost technical documentation previously described a three-mode signing cascade: 67% → 51% → federation. The current documentation describes it as two-mode: 51% → federation. The main design text throughout `technical_documentation.md` consistently uses the two-mode form (§1.3 glossary, §2 architecture, §3 participants, §7 flows).
+
+Heimdall's implementation carried the three-mode form across ~12 files: a `Y_67` leaf in the treasury Taproot tree, a `y_67` field on `TreasuryUtxo`/`TreasuryConfig`, a `CascadeLevel::Quorum67` enum variant, a `quorum67_timeout` config field, and a `y_67_seed_hex` in the demo TOML.
+
+### Decision
+
+- Treasury Taproot tree: internal key `Y_51` + single federation-CSV leaf. No `Y_67` leaf.
+- `CascadeLevel` enum variants: `Quorum51`, `Federation` only.
+- `TreasuryUtxo` / `TreasuryConfig` / `StaticFixture`: drop `y_67` field.
+- `EpochConfig` / `ProtocolConfig`: drop `quorum67_timeout`.
+- `BitcoinConfig`: drop `y_67_seed_hex`.
+
+### Rationale
+
+- **Alignment with spec.** Heimdall implements the Bifrost spec. When the spec changed, the code had to follow.
+- **Pure code refactor.** The on-chain Plutus datum does not encode treasury keys (they come from `TreasuryConfig`), so no datum migration is required.
+- **Cascade is still placeholder.** `sign_phase` does not yet implement any cascade failover — removing the unused `Quorum67` variant is a simplification, not a regression.
+
+### Trade-off / Known Impact
+
+Removing the `Y_67` leaf changes the merkle root → the Taproot tweak → the treasury output key → the on-chain treasury address. Any BTC held at the current preprod treasury address is stranded under the new derivation. Operationally either (a) treat preprod state as reset and re-fund, or (b) do a one-off sweep from the old address to the new one under the existing `Y_51 = Y_fed` key-path before deploying.
+
+Existing `heimdall.toml` files with `y_67_seed_hex` / `quorum67_timeout_secs` become silent no-ops (serde ignores unknown fields with `#[serde(default)]`). Operators should prune the stale fields.
+
+### Reference
+
+- Design doc: `docs/superpowers/specs/2026-04-22-remove-67-percent-design.md`
+- Driver: `../ft-bifrost-bridge/documentation/technical_documentation.md` (cascade now `51% → federation`).

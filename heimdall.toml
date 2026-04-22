@@ -4,7 +4,6 @@
 [protocol]
 dkg_round_timeout_secs = 300
 poll_interval_ms = 5000
-quorum67_timeout_secs = 300
 quorum51_timeout_secs = 300
 federation_timeout_secs = 300
 leader_timeout_secs = 10000
@@ -19,15 +18,14 @@ federation_csv_blocks = 144
 # Depositor refund timelock in BTC blocks (peg-in Taproot refund leaf).
 # Production spec is 4320 (~30 days); demo simplification uses 720 (~5 days).
 pegin_refund_timeout_blocks = 720
-# 32-byte hex seeds for deterministic demo keys.
-# In production these come from the on-chain treasury oracle.
-y_67_seed_hex = "6767676767676767676767676767676767676767676767676767676767676767"
+# 32-byte hex seed for the deterministic demo federation key.
+# In production this comes from the on-chain treasury oracle.
 y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe"
 rpc_url = "http://127.0.0.1:18443"
 rpc_user = "bitcoin"
 rpc_pass = "bitcoin"
 submit = false          # broadcast signed BTC tx to rpc_url
-# FROST treasury UTXO: funded at the all-same-key address (Y_fed=Y_67=Y_51=FROST group key)
+# FROST treasury UTXO: funded at the all-same-key address (Y_fed=Y_51=FROST group key)
 # (bcrt1p8009hhk29r067ygrd0xw42dp4ltg0ensn5wrxcngf0qkmv090atssrem7f)
 treasury_txid = "478b7ae50b71603aca16c97d3ee974f98e4ecc55b875fe34fe3cd6afc97f1317"
 treasury_vout = 0

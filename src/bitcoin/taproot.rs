@@ -14,14 +14,6 @@ use bitcoin::{script, ScriptBuf};
 // Script builders
 // ---------------------------------------------------------------------------
 
-/// `<pubkey> OP_CHECKSIG`
-fn build_checksig_script(pubkey: UntweakedPublicKey) -> ScriptBuf {
-    script::Builder::new()
-        .push_x_only_key(&pubkey)
-        .push_opcode(OP_CHECKSIG)
-        .into_script()
-}
-
 /// `<timeout> OP_CSV OP_DROP <pubkey> OP_CHECKSIG`
 fn build_csv_checksig_script(timeout: u16, pubkey: UntweakedPublicKey) -> ScriptBuf {
     script::Builder::new()
@@ -42,23 +34,18 @@ fn build_csv_checksig_script(timeout: u16, pubkey: UntweakedPublicKey) -> Script
 /// ```text
 /// Internal key: Y_51 (51% quorum — key-path spend)
 /// Script tree:
-///   Leaf 1 (depth 1): <Y_67> OP_CHECKSIG
-///   Leaf 2 (depth 1): <federation_timeout> OP_CSV OP_DROP <Y_federation> OP_CHECKSIG
+///   Leaf 1 (depth 0): <federation_timeout> OP_CSV OP_DROP <Y_federation> OP_CHECKSIG
 /// ```
 pub fn treasury_spend_info(
     secp: &Secp256k1<All>,
     y_51: UntweakedPublicKey,
-    y_67: UntweakedPublicKey,
     y_federation: UntweakedPublicKey,
     federation_timeout: u16,
 ) -> TaprootSpendInfo {
-    let leaf1 = build_checksig_script(y_67);
-    let leaf2 = build_csv_checksig_script(federation_timeout, y_federation);
+    let leaf = build_csv_checksig_script(federation_timeout, y_federation);
 
     bitcoin::taproot::TaprootBuilder::new()
-        .add_leaf(1, leaf1)
-        .expect("valid leaf")
-        .add_leaf(1, leaf2)
+        .add_leaf(0, leaf)
         .expect("valid leaf")
         .finalize(secp, y_51)
         .expect("finalizable tree")
@@ -101,20 +88,19 @@ mod tests {
         kp.x_only_public_key().0
     }
 
-    fn test_keys() -> (UntweakedPublicKey, UntweakedPublicKey, UntweakedPublicKey) {
+    fn test_keys() -> (UntweakedPublicKey, UntweakedPublicKey) {
         let y_51 = xonly_from_seed([1u8; 32]);
-        let y_67 = xonly_from_seed([2u8; 32]);
         let y_fed = xonly_from_seed([3u8; 32]);
-        (y_51, y_67, y_fed)
+        (y_51, y_fed)
     }
 
     #[test]
     fn test_treasury_spend_info_deterministic() {
         let secp = Secp256k1::new();
-        let (y_51, y_67, y_fed) = test_keys();
+        let (y_51, y_fed) = test_keys();
 
-        let si1 = treasury_spend_info(&secp, y_51, y_67, y_fed, 144);
-        let si2 = treasury_spend_info(&secp, y_51, y_67, y_fed, 144);
+        let si1 = treasury_spend_info(&secp, y_51, y_fed, 144);
+        let si2 = treasury_spend_info(&secp, y_51, y_fed, 144);
 
         assert_eq!(si1.output_key(), si2.output_key());
         assert_eq!(si1.merkle_root(), si2.merkle_root());
@@ -123,7 +109,7 @@ mod tests {
     #[test]
     fn test_pegin_spend_info_deterministic() {
         let secp = Secp256k1::new();
-        let (_, _, y_fed) = test_keys();
+        let (_, y_fed) = test_keys();
         let depositor = xonly_from_seed([0xAB; 32]);
 
         let si1 = pegin_spend_info(&secp, y_fed, depositor, 720);
@@ -136,10 +122,10 @@ mod tests {
     #[test]
     fn test_treasury_vs_pegin_different() {
         let secp = Secp256k1::new();
-        let (y_51, y_67, y_fed) = test_keys();
+        let (y_51, y_fed) = test_keys();
         let depositor = xonly_from_seed([0xAB; 32]);
 
-        let treasury = treasury_spend_info(&secp, y_51, y_67, y_fed, 144);
+        let treasury = treasury_spend_info(&secp, y_51, y_fed, 144);
         let pegin = pegin_spend_info(&secp, y_fed, depositor, 720);
 
         assert_ne!(treasury.output_key(), pegin.output_key());
@@ -148,29 +134,23 @@ mod tests {
     #[test]
     fn test_treasury_script_leaves() {
         let secp = Secp256k1::new();
-        let (y_51, y_67, y_fed) = test_keys();
-        let si = treasury_spend_info(&secp, y_51, y_67, y_fed, 144);
+        let (y_51, y_fed) = test_keys();
+        let si = treasury_spend_info(&secp, y_51, y_fed, 144);
 
-        // Verify that both expected scripts are present in the script map
-        let checksig = build_checksig_script(y_67);
         let csv_checksig = build_csv_checksig_script(144, y_fed);
 
         let script_map = si.script_map();
         assert!(
-            script_map.keys().any(|(s, _)| *s == checksig),
-            "checksig leaf not found in script map"
-        );
-        assert!(
             script_map.keys().any(|(s, _)| *s == csv_checksig),
             "csv+checksig leaf not found in script map"
         );
-        assert_eq!(script_map.len(), 2, "expected exactly 2 script leaves");
+        assert_eq!(script_map.len(), 1, "expected exactly 1 script leaf");
     }
 
     #[test]
     fn test_pegin_script_leaves() {
         let secp = Secp256k1::new();
-        let (_, _, y_fed) = test_keys();
+        let (_, y_fed) = test_keys();
         let depositor = xonly_from_seed([0xAB; 32]);
         let si = pegin_spend_info(&secp, y_fed, depositor, 720);
 

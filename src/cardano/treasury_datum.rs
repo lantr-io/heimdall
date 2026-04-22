@@ -23,7 +23,6 @@ pub struct TreasuryConfig {
     /// equals `y_fed`; in steady state it is the previous epoch's FROST
     /// group x-only key.
     pub y_51: bitcoin::key::UntweakedPublicKey,
-    pub y_67: bitcoin::key::UntweakedPublicKey,
     pub y_fed: bitcoin::key::UntweakedPublicKey,
     pub federation_csv_blocks: u32,
     pub fee_rate_sat_per_vb: u64,
@@ -77,7 +76,6 @@ pub fn treasury_from_btc_tx_bytes(
         outpoint: OutPoint { txid, vout: 0 },
         value: out.value,
         y_51: config.y_51,
-        y_67: config.y_67,
         y_fed: config.y_fed,
         federation_csv_blocks: config.federation_csv_blocks,
         fee_rate_sat_per_vb: config.fee_rate_sat_per_vb,
@@ -137,7 +135,6 @@ pub fn parse_treasury_datum(
         outpoint: OutPoint { txid, vout: 0 },
         value: out.value,
         y_51: config.y_51,
-        y_67: config.y_67,
         y_fed: config.y_fed,
         federation_csv_blocks: config.federation_csv_blocks,
         fee_rate_sat_per_vb: config.fee_rate_sat_per_vb,
@@ -154,14 +151,6 @@ mod tests {
 
     fn demo_config() -> TreasuryConfig {
         let secp = bitcoin::key::Secp256k1::new();
-        let y_67 = bitcoin::key::UntweakedPublicKey::from_slice(
-            &bitcoin::secp256k1::SecretKey::from_slice(&[0x67u8; 32])
-                .unwrap()
-                .x_only_public_key(&secp)
-                .0
-                .serialize(),
-        )
-        .unwrap();
         let y_fed = bitcoin::key::UntweakedPublicKey::from_slice(
             &bitcoin::secp256k1::SecretKey::from_slice(&[0xFEu8; 32])
                 .unwrap()
@@ -172,7 +161,6 @@ mod tests {
         .unwrap();
         TreasuryConfig {
             y_51: y_fed, // bootstrap: internal key = federation
-            y_67,
             y_fed,
             federation_csv_blocks: 144,
             fee_rate_sat_per_vb: 1,

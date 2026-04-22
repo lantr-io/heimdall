@@ -118,7 +118,7 @@ enum Commands {
         #[arg(long)]
         federation_csv_blocks: Option<u16>,
     },
-    /// Print the FROST group treasury address (Y_fed = Y_51 = Y_67 = FROST key).
+    /// Print the FROST group treasury address (Y_fed = Y_51 = FROST key).
     /// Runs a deterministic DKG to derive the group key, then prints the P2TR address.
     FrostTreasury {
         /// Path to a TOML configuration file.
@@ -285,7 +285,6 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
     if let Some(project_id) = cfg.cardano.blockfrost_project_id.as_deref() {
         let treasury_config = TreasuryConfig {
             y_51: fixture.y_51,
-            y_67: fixture.y_67,
             y_fed: fixture.y_fed,
             federation_csv_blocks: fixture.federation_csv_blocks,
             fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
@@ -454,23 +453,11 @@ fn print_bootstrap_treasury(cfg: &HeimdallConfig) {
 
     let secp = Secp256k1::new();
 
-    let y_67_seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_67_seed_hex)
-        .expect("bitcoin.y_67_seed_hex must be valid hex")
-        .try_into()
-        .expect("bitcoin.y_67_seed_hex must be 32 bytes");
     let y_fed_seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_fed_seed_hex)
         .expect("bitcoin.y_fed_seed_hex must be valid hex")
         .try_into()
         .expect("bitcoin.y_fed_seed_hex must be 32 bytes");
 
-    let y_67 = UntweakedPublicKey::from_slice(
-        &SecretKey::from_slice(&y_67_seed)
-            .unwrap()
-            .x_only_public_key(&secp)
-            .0
-            .serialize(),
-    )
-    .unwrap();
     let y_fed = UntweakedPublicKey::from_slice(
         &SecretKey::from_slice(&y_fed_seed)
             .unwrap()
@@ -484,7 +471,7 @@ fn print_bootstrap_treasury(cfg: &HeimdallConfig) {
     let csv_blocks = cfg.bitcoin.federation_csv_blocks as u16;
 
     // At bootstrap Y_51 = Y_fed.
-    let spend_info = treasury_spend_info(&secp, y_fed, y_67, y_fed, csv_blocks);
+    let spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv_blocks);
     let output_key = spend_info.output_key();
     let script_pubkey = ScriptBuf::new_p2tr_tweaked(output_key);
     let address = Address::from_script(&script_pubkey, network)
@@ -493,7 +480,7 @@ fn print_bootstrap_treasury(cfg: &HeimdallConfig) {
     println!("{address}");
 }
 
-/// Print the treasury Taproot address when Y_fed = Y_67 = Y_51 = FROST group key.
+/// Print the treasury Taproot address when Y_fed = Y_51 = FROST group key.
 ///
 /// `frost_key_hex` must be the 32-byte x-only FROST group key as hex.
 fn print_frost_treasury(cfg: &HeimdallConfig, frost_key_hex: Option<&str>) {
@@ -513,13 +500,13 @@ fn print_frost_treasury(cfg: &HeimdallConfig, frost_key_hex: Option<&str>) {
 
     println!("FROST group key (x-only): {}", hex::encode(group_key.serialize()));
 
-    // Y_fed = Y_67 = Y_51 = FROST group key
-    let spend_info = treasury_spend_info(&secp, group_key, group_key, group_key, csv_blocks);
+    // Y_fed = Y_51 = FROST group key
+    let spend_info = treasury_spend_info(&secp, group_key, group_key, csv_blocks);
     let output_key = spend_info.output_key();
     let script_pubkey = ScriptBuf::new_p2tr_tweaked(output_key);
     let address = Address::from_script(&script_pubkey, network).expect("valid P2TR address");
 
-    println!("Treasury address (Y_fed=Y_67=Y_51=FROST): {address}");
+    println!("Treasury address (Y_fed=Y_51=FROST): {address}");
     println!("Script pubkey: {}", hex::encode(script_pubkey.as_bytes()));
 }
 

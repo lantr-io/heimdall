@@ -173,17 +173,16 @@ pub enum SigningRound {
     Round2,
 }
 
-/// Signing cascade level (only `Quorum67` exercised in v0.2 first cycle).
+/// Signing cascade level (only `Quorum51` exercised in v0.2 first cycle).
 ///
-/// TODO: implement the `Quorum51` and `Federation` fallback paths. When
-/// `Quorum67` fails to collect a threshold of signatures within
-/// `EpochConfig::quorum67_timeout`, `sign_phase` should transition to
-/// `Quorum51`, and finally to `Federation` (script-path spend using the
-/// federation fallback leaf after `federation_csv_blocks`). Today the
-/// cascade is a type-level placeholder; `sign_phase` never demotes.
+/// TODO: implement the `Federation` fallback path. When `Quorum51` fails
+/// to collect a threshold of signatures within
+/// `EpochConfig::quorum51_timeout`, `sign_phase` should transition to
+/// `Federation` (script-path spend using the federation fallback leaf
+/// after `federation_csv_blocks`). Today the cascade is a type-level
+/// placeholder; `sign_phase` never demotes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CascadeLevel {
-    Quorum67,
     Quorum51,
     Federation,
 }
@@ -309,7 +308,6 @@ pub struct SpoIdentity {
 pub struct EpochConfig {
     pub dkg_round_timeout: Duration,
     pub poll_interval: Duration,
-    pub quorum67_timeout: Duration,
     pub quorum51_timeout: Duration,
     pub federation_timeout: Duration,
     pub leader_timeout: Duration,
@@ -336,7 +334,6 @@ impl EpochConfig {
         Self {
             dkg_round_timeout: Duration::from_secs(300),
             poll_interval: Duration::from_millis(5000),
-            quorum67_timeout: Duration::from_secs(300),
             quorum51_timeout: Duration::from_secs(300),
             federation_timeout: Duration::from_secs(300),
             leader_timeout: Duration::from_secs(10000),

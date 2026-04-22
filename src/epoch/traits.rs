@@ -54,8 +54,6 @@ pub struct TreasuryUtxo {
     /// was locked under). At bootstrap this equals `y_fed`; after the
     /// first DKG it is the previous epoch's FROST group x-only key.
     pub y_51: bitcoin::key::UntweakedPublicKey,
-    /// The Taproot script-tree leaf key for the 67%-quorum script path.
-    pub y_67: bitcoin::key::UntweakedPublicKey,
     /// The Taproot script-tree leaf key for the federation fallback.
     pub y_fed: bitcoin::key::UntweakedPublicKey,
     pub federation_csv_blocks: u32,

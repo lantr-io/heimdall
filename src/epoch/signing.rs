@@ -25,12 +25,10 @@ use crate::http::payloads::{Sign1Payload, Sign2Payload};
 /// Drive one sub-round of the signing phase for all TM inputs.
 ///
 /// TODO: signing cascade is not implemented. Today `sign_phase` only
-/// exercises `CascadeLevel::Quorum67`; on timeout it returns `PollTimeout`
+/// exercises `CascadeLevel::Quorum51`; on timeout it returns `PollTimeout`
 /// and the state machine aborts. A real implementation should catch
-/// `PollTimeout` from `poll_sign_round{1,2}` and transition to
-/// `CascadeLevel::Quorum51`, rebuilding the signing session with the
-/// lower threshold, and ultimately fall through to `Federation`
-/// (script-path spend after `federation_csv_blocks`).
+/// `PollTimeout` from `poll_sign_round{1,2}` and fall through to
+/// `Federation` (script-path spend after `federation_csv_blocks`).
 ///
 /// TODO: misbehavior detection. FROST errors here currently surface as
 /// `EpochError::Frost(String)` with the identity lost. The identifiable
@@ -225,7 +223,7 @@ async fn poll_sign_round1(
     out: &mut BTreeMap<Identifier, frost::round1::SigningCommitments>,
 ) -> EpochResult<()> {
     let need = peer_infos.len() + out.len(); // self already present
-    let deadline = clock.deadline(config.quorum67_timeout);
+    let deadline = clock.deadline(config.quorum51_timeout);
     while out.len() < need {
         for peer in peer_infos {
             if out.contains_key(&peer.identifier) {
@@ -267,7 +265,7 @@ async fn poll_sign_round2(
     out: &mut BTreeMap<Identifier, frost::round2::SignatureShare>,
 ) -> EpochResult<()> {
     let need = peer_infos.len() + out.len();
-    let deadline = clock.deadline(config.quorum67_timeout);
+    let deadline = clock.deadline(config.quorum51_timeout);
     while out.len() < need {
         for peer in peer_infos {
             if out.contains_key(&peer.identifier) {
@@ -403,16 +401,8 @@ mod tests {
         let gk0 = &group_keys_all[0];
 
         // Build a 2-input TM where both inputs live under the group key's
-        // internal Y_51. Y_67 and Y_fed are unrelated placeholder keys.
+        // internal Y_51. Y_fed is an unrelated placeholder key.
         let y_51 = frost_vk_to_xonly(&gk0.verifying_key);
-        let y_67 = UntweakedPublicKey::from_slice(
-            &bitcoin::secp256k1::SecretKey::from_slice(&[7u8; 32])
-                .unwrap()
-                .x_only_public_key(&secp)
-                .0
-                .serialize(),
-        )
-        .unwrap();
         let y_fed = UntweakedPublicKey::from_slice(
             &bitcoin::secp256k1::SecretKey::from_slice(&[9u8; 32])
                 .unwrap()
@@ -422,8 +412,8 @@ mod tests {
         )
         .unwrap();
 
-        let treasury_spend = treasury_spend_info(&secp, y_51, y_67, y_fed, 144);
-        let pegin_spend = treasury_spend_info(&secp, y_51, y_67, y_fed, 144);
+        let treasury_spend = treasury_spend_info(&secp, y_51, y_fed, 144);
+        let pegin_spend = treasury_spend_info(&secp, y_51, y_fed, 144);
 
         let treasury_spk = ScriptBuf::new_p2tr_tweaked(treasury_spend.output_key());
         let unsigned = build_tm(
@@ -486,7 +476,7 @@ mod tests {
                 let mut phase = EpochPhase::Sign {
                     epoch: 0,
                     roster,
-                    cascade: CascadeLevel::Quorum67,
+                    cascade: CascadeLevel::Quorum51,
                     group_keys: gk,
                     tm,
                     round: SigningRound::Round1,

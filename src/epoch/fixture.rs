@@ -23,9 +23,6 @@ pub struct StaticFixture {
     /// Internal key (Y_51) of the current treasury. At bootstrap this
     /// equals `y_fed`.
     pub y_51: UntweakedPublicKey,
-    /// Placeholder Y_67 x-only key — not used for key-path spends but
-    /// committed to in the Taproot script tree.
-    pub y_67: UntweakedPublicKey,
     /// Placeholder Y_federation x-only key.
     pub y_fed: UntweakedPublicKey,
     /// Timeout (in Bitcoin blocks) before the federation fallback leaf
@@ -84,15 +81,7 @@ pub fn demo_static_fixture(
         participants,
     };
 
-    // Deterministic placeholder leaf keys.
-    let y_67 = UntweakedPublicKey::from_slice(
-        &SecretKey::from_slice(&[0x67u8; 32])
-            .unwrap()
-            .x_only_public_key(&secp)
-            .0
-            .serialize(),
-    )
-    .unwrap();
+    // Deterministic placeholder leaf key.
     let y_fed = UntweakedPublicKey::from_slice(
         &SecretKey::from_slice(&[0xFEu8; 32])
             .unwrap()
@@ -105,7 +94,6 @@ pub fn demo_static_fixture(
     StaticFixture {
         roster,
         y_51: y_fed, // bootstrap: internal key = federation
-        y_67,
         y_fed,
         federation_csv_blocks: 144,
         treasury_outpoint: OutPoint {
@@ -124,23 +112,11 @@ pub fn demo_static_fixture(
 pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
     let secp = Secp256k1::new();
 
-    let y_67_seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_67_seed_hex)
-        .expect("bitcoin.y_67_seed_hex must be valid hex")
-        .try_into()
-        .expect("bitcoin.y_67_seed_hex must be 32 bytes");
     let y_fed_seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_fed_seed_hex)
         .expect("bitcoin.y_fed_seed_hex must be valid hex")
         .try_into()
         .expect("bitcoin.y_fed_seed_hex must be 32 bytes");
 
-    let y_67 = UntweakedPublicKey::from_slice(
-        &SecretKey::from_slice(&y_67_seed)
-            .unwrap()
-            .x_only_public_key(&secp)
-            .0
-            .serialize(),
-    )
-    .unwrap();
     let y_fed = UntweakedPublicKey::from_slice(
         &SecretKey::from_slice(&y_fed_seed)
             .unwrap()
@@ -172,7 +148,6 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
             participants,
         },
         y_51: y_fed, // bootstrap: internal key = federation
-        y_67,
         y_fed,
         federation_csv_blocks: cfg.bitcoin.federation_csv_blocks,
         treasury_outpoint: {

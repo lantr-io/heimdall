@@ -333,9 +333,8 @@ mod tests {
     fn make_treasury_spend_info() -> TaprootSpendInfo {
         let secp = Secp256k1::new();
         let y_51 = xonly_from_seed([1u8; 32]);
-        let y_67 = xonly_from_seed([2u8; 32]);
         let y_fed = xonly_from_seed([3u8; 32]);
-        treasury_spend_info(&secp, y_51, y_67, y_fed, 144)
+        treasury_spend_info(&secp, y_51, y_fed, 144)
     }
 
     fn make_txid(b: u8) -> Txid {
@@ -688,10 +687,9 @@ mod tests {
             .expect("valid x-only pubkey");
 
         let secp = Secp256k1::new();
-        let y_67 = xonly_from_seed([2u8; 32]);
         let y_fed = xonly_from_seed([3u8; 32]);
 
-        let spend_info = treasury_spend_info(&secp, y_51, y_67, y_fed, 144);
+        let spend_info = treasury_spend_info(&secp, y_51, y_fed, 144);
         let treasury_script_pubkey = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
 
         // Build a simple TM: one treasury input, one pegout, change back
