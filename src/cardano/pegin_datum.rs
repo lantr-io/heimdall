@@ -9,14 +9,13 @@
 //!    `PegInDatum` record; field index 1 is the raw BTC tx. All other
 //!    datum fields are attacker-controlled noise and are ignored —
 //!    they will be removed from the spec later.
-//! 2. The BTC tx has exactly one `OP_RETURN "BFR" || depositor_pkh`
-//!    beacon output (spec § Peg-in deposit). This is how watchtowers
-//!    and SPOs recover the depositor's pubkey hash.
-//! 3. Using the current `Y_51` and `Y_fed` from the on-chain treasury
-//!    state, the protocol-constant `federation_timeout`, and
-//!    `refund_timeout` (4320 blocks ≈ 30 days per spec, overridable
-//!    per-network), we reconstruct the expected peg-in Taproot address
-//!    Q via `pegin_spend_info`.
+//! 2. The BTC tx has exactly one `OP_RETURN "BFR" || depositor_xonly`
+//!    beacon output (spec § Peg-in deposit, demo simplification). This
+//!    is how watchtowers and SPOs recover the depositor's x-only pubkey.
+//! 3. Using `Y_fed` from the on-chain treasury oracle and the
+//!    `refund_timeout` protocol parameter (720 blocks per demo,
+//!    overridable per-network), we reconstruct the expected peg-in
+//!    Taproot address Q via `pegin_spend_info`.
 //! 4. Exactly one tx output must pay to that Q; that output's
 //!    `(txid, vout, value)` becomes the TM input.
 
@@ -36,8 +35,11 @@ const DUST_THRESHOLD: Amount = Amount::from_sat(330);
 const BEACON_MARKER: &[u8; 3] = b"BFR";
 
 /// Full scriptPubKey length of the beacon OP_RETURN:
-/// OP_RETURN (1) + push-23 (1) + "BFR" (3) + pkh (20) = 25 bytes.
-const BEACON_SCRIPT_LEN: usize = 25;
+/// OP_RETURN (1) + push-35 (1) + "BFR" (3) + xonly (32) = 37 bytes.
+const BEACON_SCRIPT_LEN: usize = 37;
+
+/// Push-opcode value matching a 35-byte payload ("BFR" || xonly).
+const BEACON_PUSH_OPCODE: u8 = 0x23; // OP_PUSHBYTES_35
 
 /// A peg-in that has been parsed out of a Cardano datum and resolved
 /// to a concrete Bitcoin `(outpoint, value)` paying to the
@@ -49,10 +51,10 @@ pub struct ParsedPegIn {
     pub btc_vout: u32,
     pub value: Amount,
     pub cardano_utxo: CardanoOutRef,
-    /// HASH160 of the depositor's BTC x-only pubkey, recovered from
-    /// the OP_RETURN beacon. Needed later to reconstruct the peg-in
-    /// script tree for FROST-signing the TM input.
-    pub depositor_pkh: [u8; 20],
+    /// X-only pubkey of the depositor, recovered from the OP_RETURN
+    /// beacon. Needed later to reconstruct the peg-in script tree for
+    /// FROST-signing the TM input.
+    pub depositor_xonly_pubkey: UntweakedPublicKey,
 }
 
 #[derive(Debug)]
@@ -62,14 +64,17 @@ pub enum ParseError {
     BadDatumShape(String),
     /// Field[1] did not decode as a valid Bitcoin transaction.
     InvalidBtcTx(String),
-    /// No `OP_RETURN "BFR"||pkh` output in the BTC tx. Either not a
+    /// No `OP_RETURN "BFR"||xonly` output in the BTC tx. Either not a
     /// Bifrost peg-in, or the depositor built the tx incorrectly.
     NoBeacon,
     /// More than one beacon output — ambiguous; reject.
     AmbiguousBeacon,
+    /// Beacon push and marker matched, but the 32-byte payload is not
+    /// a valid x-only pubkey (point not on the curve / parity error).
+    InvalidBeaconXonly(String),
     /// No tx output pays to the spec-derived peg-in Taproot address
-    /// for the (Y_51, Y_fed, timeouts, depositor_pkh) tuple. Either
-    /// the depositor used a stale `Y_51`, or the attacker fabricated
+    /// for the (Y_fed, refund_timeout, depositor_xonly) tuple. Either
+    /// the depositor used a stale `Y_fed`, or the attacker fabricated
     /// the PegInRequest over an unrelated BTC tx.
     NoPegInOutput,
     /// More than one output pays to the peg-in Taproot — ambiguous;
@@ -86,6 +91,7 @@ impl std::fmt::Display for ParseError {
             Self::InvalidBtcTx(s) => write!(f, "invalid bitcoin tx: {s}"),
             Self::NoBeacon => write!(f, "no OP_RETURN BFR beacon"),
             Self::AmbiguousBeacon => write!(f, "multiple OP_RETURN BFR beacons"),
+            Self::InvalidBeaconXonly(s) => write!(f, "invalid beacon xonly pubkey: {s}"),
             Self::NoPegInOutput => write!(f, "no output pays to the peg-in Taproot"),
             Self::AmbiguousPegInOutput => {
                 write!(f, "multiple outputs pay to the peg-in Taproot")
@@ -131,47 +137,45 @@ pub fn extract_raw_btc_tx(data: &PlutusData) -> Result<Vec<u8>, ParseError> {
 }
 
 /// Scan a BTC tx for the Bifrost beacon OP_RETURN output and return
-/// the 20-byte depositor pubkey hash. Exactly one beacon must exist.
+/// the depositor x-only pubkey. Exactly one beacon must exist, and its
+/// 32-byte payload must be a valid curve point.
 ///
-/// ScriptPubKey shape (25 bytes):
+/// ScriptPubKey shape (37 bytes):
 /// ```text
-/// 6a 17 42 46 52 <20-byte-pkh>
+/// 6a 23 42 46 52 <32-byte-xonly>
 /// ^^ ^^ ^^^^^^^^
 /// |  |  "BFR"
-/// |  push-23 (0x17)
+/// |  push-35 (0x23)
 /// OP_RETURN
 /// ```
-pub fn parse_beacon(tx: &Transaction) -> Result<[u8; 20], ParseError> {
-    let mut found: Option<[u8; 20]> = None;
+pub fn parse_beacon(tx: &Transaction) -> Result<UntweakedPublicKey, ParseError> {
+    let mut found: Option<UntweakedPublicKey> = None;
     for out in &tx.output {
         let bytes = out.script_pubkey.as_bytes();
         if bytes.len() != BEACON_SCRIPT_LEN {
             continue;
         }
-        // OP_RETURN, push-23 (0x17), "BFR"
-        if bytes[0] != 0x6a || bytes[1] != 0x17 || &bytes[2..5] != BEACON_MARKER {
+        if bytes[0] != 0x6a || bytes[1] != BEACON_PUSH_OPCODE || &bytes[2..5] != BEACON_MARKER {
             continue;
         }
-        let mut pkh = [0u8; 20];
-        pkh.copy_from_slice(&bytes[5..25]);
+        let xonly = UntweakedPublicKey::from_slice(&bytes[5..37])
+            .map_err(|e| ParseError::InvalidBeaconXonly(e.to_string()))?;
         if found.is_some() {
             return Err(ParseError::AmbiguousBeacon);
         }
-        found = Some(pkh);
+        found = Some(xonly);
     }
     found.ok_or(ParseError::NoBeacon)
 }
 
 /// Parse and validate a raw Cardano peg-in request.
 ///
-/// `y_51` / `y_fed` come from the current on-chain treasury state;
-/// `federation_timeout` and `refund_timeout` are protocol parameters
-/// (the latter overridable per-network for testnet4/preprod).
+/// `y_fed` comes from the current on-chain treasury oracle;
+/// `refund_timeout` is a protocol parameter (720 blocks per demo,
+/// overridable per-network).
 pub fn parse_pegin_request(
     req: &CardanoPegInRequest,
-    y_51: UntweakedPublicKey,
     y_fed: UntweakedPublicKey,
-    federation_timeout: u16,
     refund_timeout: u16,
 ) -> Result<ParsedPegIn, ParseError> {
     // 1. Decode the Cardano datum: we only trust field[1] (raw tx).
@@ -184,20 +188,13 @@ pub fn parse_pegin_request(
         .map_err(|e| ParseError::InvalidBtcTx(e.to_string()))?;
     let btc_txid = btc_tx.compute_txid();
 
-    // 3. Recover the depositor pkh from the OP_RETURN beacon.
-    let depositor_pkh = parse_beacon(&btc_tx)?;
+    // 3. Recover the depositor x-only pubkey from the OP_RETURN beacon.
+    let depositor_xonly_pubkey = parse_beacon(&btc_tx)?;
 
     // 4. Reconstruct the spec-defined peg-in Taproot address and find
     //    the unique output paying to it.
     let secp = Secp256k1::new();
-    let spend_info = pegin_spend_info(
-        &secp,
-        y_51,
-        y_fed,
-        federation_timeout,
-        depositor_pkh,
-        refund_timeout,
-    );
+    let spend_info = pegin_spend_info(&secp, y_fed, depositor_xonly_pubkey, refund_timeout);
     let expected_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
 
     let mut matches = btc_tx
@@ -221,7 +218,7 @@ pub fn parse_pegin_request(
         btc_vout: vout as u32,
         value: txout.value,
         cardano_utxo: req.cardano_utxo.clone(),
-        depositor_pkh,
+        depositor_xonly_pubkey,
     })
 }
 
@@ -233,7 +230,7 @@ pub fn parse_pegin_request(
 mod tests {
     use super::*;
     use bitcoin::consensus::encode::serialize;
-    use bitcoin::hashes::{hash160, Hash as _};
+    use bitcoin::hashes::Hash as _;
     use bitcoin::opcodes::all::OP_RETURN;
     use bitcoin::secp256k1::{Keypair, SecretKey};
     use bitcoin::{
@@ -244,8 +241,7 @@ mod tests {
 
     // ------ Helpers ------------------------------------------------------
 
-    const FED_TIMEOUT: u16 = 144;
-    const REFUND_TIMEOUT: u16 = 4320;
+    const REFUND_TIMEOUT: u16 = 720;
 
     fn xonly_from_seed(seed: [u8; 32]) -> UntweakedPublicKey {
         let secp = Secp256k1::new();
@@ -254,39 +250,27 @@ mod tests {
         kp.x_only_public_key().0
     }
 
-    fn depositor_keys() -> ([u8; 32], [u8; 20]) {
-        let seed = [0xABu8; 32];
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&seed).unwrap();
-        let kp = Keypair::from_secret_key(&secp, &sk);
-        let (xonly, _) = kp.x_only_public_key();
-        let xonly_bytes = xonly.serialize();
-        let pkh = hash160::Hash::hash(&xonly_bytes).to_byte_array();
-        (xonly_bytes, pkh)
+    /// Return a deterministic depositor x-only pubkey as 32 raw bytes.
+    fn depositor_xonly() -> [u8; 32] {
+        xonly_from_seed([0xABu8; 32]).serialize()
     }
 
-    fn test_keys() -> (UntweakedPublicKey, UntweakedPublicKey) {
-        (xonly_from_seed([0x51u8; 32]), xonly_from_seed([0xFEu8; 32]))
+    fn test_y_fed() -> UntweakedPublicKey {
+        xonly_from_seed([0xFEu8; 32])
     }
 
-    fn pegin_spk(depositor_pkh: [u8; 20]) -> ScriptBuf {
+    fn pegin_spk(depositor_xonly_bytes: [u8; 32]) -> ScriptBuf {
         let secp = Secp256k1::new();
-        let (y_51, y_fed) = test_keys();
-        let si = pegin_spend_info(
-            &secp,
-            y_51,
-            y_fed,
-            FED_TIMEOUT,
-            depositor_pkh,
-            REFUND_TIMEOUT,
-        );
+        let depositor =
+            UntweakedPublicKey::from_slice(&depositor_xonly_bytes).expect("valid xonly");
+        let si = pegin_spend_info(&secp, test_y_fed(), depositor, REFUND_TIMEOUT);
         ScriptBuf::new_p2tr_tweaked(si.output_key())
     }
 
-    fn beacon_spk(pkh: [u8; 20]) -> ScriptBuf {
-        let mut payload = Vec::with_capacity(23);
+    fn beacon_spk(xonly: [u8; 32]) -> ScriptBuf {
+        let mut payload = Vec::with_capacity(35);
         payload.extend_from_slice(BEACON_MARKER);
-        payload.extend_from_slice(&pkh);
+        payload.extend_from_slice(&xonly);
         script::Builder::new()
             .push_opcode(OP_RETURN)
             .push_slice(<&bitcoin::script::PushBytes>::try_from(payload.as_slice()).unwrap())
@@ -295,17 +279,17 @@ mod tests {
 
     /// Build a peg-in BTC tx with: 1 input (dummy P2WPKH), 1 P2TR peg-in
     /// output at `amount`, 1 OP_RETURN beacon, 1 change output.
-    fn build_pegin_tx(depositor_pkh: [u8; 20], amount: Amount) -> Transaction {
+    fn build_pegin_tx(depositor_xonly_bytes: [u8; 32], amount: Amount) -> Transaction {
         let change_script =
             ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x33; 20]));
         build_tx_with_outputs(vec![
             TxOut {
                 value: amount,
-                script_pubkey: pegin_spk(depositor_pkh),
+                script_pubkey: pegin_spk(depositor_xonly_bytes),
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(depositor_pkh),
+                script_pubkey: beacon_spk(depositor_xonly_bytes),
             },
             TxOut {
                 value: Amount::from_sat(500_000),
@@ -373,16 +357,15 @@ mod tests {
     }
 
     fn parse(req: &CardanoPegInRequest) -> Result<ParsedPegIn, ParseError> {
-        let (y_51, y_fed) = test_keys();
-        parse_pegin_request(req, y_51, y_fed, FED_TIMEOUT, REFUND_TIMEOUT)
+        parse_pegin_request(req, test_y_fed(), REFUND_TIMEOUT)
     }
 
     // ------ Happy path --------------------------------------------------
 
     #[test]
     fn parse_happy_path() {
-        let (_, pkh) = depositor_keys();
-        let tx = build_pegin_tx(pkh, Amount::from_sat(1_234_567));
+        let xonly = depositor_xonly();
+        let tx = build_pegin_tx(xonly, Amount::from_sat(1_234_567));
         let expected_txid = tx.compute_txid();
 
         let req = make_request(build_datum_bytes(serialize(&tx)));
@@ -393,23 +376,23 @@ mod tests {
         assert_eq!(parsed.value, Amount::from_sat(1_234_567));
         assert_eq!(parsed.cardano_utxo.tx_hash, [0xAA; 32]);
         assert_eq!(parsed.cardano_utxo.output_index, 7);
-        assert_eq!(parsed.depositor_pkh, pkh);
+        assert_eq!(parsed.depositor_xonly_pubkey.serialize(), xonly);
     }
 
     #[test]
     fn parse_happy_path_pegin_not_first_output() {
         // Beacon first, then peg-in — vout should be 1.
-        let (_, pkh) = depositor_keys();
+        let xonly = depositor_xonly();
         let change_script =
             ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x33; 20]));
         let tx = build_tx_with_outputs(vec![
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(pkh),
+                script_pubkey: beacon_spk(xonly),
             },
             TxOut {
                 value: Amount::from_sat(100_000),
-                script_pubkey: pegin_spk(pkh),
+                script_pubkey: pegin_spk(xonly),
             },
             TxOut {
                 value: Amount::from_sat(500_000),
@@ -501,10 +484,10 @@ mod tests {
 
     #[test]
     fn no_beacon_output() {
-        let (_, pkh) = depositor_keys();
+        let xonly = depositor_xonly();
         let tx = build_tx_with_outputs(vec![TxOut {
             value: Amount::from_sat(100_000),
-            script_pubkey: pegin_spk(pkh),
+            script_pubkey: pegin_spk(xonly),
         }]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
         assert!(matches!(parse(&req).unwrap_err(), ParseError::NoBeacon));
@@ -512,11 +495,11 @@ mod tests {
 
     #[test]
     fn beacon_wrong_prefix() {
-        // OP_RETURN push-23 "FOO" + pkh — not "BFR".
-        let (_, pkh) = depositor_keys();
-        let mut payload = Vec::with_capacity(23);
+        // OP_RETURN push-35 "FOO" + xonly — not "BFR".
+        let xonly = depositor_xonly();
+        let mut payload = Vec::with_capacity(35);
         payload.extend_from_slice(b"FOO");
-        payload.extend_from_slice(&pkh);
+        payload.extend_from_slice(&xonly);
         let wrong_beacon = script::Builder::new()
             .push_opcode(OP_RETURN)
             .push_slice(<&bitcoin::script::PushBytes>::try_from(payload.as_slice()).unwrap())
@@ -524,7 +507,7 @@ mod tests {
         let tx = build_tx_with_outputs(vec![
             TxOut {
                 value: Amount::from_sat(100_000),
-                script_pubkey: pegin_spk(pkh),
+                script_pubkey: pegin_spk(xonly),
             },
             TxOut {
                 value: Amount::ZERO,
@@ -537,8 +520,8 @@ mod tests {
 
     #[test]
     fn beacon_wrong_length() {
-        // OP_RETURN push-3 "BFR" — no pkh payload; total 5 bytes.
-        let (_, pkh) = depositor_keys();
+        // OP_RETURN push-3 "BFR" — no xonly payload; total 5 bytes.
+        let xonly = depositor_xonly();
         let short_beacon = script::Builder::new()
             .push_opcode(OP_RETURN)
             .push_slice(<&bitcoin::script::PushBytes>::try_from(&b"BFR"[..]).unwrap())
@@ -546,7 +529,7 @@ mod tests {
         let tx = build_tx_with_outputs(vec![
             TxOut {
                 value: Amount::from_sat(100_000),
-                script_pubkey: pegin_spk(pkh),
+                script_pubkey: pegin_spk(xonly),
             },
             TxOut {
                 value: Amount::ZERO,
@@ -559,19 +542,19 @@ mod tests {
 
     #[test]
     fn beacon_ambiguous() {
-        let (_, pkh) = depositor_keys();
+        let xonly = depositor_xonly();
         let tx = build_tx_with_outputs(vec![
             TxOut {
                 value: Amount::from_sat(100_000),
-                script_pubkey: pegin_spk(pkh),
+                script_pubkey: pegin_spk(xonly),
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(pkh),
+                script_pubkey: beacon_spk(xonly),
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(pkh), // second beacon
+                script_pubkey: beacon_spk(xonly), // second beacon
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
@@ -581,18 +564,18 @@ mod tests {
     // ------ Taproot-match failures --------------------------------------
 
     #[test]
-    fn beacon_pkh_does_not_match_taproot() {
-        // Beacon says pkh_A, but the P2TR output was derived from pkh_B.
-        let (_, pkh_a) = depositor_keys();
-        let pkh_b = [0xCCu8; 20];
+    fn beacon_xonly_does_not_match_taproot() {
+        // Beacon says xonly_A, but the P2TR output was derived from xonly_B.
+        let xonly_a = depositor_xonly();
+        let xonly_b = xonly_from_seed([0xCCu8; 32]).serialize();
         let tx = build_tx_with_outputs(vec![
             TxOut {
                 value: Amount::from_sat(100_000),
-                script_pubkey: pegin_spk(pkh_b), // wrong depositor
+                script_pubkey: pegin_spk(xonly_b), // wrong depositor
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(pkh_a),
+                script_pubkey: beacon_spk(xonly_a),
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
@@ -601,32 +584,25 @@ mod tests {
 
     #[test]
     fn no_pegin_output_only_beacon() {
-        let (_, pkh) = depositor_keys();
+        let xonly = depositor_xonly();
         let tx = build_tx_with_outputs(vec![TxOut {
             value: Amount::ZERO,
-            script_pubkey: beacon_spk(pkh),
+            script_pubkey: beacon_spk(xonly),
         }]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
         assert!(matches!(parse(&req).unwrap_err(), ParseError::NoPegInOutput));
     }
 
     #[test]
-    fn no_pegin_output_wrong_y51() {
-        // Build the peg-in address from a *different* Y_51 than the
-        // parser will use. parse() uses test_keys()'s Y_51; we use a
-        // stale one here.
-        let (_, pkh) = depositor_keys();
-        let stale_y_51 = xonly_from_seed([0x99u8; 32]);
-        let (_, y_fed) = test_keys();
+    fn no_pegin_output_wrong_y_fed() {
+        // Build the peg-in address from a *different* Y_fed than the
+        // parser will use. parse() uses test_y_fed(); we use a stale
+        // one here.
+        let xonly = depositor_xonly();
+        let stale_y_fed = xonly_from_seed([0x99u8; 32]);
         let secp = Secp256k1::new();
-        let stale_si = pegin_spend_info(
-            &secp,
-            stale_y_51,
-            y_fed,
-            FED_TIMEOUT,
-            pkh,
-            REFUND_TIMEOUT,
-        );
+        let depositor = UntweakedPublicKey::from_slice(&xonly).unwrap();
+        let stale_si = pegin_spend_info(&secp, stale_y_fed, depositor, REFUND_TIMEOUT);
         let stale_spk = ScriptBuf::new_p2tr_tweaked(stale_si.output_key());
 
         let tx = build_tx_with_outputs(vec![
@@ -636,7 +612,7 @@ mod tests {
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(pkh),
+                script_pubkey: beacon_spk(xonly),
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
@@ -646,19 +622,19 @@ mod tests {
     #[test]
     fn ambiguous_pegin_outputs() {
         // Two outputs paying the correct peg-in Taproot.
-        let (_, pkh) = depositor_keys();
+        let xonly = depositor_xonly();
         let tx = build_tx_with_outputs(vec![
             TxOut {
                 value: Amount::from_sat(100_000),
-                script_pubkey: pegin_spk(pkh),
+                script_pubkey: pegin_spk(xonly),
             },
             TxOut {
                 value: Amount::from_sat(100_000),
-                script_pubkey: pegin_spk(pkh),
+                script_pubkey: pegin_spk(xonly),
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(pkh),
+                script_pubkey: beacon_spk(xonly),
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
@@ -667,28 +643,40 @@ mod tests {
 
     #[test]
     fn dust_output() {
-        let (_, pkh) = depositor_keys();
+        let xonly = depositor_xonly();
         let tx = build_tx_with_outputs(vec![
             TxOut {
                 value: Amount::from_sat(329), // one below dust
-                script_pubkey: pegin_spk(pkh),
+                script_pubkey: pegin_spk(xonly),
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(pkh),
+                script_pubkey: beacon_spk(xonly),
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
         assert!(matches!(parse(&req).unwrap_err(), ParseError::DustOutput));
     }
 
+    #[test]
+    fn beacon_xonly_not_on_curve() {
+        // Beacon payload is 32 bytes but is not a valid x-only point.
+        let invalid_xonly = [0xFFu8; 32];
+        let tx = build_tx_with_outputs(vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: beacon_spk(invalid_xonly),
+        }]);
+        let req = make_request(build_datum_bytes(serialize(&tx)));
+        assert!(matches!(parse(&req).unwrap_err(), ParseError::InvalidBeaconXonly(_)));
+    }
+
     // ------ Raw beacon parser tests -------------------------------------
 
     #[test]
     fn beacon_parser_direct_happy() {
-        let (_, pkh) = depositor_keys();
-        let tx = build_pegin_tx(pkh, Amount::from_sat(50_000));
-        assert_eq!(parse_beacon(&tx).unwrap(), pkh);
+        let xonly = depositor_xonly();
+        let tx = build_pegin_tx(xonly, Amount::from_sat(50_000));
+        assert_eq!(parse_beacon(&tx).unwrap().serialize(), xonly);
     }
 
     #[test]

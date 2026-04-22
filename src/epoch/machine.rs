@@ -204,7 +204,7 @@ async fn publish_keys_phase(
 
 /// Poll the Cardano peg-in source over `config.pegin_collection_window`,
 /// parsing each observed request against the spec-derived peg-in
-/// Taproot for the current (Y_51, Y_fed, timeouts, depositor_pkh).
+/// Taproot for the current Y_fed + refund_timeout + depositor_xonly.
 /// Parse failures are logged and dropped. The deduped, parsed set is
 /// frozen into the next `BuildTm` phase.
 async fn collect_pegins_phase(
@@ -218,11 +218,10 @@ async fn collect_pegins_phase(
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
 
-    // Pull current Y_51 / Y_fed / fed-timeout from the on-chain
-    // treasury state. The peg-in Taproot Q is derived per-depositor
-    // inside `parse_pegin_request` using the OP_RETURN beacon pkh.
+    // Pull current Y_fed from the on-chain treasury oracle. The
+    // peg-in Taproot Q is derived per-depositor inside
+    // `parse_pegin_request` using the OP_RETURN beacon xonly pubkey.
     let treasury = chain.query_treasury().await?;
-    let fed_timeout = treasury.federation_csv_blocks as u16;
     let refund_timeout = config.pegin_refund_timeout_blocks;
 
     let deadline = clock.deadline(config.pegin_collection_window);
@@ -242,13 +241,7 @@ async fn collect_pegins_phase(
             if accepted.contains_key(&req.cardano_utxo) {
                 continue;
             }
-            match parse_pegin_request(
-                &req,
-                treasury.y_51,
-                treasury.y_fed,
-                fed_timeout,
-                refund_timeout,
-            ) {
+            match parse_pegin_request(&req, treasury.y_fed, refund_timeout) {
                 Ok(parsed) => {
                     accepted.insert(req.cardano_utxo.clone(), parsed);
                 }

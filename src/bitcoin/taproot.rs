@@ -33,19 +33,6 @@ fn build_csv_checksig_script(timeout: u16, pubkey: UntweakedPublicKey) -> Script
         .into_script()
 }
 
-/// `OP_DUP OP_HASH160 <pubkey_hash> OP_EQUALVERIFY OP_CHECKSIGVERIFY <timeout> OP_CSV`
-fn build_depositor_refund_script(pubkey_hash: [u8; 20], timeout: u16) -> ScriptBuf {
-    script::Builder::new()
-        .push_opcode(OP_DUP)
-        .push_opcode(OP_HASH160)
-        .push_slice(pubkey_hash)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_CHECKSIGVERIFY)
-        .push_int(timeout as i64)
-        .push_opcode(OP_CSV)
-        .into_script()
-}
-
 // ---------------------------------------------------------------------------
 // Treasury Taproot tree
 // ---------------------------------------------------------------------------
@@ -77,32 +64,25 @@ pub fn treasury_spend_info(
         .expect("finalizable tree")
 }
 
-/// Build the peg-in `TaprootSpendInfo` for a specific depositor.
+/// Build the peg-in `TaprootSpendInfo` for a specific depositor — demo
+/// simplification per `ft-bifrost-bridge/documentation/demo_simplifications.md`.
 ///
 /// ```text
-/// Internal key: Y_51 (51% quorum — key-path spend for SPO sweep)
+/// Internal key: Y_federation (key-path — federation sweeps into treasury)
 /// Script tree:
-///   Leaf 1 (depth 1): <federation_timeout> OP_CSV OP_DROP <Y_federation> OP_CHECKSIG
-///   Leaf 2 (depth 1): OP_DUP OP_HASH160 <depositor_pubkey_hash> OP_EQUALVERIFY
-///                      OP_CHECKSIGVERIFY <depositor_refund_timeout> OP_CSV
+///   Leaf 1 (depth 0): <refund_timeout> OP_CSV OP_DROP <depositor_xonly> OP_CHECKSIG
 /// ```
 pub fn pegin_spend_info(
     secp: &Secp256k1<All>,
-    y_51: UntweakedPublicKey,
     y_federation: UntweakedPublicKey,
-    federation_timeout: u16,
-    depositor_pubkey_hash: [u8; 20],
-    depositor_refund_timeout: u16,
+    depositor_xonly_pubkey: UntweakedPublicKey,
+    refund_timeout: u16,
 ) -> TaprootSpendInfo {
-    let leaf1 = build_csv_checksig_script(federation_timeout, y_federation);
-    let leaf2 = build_depositor_refund_script(depositor_pubkey_hash, depositor_refund_timeout);
-
+    let leaf = build_csv_checksig_script(refund_timeout, depositor_xonly_pubkey);
     bitcoin::taproot::TaprootBuilder::new()
-        .add_leaf(1, leaf1)
+        .add_leaf(0, leaf)
         .expect("valid leaf")
-        .add_leaf(1, leaf2)
-        .expect("valid leaf")
-        .finalize(secp, y_51)
+        .finalize(secp, y_federation)
         .expect("finalizable tree")
 }
 
@@ -143,11 +123,11 @@ mod tests {
     #[test]
     fn test_pegin_spend_info_deterministic() {
         let secp = Secp256k1::new();
-        let (y_51, _, y_fed) = test_keys();
-        let depositor_hash = [0xABu8; 20];
+        let (_, _, y_fed) = test_keys();
+        let depositor = xonly_from_seed([0xAB; 32]);
 
-        let si1 = pegin_spend_info(&secp, y_51, y_fed, 144, depositor_hash, 4320);
-        let si2 = pegin_spend_info(&secp, y_51, y_fed, 144, depositor_hash, 4320);
+        let si1 = pegin_spend_info(&secp, y_fed, depositor, 720);
+        let si2 = pegin_spend_info(&secp, y_fed, depositor, 720);
 
         assert_eq!(si1.output_key(), si2.output_key());
         assert_eq!(si1.merkle_root(), si2.merkle_root());
@@ -157,10 +137,10 @@ mod tests {
     fn test_treasury_vs_pegin_different() {
         let secp = Secp256k1::new();
         let (y_51, y_67, y_fed) = test_keys();
-        let depositor_hash = [0xABu8; 20];
+        let depositor = xonly_from_seed([0xAB; 32]);
 
         let treasury = treasury_spend_info(&secp, y_51, y_67, y_fed, 144);
-        let pegin = pegin_spend_info(&secp, y_51, y_fed, 144, depositor_hash, 4320);
+        let pegin = pegin_spend_info(&secp, y_fed, depositor, 720);
 
         assert_ne!(treasury.output_key(), pegin.output_key());
     }
@@ -190,22 +170,16 @@ mod tests {
     #[test]
     fn test_pegin_script_leaves() {
         let secp = Secp256k1::new();
-        let (y_51, _, y_fed) = test_keys();
-        let depositor_hash = [0xABu8; 20];
-        let si = pegin_spend_info(&secp, y_51, y_fed, 144, depositor_hash, 4320);
+        let (_, _, y_fed) = test_keys();
+        let depositor = xonly_from_seed([0xAB; 32]);
+        let si = pegin_spend_info(&secp, y_fed, depositor, 720);
 
-        let csv_checksig = build_csv_checksig_script(144, y_fed);
-        let refund = build_depositor_refund_script(depositor_hash, 4320);
-
+        let expected_leaf = build_csv_checksig_script(720, depositor);
         let script_map = si.script_map();
         assert!(
-            script_map.keys().any(|(s, _)| *s == csv_checksig),
+            script_map.keys().any(|(s, _)| *s == expected_leaf),
             "csv+checksig leaf not found in script map"
         );
-        assert!(
-            script_map.keys().any(|(s, _)| *s == refund),
-            "depositor refund leaf not found in script map"
-        );
-        assert_eq!(script_map.len(), 2, "expected exactly 2 script leaves");
+        assert_eq!(script_map.len(), 1, "expected exactly 1 script leaf");
     }
 }
