@@ -78,8 +78,15 @@ impl BlockfrostCardanoChain {
         treasury_asset_name_hex: impl Into<String>,
         treasury_config: TreasuryConfig,
         fallback_roster: Roster,
+        // Custom Blockfrost-compatible base URL (e.g. yaci-devkit's http://localhost:8080/api/v1).
+        // None → the public blockfrost.io URL derived from the project_id prefix.
+        blockfrost_url: Option<&str>,
     ) -> Self {
-        let api = BlockfrostAPI::new(project_id, BlockFrostSettings::new());
+        let mut settings = BlockFrostSettings::new();
+        if let Some(url) = blockfrost_url {
+            settings.base_url = Some(url.to_string());
+        }
+        let api = BlockfrostAPI::new(project_id, settings);
         Self {
             api,
             treasury_address: treasury_address.into(),

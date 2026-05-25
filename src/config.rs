@@ -129,6 +129,9 @@ impl BitcoinConfig {
 #[serde(default)]
 pub struct CardanoConfig {
     pub blockfrost_project_id: Option<String>,
+    /// Custom Blockfrost-compatible API base URL (e.g. yaci-devkit's
+    /// http://localhost:8080/api/v1). None → public blockfrost.io.
+    pub blockfrost_url: Option<String>,
     pub socket_path: Option<String>,
     pub network_magic: Option<u64>,
     pub pegin_script_address: Option<String>,
@@ -158,6 +161,7 @@ impl Default for CardanoConfig {
     fn default() -> Self {
         Self {
             blockfrost_project_id: None,
+            blockfrost_url: None,
             socket_path: None,
             network_magic: None,
             pegin_script_address: None,

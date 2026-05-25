@@ -440,6 +440,7 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
             &treasury_asset_name_hex,
             treasury_config,
             fixture.roster.clone(),
+            cfg.cardano.blockfrost_url.as_deref(),
         );
 
         if let Some(mnemonic) = &cfg.cardano.mnemonic {
@@ -882,6 +883,7 @@ fn run_sweep_pegins(
             &treasury_asset_name_hex,
             treasury_config,
             fixture.roster.clone(),
+            cfg.cardano.blockfrost_url.as_deref(),
         );
         if let Some(mnemonic) = &cfg.cardano.mnemonic {
             chain = chain
