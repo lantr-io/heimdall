@@ -249,18 +249,106 @@ pub type Proof = Vec<ProofStep>;
 // including / excluding
 // ---------------------------------------------------------------------------
 
-/// Root obtained by walking `proof` with the element `(key, value)` present.
-/// Equals the trie root iff the element is in the trie with that value.
-#[must_use]
-pub fn including(key: &[u8], value: &[u8], proof: &Proof) -> Hash {
-    do_including(&blake2b_256(key), blake2b_256(value), 0, proof)
+impl ProofStep {
+    fn skip(&self) -> usize {
+        match self {
+            ProofStep::Branch { skip, .. }
+            | ProofStep::Fork { skip, .. }
+            | ProofStep::Leaf { skip, .. } => *skip,
+        }
+    }
 }
 
-/// Root obtained by walking `proof` without the element. Equals the trie root
+/// Validate an untrusted `proof` against `path` (the 32-byte key hash) so the
+/// subsequent walk cannot panic: bounds-check every cursor and field-length
+/// access up front and reject anything malformed. After this returns `Ok`,
+/// `do_including` / `do_excluding` index only in-range bytes.
+fn validate_proof(path: &[u8], proof: &[ProofStep]) -> Result<(), MpfError> {
+    let n = path.len() * 2; // nibbles in the path (64 for a 32-byte key hash)
+    if proof.len() > n {
+        return Err(MpfError::ProofTooDeep);
+    }
+    let mut cursor = 0usize;
+    for step in proof {
+        let next_cursor = cursor + step.skip();
+        if next_cursor >= n {
+            return Err(MpfError::CursorOutOfRange);
+        }
+        let branch = nibble(path, next_cursor);
+        match step {
+            ProofStep::Branch { neighbors, .. } => {
+                if neighbors.len() != 4 * DIGEST {
+                    return Err(MpfError::BadNeighborsLen);
+                }
+            }
+            ProofStep::Fork { neighbor, .. } => {
+                if neighbor.nibble > 15 {
+                    return Err(MpfError::BadNibble);
+                }
+                if neighbor.root.len() != DIGEST {
+                    return Err(MpfError::BadHashLen);
+                }
+                if branch == neighbor.nibble {
+                    return Err(MpfError::InvalidFork);
+                }
+            }
+            ProofStep::Leaf { key, value, .. } => {
+                if key.len() != DIGEST || value.len() != DIGEST {
+                    return Err(MpfError::BadHashLen);
+                }
+                if branch == nibble(key, next_cursor) {
+                    return Err(MpfError::InvalidFork);
+                }
+            }
+        }
+        cursor = next_cursor + 1;
+    }
+    if cursor > n {
+        return Err(MpfError::CursorOutOfRange);
+    }
+    Ok(())
+}
+
+/// Root obtained by walking `proof` with the element `(key, value)` present —
+/// equals the trie root iff the element is in the trie with that value.
+/// Returns `Err` on a malformed proof rather than panicking.
+pub fn including(key: &[u8], value: &[u8], proof: &Proof) -> Result<Hash, MpfError> {
+    let path = blake2b_256(key);
+    validate_proof(&path, proof)?;
+    Ok(do_including(&path, blake2b_256(value), 0, proof))
+}
+
+/// Root obtained by walking `proof` without the element — equals the trie root
 /// iff `key` is absent (a non-membership / exclusion proof).
-#[must_use]
-pub fn excluding(key: &[u8], proof: &Proof) -> Hash {
-    do_excluding(&blake2b_256(key), 0, proof)
+pub fn excluding(key: &[u8], proof: &Proof) -> Result<Hash, MpfError> {
+    let path = blake2b_256(key);
+    validate_proof(&path, proof)?;
+    Ok(do_excluding(&path, 0, proof))
+}
+
+/// Verify `key → value` is included in the trie with root `expected_root`.
+/// Removes the footgun of forgetting the root comparison — the treasury holds
+/// two MPF roots (bifrost-identity and completed-peg-ins).
+pub fn verify_inclusion(
+    key: &[u8],
+    value: &[u8],
+    proof: &Proof,
+    expected_root: &Hash,
+) -> Result<(), MpfError> {
+    if &including(key, value, proof)? == expected_root {
+        Ok(())
+    } else {
+        Err(MpfError::RootMismatch)
+    }
+}
+
+/// Verify `key` is absent from the trie with root `expected_root`.
+pub fn verify_exclusion(key: &[u8], proof: &Proof, expected_root: &Hash) -> Result<(), MpfError> {
+    if &excluding(key, proof)? == expected_root {
+        Ok(())
+    } else {
+        Err(MpfError::RootMismatch)
+    }
 }
 
 fn do_including(path: &[u8], value: Hash, cursor: usize, proof: &[ProofStep]) -> Hash {
@@ -386,11 +474,12 @@ fn do_fork(
 // validated against the Aiken library's vectors — so a self-consistent prover
 // here is Aiken-compatible.
 //
-// NOTE (Phase 2 hardening): node hashes are recomputed on demand (no memoised
-// cache as in the scalus original); fine for the small rosters register_spo
-// builds, revisit if used on large tries. `do_insert` panics on a duplicate
-// key (mirrors the scalus `throw`); convert to `Result` with the rest of the
-// hardening pass.
+// NOTE (WI-007 hardening): the verifier (`including`/`excluding`) validates an
+// untrusted proof up front (`validate_proof`) and returns `Result` instead of
+// panicking; `do_insert` returns `Err(KeyPresent)` on a duplicate key. Still
+// deferred (WI-007): memoised node hashes (recomputed on demand today — fine
+// for the small rosters register_spo builds), fewer per-insert clones,
+// `do_delete` (deregister), fixed-size proof types, and an iterator `from_pairs`.
 // ===========================================================================
 
 /// blake2b-256 of a key/value yields a 32-byte path → 64 nibbles deep.
@@ -398,10 +487,24 @@ const PATH_NIBBLES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MpfError {
-    /// `prove_non_membership` called on a key already in the trie.
+    /// A key is already present (duplicate `insert`, or `prove_non_membership` on a present key).
     KeyPresent,
-    /// `prove_membership` called on a key absent from the trie.
+    /// `prove_membership` on a key absent from the trie.
     KeyAbsent,
+    /// Proof has more steps than the 64-nibble path can be deep.
+    ProofTooDeep,
+    /// A step's `skip` pushes the walk cursor past the 64-nibble path.
+    CursorOutOfRange,
+    /// A `Branch` step's `neighbors` blob is not exactly 128 bytes (4×32).
+    BadNeighborsLen,
+    /// A `Fork` neighbor's `nibble` is not a 4-bit value (0..=15).
+    BadNibble,
+    /// A 32-byte field (`Leaf` key/value, `Fork` root) has the wrong length.
+    BadHashLen,
+    /// A `Fork`/`Leaf` neighbor shares the path's branch nibble (impossible in a real proof).
+    InvalidFork,
+    /// A computed root did not equal the expected on-chain root.
+    RootMismatch,
 }
 
 /// A trie node. Radix-16 Patricia with prefix (`skip`) compression.
@@ -508,13 +611,13 @@ fn branch_skip_matches_path(rep_path: &[u8], skip_len: usize, path: &[u8], curso
     (0..skip_len).all(|i| nibble(rep_path, cursor + i) == nibble(path, cursor + i))
 }
 
-fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Node {
+fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Result<Node, MpfError> {
     match node {
-        Node::Empty => Node::Leaf {
+        Node::Empty => Ok(Node::Leaf {
             skip_start: cursor,
             full_path: path.to_vec(),
             value: value.to_vec(),
-        },
+        }),
 
         Node::Leaf {
             full_path: leaf_path,
@@ -523,7 +626,9 @@ fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Node {
         } => {
             let remaining_len = PATH_NIBBLES - cursor;
             let cp = common_prefix_len(path, leaf_path, cursor, PATH_NIBBLES);
-            assert!(cp != remaining_len, "key already in trie");
+            if cp == remaining_len {
+                return Err(MpfError::KeyPresent);
+            }
 
             let new_nibble = nibble(path, cursor + cp) as usize;
             let old_nibble = nibble(leaf_path, cursor + cp) as usize;
@@ -540,13 +645,13 @@ fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Node {
                 full_path: leaf_path.clone(),
                 value: leaf_value.clone(),
             };
-            Node::Branch {
+            Ok(Node::Branch {
                 skip_start: cursor,
                 skip_len: cp,
                 rep_path: path.to_vec(),
                 children,
                 size: 2,
-            }
+            })
         }
 
         Node::Branch {
@@ -576,27 +681,27 @@ fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Node {
                     children: children.clone(),
                     size: *size,
                 };
-                Node::Branch {
+                Ok(Node::Branch {
                     skip_start: cursor,
                     skip_len: cp,
                     rep_path: path.to_vec(),
                     children: new_children,
                     size: size + 1,
-                }
+                })
             } else {
                 // Prefix matches → descend into the child.
                 let child_nibble = nibble(path, cursor + skip_len) as usize;
                 let child_cursor = cursor + skip_len + 1;
-                let new_child = do_insert(&children[child_nibble], path, child_cursor, value);
+                let new_child = do_insert(&children[child_nibble], path, child_cursor, value)?;
                 let mut new_children = children.clone();
                 new_children[child_nibble] = new_child;
-                Node::Branch {
+                Ok(Node::Branch {
                     skip_start: *skip_start,
                     skip_len: *skip_len,
                     rep_path: rep_path.clone(),
                     children: new_children,
                     size: size + 1,
-                }
+                })
             }
         }
     }
@@ -711,14 +816,13 @@ impl Trie {
         Trie { root: Node::Empty }
     }
 
-    /// Build a trie from `(key, value)` pairs (keys must be distinct).
-    #[must_use]
-    pub fn from_pairs(entries: &[(Vec<u8>, Vec<u8>)]) -> Self {
+    /// Build a trie from `(key, value)` pairs. Returns `Err(KeyPresent)` on a duplicate key.
+    pub fn from_pairs(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<Self, MpfError> {
         let mut t = Trie::empty();
         for (k, v) in entries {
-            t = t.insert(k, v);
+            t = t.insert(k, v)?;
         }
-        t
+        Ok(t)
     }
 
     /// The 32-byte root hash — compare against the on-chain `bifrost_identity_root`.
@@ -742,13 +846,12 @@ impl Trie {
         }
     }
 
-    /// Insert `key → value`. Panics if `key` is already present.
-    #[must_use]
-    pub fn insert(&self, key: &[u8], value: &[u8]) -> Trie {
+    /// Insert `key → value`. Returns `Err(KeyPresent)` if `key` is already present.
+    pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<Trie, MpfError> {
         let path = blake2b_256(key);
-        Trie {
-            root: do_insert(&self.root, &path, 0, value),
-        }
+        Ok(Trie {
+            root: do_insert(&self.root, &path, 0, value)?,
+        })
     }
 
     #[must_use]
@@ -779,7 +882,7 @@ impl Trie {
         // The proof carries only neighbors (not the target leaf's value), so the
         // dummy is irrelevant: `excluding` rebuilds the original root, `including`
         // the post-insert root.
-        self.insert(key, &[]).prove_membership(key)
+        self.insert(key, &[])?.prove_membership(key)
     }
 }
 
@@ -804,7 +907,7 @@ mod tests {
     // merkle-patricia-forestry.ak `excluding_empty_proof`: excluding("foo", []) == empty root.
     #[test]
     fn excluding_empty_proof() {
-        assert_eq!(excluding(b"foo", &vec![]), NULL_HASH);
+        assert_eq!(excluding(b"foo", &vec![]).unwrap(), NULL_HASH);
     }
 
     // merkle-patricia-forestry.ak `including_empty_proof`:
@@ -813,7 +916,7 @@ mod tests {
     fn including_empty_proof() {
         let path = blake2b_256(b"foo");
         let expected = combine(&suffix(&path, 0), &blake2b_256(b"bar"));
-        assert_eq!(including(b"foo", b"bar", &vec![]), expected);
+        assert_eq!(including(b"foo", b"bar", &vec![]).unwrap(), expected);
     }
 
     // README `insert_bitcoin_block_845602`: inserting block 845602 into a 5-branch trie.
@@ -837,9 +940,9 @@ mod tests {
             branch("f89f9d06b48ecc0e1ea2e6a43a9047e1ff02ecf9f79b357091ffc0a7104bbb260908746f8e61ecc60dfe26b8d03bcc2f1318a2a95fa895e4d1aadbb917f9f2936b900c75ffe49081c265df9c7c329b9036a0efb46d5bac595a1dcb7c200e7d590000000000000000000000000000000000000000000000000000000000000000"),
         ];
 
-        assert_eq!(&excluding(&block_hash, &proof)[..], &r0[..], "excluding == old root");
+        assert_eq!(&excluding(&block_hash, &proof).unwrap()[..], &r0[..], "excluding == old root");
         assert_eq!(
-            &including(&block_hash, &block_body, &proof)[..],
+            &including(&block_hash, &block_body, &proof).unwrap()[..],
             &r1[..],
             "including == new root"
         );
@@ -875,12 +978,12 @@ mod tests {
     // `excluding(key,proof) == old_root` ∧ `including(key,value,proof) == new_root`.
     fn check_insert(old_root: &str, key: &str, value: &str, proof: &Proof, new_root: &str) {
         assert_eq!(
-            &excluding(&h(key), proof)[..],
+            &excluding(&h(key), proof).unwrap()[..],
             &h(old_root)[..],
             "excluding must equal the old root"
         );
         assert_eq!(
-            &including(&h(key), &h(value), proof)[..],
+            &including(&h(key), &h(value), proof).unwrap()[..],
             &h(new_root)[..],
             "including must equal the new root"
         );
@@ -969,8 +1072,8 @@ mod tests {
     // cross-checks the prover's root against the Aiken-validated verifier.
     #[test]
     fn trie_single_element_matches_empty_proof() {
-        let t = Trie::empty().insert(b"spo-0", b"pool-0");
-        assert_eq!(t.root_hash(), including(b"spo-0", b"pool-0", &vec![]));
+        let t = Trie::empty().insert(b"spo-0", b"pool-0").unwrap();
+        assert_eq!(t.root_hash(), including(b"spo-0", b"pool-0", &vec![]).unwrap());
         assert_eq!(t.get(b"spo-0"), Some(b"pool-0".to_vec()));
         assert_eq!(t.get(b"spo-1"), None);
         assert_eq!(t.prove_membership(b"spo-0"), Ok(vec![]));
@@ -981,13 +1084,13 @@ mod tests {
     #[test]
     fn trie_membership_proofs_verify_for_all_keys() {
         let pairs = sample_pairs(30);
-        let t = Trie::from_pairs(&pairs);
+        let t = Trie::from_pairs(&pairs).unwrap();
         assert_eq!(t.len(), 30);
         assert_eq!(t.get(b"spo-7"), Some(b"pool-7".to_vec()));
         for (k, v) in &pairs {
             let proof = t.prove_membership(k).expect("key present");
             assert_eq!(
-                including(k, v, &proof),
+                including(k, v, &proof).unwrap(),
                 t.root_hash(),
                 "inclusion proof for {k:?} must rebuild the root"
             );
@@ -998,23 +1101,23 @@ mod tests {
     // (with the real value) the post-insert root — exactly the register_spo flow.
     #[test]
     fn trie_non_membership_proof_round_trips() {
-        let t = Trie::from_pairs(&sample_pairs(30));
+        let t = Trie::from_pairs(&sample_pairs(30)).unwrap();
         let key = b"spo-new";
         let value = b"pool-new";
         assert!(t.get(key).is_none());
 
         let proof = t.prove_non_membership(key).expect("key absent");
-        assert_eq!(excluding(key, &proof), t.root_hash(), "exclusion == old root");
+        assert_eq!(excluding(key, &proof).unwrap(), t.root_hash(), "exclusion == old root");
         assert_eq!(
-            including(key, value, &proof),
-            t.insert(key, value).root_hash(),
+            including(key, value, &proof).unwrap(),
+            t.insert(key, value).unwrap().root_hash(),
             "inclusion == new root after registering key→value"
         );
     }
 
     #[test]
     fn trie_prove_error_cases() {
-        let t = Trie::from_pairs(&sample_pairs(5));
+        let t = Trie::from_pairs(&sample_pairs(5)).unwrap();
         assert_eq!(t.prove_membership(b"spo-absent"), Err(MpfError::KeyAbsent));
         assert_eq!(t.prove_non_membership(b"spo-0"), Err(MpfError::KeyPresent));
     }
@@ -1026,17 +1129,94 @@ mod tests {
     #[test]
     fn trie_large_trie_exercises_fork_steps() {
         let pairs = sample_pairs(200);
-        let t = Trie::from_pairs(&pairs);
+        let t = Trie::from_pairs(&pairs).unwrap();
         assert_eq!(t.len(), 200);
         let mut fork_seen = false;
         for (k, v) in &pairs {
             let proof = t.prove_membership(k).expect("key present");
-            assert_eq!(including(k, v, &proof), t.root_hash(), "inclusion for {k:?}");
+            assert_eq!(including(k, v, &proof).unwrap(), t.root_hash(), "inclusion for {k:?}");
             fork_seen |= proof.iter().any(|s| matches!(s, ProofStep::Fork { .. }));
         }
         assert!(
             fork_seen,
             "a 200-key trie should generate at least one Fork proof step"
         );
+    }
+
+    // ----- WI-007 hardening: malformed input returns Err, never panics -----
+
+    #[test]
+    fn verifier_rejects_malformed_proofs_without_panicking() {
+        let key = b"spo-0";
+        // Branch step whose neighbors blob is not 128 bytes.
+        let short = vec![ProofStep::Branch {
+            skip: 0,
+            neighbors: vec![0u8; 64],
+        }];
+        assert_eq!(excluding(key, &short), Err(MpfError::BadNeighborsLen));
+
+        // skip pushing the cursor past the 64-nibble path.
+        let deep_skip = vec![ProofStep::Branch {
+            skip: 100,
+            neighbors: vec![0u8; 128],
+        }];
+        assert_eq!(excluding(key, &deep_skip), Err(MpfError::CursorOutOfRange));
+
+        // proof longer than the path can be deep.
+        let too_deep: Proof = (0..65)
+            .map(|_| ProofStep::Branch {
+                skip: 0,
+                neighbors: vec![0u8; 128],
+            })
+            .collect();
+        assert_eq!(excluding(key, &too_deep), Err(MpfError::ProofTooDeep));
+
+        // Fork neighbor nibble out of the 0..=15 range.
+        let bad_nibble = vec![ProofStep::Fork {
+            skip: 0,
+            neighbor: Neighbor {
+                nibble: 200,
+                prefix: vec![],
+                root: vec![0u8; 32],
+            },
+        }];
+        assert_eq!(excluding(key, &bad_nibble), Err(MpfError::BadNibble));
+
+        // Leaf step with a non-32-byte key.
+        let short_leaf = vec![ProofStep::Leaf {
+            skip: 0,
+            key: vec![0u8; 8],
+            value: vec![0u8; 32],
+        }];
+        assert_eq!(excluding(key, &short_leaf), Err(MpfError::BadHashLen));
+    }
+
+    // do_insert no longer panics on a duplicate key — it returns Err(KeyPresent).
+    #[test]
+    fn duplicate_key_insert_returns_err() {
+        let t = Trie::empty().insert(b"k", b"v1").unwrap();
+        assert!(matches!(t.insert(b"k", b"v2"), Err(MpfError::KeyPresent)));
+
+        let dup = vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"a".to_vec(), b"2".to_vec()),
+        ];
+        assert!(matches!(Trie::from_pairs(&dup), Err(MpfError::KeyPresent)));
+    }
+
+    // The verify_* helpers do the root comparison for the caller.
+    #[test]
+    fn verify_helpers_compare_against_expected_root() {
+        let t = Trie::from_pairs(&sample_pairs(30)).unwrap();
+        let key = b"spo-new";
+        let proof = t.prove_non_membership(key).unwrap();
+        // Exclusion against the real root succeeds; against a wrong root, RootMismatch.
+        assert_eq!(verify_exclusion(key, &proof, &t.root_hash()), Ok(()));
+        assert_eq!(
+            verify_exclusion(key, &proof, &NULL_HASH),
+            Err(MpfError::RootMismatch)
+        );
+        let new_root = t.insert(key, b"pool-new").unwrap().root_hash();
+        assert_eq!(verify_inclusion(key, b"pool-new", &proof, &new_root), Ok(()));
     }
 }
