@@ -22,6 +22,7 @@
 //! on-chain lib; reference the `aiken-lang/merkle-patricia-forestry` `off-chain` (TS) package
 //! or the scalus `AikenMpfData` port.
 
+use std::cell::OnceCell;
 use std::sync::LazyLock;
 
 use pallas_crypto::hash::Hasher;
@@ -476,10 +477,12 @@ fn do_fork(
 //
 // NOTE (WI-007 hardening): the verifier (`including`/`excluding`) validates an
 // untrusted proof up front (`validate_proof`) and returns `Result` instead of
-// panicking; `do_insert` returns `Err(KeyPresent)` on a duplicate key. Still
-// deferred (WI-007): memoised node hashes (recomputed on demand today — fine
-// for the small rosters register_spo builds), fewer per-insert clones,
-// `do_delete` (deregister), fixed-size proof types, and an iterator `from_pairs`.
+// panicking; `do_insert` returns `Err(KeyPresent)` on a duplicate key; node
+// hashes are memoised (`OnceCell`). Still deferred (WI-007): fewer per-insert
+// children clones (`do_insert` deep-clones the children Vec per level — O(N²)
+// build, fine for the small rosters register_spo builds; an Rc-shared node
+// representation would make it O(N·depth)), `do_delete` (deregister), fixed-size
+// proof types, and an iterator `from_pairs`.
 // ===========================================================================
 
 /// blake2b-256 of a key/value yields a 32-byte path → 64 nibbles deep.
@@ -508,6 +511,12 @@ pub enum MpfError {
 }
 
 /// A trie node. Radix-16 Patricia with prefix (`skip`) compression.
+///
+/// `hash` memoises the node digest (computed once on first access, like the
+/// scalus `lazy val hash`) so building/proving never re-hashes whole subtrees.
+/// A cloned node carries its cached hash; only nodes rebuilt on the insert path
+/// recompute. (`OnceCell` is `!Sync` but `Send`, which is all the single-thread
+/// build-then-prove flow needs.)
 #[derive(Clone)]
 enum Node {
     Empty,
@@ -516,6 +525,7 @@ enum Node {
         skip_start: usize,
         full_path: Vec<u8>,
         value: Vec<u8>,
+        hash: OnceCell<Hash>,
     },
     /// `rep_path` is any descendant leaf's full path (used to read prefix nibbles).
     Branch {
@@ -524,6 +534,7 @@ enum Node {
         rep_path: Vec<u8>,
         children: Vec<Node>, // length 16
         size: usize,
+        hash: OnceCell<Hash>,
     },
 }
 
@@ -532,6 +543,32 @@ fn empty_children() -> Vec<Node> {
 }
 
 impl Node {
+    fn leaf(skip_start: usize, full_path: Vec<u8>, value: Vec<u8>) -> Node {
+        Node::Leaf {
+            skip_start,
+            full_path,
+            value,
+            hash: OnceCell::new(),
+        }
+    }
+
+    fn branch(
+        skip_start: usize,
+        skip_len: usize,
+        rep_path: Vec<u8>,
+        children: Vec<Node>,
+        size: usize,
+    ) -> Node {
+        Node::Branch {
+            skip_start,
+            skip_len,
+            rep_path,
+            children,
+            size,
+            hash: OnceCell::new(),
+        }
+    }
+
     fn hash(&self) -> Hash {
         match self {
             Node::Empty => NULL_HASH,
@@ -539,17 +576,22 @@ impl Node {
                 skip_start,
                 full_path,
                 value,
-            } => combine(&suffix(full_path, *skip_start), &blake2b_256(value)),
+                hash,
+            } => *hash
+                .get_or_init(|| combine(&suffix(full_path, *skip_start), &blake2b_256(value))),
             Node::Branch {
                 skip_start,
                 skip_len,
                 rep_path,
                 children,
+                hash,
                 ..
-            } => combine(
-                &nibbles(rep_path, *skip_start, *skip_start + *skip_len),
-                &merkle_root_16(children),
-            ),
+            } => *hash.get_or_init(|| {
+                combine(
+                    &nibbles(rep_path, *skip_start, *skip_start + *skip_len),
+                    &merkle_root_16(children),
+                )
+            }),
         }
     }
 }
@@ -613,11 +655,7 @@ fn branch_skip_matches_path(rep_path: &[u8], skip_len: usize, path: &[u8], curso
 
 fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Result<Node, MpfError> {
     match node {
-        Node::Empty => Ok(Node::Leaf {
-            skip_start: cursor,
-            full_path: path.to_vec(),
-            value: value.to_vec(),
-        }),
+        Node::Empty => Ok(Node::leaf(cursor, path.to_vec(), value.to_vec())),
 
         Node::Leaf {
             full_path: leaf_path,
@@ -635,23 +673,9 @@ fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Result<No
             let split_cursor = cursor + cp + 1;
 
             let mut children = empty_children();
-            children[new_nibble] = Node::Leaf {
-                skip_start: split_cursor,
-                full_path: path.to_vec(),
-                value: value.to_vec(),
-            };
-            children[old_nibble] = Node::Leaf {
-                skip_start: split_cursor,
-                full_path: leaf_path.clone(),
-                value: leaf_value.clone(),
-            };
-            Ok(Node::Branch {
-                skip_start: cursor,
-                skip_len: cp,
-                rep_path: path.to_vec(),
-                children,
-                size: 2,
-            })
+            children[new_nibble] = Node::leaf(split_cursor, path.to_vec(), value.to_vec());
+            children[old_nibble] = Node::leaf(split_cursor, leaf_path.clone(), leaf_value.clone());
+            Ok(Node::branch(cursor, cp, path.to_vec(), children, 2))
         }
 
         Node::Branch {
@@ -660,6 +684,7 @@ fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Result<No
             rep_path,
             children,
             size,
+            ..
         } => {
             let cp = common_prefix_len(path, rep_path, cursor, cursor + skip_len);
             if cp < *skip_len {
@@ -669,25 +694,15 @@ fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Result<No
                 let old_nibble = nibble(rep_path, cursor + cp) as usize;
 
                 let mut new_children = empty_children();
-                new_children[new_nibble] = Node::Leaf {
-                    skip_start: split_cursor,
-                    full_path: path.to_vec(),
-                    value: value.to_vec(),
-                };
-                new_children[old_nibble] = Node::Branch {
-                    skip_start: skip_start + cp + 1,
-                    skip_len: skip_len - cp - 1,
-                    rep_path: rep_path.clone(),
-                    children: children.clone(),
-                    size: *size,
-                };
-                Ok(Node::Branch {
-                    skip_start: cursor,
-                    skip_len: cp,
-                    rep_path: path.to_vec(),
-                    children: new_children,
-                    size: size + 1,
-                })
+                new_children[new_nibble] = Node::leaf(split_cursor, path.to_vec(), value.to_vec());
+                new_children[old_nibble] = Node::branch(
+                    skip_start + cp + 1,
+                    skip_len - cp - 1,
+                    rep_path.clone(),
+                    children.clone(),
+                    *size,
+                );
+                Ok(Node::branch(cursor, cp, path.to_vec(), new_children, size + 1))
             } else {
                 // Prefix matches → descend into the child.
                 let child_nibble = nibble(path, cursor + skip_len) as usize;
@@ -695,13 +710,13 @@ fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Result<No
                 let new_child = do_insert(&children[child_nibble], path, child_cursor, value)?;
                 let mut new_children = children.clone();
                 new_children[child_nibble] = new_child;
-                Ok(Node::Branch {
-                    skip_start: *skip_start,
-                    skip_len: *skip_len,
-                    rep_path: rep_path.clone(),
-                    children: new_children,
-                    size: size + 1,
-                })
+                Ok(Node::branch(
+                    *skip_start,
+                    *skip_len,
+                    rep_path.clone(),
+                    new_children,
+                    size + 1,
+                ))
             }
         }
     }
@@ -875,13 +890,11 @@ impl Trie {
     /// Verify with `excluding(key, &proof) == root_hash()`; after registering,
     /// `including(key, new_value, &proof)` is the updated root.
     pub fn prove_non_membership(&self, key: &[u8]) -> Result<Proof, MpfError> {
-        if self.get(key).is_some() {
-            return Err(MpfError::KeyPresent);
-        }
         // Insert under a dummy value, then prove membership in the expanded trie.
-        // The proof carries only neighbors (not the target leaf's value), so the
-        // dummy is irrelevant: `excluding` rebuilds the original root, `including`
-        // the post-insert root.
+        // `insert` already errors `KeyPresent` if the key exists, so no separate
+        // presence-check walk is needed. The proof carries only neighbors (not
+        // the target leaf's value), so the dummy is irrelevant: `excluding`
+        // rebuilds the original root, `including` the post-insert root.
         self.insert(key, &[])?.prove_membership(key)
     }
 }
