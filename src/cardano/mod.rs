@@ -12,6 +12,7 @@
 pub mod always_ok;
 pub mod bf_http;
 pub mod blockfrost_chain;
+pub mod blueprint;
 pub mod btc_rpc;
 pub mod blockfrost_source;
 pub mod mock;
@@ -21,6 +22,7 @@ pub mod pegin_datum;
 pub mod pegin_source;
 pub mod publish;
 pub mod registry;
+pub mod treasury_bootstrap;
 pub mod treasury_datum;
 pub mod treasury_info;
 pub mod wallet;

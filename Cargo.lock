@@ -1368,6 +1368,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "uplc",
  "whisky",
  "whisky-common",
  "whisky-pallas",

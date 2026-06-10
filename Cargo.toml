@@ -35,3 +35,4 @@ whisky = { version = "1.0.25", default-features = false, features = ["pallas"] }
 whisky-pallas = "1.0.25"
 whisky-common = "1.0.25"
 pallas-wallet = "0.32"
+uplc = "1.1.10"

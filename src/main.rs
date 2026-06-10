@@ -160,6 +160,39 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Bootstrap (K1 / init) the Cardano `treasury_info` state UTxO: one-shot mint
+    /// of the treasury NFT plus the initial TreasuryDatum (empty MPF identity root,
+    /// BTC treasury P2TR scriptPubKey, BTC treasury outpoint, FROST group key).
+    /// Spends a wallet UTxO as the one-shot; prints the signed tx, submits only
+    /// with --submit.
+    BootstrapTreasuryInfo {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json) holding the compiled
+        /// spos_registry + treasury_info validators.
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref, as
+        /// <cardano_tx_hash>:<index>. Parameterizes the registry policy (and through
+        /// it treasury_info). It must still be unspent when the registry linked list
+        /// itself is bootstrapped later — pick a wallet UTxO that will be left alone
+        /// until then.
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// Bootstrap BTC treasury P2TR scriptPubKey, hex (5120 || x-only key).
+        #[arg(long)]
+        btc_treasury_spk: String,
+        /// Bootstrap BTC treasury outpoint, as <btc_txid>:<vout>. Stored in the
+        /// datum in Bitcoin consensus form (txid little-endian || u32-LE vout).
+        #[arg(long)]
+        btc_outpoint: String,
+        /// 32-byte FROST group key (y_fed, x-only), hex.
+        #[arg(long)]
+        frost_key: String,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
     /// Scan binocular's on-chain peg-in requests over N2C, then build → sign →
     /// (optionally) broadcast the Treasury Movement sweeping the treasury + all
     /// discovered deposits into a new treasury output[0]. Key-path spend signed
@@ -344,6 +377,29 @@ fn main() {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
+            }
+        }
+        Commands::BootstrapTreasuryInfo {
+            config,
+            blueprint,
+            registry_bootstrap,
+            btc_treasury_spk,
+            btc_outpoint,
+            frost_key,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_bootstrap_treasury_info(
+                &cfg,
+                &blueprint,
+                &registry_bootstrap,
+                &btc_treasury_spk,
+                &btc_outpoint,
+                &frost_key,
+                submit,
+            ) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
             }
         }
         Commands::SweepPegins {
@@ -730,6 +786,144 @@ fn run_treasury_self_send(
 /// scriptPubKey. The treasury input is passed by arg (its Cardano oracle UTxO is
 /// not required for the pure-Bitcoin sweep).
 #[allow(clippy::too_many_arguments)]
+/// Parse `<cardano_tx_hash>:<index>` into a 32-byte tx id + output index.
+fn parse_cardano_outref(s: &str) -> Result<([u8; 32], u64), String> {
+    let (h, i) = s
+        .split_once(':')
+        .ok_or_else(|| format!("expected <tx_hash>:<index>, got '{s}'"))?;
+    let tx_id: [u8; 32] = hex::decode(h)
+        .map_err(|e| format!("tx hash hex: {e}"))?
+        .try_into()
+        .map_err(|_| "tx hash must be 32 bytes".to_string())?;
+    let index: u64 = i.parse().map_err(|e| format!("output index: {e}"))?;
+    Ok((tx_id, index))
+}
+
+/// Build (and with `submit`, broadcast) the K1 `treasury_info` bootstrap mint.
+/// See `heimdall::cardano::treasury_bootstrap` for the on-chain contract.
+fn run_bootstrap_treasury_info(
+    cfg: &HeimdallConfig,
+    blueprint_path: &str,
+    registry_bootstrap: &str,
+    btc_treasury_spk: &str,
+    btc_outpoint: &str,
+    frost_key: &str,
+    submit: bool,
+) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::treasury_bootstrap::{bootstrap_datum, build_treasury_bootstrap_tx};
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let mnemonic = cfg
+        .cardano
+        .mnemonic
+        .clone()
+        .or_else(|| {
+            std::env::var("HEIMDALL_MNEMONIC")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .ok_or("no mnemonic (set cardano.mnemonic or $HEIMDALL_MNEMONIC)")?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = std::fs::read_to_string(blueprint_path)
+        .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, reg_index)
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+    println!("registry policy id:   {}", registry.hash_hex());
+    println!("treasury_info policy: {}", treasury.hash_hex());
+
+    let spk = hex::decode(btc_treasury_spk).map_err(|e| format!("--btc-treasury-spk: {e}"))?;
+    let outpoint = parse_outpoint(btc_outpoint)?;
+    let utxo_id = bitcoin::consensus::encode::serialize(&outpoint);
+    let frost = hex::decode(frost_key).map_err(|e| format!("--frost-key: {e}"))?;
+    if frost.len() != 32 {
+        return Err(format!("--frost-key must be 32 bytes, got {}", frost.len()));
+    }
+    let datum = bootstrap_datum(spk, utxo_id, frost);
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    let raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = raw
+        .iter()
+        .map(|u| {
+            let lovelace: u64 = u
+                .amount
+                .iter()
+                .find(|a| a.unit == "lovelace")
+                .map(|a| a.quantity.parse().unwrap_or(0))
+                .unwrap_or(0);
+            let pure_ada = u.amount.iter().all(|a| a.unit == "lovelace");
+            WalletUtxo {
+                tx_hash: u.tx_hash.clone(),
+                output_index: u.output_index,
+                lovelace,
+                pure_ada,
+            }
+        })
+        .collect();
+    if wallet_utxos.is_empty() {
+        return Err(format!(
+            "wallet has no UTxOs — fund it first (address: {wallet_addr})"
+        ));
+    }
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let built = build_treasury_bootstrap_tx(
+        &treasury,
+        &wallet_addr,
+        &wallet_utxos,
+        &datum,
+        &key,
+        Some(cost_models),
+    )
+    .map_err(|e| format!("build bootstrap tx: {e}"))?;
+
+    println!(
+        "one-shot input_ref:   {}#{}",
+        built.input_ref.0, built.input_ref.1
+    );
+    println!(
+        "treasury NFT:         {}.{}",
+        built.policy_id_hex, built.asset_name_hex
+    );
+    println!("state UTxO address:   {}", built.script_address);
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    if !submit {
+        println!("(dry run — pass --submit to broadcast via Blockfrost)");
+        return Ok(());
+    }
+    let cbor = hex::decode(&built.signed_tx_hex).map_err(|e| e.to_string())?;
+    let mut settings = blockfrost::BlockFrostSettings::new();
+    if let Some(url) = cfg.cardano.blockfrost_url.as_deref() {
+        settings.base_url = Some(url.to_string());
+    }
+    let api = blockfrost::BlockfrostAPI::new(pid, settings);
+    let tx_hash = rt
+        .block_on(api.transactions_submit(cbor))
+        .map_err(|e| format!("blockfrost submit: {e}"))?;
+    println!("submitted: tx_hash={tx_hash}");
+    Ok(())
+}
+
 fn run_sweep_pegins(
     cfg: &HeimdallConfig,
     cardano_socket: &str,
