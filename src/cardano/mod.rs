@@ -20,6 +20,7 @@ pub mod pallas_source;
 pub mod pegin_datum;
 pub mod pegin_source;
 pub mod publish;
+pub mod registry;
 pub mod treasury_datum;
 pub mod treasury_info;
 pub mod wallet;
