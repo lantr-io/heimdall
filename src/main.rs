@@ -218,6 +218,16 @@ enum Commands {
         /// Treasury input amount in satoshis.
         #[arg(long)]
         treasury_amount_sat: u64,
+        /// Bech32 address of the `peg_out.ak` script holding PegOut UTxOs. A Treasury Movement
+        /// collects EVERY pending peg-out here (technical_documentation §"Treasury Movement
+        /// (Bitcoin)": "pay every pending peg-out") alongside every confirmed peg-in. Destination +
+        /// amount come from each on-chain PegOut UTxO, never from the CLI.
+        #[arg(long)]
+        pegout_script_address: String,
+        /// The bridged-token (fBTC) unit `<policy_hex><asset_name_hex>` used to read each PegOut
+        /// UTxO's locked amount from its value.
+        #[arg(long)]
+        bridged_token_unit: String,
         /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
         #[arg(long)]
         broadcast: bool,
@@ -410,6 +420,8 @@ fn main() {
             pegin_policy_id,
             treasury_outpoint,
             treasury_amount_sat,
+            pegout_script_address,
+            bridged_token_unit,
             broadcast,
             existing_tm_hex,
         } => {
@@ -422,6 +434,8 @@ fn main() {
                 &pegin_policy_id,
                 &treasury_outpoint,
                 treasury_amount_sat,
+                &pegout_script_address,
+                &bridged_token_unit,
                 broadcast,
                 existing_tm_hex.as_deref(),
             ) {
@@ -932,13 +946,19 @@ fn run_sweep_pegins(
     pegin_policy_id: &str,
     treasury_outpoint: &str,
     treasury_amount_sat: u64,
+    pegout_script_address: &str,
+    bridged_token_unit: &str,
     broadcast: bool,
     existing_tm_hex: Option<&str>,
 ) -> Result<(), String> {
     use bitcoin::key::Secp256k1;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
     use heimdall::bitcoin::taproot::treasury_spend_info;
-    use heimdall::bitcoin::tm_builder::{build_tm, sign_tm_single_key, PegInInput, TreasuryInput};
+    use heimdall::bitcoin::tm_builder::{
+        build_tm, sign_tm_single_key, PegInInput, PegOutRequest, TreasuryInput,
+    };
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::pegout_datum::fetch_pegout_requests;
     use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
     use heimdall::cardano::btc_rpc::broadcast_btc_tx;
     use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
@@ -1006,11 +1026,45 @@ fn run_sweep_pegins(
         });
     }
 
+    // Collect EVERY pending peg-out at the peg_out.ak address (the SPO's spec job — a TM pays every
+    // pending peg-out alongside sweeping every peg-in). Destination scriptPubKey + amount come from
+    // each on-chain PegOut UTxO. Blockfrost-backed (the demo path); the pallas N2C path is peg-in only.
+    let pegout_data = {
+        let pid = cfg.cardano.blockfrost_project_id.as_deref().ok_or_else(|| {
+            "peg-out collection requires cardano.blockfrost_project_id".to_string()
+        })?;
+        let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+        rt.block_on(fetch_pegout_requests(
+            &base_url,
+            pid,
+            pegout_script_address,
+            bridged_token_unit,
+        ))
+        .map_err(|e| format!("fetch_pegout_requests: {e}"))?
+    };
+    println!(
+        "scanned {} peg-out request(s) at {pegout_script_address}",
+        pegout_data.len()
+    );
+    let mut pegout_requests = Vec::with_capacity(pegout_data.len());
+    for po in &pegout_data {
+        println!(
+            "  peg-out → {} — {} sat",
+            hex::encode(&po.destination_script_pubkey),
+            po.amount_sat
+        );
+        pegout_requests.push(PegOutRequest {
+            script_pubkey: ScriptBuf::from_bytes(po.destination_script_pubkey.clone()),
+            amount: Amount::from_sat(po.amount_sat),
+        });
+    }
+
     let treasury_outpoint = parse_outpoint(treasury_outpoint)?;
     let treasury_spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv);
     let treasury_spk = ScriptBuf::new_p2tr_tweaked(treasury_spend_info.output_key());
 
-    // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee.
+    // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..] = one
+    // payment per peg-out (sorted by scriptPubKey inside build_tm).
     let unsigned = build_tm(
         TreasuryInput {
             outpoint: treasury_outpoint,
@@ -1018,7 +1072,7 @@ fn run_sweep_pegins(
             spend_info: treasury_spend_info,
         },
         pegin_inputs,
-        vec![],
+        pegout_requests,
         treasury_spk.clone(),
         &fee_params_from_cfg(cfg),
     )
