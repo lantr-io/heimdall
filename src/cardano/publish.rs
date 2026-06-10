@@ -80,7 +80,10 @@ fn encode_datum_hex(btc_tx: &[u8], constructor: u8) -> String {
     let datum = PlutusData::Constr(Constr {
         tag,
         any_constructor,
-        fields: MaybeIndefArray::Def(vec![PlutusData::BoundedBytes(BoundedBytes::from(
+        // Canonical plutus-core encoding: non-empty Constr fields are indefinite-length. Matches
+        // what a Haskell node produces and what the encoding-sensitive Rust uplc evaluator
+        // (whisky / aiken simulate) expects — see treasury_info::constr.
+        fields: MaybeIndefArray::Indef(vec![PlutusData::BoundedBytes(BoundedBytes::from(
             btc_tx.to_vec(),
         ))]),
     });

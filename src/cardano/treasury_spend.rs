@@ -34,10 +34,10 @@ use crate::cardano::treasury_info::{
 
 #[derive(Debug)]
 pub enum TreasurySpendError {
-    /// No UTxO at the script address carries an asset under the treasury policy.
+    /// No UTxO at the script address carries the treasury NFT (policy + name).
     StateNotFound,
-    /// More than one UTxO carries treasury-policy assets — the singleton
-    /// invariant is broken (or the wrong address/policy was queried).
+    /// More than one UTxO carries the treasury NFT — a supply anomaly (or the
+    /// wrong policy/name was queried).
     MultipleStates(usize),
     /// The state UTxO carries assets under a foreign policy; the continuing
     /// output could not reproduce the value faithfully from our model.
@@ -55,10 +55,7 @@ impl std::fmt::Display for TreasurySpendError {
         match self {
             Self::StateNotFound => write!(f, "no treasury_info state UTxO at the script address"),
             Self::MultipleStates(n) => {
-                write!(
-                    f,
-                    "{n} UTxOs carry treasury-policy assets, expected exactly 1"
-                )
+                write!(f, "{n} UTxOs carry the treasury NFT, expected exactly 1")
             }
             Self::ForeignAssets(unit) => {
                 write!(f, "state UTxO carries a foreign asset: {unit}")
@@ -87,47 +84,59 @@ pub struct TreasuryStateUtxo {
 }
 
 /// Locate the treasury_info state UTxO among `utxos` (fetched from the script
-/// address): exactly one UTxO carrying exactly one asset under
-/// `policy_id_hex`, with an inline `TreasuryDatum`.
+/// address): the UTxO carrying exactly the treasury NFT `policy_id_hex` +
+/// `asset_name_hex` (quantity 1) with an inline `TreasuryDatum`.
 ///
-/// The validator maintains these invariants from K1 onward; violations here
-/// mean the wrong address/policy was queried or the instance is corrupt —
-/// either way, refuse rather than guess.
+/// The NFT asset name (`sha2_256(serialise_data(bootstrap input_ref))`) is
+/// fixed at K1 and recorded by the operator, so we select by the EXACT unit —
+/// not merely "any asset under the policy". This matters because `treasury.ak`'s
+/// mint branch is permissionless and repeatable: anyone can mint a second
+/// treasury-policy NFT (under a different asset name) to the same address. A
+/// policy-only filter would then see two candidates and brick discovery, even
+/// though the genuine state is still uniquely identified by its name. Matching
+/// the exact unit also pins the value-preservation invariant (a foreign or
+/// extra asset on the UTxO is rejected rather than silently dropped from the
+/// continuing output).
 pub fn find_treasury_state(
     utxos: &[BfUtxo],
     policy_id_hex: &str,
+    asset_name_hex: &str,
 ) -> Result<TreasuryStateUtxo, TreasurySpendError> {
+    let nft_unit = format!("{policy_id_hex}{asset_name_hex}");
     let candidates: Vec<&BfUtxo> = utxos
         .iter()
-        .filter(|u| {
-            u.amount
-                .iter()
-                .any(|a| a.unit != "lovelace" && a.unit.starts_with(policy_id_hex))
-        })
+        .filter(|u| u.amount.iter().any(|a| a.unit == nft_unit))
         .collect();
     let state = match candidates.as_slice() {
         [] => return Err(TreasurySpendError::StateNotFound),
         [one] => one,
+        // A single-mint NFT lives in exactly one UTxO; two matches means a
+        // supply anomaly (or the wrong policy/name) — refuse rather than guess.
         many => return Err(TreasurySpendError::MultipleStates(many.len())),
     };
 
     let mut lovelace = 0u64;
-    let mut asset_name_hex = None;
     for a in &state.amount {
         if a.unit == "lovelace" {
             lovelace = a
                 .quantity
                 .parse()
                 .map_err(|e| TreasurySpendError::BadLovelace(format!("{e}")))?;
-        } else if let Some(name) = a.unit.strip_prefix(policy_id_hex) {
-            asset_name_hex = Some(name.to_string());
+        } else if a.unit == nft_unit {
+            // The treasury NFT — exactly 1 by the policy's mint rule. Anything
+            // else means a corrupted instance whose value we can't preserve.
+            if a.quantity != "1" {
+                return Err(TreasurySpendError::ForeignAssets(format!(
+                    "{nft_unit} quantity {}",
+                    a.quantity
+                )));
+            }
         } else {
             // Foreign asset: the value-preservation contract would silently
             // drop it from the continuing output we build.
             return Err(TreasurySpendError::ForeignAssets(a.unit.clone()));
         }
     }
-    let asset_name_hex = asset_name_hex.expect("candidate filter guarantees the NFT");
 
     let datum_hex = state
         .inline_datum
@@ -144,7 +153,7 @@ pub fn find_treasury_state(
         tx_hash: state.tx_hash.clone(),
         output_index: state.output_index,
         lovelace,
-        asset_name_hex,
+        asset_name_hex: asset_name_hex.to_string(),
         datum,
     })
 }
@@ -249,7 +258,17 @@ mod tests {
         }
     }
 
+    // The genuine state UTxO's NFT asset name (would be sha2_256(serialise_data(
+    // input_ref)) on-chain; any fixed 32-byte value works for these tests).
+    fn nft_name() -> String {
+        "ee".repeat(32)
+    }
+
     fn state_utxo(policy_hex: &str, datum: &TreasuryInfoDatum) -> BfUtxo {
+        named_state_utxo(policy_hex, &nft_name(), datum)
+    }
+
+    fn named_state_utxo(policy_hex: &str, name_hex: &str, datum: &TreasuryInfoDatum) -> BfUtxo {
         BfUtxo {
             tx_hash: "dd".repeat(32),
             output_index: 0,
@@ -259,7 +278,7 @@ mod tests {
                     quantity: "3104330".into(),
                 },
                 BfAmount {
-                    unit: format!("{policy_hex}{}", "ee".repeat(32)),
+                    unit: format!("{policy_hex}{name_hex}"),
                     quantity: "1".into(),
                 },
             ],
@@ -284,11 +303,27 @@ mod tests {
         let script = test_script();
         let datum = sample_datum(mpf::NULL_HASH);
         let utxos = vec![ada_utxo(2_000_000), state_utxo(&script.hash_hex(), &datum)];
-        let state = find_treasury_state(&utxos, &script.hash_hex()).unwrap();
+        let state = find_treasury_state(&utxos, &script.hash_hex(), &nft_name()).unwrap();
         assert_eq!(state.tx_hash, "dd".repeat(32));
         assert_eq!(state.lovelace, 3_104_330);
-        assert_eq!(state.asset_name_hex, "ee".repeat(32));
+        assert_eq!(state.asset_name_hex, nft_name());
         assert_eq!(state.datum, datum);
+    }
+
+    // A second, attacker-minted treasury NFT (different asset name, same policy
+    // and address — treasury.ak's mint branch is permissionless/repeatable) must
+    // NOT brick discovery: selecting by the genuine asset name ignores it.
+    #[test]
+    fn ignores_a_second_policy_nft_with_a_different_name() {
+        let script = test_script();
+        let policy = script.hash_hex();
+        let datum = sample_datum(mpf::NULL_HASH);
+        let genuine = state_utxo(&policy, &datum);
+        let mut decoy = named_state_utxo(&policy, &"aa".repeat(32), &datum);
+        decoy.tx_hash = "ff".repeat(32);
+        let state = find_treasury_state(&[decoy, genuine], &policy, &nft_name()).unwrap();
+        assert_eq!(state.tx_hash, "dd".repeat(32));
+        assert_eq!(state.asset_name_hex, nft_name());
     }
 
     #[test]
@@ -299,27 +334,27 @@ mod tests {
 
         // none
         assert!(matches!(
-            find_treasury_state(&[ada_utxo(1)], &policy),
+            find_treasury_state(&[ada_utxo(1)], &policy, &nft_name()),
             Err(TreasurySpendError::StateNotFound)
         ));
-        // duplicated NFT-bearing UTxO
+        // two UTxOs carrying the SAME NFT name (supply anomaly)
         let two = vec![state_utxo(&policy, &datum), state_utxo(&policy, &datum)];
         assert!(matches!(
-            find_treasury_state(&two, &policy),
+            find_treasury_state(&two, &policy, &nft_name()),
             Err(TreasurySpendError::MultipleStates(2))
         ));
         // missing inline datum
         let mut no_datum = state_utxo(&policy, &datum);
         no_datum.inline_datum = None;
         assert!(matches!(
-            find_treasury_state(&[no_datum], &policy),
+            find_treasury_state(&[no_datum], &policy, &nft_name()),
             Err(TreasurySpendError::NoInlineDatum)
         ));
         // garbage datum CBOR
         let mut bad = state_utxo(&policy, &datum);
         bad.inline_datum = Some("ff".into());
         assert!(matches!(
-            find_treasury_state(&[bad], &policy),
+            find_treasury_state(&[bad], &policy, &nft_name()),
             Err(TreasurySpendError::BadDatumCbor(_))
         ));
         // foreign asset alongside the NFT
@@ -329,7 +364,7 @@ mod tests {
             quantity: "5".into(),
         });
         assert!(matches!(
-            find_treasury_state(&[foreign], &policy),
+            find_treasury_state(&[foreign], &policy, &nft_name()),
             Err(TreasurySpendError::ForeignAssets(_))
         ));
     }
@@ -340,9 +375,12 @@ mod tests {
     fn spend_leg_preserves_value_and_updates_datum() {
         let script = test_script();
         let old = sample_datum(mpf::NULL_HASH);
-        let state =
-            find_treasury_state(&[state_utxo(&script.hash_hex(), &old)], &script.hash_hex())
-                .unwrap();
+        let state = find_treasury_state(
+            &[state_utxo(&script.hash_hex(), &old)],
+            &script.hash_hex(),
+            &nft_name(),
+        )
+        .unwrap();
 
         let mut new_datum = old.clone();
         new_datum.bifrost_identity_root = [7u8; 32];
@@ -400,9 +438,12 @@ mod tests {
         ])
         .unwrap();
         let old = sample_datum(trie.root_hash());
-        let state =
-            find_treasury_state(&[state_utxo(&script.hash_hex(), &old)], &script.hash_hex())
-                .unwrap();
+        let state = find_treasury_state(
+            &[state_utxo(&script.hash_hex(), &old)],
+            &script.hash_hex(),
+            &nft_name(),
+        )
+        .unwrap();
 
         let (new_datum, proof) =
             apply_registration(&state.datum, &trie, b"new-spo-pk", b"new-pool").unwrap();
@@ -445,9 +486,12 @@ mod tests {
 
         let script = test_script();
         let old = sample_datum(mpf::NULL_HASH);
-        let state =
-            find_treasury_state(&[state_utxo(&script.hash_hex(), &old)], &script.hash_hex())
-                .unwrap();
+        let state = find_treasury_state(
+            &[state_utxo(&script.hash_hex(), &old)],
+            &script.hash_hex(),
+            &nft_name(),
+        )
+        .unwrap();
         let mut new_datum = old.clone();
         new_datum.bifrost_identity_root = [7u8; 32];
         let (treasury_in, treasury_out) = treasury_spend_leg(

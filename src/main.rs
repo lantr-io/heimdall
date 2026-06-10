@@ -1028,18 +1028,27 @@ fn run_sweep_pegins(
     // Collect EVERY pending peg-out at the peg_out.ak address (the SPO's spec job — a TM pays every
     // pending peg-out alongside sweeping every peg-in). Destination scriptPubKey + amount come from
     // each on-chain PegOut UTxO. Blockfrost-backed (the demo path); the pallas N2C path is peg-in only.
-    let pegout_data = {
-        let pid = cfg.cardano.blockfrost_project_id.as_deref().ok_or_else(|| {
-            "peg-out collection requires cardano.blockfrost_project_id".to_string()
-        })?;
-        let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
-        rt.block_on(fetch_pegout_requests(
-            &base_url,
-            pid,
-            pegout_script_address,
-            bridged_token_unit,
-        ))
-        .map_err(|e| format!("fetch_pegout_requests: {e}"))?
+    // Peg-out collection is Blockfrost-only (the N2C path is peg-in only). When no Blockfrost is
+    // configured, skip it with a loud warning rather than hard-failing — an N2C-only sweep that
+    // previously worked must still build a TM (it just can't include peg-outs over N2C).
+    let pegout_data = match cfg.cardano.blockfrost_project_id.as_deref() {
+        Some(pid) => {
+            let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+            rt.block_on(fetch_pegout_requests(
+                &base_url,
+                pid,
+                pegout_script_address,
+                bridged_token_unit,
+            ))
+            .map_err(|e| format!("fetch_pegout_requests: {e}"))?
+        }
+        None => {
+            eprintln!(
+                "[sweep] no cardano.blockfrost_project_id — peg-out collection is Blockfrost-only \
+                 (N2C is peg-in only); building TM without peg-outs"
+            );
+            Vec::new()
+        }
     };
     println!(
         "scanned {} peg-out request(s) at {pegout_script_address}",
