@@ -105,7 +105,8 @@ impl Default for AxiomDkgCircuitParams {
 impl AxiomDkgCircuitParams {
     pub fn round1_digest_fault() -> Self {
         Self {
-            degree: 21,
+            degree: 22,
+            advice_columns: 2,
             ..Self::default()
         }
     }
