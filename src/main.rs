@@ -1137,18 +1137,57 @@ fn run_sweep_pegins(
             (signed, local_raw, false)
         };
 
+    // With an override, the bytes posted to Cardano are the supplied TM, NOT the locally-built
+    // one (heimdall's real output is the Cardano post; the BTC broadcast path is debug/demo).
+    // Warn about any peg-out the local build would pay that the supplied TM does NOT — typically
+    // a peg-out created/scanned AFTER the supplied TM was built, which this movement cannot
+    // fulfil (it rolls to the next TM). Surfacing it prevents silently recording a TM that skips
+    // a pending withdrawal. (Compared by destination scriptPubKey: local peg-out outputs are
+    // `unsigned.tx.output[1..]`; output[0] is the treasury change.)
+    if override_in_effect {
+        let override_out_spks: std::collections::HashSet<&[u8]> = effective_tx
+            .output
+            .iter()
+            .map(|o| o.script_pubkey.as_bytes())
+            .collect();
+        for out in unsigned.tx.output.iter().skip(1) {
+            if !override_out_spks.contains(out.script_pubkey.as_bytes()) {
+                eprintln!(
+                    "[override] WARNING: supplied TM does not pay pending peg-out → {} ({} sat) \
+                     — likely recorded after the supplied TM was built; it will NOT be fulfilled \
+                     by this movement",
+                    hex::encode(out.script_pubkey.as_bytes()),
+                    out.value.to_sat(),
+                );
+            }
+        }
+    }
+
     println!("\n── Treasury Movement (sweep peg-ins) ──");
     println!("  txid:    {}", effective_tx.compute_txid());
     println!("  inputs:  {}", effective_tx.input.len());
-    for (i, (inp, prevout)) in effective_tx.input.iter().zip(unsigned.prevouts.iter()).enumerate() {
-        println!(
-            "    [{}] {}:{} — {} sat  script={}",
-            i,
-            inp.previous_output.txid,
-            inp.previous_output.vout,
-            prevout.value.to_sat(),
-            hex::encode(prevout.script_pubkey.as_bytes()),
-        );
+    if override_in_effect {
+        // The override is a different tx than the local build, so its inputs do NOT correspond
+        // to the locally-computed `unsigned.prevouts` — print outpoints only (we don't have the
+        // override's prevout values/scripts) rather than mispair them.
+        for (i, inp) in effective_tx.input.iter().enumerate() {
+            println!(
+                "    [{}] {}:{}",
+                i, inp.previous_output.txid, inp.previous_output.vout
+            );
+        }
+    } else {
+        for (i, (inp, prevout)) in effective_tx.input.iter().zip(unsigned.prevouts.iter()).enumerate()
+        {
+            println!(
+                "    [{}] {}:{} — {} sat  script={}",
+                i,
+                inp.previous_output.txid,
+                inp.previous_output.vout,
+                prevout.value.to_sat(),
+                hex::encode(prevout.script_pubkey.as_bytes()),
+            );
+        }
     }
     println!("  outputs: {}", effective_tx.output.len());
     for (i, out) in effective_tx.output.iter().enumerate() {
