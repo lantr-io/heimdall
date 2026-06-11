@@ -51,4 +51,4 @@ name = "dkg_fault_onchain"
 harness = false
 
 [dev-dependencies]
-plutus-halo2-verifier-gen = { git = "https://github.com/vlasin/plutus-halo2-verifier-gen.git", rev = "e55547178d2fb1f286ba2d6372b1c5e4193842ca" }
+plutus-halo2-verifier-gen = { git = "https://github.com/vlasin/plutus-halo2-verifier-gen.git", rev = "81e4af5d06a9100c0b9b908e59555480e0152089" }

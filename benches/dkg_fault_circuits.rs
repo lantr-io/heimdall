@@ -51,27 +51,14 @@ const ROUND2_T: usize = 2;
 const ROUND2_INDEX_BITS: usize = 16;
 
 fn main() {
-    let params = AxiomDkgCircuitParams::default();
     println!(
         "backend: Axiom halo2-axiom, BLS12-381 KZG, SHPLONK, Cardano-friendly Blake2b transcript"
     );
-    println!(
-        "circuit_config: k={}, lookup_bits={}, advice_columns={}, lookup_advice_columns={}, fixed_columns={}, limb_bits={}, num_limbs={}, window_bits={}, unusable_rows={}",
-        params.degree,
-        params.lookup_bits,
-        params.advice_columns,
-        params.lookup_advice_columns,
-        params.fixed_columns,
-        params.limb_bits,
-        params.num_limbs,
-        params.window_bits,
-        params.unusable_rows
-    );
 
-    run_round1_benchmark(params);
-    run_round1_digest_fault_benchmark(params);
-    run_round2_benchmark(params);
-    run_round2_digest_fault_benchmark(params);
+    run_round1_benchmark(AxiomDkgCircuitParams::default());
+    run_round1_digest_fault_benchmark(AxiomDkgCircuitParams::round1_digest_fault());
+    run_round2_benchmark(AxiomDkgCircuitParams::default());
+    run_round2_digest_fault_benchmark(AxiomDkgCircuitParams::round2_digest_fault());
 }
 
 fn run_round1_benchmark(params: AxiomDkgCircuitParams) {
@@ -82,6 +69,7 @@ fn run_round1_benchmark(params: AxiomDkgCircuitParams) {
 
     println!();
     println!("== round1-pok ==");
+    print_circuit_config(params);
     print_stats(&stats, params);
     print_keygen_times(&keygen_times);
 
@@ -125,6 +113,7 @@ fn run_round1_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
 
     println!();
     println!("== round1-pok-digest-fault ==");
+    print_circuit_config(params);
     print_stats(&stats, params);
     print_keygen_times(&keygen_times);
 
@@ -134,7 +123,7 @@ fn run_round1_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
         params,
         &case.digest_witness,
     );
-    assert_eq!(public_instances, vec![expected_digest, BlsFr::from(0)]);
+    assert_eq!(public_instances, vec![expected_digest]);
     let computed = round1_digest_residual(&case.digest_witness);
     assert_ne!(computed, case.digest_witness.transcript_r);
     run_proof_case(
@@ -143,7 +132,7 @@ fn run_round1_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
         prover_builder,
         &public_instances,
         &case.name,
-        "public inputs = Poseidon(message) plus constrained zero, circuit derives HDKG and asserts D != R",
+        "public input = Poseidon(message), circuit derives HDKG and asserts D != R",
     );
 }
 
@@ -156,6 +145,7 @@ fn run_round2_benchmark(params: AxiomDkgCircuitParams) {
 
     println!();
     println!("== round2-share ==");
+    print_circuit_config(params);
     print_stats(&stats, params);
     print_keygen_times(&keygen_times);
 
@@ -196,6 +186,7 @@ fn run_round2_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
 
     println!();
     println!("== round2-share-digest-fault ==");
+    print_circuit_config(params);
     print_stats(&stats, params);
     print_keygen_times(&keygen_times);
 
@@ -206,7 +197,7 @@ fn run_round2_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
             params,
             &case.witness,
         );
-    assert_eq!(public_instances, vec![expected_digest, BlsFr::from(0)]);
+    assert_eq!(public_instances, vec![expected_digest]);
     let computed = round2_residual(&case.witness);
     assert!(!is_identity(&computed));
     run_proof_case(
@@ -215,7 +206,7 @@ fn run_round2_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
         prover_builder,
         &public_instances,
         &case.name,
-        "public inputs = Poseidon(message) plus constrained zero, circuit asserts D != identity",
+        "public input = Poseidon(message), circuit asserts D != identity",
     );
 }
 
@@ -313,6 +304,21 @@ fn verify(
         &mut transcript,
     )
     .expect("proof verification should succeed");
+}
+
+fn print_circuit_config(params: AxiomDkgCircuitParams) {
+    println!(
+        "circuit_config: k={}, lookup_bits={}, advice_columns={}, lookup_advice_columns={}, fixed_columns={}, limb_bits={}, num_limbs={}, window_bits={}, unusable_rows={}",
+        params.degree,
+        params.lookup_bits,
+        params.advice_columns,
+        params.lookup_advice_columns,
+        params.fixed_columns,
+        params.limb_bits,
+        params.num_limbs,
+        params.window_bits,
+        params.unusable_rows
+    );
 }
 
 fn print_stats(stats: &CircuitStats, params: AxiomDkgCircuitParams) {
