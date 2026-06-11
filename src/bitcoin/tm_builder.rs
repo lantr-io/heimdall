@@ -71,13 +71,33 @@ pub struct UnsignedTm {
     pub skipped_pegouts: Vec<SkippedPegOut>,
 }
 
-/// A peg-out request excluded from a TM as unfulfillable (see
-/// [`UnsignedTm::skipped_pegouts`]).
+/// A peg-out request excluded from a TM (see [`UnsignedTm::skipped_pegouts`]).
 #[derive(Debug, Clone)]
 pub struct SkippedPegOut {
     pub script_pubkey: ScriptBuf,
     /// The gross amount from the PegOut UTxO (before the per-pegout fee).
     pub amount: Amount,
+    pub reason: SkipReason,
+}
+
+/// Why a peg-out was excluded from the TM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Gross amount minus the per-pegout fee is below the dust threshold — no
+    /// valid BTC output can be produced.
+    BelowDust,
+    /// The destination scriptPubKey is not a standard, spendable output type
+    /// (empty / OP_RETURN / bare / non-standard) — unsafe or non-relayable.
+    NonStandardScript,
+}
+
+impl fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BelowDust => write!(f, "amount below dust after fee"),
+            Self::NonStandardScript => write!(f, "non-standard/unspendable destination script"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +181,15 @@ fn outpoint_sort_key(op: &OutPoint) -> [u8; 36] {
 // Builder
 // ---------------------------------------------------------------------------
 
+/// True iff `spk` is a standard, spendable Bitcoin output type
+/// (P2PKH / P2SH / P2WPKH / P2WSH / P2TR). Rejects empty (anyone-can-spend),
+/// OP_RETURN (unspendable), bare multisig / P2PK, and any non-standard script —
+/// none of which a TM can safely pay. All accepted types have a scriptPubKey
+/// <= 34 bytes, keeping `estimate_vsize` a safe upper bound.
+fn is_standard_payable(spk: &bitcoin::Script) -> bool {
+    spk.is_p2pkh() || spk.is_p2sh() || spk.is_p2wpkh() || spk.is_p2wsh() || spk.is_p2tr()
+}
+
 /// Build a deterministic unsigned Treasury Movement transaction.
 ///
 /// Every honest SPO must produce byte-identical bytes for the same
@@ -180,20 +209,40 @@ pub fn build_tm(
     change_script_pubkey: ScriptBuf,
     fee_params: &FeeParams,
 ) -> Result<UnsignedTm, TmBuildError> {
-    // --- Drop unfulfillable peg-outs (skip, don't abort) ---
-    // A peg-out is payable iff its net (gross − per-pegout fee) is at least the
-    // dust threshold; below that, no valid BTC output exists. SKIP such requests
-    // rather than fail the whole TM — the peg-out address is permissionlessly
-    // payable, so one tiny/hostile peg-out must not block every peg-in and
-    // peg-out (bridge-wide liveness DoS). The user reclaims a sub-dust peg-out
-    // via `peg_out.ak`'s Cancel path.
+    // --- Drop unpayable peg-outs (skip, don't abort) ---
+    // The peg-out destination + amount come from attacker-controllable on-chain
+    // datum (anyone can lock fBTC at the permissionlessly-payable peg_out.ak
+    // address). SKIP a request the TM cannot safely pay rather than fail the
+    // whole TM — one tiny/hostile peg-out must not block every peg-in and
+    // peg-out (bridge-wide liveness DoS). The user reclaims via Cancel. Two ways
+    // a request is unpayable:
+    //
+    //  (1) Non-standard destination scriptPubKey. An empty script is
+    //      anyone-can-spend (treasury BTC claimable by anyone — fund loss),
+    //      OP_RETURN is an unspendable burn, and any non-standard/oversized
+    //      script makes the whole TM non-relayable (dead on arrival, taking the
+    //      batched peg-ins with it). Accepting only P2PKH/P2SH/P2WPKH/P2WSH/P2TR
+    //      also caps every peg-out spk at 34 bytes, so estimate_vsize's
+    //      per-output assumption stays a safe upper bound.
+    //  (2) Net (gross − per-pegout fee) below the dust threshold — no valid
+    //      output exists.
     //
     // DETERMINISM: every SPO must skip the SAME set to build byte-identical TMs
-    // for FROST, so `per_pegout_fee` must be a consensus value — see WI-009 /
-    // technical_questions.md §2. (The proper long-term fix is the contract
-    // rejecting sub-min peg-outs at lock time via a config min-fbtc value.)
+    // for FROST. The script check is network-independent; the dust check needs
+    // `per_pegout_fee` to be a consensus value — see WI-009 /
+    // technical_questions.md §2. (The proper long-term fix for (2) is the
+    // contract rejecting sub-min peg-outs at lock time via a config min-fbtc
+    // value; for (1), validating the destination at lock time.)
     let mut skipped_pegouts = Vec::new();
     pegouts.retain(|po| {
+        if !is_standard_payable(&po.script_pubkey) {
+            skipped_pegouts.push(SkippedPegOut {
+                script_pubkey: po.script_pubkey.clone(),
+                amount: po.amount,
+                reason: SkipReason::NonStandardScript,
+            });
+            return false;
+        }
         let payable = matches!(
             po.amount.checked_sub(fee_params.per_pegout_fee),
             Some(net) if net >= DUST_THRESHOLD
@@ -202,6 +251,7 @@ pub fn build_tm(
             skipped_pegouts.push(SkippedPegOut {
                 script_pubkey: po.script_pubkey.clone(),
                 amount: po.amount,
+                reason: SkipReason::BelowDust,
             });
         }
         payable
@@ -680,6 +730,41 @@ mod tests {
         let mut skipped: Vec<u64> = tm.skipped_pegouts.iter().map(|s| s.amount.to_sat()).collect();
         skipped.sort_unstable();
         assert_eq!(skipped, vec![500, 1_200]);
+    }
+
+    // Non-standard / unspendable destination scriptPubKeys (empty, OP_RETURN,
+    // junk) are skipped — they come from attacker-controllable datum and would
+    // lose funds or make the TM non-relayable.
+    #[test]
+    fn test_nonstandard_destination_pegouts_are_skipped() {
+        let fee_params = default_fee_params();
+        let pegouts = vec![
+            make_pegout(0x10, 100_000), // P2TR — payable
+            PegOutRequest {
+                script_pubkey: ScriptBuf::new(), // empty (anyone-can-spend)
+                amount: Amount::from_sat(100_000),
+            },
+            PegOutRequest {
+                script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x02, 0xde, 0xad]), // OP_RETURN
+                amount: Amount::from_sat(100_000),
+            },
+        ];
+        let tm = build_tm(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            pegouts,
+            change_address(),
+            &fee_params,
+        )
+        .unwrap();
+
+        assert_eq!(tm.tx.output.len(), 2); // change + the one P2TR payment
+        assert_eq!(tm.skipped_pegouts.len(), 2);
+        assert!(
+            tm.skipped_pegouts
+                .iter()
+                .all(|s| s.reason == SkipReason::NonStandardScript)
+        );
     }
 
     // A TM built entirely of unfulfillable peg-outs still succeeds (no payments,

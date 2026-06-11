@@ -1086,13 +1086,15 @@ fn run_sweep_pegins(
     )
     .map_err(|e| format!("build sweep: {e}"))?;
 
-    // Surface any peg-outs dropped as unfulfillable (sub-dust after the fee) so
-    // the operator sees them — the TM still pays the rest rather than aborting.
+    // Surface any peg-outs the TM dropped as unpayable (non-standard destination
+    // or sub-dust after fee) so the operator sees them — the TM still pays the
+    // rest rather than aborting.
     for s in &unsigned.skipped_pegouts {
         eprintln!(
-            "[sweep] skipped unfulfillable peg-out → {} ({} sat, below dust after fee)",
+            "[sweep] skipped peg-out → {} ({} sat): {}",
             hex::encode(s.script_pubkey.as_bytes()),
-            s.amount.to_sat()
+            s.amount.to_sat(),
+            s.reason
         );
     }
 
