@@ -5,17 +5,29 @@
 //! Each PegOut UTxO carries an inline `PegOutDatum` (Aiken `Constr 0` with 3 fields:
 //! `[owner_auth, source_chain_destination_address, source_chain_treasury_utxo_id]`). Field[1] is
 //! the raw Bitcoin scriptPubKey the TM must pay; the locked fBTC quantity in the UTxO value is the
-//! amount (the protocol pays the destination exactly this amount — no per-pegout fee). The
-//! destination + amount come from on-chain state, never from the operator.
+//! GROSS peg-out amount. The destination + gross amount come from on-chain state, never from the
+//! operator.
+//!
+//! The BTC output does NOT pay the gross amount in full: per technical_documentation §"Treasury
+//! Movement" ("Amounts and fees"), each peg-out output = gross amount − a fixed per-peg-out
+//! PROTOCOL fee (covering the miner-fee share + protocol operating costs), and the treasury change
+//! absorbs the Bitcoin miner fee. The fee must be a protocol-wide parameter so every SPO builds
+//! byte-identical TM bytes (FROST determinism) — see the fee-source WI and technical_questions.md.
+//! The deduction is applied downstream in `bitcoin::tm_builder::build_tm`; this module only reads
+//! the gross amount + destination.
 
 use pallas_primitives::PlutusData;
 
 use crate::cardano::bf_http;
 
-/// A peg-out the SPO must fulfil in the TM: pay `destination_script_pubkey` exactly `amount_sat`.
+/// A peg-out the SPO must fulfil in the TM: pay `destination_script_pubkey` the GROSS
+/// `amount_sat` minus the per-peg-out protocol fee (the fee deduction happens in
+/// `bitcoin::tm_builder::build_tm`, not here).
 #[derive(Debug, Clone)]
 pub struct PegOutRequestData {
     pub destination_script_pubkey: Vec<u8>,
+    /// Gross peg-out amount (the locked fBTC quantity); the BTC output pays this minus the
+    /// per-peg-out protocol fee.
     pub amount_sat: u64,
 }
 
