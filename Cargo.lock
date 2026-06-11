@@ -3354,7 +3354,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 [[package]]
 name = "plutus-halo2-verifier-gen"
 version = "0.1.0"
-source = "git+https://github.com/vlasin/plutus-halo2-verifier-gen.git?rev=e55547178d2fb1f286ba2d6372b1c5e4193842ca#e55547178d2fb1f286ba2d6372b1c5e4193842ca"
+source = "git+https://github.com/vlasin/plutus-halo2-verifier-gen.git?rev=81e4af5d06a9100c0b9b908e59555480e0152089#81e4af5d06a9100c0b9b908e59555480e0152089"
 dependencies = [
  "anyhow",
  "atms-halo2",

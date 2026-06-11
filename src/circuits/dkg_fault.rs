@@ -89,7 +89,7 @@ pub struct AxiomDkgCircuitParams {
 impl Default for AxiomDkgCircuitParams {
     fn default() -> Self {
         Self {
-            degree: 21,
+            degree: 18,
             lookup_bits: 17,
             advice_columns: 4,
             lookup_advice_columns: 1,
@@ -98,6 +98,22 @@ impl Default for AxiomDkgCircuitParams {
             num_limbs: 3,
             window_bits: 4,
             unusable_rows: 9,
+        }
+    }
+}
+
+impl AxiomDkgCircuitParams {
+    pub fn round1_digest_fault() -> Self {
+        Self {
+            degree: 21,
+            ..Self::default()
+        }
+    }
+
+    pub fn round2_digest_fault() -> Self {
+        Self {
+            advice_columns: 2,
+            ..Self::default()
         }
     }
 }
@@ -510,9 +526,7 @@ fn synthesize_round1_digest_fault(
     digest_inputs.extend_from_slice(transcript_r.y.limbs());
 
     let digest = poseidon_digest_assigned(ctx, range, &digest_inputs);
-    // The pinned Aiken verifier generator currently mishandles singleton
-    // instance vectors. Keep a circuit-constrained zero until that is fixed.
-    vec![digest, ctx.load_zero()]
+    vec![digest]
 }
 
 fn synthesize_round2<const T: usize, const INDEX_BITS: usize>(
@@ -650,9 +664,7 @@ fn synthesize_round2_digest_fault<const T: usize, const INDEX_BITS: usize>(
     }
 
     let digest = poseidon_digest_assigned(ctx, range, &digest_inputs);
-    // The pinned Aiken verifier generator currently mishandles singleton
-    // instance vectors. Keep a circuit-constrained zero until that is fixed.
-    vec![digest, ctx.load_zero()]
+    vec![digest]
 }
 
 fn small_linear_combination<const INDEX_BITS: usize, FC>(

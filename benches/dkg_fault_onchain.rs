@@ -14,7 +14,7 @@ use frost_secp256k1_tr as frost;
 use halo2_base::halo2_proofs::{
     halo2curves::{
         bls12_381::{Bls12, Fr as BlsFr, G1Affine},
-        ff::{Field, PrimeField},
+        ff::PrimeField,
         secp256k1::Fq,
     },
     plonk::{Circuit, ProvingKey, create_proof, keygen_pk, keygen_vk, verify_proof},
@@ -109,7 +109,6 @@ source = "github"
 "#;
 
 fn main() {
-    let params = AxiomDkgCircuitParams::default();
     let limits = tx_ex_unit_limits();
     println!(
         "backend: Axiom halo2-axiom, BLS12-381 KZG, SHPLONK, Cardano-friendly Blake2b transcript"
@@ -117,27 +116,19 @@ fn main() {
     println!(
         "onchain_benchmark: Aiken Plutus V3 minting policy with two pubkey inputs and two pubkey outputs"
     );
-    println!(
-        "circuit_config: k={}, lookup_bits={}, advice_columns={}, lookup_advice_columns={}, fixed_columns={}, limb_bits={}, num_limbs={}, window_bits={}, unusable_rows={}",
-        params.degree,
-        params.lookup_bits,
-        params.advice_columns,
-        params.lookup_advice_columns,
-        params.fixed_columns,
-        params.limb_bits,
-        params.num_limbs,
-        params.window_bits,
-        params.unusable_rows
-    );
     println!("max_tx_ex_units_mem: {}", limits.mem);
     println!("max_tx_ex_units_cpu: {}", limits.cpu);
 
     let reports = match env::var("DKG_FAULT_ONCHAIN_ROUND").as_deref() {
-        Ok("round1") => vec![run_round1_onchain_benchmark(params)],
-        Ok("round2") => vec![run_round2_onchain_benchmark(params)],
+        Ok("round1") => vec![run_round1_onchain_benchmark(
+            AxiomDkgCircuitParams::round1_digest_fault(),
+        )],
+        Ok("round2") => vec![run_round2_onchain_benchmark(
+            AxiomDkgCircuitParams::round2_digest_fault(),
+        )],
         Ok("all") | Err(_) => vec![
-            run_round1_onchain_benchmark(params),
-            run_round2_onchain_benchmark(params),
+            run_round1_onchain_benchmark(AxiomDkgCircuitParams::round1_digest_fault()),
+            run_round2_onchain_benchmark(AxiomDkgCircuitParams::round2_digest_fault()),
         ],
         Ok(other) => panic!("DKG_FAULT_ONCHAIN_ROUND must be round1, round2, or all; got {other}"),
     };
@@ -164,6 +155,7 @@ fn run_round1_onchain_benchmark(params: AxiomDkgCircuitParams) -> BudgetReport {
 
     println!();
     println!("== round1-onchain-pok-digest-fault ==");
+    print_circuit_config(params);
     print_stats(&stats, params);
     print_keygen_times(&keygen_times);
 
@@ -215,6 +207,7 @@ fn run_round2_onchain_benchmark(params: AxiomDkgCircuitParams) -> BudgetReport {
 
     println!();
     println!("== round2-onchain-share-digest-fault ==");
+    print_circuit_config(params);
     print_stats(&stats, params);
     print_keygen_times(&keygen_times);
 
@@ -283,7 +276,7 @@ fn prove_round1_digest_fault_case(
     let witness_time = witness_start.elapsed();
 
     let expected_digest = round1_message_digest(params, &case.witness);
-    assert_eq!(public_instances, vec![expected_digest, BlsFr::ZERO]);
+    assert_eq!(public_instances, vec![expected_digest]);
     assert_eq!(case.witness.challenge, round1_hdk_challenge(&case.witness));
     let computed = round1_digest_residual(&case.witness);
     assert_eq!(
@@ -300,7 +293,7 @@ fn prove_round1_digest_fault_case(
         expected_digest,
         case.name.clone(),
         witness_time,
-        "public inputs = signed Poseidon(message) plus constrained zero, circuit derives HDKG and asserts D != R",
+        "public input = signed Poseidon(message), circuit derives HDKG and asserts D != R",
     )
 }
 
@@ -323,7 +316,7 @@ fn prove_round2_digest_fault_case(
 
     let expected_digest =
         round2_message_digest::<ROUND2_T, ROUND2_INDEX_BITS>(params, &case.witness);
-    assert_eq!(public_instances, vec![expected_digest, BlsFr::ZERO]);
+    assert_eq!(public_instances, vec![expected_digest]);
     let computed = round2_residual(&case.witness);
     assert!(!is_identity(&computed));
 
@@ -335,7 +328,7 @@ fn prove_round2_digest_fault_case(
         expected_digest,
         case.name.clone(),
         witness_time,
-        "public inputs = signed Poseidon(message) plus constrained zero, circuit asserts D != identity",
+        "public input = signed Poseidon(message), circuit asserts D != identity",
     )
 }
 
@@ -538,12 +531,7 @@ pub fn validate_fault(
   policy_id: PolicyId,
   self: Transaction,
 ) -> Bool {
-  // The second public input is constrained to zero by the circuit. It works
-  // around the current pinned generator's singleton-instance limitation.
-  let public_inputs = [
-    from_bytes_little_endian(redeemer.digest),
-    from_bytes_little_endian(#"0000000000000000000000000000000000000000000000000000000000000000"),
-  ]
+  let public_inputs = [from_bytes_little_endian(redeemer.digest)]
   and {
     verify_ed25519_signature(redeemer.spo_vkey, redeemer.digest, redeemer.spo_sig),
     verifier(redeemer.proof, public_inputs),
@@ -880,6 +868,21 @@ fn print_digest_proof_artifact(artifact: &DigestProofArtifact) {
     println!("  host_check: {}", artifact.host_check);
 }
 
+fn print_circuit_config(params: AxiomDkgCircuitParams) {
+    println!(
+        "circuit_config: k={}, lookup_bits={}, advice_columns={}, lookup_advice_columns={}, fixed_columns={}, limb_bits={}, num_limbs={}, window_bits={}, unusable_rows={}",
+        params.degree,
+        params.lookup_bits,
+        params.advice_columns,
+        params.lookup_advice_columns,
+        params.fixed_columns,
+        params.limb_bits,
+        params.num_limbs,
+        params.window_bits,
+        params.unusable_rows
+    );
+}
+
 fn print_onchain_budget(name: &str, budget: ExUnits, aiken_time: Duration) {
     println!("aiken_benchmark: {name}");
     println!("aiken_mem: {}", budget.mem);
@@ -917,7 +920,7 @@ impl DigestProofArtifact {
         Self {
             name: name.to_string(),
             proof: self.proof.clone(),
-            public_instances: vec![digest, BlsFr::ZERO],
+            public_instances: vec![digest],
             digest,
             spo_vkey,
             spo_sig,
