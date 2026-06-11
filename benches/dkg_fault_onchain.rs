@@ -15,8 +15,7 @@ use halo2_base::halo2_proofs::{
     halo2curves::{
         bls12_381::{Bls12, Fr as BlsFr, G1Affine},
         ff::{Field, PrimeField},
-        group::prime::PrimeCurveAffine,
-        secp256k1::{Fp, Fq, Secp256k1Affine},
+        secp256k1::Fq,
     },
     plonk::{Circuit, ProvingKey, create_proof, keygen_pk, keygen_vk, verify_proof},
     poly::{
@@ -29,11 +28,11 @@ use halo2_base::halo2_proofs::{
     },
     transcript::{Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer},
 };
-use halo2_base::utils::CurveAffineExt;
 use k256::{
     AffinePoint, EncodedPoint, ProjectivePoint, Scalar,
     elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint},
 };
+use pallas_crypto::key::ed25519;
 use plutus_halo2_verifier_gen::plutus_gen::{
     AxiomShplonkAikenOutputPaths, generate_axiom_shplonk_aiken_from_vk_and_instances,
 };
@@ -42,17 +41,17 @@ use rand_chacha::ChaCha20Rng;
 use serde_json::Value;
 
 use heimdall::circuits::dkg_fault::{
-    AxiomDkgCircuitParams, CircuitStats, DkgRound1PokFaultWitness, DkgRound2ShareFaultWitness,
-    axiom_point_from_compressed, axiom_point_from_projective, axiom_scalar_from_be_bytes,
-    build_round1_keygen_circuit, build_round1_prover_circuit, build_round2_keygen_circuit,
-    build_round2_prover_circuit, is_identity, round1_residual, round2_residual,
+    AxiomDkgCircuitParams, CircuitStats, DkgRound1PokDigestFaultWitness,
+    DkgRound2ShareFaultWitness, axiom_point_from_compressed, axiom_point_from_projective,
+    axiom_scalar_from_be_bytes, build_round1_digest_fault_keygen_circuit,
+    build_round1_digest_fault_prover_circuit, build_round2_digest_fault_keygen_circuit,
+    build_round2_digest_fault_prover_circuit, is_identity, round1_digest_residual,
+    round1_hdk_challenge, round1_message_digest, round2_message_digest, round2_residual,
 };
 use heimdall::frost::participant;
 
 const ROUND2_T: usize = 2;
 const ROUND2_INDEX_BITS: usize = 16;
-const ROUND1_RESIDUAL_OFFSET: usize = 12;
-const ROUND2_RESIDUAL_OFFSET: usize = 16;
 const TARGET_ROOT: &str = "target/dkg_fault_onchain";
 const DEFAULT_MAX_TX_EX_MEM: u64 = 16_500_000;
 const DEFAULT_MAX_TX_EX_CPU: u64 = 10_000_000_000;
@@ -119,9 +118,12 @@ fn main() {
         "onchain_benchmark: Aiken Plutus V3 minting policy with two pubkey inputs and two pubkey outputs"
     );
     println!(
-        "circuit_config: k={}, lookup_bits={}, limb_bits={}, num_limbs={}, window_bits={}, unusable_rows={}",
+        "circuit_config: k={}, lookup_bits={}, advice_columns={}, lookup_advice_columns={}, fixed_columns={}, limb_bits={}, num_limbs={}, window_bits={}, unusable_rows={}",
         params.degree,
         params.lookup_bits,
+        params.advice_columns,
+        params.lookup_advice_columns,
+        params.fixed_columns,
         params.limb_bits,
         params.num_limbs,
         params.window_bits,
@@ -130,10 +132,15 @@ fn main() {
     println!("max_tx_ex_units_mem: {}", limits.mem);
     println!("max_tx_ex_units_cpu: {}", limits.cpu);
 
-    let reports = [
-        run_round1_onchain_benchmark(params),
-        run_round2_onchain_benchmark(params),
-    ];
+    let reports = match env::var("DKG_FAULT_ONCHAIN_ROUND").as_deref() {
+        Ok("round1") => vec![run_round1_onchain_benchmark(params)],
+        Ok("round2") => vec![run_round2_onchain_benchmark(params)],
+        Ok("all") | Err(_) => vec![
+            run_round1_onchain_benchmark(params),
+            run_round2_onchain_benchmark(params),
+        ],
+        Ok(other) => panic!("DKG_FAULT_ONCHAIN_ROUND must be round1, round2, or all; got {other}"),
+    };
     assert_all_within_tx_budget(&reports, limits);
 }
 
@@ -150,42 +157,30 @@ fn run_round1_onchain_benchmark(params: AxiomDkgCircuitParams) -> BudgetReport {
         .expect("round 1 honest fixture")
         .clone();
 
-    let (keygen_builder, stats) = build_round1_keygen_circuit(params, &corrupted.witness);
+    let (keygen_builder, stats) =
+        build_round1_digest_fault_keygen_circuit(params, &corrupted.witness);
     let setup = setup(params);
     let (pk, break_points, keygen_times) = keygen(&setup, keygen_builder);
 
     println!();
-    println!("== round1-onchain-pok ==");
+    println!("== round1-onchain-pok-digest-fault ==");
     print_stats(&stats, params);
     print_keygen_times(&keygen_times);
 
-    let corrupted_artifact = prove_round1_case(
-        &setup,
-        &pk,
-        stats.config_params.clone(),
-        break_points.clone(),
-        params,
-        &corrupted,
-    );
-    let honest_artifact = prove_round1_case(
+    let corrupted_artifact = prove_round1_digest_fault_case(
         &setup,
         &pk,
         stats.config_params.clone(),
         break_points,
         params,
-        &honest,
+        &corrupted,
     );
-    print_proof_artifact(&corrupted_artifact);
-    print_proof_artifact(&honest_artifact);
+    let honest_digest = round1_message_digest(params, &honest.witness);
+    let honest_artifact = corrupted_artifact.with_digest("round1-honest-digest", honest_digest);
+    print_digest_proof_artifact(&corrupted_artifact);
 
-    let project_dir = generate_round_project(
-        "round1",
-        params,
-        &setup,
-        &pk,
-        &corrupted_artifact,
-        &honest_artifact,
-    );
+    let project_dir =
+        generate_digest_project("round1", &setup, &pk, &corrupted_artifact, &honest_artifact);
     let aiken_start = Instant::now();
     let aiken_output = run_aiken_check(&project_dir);
     let aiken_time = aiken_start.elapsed();
@@ -211,43 +206,33 @@ fn run_round2_onchain_benchmark(params: AxiomDkgCircuitParams) -> BudgetReport {
         .expect("round 2 honest fixture")
         .clone();
 
-    let (keygen_builder, stats) =
-        build_round2_keygen_circuit::<ROUND2_T, ROUND2_INDEX_BITS>(params, &corrupted.witness);
+    let (keygen_builder, stats) = build_round2_digest_fault_keygen_circuit::<
+        ROUND2_T,
+        ROUND2_INDEX_BITS,
+    >(params, &corrupted.witness);
     let setup = setup(params);
     let (pk, break_points, keygen_times) = keygen(&setup, keygen_builder);
 
     println!();
-    println!("== round2-onchain-share ==");
+    println!("== round2-onchain-share-digest-fault ==");
     print_stats(&stats, params);
     print_keygen_times(&keygen_times);
 
-    let corrupted_artifact = prove_round2_case(
-        &setup,
-        &pk,
-        stats.config_params.clone(),
-        break_points.clone(),
-        params,
-        &corrupted,
-    );
-    let honest_artifact = prove_round2_case(
+    let corrupted_artifact = prove_round2_digest_fault_case(
         &setup,
         &pk,
         stats.config_params.clone(),
         break_points,
         params,
-        &honest,
+        &corrupted,
     );
-    print_proof_artifact(&corrupted_artifact);
-    print_proof_artifact(&honest_artifact);
+    let honest_digest =
+        round2_message_digest::<ROUND2_T, ROUND2_INDEX_BITS>(params, &honest.witness);
+    let honest_artifact = corrupted_artifact.with_digest("round2-honest-digest", honest_digest);
+    print_digest_proof_artifact(&corrupted_artifact);
 
-    let project_dir = generate_round_project(
-        "round2",
-        params,
-        &setup,
-        &pk,
-        &corrupted_artifact,
-        &honest_artifact,
-    );
+    let project_dir =
+        generate_digest_project("round2", &setup, &pk, &corrupted_artifact, &honest_artifact);
     let aiken_start = Instant::now();
     let aiken_output = run_aiken_check(&project_dir);
     let aiken_time = aiken_start.elapsed();
@@ -280,48 +265,55 @@ fn keygen(
     (pk, break_points, KeygenTimes { vk_time, pk_time })
 }
 
-fn prove_round1_case(
+fn prove_round1_digest_fault_case(
     setup: &ParamsKZG<Bls12>,
     pk: &ProvingKey<G1Affine>,
     config_params: halo2_base::gates::circuit::BaseCircuitParams,
     break_points: Vec<Vec<usize>>,
     params: AxiomDkgCircuitParams,
     case: &Round1Case,
-) -> ProofArtifact {
+) -> DigestProofArtifact {
     let witness_start = Instant::now();
-    let (prover_builder, public_instances) =
-        build_round1_prover_circuit(config_params, break_points, params, &case.witness);
+    let (prover_builder, public_instances) = build_round1_digest_fault_prover_circuit(
+        config_params,
+        break_points,
+        params,
+        &case.witness,
+    );
     let witness_time = witness_start.elapsed();
 
-    let computed = round1_residual(&case.witness);
+    let expected_digest = round1_message_digest(params, &case.witness);
+    assert_eq!(public_instances, vec![expected_digest, BlsFr::ZERO]);
+    assert_eq!(case.witness.challenge, round1_hdk_challenge(&case.witness));
+    let computed = round1_digest_residual(&case.witness);
     assert_eq!(
-        computed == case.transcript_r,
+        computed == case.witness.transcript_r,
         case.expect_residual_matches_transcript
     );
+    assert!(!case.expect_residual_matches_transcript);
 
-    prove_artifact(
+    prove_digest_artifact(
         setup,
         pk,
         prover_builder,
         public_instances,
+        expected_digest,
         case.name.clone(),
-        ROUND1_RESIDUAL_OFFSET,
-        point_public_limbs(case.transcript_r, params),
-        case.host_check_label(),
         witness_time,
+        "public inputs = signed Poseidon(message) plus constrained zero, circuit derives HDKG and asserts D != R",
     )
 }
 
-fn prove_round2_case(
+fn prove_round2_digest_fault_case(
     setup: &ParamsKZG<Bls12>,
     pk: &ProvingKey<G1Affine>,
     config_params: halo2_base::gates::circuit::BaseCircuitParams,
     break_points: Vec<Vec<usize>>,
     params: AxiomDkgCircuitParams,
     case: &Round2Case,
-) -> ProofArtifact {
+) -> DigestProofArtifact {
     let witness_start = Instant::now();
-    let (prover_builder, public_instances) = build_round2_prover_circuit::<
+    let (prover_builder, public_instances) = build_round2_digest_fault_prover_circuit::<
         ROUND2_T,
         ROUND2_INDEX_BITS,
     >(
@@ -329,33 +321,34 @@ fn prove_round2_case(
     );
     let witness_time = witness_start.elapsed();
 
+    let expected_digest =
+        round2_message_digest::<ROUND2_T, ROUND2_INDEX_BITS>(params, &case.witness);
+    assert_eq!(public_instances, vec![expected_digest, BlsFr::ZERO]);
     let computed = round2_residual(&case.witness);
-    assert_eq!(is_identity(&computed), case.expect_identity_residual);
+    assert!(!is_identity(&computed));
 
-    prove_artifact(
+    prove_digest_artifact(
         setup,
         pk,
         prover_builder,
         public_instances,
+        expected_digest,
         case.name.clone(),
-        ROUND2_RESIDUAL_OFFSET,
-        vec![BlsFr::ZERO; params.num_limbs * 2],
-        case.host_check_label(),
         witness_time,
+        "public inputs = signed Poseidon(message) plus constrained zero, circuit asserts D != identity",
     )
 }
 
-fn prove_artifact<C>(
+fn prove_digest_artifact<C>(
     setup: &ParamsKZG<Bls12>,
     pk: &ProvingKey<G1Affine>,
     circuit: C,
     public_instances: Vec<BlsFr>,
+    digest: BlsFr,
     name: String,
-    residual_offset: usize,
-    comparison_point: Vec<BlsFr>,
-    host_check: &'static str,
     witness_time: Duration,
-) -> ProofArtifact
+    host_check: &'static str,
+) -> DigestProofArtifact
 where
     C: Circuit<BlsFr>,
 {
@@ -367,12 +360,14 @@ where
     verify(setup, pk, &proof, &public_instances);
     let verify_time = verify_start.elapsed();
 
-    ProofArtifact {
+    let (spo_vkey, spo_sig) = sign_digest(digest);
+    DigestProofArtifact {
         name,
         proof,
         public_instances,
-        residual_offset,
-        comparison_point,
+        digest,
+        spo_vkey,
+        spo_sig,
         host_check,
         witness_time,
         proof_time,
@@ -430,13 +425,12 @@ fn verify(
     .expect("proof verification should succeed");
 }
 
-fn generate_round_project(
+fn generate_digest_project(
     round_name: &str,
-    params: AxiomDkgCircuitParams,
     setup: &ParamsKZG<Bls12>,
     pk: &ProvingKey<G1Affine>,
-    corrupted: &ProofArtifact,
-    honest: &ProofArtifact,
+    corrupted: &DigestProofArtifact,
+    honest: &DigestProofArtifact,
 ) -> PathBuf {
     let project_dir = prepare_project(round_name);
     let paths = generator_paths(&project_dir);
@@ -455,7 +449,7 @@ fn generate_round_project(
         fmt_duration(generator_start.elapsed())
     );
 
-    write_policy(&project_dir, round_name, params, corrupted, honest);
+    write_digest_policy(&project_dir, round_name, corrupted, honest);
     project_dir
 }
 
@@ -480,36 +474,39 @@ fn generator_paths(project_dir: &Path) -> AxiomShplonkAikenOutputPaths {
     }
 }
 
-fn write_policy(
+fn write_digest_policy(
     project_dir: &Path,
     round_name: &str,
-    _params: AxiomDkgCircuitParams,
-    corrupted: &ProofArtifact,
-    honest: &ProofArtifact,
+    corrupted: &DigestProofArtifact,
+    honest: &DigestProofArtifact,
 ) {
-    let policy = policy_source(round_name, corrupted, honest);
+    let policy = digest_policy_source(round_name, corrupted, honest);
     fs::write(
         project_dir.join("validators").join("dkg_fault_mint.ak"),
         policy,
     )
-    .expect("write generated DKG fault mint policy");
+    .expect("write generated digest DKG fault mint policy");
 
     let tests_dir = project_dir.join("validators").join("tests");
     fs::create_dir_all(&tests_dir).expect("create generated validator tests dir");
-    let tests = policy_tests_source(round_name, corrupted, honest);
+    let tests = digest_policy_tests_source(round_name, corrupted, honest);
     fs::write(tests_dir.join("dkg_fault_mint.ak"), tests)
-        .expect("write generated DKG fault mint policy tests");
+        .expect("write generated digest DKG fault mint policy tests");
 }
 
-fn policy_source(round_name: &str, corrupted: &ProofArtifact, honest: &ProofArtifact) -> String {
+fn digest_policy_source(
+    round_name: &str,
+    corrupted: &DigestProofArtifact,
+    honest: &DigestProofArtifact,
+) -> String {
     let policy_id = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b";
     let token_name = format!("{}2d646b672d6661756c74", hex::encode(round_name));
     let benchmark_name = format!("{round_name}_corrupted_mint_benchmark");
     let reject_name = format!("{round_name}_honest_mint_rejected");
 
     let mut source = r#"use aiken/collection/list
-use aiken/crypto/bitwise.{State}
-use aiken/crypto/bls12_381/scalar.{Scalar, from_bytes_little_endian}
+use aiken/crypto.{verify_ed25519_signature}
+use aiken/crypto/bls12_381/scalar.{from_bytes_little_endian}
 use cardano/address
 use cardano/assets
 use cardano/assets.{PolicyId, quantity_of}
@@ -520,9 +517,9 @@ use proof_verifier.{verifier}
 
 pub type FaultRedeemer {
   proof: ByteArray,
-  public_inputs: List<ByteArray>,
-  comparison_point: List<ByteArray>,
-  residual_offset: Int,
+  digest: ByteArray,
+  spo_vkey: ByteArray,
+  spo_sig: ByteArray,
   token_name: ByteArray,
 }
 
@@ -541,33 +538,20 @@ pub fn validate_fault(
   policy_id: PolicyId,
   self: Transaction,
 ) -> Bool {
-  let public_inputs = to_scalars(redeemer.public_inputs)
-  let comparison_point = to_scalars(redeemer.comparison_point)
+  // The second public input is constrained to zero by the circuit. It works
+  // around the current pinned generator's singleton-instance limitation.
+  let public_inputs = [
+    from_bytes_little_endian(redeemer.digest),
+    from_bytes_little_endian(#"0000000000000000000000000000000000000000000000000000000000000000"),
+  ]
   and {
+    verify_ed25519_signature(redeemer.spo_vkey, redeemer.digest, redeemer.spo_sig),
     verifier(redeemer.proof, public_inputs),
-    residual_not_equal(
-      public_inputs,
-      redeemer.residual_offset,
-      comparison_point,
-    ),
     quantity_of(self.mint, policy_id, redeemer.token_name) == 1,
     output_contains_token(self, policy_id, redeemer.token_name),
     list.length(self.inputs) == 2,
     list.length(self.outputs) == 2,
   }
-}
-
-fn to_scalars(raw: List<ByteArray>) -> List<State<Scalar>> {
-  list.map(raw, fn(item) { from_bytes_little_endian(item) })
-}
-
-fn residual_not_equal(
-  public_inputs: List<State<Scalar>>,
-  offset: Int,
-  comparison_point: List<State<Scalar>>,
-) -> Bool {
-  let residual = list.take(list.drop(public_inputs, offset), 6)
-  residual != comparison_point
 }
 
 fn output_contains_token(
@@ -590,27 +574,33 @@ const token_name =
 const corrupted_proof =
   #"__CORRUPTED_PROOF__"
 
-const corrupted_public_inputs =
-  __CORRUPTED_PUBLIC_INPUTS__
+const corrupted_digest =
+  #"__CORRUPTED_DIGEST__"
 
-const corrupted_comparison_point =
-  __CORRUPTED_COMPARISON_POINT__
+const corrupted_spo_vkey =
+  #"__CORRUPTED_SPO_VKEY__"
+
+const corrupted_spo_sig =
+  #"__CORRUPTED_SPO_SIG__"
 
 const honest_proof =
   #"__HONEST_PROOF__"
 
-const honest_public_inputs =
-  __HONEST_PUBLIC_INPUTS__
+const honest_digest =
+  #"__HONEST_DIGEST__"
 
-const honest_comparison_point =
-  __HONEST_COMPARISON_POINT__
+const honest_spo_vkey =
+  #"__HONEST_SPO_VKEY__"
+
+const honest_spo_sig =
+  #"__HONEST_SPO_SIG__"
 
 fn corrupted_redeemer() -> FaultRedeemer {
   FaultRedeemer {
     proof: corrupted_proof,
-    public_inputs: corrupted_public_inputs,
-    comparison_point: corrupted_comparison_point,
-    residual_offset: __CORRUPTED_RESIDUAL_OFFSET__,
+    digest: corrupted_digest,
+    spo_vkey: corrupted_spo_vkey,
+    spo_sig: corrupted_spo_sig,
     token_name,
   }
 }
@@ -618,9 +608,9 @@ fn corrupted_redeemer() -> FaultRedeemer {
 fn honest_redeemer() -> FaultRedeemer {
   FaultRedeemer {
     proof: honest_proof,
-    public_inputs: honest_public_inputs,
-    comparison_point: honest_comparison_point,
-    residual_offset: __HONEST_RESIDUAL_OFFSET__,
+    digest: honest_digest,
+    spo_vkey: honest_spo_vkey,
+    spo_sig: honest_spo_sig,
     token_name,
   }
 }
@@ -684,31 +674,13 @@ test __REJECT_NAME__() fail {
         ("__POLICY_ID__", policy_id.to_string()),
         ("__TOKEN_NAME__", token_name),
         ("__CORRUPTED_PROOF__", hex::encode(&corrupted.proof)),
-        (
-            "__CORRUPTED_PUBLIC_INPUTS__",
-            aiken_bytearray_list(&corrupted.public_instances),
-        ),
-        (
-            "__CORRUPTED_COMPARISON_POINT__",
-            aiken_bytearray_list(&corrupted.comparison_point),
-        ),
+        ("__CORRUPTED_DIGEST__", bls_scalar_hex(corrupted.digest)),
+        ("__CORRUPTED_SPO_VKEY__", hex::encode(corrupted.spo_vkey)),
+        ("__CORRUPTED_SPO_SIG__", hex::encode(corrupted.spo_sig)),
         ("__HONEST_PROOF__", hex::encode(&honest.proof)),
-        (
-            "__HONEST_PUBLIC_INPUTS__",
-            aiken_bytearray_list(&honest.public_instances),
-        ),
-        (
-            "__HONEST_COMPARISON_POINT__",
-            aiken_bytearray_list(&honest.comparison_point),
-        ),
-        (
-            "__CORRUPTED_RESIDUAL_OFFSET__",
-            corrupted.residual_offset.to_string(),
-        ),
-        (
-            "__HONEST_RESIDUAL_OFFSET__",
-            honest.residual_offset.to_string(),
-        ),
+        ("__HONEST_DIGEST__", bls_scalar_hex(honest.digest)),
+        ("__HONEST_SPO_VKEY__", hex::encode(honest.spo_vkey)),
+        ("__HONEST_SPO_SIG__", hex::encode(honest.spo_sig)),
         ("__BENCHMARK_NAME__", benchmark_name),
         ("__REJECT_NAME__", reject_name),
     ];
@@ -719,12 +691,12 @@ test __REJECT_NAME__() fail {
     source
 }
 
-fn policy_tests_source(
+fn digest_policy_tests_source(
     round_name: &str,
-    corrupted: &ProofArtifact,
-    honest: &ProofArtifact,
+    corrupted: &DigestProofArtifact,
+    honest: &DigestProofArtifact,
 ) -> String {
-    let policy = policy_source(round_name, corrupted, honest);
+    let policy = digest_policy_source(round_name, corrupted, honest);
     let (_, fixtures) = policy
         .split_once("const policy_id")
         .expect("generated policy contains fixture constants");
@@ -742,51 +714,20 @@ use dkg_fault_mint.{{FaultRedeemer}}
     )
 }
 
-fn aiken_bytearray_list(values: &[BlsFr]) -> String {
-    let entries = values
-        .iter()
-        .map(|value| format!("    #\"{}\"", bls_scalar_hex(*value)))
-        .collect::<Vec<_>>()
-        .join(",\n");
-    format!("[\n{entries}\n  ]")
-}
-
-fn point_public_limbs(point: Secp256k1Affine, params: AxiomDkgCircuitParams) -> Vec<BlsFr> {
-    if bool::from(point.is_identity()) {
-        return vec![BlsFr::ZERO; params.num_limbs * 2];
-    }
-
-    let (x, y) = point.into_coordinates();
-    [x, y]
-        .into_iter()
-        .flat_map(|coordinate| fp_public_limbs(coordinate, params))
-        .collect()
-}
-
-fn fp_public_limbs(value: Fp, params: AxiomDkgCircuitParams) -> Vec<BlsFr> {
-    let repr = value.to_repr();
-    (0..params.num_limbs)
-        .map(|limb| bls_fr_from_bits(&repr, limb * params.limb_bits, params.limb_bits))
-        .collect()
-}
-
-fn bls_fr_from_bits(source: &[u8], bit_offset: usize, bit_len: usize) -> BlsFr {
-    let mut repr = [0u8; 32];
-    for bit in 0..bit_len {
-        let source_bit = bit_offset + bit;
-        if source_bit / 8 >= source.len() {
-            break;
-        }
-        let is_set = ((source[source_bit / 8] >> (source_bit % 8)) & 1) == 1;
-        if is_set {
-            repr[bit / 8] |= 1 << (bit % 8);
-        }
-    }
-    Option::<BlsFr>::from(BlsFr::from_repr(repr)).expect("limb fits in BLS scalar field")
-}
-
 fn bls_scalar_hex(scalar: BlsFr) -> String {
     hex::encode(scalar.to_repr())
+}
+
+fn sign_digest(digest: BlsFr) -> ([u8; 32], [u8; 64]) {
+    let key = ed25519::SecretKey::from([0x42; 32]);
+    let message = digest.to_repr();
+    let vkey: [u8; 32] = key.public_key().into();
+    let sig: [u8; 64] = key
+        .sign(message)
+        .as_ref()
+        .try_into()
+        .expect("ed25519 signature is 64 bytes");
+    (vkey, sig)
 }
 
 fn run_aiken_check(project_dir: &Path) -> String {
@@ -926,7 +867,7 @@ fn print_keygen_times(times: &KeygenTimes) {
     println!("pk_time: {}", fmt_duration(times.pk_time));
 }
 
-fn print_proof_artifact(artifact: &ProofArtifact) {
+fn print_digest_proof_artifact(artifact: &DigestProofArtifact) {
     println!("case: {}", artifact.name);
     println!(
         "  public_instance_count: {}",
@@ -957,16 +898,35 @@ struct KeygenTimes {
 }
 
 #[derive(Clone)]
-struct ProofArtifact {
+struct DigestProofArtifact {
     name: String,
     proof: Vec<u8>,
     public_instances: Vec<BlsFr>,
-    residual_offset: usize,
-    comparison_point: Vec<BlsFr>,
+    digest: BlsFr,
+    spo_vkey: [u8; 32],
+    spo_sig: [u8; 64],
     host_check: &'static str,
     witness_time: Duration,
     proof_time: Duration,
     verify_time: Duration,
+}
+
+impl DigestProofArtifact {
+    fn with_digest(&self, name: &str, digest: BlsFr) -> Self {
+        let (spo_vkey, spo_sig) = sign_digest(digest);
+        Self {
+            name: name.to_string(),
+            proof: self.proof.clone(),
+            public_instances: vec![digest, BlsFr::ZERO],
+            digest,
+            spo_vkey,
+            spo_sig,
+            host_check: "signed digest does not match proof public input",
+            witness_time: Duration::ZERO,
+            proof_time: Duration::ZERO,
+            verify_time: Duration::ZERO,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -983,19 +943,8 @@ struct BudgetReport {
 #[derive(Clone)]
 struct Round1Case {
     name: String,
-    witness: DkgRound1PokFaultWitness,
-    transcript_r: Secp256k1Affine,
+    witness: DkgRound1PokDigestFaultWitness,
     expect_residual_matches_transcript: bool,
-}
-
-impl Round1Case {
-    fn host_check_label(&self) -> &'static str {
-        if self.expect_residual_matches_transcript {
-            "D == R"
-        } else {
-            "D != R"
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -1005,19 +954,10 @@ struct Round2Case {
     expect_identity_residual: bool,
 }
 
-impl Round2Case {
-    fn host_check_label(&self) -> &'static str {
-        if self.expect_identity_residual {
-            "D == identity"
-        } else {
-            "D != identity"
-        }
-    }
-}
-
 fn round1_fixtures() -> Vec<Round1Case> {
     let mut rng = ChaCha20Rng::seed_from_u64(0x524f_554e_4431);
-    let identifier = Identifier::try_from(1u16).unwrap();
+    let participant_identifier = 1u16;
+    let identifier = Identifier::try_from(participant_identifier).unwrap();
     let (_secret, package) = participant::dkg_part1(identifier, 3, 2, &mut rng).unwrap();
 
     let commitments = package.commitment().serialize().unwrap();
@@ -1043,15 +983,16 @@ fn round1_fixtures() -> Vec<Round1Case> {
     .map(|(name, transcript_r_projective, expect_match)| {
         let transcript_r_bytes = compressed_from_projective(transcript_r_projective);
         let challenge = round1_challenge(identifier, &phi0_bytes, &transcript_r_bytes);
-        let witness = DkgRound1PokFaultWitness {
+        let witness = DkgRound1PokDigestFaultWitness {
+            identifier: u64::from(participant_identifier),
             mu,
             challenge,
             phi0,
+            transcript_r: axiom_point_from_projective(transcript_r_projective),
         };
         Round1Case {
             name: name.to_string(),
             witness,
-            transcript_r: axiom_point_from_projective(transcript_r_projective),
             expect_residual_matches_transcript: expect_match,
         }
     })

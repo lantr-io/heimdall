@@ -12,6 +12,8 @@ ff = "0.13"
 blake2b_simd = "1.0.3"
 halo2-base = { git = "https://github.com/vlasin/halo2-lib.git", rev = "2f753ef0508d5d7500865f2ca803069bcfe4c80d", default-features = false, features = ["halo2-axiom"] }
 halo2-ecc = { git = "https://github.com/vlasin/halo2-lib.git", rev = "2f753ef0508d5d7500865f2ca803069bcfe4c80d", default-features = false, features = ["halo2-axiom"] }
+pse-poseidon = { git = "https://github.com/axiom-crypto/pse-poseidon.git", rev = "19d3b09481bda0e95e7c005906365d070fceb752" }
+sha2 = "0.10"
 rayon = "1.10"
 rand = "0.8"
 rand_core = "0.6"
