@@ -36,10 +36,14 @@ use rand::{SeedableRng, rngs::StdRng};
 use rand_chacha::ChaCha20Rng;
 
 use heimdall::circuits::dkg_fault::{
-    AxiomDkgCircuitParams, CircuitStats, DkgRound1PokFaultWitness, DkgRound2ShareFaultWitness,
-    axiom_point_from_compressed, axiom_point_from_projective, axiom_scalar_from_be_bytes,
-    build_round1_keygen_circuit, build_round1_prover_circuit, build_round2_keygen_circuit,
-    build_round2_prover_circuit, is_identity, round1_residual, round2_residual,
+    AxiomDkgCircuitParams, CircuitStats, DkgRound1PokDigestFaultWitness, DkgRound1PokFaultWitness,
+    DkgRound2ShareFaultWitness, axiom_point_from_compressed, axiom_point_from_projective,
+    axiom_scalar_from_be_bytes, build_round1_digest_fault_keygen_circuit,
+    build_round1_digest_fault_prover_circuit, build_round1_keygen_circuit,
+    build_round1_prover_circuit, build_round2_digest_fault_keygen_circuit,
+    build_round2_digest_fault_prover_circuit, build_round2_keygen_circuit,
+    build_round2_prover_circuit, is_identity, round1_digest_residual, round1_hdk_challenge,
+    round1_message_digest, round1_residual, round2_message_digest, round2_residual,
 };
 use heimdall::frost::participant;
 
@@ -52,9 +56,12 @@ fn main() {
         "backend: Axiom halo2-axiom, BLS12-381 KZG, SHPLONK, Cardano-friendly Blake2b transcript"
     );
     println!(
-        "circuit_config: k={}, lookup_bits={}, limb_bits={}, num_limbs={}, window_bits={}, unusable_rows={}",
+        "circuit_config: k={}, lookup_bits={}, advice_columns={}, lookup_advice_columns={}, fixed_columns={}, limb_bits={}, num_limbs={}, window_bits={}, unusable_rows={}",
         params.degree,
         params.lookup_bits,
+        params.advice_columns,
+        params.lookup_advice_columns,
+        params.fixed_columns,
         params.limb_bits,
         params.num_limbs,
         params.window_bits,
@@ -62,7 +69,9 @@ fn main() {
     );
 
     run_round1_benchmark(params);
+    run_round1_digest_fault_benchmark(params);
     run_round2_benchmark(params);
+    run_round2_digest_fault_benchmark(params);
 }
 
 fn run_round1_benchmark(params: AxiomDkgCircuitParams) {
@@ -99,6 +108,45 @@ fn run_round1_benchmark(params: AxiomDkgCircuitParams) {
     }
 }
 
+fn run_round1_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
+    let case = round1_fixtures()
+        .into_iter()
+        .find(|case| !case.expect_residual_matches_transcript)
+        .expect("round 1 corrupted fixture");
+    assert_eq!(
+        case.digest_witness.challenge,
+        round1_hdk_challenge(&case.digest_witness)
+    );
+    let expected_digest = round1_message_digest(params, &case.digest_witness);
+    let (keygen_builder, stats) =
+        build_round1_digest_fault_keygen_circuit(params, &case.digest_witness);
+    let setup = setup(params);
+    let (pk, break_points, keygen_times) = keygen(&setup, keygen_builder);
+
+    println!();
+    println!("== round1-pok-digest-fault ==");
+    print_stats(&stats, params);
+    print_keygen_times(&keygen_times);
+
+    let (prover_builder, public_instances) = build_round1_digest_fault_prover_circuit(
+        stats.config_params.clone(),
+        break_points,
+        params,
+        &case.digest_witness,
+    );
+    assert_eq!(public_instances, vec![expected_digest, BlsFr::from(0)]);
+    let computed = round1_digest_residual(&case.digest_witness);
+    assert_ne!(computed, case.digest_witness.transcript_r);
+    run_proof_case(
+        &setup,
+        &pk,
+        prover_builder,
+        &public_instances,
+        &case.name,
+        "public inputs = Poseidon(message) plus constrained zero, circuit derives HDKG and asserts D != R",
+    );
+}
+
 fn run_round2_benchmark(params: AxiomDkgCircuitParams) {
     let cases = round2_fixtures();
     let (keygen_builder, stats) =
@@ -130,6 +178,45 @@ fn run_round2_benchmark(params: AxiomDkgCircuitParams) {
             case.host_check_label(),
         );
     }
+}
+
+fn run_round2_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
+    let case = round2_fixtures()
+        .into_iter()
+        .find(|case| !case.expect_identity_residual)
+        .expect("round 2 corrupted fixture");
+    let expected_digest =
+        round2_message_digest::<ROUND2_T, ROUND2_INDEX_BITS>(params, &case.witness);
+    let (keygen_builder, stats) = build_round2_digest_fault_keygen_circuit::<
+        ROUND2_T,
+        ROUND2_INDEX_BITS,
+    >(params, &case.witness);
+    let setup = setup(params);
+    let (pk, break_points, keygen_times) = keygen(&setup, keygen_builder);
+
+    println!();
+    println!("== round2-share-digest-fault ==");
+    print_stats(&stats, params);
+    print_keygen_times(&keygen_times);
+
+    let (prover_builder, public_instances) =
+        build_round2_digest_fault_prover_circuit::<ROUND2_T, ROUND2_INDEX_BITS>(
+            stats.config_params.clone(),
+            break_points,
+            params,
+            &case.witness,
+        );
+    assert_eq!(public_instances, vec![expected_digest, BlsFr::from(0)]);
+    let computed = round2_residual(&case.witness);
+    assert!(!is_identity(&computed));
+    run_proof_case(
+        &setup,
+        &pk,
+        prover_builder,
+        &public_instances,
+        &case.name,
+        "public inputs = Poseidon(message) plus constrained zero, circuit asserts D != identity",
+    );
 }
 
 fn setup(params: AxiomDkgCircuitParams) -> ParamsKZG<Bls12> {
@@ -265,6 +352,7 @@ struct KeygenTimes {
 struct Round1Case {
     name: String,
     witness: DkgRound1PokFaultWitness,
+    digest_witness: DkgRound1PokDigestFaultWitness,
     transcript_r: Secp256k1Affine,
     expect_residual_matches_transcript: bool,
 }
@@ -297,7 +385,8 @@ impl Round2Case {
 
 fn round1_fixtures() -> Vec<Round1Case> {
     let mut rng = ChaCha20Rng::seed_from_u64(0x524f_554e_4431);
-    let identifier = Identifier::try_from(1u16).unwrap();
+    let participant_identifier = 1u16;
+    let identifier = Identifier::try_from(participant_identifier).unwrap();
     let (_secret, package) = participant::dkg_part1(identifier, 3, 2, &mut rng).unwrap();
 
     let commitments = package.commitment().serialize().unwrap();
@@ -328,10 +417,19 @@ fn round1_fixtures() -> Vec<Round1Case> {
             challenge,
             phi0,
         };
+        let transcript_r = axiom_point_from_projective(transcript_r_projective);
+        let digest_witness = DkgRound1PokDigestFaultWitness {
+            identifier: u64::from(participant_identifier),
+            mu,
+            challenge,
+            phi0,
+            transcript_r,
+        };
         Round1Case {
             name: name.to_string(),
             witness,
-            transcript_r: axiom_point_from_projective(transcript_r_projective),
+            digest_witness,
+            transcript_r,
             expect_residual_matches_transcript: expect_match,
         }
     })
