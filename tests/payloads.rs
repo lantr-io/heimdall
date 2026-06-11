@@ -10,7 +10,6 @@ struct TestData {
     round2_packages_per_sender:
         BTreeMap<Identifier, BTreeMap<Identifier, frost::keys::dkg::round2::Package>>,
     key_packages: BTreeMap<Identifier, frost::keys::KeyPackage>,
-    pubkey_package: frost::keys::PublicKeyPackage,
 }
 
 fn setup() -> TestData {
@@ -42,7 +41,6 @@ fn setup() -> TestData {
     }
 
     let mut key_packages = BTreeMap::new();
-    let mut pubkey_pkg = None;
     for &id in &ids {
         let round1_others: BTreeMap<_, _> = round1_packages
             .iter()
@@ -54,17 +52,15 @@ fn setup() -> TestData {
             .filter(|&(&sender, _)| sender != id)
             .map(|(&sender, pkgs)| (sender, pkgs[&id].clone()))
             .collect();
-        let (kp, pp) =
+        let (kp, _pp) =
             participant::dkg_part3(&round2_secrets[&id], &round1_others, &round2_for_me).unwrap();
         key_packages.insert(id, kp);
-        pubkey_pkg = Some(pp);
     }
 
     TestData {
         round1_packages,
         round2_packages_per_sender,
         key_packages,
-        pubkey_package: pubkey_pkg.unwrap(),
     }
 }
 
