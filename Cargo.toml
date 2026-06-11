@@ -9,6 +9,9 @@ dusk-bls12_381 = "0.14"
 dusk-bytes = "0.1"
 frost-secp256k1-tr = { version = "3.0.0-rc.0", features = ["serialization"] }
 ff = "0.13"
+blake2b_simd = "1.0.3"
+halo2-base = { path = "../axiom-halo2-lib-fork/halo2-base", default-features = false, features = ["halo2-axiom"] }
+halo2-ecc = { path = "../axiom-halo2-lib-fork/halo2-ecc", default-features = false, features = ["halo2-axiom"] }
 rayon = "1.10"
 rand = "0.8"
 rand_core = "0.6"
@@ -36,3 +39,10 @@ whisky-pallas = "1.0.25"
 whisky-common = "1.0.25"
 pallas-wallet = "0.32"
 uplc = "1.1.10"
+
+[[bench]]
+name = "dkg_fault_circuits"
+harness = false
+
+[patch."https://github.com/vlasin/halo2curves.git"]
+halo2curves-axiom = { path = "../halo2curves-axiom-bls-serde" }
