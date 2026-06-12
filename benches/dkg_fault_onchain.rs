@@ -539,16 +539,17 @@ fn digest_policy_source(
     honest: &DigestProofArtifact,
 ) -> String {
     let policy_id = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b";
-    let token_name = format!("{}2d646b672d6661756c74", hex::encode(round_name));
     let benchmark_name = format!("{round_name}_corrupted_mint_benchmark");
     let reject_name = format!("{round_name}_honest_mint_rejected");
 
-    let mut source = r#"use aiken/collection/list
-use aiken/crypto.{verify_ed25519_signature}
+    let mut source = r#"use aiken/collection/dict
+use aiken/collection/list
+use aiken/crypto.{blake2b_224, blake2b_256, verify_ed25519_signature}
 use aiken/crypto/bls12_381/scalar.{from_bytes_little_endian}
+use aiken/primitive/bytearray
 use cardano/address
 use cardano/assets
-use cardano/assets.{PolicyId, quantity_of}
+use cardano/assets.{PolicyId, quantity_of, tokens}
 use cardano/transaction.{
   Input, NoDatum, Output, OutputReference, Transaction, placeholder,
 }
@@ -559,7 +560,6 @@ pub type FaultRedeemer {
   digest: ByteArray,
   spo_vkey: ByteArray,
   spo_sig: ByteArray,
-  token_name: ByteArray,
 }
 
 validator dkg_fault_mint {
@@ -578,14 +578,22 @@ pub fn validate_fault(
   self: Transaction,
 ) -> Bool {
   let public_inputs = [from_bytes_little_endian(redeemer.digest)]
+  let token_name = fault_token_name(redeemer.spo_vkey, redeemer.digest)
+  expect [Pair(minted_token_name, 1)] =
+    dict.to_pairs(tokens(self.mint, policy_id))
   and {
+    minted_token_name == token_name,
     verify_ed25519_signature(redeemer.spo_vkey, redeemer.digest, redeemer.spo_sig),
     verifier(redeemer.proof, public_inputs),
-    quantity_of(self.mint, policy_id, redeemer.token_name) == 1,
-    output_contains_token(self, policy_id, redeemer.token_name),
+    output_contains_token(self, policy_id, token_name),
     list.length(self.inputs) == 2,
     list.length(self.outputs) == 2,
   }
+}
+
+pub fn fault_token_name(spo_vkey: ByteArray, public_input: ByteArray) -> ByteArray {
+  let pool_id = blake2b_224(spo_vkey)
+  blake2b_256(bytearray.concat(pool_id, public_input))
 }
 
 fn output_contains_token(
@@ -601,9 +609,6 @@ fn output_contains_token(
 
 const policy_id =
   #"__POLICY_ID__"
-
-const token_name =
-  #"__TOKEN_NAME__"
 
 const corrupted_proof =
   #"__CORRUPTED_PROOF__"
@@ -635,7 +640,6 @@ fn corrupted_redeemer() -> FaultRedeemer {
     digest: corrupted_digest,
     spo_vkey: corrupted_spo_vkey,
     spo_sig: corrupted_spo_sig,
-    token_name,
   }
 }
 
@@ -645,7 +649,6 @@ fn honest_redeemer() -> FaultRedeemer {
     digest: honest_digest,
     spo_vkey: honest_spo_vkey,
     spo_sig: honest_spo_sig,
-    token_name,
   }
 }
 
@@ -675,9 +678,10 @@ fn input(index: Int) -> Input {
 }
 
 fn tx(redeemer: FaultRedeemer) -> Transaction {
+  let token_name = fault_token_name(redeemer.spo_vkey, redeemer.digest)
   let token_output_value =
     assets.from_lovelace(1_500_000)
-      |> assets.add(policy_id, redeemer.token_name, 1)
+      |> assets.add(policy_id, token_name, 1)
 
   Transaction {
     ..placeholder,
@@ -687,7 +691,7 @@ fn tx(redeemer: FaultRedeemer) -> Transaction {
       output(assets.from_lovelace(2_000_000)),
     ],
     fee: 200_000,
-    mint: assets.from_asset(policy_id, redeemer.token_name, 1),
+    mint: assets.from_asset(policy_id, token_name, 1),
     redeemers: [],
   }
 }
@@ -706,7 +710,6 @@ test __REJECT_NAME__() fail {
 
     let replacements = [
         ("__POLICY_ID__", policy_id.to_string()),
-        ("__TOKEN_NAME__", token_name),
         ("__CORRUPTED_PROOF__", hex::encode(&corrupted.proof)),
         ("__CORRUPTED_DIGEST__", bls_scalar_hex(corrupted.digest)),
         ("__CORRUPTED_SPO_VKEY__", hex::encode(corrupted.spo_vkey)),
@@ -742,7 +745,7 @@ fn digest_policy_tests_source(
 use cardano/assets
 use cardano/transaction.{{Input, NoDatum, Output, OutputReference, Transaction, placeholder}}
 use dkg_fault_mint
-use dkg_fault_mint.{{FaultRedeemer}}
+use dkg_fault_mint.{{FaultRedeemer, fault_token_name}}
 
 {fixtures}"#
     )
