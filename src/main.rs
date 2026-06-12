@@ -726,6 +726,10 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
         match heimdall::cardano::roster::RegistryRosterSource::from_config(&cfg.cardano) {
             Ok(Some(source)) => {
                 println!("on-chain SPO registry: {}", source.registry_address);
+                println!(
+                    "note: threshold = majority of registered SPOs — demo.min_signers is \
+                     ignored with the on-chain registry (stake-weighted threshold is WI-012)"
+                );
                 bf_chain = bf_chain.with_registry_roster(source);
             }
             Ok(None) => {}
@@ -770,7 +774,7 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
         .participants
         .get(&id)
         .unwrap_or_else(|| panic!("identifier {index} not in roster"));
-    let port = port_from_url(&me.bifrost_url);
+    let port = port_from_url(&me.bifrost_url).unwrap_or_else(|e| panic!("{e}"));
 
     let net = Arc::new(HttpPeerNetwork::new());
     let app = router(net.shared_state());
@@ -854,11 +858,20 @@ fn mock_chain_with_rpc(
     chain
 }
 
-fn port_from_url(url: &str) -> u16 {
+/// The local HTTP bind port, from this node's OWN registered bifrost_url.
+/// Requires an explicit trailing `:<port>` — peers fetching FROM a URL can
+/// rely on scheme defaults, but the node cannot guess which local port to
+/// serve on.
+fn port_from_url(url: &str) -> Result<u16, String> {
     url.rsplit(':')
         .next()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("cannot parse port from bifrost_url {url:?}"))
+        .ok_or_else(|| {
+            format!(
+                "this node's bifrost_url {url:?} has no explicit ':<port>' — the demo binds its \
+                 local HTTP server to that port, so register a URL ending in ':<port>'"
+            )
+        })
 }
 
 /// Derive the bootstrap federation keypair from `bitcoin.y_fed_seed_hex`.
@@ -1617,9 +1630,7 @@ fn run_show_roster(
     treasury_nft_name: Option<String>,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::roster::{
-        RegistryRosterSource, RosterError, fetch_registry_snapshot, roster_from_snapshot,
-    };
+    use heimdall::cardano::roster::{RegistryRosterSource, RosterError, roster_from_snapshot};
 
     let blueprint = blueprint
         .or_else(|| cfg.cardano.registry_blueprint.clone())
@@ -1647,15 +1658,7 @@ fn run_show_roster(
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let epoch = rt.block_on(bf_http::fetch_current_epoch(&base_url, pid))?;
     let snapshot = rt
-        .block_on(fetch_registry_snapshot(
-            &base_url,
-            pid,
-            &source.registry_address,
-            &source.registry_policy_hex,
-            &source.treasury_info_address,
-            &source.treasury_info_policy_hex,
-            &source.treasury_info_asset_name_hex,
-        ))
+        .block_on(source.fetch_snapshot(&base_url, pid))
         .map_err(|e| e.to_string())?;
 
     println!("current epoch:     {epoch}");
@@ -1694,7 +1697,9 @@ fn run_show_roster(
                 );
             }
         }
-        Err(RosterError::Empty) => println!("DKG roster:        (empty registry)"),
+        Err(RosterError::TooFew { got }) => {
+            println!("DKG roster:        ({got} registered SPO(s) — FROST DKG needs at least 2)")
+        }
         Err(e) => return Err(e.to_string()),
     }
     Ok(())

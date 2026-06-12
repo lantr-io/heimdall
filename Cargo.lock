@@ -1369,6 +1369,7 @@ dependencies = [
  "tokio",
  "toml",
  "uplc",
+ "url",
  "whisky",
  "whisky-common",
  "whisky-pallas",

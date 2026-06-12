@@ -33,6 +33,19 @@ use crate::cardano::registry::{RegistryError, RegistryList};
 use crate::cardano::treasury_spend::{TreasurySpendError, TreasuryStateUtxo, find_treasury_state};
 use crate::epoch::state::{Roster, SpoInfo};
 
+/// frost-core's `validate_num_of_signers` (called by `dkg::part1`) rejects
+/// `min_signers < 2` and `max_signers < 2` outright, so a roster below this
+/// size can never run DKG — fail at construction, not rounds later inside
+/// FROST with an opaque `InvalidMinSigners`.
+pub const FROST_MIN_PARTICIPANTS: u16 = 2;
+
+/// Backoff schedule for [`RegistryRosterSource::fetch_snapshot`] retries
+/// (attempts = delays + 1). Epoch-scale timing tolerates seconds of latency.
+const SNAPSHOT_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(5),
+];
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -58,10 +71,22 @@ pub enum RosterError {
     },
     /// HTTP/Blockfrost failure fetching the UTxO sets.
     Fetch(String),
-    /// A roster needs at least one registered SPO.
-    Empty,
-    /// `bifrost_url` is not valid UTF-8 (it must become a base URL).
-    BadUrl { pool_id: Vec<u8> },
+    /// Fewer registered SPOs than FROST DKG can run with
+    /// ([`FROST_MIN_PARTICIPANTS`]).
+    TooFew { got: usize },
+    /// `bifrost_url` is not a usable base URL (peers join `"/dkg/..."` onto
+    /// it verbatim, and the owner binds its local HTTP port from it).
+    BadUrl { pool_id: Vec<u8>, reason: String },
+    /// Two registrations share a `bifrost_url`. Today's peer transport keys
+    /// payloads by URL alone (the server ignores the pool_id path segment),
+    /// so a shared URL makes peers' DKG rounds time out undiagnosably —
+    /// refuse loudly here instead. Can be relaxed once WI-013's
+    /// pool_id-namespaced payload paths land.
+    DuplicateUrl { url: String },
+    /// A `min_signers` override outside `[2, max_signers]` — rejected rather
+    /// than clamped, since silently altering a signing threshold masks a
+    /// security-critical misconfiguration.
+    BadMinSigners { requested: u16, max: u16 },
     /// More registrations than FROST identifiers (`u16`).
     TooMany(usize),
     /// Bad blueprint/bootstrap configuration for the registry source.
@@ -86,11 +111,20 @@ impl std::fmt::Display for RosterError {
                 hex::encode(computed)
             ),
             Self::Fetch(e) => write!(f, "fetch: {e}"),
-            Self::Empty => write!(f, "no registered SPOs — cannot form a roster"),
-            Self::BadUrl { pool_id } => write!(
+            Self::TooFew { got } => write!(
                 f,
-                "bifrost_url of pool {} is not valid UTF-8",
-                hex::encode(pool_id)
+                "only {got} registered SPO(s) — FROST DKG needs at least \
+                 {FROST_MIN_PARTICIPANTS}"
+            ),
+            Self::BadUrl { pool_id, reason } => {
+                write!(f, "bifrost_url of pool {}: {reason}", hex::encode(pool_id))
+            }
+            Self::DuplicateUrl { url } => {
+                write!(f, "two registrations share bifrost_url {url:?}")
+            }
+            Self::BadMinSigners { requested, max } => write!(
+                f,
+                "min_signers override {requested} outside [{FROST_MIN_PARTICIPANTS}, {max}]"
             ),
             Self::TooMany(n) => write!(f, "{n} registrations exceed u16 FROST identifiers"),
             Self::Config(e) => write!(f, "registry source config: {e}"),
@@ -99,6 +133,21 @@ impl std::fmt::Display for RosterError {
 }
 
 impl std::error::Error for RosterError {}
+
+impl RosterError {
+    /// Whether a re-read can plausibly clear the error. Network failures
+    /// are transient; so are the inconsistencies a tx confirming mid-read
+    /// can cause — a root mismatch between the two address fetches, or a
+    /// torn paginated list (broken links / missing root). Everything else
+    /// (corrupt datums, duplicate keys, bad config) is persistent state.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Fetch(_) | Self::RootMismatch { .. } | Self::List(_)
+        )
+    }
+}
 
 impl From<RegisterSpoError> for RosterError {
     fn from(e: RegisterSpoError) -> Self {
@@ -201,12 +250,39 @@ pub fn registry_snapshot(
     })
 }
 
+/// Shape-check one registered `bifrost_url` (already UTF-8, trailing slashes
+/// trimmed): peers join `"{url}/dkg/..."` onto it verbatim, so it must be an
+/// absolute http(s) base URL without query or fragment.
+fn validate_bifrost_url(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("not a valid URL: {e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!(
+            "scheme must be http or https, got {:?}",
+            parsed.scheme()
+        ));
+    }
+    if parsed.host_str().is_none() {
+        return Err("missing host".into());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("query/fragment not allowed in a base URL".into());
+    }
+    Ok(())
+}
+
 /// Derive the epoch [`Roster`] from a verified snapshot.
 ///
 /// Participants are ordered lexicographically by `bifrost_id_pk` and given
 /// FROST identifiers `1..=n` in that order — the spec's canonical DKG
-/// participant ordering. `min_signers` is the caller's override; without one
-/// a simple majority `n/2 + 1` is used.
+/// participant ordering. Each `bifrost_url` is normalized (trailing slashes
+/// trimmed) and validated as an http(s) base URL, and must be unique across
+/// the roster; a bad registration fails here, loudly naming the pool, rather
+/// than as an undiagnosable DKG poll timeout.
+///
+/// `min_signers` is the caller's override and must lie in
+/// `[`[`FROST_MIN_PARTICIPANTS`]`, max_signers]` — out-of-range values are
+/// rejected, never silently clamped. Without one a simple majority `n/2 + 1`
+/// is used (always valid for `n >= 2`).
 ///
 /// TODO(WI-012): the real threshold is stake-weighted — the smallest `t`
 /// such that any `t` participants control > 51% of eligible stake — and the
@@ -218,8 +294,8 @@ pub fn roster_from_snapshot(
     min_signers: Option<u16>,
 ) -> Result<Roster, RosterError> {
     let n = snapshot.spos.len();
-    if n == 0 {
-        return Err(RosterError::Empty);
+    if n < usize::from(FROST_MIN_PARTICIPANTS) {
+        return Err(RosterError::TooFew { got: n });
     }
     let max_signers = u16::try_from(n).map_err(|_| RosterError::TooMany(n))?;
 
@@ -227,13 +303,22 @@ pub fn roster_from_snapshot(
     ordered.sort_by(|a, b| a.bifrost_id_pk.cmp(&b.bifrost_id_pk));
 
     let mut participants = BTreeMap::new();
+    let mut seen_urls = BTreeSet::new();
     for (i, spo) in ordered.iter().enumerate() {
         let identifier = Identifier::try_from(u16::try_from(i + 1).expect("n fits u16"))
             .expect("1..=n is a valid FROST identifier");
-        let bifrost_url =
-            String::from_utf8(spo.bifrost_url.clone()).map_err(|_| RosterError::BadUrl {
-                pool_id: spo.pool_id.clone(),
-            })?;
+        let bad_url = |reason: String| RosterError::BadUrl {
+            pool_id: spo.pool_id.clone(),
+            reason,
+        };
+        let bifrost_url = String::from_utf8(spo.bifrost_url.clone())
+            .map_err(|_| bad_url("not valid UTF-8".into()))?
+            .trim_end_matches('/')
+            .to_string();
+        validate_bifrost_url(&bifrost_url).map_err(bad_url)?;
+        if !seen_urls.insert(bifrost_url.clone()) {
+            return Err(RosterError::DuplicateUrl { url: bifrost_url });
+        }
         participants.insert(
             identifier,
             SpoInfo {
@@ -244,9 +329,16 @@ pub fn roster_from_snapshot(
         );
     }
 
-    let min_signers = min_signers
-        .unwrap_or(max_signers / 2 + 1)
-        .clamp(1, max_signers);
+    let min_signers = match min_signers {
+        None => max_signers / 2 + 1,
+        Some(m) if m < FROST_MIN_PARTICIPANTS || m > max_signers => {
+            return Err(RosterError::BadMinSigners {
+                requested: m,
+                max: max_signers,
+            });
+        }
+        Some(m) => m,
+    };
     Ok(Roster {
         epoch,
         min_signers,
@@ -256,7 +348,9 @@ pub fn roster_from_snapshot(
 }
 
 /// Fetch the registry + `treasury_info` UTxO sets from a Blockfrost-compatible
-/// API and build the verified snapshot.
+/// API and build the verified snapshot. Single attempt — callers that can
+/// tolerate latency should go through [`RegistryRosterSource::fetch_snapshot`],
+/// which retries transient failures.
 pub async fn fetch_registry_snapshot(
     base_url: &str,
     project_id: &str,
@@ -266,12 +360,13 @@ pub async fn fetch_registry_snapshot(
     treasury_policy_hex: &str,
     treasury_asset_name_hex: &str,
 ) -> Result<RegistrySnapshot, RosterError> {
-    let registry_utxos = bf_http::fetch_address_utxos(base_url, project_id, registry_address)
-        .await
-        .map_err(RosterError::Fetch)?;
-    let treasury_utxos = bf_http::fetch_address_utxos(base_url, project_id, treasury_address)
-        .await
-        .map_err(RosterError::Fetch)?;
+    // Concurrent: also narrows the window in which a confirming register_spo
+    // (which updates BOTH addresses in one tx) can tear the read.
+    let (registry_utxos, treasury_utxos) = tokio::try_join!(
+        bf_http::fetch_address_utxos(base_url, project_id, registry_address),
+        bf_http::fetch_address_utxos(base_url, project_id, treasury_address),
+    )
+    .map_err(RosterError::Fetch)?;
     registry_snapshot(
         &registry_utxos,
         registry_policy_hex,
@@ -378,23 +473,56 @@ impl RegistryRosterSource {
         Self::from_blueprint(blueprint_path, bootstrap, asset_name_hex, mainnet).map(Some)
     }
 
-    /// Fetch + verify the snapshot and derive the roster for `epoch`.
+    /// Fetch + verify the snapshot, retrying transient failures.
+    ///
+    /// A registration confirming between (or during) the two address
+    /// fetches tears the read — the rebuilt identity root no longer matches
+    /// the treasury datum — and a Blockfrost blip fails it outright. Both
+    /// clear on a re-read, and the epoch machine treats roster errors as
+    /// fatal, so absorb them here instead of killing the SPO over a
+    /// transient condition. Persistent errors still surface after the last
+    /// attempt.
+    pub async fn fetch_snapshot(
+        &self,
+        base_url: &str,
+        project_id: &str,
+    ) -> Result<RegistrySnapshot, RosterError> {
+        let mut delays = SNAPSHOT_RETRY_DELAYS.iter();
+        loop {
+            let result = fetch_registry_snapshot(
+                base_url,
+                project_id,
+                &self.registry_address,
+                &self.registry_policy_hex,
+                &self.treasury_info_address,
+                &self.treasury_info_policy_hex,
+                &self.treasury_info_asset_name_hex,
+            )
+            .await;
+            match result {
+                Err(e) if e.is_transient() => match delays.next() {
+                    Some(delay) => {
+                        eprintln!(
+                            "[roster] transient snapshot failure: {e} — retrying in {delay:?}"
+                        );
+                        tokio::time::sleep(*delay).await;
+                    }
+                    None => return Err(e),
+                },
+                other => return other,
+            }
+        }
+    }
+
+    /// Fetch + verify the snapshot (with retry) and derive the roster for
+    /// `epoch`.
     pub async fn fetch_roster(
         &self,
         base_url: &str,
         project_id: &str,
         epoch: u64,
     ) -> Result<Roster, RosterError> {
-        let snapshot = fetch_registry_snapshot(
-            base_url,
-            project_id,
-            &self.registry_address,
-            &self.registry_policy_hex,
-            &self.treasury_info_address,
-            &self.treasury_info_policy_hex,
-            &self.treasury_info_asset_name_hex,
-        )
-        .await?;
+        let snapshot = self.fetch_snapshot(base_url, project_id).await?;
         roster_from_snapshot(&snapshot, epoch, self.min_signers)
     }
 }
@@ -609,7 +737,24 @@ mod tests {
         );
         assert!(matches!(
             roster_from_snapshot(&snap, 7, None),
-            Err(RosterError::Empty)
+            Err(RosterError::TooFew { got: 0 })
+        ));
+    }
+
+    // frost-core's validate_num_of_signers rejects min/max < 2, so a 1-SPO
+    // roster must fail at construction, not rounds later inside dkg_part1.
+    #[test]
+    fn roster_rejects_single_spo() {
+        let spos = vec![Spo {
+            pool_id: [0xAA; 28],
+            pk: [0x11; 32],
+            url: b"http://spo-a.example:18500",
+        }];
+        let snap = snapshot_of(&spos).unwrap();
+        assert_eq!(snap.spos.len(), 1, "the snapshot itself is fine");
+        assert!(matches!(
+            roster_from_snapshot(&snap, 0, None),
+            Err(RosterError::TooFew { got: 1 })
         ));
     }
 
@@ -634,38 +779,106 @@ mod tests {
         );
     }
 
+    // Out-of-range overrides are rejected, never silently clamped — a typo'd
+    // threshold must not quietly become 2-of-n or n-of-n.
     #[test]
-    fn roster_min_signers_override_and_clamp() {
+    fn roster_min_signers_override_validated_not_clamped() {
         let spos = three_spos();
         let snap = snapshot_of(&spos).unwrap();
         assert_eq!(
             roster_from_snapshot(&snap, 0, Some(3)).unwrap().min_signers,
             3
         );
-        // clamped to max_signers
         assert_eq!(
-            roster_from_snapshot(&snap, 0, Some(9)).unwrap().min_signers,
-            3
+            roster_from_snapshot(&snap, 0, Some(2)).unwrap().min_signers,
+            2
         );
-        // clamped up to 1
-        assert_eq!(
-            roster_from_snapshot(&snap, 0, Some(0)).unwrap().min_signers,
-            1
-        );
+        for bad in [0u16, 1, 4, 9] {
+            assert!(
+                matches!(
+                    roster_from_snapshot(&snap, 0, Some(bad)),
+                    Err(RosterError::BadMinSigners { requested, max: 3 }) if requested == bad
+                ),
+                "override {bad} must be rejected"
+            );
+        }
+    }
+
+    /// Two valid SPOs plus one whose URL is the case under test — bad-URL
+    /// checks need n >= 2 so TooFew doesn't fire first.
+    fn spos_with_url(url: &'static [u8]) -> Vec<Spo> {
+        vec![
+            Spo {
+                pool_id: [0xAA; 28],
+                pk: [0x22; 32],
+                url: b"http://spo-a.example:18500",
+            },
+            Spo {
+                pool_id: [0xBB; 28],
+                pk: [0x11; 32],
+                url,
+            },
+        ]
     }
 
     #[test]
-    fn roster_rejects_non_utf8_url() {
-        let spos = vec![Spo {
-            pool_id: [0xAA; 28],
-            pk: [0x11; 32],
-            url: b"\xFF\xFEnot-utf8",
-        }];
-        let snap = snapshot_of(&spos).unwrap();
+    fn roster_rejects_unusable_urls() {
+        for (url, what) in [
+            (b"\xFF\xFEnot-utf8".as_slice(), "non-UTF-8"),
+            (b"spo.example.com:18500".as_slice(), "missing scheme"),
+            (b"ftp://spo.example.com:1".as_slice(), "non-http scheme"),
+            (b"http://spo.example.com:1?x=1".as_slice(), "query string"),
+            (b"".as_slice(), "empty"),
+        ] {
+            let snap = snapshot_of(&spos_with_url(url)).unwrap();
+            assert!(
+                matches!(
+                    roster_from_snapshot(&snap, 0, None),
+                    Err(RosterError::BadUrl { ref pool_id, .. }) if pool_id == &[0xBB; 28].to_vec()
+                ),
+                "{what} URL must be rejected and name the offending pool"
+            );
+        }
+    }
+
+    // A trailing slash would turn peer fetches into "...com//dkg/..." (404,
+    // read as not-yet-published) — normalize it away instead of failing.
+    #[test]
+    fn roster_normalizes_trailing_slash() {
+        let snap = snapshot_of(&spos_with_url(b"https://spo-b.example:18500/")).unwrap();
+        let roster = roster_from_snapshot(&snap, 0, None).unwrap();
+        let id = |n: u16| Identifier::try_from(n).unwrap();
+        assert_eq!(
+            roster.participants[&id(1)].bifrost_url,
+            "https://spo-b.example:18500"
+        );
+    }
+
+    // Today's peer transport keys payloads by URL alone, so a shared URL
+    // bricks DKG with an undiagnosable poll timeout — refuse loudly instead.
+    #[test]
+    fn roster_rejects_duplicate_urls() {
+        let snap = snapshot_of(&spos_with_url(b"http://spo-a.example:18500/")).unwrap();
         assert!(matches!(
             roster_from_snapshot(&snap, 0, None),
-            Err(RosterError::BadUrl { .. })
+            Err(RosterError::DuplicateUrl { ref url }) if url == "http://spo-a.example:18500"
         ));
+    }
+
+    #[test]
+    fn transient_errors_are_classified() {
+        assert!(RosterError::Fetch("http 500".into()).is_transient());
+        assert!(
+            RosterError::RootMismatch {
+                datum: [0; 32],
+                computed: [1; 32]
+            }
+            .is_transient()
+        );
+        assert!(RosterError::List(RegistryError::MissingRoot).is_transient());
+        assert!(!RosterError::TooFew { got: 1 }.is_transient());
+        assert!(!RosterError::DuplicateIdPk(vec![1]).is_transient());
+        assert!(!RosterError::Config("x".into()).is_transient());
     }
 
     #[test]
