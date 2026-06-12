@@ -20,6 +20,15 @@ pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
     *Hasher::<256>::hash(data)
 }
 
+/// Bech32-encode a 28-byte pool id (`blake2b_224(cold_vkey)`) with the
+/// `pool` HRP — the form Blockfrost's `/pools/{pool_id}` endpoint expects.
+#[must_use]
+pub fn pool_id_bech32(pool_id: &[u8; 28]) -> String {
+    use bitcoin::bech32::{self, Hrp};
+    bech32::encode::<bech32::Bech32>(Hrp::parse("pool").expect("valid hrp"), pool_id)
+        .expect("bech32 encode pool id")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -35,5 +44,12 @@ mod tests {
             hex::encode(blake2b_256(b"abc")),
             "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319"
         );
+    }
+
+    #[test]
+    fn pool_id_bech32_has_pool_hrp() {
+        let id = [0x5a; 28];
+        let s = pool_id_bech32(&id);
+        assert!(s.starts_with("pool1"), "got {s}");
     }
 }

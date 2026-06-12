@@ -720,10 +720,22 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
             Ok(Some(source)) => {
                 println!("on-chain SPO registry: {}", source.registry_address);
                 println!(
-                    "note: threshold = majority of registered SPOs — demo.min_signers is \
-                     ignored with the on-chain registry (stake-weighted threshold is WI-012)"
+                    "note: eligible roster = registry − active bans; FROST threshold is \
+                     stake-weighted (WI-012) — demo.min_signers is ignored on this path"
                 );
                 bf_chain = bf_chain.with_registry_roster(source);
+                // Ban filtering (WI-011/012): only if cardano.ban_bootstrap is set.
+                match heimdall::cardano::ban_list::BanListSource::from_config(&cfg.cardano) {
+                    Ok(Some(bans)) => {
+                        println!("on-chain ban list:     {}", bans.ban_address);
+                        bf_chain = bf_chain.with_ban_source(bans);
+                    }
+                    Ok(None) => println!(
+                        "note: no ban list configured (cardano.ban_bootstrap) — roster not \
+                         ban-filtered"
+                    ),
+                    Err(e) => panic!("ban source config: {e}"),
+                }
             }
             Ok(None) => {}
             Err(e) => panic!("registry roster config: {e}"),
@@ -1361,11 +1373,7 @@ fn parse_hex_n<const N: usize>(arg: &str, what: &str) -> Result<[u8; N], String>
 }
 
 /// Bech32 (`pool1…`) form of the 28-byte pool key hash, as Blockfrost expects.
-fn pool_id_bech32(pool_id: &[u8; 28]) -> String {
-    use bitcoin::bech32::{self, Hrp};
-    bech32::encode::<bech32::Bech32>(Hrp::parse("pool").expect("valid hrp"), pool_id)
-        .expect("bech32 encode pool id")
-}
+use heimdall::cardano::hash::pool_id_bech32;
 
 /// Build (and with `--submit`, broadcast) the register_spo tx. Identities come
 /// from local secret keys or from the air-gapped (vkey + signature) flow; the
@@ -1641,7 +1649,7 @@ fn run_show_roster(
     treasury_nft_name: Option<String>,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::roster::{RegistryRosterSource, RosterError, roster_from_snapshot};
+    use heimdall::cardano::roster::RegistryRosterSource;
 
     let blueprint = blueprint
         .or_else(|| cfg.cardano.registry_blueprint.clone())
@@ -1697,34 +1705,14 @@ fn run_show_roster(
         println!("    element UTxO:  {}:{}", spo.tx_hash, spo.output_index);
     }
 
-    match roster_from_snapshot(&snapshot, epoch, None) {
-        Ok(roster) => {
-            println!(
-                "DKG roster (ordered by bifrost_id_pk; min_signers={} of {}):",
-                roster.min_signers, roster.max_signers
-            );
-            for (i, info) in roster.participants.values().enumerate() {
-                println!(
-                    "  #{:<3} pk {}  {}",
-                    i + 1,
-                    hex::encode(&info.bifrost_id_pk),
-                    info.bifrost_url
-                );
-            }
-        }
-        Err(RosterError::TooFew { got }) => {
-            println!("DKG roster:        ({got} registered SPO(s) — FROST DKG needs at least 2)")
-        }
-        Err(e) => return Err(e.to_string()),
-    }
-
-    // ── ban list (WI-011) — informational; the eligible roster subtracts
-    // active bans in WI-012 ──
+    // ── ban list (WI-011) ── list entries AND capture the active-ban set the
+    // Round-0 derivation below subtracts. Derive from the SAME resolved
+    // blueprint/registry-bootstrap (the ban policy is parameterized by the
+    // registry policy) so a --blueprint/--registry-bootstrap override can't
+    // make the sections describe different deployments. ban_bootstrap is
+    // config-only.
     use heimdall::cardano::ban_list::{BanListError, BanListSource};
-    // Derive from the SAME resolved blueprint/registry-bootstrap the roster
-    // section used (the ban policy is parameterized by the registry policy),
-    // so a --blueprint/--registry-bootstrap override can't make the two
-    // sections describe different deployments. ban_bootstrap is config-only.
+    let mut active_bans: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     match cfg.cardano.ban_bootstrap.as_deref() {
         None => {
             println!("ban list:          (not configured — set cardano.ban_bootstrap)");
@@ -1741,10 +1729,11 @@ fn run_show_roster(
             println!("ban address:       {}", source.ban_address);
             match rt.block_on(source.fetch_ban_list(&base_url, pid)) {
                 Ok(bans) => {
+                    active_bans = bans.active_bans(epoch);
                     println!(
                         "ban entries:       {} ({} active for epoch {epoch})",
                         bans.len(),
-                        bans.active_bans(epoch).len()
+                        active_bans.len()
                     );
                     for (pool_id, data) in bans.iter() {
                         let state = if data.active_for(epoch) {
@@ -1766,6 +1755,50 @@ fn run_show_roster(
                 Err(e) => return Err(format!("ban list: {e}")),
             }
         }
+    }
+
+    // ── DKG Round 0 (WI-012): eligible roster (registry − active bans −
+    // unusable/duplicate URLs) + stake-weighted FROST threshold ──
+    use heimdall::cardano::dkg_roster::{
+        derive_dkg_context, eligible_pool_ids, fetch_eligible_stakes,
+    };
+    let eligible = eligible_pool_ids(&snapshot, &active_bans);
+    match rt.block_on(fetch_eligible_stakes(&base_url, pid, &eligible)) {
+        Ok(stakes) => match derive_dkg_context(&snapshot, &active_bans, &stakes, epoch, 0) {
+            Ok(ctx) => {
+                println!(
+                    "DKG roster (epoch {epoch}; threshold {} of {}, total stake {}):",
+                    ctx.threshold,
+                    ctx.participants.len(),
+                    ctx.total_stake
+                );
+                for p in &ctx.participants {
+                    println!(
+                        "  #{:<3} pk {}  stake={} {}",
+                        p.index,
+                        hex::encode(&p.bifrost_id_pk),
+                        p.active_stake,
+                        p.bifrost_url
+                    );
+                }
+                for ex in &ctx.excluded {
+                    println!(
+                        "  excluded pool {}: {}",
+                        hex::encode(&ex.pool_id),
+                        ex.reason
+                    );
+                }
+            }
+            Err(e) => println!("DKG roster:        cannot derive ({e})"),
+        },
+        // A stake query failure is fatal for a real ceremony (the threshold
+        // can't be computed), but tolerated in this read-only diagnostic so
+        // the registry + ban sections above still print — synthetic preprod
+        // pools aren't registered Cardano SPOs, so /pools/{id} returns 404.
+        Err(e) => println!(
+            "DKG roster:        stake unavailable ({e}) — {} eligible pool(s) before threshold",
+            eligible.len()
+        ),
     }
     Ok(())
 }

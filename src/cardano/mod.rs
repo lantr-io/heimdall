@@ -16,6 +16,7 @@ pub mod blockfrost_chain;
 pub mod blueprint;
 pub mod btc_rpc;
 pub mod blockfrost_source;
+pub mod dkg_roster;
 pub mod hash;
 pub mod mock;
 pub mod mpf;

@@ -263,7 +263,7 @@ pub fn registry_snapshot(
 /// stray trailing space can't survive into a malformed fetch URL. Rejects
 /// non-http(s) schemes, missing host, query/fragment, and userinfo
 /// (credentials have no place in a public endpoint).
-fn validate_bifrost_url(url: &str) -> Result<String, String> {
+pub(crate) fn validate_bifrost_url(url: &str) -> Result<String, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("not a valid URL: {e}"))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(format!(
