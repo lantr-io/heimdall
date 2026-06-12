@@ -33,8 +33,8 @@ use crate::http::payloads::{Sign1Payload, Sign2Payload};
 /// TODO: misbehavior detection. FROST errors here currently surface as
 /// `EpochError::Frost(String)` with the identity lost. The identifiable
 /// abort property means we can attribute a bad share to a specific
-/// `Identifier`; the PLONK circuits in `src/circuits/` are supposed to
-/// turn that into an on-chain slashing proof. None of that is wired up.
+/// `Identifier`. The on-chain fault-proof flow is currently implemented for
+/// DKG faults; signing-share fault proofs are still not wired up.
 pub async fn sign_phase(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
@@ -546,4 +546,3 @@ mod tests {
         }
     }
 }
-
