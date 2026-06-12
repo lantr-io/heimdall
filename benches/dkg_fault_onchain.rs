@@ -55,6 +55,7 @@ const ROUND2_INDEX_BITS: usize = 16;
 const TARGET_ROOT: &str = "target/dkg_fault_onchain";
 const DEFAULT_MAX_TX_EX_MEM: u64 = 16_500_000;
 const DEFAULT_MAX_TX_EX_CPU: u64 = 10_000_000_000;
+const GENERATE_ONLY_ENV: &str = "DKG_FAULT_ONCHAIN_GENERATE_ONLY";
 const AIKEN_TOML: &str = r#"name = "heimdall/dkg_fault_onchain_benchmark"
 version = "0.0.0"
 compiler = "v1.1.21"
@@ -108,7 +109,14 @@ source = "github"
 [etags]
 "#;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunMode {
+    Benchmark,
+    GenerateOnly,
+}
+
 fn main() {
+    let mode = run_mode();
     let limits = tx_ex_unit_limits();
     println!(
         "backend: Axiom halo2-axiom, BLS12-381 KZG, SHPLONK, Cardano-friendly Blake2b transcript"
@@ -116,26 +124,46 @@ fn main() {
     println!(
         "onchain_benchmark: Aiken Plutus V3 minting policy with two pubkey inputs and two pubkey outputs"
     );
+    println!("mode: {mode:?}");
     println!("max_tx_ex_units_mem: {}", limits.mem);
     println!("max_tx_ex_units_cpu: {}", limits.cpu);
 
     let reports = match env::var("DKG_FAULT_ONCHAIN_ROUND").as_deref() {
-        Ok("round1") => vec![run_round1_onchain_benchmark(
+        Ok("round1") => vec![run_round1_onchain(
             AxiomDkgCircuitParams::round1_digest_fault(),
+            mode,
         )],
-        Ok("round2") => vec![run_round2_onchain_benchmark(
+        Ok("round2") => vec![run_round2_onchain(
             AxiomDkgCircuitParams::round2_digest_fault(),
+            mode,
         )],
         Ok("all") | Err(_) => vec![
-            run_round1_onchain_benchmark(AxiomDkgCircuitParams::round1_digest_fault()),
-            run_round2_onchain_benchmark(AxiomDkgCircuitParams::round2_digest_fault()),
+            run_round1_onchain(AxiomDkgCircuitParams::round1_digest_fault(), mode),
+            run_round2_onchain(AxiomDkgCircuitParams::round2_digest_fault(), mode),
         ],
         Ok(other) => panic!("DKG_FAULT_ONCHAIN_ROUND must be round1, round2, or all; got {other}"),
-    };
-    assert_all_within_tx_budget(&reports, limits);
+    }
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    if mode == RunMode::Benchmark {
+        assert_all_within_tx_budget(&reports, limits);
+    }
 }
 
-fn run_round1_onchain_benchmark(params: AxiomDkgCircuitParams) -> BudgetReport {
+fn run_mode() -> RunMode {
+    let generate_only = env::var(GENERATE_ONLY_ENV)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    if generate_only {
+        RunMode::GenerateOnly
+    } else {
+        RunMode::Benchmark
+    }
+}
+
+fn run_round1_onchain(params: AxiomDkgCircuitParams, mode: RunMode) -> Option<BudgetReport> {
     let cases = round1_fixtures();
     let corrupted = cases
         .iter()
@@ -173,19 +201,24 @@ fn run_round1_onchain_benchmark(params: AxiomDkgCircuitParams) -> BudgetReport {
 
     let project_dir =
         generate_digest_project("round1", &setup, &pk, &corrupted_artifact, &honest_artifact);
+    print_generated_project(&project_dir);
+    if mode == RunMode::GenerateOnly {
+        return None;
+    }
+
     let aiken_start = Instant::now();
     let aiken_output = run_aiken_check(&project_dir);
     let aiken_time = aiken_start.elapsed();
     let budget = parse_aiken_budget(&aiken_output, "round1_corrupted_mint_benchmark")
         .expect("round 1 Aiken benchmark ExUnits should be present");
     print_onchain_budget("round1_corrupted_mint_benchmark", budget, aiken_time);
-    BudgetReport {
+    Some(BudgetReport {
         name: "round1_corrupted_mint_benchmark",
         budget,
-    }
+    })
 }
 
-fn run_round2_onchain_benchmark(params: AxiomDkgCircuitParams) -> BudgetReport {
+fn run_round2_onchain(params: AxiomDkgCircuitParams, mode: RunMode) -> Option<BudgetReport> {
     let cases = round2_fixtures();
     let corrupted = cases
         .iter()
@@ -226,16 +259,21 @@ fn run_round2_onchain_benchmark(params: AxiomDkgCircuitParams) -> BudgetReport {
 
     let project_dir =
         generate_digest_project("round2", &setup, &pk, &corrupted_artifact, &honest_artifact);
+    print_generated_project(&project_dir);
+    if mode == RunMode::GenerateOnly {
+        return None;
+    }
+
     let aiken_start = Instant::now();
     let aiken_output = run_aiken_check(&project_dir);
     let aiken_time = aiken_start.elapsed();
     let budget = parse_aiken_budget(&aiken_output, "round2_corrupted_mint_benchmark")
         .expect("round 2 Aiken benchmark ExUnits should be present");
     print_onchain_budget("round2_corrupted_mint_benchmark", budget, aiken_time);
-    BudgetReport {
+    Some(BudgetReport {
         name: "round2_corrupted_mint_benchmark",
         budget,
-    }
+    })
 }
 
 fn setup(params: AxiomDkgCircuitParams) -> ParamsKZG<Bls12> {
@@ -444,6 +482,14 @@ fn generate_digest_project(
 
     write_digest_policy(&project_dir, round_name, corrupted, honest);
     project_dir
+}
+
+fn print_generated_project(project_dir: &Path) {
+    println!("generated_aiken_project: {}", project_dir.display());
+    println!(
+        "generated_plutus_blueprint_command: cd {} && aiken build",
+        project_dir.display()
+    );
 }
 
 fn prepare_project(round_name: &str) -> PathBuf {
