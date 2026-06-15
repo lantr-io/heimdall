@@ -84,7 +84,9 @@ impl From<plutus::PlutusError> for TreasuryInfoError {
             // unreachable for this datum shape (no Int fields).
             plutus::PlutusError::MissingField(i)
             | plutus::PlutusError::NotBytes(i)
-            | plutus::PlutusError::NotInt(i) => Self::NotBytes(i),
+            | plutus::PlutusError::NotInt(i)
+            | plutus::PlutusError::NotBool(i)
+            | plutus::PlutusError::NotList(i) => Self::NotBytes(i),
         }
     }
 }

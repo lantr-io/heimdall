@@ -132,6 +132,49 @@ pub async fn fetch_current_epoch(base_url: &str, project_id: &str) -> Result<u64
         .ok_or_else(|| "epochs/latest: missing/non-numeric `epoch`".to_string())
 }
 
+/// POSIX start time (ms) of `epoch`, from `/epochs/{epoch}`. This is the
+/// epoch-boundary time the eligible-roster ban check compares against — using a
+/// chain-derived boundary (not a node clock) so every SPO derives the same
+/// roster even when a ban's `ban_until_time` is expiring around the boundary.
+pub async fn fetch_epoch_start_ms(
+    base_url: &str,
+    project_id: &str,
+    epoch: u64,
+) -> Result<i64, String> {
+    let url = format!("{base_url}/epochs/{epoch}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("epochs/{epoch} request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "epochs/{epoch} http {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("epochs/{epoch} json: {e}"))?;
+    let secs = v
+        .get("start_time")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("epochs/{epoch}: missing/non-numeric `start_time`"))?;
+    // Blockfrost `start_time` is Unix SECONDS. Reject values outside a sane
+    // window (~2001..2286): a negative/zero, or an already-milliseconds value
+    // (~1.7e12), would otherwise yield a wrong boundary time that silently marks
+    // every temporary ban expired — re-admitting banned pools to the roster.
+    if !(1_000_000_000..10_000_000_000).contains(&secs) {
+        return Err(format!(
+            "epochs/{epoch}: implausible start_time {secs} (want Unix seconds)"
+        ));
+    }
+    Ok(secs * 1000)
+}
+
 /// The current slot and the upper validity bound at the epoch boundary, for
 /// the register_spo validity window (`invalid_before` / `invalid_hereafter`).
 #[derive(Debug, Clone, Copy)]
