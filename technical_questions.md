@@ -313,4 +313,50 @@ statement above: it adds that circuit and removes the old dusk-plonk
 `src/circuits/{commitment,signature}.rs` + `src/gadgets/*`. (Separately, PR #3's
 `fault_token_name = blake2b_256(pool_id ‖ public_input)` diverges from the spec's
 `pool_id ‖ epoch_u32_be` that `spo_bans.ak` ApplyBan burns — tracked against
-WI-016/017, not WI-013.)
+WI-016/017, not WI-013; expanded in §5.)
+
+## 5. FaultProof token name + ban policy — resolved upstream (evidence-bound, evidence-hash dedup)
+
+**Resolved upstream (FluidTokens `main`).** The FaultProof token name and the
+`spo_bans.ak` recidivism model were already reworked in upstream
+`technical_documentation.md` to be **evidence-bound**, dropping the epoch — the
+same direction the Axiom/Halo2 fault circuits (lantr-io/heimdall **PR #3**)
+implement. This is settled, not an open question; heimdall (WI-016/017/018) must
+match it.
+
+Why the change: a proof of knowledge is mathematically invalid (or not)
+independent of which epoch the payload was published in, so **the epoch cannot be
+verified inside the Plutus/ZK circuit**. A plaintext `pool_id ‖ epoch` name would
+carry an unverifiable epoch; binding the name to the (verifiable) evidence is
+sound. (An earlier draft — still on the `feat/b1-confirm-tm-reference` fork
+branch — used `pool_id ‖ epoch_u32_be`; upstream `main` has superseded it.)
+
+Upstream `main` model (the `fault_verifier.ak` / `spo_bans.ak` sections):
+- **Token name** = `blake2b_256(pool_id ‖ evidence_hash)`, minted by *an
+  authorized fault-verifier policy* — plural, accommodating PR #3's separate
+  round1 / round2 / equivocation policies (split because each ZK verify is ~90%
+  of the ex-unit budget).
+- **Pool binding** by recompute: the ApplyBan redeemer carries `accused_pool_id`
+  + `evidence_hash`; `spo_bans.ak` recomputes the token name and checks the
+  authorized policy minted+burned exactly that token. No name-slicing.
+- **Dedup / recidivism** by evidence, not epoch: the ban node stores
+  `evidence_hashes :: List<ByteArray>`; a repeat ban is rejected if the
+  `evidence_hash` is already present. Each fault is punished once; escalation is
+  bounded by distinct genuine faults and a `permanent` cap at
+  `ban_counter >= max_faults_before_permanent`.
+- **Time-based bans** (epoch removed): `ban_until_time` (POSIX ms),
+  `base_ban_duration_ms * 2^(n−1)`, active iff `permanent || ban_until_time > T`
+  — all checkable against the tx validity interval.
+
+This is effectively the "Option A" (evidence-uniqueness dedup) we had scoped,
+plus a `permanent` cap and the multi-policy split — the `evidence_hashes` list
+also subsumes the anti-grief concern (the same evidence can't be re-applied, and
+escalation tops out at `permanent`). heimdall-side work to match it (FaultProof
+mint token name + datum, ApplyBan redeemer carrying `accused_pool_id` +
+`evidence_hash`, the `evidence_hashes` / `ban_until_time` transitions) is tracked
+as **WI-018** (updates WI-016, blocks WI-017). The σ_i encoding (§4) is
+unaffected.
+
+ACTION: rebase the `feat/b1-confirm-tm-reference` fork branch on upstream `main`
+so the fault/ban section isn't worked from a stale copy. No FluidTokens spec PR
+is needed — the change is already merged upstream.
