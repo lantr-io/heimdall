@@ -34,8 +34,7 @@
 //! is defined here pending confirmation — see `technical_questions.md`.
 
 use bitcoin::secp256k1::{
-    schnorr, All, Keypair, Message, Parity, PublicKey, Scalar, Secp256k1, SecretKey,
-    XOnlyPublicKey,
+    All, Keypair, Message, Parity, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey, schnorr,
 };
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
@@ -81,7 +80,11 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 /// BIP-340 sign `SHA256(canonical_bytes)` with this SPO's bifrost
 /// identity keypair. Returns the 64-byte signature for the payload's
 /// `signature` field.
-pub fn sign_payload(secp: &Secp256k1<All>, keypair: &Keypair, canonical_bytes: &[u8]) -> [u8; SIG_LEN] {
+pub fn sign_payload(
+    secp: &Secp256k1<All>,
+    keypair: &Keypair,
+    canonical_bytes: &[u8],
+) -> [u8; SIG_LEN] {
     let msg = Message::from_digest(sha256(canonical_bytes));
     secp.sign_schnorr_no_aux_rand(&msg, keypair).serialize()
 }
@@ -95,10 +98,13 @@ pub fn verify_payload(
     canonical_bytes: &[u8],
     signature: &[u8; SIG_LEN],
 ) -> Result<(), AuthError> {
-    let xonly = XOnlyPublicKey::from_slice(bifrost_id_pk).map_err(|e| AuthError::BadKey(e.to_string()))?;
-    let sig = schnorr::Signature::from_slice(signature).map_err(|e| AuthError::BadSig(e.to_string()))?;
+    let xonly =
+        XOnlyPublicKey::from_slice(bifrost_id_pk).map_err(|e| AuthError::BadKey(e.to_string()))?;
+    let sig =
+        schnorr::Signature::from_slice(signature).map_err(|e| AuthError::BadSig(e.to_string()))?;
     let msg = Message::from_digest(sha256(canonical_bytes));
-    secp.verify_schnorr(&sig, &msg, &xonly).map_err(|_| AuthError::VerifyFailed)
+    secp.verify_schnorr(&sig, &msg, &xonly)
+        .map_err(|_| AuthError::VerifyFailed)
 }
 
 // ---------------------------------------------------------------------------
@@ -216,8 +222,7 @@ mod tests {
         let share = [42u8; SHARE_LEN];
         let (ephemeral_pk, ciphertext) =
             encrypt_share(&secp, &ephemeral_sk, &recipient_xonly, &share).unwrap();
-        let recovered =
-            decrypt_share(&secp, &recipient_sk, &ephemeral_pk, &ciphertext).unwrap();
+        let recovered = decrypt_share(&secp, &recipient_sk, &ephemeral_pk, &ciphertext).unwrap();
         assert_eq!(recovered, share, "decrypt must recover the original share");
         assert_ne!(ciphertext, share, "ciphertext must differ from plaintext");
     }
@@ -233,6 +238,9 @@ mod tests {
         let (ephemeral_pk, ciphertext) =
             encrypt_share(&secp, &ephemeral_sk, &recipient_xonly, &share).unwrap();
         let wrong = decrypt_share(&secp, &attacker_sk, &ephemeral_pk, &ciphertext).unwrap();
-        assert_ne!(wrong, share, "a different secret must not recover the share");
+        assert_ne!(
+            wrong, share,
+            "a different secret must not recover the share"
+        );
     }
 }

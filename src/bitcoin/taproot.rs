@@ -8,7 +8,7 @@ use bitcoin::key::UntweakedPublicKey;
 use bitcoin::opcodes::all::*;
 use bitcoin::secp256k1::{All, Secp256k1};
 use bitcoin::taproot::TaprootSpendInfo;
-use bitcoin::{script, ScriptBuf};
+use bitcoin::{ScriptBuf, script};
 
 // ---------------------------------------------------------------------------
 // Script builders
@@ -80,7 +80,7 @@ mod tests {
 
     /// Generate a deterministic x-only public key from a 32-byte seed.
     fn xonly_from_seed(seed: [u8; 32]) -> UntweakedPublicKey {
-        use bitcoin::hashes::{sha256, Hash as _};
+        use bitcoin::hashes::{Hash as _, sha256};
         let secp = Secp256k1::new();
         let hash = sha256::Hash::hash(&seed);
         let sk = bitcoin::secp256k1::SecretKey::from_slice(hash.as_ref()).unwrap();

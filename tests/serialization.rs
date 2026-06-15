@@ -6,7 +6,8 @@ use heimdall::frost::participant;
 /// Helper: run a 2-of-3 DKG returning all intermediate data for serialization testing.
 struct DkgData {
     round1_packages: BTreeMap<Identifier, frost::keys::dkg::round1::Package>,
-    round2_packages_per_sender: BTreeMap<Identifier, BTreeMap<Identifier, frost::keys::dkg::round2::Package>>,
+    round2_packages_per_sender:
+        BTreeMap<Identifier, BTreeMap<Identifier, frost::keys::dkg::round2::Package>>,
     key_packages: BTreeMap<Identifier, frost::keys::KeyPackage>,
     pubkey_package: frost::keys::PublicKeyPackage,
 }

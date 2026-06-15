@@ -9,7 +9,9 @@ use bitcoin::hashes::Hash;
 use bitcoin::locktime::absolute;
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::TaprootSpendInfo;
-use bitcoin::{transaction, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+use bitcoin::{
+    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, transaction,
+};
 
 /// Dust threshold for P2TR outputs (330 sat).
 const DUST_THRESHOLD: Amount = Amount::from_sat(330);
@@ -106,21 +108,38 @@ impl fmt::Display for SkipReason {
 
 #[derive(Debug)]
 pub enum TmBuildError {
-    InsufficientFunds { available: Amount, required: Amount },
-    DustOutput { index: usize, value: Amount },
-    MalformedUnsignedTm { inputs: usize, prevouts: usize, spend_infos: usize },
+    InsufficientFunds {
+        available: Amount,
+        required: Amount,
+    },
+    DustOutput {
+        index: usize,
+        value: Amount,
+    },
+    MalformedUnsignedTm {
+        inputs: usize,
+        prevouts: usize,
+        spend_infos: usize,
+    },
 }
 
 impl fmt::Display for TmBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InsufficientFunds { available, required } => {
+            Self::InsufficientFunds {
+                available,
+                required,
+            } => {
                 write!(f, "insufficient funds: have {available}, need {required}")
             }
             Self::DustOutput { index, value } => {
                 write!(f, "output [{index}] value {value} below dust threshold")
             }
-            Self::MalformedUnsignedTm { inputs, prevouts, spend_infos } => write!(
+            Self::MalformedUnsignedTm {
+                inputs,
+                prevouts,
+                spend_infos,
+            } => write!(
                 f,
                 "malformed UnsignedTm: {inputs} inputs but {prevouts} prevouts \
                  and {spend_infos} spend infos (all must match)"
@@ -161,7 +180,15 @@ pub fn estimate_vsize(num_inputs: usize, num_outputs: usize) -> u64 {
 }
 
 fn varint_size(n: u64) -> u64 {
-    if n < 0xFD { 1 } else if n <= 0xFFFF { 3 } else if n <= 0xFFFF_FFFF { 5 } else { 9 }
+    if n < 0xFD {
+        1
+    } else if n <= 0xFFFF {
+        3
+    } else if n <= 0xFFFF_FFFF {
+        5
+    } else {
+        9
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -458,7 +485,7 @@ mod tests {
     use bitcoin::secp256k1::{Keypair, Secp256k1};
 
     fn xonly_from_seed(seed: [u8; 32]) -> bitcoin::key::UntweakedPublicKey {
-        use bitcoin::hashes::{sha256, Hash as _};
+        use bitcoin::hashes::{Hash as _, sha256};
         let secp = Secp256k1::new();
         // Hash the seed to get a value guaranteed to be in the valid range
         let hash = sha256::Hash::hash(&seed);
@@ -480,7 +507,10 @@ mod tests {
 
     fn make_treasury_input(txid_byte: u8, sats: u64) -> TreasuryInput {
         TreasuryInput {
-            outpoint: OutPoint { txid: make_txid(txid_byte), vout: 0 },
+            outpoint: OutPoint {
+                txid: make_txid(txid_byte),
+                vout: 0,
+            },
             value: Amount::from_sat(sats),
             spend_info: make_treasury_spend_info(),
         }
@@ -488,7 +518,10 @@ mod tests {
 
     fn make_pegin_input(txid_byte: u8, vout: u32, sats: u64) -> PegInInput {
         PegInInput {
-            outpoint: OutPoint { txid: make_txid(txid_byte), vout },
+            outpoint: OutPoint {
+                txid: make_txid(txid_byte),
+                vout,
+            },
             value: Amount::from_sat(sats),
             spend_info: make_treasury_spend_info(),
         }
@@ -519,7 +552,7 @@ mod tests {
 
     /// Secret key matching `xonly_from_seed(seed)` (both hash the seed first).
     fn sk_from_seed(seed: [u8; 32]) -> bitcoin::secp256k1::SecretKey {
-        use bitcoin::hashes::{sha256, Hash as _};
+        use bitcoin::hashes::{Hash as _, sha256};
         bitcoin::secp256k1::SecretKey::from_slice(sha256::Hash::hash(&seed).as_ref()).unwrap()
     }
 
@@ -549,7 +582,11 @@ mod tests {
         for (i, txin) in signed.input.iter().enumerate() {
             let items = txin.witness.to_vec();
             assert_eq!(items.len(), 1, "input {i}: key-path witness is one element");
-            assert_eq!(items[0].len(), 64, "input {i}: Default-sighash sig is 64 bytes");
+            assert_eq!(
+                items[0].len(),
+                64,
+                "input {i}: Default-sighash sig is 64 bytes"
+            );
             let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(&items[0]).unwrap();
             let msg = bitcoin::secp256k1::Message::from_digest(sighashes[i]);
             let outkey = tm.input_spend_info[i].output_key().to_x_only_public_key();
@@ -606,7 +643,10 @@ mod tests {
         .unwrap();
 
         // Input [0] is treasury
-        assert_eq!(tm.tx.input[0].previous_output.txid, make_txid(treasury_txid_byte));
+        assert_eq!(
+            tm.tx.input[0].previous_output.txid,
+            make_txid(treasury_txid_byte)
+        );
         // Inputs [1..3] are sorted: AA < BB < CC
         assert_eq!(tm.tx.input[1].previous_output.txid, make_txid(0xAA));
         assert_eq!(tm.tx.input[2].previous_output.txid, make_txid(0xBB));
@@ -648,7 +688,12 @@ mod tests {
         assert_eq!(tm.tx.output[0].script_pubkey, change);
         // Outputs 1..3 are peg-outs sorted by scriptPubKey
         for (i, expected) in expected_order.iter().enumerate() {
-            assert_eq!(&tm.tx.output[i + 1].script_pubkey, expected, "output {} wrong order", i + 1);
+            assert_eq!(
+                &tm.tx.output[i + 1].script_pubkey,
+                expected,
+                "output {} wrong order",
+                i + 1
+            );
         }
     }
 
@@ -727,7 +772,11 @@ mod tests {
         );
         // The two unfulfillable ones are reported as skipped, with gross amounts.
         assert_eq!(tm.skipped_pegouts.len(), 2);
-        let mut skipped: Vec<u64> = tm.skipped_pegouts.iter().map(|s| s.amount.to_sat()).collect();
+        let mut skipped: Vec<u64> = tm
+            .skipped_pegouts
+            .iter()
+            .map(|s| s.amount.to_sat())
+            .collect();
         skipped.sort_unstable();
         assert_eq!(skipped, vec![500, 1_200]);
     }
@@ -797,7 +846,10 @@ mod tests {
             &fee_params,
         );
 
-        assert!(matches!(result, Err(TmBuildError::InsufficientFunds { .. })));
+        assert!(matches!(
+            result,
+            Err(TmBuildError::InsufficientFunds { .. })
+        ));
     }
 
     // --- Edge cases ---
@@ -944,7 +996,9 @@ mod tests {
 
         // Extract the FROST group x-only public key
         let frost_group_key = dkg_result.public_key_package.verifying_key();
-        let group_key_bytes = frost_group_key.serialize().expect("serialize verifying key");
+        let group_key_bytes = frost_group_key
+            .serialize()
+            .expect("serialize verifying key");
         // frost-secp256k1-tr serializes as 33-byte compressed point (02/03 || x).
         // Extract the 32-byte x-coordinate for the x-only public key.
         let y_51 = bitcoin::key::UntweakedPublicKey::from_slice(&group_key_bytes[1..33])
@@ -960,7 +1014,10 @@ mod tests {
         let fee_params = default_fee_params();
         let tm = build_tm(
             TreasuryInput {
-                outpoint: OutPoint { txid: make_txid(0xAA), vout: 0 },
+                outpoint: OutPoint {
+                    txid: make_txid(0xAA),
+                    vout: 0,
+                },
                 value: Amount::from_sat(10_000_000),
                 spend_info,
             },
@@ -985,12 +1042,14 @@ mod tests {
         );
 
         // Convert FROST signature (64 bytes: R || z) to bitcoin::taproot::Signature
-        let frost_sig_bytes = signing_result.signature.serialize().expect("serialize signature");
+        let frost_sig_bytes = signing_result
+            .signature
+            .serialize()
+            .expect("serialize signature");
         assert_eq!(frost_sig_bytes.len(), 64);
 
-        let schnorr_sig =
-            bitcoin::secp256k1::schnorr::Signature::from_slice(&frost_sig_bytes)
-                .expect("valid 64-byte schnorr sig");
+        let schnorr_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(&frost_sig_bytes)
+            .expect("valid 64-byte schnorr sig");
 
         let tap_sig = bitcoin::taproot::Signature {
             signature: schnorr_sig,
@@ -1020,6 +1079,10 @@ mod tests {
 
         println!("  FROST signature verified against group public key");
         println!("  txid: {}", tm.txid);
-        println!("  signed tx has {} inputs, {} outputs", signed_tx.input.len(), signed_tx.output.len());
+        println!(
+            "  signed tx has {} inputs, {} outputs",
+            signed_tx.input.len(),
+            signed_tx.output.len()
+        );
     }
 }

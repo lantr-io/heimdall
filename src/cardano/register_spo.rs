@@ -98,7 +98,10 @@ impl std::fmt::Display for RegisterSpoError {
             Self::TreasurySpend(e) => write!(f, "treasury spend: {e}"),
             Self::TreasuryInfo(e) => write!(f, "treasury info: {e}"),
             Self::ColdSignatureInvalid => {
-                write!(f, "cold Ed25519 signature does not verify over the registration message")
+                write!(
+                    f,
+                    "cold Ed25519 signature does not verify over the registration message"
+                )
             }
             Self::BifrostSignatureInvalid => write!(
                 f,
@@ -146,7 +149,10 @@ pub fn pool_id_from_cold_vkey(cold_vkey: &[u8; 32]) -> [u8; 28] {
 #[must_use]
 pub fn registration_message(pool_id: &[u8], bifrost_id_pk: &[u8], bifrost_url: &[u8]) -> Vec<u8> {
     let mut m = Vec::with_capacity(
-        REGISTRATION_DOMAIN_SEPARATOR.len() + pool_id.len() + bifrost_id_pk.len() + bifrost_url.len(),
+        REGISTRATION_DOMAIN_SEPARATOR.len()
+            + pool_id.len()
+            + bifrost_id_pk.len()
+            + bifrost_url.len(),
     );
     m.extend_from_slice(REGISTRATION_DOMAIN_SEPARATOR);
     m.extend_from_slice(pool_id);
@@ -538,7 +544,10 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
         }),
     };
 
-    let anchor_unit = format!("{registry_policy_hex}{}", hex::encode(&plan.anchor_asset_name));
+    let anchor_unit = format!(
+        "{registry_policy_hex}{}",
+        hex::encode(&plan.anchor_asset_name)
+    );
     let anchor_value = vec![
         Asset::new_from_str("lovelace", &anchor.lovelace.to_string()),
         Asset::new_from_str(&anchor_unit, "1"),
@@ -578,7 +587,10 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
         datum: Some(Datum::Inline(hex::encode(plan.continued_anchor.to_cbor()))),
         reference_script: None,
     };
-    let new_node_unit = format!("{registry_policy_hex}{}", hex::encode(&plan.new_node_asset_name));
+    let new_node_unit = format!(
+        "{registry_policy_hex}{}",
+        hex::encode(&plan.new_node_asset_name)
+    );
     let new_node_out = Output {
         address: registry_address,
         amount: vec![
@@ -694,18 +706,17 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
 
         {
             let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
-            let at =
-                |i: i64, want: &([u8; 32], u32), what: &str| -> Result<(), RegisterSpoError> {
-                    let got = inputs.get(i as usize).ok_or_else(|| {
-                        RegisterSpoError::Build(format!("{what} input index {i} out of range"))
-                    })?;
-                    if got.transaction_id.as_slice() != want.0 || got.index != u64::from(want.1) {
-                        return Err(RegisterSpoError::Build(format!(
-                            "{what} input not at redeemer index {i} — input ordering changed"
-                        )));
-                    }
-                    Ok(())
-                };
+            let at = |i: i64, want: &([u8; 32], u32), what: &str| -> Result<(), RegisterSpoError> {
+                let got = inputs.get(i as usize).ok_or_else(|| {
+                    RegisterSpoError::Build(format!("{what} input index {i} out of range"))
+                })?;
+                if got.transaction_id.as_slice() != want.0 || got.index != u64::from(want.1) {
+                    return Err(RegisterSpoError::Build(format!(
+                        "{what} input not at redeemer index {i} — input ordering changed"
+                    )));
+                }
+                Ok(())
+            };
             at(anchor_input_index, &anchor_ref, "anchor")?;
             at(treasury_input_index, &treasury_ref, "treasury")?;
         }
@@ -1241,7 +1252,14 @@ mod tests {
     #[test]
     fn find_registry_utxos_decodes_and_rejects() {
         let policy = "aa".repeat(28);
-        let root = element_utxo(&policy, &"11".repeat(32), 0, 2_000_000, b"reg-root", &root_element(None));
+        let root = element_utxo(
+            &policy,
+            &"11".repeat(32),
+            0,
+            2_000_000,
+            b"reg-root",
+            &root_element(None),
+        );
         // a stray pure-ADA UTxO at the address is ignored
         let stray = BfUtxo {
             tx_hash: "22".repeat(32),
@@ -1468,7 +1486,10 @@ mod tests {
         assert_eq!(continued.bifrost_identity_root, expected);
 
         // Validity window made it into the body.
-        assert_eq!(tx.transaction_body.validity_interval_start, Some(70_000_000));
+        assert_eq!(
+            tx.transaction_body.validity_interval_start,
+            Some(70_000_000)
+        );
         assert_eq!(tx.transaction_body.ttl, Some(70_432_000));
 
         // Signed by the wallet key.
@@ -1548,10 +1569,13 @@ mod tests {
         // the new node takes over the anchor's old link (the high node).
         let out0 = decode_element_output(&tx, 0);
         assert_eq!(out0.0, 2_700_000);
-        assert_eq!(out0.1.data, ElementData::Node(RegistrationNodeData {
-            bifrost_id_pk: b"pk-lo".to_vec(),
-            bifrost_url: b"https://other-spo.example".to_vec(),
-        }));
+        assert_eq!(
+            out0.1.data,
+            ElementData::Node(RegistrationNodeData {
+                bifrost_id_pk: b"pk-lo".to_vec(),
+                bifrost_url: b"https://other-spo.example".to_vec(),
+            })
+        );
         assert_eq!(out0.1.link.as_deref(), Some(pool_id.as_slice()));
         let out1 = decode_element_output(&tx, 1);
         assert_eq!(out1.1.link.as_deref(), Some(hi.as_slice()));
@@ -1659,7 +1683,9 @@ mod tests {
         };
         assert!(matches!(
             build_register_spo_tx(&req),
-            Err(RegisterSpoError::TreasuryInfo(TreasuryInfoError::RootMismatch))
+            Err(RegisterSpoError::TreasuryInfo(
+                TreasuryInfoError::RootMismatch
+            ))
         ));
     }
 

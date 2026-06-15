@@ -4,9 +4,9 @@
 /// one process would call during the protocol.
 use std::collections::BTreeMap;
 
-use frost_secp256k1_tr as frost;
-use frost::keys::dkg;
 use frost::Identifier;
+use frost::keys::dkg;
+use frost_secp256k1_tr as frost;
 use rand_core::{CryptoRng, RngCore};
 
 // ── DKG ────────────────────────────────────────────────────────────────
@@ -25,8 +25,13 @@ pub fn dkg_part1(
 pub fn dkg_part2(
     secret_package: dkg::round1::SecretPackage,
     round1_packages: &BTreeMap<Identifier, dkg::round1::Package>,
-) -> Result<(dkg::round2::SecretPackage, BTreeMap<Identifier, dkg::round2::Package>), frost::Error>
-{
+) -> Result<
+    (
+        dkg::round2::SecretPackage,
+        BTreeMap<Identifier, dkg::round2::Package>,
+    ),
+    frost::Error,
+> {
     dkg::part2(secret_package, round1_packages)
 }
 
@@ -45,7 +50,10 @@ pub fn dkg_part3(
 pub fn sign_round1(
     key_package: &frost::keys::KeyPackage,
     rng: &mut (impl RngCore + CryptoRng),
-) -> (frost::round1::SigningNonces, frost::round1::SigningCommitments) {
+) -> (
+    frost::round1::SigningNonces,
+    frost::round1::SigningCommitments,
+) {
     frost::round1::commit(key_package.signing_share(), rng)
 }
 

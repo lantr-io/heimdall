@@ -21,9 +21,7 @@ use pallas_network::miniprotocols::localstate::queries_v16::{
 };
 use tokio::sync::Mutex;
 
-use crate::cardano::pegin_source::{
-    CardanoOutRef, CardanoPegInRequest, CardanoPegInSource,
-};
+use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInRequest, CardanoPegInSource};
 use crate::epoch::state::{EpochError, EpochResult};
 
 /// Cardano network magic.
@@ -64,8 +62,8 @@ impl PallasPegInSource {
         magic: NetworkMagic,
         bech32: &str,
     ) -> EpochResult<Self> {
-        let addr = Address::from_bech32(bech32)
-            .map_err(|e| EpochError::Chain(format!("bech32: {e}")))?;
+        let addr =
+            Address::from_bech32(bech32).map_err(|e| EpochError::Chain(format!("bech32: {e}")))?;
         Ok(Self::new(socket_path, magic, addr))
     }
 }
@@ -117,9 +115,9 @@ impl CardanoPegInSource for PallasPegInSource {
             // outputs at the script address are ignored.
             let has_policy = match &post.amount {
                 Value::Coin(_) => false,
-                Value::Multiasset(_coin, assets) => assets
-                    .iter()
-                    .any(|(pid, _)| pid.as_slice() == policy_id),
+                Value::Multiasset(_coin, assets) => {
+                    assets.iter().any(|(pid, _)| pid.as_slice() == policy_id)
+                }
             };
             if !has_policy {
                 continue;

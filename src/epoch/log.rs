@@ -23,7 +23,11 @@ pub fn short_hex(data: &[u8], take: usize) -> String {
     if data.len() <= take {
         hex::encode(data)
     } else {
-        format!("{}…({} more)", hex::encode(&data[..take]), data.len() - take)
+        format!(
+            "{}…({} more)",
+            hex::encode(&data[..take]),
+            data.len() - take
+        )
     }
 }
 

@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use frost_secp256k1_tr as frost;
 use frost::Identifier;
+use frost_secp256k1_tr as frost;
 use serde::{Deserialize, Serialize};
 
 use crate::cardano::pegin_datum::ParsedPegIn;
@@ -130,12 +130,10 @@ impl TreasuryMovement {
     /// Per-input Taproot merkle root, encoded as `Option<Vec<u8>>` for the
     /// `frost::*_with_tweak` API which takes `Option<&[u8]>`.
     pub fn merkle_root_bytes(&self, input_index: usize) -> Option<Vec<u8>> {
-        self.input_spend_info[input_index]
-            .merkle_root()
-            .map(|h| {
-                use bitcoin::hashes::Hash;
-                h.as_byte_array().to_vec()
-            })
+        self.input_spend_info[input_index].merkle_root().map(|h| {
+            use bitcoin::hashes::Hash;
+            h.as_byte_array().to_vec()
+        })
     }
 }
 
@@ -286,14 +284,29 @@ impl EpochPhase {
         match self {
             EpochPhase::Idle => "Idle",
             EpochPhase::EpochStart { .. } => "EpochStart",
-            EpochPhase::Dkg { round: DkgRound::Round1, .. } => "Dkg(Round1)",
-            EpochPhase::Dkg { round: DkgRound::Round2, .. } => "Dkg(Round2)",
-            EpochPhase::Dkg { round: DkgRound::Part3, .. } => "Dkg(Part3)",
+            EpochPhase::Dkg {
+                round: DkgRound::Round1,
+                ..
+            } => "Dkg(Round1)",
+            EpochPhase::Dkg {
+                round: DkgRound::Round2,
+                ..
+            } => "Dkg(Round2)",
+            EpochPhase::Dkg {
+                round: DkgRound::Part3,
+                ..
+            } => "Dkg(Part3)",
             EpochPhase::PublishKeys { .. } => "PublishKeys",
             EpochPhase::CollectPegins { .. } => "CollectPegins",
             EpochPhase::BuildTm { .. } => "BuildTm",
-            EpochPhase::Sign { round: SigningRound::Round1, .. } => "Sign(Round1)",
-            EpochPhase::Sign { round: SigningRound::Round2, .. } => "Sign(Round2)",
+            EpochPhase::Sign {
+                round: SigningRound::Round1,
+                ..
+            } => "Sign(Round1)",
+            EpochPhase::Sign {
+                round: SigningRound::Round2,
+                ..
+            } => "Sign(Round2)",
             EpochPhase::Submit { .. } => "Submit",
             EpochPhase::AwaitConfirm { .. } => "AwaitConfirm",
         }

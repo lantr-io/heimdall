@@ -36,16 +36,16 @@ use std::str::FromStr;
 use bitcoin::hashes::Hash as _;
 use bitcoin::key::{PrivateKey, UntweakedPublicKey};
 use bitcoin::opcodes::all::OP_RETURN;
-use bitcoin::secp256k1::{ecdsa, Message, Secp256k1, SecretKey};
+use bitcoin::secp256k1::{Message, Secp256k1, SecretKey, ecdsa};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{
-    absolute, script, transaction, Address, Amount, CompressedPublicKey, OutPoint, ScriptBuf,
-    Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    Address, Amount, CompressedPublicKey, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+    Txid, Witness, absolute, script, transaction,
 };
 use clap::Parser;
 
 use heimdall::bitcoin::taproot::pegin_spend_info;
-use heimdall::cardano::btc_rpc::{broadcast_btc_tx, BtcRpcConfig};
+use heimdall::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
 use heimdall::config::HeimdallConfig;
 
 /// Extra fee allowance per additional P2WPKH input (sats).
@@ -65,7 +65,11 @@ struct Cli {
     /// Depositor's funding key in Bitcoin WIF format. The same key derives
     /// the depositor x-only pubkey used in the OP_RETURN beacon and the
     /// peg-in P2TR refund leaf. Mutually exclusive with --depositor-wif-file.
-    #[arg(long, conflicts_with = "depositor_wif_file", required_unless_present = "depositor_wif_file")]
+    #[arg(
+        long,
+        conflicts_with = "depositor_wif_file",
+        required_unless_present = "depositor_wif_file"
+    )]
     depositor_wif: Option<String>,
 
     /// Path to a file containing the depositor WIF (whitespace trimmed).
@@ -142,7 +146,10 @@ fn run() -> Result<(), String> {
 
     let pegin_addr = pegin_address(&secp, y_fed, depositor_xonly, refund_timeout, network);
     eprintln!("peg-in P2TR address: {pegin_addr}");
-    eprintln!("depositor x-only:    {}", hex::encode(depositor_xonly.serialize()));
+    eprintln!(
+        "depositor x-only:    {}",
+        hex::encode(depositor_xonly.serialize())
+    );
     eprintln!("depositor P2WPKH:    {depositor_p2wpkh}");
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
@@ -166,12 +173,15 @@ fn run() -> Result<(), String> {
                 txid: Txid::from_str(txid_hex).map_err(|e| format!("invalid funding txid: {e}"))?,
                 vout: cli.funding_vout.expect("clap requires_all guarantees this"),
                 amount: Amount::from_sat(
-                    cli.funding_amount_sat.expect("clap requires_all guarantees this"),
+                    cli.funding_amount_sat
+                        .expect("clap requires_all guarantees this"),
                 ),
             };
             eprintln!(
                 "manual UTXO: {}:{} ({} sat)",
-                utxo.txid, utxo.vout, utxo.amount.to_sat()
+                utxo.txid,
+                utxo.vout,
+                utxo.amount.to_sat()
             );
             (vec![utxo], Amount::from_sat(cli.fee_sat))
         }
@@ -180,8 +190,7 @@ fn run() -> Result<(), String> {
             // One `Client` for the whole discovery + broadcast chain so reqwest pools the
             // bitcoind RPC connection across `listunspent` / `scantxoutset` / `sendrawtransaction`.
             let http = reqwest::Client::new();
-            let utxos =
-                rt.block_on(discover_utxos(&http, &rpc, &depositor_p2wpkh.to_string()))?;
+            let utxos = rt.block_on(discover_utxos(&http, &rpc, &depositor_p2wpkh.to_string()))?;
             if utxos.is_empty() {
                 return Err(format!(
                     "no UTXOs found at {depositor_p2wpkh}. Fund the address and retry."
@@ -196,7 +205,9 @@ fn run() -> Result<(), String> {
             for u in &selected {
                 eprintln!(
                     "selected UTXO: {}:{} ({} sat)",
-                    u.txid, u.vout, u.amount.to_sat()
+                    u.txid,
+                    u.vout,
+                    u.amount.to_sat()
                 );
             }
             if extra > 0 {
@@ -460,13 +471,14 @@ async fn list_unspent(
         .ok_or_else(|| "listunspent: missing result array".to_string())?;
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
-        let txid_str = item.get("txid").and_then(|v| v.as_str()).ok_or_else(|| {
-            "listunspent: entry missing txid".to_string()
-        })?;
-        let vout = item
-            .get("vout")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| "listunspent: entry missing vout".to_string())? as u32;
+        let txid_str = item
+            .get("txid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "listunspent: entry missing txid".to_string())?;
+        let vout =
+            item.get("vout")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| "listunspent: entry missing vout".to_string())? as u32;
         let amount_btc = item
             .get("amount")
             .and_then(|v| v.as_f64())
@@ -503,13 +515,14 @@ async fn scan_utxos(
         .ok_or_else(|| "scantxoutset: missing unspents array".to_string())?;
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
-        let txid_str = item.get("txid").and_then(|v| v.as_str()).ok_or_else(|| {
-            "scantxoutset: entry missing txid".to_string()
-        })?;
-        let vout = item
-            .get("vout")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| "scantxoutset: entry missing vout".to_string())? as u32;
+        let txid_str = item
+            .get("txid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "scantxoutset: entry missing txid".to_string())?;
+        let vout =
+            item.get("vout")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| "scantxoutset: entry missing vout".to_string())? as u32;
         let amount_btc = item
             .get("amount")
             .and_then(|v| v.as_f64())
@@ -577,9 +590,8 @@ fn select_utxos(utxos: &[Utxo], required: Amount) -> Result<Vec<Utxo>, String> {
     for u in by_size_asc.iter().rev() {
         acc += u.amount;
         picked.push((*u).clone());
-        let fee_budget = Amount::from_sat(
-            EXTRA_INPUT_FEE_SAT * (picked.len().saturating_sub(1) as u64),
-        );
+        let fee_budget =
+            Amount::from_sat(EXTRA_INPUT_FEE_SAT * (picked.len().saturating_sub(1) as u64));
         if acc >= required + fee_budget {
             return Ok(picked);
         }

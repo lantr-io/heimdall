@@ -29,16 +29,16 @@
 
 use std::sync::Arc;
 
+use bitcoin::Witness;
 use bitcoin::hashes::Hash;
 use bitcoin::key::{Secp256k1, UntweakedPublicKey};
-use bitcoin::{Witness};
 use frost_secp256k1_tr as frost;
 
 use crate::bitcoin::taproot::treasury_spend_info;
 use crate::bitcoin::tm_builder::{
-    build_tm, compute_sighashes, FeeParams, PegInInput, PegOutRequest, TreasuryInput,
+    FeeParams, PegInInput, PegOutRequest, TreasuryInput, build_tm, compute_sighashes,
 };
-use crate::cardano::pegin_datum::{parse_pegin_request, ParsedPegIn};
+use crate::cardano::pegin_datum::{ParsedPegIn, parse_pegin_request};
 use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInSource};
 use crate::epoch::dkg::dkg_phase;
 use crate::epoch::signing::sign_phase;
@@ -69,7 +69,6 @@ pub async fn run_epoch_loop(
     loop {
         crate::epoch_log!(me, current_epoch(&phase), "==> phase = {}", phase.name());
         phase = match phase {
-
             EpochPhase::Idle => idle_phase(&chain).await?,
 
             EpochPhase::EpochStart { epoch } => epoch_start_phase(&chain, epoch).await?,
@@ -79,7 +78,12 @@ pub async fn run_epoch_loop(
                 round,
                 roster,
                 collected,
-            } => dkg_phase(&peers, &clock, &rng, config, epoch, round, roster, collected).await?,
+            } => {
+                dkg_phase(
+                    &peers, &clock, &rng, config, epoch, round, roster, collected,
+                )
+                .await?
+            }
 
             EpochPhase::PublishKeys {
                 epoch,
@@ -157,10 +161,7 @@ async fn idle_phase(chain: &Arc<dyn CardanoChain>) -> EpochResult<EpochPhase> {
     Ok(EpochPhase::EpochStart { epoch: event.epoch })
 }
 
-async fn epoch_start_phase(
-    chain: &Arc<dyn CardanoChain>,
-    epoch: u64,
-) -> EpochResult<EpochPhase> {
+async fn epoch_start_phase(chain: &Arc<dyn CardanoChain>, epoch: u64) -> EpochResult<EpochPhase> {
     let roster = chain.query_roster(epoch).await?;
     Ok(EpochPhase::Dkg {
         epoch,
@@ -184,7 +185,8 @@ async fn publish_keys_phase(
     let y_51 = frost_vk_to_xonly(&group_keys.verifying_key)?;
 
     crate::epoch_log!(
-        me, epoch,
+        me,
+        epoch,
         "PublishKeys: group_key = {}",
         hex::encode(y_51.serialize())
     );
@@ -228,9 +230,11 @@ async fn collect_pegins_phase(
     let mut accepted: BTreeMap<CardanoOutRef, ParsedPegIn> = BTreeMap::new();
 
     crate::epoch_log!(
-        me, epoch,
+        me,
+        epoch,
         "CollectPegins: polling source for {:?} (poll interval {:?})",
-        config.pegin_collection_window, config.pegin_poll_interval
+        config.pegin_collection_window,
+        config.pegin_poll_interval
     );
 
     loop {
@@ -246,11 +250,7 @@ async fn collect_pegins_phase(
                     accepted.insert(req.cardano_utxo.clone(), parsed);
                 }
                 Err(e) => {
-                    crate::epoch_log!(
-                        me, epoch,
-                        "  dropped peg-in {:?}: {}",
-                        req.cardano_utxo, e
-                    );
+                    crate::epoch_log!(me, epoch, "  dropped peg-in {:?}: {}", req.cardano_utxo, e);
                 }
             }
         }
@@ -262,7 +262,8 @@ async fn collect_pegins_phase(
 
     let frozen_pegins: Vec<ParsedPegIn> = accepted.into_values().collect();
     crate::epoch_log!(
-        me, epoch,
+        me,
+        epoch,
         "  -> froze {} peg-in(s) for BuildTm",
         frozen_pegins.len()
     );
@@ -296,7 +297,8 @@ async fn build_tm_phase(
             break t;
         }
         crate::epoch_log!(
-            me, epoch,
+            me,
+            epoch,
             "BuildTm: previous treasury movement not yet confirmed on Bitcoin, waiting…"
         );
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -304,7 +306,8 @@ async fn build_tm_phase(
 
     let pegouts = chain.query_pegout_requests().await?;
     crate::epoch_log!(
-        me, epoch,
+        me,
+        epoch,
         "  chain query: treasury={} sat, {} frozen pegins, {} pegouts, fee_rate={}sat/vb",
         treasury.value.to_sat(),
         frozen_pegins.len(),
@@ -389,7 +392,8 @@ async fn build_tm_phase(
     };
 
     crate::epoch_log!(
-        me, epoch,
+        me,
+        epoch,
         "  -> built unsigned tx: txid={} ({num_inputs} inputs)",
         tm.txid
     );
@@ -432,7 +436,8 @@ async fn submit_phase(
     // before assembling the witnesses. This catches a broken signing
     // path before we hand bytes to the chain.
     crate::epoch_log!(
-        me, epoch,
+        me,
+        epoch,
         "Submit: verifying {} per-input signatures",
         tm.signatures.len()
     );
@@ -445,13 +450,15 @@ async fn submit_phase(
             .map_err(|e| EpochError::Frost(format!("sig serialize: {e}")))?;
         let schnorr = bitcoin::secp256k1::schnorr::Signature::from_slice(&sig_bytes)
             .map_err(|e| EpochError::SignatureVerify(i, format!("from_slice: {e}")))?;
-        let xonly = tm.input_spend_info[i]
-            .output_key()
-            .to_x_only_public_key();
+        let xonly = tm.input_spend_info[i].output_key().to_x_only_public_key();
         let msg = bitcoin::secp256k1::Message::from_digest(tm.sighashes[i]);
         secp.verify_schnorr(&schnorr, &msg, &xonly)
             .map_err(|e| EpochError::SignatureVerify(i, e.to_string()))?;
-        crate::epoch_log!(me, epoch, "  input {i}: schnorr sig verifies under output key");
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  input {i}: schnorr sig verifies under output key"
+        );
     }
 
     // Build the final witnessed transaction (key-path spend on every input).
@@ -462,8 +469,8 @@ async fn submit_phase(
             .expect("checked above")
             .serialize()
             .map_err(|e| EpochError::Frost(format!("sig serialize: {e}")))?;
-        let schnorr = bitcoin::secp256k1::schnorr::Signature::from_slice(&sig)
-            .expect("verified above");
+        let schnorr =
+            bitcoin::secp256k1::schnorr::Signature::from_slice(&sig).expect("verified above");
         let tap_sig = bitcoin::taproot::Signature {
             signature: schnorr,
             sighash_type: bitcoin::sighash::TapSighashType::Default,
@@ -479,7 +486,8 @@ async fn submit_phase(
     let leader = roster.leader(leader_attempt);
     if me == leader {
         crate::epoch_log!(
-            me, epoch,
+            me,
+            epoch,
             "Submit: leader (attempt {leader_attempt}) — broadcasting signed tx; \
              txid = {} ({} bytes)",
             tm.txid,
@@ -488,7 +496,8 @@ async fn submit_phase(
         chain.submit_signed_tm(&tx_bytes).await?;
     } else {
         crate::epoch_log!(
-            me, epoch,
+            me,
+            epoch,
             "Submit: follower (leader = {:?}, attempt {leader_attempt}); \
              holding witnessed tx ({} bytes), not broadcasting",
             leader,

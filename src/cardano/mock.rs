@@ -31,10 +31,10 @@ impl MockCardanoPegInSource {
     /// Schedule a peg-in request to become visible at `release_at`.
     /// Pass `Instant::now()` for "visible immediately".
     pub fn push(&self, release_at: Instant, request: CardanoPegInRequest) {
-        self.scheduled
-            .lock()
-            .unwrap()
-            .push(Scheduled { release_at, request });
+        self.scheduled.lock().unwrap().push(Scheduled {
+            release_at,
+            request,
+        });
     }
 }
 

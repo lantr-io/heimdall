@@ -172,10 +172,7 @@ pub fn spos_registry_script(
     let code = validator_compiled_code(blueprint_json, SPOS_REGISTRY_TITLE)?;
     apply_params(
         &code,
-        &[
-            bytes(bootstrap_tx_id),
-            int_from_u64(bootstrap_output_index),
-        ],
+        &[bytes(bootstrap_tx_id), int_from_u64(bootstrap_output_index)],
     )
 }
 
