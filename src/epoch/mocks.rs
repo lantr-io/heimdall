@@ -420,6 +420,7 @@ mod tests {
 
         let info1 = SpoInfo {
             identifier: id1,
+            pool_id: vec![],
             bifrost_url: String::new(),
             bifrost_id_pk: vec![],
         };

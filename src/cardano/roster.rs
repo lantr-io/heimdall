@@ -336,6 +336,7 @@ pub fn roster_from_snapshot(
             identifier,
             SpoInfo {
                 identifier,
+                pool_id: spo.pool_id.clone(),
                 bifrost_url,
                 bifrost_id_pk: spo.bifrost_id_pk.clone(),
             },

@@ -321,6 +321,7 @@ impl DkgContext {
                     p.identifier,
                     SpoInfo {
                         identifier: p.identifier,
+                        pool_id: p.pool_id.clone(),
                         bifrost_url: p.bifrost_url.clone(),
                         bifrost_id_pk: p.bifrost_id_pk.clone(),
                     },

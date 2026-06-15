@@ -69,6 +69,7 @@ pub fn demo_static_fixture(
             id,
             SpoInfo {
                 identifier: id,
+                pool_id: vec![],
                 bifrost_url: format!("http://127.0.0.1:{port}"),
                 bifrost_id_pk: vec![],
             },
@@ -134,6 +135,7 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
             id,
             SpoInfo {
                 identifier: id,
+                pool_id: vec![],
                 bifrost_url: format!("http://{}:{}", cfg.http.bind_address, port),
                 bifrost_id_pk: vec![],
             },

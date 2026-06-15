@@ -320,6 +320,7 @@ mod tests {
                 id,
                 SpoInfo {
                     identifier: id,
+                    pool_id: vec![],
                     bifrost_url: String::new(),
                     bifrost_id_pk: vec![],
                 },
