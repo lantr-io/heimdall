@@ -292,3 +292,25 @@ bytes and the Round-1 fault circuit agree. Tracked by WI-013 (parcel 1 pins the
 layout in the canonical-bytes builder); cheap either way, but must be fixed
 before WI-013 ships because σ_i is signature-covered and becomes on-chain
 evidence.
+
+**Resolved (2026-06-15): in-repo, frost-native `R_x ‖ μ` (Interpretation A).**
+Two independent implementations converged on it, so no FluidTokens confirmation
+is needed for the layout:
+
+- **Transport (WI-013, PR #4):** `http/frost_bridge.rs` ships
+  `proof_of_knowledge().serialize()` = x-only `R_i ‖ μ_i` verbatim.
+- **On-chain fault circuit (PR #3, `feat/dkg-fault-circuits`):** the Halo2 DKG
+  Round-1 PoK fault prover (`src/circuits/dkg_fault.rs`) reads σ_i the same way —
+  `package.proof_of_knowledge().serialize()`, taking `μ = bytes[32..64]` and
+  lifting `R = even_y(bytes[0..32])` — and recomputes the challenge via
+  `Secp256K1Sha256TR::HDKG(identifier ‖ φ_{i0} ‖ R)` (context
+  `FROST-secp256k1-SHA256-TR-v1` + label `dkg`). So the wire σ_i feeds the fault
+  prover with no conversion.
+
+The literal-spec `c_i ‖ μ_i` form was never implemented. Note also that PR #3
+**supersedes** the "heimdall's circuits don't cover the Round-1 PoK fault"
+statement above: it adds that circuit and removes the old dusk-plonk
+`src/circuits/{commitment,signature}.rs` + `src/gadgets/*`. (Separately, PR #3's
+`fault_token_name = blake2b_256(pool_id ‖ public_input)` diverges from the spec's
+`pool_id ‖ epoch_u32_be` that `spo_bans.ak` ApplyBan burns — tracked against
+WI-016/017, not WI-013.)
