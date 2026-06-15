@@ -3,7 +3,7 @@
 /// Provides:
 /// - `run_signing()`: successful threshold signing (t-of-n)
 /// - `run_cheating_signing()`: one SPO submits a bad signature share
-/// - `compute_misbehavior_witness()`: EC witness for the PLONK misbehavior circuit
+/// - `compute_misbehavior_witness()`: EC witness values for a future signing-share fault circuit
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -197,7 +197,7 @@ pub fn run_cheating_signing(
     }
 }
 
-/// Compute the EC points for the signature misbehavior witness.
+/// Compute the EC points for a signature-share fault witness.
 ///
 /// For a valid share z_good: z_good * G == R_p + lambda_p * c * Y_p
 /// For a corrupted share z_bad: z_bad * G != R_p + lambda_p * c * Y_p

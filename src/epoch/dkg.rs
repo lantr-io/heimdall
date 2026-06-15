@@ -22,9 +22,8 @@ use crate::http::wire::DkgNamespace;
 /// them into `EpochError::Frost(String)` and abort the whole epoch.
 ///
 /// In the real world, we're supposed to slash the misbehaving SPO via a
-/// FROST-signed membership exit, restart DKG with the reduced
-/// candidate set, and submit a PLONK proof of misbehavior to
-/// the Cardano slashing contract.
+/// FROST-signed membership exit, restart DKG with the reduced candidate set,
+/// and submit a Halo2 DKG fault proof to the Cardano fault verifier.
 pub async fn dkg_phase(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,

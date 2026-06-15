@@ -1,2 +1,1 @@
-pub mod commitment;
-pub mod signature;
+pub mod dkg_fault;
