@@ -82,6 +82,8 @@ pub enum PlutusError {
     MissingField(usize),
     /// Field at index `usize` is not a `ByteArray`.
     NotBytes(usize),
+    /// Field at index `usize` is not an `Int` (or exceeds `i64`).
+    NotInt(usize),
 }
 
 impl std::fmt::Display for PlutusError {
@@ -93,6 +95,7 @@ impl std::fmt::Display for PlutusError {
             }
             Self::MissingField(i) => write!(f, "missing field [{i}]"),
             Self::NotBytes(i) => write!(f, "field [{i}] is not a ByteArray"),
+            Self::NotInt(i) => write!(f, "field [{i}] is not an Int (or exceeds i64)"),
         }
     }
 }
@@ -133,6 +136,46 @@ pub fn field_bytes(fields: &[PlutusData], i: usize) -> Result<Vec<u8>, PlutusErr
         Some(PlutusData::BoundedBytes(b)) => Ok(b.clone().into()),
         Some(_) => Err(PlutusError::NotBytes(i)),
         None => Err(PlutusError::MissingField(i)),
+    }
+}
+
+/// The `Int` field at index `i`, as an `i64`. Accepts every CBOR integer
+/// form Plutus `Data` can carry — the compact `Int` and the tag-2/tag-3
+/// bignums — because on-chain integer equality is by VALUE: a validator that
+/// accepts a (possibly non-minimally-encoded) bignum datum would have a
+/// matching small value, so the reader must too, or one such UTxO bricks the
+/// whole list decode. Values outside `i64` are rejected (no bifrost datum
+/// legitimately carries an epoch or counter that large), not truncated.
+pub fn field_int(fields: &[PlutusData], i: usize) -> Result<i64, PlutusError> {
+    match fields.get(i) {
+        Some(PlutusData::BigInt(b)) => bigint_to_i64(b).ok_or(PlutusError::NotInt(i)),
+        Some(_) => Err(PlutusError::NotInt(i)),
+        None => Err(PlutusError::MissingField(i)),
+    }
+}
+
+/// Big-endian magnitude bytes → `u128`, or `None` if wider than 16 bytes.
+fn be_magnitude(bytes: &[u8]) -> Option<u128> {
+    if bytes.len() > 16 {
+        return None;
+    }
+    Some(
+        bytes
+            .iter()
+            .fold(0u128, |acc, &b| (acc << 8) | u128::from(b)),
+    )
+}
+
+/// `BigInt` → `i64` if it fits. tag-2 bignum is `+magnitude`; tag-3 is
+/// `-1 - magnitude` (CBOR negative bignum).
+fn bigint_to_i64(b: &BigInt) -> Option<i64> {
+    match b {
+        BigInt::Int(n) => i64::try_from(i128::from(*n)).ok(),
+        BigInt::BigUInt(bytes) => i64::try_from(be_magnitude(bytes)?).ok(),
+        BigInt::BigNInt(bytes) => {
+            let m = i128::try_from(be_magnitude(bytes)?).ok()?;
+            i64::try_from(-(m.checked_add(1)?)).ok()
+        }
     }
 }
 
@@ -214,6 +257,31 @@ mod tests {
             field_bytes(&fields, 5).unwrap_err(),
             PlutusError::MissingField(5)
         );
+    }
+
+    #[test]
+    fn field_int_decodes_compact_and_bignum() {
+        // compact Int
+        let fields = [int(295), int(-3)];
+        assert_eq!(field_int(&fields, 0).unwrap(), 295);
+        assert_eq!(field_int(&fields, 1).unwrap(), -3);
+
+        // bignum-encoded SMALL values (tag 2 / tag 3) must decode by value —
+        // on-chain `==` would accept these, so the reader must too.
+        let big_pos = PlutusData::BigInt(BigInt::BigUInt(BoundedBytes::from(vec![0x01, 0x27]))); // 295
+        let big_neg = PlutusData::BigInt(BigInt::BigNInt(BoundedBytes::from(vec![0x02]))); // -1 - 2 = -3
+        assert_eq!(field_int(std::slice::from_ref(&big_pos), 0).unwrap(), 295);
+        assert_eq!(field_int(std::slice::from_ref(&big_neg), 0).unwrap(), -3);
+
+        // genuinely out of i64 → NotInt (not truncation)
+        let huge = PlutusData::BigInt(BigInt::BigUInt(BoundedBytes::from(vec![0xFF; 16])));
+        assert_eq!(
+            field_int(std::slice::from_ref(&huge), 0),
+            Err(PlutusError::NotInt(0))
+        );
+        // wrong type / missing
+        assert_eq!(field_int(&[bytes(b"x")], 0), Err(PlutusError::NotInt(0)));
+        assert_eq!(field_int(&[], 0), Err(PlutusError::MissingField(0)));
     }
 
     #[test]

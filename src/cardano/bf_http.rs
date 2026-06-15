@@ -105,6 +105,33 @@ pub async fn fetch_script_size(
         .ok_or_else(|| "script: missing serialised_size".to_string())
 }
 
+/// Current epoch number from `/epochs/latest`. Roster snapshots and ban
+/// activity are epoch-scoped, so callers must use the chain's epoch, never a
+/// local clock.
+pub async fn fetch_current_epoch(base_url: &str, project_id: &str) -> Result<u64, String> {
+    let url = format!("{base_url}/epochs/latest");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("epochs/latest request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "epochs/latest http {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("epochs/latest json: {e}"))?;
+    v.get("epoch")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "epochs/latest: missing/non-numeric `epoch`".to_string())
+}
+
 /// The current slot and the upper validity bound at the epoch boundary, for
 /// the register_spo validity window (`invalid_before` / `invalid_hereafter`).
 #[derive(Debug, Clone, Copy)]

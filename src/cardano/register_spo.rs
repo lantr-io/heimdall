@@ -301,84 +301,25 @@ pub fn find_registry_utxos(
     utxos: &[BfUtxo],
     policy_id_hex: &str,
 ) -> Result<Vec<RegistryUtxo>, RegisterSpoError> {
-    let mut out = Vec::new();
-    for u in utxos {
-        let mut lovelace = 0u64;
-        let mut nft: Option<(Vec<u8>, String)> = None; // (asset_name, quantity)
-        let mut foreign: Option<String> = None;
-        for a in &u.amount {
-            if a.unit == "lovelace" {
-                lovelace = a.quantity.parse().map_err(|e| {
-                    RegisterSpoError::BadElementUtxo(format!(
-                        "{}#{}: lovelace: {e}",
-                        u.tx_hash, u.output_index
-                    ))
-                })?;
-            } else if let Some(name_hex) = a.unit.strip_prefix(policy_id_hex) {
-                let name = hex::decode(name_hex).map_err(|e| {
-                    RegisterSpoError::BadElementUtxo(format!(
-                        "{}#{}: asset name hex: {e}",
-                        u.tx_hash, u.output_index
-                    ))
-                })?;
-                if nft.replace((name, a.quantity.clone())).is_some() {
-                    return Err(RegisterSpoError::BadElementUtxo(format!(
-                        "{}#{}: multiple registry-policy assets on one UTxO",
-                        u.tx_hash, u.output_index
-                    )));
-                }
-            } else {
-                foreign = Some(a.unit.clone());
-            }
-        }
-        let Some((asset_name, quantity)) = nft else {
-            continue; // not a list element (stray value at the address)
-        };
-        if quantity != "1" {
-            return Err(RegisterSpoError::BadElementUtxo(format!(
-                "{}#{}: registry NFT quantity {quantity}, expected 1",
-                u.tx_hash, u.output_index
-            )));
-        }
-        if let Some(unit) = foreign {
-            return Err(RegisterSpoError::BadElementUtxo(format!(
-                "{}#{}: foreign asset {unit} alongside the element NFT",
-                u.tx_hash, u.output_index
-            )));
-        }
-        let datum_hex = u.inline_datum.as_deref().ok_or_else(|| {
-            RegisterSpoError::BadElementUtxo(format!(
-                "{}#{}: no inline datum",
-                u.tx_hash, u.output_index
-            ))
-        })?;
-        let datum_cbor = hex::decode(datum_hex).map_err(|e| {
-            RegisterSpoError::BadElementUtxo(format!(
-                "{}#{}: datum hex: {e}",
-                u.tx_hash, u.output_index
-            ))
-        })?;
-        let pd: PlutusData = minicbor::decode(&datum_cbor).map_err(|e| {
-            RegisterSpoError::BadElementUtxo(format!(
-                "{}#{}: datum CBOR: {e}",
-                u.tx_hash, u.output_index
-            ))
-        })?;
-        let element = RegistryElement::from_plutus_data(&pd).map_err(|e| {
-            RegisterSpoError::BadElementUtxo(format!(
-                "{}#{}: datum: {e}",
-                u.tx_hash, u.output_index
-            ))
-        })?;
-        out.push(RegistryUtxo {
-            tx_hash: u.tx_hash.clone(),
-            output_index: u.output_index,
-            lovelace,
-            asset_name,
-            element,
-        });
-    }
-    Ok(out)
+    crate::cardano::nft_scan::find_policy_nft_utxos(utxos, policy_id_hex)
+        .map_err(RegisterSpoError::BadElementUtxo)?
+        .into_iter()
+        .map(|u| {
+            let element = RegistryElement::from_plutus_data(&u.datum).map_err(|e| {
+                RegisterSpoError::BadElementUtxo(format!(
+                    "{}#{}: datum: {e}",
+                    u.tx_hash, u.output_index
+                ))
+            })?;
+            Ok(RegistryUtxo {
+                tx_hash: u.tx_hash,
+                output_index: u.output_index,
+                lovelace: u.lovelace,
+                asset_name: u.asset_name,
+                element,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -80,10 +80,11 @@ impl From<plutus::PlutusError> for TreasuryInfoError {
             plutus::PlutusError::WrongConstructor { got, .. } => Self::WrongConstructor(got),
             // The shared `field_bytes` distinguishes missing vs wrong-type; this
             // module's `from_plutus_data` checks field count first, so both map
-            // to NotBytes (preserving the prior behaviour).
-            plutus::PlutusError::MissingField(i) | plutus::PlutusError::NotBytes(i) => {
-                Self::NotBytes(i)
-            }
+            // to NotBytes (preserving the prior behaviour). NotInt is
+            // unreachable for this datum shape (no Int fields).
+            plutus::PlutusError::MissingField(i)
+            | plutus::PlutusError::NotBytes(i)
+            | plutus::PlutusError::NotInt(i) => Self::NotBytes(i),
         }
     }
 }

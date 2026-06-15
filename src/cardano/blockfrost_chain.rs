@@ -40,6 +40,16 @@ pub struct BlockfrostCardanoChain {
     treasury_config: TreasuryConfig,
     /// Fallback roster.
     fallback_roster: Roster,
+    /// On-chain SPO registry source. When set, `query_roster` reads the
+    /// real registry (verified against the `treasury_info` identity root)
+    /// and any failure is a hard error — it never silently falls back to
+    /// `fallback_roster`, which would let SPOs run DKG on divergent rosters.
+    registry_roster: Option<crate::cardano::roster::RegistryRosterSource>,
+    /// On-chain ban-list source. When set (alongside `registry_roster`),
+    /// `query_roster` subtracts pools actively banned for the epoch before
+    /// computing the threshold (WI-012). `None` → no ban filtering (e.g.
+    /// before the ban list is bootstrapped, WI-015).
+    ban_source: Option<crate::cardano::ban_list::BanListSource>,
     /// Mnemonic-derived payment key for the Cardano wallet that pays
     /// fees. `None` means publishing is disabled (dry run).
     payment_key: Option<PrivateKey>,
@@ -97,6 +107,8 @@ impl BlockfrostCardanoChain {
             treasury_asset_name_hex: treasury_asset_name_hex.into(),
             treasury_config,
             fallback_roster,
+            registry_roster: None,
+            ban_source: None,
             payment_key: None,
             wallet_base_address: None,
             treasury_y_51: Mutex::new(None),
@@ -120,6 +132,23 @@ impl BlockfrostCardanoChain {
     ) -> Self {
         self.tm_script_cbor = Some(script_cbor.to_string());
         self.tm_control_ref = Some((control_tx_hash.to_string(), control_index));
+        self
+    }
+
+    /// Read the roster from the on-chain SPO registry instead of the
+    /// fallback fixture (WI-010).
+    pub fn with_registry_roster(
+        mut self,
+        source: crate::cardano::roster::RegistryRosterSource,
+    ) -> Self {
+        self.registry_roster = Some(source);
+        self
+    }
+
+    /// Subtract the on-chain ban list when deriving the eligible roster
+    /// (WI-012). Only meaningful alongside [`Self::with_registry_roster`].
+    pub fn with_ban_source(mut self, source: crate::cardano::ban_list::BanListSource) -> Self {
+        self.ban_source = Some(source);
         self
     }
 
@@ -191,8 +220,26 @@ impl CardanoChain for BlockfrostCardanoChain {
         Ok(EpochBoundaryEvent { epoch: 0 })
     }
 
-    async fn query_roster(&self, _epoch: u64) -> EpochResult<Roster> {
-        Ok(self.fallback_roster.clone())
+    async fn query_roster(&self, epoch: u64) -> EpochResult<Roster> {
+        let Some(registry) = &self.registry_roster else {
+            return Ok(self.fallback_roster.clone());
+        };
+        // WI-012: eligible roster = registry − active bans, FROST threshold
+        // stake-weighted. Any failure is hard — never silently fall back to
+        // the fixture, which would let SPOs run DKG on divergent rosters.
+        // `attempt` is 0 here; the orchestration layer (WI-014) bumps it on
+        // a failed ceremony.
+        let ctx = crate::cardano::dkg_roster::fetch_dkg_context(
+            registry,
+            self.ban_source.as_ref(),
+            &self.bf_base_url,
+            &self.bf_project_id,
+            epoch,
+            0,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("eligible roster: {e}")))?;
+        Ok(ctx.to_roster())
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {

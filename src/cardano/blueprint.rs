@@ -35,6 +35,14 @@ pub const SPOS_REGISTRY_TITLE: &str = "bitcoin/spos_registry.spo_registry.mint";
 /// Blueprint title of the treasury_info validator (mint + spend share one hash).
 pub const TREASURY_INFO_TITLE: &str = "bitcoin/treasury.treasury_info.mint";
 
+/// Blueprint title of the spo_bans validator (mint + spend + withdraw share
+/// one hash; its hash is the ban-list policy id).
+pub const SPO_BANS_TITLE: &str = "bitcoin/spo_bans.spo_bans.mint";
+
+/// Blueprint title of the fault_verifier minting policy (parameterless — its
+/// blueprint `hash` is final; FaultProof tokens are minted under it).
+pub const FAULT_VERIFIER_TITLE: &str = "bitcoin/fault_verifier.fault_verifier.mint";
+
 #[derive(Debug)]
 pub enum BlueprintError {
     /// The blueprint file is not valid JSON or lacks the expected structure.
@@ -178,6 +186,51 @@ pub fn treasury_info_script(
 ) -> Result<ParameterizedScript, BlueprintError> {
     let code = validator_compiled_code(blueprint_json, TREASURY_INFO_TITLE)?;
     apply_params(&code, &[bytes(registry_policy_id)])
+}
+
+/// The blueprint's own `hash` field of the validator titled `title` — final
+/// only for PARAMETERLESS validators (e.g. fault_verifier); a parameterized
+/// validator's blueprint hash is pre-application and meaningless.
+pub fn validator_hash(blueprint_json: &str, title: &str) -> Result<[u8; 28], BlueprintError> {
+    let bp: serde_json::Value = serde_json::from_str(blueprint_json)
+        .map_err(|e| BlueprintError::BadBlueprint(e.to_string()))?;
+    let validators = bp["validators"]
+        .as_array()
+        .ok_or_else(|| BlueprintError::BadBlueprint("no validators array".into()))?;
+    let validator = validators
+        .iter()
+        .find(|v| v["title"].as_str() == Some(title))
+        .ok_or_else(|| BlueprintError::ValidatorNotFound(title.into()))?;
+    let hash_hex = validator["hash"]
+        .as_str()
+        .ok_or_else(|| BlueprintError::BadBlueprint(format!("{title}: no hash")))?;
+    hex::decode(hash_hex)
+        .map_err(|e| BlueprintError::BadHex(e.to_string()))?
+        .try_into()
+        .map_err(|_| BlueprintError::BadBlueprint(format!("{title}: hash is not 28 bytes")))
+}
+
+/// `spo_bans` parameterized by the registry policy id (its
+/// `registration_script_hash`), the fault_verifier policy id, and its own
+/// one-shot bootstrap output ref. The resulting hash is the ban-list policy
+/// id; the enterprise address of the same hash holds the list elements.
+pub fn spo_bans_script(
+    blueprint_json: &str,
+    registry_policy_id: &[u8; 28],
+    fault_proof_policy_id: &[u8; 28],
+    bootstrap_tx_id: &[u8; 32],
+    bootstrap_output_index: u64,
+) -> Result<ParameterizedScript, BlueprintError> {
+    let code = validator_compiled_code(blueprint_json, SPO_BANS_TITLE)?;
+    apply_params(
+        &code,
+        &[
+            bytes(registry_policy_id),
+            bytes(fault_proof_policy_id),
+            bytes(bootstrap_tx_id),
+            int_from_u64(bootstrap_output_index),
+        ],
+    )
 }
 
 #[cfg(test)]

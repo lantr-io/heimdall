@@ -131,9 +131,10 @@ impl From<plutus::PlutusError> for RegistryError {
         match e {
             plutus::PlutusError::NotConstr => Self::NotConstr,
             plutus::PlutusError::WrongConstructor { got, .. } => Self::WrongConstructor(got),
-            plutus::PlutusError::MissingField(i) | plutus::PlutusError::NotBytes(i) => {
-                Self::NotBytes(i)
-            }
+            // NotInt is unreachable for this datum shape (no Int fields).
+            plutus::PlutusError::MissingField(i)
+            | plutus::PlutusError::NotBytes(i)
+            | plutus::PlutusError::NotInt(i) => Self::NotBytes(i),
         }
     }
 }

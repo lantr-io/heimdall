@@ -13,10 +13,11 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use frost_secp256k1_tr::Identifier;
+use frost_secp256k1_tr::keys::dkg::{round1, round2};
 
 use crate::epoch::state::{EpochResult, Roster, SpoInfo};
-use crate::http::payloads::{Dkg1Payload, Dkg2Payload, Sign1Payload, Sign2Payload};
+use crate::http::payloads::{Sign1Payload, Sign2Payload};
+use crate::http::wire::DkgNamespace;
 
 // ---------------------------------------------------------------------------
 // CardanoChain
@@ -85,8 +86,10 @@ pub trait CardanoChain: Send + Sync {
     /// min_stake` before building register_spo and before admitting the SPO to
     /// the DKG candidate set. `pool_id` is the bech32 pool id; see
     /// [`crate::cardano::stake`] for the threshold check.
-    async fn query_pool_stake(&self, pool_id: &str)
-    -> EpochResult<crate::cardano::stake::PoolStake>;
+    async fn query_pool_stake(
+        &self,
+        pool_id: &str,
+    ) -> EpochResult<crate::cardano::stake::PoolStake>;
 
     /// Publish the new FROST group key after DKG. The key becomes the
     /// internal key (Y_51) of the next treasury Taproot address.
@@ -117,24 +120,44 @@ pub trait CardanoChain: Send + Sync {
 /// All `publish_*` calls write to *this* SPO's local state — peers
 /// fetch from us; we never push. The `fetch_*` calls poll a specific
 /// peer's endpoint.
+///
+/// DKG payloads cross this boundary as plain FROST packages: the
+/// implementation is responsible for the spec wire format — building +
+/// BIP-340 signing on publish, and verifying (against the peer's
+/// `bifrost_id_pk`/`pool_id`) + decrypting on fetch — so callers never
+/// touch the canonical bytes or identity keys. A `fetch_*` that returns
+/// `Some` has already been authenticated; `None` means "not published
+/// yet". A payload that fails verification is dropped (and retained as
+/// fault evidence by the implementation), surfaced as `Ok(None)` so the
+/// poll loop keeps waiting rather than aborting the epoch.
 #[async_trait]
 pub trait PeerNetwork: Send + Sync {
-    async fn publish_dkg_round1(&self, payload: Dkg1Payload) -> EpochResult<()>;
-    async fn publish_dkg_round2(&self, payload: Dkg2Payload) -> EpochResult<()>;
+    async fn publish_dkg_round1(
+        &self,
+        ns: DkgNamespace,
+        package: &round1::Package,
+    ) -> EpochResult<()>;
+    /// Publish Round 2: one encrypted share per recipient. Each entry pairs
+    /// a recipient's `SpoInfo` (for its `pool_id` + `bifrost_id_pk`) with
+    /// the FROST package addressed to it.
+    async fn publish_dkg_round2(
+        &self,
+        ns: DkgNamespace,
+        recipients: &[(SpoInfo, round2::Package)],
+    ) -> EpochResult<()>;
     async fn publish_sign_round1(&self, payload: Sign1Payload) -> EpochResult<()>;
     async fn publish_sign_round2(&self, payload: Sign2Payload) -> EpochResult<()>;
 
     async fn fetch_dkg_round1(
         &self,
-        epoch: u64,
+        ns: DkgNamespace,
         peer: &SpoInfo,
-    ) -> EpochResult<Option<Dkg1Payload>>;
+    ) -> EpochResult<Option<round1::Package>>;
     async fn fetch_dkg_round2(
         &self,
-        epoch: u64,
+        ns: DkgNamespace,
         peer: &SpoInfo,
-        my_id: Identifier,
-    ) -> EpochResult<Option<Dkg2Payload>>;
+    ) -> EpochResult<Option<round2::Package>>;
     async fn fetch_sign_round1(
         &self,
         epoch: u64,

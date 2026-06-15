@@ -23,6 +23,12 @@ use crate::cardano::pegin_datum::ParsedPegIn;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpoInfo {
     pub identifier: Identifier,
+    /// 28-byte `blake2b_224(cold_vkey)` membership id — the spec `pool_id`.
+    /// Distinct from `identifier` (the 1..n DKG index): the spec URLs and
+    /// canonical-byte layouts are keyed by this, not the index. Empty only
+    /// in legacy fixtures predating WI-013.
+    #[serde(default)]
+    pub pool_id: Vec<u8>,
     pub bifrost_url: String,
     /// Reserved for BIP-340 payload authentication. Not enforced in v0.2.
     ///
@@ -401,6 +407,7 @@ mod tests {
             Identifier::try_from(1u16).unwrap(),
             SpoInfo {
                 identifier: Identifier::try_from(1u16).unwrap(),
+                pool_id: vec![],
                 bifrost_url: "http://localhost:18500".to_string(),
                 bifrost_id_pk: vec![],
             },

@@ -20,6 +20,7 @@ pub struct HeimdallConfig {
     pub cardano: CardanoConfig,
     pub http: HttpConfig,
     pub demo: DemoConfig,
+    pub bifrost: BifrostConfig,
 }
 
 impl Default for HeimdallConfig {
@@ -30,7 +31,27 @@ impl Default for HeimdallConfig {
             cardano: CardanoConfig::default(),
             http: HttpConfig::default(),
             demo: DemoConfig::default(),
+            bifrost: BifrostConfig::default(),
         }
+    }
+}
+
+// ── [bifrost] ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BifrostConfig {
+    /// Path to a `0600` file holding this SPO's 32-byte bifrost identity
+    /// secret key, hex-encoded. This is the long-lived secp256k1 key bound
+    /// on-chain at registration; the running process needs it to BIP-340
+    /// sign published DKG/signing payloads. Required for live participation;
+    /// `None` is fine for read-only / air-gapped-registration commands.
+    pub skey_path: Option<String>,
+}
+
+impl Default for BifrostConfig {
+    fn default() -> Self {
+        Self { skey_path: None }
     }
 }
 
@@ -162,6 +183,23 @@ pub struct CardanoConfig {
     /// The TM-control UTxO outpoint `<tx_hash>#<index>` to reference (carries the authorized-minter
     /// datum). Required alongside `tm_script_cbor`.
     pub tm_control_ref: Option<String>,
+    /// Path to the bifrost Aiken blueprint (plutus.json) holding the compiled
+    /// spos_registry + treasury_info validators. Together with
+    /// `registry_bootstrap` and `treasury_info_asset_name` this switches
+    /// `query_roster` from the demo fixture to the on-chain SPO registry.
+    pub registry_blueprint: Option<String>,
+    /// The spos_registry one-shot bootstrap outref `<tx_hash>:<index>` that
+    /// parameterizes the registry policy (and through it treasury_info).
+    pub registry_bootstrap: Option<String>,
+    /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
+    /// Identifies the `treasury_info` state UTxO whose
+    /// `bifrost_identity_root` the registry snapshot is verified against.
+    pub treasury_info_asset_name: Option<String>,
+    /// The spo_bans one-shot bootstrap outref `<tx_hash>:<index>` that
+    /// parameterizes the ban-list policy (the policy is also parameterized
+    /// by the registry policy, so `registry_blueprint` + `registry_bootstrap`
+    /// must be set alongside). Unset → the ban list is not read.
+    pub ban_bootstrap: Option<String>,
 }
 
 impl Default for CardanoConfig {
@@ -182,6 +220,10 @@ impl Default for CardanoConfig {
             oracle_constructor: 0,
             tm_script_cbor: None,
             tm_control_ref: None,
+            registry_blueprint: None,
+            registry_bootstrap: None,
+            treasury_info_asset_name: None,
+            ban_bootstrap: None,
         }
     }
 }
@@ -232,6 +274,21 @@ impl HeimdallConfig {
             .map_err(|e| ConfigError::Parse(path.display().to_string(), e))
     }
 
+    /// Load this SPO's bifrost identity keypair from `[bifrost].skey_path`.
+    /// Errors if the path is unset or (on unix) the key file is readable by
+    /// group/other.
+    pub fn load_bifrost_keypair(
+        &self,
+        secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    ) -> Result<bitcoin::secp256k1::Keypair, ConfigError> {
+        let path = self
+            .bifrost
+            .skey_path
+            .as_deref()
+            .ok_or(ConfigError::MissingBifrostKey)?;
+        load_bifrost_keypair_from(secp, std::path::Path::new(path))
+    }
+
     /// Build an `EpochConfig` from the merged configuration plus the
     /// per-instance identity.
     pub fn to_epoch_config(&self, identity: SpoIdentity) -> EpochConfig {
@@ -265,12 +322,45 @@ impl HeimdallConfig {
     }
 }
 
+/// Load a bifrost identity keypair from a `0600` hex key file.
+///
+/// On unix the file must not be group/other-accessible (any bit in `0o077`
+/// is rejected) — this is a long-lived signing secret. The file holds the
+/// 32-byte secret key as hex (whitespace trimmed).
+pub fn load_bifrost_keypair_from(
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    path: &std::path::Path,
+) -> Result<bitcoin::secp256k1::Keypair, ConfigError> {
+    let display = path.display().to_string();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).map_err(|e| ConfigError::Io(display.clone(), e))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(ConfigError::KeyPermsTooOpen { path: display, mode });
+        }
+    }
+    let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(display.clone(), e))?;
+    let bytes = hex::decode(contents.trim())
+        .map_err(|e| ConfigError::KeyParse(format!("{display}: not valid hex: {e}")))?;
+    let sk = bitcoin::secp256k1::SecretKey::from_slice(&bytes)
+        .map_err(|e| ConfigError::KeyParse(format!("{display}: {e}")))?;
+    Ok(bitcoin::secp256k1::Keypair::from_secret_key(secp, &sk))
+}
+
 // ── Errors ──────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub enum ConfigError {
     Io(String, std::io::Error),
     Parse(String, toml::de::Error),
+    /// `[bifrost].skey_path` was needed but not configured.
+    MissingBifrostKey,
+    /// The key file is readable by group/other (unix mode has `0o077` bits).
+    KeyPermsTooOpen { path: String, mode: u32 },
+    /// The key file's contents are not a valid 32-byte secp256k1 secret.
+    KeyParse(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -278,6 +368,14 @@ impl std::fmt::Display for ConfigError {
         match self {
             Self::Io(path, e) => write!(f, "reading config {path}: {e}"),
             Self::Parse(path, e) => write!(f, "parsing config {path}: {e}"),
+            Self::MissingBifrostKey => {
+                write!(f, "[bifrost].skey_path is required but not set")
+            }
+            Self::KeyPermsTooOpen { path, mode } => write!(
+                f,
+                "bifrost key file {path} has mode {mode:o}; must be 0600 (not group/other readable)"
+            ),
+            Self::KeyParse(s) => write!(f, "bifrost key: {s}"),
         }
     }
 }
@@ -361,5 +459,46 @@ fee_rate_sat_per_vb = 5
             epoch.pegin_refund_timeout_blocks,
             demo.pegin_refund_timeout_blocks
         );
+    }
+
+    #[test]
+    fn bifrost_keypair_loads_from_file() {
+        use std::io::Write;
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sk_hex = "0101010101010101010101010101010101010101010101010101010101010101";
+        let path = std::env::temp_dir().join("heimdall_test_bifrost_ok.hex");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(sk_hex.as_bytes())
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let kp = load_bifrost_keypair_from(&secp, &path).unwrap();
+        let expected = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&hex::decode(sk_hex).unwrap()).unwrap(),
+        );
+        assert_eq!(kp.x_only_public_key().0, expected.x_only_public_key().0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bifrost_keypair_rejects_group_readable_file() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let path = std::env::temp_dir().join("heimdall_test_bifrost_open.hex");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"0101010101010101010101010101010101010101010101010101010101010101")
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = load_bifrost_keypair_from(&secp, &path);
+        assert!(matches!(err, Err(ConfigError::KeyPermsTooOpen { .. })));
+        let _ = std::fs::remove_file(&path);
     }
 }

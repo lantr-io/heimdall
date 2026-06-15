@@ -10,14 +10,17 @@
 //! a one-line change at the demo entry point.
 
 pub mod always_ok;
+pub mod ban_list;
 pub mod bf_http;
 pub mod blockfrost_chain;
 pub mod blueprint;
 pub mod btc_rpc;
 pub mod blockfrost_source;
+pub mod dkg_roster;
 pub mod hash;
 pub mod mock;
 pub mod mpf;
+pub mod nft_scan;
 pub mod pallas_source;
 pub mod pegin_datum;
 pub mod pegin_source;
@@ -26,6 +29,8 @@ pub mod pegout_datum;
 pub mod publish;
 pub mod register_spo;
 pub mod registry;
+pub mod retry;
+pub mod roster;
 pub mod stake;
 pub mod treasury_bootstrap;
 pub mod treasury_datum;

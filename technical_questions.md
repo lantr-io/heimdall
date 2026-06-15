@@ -240,3 +240,123 @@ current_treasury_address, current_treasury_utxo_id, current_spos_frost_key)`
 — with replay protection (e.g. epoch binding or the spent outpoint in the
 signed message). Gates heimdall's K2 / `PublishKeys` (treasury handoff at
 epoch boundary); until then the group key set at K1 bootstrap is permanent.
+
+## 4. DKG Round 1 σ_i (proof-of-knowledge) byte layout: "challenge ‖ response" (spec) vs frost-native R_x‖μ
+
+`technical_documentation.md` §6.1 "Round 1 Payload" describes the
+proof-of-knowledge field as:
+
+> `sigma_i` is the Schnorr proof of knowledge (challenge ‖ response, 64 bytes).
+
+and appends `σ_i (64B)` to the **signed** canonical byte layout
+(`"bifrost-dkg-r1" || … || φ_{i(t-1)} (33B) || σ_i (64B)`).
+
+The FROST library heimdall uses (`frost-secp256k1-tr` 3.0.0-rc.0 over
+`frost-core` 3.0.0-rc.0) produces the PoK as RFC 9591 σ_i = (R_i, μ_i):
+`R_i = g^k` (a nonce commitment **point**), `μ_i = k + a_{i0}·c_i` (the response
+scalar), `c_i = H(i, Φ, φ_{i0}, R_i)`. Its public serialization
+(`Signature::serialize()` → the `-tr` BIP340 compact hook) is **x-only `R_i`
+(32B) ‖ `μ_i` (32B) = 64 bytes** — i.e. *commitment-point ‖ response*, not
+*challenge ‖ response*. The width is identical, so that is not the issue: the
+**first 32 bytes differ** — R's x-coordinate vs the challenge scalar `c_i`.
+
+This is not cosmetic. `σ_i` sits **inside** the BIP340-signed `canonical_bytes`
+for `bifrost-dkg-r1`, and it is the exact object the Round-1 invalid-PoK fault
+circuit checks (§9: "the circuit verifies that σ_i is not a valid Schnorr proof
+for φ_{i0}"). The layout must be byte-identical across the publisher, every
+verifying peer, and the on-chain / Plonk verifier, or both payload
+authentication and equivocation evidence break.
+
+No existing implementation pins it: the upstream offchain DKG is a placeholder
+(`offchain/spo-demo` uses `@noble/curves` schnorr only for identity/bootstrap),
+the Lean proofs are abstract (`opaque validSchnorrSig`), and heimdall's own
+circuits cover only the Round-2 Feldman-VSS fault (`src/circuits/commitment.rs`)
+and the signing-share fault (`src/circuits/signature.rs`) — **not** the Round-1
+PoK fault. Heimdall is effectively the first/reference implementer of DKG
+Round 1.
+
+**Proposed resolution (heimdall-ward, pending confirmation): σ_i = x-only R_i ‖
+μ_i** — the `frost-secp256k1-tr` `Signature::serialize()` output, used verbatim.
+Rationale: it is emitted losslessly by the library (no re-derivation); frost's
+verification is the RFC form `R_i ≟ g^{μ_i}·φ_{i0}^{−c_i}`, which needs `R_i`
+present in the payload — exactly what an on-chain Round-1 fault circuit will need
+too; and "challenge ‖ response" reads as loose wording for the `(R, μ)` proof.
+Whichever layout is chosen, `c_i` is computed with frost's domain-separated hash
+(the secp256k1-tr context string + `"dkg"` subdomain), so any on-chain Round-1
+fault circuit must replicate that exact hash regardless of the field order.
+
+**Question for FluidTokens:** confirm `σ_i = x-only R_i (32B) || μ_i (32B)` as
+serialized by `frost-secp256k1-tr` — or, if `challenge ‖ response` (`c_i || μ_i`)
+is intended, specify the exact challenge-hash domain separation so the canonical
+bytes and the Round-1 fault circuit agree. Tracked by WI-013 (parcel 1 pins the
+layout in the canonical-bytes builder); cheap either way, but must be fixed
+before WI-013 ships because σ_i is signature-covered and becomes on-chain
+evidence.
+
+**Resolved (2026-06-15): in-repo, frost-native `R_x ‖ μ` (Interpretation A).**
+Two independent implementations converged on it, so no FluidTokens confirmation
+is needed for the layout:
+
+- **Transport (WI-013, PR #4):** `http/frost_bridge.rs` ships
+  `proof_of_knowledge().serialize()` = x-only `R_i ‖ μ_i` verbatim.
+- **On-chain fault circuit (PR #3, `feat/dkg-fault-circuits`):** the Halo2 DKG
+  Round-1 PoK fault prover (`src/circuits/dkg_fault.rs`) reads σ_i the same way —
+  `package.proof_of_knowledge().serialize()`, taking `μ = bytes[32..64]` and
+  lifting `R = even_y(bytes[0..32])` — and recomputes the challenge via
+  `Secp256K1Sha256TR::HDKG(identifier ‖ φ_{i0} ‖ R)` (context
+  `FROST-secp256k1-SHA256-TR-v1` + label `dkg`). So the wire σ_i feeds the fault
+  prover with no conversion.
+
+The literal-spec `c_i ‖ μ_i` form was never implemented. Note also that PR #3
+**supersedes** the "heimdall's circuits don't cover the Round-1 PoK fault"
+statement above: it adds that circuit and removes the old dusk-plonk
+`src/circuits/{commitment,signature}.rs` + `src/gadgets/*`. (Separately, PR #3's
+`fault_token_name = blake2b_256(pool_id ‖ public_input)` diverges from the spec's
+`pool_id ‖ epoch_u32_be` that `spo_bans.ak` ApplyBan burns — tracked against
+WI-016/017, not WI-013; expanded in §5.)
+
+## 5. FaultProof token name + ban policy — resolved upstream (evidence-bound, evidence-hash dedup)
+
+**Resolved upstream (FluidTokens `main`).** The FaultProof token name and the
+`spo_bans.ak` recidivism model were already reworked in upstream
+`technical_documentation.md` to be **evidence-bound**, dropping the epoch — the
+same direction the Axiom/Halo2 fault circuits (lantr-io/heimdall **PR #3**)
+implement. This is settled, not an open question; heimdall (WI-016/017/018) must
+match it.
+
+Why the change: a proof of knowledge is mathematically invalid (or not)
+independent of which epoch the payload was published in, so **the epoch cannot be
+verified inside the Plutus/ZK circuit**. A plaintext `pool_id ‖ epoch` name would
+carry an unverifiable epoch; binding the name to the (verifiable) evidence is
+sound. (An earlier draft — still on the `feat/b1-confirm-tm-reference` fork
+branch — used `pool_id ‖ epoch_u32_be`; upstream `main` has superseded it.)
+
+Upstream `main` model (the `fault_verifier.ak` / `spo_bans.ak` sections):
+- **Token name** = `blake2b_256(pool_id ‖ evidence_hash)`, minted by *an
+  authorized fault-verifier policy* — plural, accommodating PR #3's separate
+  round1 / round2 / equivocation policies (split because each ZK verify is ~90%
+  of the ex-unit budget).
+- **Pool binding** by recompute: the ApplyBan redeemer carries `accused_pool_id`
+  + `evidence_hash`; `spo_bans.ak` recomputes the token name and checks the
+  authorized policy minted+burned exactly that token. No name-slicing.
+- **Dedup / recidivism** by evidence, not epoch: the ban node stores
+  `evidence_hashes :: List<ByteArray>`; a repeat ban is rejected if the
+  `evidence_hash` is already present. Each fault is punished once; escalation is
+  bounded by distinct genuine faults and a `permanent` cap at
+  `ban_counter >= max_faults_before_permanent`.
+- **Time-based bans** (epoch removed): `ban_until_time` (POSIX ms),
+  `base_ban_duration_ms * 2^(n−1)`, active iff `permanent || ban_until_time > T`
+  — all checkable against the tx validity interval.
+
+This is effectively the "Option A" (evidence-uniqueness dedup) we had scoped,
+plus a `permanent` cap and the multi-policy split — the `evidence_hashes` list
+also subsumes the anti-grief concern (the same evidence can't be re-applied, and
+escalation tops out at `permanent`). heimdall-side work to match it (FaultProof
+mint token name + datum, ApplyBan redeemer carrying `accused_pool_id` +
+`evidence_hash`, the `evidence_hashes` / `ban_until_time` transitions) is tracked
+as **WI-018** (updates WI-016, blocks WI-017). The σ_i encoding (§4) is
+unaffected.
+
+ACTION: rebase the `feat/b1-confirm-tm-reference` fork branch on upstream `main`
+so the fault/ban section isn't worked from a stale copy. No FluidTokens spec PR
+is needed — the change is already merged upstream.

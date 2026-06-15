@@ -25,15 +25,17 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use frost_secp256k1_tr::Identifier;
+use frost_secp256k1_tr::keys::dkg::{round1, round2};
 use tokio::sync::Notify;
 
-use crate::cardano::btc_rpc::{broadcast_btc_tx, BtcRpcConfig};
+use crate::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
 use crate::epoch::state::{EpochError, EpochResult, Roster, SpoInfo};
 use crate::epoch::traits::{
-    CardanoChain, Clock, CycleRng, EpochBoundaryEvent, PegOutRequestUtxo, PeerNetwork,
-    RngSource, TreasuryUtxo,
+    CardanoChain, Clock, CycleRng, EpochBoundaryEvent, PeerNetwork, PegOutRequestUtxo, RngSource,
+    TreasuryUtxo,
 };
-use crate::http::payloads::{Dkg1Payload, Dkg2Payload, Sign1Payload, Sign2Payload};
+use crate::http::payloads::{Sign1Payload, Sign2Payload};
+use crate::http::wire::DkgNamespace;
 
 // ---------------------------------------------------------------------------
 // Clocks
@@ -105,7 +107,7 @@ impl SeededRngSource {
 
 impl RngSource for SeededRngSource {
     fn rng(&self, context: &[u8]) -> CycleRng {
-        use bitcoin::hashes::{sha256, Hash, HashEngine};
+        use bitcoin::hashes::{Hash, HashEngine, sha256};
         use rand_core::SeedableRng;
         let mut eng = sha256::Hash::engine();
         eng.input(&self.seed);
@@ -265,8 +267,10 @@ impl CardanoChain for MockCardanoChain {
 /// via the `MockPeerHub`.
 #[derive(Debug, Default)]
 struct PeerSlot {
-    dkg1: Option<Dkg1Payload>,
-    dkg2: Option<Dkg2Payload>,
+    /// This SPO's Round 1 package + the namespace it was published under.
+    dkg1: Option<(DkgNamespace, round1::Package)>,
+    /// Round 2 shares this SPO published, keyed by recipient identifier.
+    dkg2: BTreeMap<Identifier, (DkgNamespace, round2::Package)>,
     sign1: BTreeMap<u32, Sign1Payload>,
     sign2: BTreeMap<u32, Sign2Payload>,
 }
@@ -305,14 +309,27 @@ fn with_slot<R>(hub: &MockPeerHub, id: Identifier, f: impl FnOnce(&mut PeerSlot)
 
 #[async_trait]
 impl PeerNetwork for MockPeerNetwork {
-    async fn publish_dkg_round1(&self, payload: Dkg1Payload) -> EpochResult<()> {
-        with_slot(&self.hub, self.me, |s| s.dkg1 = Some(payload));
+    async fn publish_dkg_round1(
+        &self,
+        ns: DkgNamespace,
+        package: &round1::Package,
+    ) -> EpochResult<()> {
+        let pkg = package.clone();
+        with_slot(&self.hub, self.me, |s| s.dkg1 = Some((ns, pkg)));
         self.hub.notify.notify_waiters();
         Ok(())
     }
 
-    async fn publish_dkg_round2(&self, payload: Dkg2Payload) -> EpochResult<()> {
-        with_slot(&self.hub, self.me, |s| s.dkg2 = Some(payload));
+    async fn publish_dkg_round2(
+        &self,
+        ns: DkgNamespace,
+        recipients: &[(SpoInfo, round2::Package)],
+    ) -> EpochResult<()> {
+        with_slot(&self.hub, self.me, |s| {
+            for (info, pkg) in recipients {
+                s.dkg2.insert(info.identifier, (ns, pkg.clone()));
+            }
+        });
         self.hub.notify.notify_waiters();
         Ok(())
     }
@@ -337,22 +354,28 @@ impl PeerNetwork for MockPeerNetwork {
 
     async fn fetch_dkg_round1(
         &self,
-        epoch: u64,
+        ns: DkgNamespace,
         peer: &SpoInfo,
-    ) -> EpochResult<Option<Dkg1Payload>> {
+    ) -> EpochResult<Option<round1::Package>> {
         Ok(with_slot(&self.hub, peer.identifier, |s| {
-            s.dkg1.as_ref().filter(|p| p.epoch == epoch).cloned()
+            s.dkg1
+                .as_ref()
+                .filter(|(slot_ns, _)| *slot_ns == ns)
+                .map(|(_, pkg)| pkg.clone())
         }))
     }
 
     async fn fetch_dkg_round2(
         &self,
-        epoch: u64,
+        ns: DkgNamespace,
         peer: &SpoInfo,
-        _my_id: Identifier,
-    ) -> EpochResult<Option<Dkg2Payload>> {
+    ) -> EpochResult<Option<round2::Package>> {
+        // Return the share `peer` addressed to us (self.me) in this namespace.
         Ok(with_slot(&self.hub, peer.identifier, |s| {
-            s.dkg2.as_ref().filter(|p| p.epoch == epoch).cloned()
+            s.dkg2
+                .get(&self.me)
+                .filter(|(slot_ns, _)| *slot_ns == ns)
+                .map(|(_, pkg)| pkg.clone())
         }))
     }
 
@@ -410,22 +433,25 @@ mod tests {
 
         let mut rng = rand::thread_rng();
         let (_, pkg) = participant::dkg_part1(id1, 3, 2, &mut rng).unwrap();
-        net1.publish_dkg_round1(Dkg1Payload {
-            epoch: 0,
-            identifier: id1,
-            package: pkg.clone(),
-        })
-        .await
-        .unwrap();
+        let ns = DkgNamespace::new(0);
+        net1.publish_dkg_round1(ns, &pkg).await.unwrap();
 
         let info1 = SpoInfo {
             identifier: id1,
+            pool_id: vec![],
             bifrost_url: String::new(),
             bifrost_id_pk: vec![],
         };
-        let fetched = net2.fetch_dkg_round1(0, &info1).await.unwrap().unwrap();
-        assert_eq!(fetched.identifier, id1);
-        assert_eq!(fetched.package, pkg);
+        let fetched = net2.fetch_dkg_round1(ns, &info1).await.unwrap().unwrap();
+        // The mock returns the package verbatim (no crypto in-process).
+        assert_eq!(fetched, pkg);
+        // A different namespace must not match.
+        assert!(
+            net2.fetch_dkg_round1(DkgNamespace::new(1), &info1)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

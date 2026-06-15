@@ -1,10 +1,6 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use frost_secp256k1_tr::Identifier;
-use heimdall::frost::participant;
-use heimdall::http::payloads::*;
-use heimdall::http::server::{AppState, SharedState, router};
+use heimdall::http::server::{AppState, DkgRoundKey, SharedState, router};
 use tokio::sync::RwLock;
 
 fn make_shared_state() -> SharedState {
@@ -33,82 +29,41 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
-async fn test_dkg1_not_found_then_found() {
+async fn test_dkg_spec_route_serves_stored_json() {
+    // The DKG server is a dumb blob store keyed by (epoch, threshold,
+    // attempt, round); the publisher signs the canonical bytes. Here we
+    // store a payload directly and check the spec URL scheme + pool_id gate.
+    let pool_hex = hex::encode([7u8; 28]);
     let state = make_shared_state();
-    let base = spawn_server(state.clone()).await;
-
-    // Not published yet -> 404
-    let resp = reqwest::get(format!("{base}/dkg/1/round1/1")).await.unwrap();
-    assert_eq!(resp.status(), 404);
-
-    // Publish DKG round 1 data
-    let mut rng = rand::thread_rng();
-    let id = Identifier::try_from(1u16).unwrap();
-    let (_, package) = participant::dkg_part1(id, 3, 2, &mut rng).unwrap();
-    let payload = Dkg1Payload {
-        epoch: 1,
-        identifier: id,
-        package,
-    };
     {
         let mut s = state.write().await;
-        s.dkg1.insert(1, payload.clone());
+        s.own_pool_id_hex = pool_hex.clone();
+        s.dkg.insert(
+            (1, 51, 0, DkgRoundKey::Round1),
+            r#"{"hello":"world"}"#.to_string(),
+        );
     }
+    let base = spawn_server(state).await;
 
-    // Now should return 200
-    let resp = reqwest::get(format!("{base}/dkg/1/round1/1")).await.unwrap();
+    // Correct spec path returns the stored JSON verbatim.
+    let resp = reqwest::get(format!("{base}/dkg/1/51/0/round1/{pool_hex}.json"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
-    let back: Dkg1Payload = resp.json().await.unwrap();
-    assert_eq!(back.epoch, payload.epoch);
-    assert_eq!(back.identifier, payload.identifier);
-    assert_eq!(back.package, payload.package);
-}
+    assert_eq!(resp.text().await.unwrap(), r#"{"hello":"world"}"#);
 
-#[tokio::test]
-async fn test_dkg2_not_found_then_found() {
-    let state = make_shared_state();
-    let base = spawn_server(state.clone()).await;
-
-    let resp = reqwest::get(format!("{base}/dkg/1/round2/1")).await.unwrap();
+    // A pool_id that is not ours -> 404.
+    let other = hex::encode([9u8; 28]);
+    let resp = reqwest::get(format!("{base}/dkg/1/51/0/round1/{other}.json"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 
-    // Generate real DKG round 2 data
-    let mut rng = rand::thread_rng();
-    let ids: Vec<Identifier> = (1..=3u16)
-        .map(|i| Identifier::try_from(i).unwrap())
-        .collect();
-    let mut round1_secrets = BTreeMap::new();
-    let mut round1_packages = BTreeMap::new();
-    for &id in &ids {
-        let (secret, package) = participant::dkg_part1(id, 3, 2, &mut rng).unwrap();
-        round1_secrets.insert(id, secret);
-        round1_packages.insert(id, package);
-    }
-    let id = ids[0];
-    let others: BTreeMap<_, _> = round1_packages
-        .iter()
-        .filter(|&(&k, _)| k != id)
-        .map(|(&k, v)| (k, v.clone()))
-        .collect();
-    let (_, packages2) =
-        participant::dkg_part2(round1_secrets.remove(&id).unwrap(), &others).unwrap();
-
-    let payload = Dkg2Payload {
-        epoch: 1,
-        identifier: id,
-        packages: packages2,
-    };
-    {
-        let mut s = state.write().await;
-        s.dkg2.insert(1, payload.clone());
-    }
-
-    let resp = reqwest::get(format!("{base}/dkg/1/round2/1")).await.unwrap();
-    assert_eq!(resp.status(), 200);
-    let back: Dkg2Payload = resp.json().await.unwrap();
-    assert_eq!(back.epoch, 1);
-    assert_eq!(back.identifier, id);
-    assert_eq!(back.packages, payload.packages);
+    // A round that was never published -> 404.
+    let resp = reqwest::get(format!("{base}/dkg/1/51/0/round2/{pool_hex}.json"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
 }
 
 #[tokio::test]
@@ -116,9 +71,13 @@ async fn test_sign_endpoints_404_when_empty() {
     let state = make_shared_state();
     let base = spawn_server(state).await;
 
-    let resp = reqwest::get(format!("{base}/sign/0/round1/0/1")).await.unwrap();
+    let resp = reqwest::get(format!("{base}/sign/0/round1/0/1"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 
-    let resp = reqwest::get(format!("{base}/sign/0/round2/0/1")).await.unwrap();
+    let resp = reqwest::get(format!("{base}/sign/0/round2/0/1"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 }
