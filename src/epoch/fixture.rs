@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use bitcoin::hashes::Hash;
 use bitcoin::key::{Secp256k1, UntweakedPublicKey};
-use bitcoin::secp256k1::SecretKey;
+use bitcoin::secp256k1::{Keypair, SecretKey};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
 use frost_secp256k1_tr::Identifier;
 
@@ -38,6 +38,11 @@ pub struct StaticFixture {
     pub pegouts: Vec<StaticPegOut>,
     pub fee_rate_sat_per_vb: u64,
     pub per_pegout_fee: Amount,
+    /// Per-SPO bifrost identity keypairs, so the HTTP demo can construct
+    /// each `HttpPeerNetwork` with the secret matching the `bifrost_id_pk`
+    /// in `roster`. Empty for the config-driven fixture (real deployments
+    /// load each node's key from its own `[bifrost].skey_path`).
+    pub bifrost_keypairs: BTreeMap<Identifier, Keypair>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,26 +59,30 @@ pub struct StaticPegOut {
 
 /// Build a demo fixture with `max_signers` SPOs, `min_signers` threshold,
 /// listening on `base_port .. base_port + max_signers - 1`.
-pub fn demo_static_fixture(
-    min_signers: u16,
-    max_signers: u16,
-    base_port: u16,
-) -> StaticFixture {
+pub fn demo_static_fixture(min_signers: u16, max_signers: u16, base_port: u16) -> StaticFixture {
     let secp = Secp256k1::new();
 
     let mut participants = BTreeMap::new();
+    let mut bifrost_keypairs = BTreeMap::new();
     for i in 1..=max_signers {
         let id = Identifier::try_from(i).unwrap();
         let port = base_port + (i - 1);
+        // Deterministic per-SPO bifrost identity: secret = [0x11..,i], so the
+        // roster's bifrost_id_pk matches the keypair each HttpPeerNetwork holds.
+        let mut seed = [0x11u8; 32];
+        seed[31] = i as u8;
+        let keypair = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&seed).unwrap());
+        let bifrost_id_pk = keypair.x_only_public_key().0.serialize().to_vec();
         participants.insert(
             id,
             SpoInfo {
                 identifier: id,
-                pool_id: vec![],
+                pool_id: vec![i as u8; 28],
                 bifrost_url: format!("http://127.0.0.1:{port}"),
-                bifrost_id_pk: vec![],
+                bifrost_id_pk,
             },
         );
+        bifrost_keypairs.insert(id, keypair);
     }
     let roster = Roster {
         epoch: 0,
@@ -106,6 +115,7 @@ pub fn demo_static_fixture(
         pegouts: vec![],
         fee_rate_sat_per_vb: 1,
         per_pegout_fee: Amount::from_sat(1_000),
+        bifrost_keypairs,
     }
 }
 
@@ -158,7 +168,10 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
                 .bitcoin
                 .treasury_txid
                 .as_deref()
-                .map(|s| s.parse::<Txid>().expect("bitcoin.treasury_txid must be a valid txid"))
+                .map(|s| {
+                    s.parse::<Txid>()
+                        .expect("bitcoin.treasury_txid must be a valid txid")
+                })
                 .unwrap_or_else(|| Txid::from_byte_array([0xAA; 32]));
             OutPoint {
                 txid,
@@ -170,5 +183,8 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
         pegouts: vec![],
         fee_rate_sat_per_vb: cfg.bitcoin.fee_rate_sat_per_vb,
         per_pegout_fee: Amount::from_sat(cfg.bitcoin.per_pegout_fee_sat),
+        // The config-driven `run` path loads each node's key from its own
+        // [bifrost].skey_path, not from the fixture.
+        bifrost_keypairs: BTreeMap::new(),
     }
 }

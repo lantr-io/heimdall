@@ -38,7 +38,13 @@ const TAG_R2: &[u8] = b"bifrost-dkg-r2";
 
 /// `epoch || threshold || attempt || pool_id` — the namespace header
 /// shared by both round layouts (each integer 8-byte big-endian).
-fn push_header(out: &mut Vec<u8>, epoch: u64, threshold: u64, attempt: u64, pool_id: &[u8; POOL_ID_LEN]) {
+fn push_header(
+    out: &mut Vec<u8>,
+    epoch: u64,
+    threshold: u64,
+    attempt: u64,
+    pool_id: &[u8; POOL_ID_LEN],
+) {
     out.extend_from_slice(&epoch.to_be_bytes());
     out.extend_from_slice(&threshold.to_be_bytes());
     out.extend_from_slice(&attempt.to_be_bytes());
@@ -86,10 +92,9 @@ pub fn round2(
     shares: &[ShareEntry],
 ) -> Vec<u8> {
     let mut sorted: Vec<&ShareEntry> = shares.iter().collect();
-    sorted.sort_by(|a, b| a.recipient_pool_id.cmp(&b.recipient_pool_id));
+    sorted.sort_by_key(|e| e.recipient_pool_id);
     let entry_len = POOL_ID_LEN + POINT_LEN + SHARE_LEN;
-    let mut out =
-        Vec::with_capacity(TAG_R2.len() + 24 + POOL_ID_LEN + sorted.len() * entry_len);
+    let mut out = Vec::with_capacity(TAG_R2.len() + 24 + POOL_ID_LEN + sorted.len() * entry_len);
     out.extend_from_slice(TAG_R2);
     push_header(&mut out, epoch, threshold, attempt, pool_id);
     for s in sorted {
@@ -123,7 +128,10 @@ mod tests {
         // epoch big-endian right after the tag
         assert_eq!(&bytes[TAG_LEN..TAG_LEN + 8], &42u64.to_be_bytes());
         // threshold == 51
-        assert_eq!(&bytes[TAG_LEN + 8..TAG_LEN + 16], &THRESHOLD_51.to_be_bytes());
+        assert_eq!(
+            &bytes[TAG_LEN + 8..TAG_LEN + 16],
+            &THRESHOLD_51.to_be_bytes()
+        );
         // σ_i is the final 64 bytes
         assert_eq!(&bytes[bytes.len() - SIG_LEN..], &sigma);
     }
@@ -131,9 +139,21 @@ mod tests {
     #[test]
     fn round2_length_and_sorted() {
         let shares = vec![
-            ShareEntry { recipient_pool_id: pid(3), ephemeral_pk: [1; POINT_LEN], ciphertext: [1; SHARE_LEN] },
-            ShareEntry { recipient_pool_id: pid(1), ephemeral_pk: [2; POINT_LEN], ciphertext: [2; SHARE_LEN] },
-            ShareEntry { recipient_pool_id: pid(2), ephemeral_pk: [3; POINT_LEN], ciphertext: [3; SHARE_LEN] },
+            ShareEntry {
+                recipient_pool_id: pid(3),
+                ephemeral_pk: [1; POINT_LEN],
+                ciphertext: [1; SHARE_LEN],
+            },
+            ShareEntry {
+                recipient_pool_id: pid(1),
+                ephemeral_pk: [2; POINT_LEN],
+                ciphertext: [2; SHARE_LEN],
+            },
+            ShareEntry {
+                recipient_pool_id: pid(2),
+                ephemeral_pk: [3; POINT_LEN],
+                ciphertext: [3; SHARE_LEN],
+            },
         ];
         let bytes = round2(7, THRESHOLD_51, 1, &pid(9), &shares);
         let entry_len = POOL_ID_LEN + POINT_LEN + SHARE_LEN;
@@ -149,8 +169,16 @@ mod tests {
 
     #[test]
     fn round2_independent_of_input_order() {
-        let a = ShareEntry { recipient_pool_id: pid(1), ephemeral_pk: [2; POINT_LEN], ciphertext: [2; SHARE_LEN] };
-        let b = ShareEntry { recipient_pool_id: pid(2), ephemeral_pk: [3; POINT_LEN], ciphertext: [3; SHARE_LEN] };
+        let a = ShareEntry {
+            recipient_pool_id: pid(1),
+            ephemeral_pk: [2; POINT_LEN],
+            ciphertext: [2; SHARE_LEN],
+        };
+        let b = ShareEntry {
+            recipient_pool_id: pid(2),
+            ephemeral_pk: [3; POINT_LEN],
+            ciphertext: [3; SHARE_LEN],
+        };
         let forward = round2(1, THRESHOLD_51, 0, &pid(0), &[a.clone(), b.clone()]);
         let reversed = round2(1, THRESHOLD_51, 0, &pid(0), &[b, a]);
         assert_eq!(forward, reversed);

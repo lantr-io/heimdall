@@ -3,16 +3,17 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use frost_secp256k1_tr as frost;
 use frost::Identifier;
+use frost_secp256k1_tr as frost;
 
 use crate::epoch::log::{id_short, short_hex};
+use crate::epoch::state::SpoInfo;
 use crate::epoch::state::{
     DkgCollected, DkgRound, EpochConfig, EpochError, EpochPhase, EpochResult, GroupKeys, Roster,
 };
 use crate::epoch::traits::{Clock, PeerNetwork, RngSource};
 use crate::frost::participant;
-use crate::http::payloads::{Dkg1Payload, Dkg2Payload};
+use crate::http::wire::DkgNamespace;
 
 /// Drive one DKG sub-round and produce the next phase.
 ///
@@ -23,7 +24,7 @@ use crate::http::payloads::{Dkg1Payload, Dkg2Payload};
 /// In the real world, we're supposed to slash the misbehaving SPO via a
 /// FROST-signed membership exit, restart DKG with the reduced
 /// candidate set, and submit a PLONK proof of misbehavior to
-/// the Cardano slashing contract. 
+/// the Cardano slashing contract.
 pub async fn dkg_phase(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
@@ -38,37 +39,32 @@ pub async fn dkg_phase(
     match round {
         DkgRound::Round1 => {
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "DKG round1: generating secret polynomial and commitments \
                  (n={}, t={})",
-                roster.max_signers, roster.min_signers
-            );
-            
-            let mut dkg_rng = rng.rng(b"dkg1");
-            let (secret, package) = participant::dkg_part1(
-                me,
                 roster.max_signers,
-                roster.min_signers,
-                &mut dkg_rng,
-            )
-            .map_err(|e| EpochError::Frost(format!("dkg_part1: {e}")))?;
+                roster.min_signers
+            );
+
+            let mut dkg_rng = rng.rng(b"dkg1");
+            let (secret, package) =
+                participant::dkg_part1(me, roster.max_signers, roster.min_signers, &mut dkg_rng)
+                    .map_err(|e| EpochError::Frost(format!("dkg_part1: {e}")))?;
 
             let pkg_bytes = package
                 .serialize()
                 .map_err(|e| EpochError::Frost(format!("round1 pkg serialize: {e}")))?;
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "  -> round1 package built ({} bytes): {}",
                 pkg_bytes.len(),
                 short_hex(&pkg_bytes, 16)
             );
 
             peers
-                .publish_dkg_round1(Dkg1Payload {
-                    epoch,
-                    identifier: me,
-                    package: package.clone(),
-                })
+                .publish_dkg_round1(DkgNamespace::new(epoch), &package)
                 .await?;
             crate::epoch_log!(me, epoch, "  -> round1 package published to local server");
 
@@ -78,7 +74,8 @@ pub async fn dkg_phase(
             // Poll peers until we have everyone's round 1 package.
             let peer_infos = roster.peers_of(me);
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "  waiting for round1 packages from {} peer(s)...",
                 peer_infos.len()
             );
@@ -93,7 +90,8 @@ pub async fn dkg_phase(
             )
             .await?;
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "  <- have all {} round1 packages, advancing to round2",
                 collected.round1_peers.len()
             );
@@ -108,7 +106,8 @@ pub async fn dkg_phase(
 
         DkgRound::Round2 => {
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "DKG round2: computing per-peer secret shares from round1 packages"
             );
 
@@ -128,24 +127,41 @@ pub async fn dkg_phase(
             let (round2_secret, round2_packages) = participant::dkg_part2(secret, &peer_round1)
                 .map_err(|e| EpochError::Frost(format!("dkg_part2: {e}")))?;
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "  -> built {} encrypted shares (one per peer)",
                 round2_packages.len()
             );
             for peer_id in round2_packages.keys() {
                 crate::epoch_log!(
-                    me, epoch,
+                    me,
+                    epoch,
                     "     - share addressed to spo={}",
                     id_short(*peer_id)
                 );
             }
 
-            peers
-                .publish_dkg_round2(Dkg2Payload {
-                    epoch,
-                    identifier: me,
-                    packages: round2_packages,
+            // Pair each share with its recipient's SpoInfo so the transport
+            // can encrypt under that peer's bifrost_id_pk and address it by
+            // pool_id.
+            let recipients: Vec<(SpoInfo, _)> = round2_packages
+                .into_iter()
+                .map(|(rid, pkg)| {
+                    roster
+                        .participants
+                        .get(&rid)
+                        .cloned()
+                        .map(|info| (info, pkg))
+                        .ok_or_else(|| {
+                            EpochError::Transition(format!(
+                                "round2 recipient {} not in roster",
+                                id_short(rid)
+                            ))
+                        })
                 })
+                .collect::<Result<_, _>>()?;
+            peers
+                .publish_dkg_round2(DkgNamespace::new(epoch), &recipients)
                 .await?;
             crate::epoch_log!(me, epoch, "  -> round2 packages published");
 
@@ -153,7 +169,8 @@ pub async fn dkg_phase(
 
             let peer_infos = roster.peers_of(me);
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "  waiting for round2 shares addressed to me from {} peer(s)...",
                 peer_infos.len()
             );
@@ -168,7 +185,8 @@ pub async fn dkg_phase(
             )
             .await?;
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "  <- have all {} round2 shares, advancing to part3",
                 collected.round2_peers.len()
             );
@@ -183,7 +201,8 @@ pub async fn dkg_phase(
 
         DkgRound::Part3 => {
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "DKG part3: combining shares into final KeyPackage + group key"
             );
 
@@ -207,12 +226,14 @@ pub async fn dkg_phase(
                 .serialize()
                 .map_err(|e| EpochError::Frost(format!("verifying_key serialize: {e}")))?;
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "  -> group verifying key (Y_51) = {}",
                 hex::encode(&vk_bytes)
             );
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "  -> my signing share is bound to spo={}, threshold {}",
                 id_short(*key_package.identifier()),
                 key_package.min_signers()
@@ -249,15 +270,19 @@ async fn poll_dkg_round1(
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            if let Some(payload) = peers.fetch_dkg_round1(epoch, peer).await? {
+            if let Some(pkg) = peers
+                .fetch_dkg_round1(DkgNamespace::new(epoch), peer)
+                .await?
+            {
                 crate::epoch_log!(
-                    me, epoch,
+                    me,
+                    epoch,
                     "     received round1 package from spo={} ({}/{})",
-                    id_short(payload.identifier),
+                    id_short(peer.identifier),
                     out.len() + 1,
                     need
                 );
-                out.insert(payload.identifier, payload.package);
+                out.insert(peer.identifier, pkg);
             }
         }
         if out.len() >= need {
@@ -318,8 +343,16 @@ mod tests {
         };
         loop {
             phase = match phase {
-                EpochPhase::Dkg { epoch, round, roster, collected } => {
-                    dkg_phase(&peers, &clock, &rng, &config, epoch, round, roster, collected).await?
+                EpochPhase::Dkg {
+                    epoch,
+                    round,
+                    roster,
+                    collected,
+                } => {
+                    dkg_phase(
+                        &peers, &clock, &rng, &config, epoch, round, roster, collected,
+                    )
+                    .await?
                 }
                 EpochPhase::PublishKeys { group_keys, .. } => return Ok(group_keys),
                 other => panic!("unexpected phase: {}", other.name()),
@@ -338,7 +371,10 @@ mod tests {
             let id = Identifier::try_from(i).unwrap();
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock = clock.clone();
-            let config = EpochConfig::demo_default(SpoIdentity { identifier: id, port: 0 });
+            let config = EpochConfig::demo_default(SpoIdentity {
+                identifier: id,
+                port: 0,
+            });
             let roster = roster.clone();
             handles.push(tokio::spawn(async move {
                 drive_dkg(peers, clock, config, roster).await
@@ -364,7 +400,10 @@ mod tests {
         let id = Identifier::try_from(1u16).unwrap();
         let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let mut config = EpochConfig::demo_default(SpoIdentity { identifier: id, port: 0 });
+        let mut config = EpochConfig::demo_default(SpoIdentity {
+            identifier: id,
+            port: 0,
+        });
         config.dkg_round_timeout = Duration::from_millis(150);
         config.poll_interval = Duration::from_millis(20);
 
@@ -393,18 +432,19 @@ async fn poll_dkg_round2(
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            if let Some(payload) = peers.fetch_dkg_round2(epoch, peer, me).await? {
-                // FIXME: `payload.packages` is plaintext — see Dkg2Payload.
-                if let Some(pkg) = payload.packages.get(&me) {
-                    crate::epoch_log!(
-                        me, epoch,
-                        "     received round2 share from spo={} ({}/{})",
-                        id_short(payload.identifier),
-                        out.len() + 1,
-                        need
-                    );
-                    out.insert(payload.identifier, pkg.clone());
-                }
+            if let Some(pkg) = peers
+                .fetch_dkg_round2(DkgNamespace::new(epoch), peer)
+                .await?
+            {
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "     received round2 share from spo={} ({}/{})",
+                    id_short(peer.identifier),
+                    out.len() + 1,
+                    need
+                );
+                out.insert(peer.identifier, pkg);
             }
         }
         if out.len() >= need {

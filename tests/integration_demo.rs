@@ -30,10 +30,28 @@ async fn full_cycle_3_spos_over_http() {
     let fixture = demo_static_fixture(min_signers, max_signers, base_port);
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-    // Build per-SPO HTTP layer + spawn the axum server.
+    // Build per-SPO HTTP layer + spawn the axum server. Each SPO gets the
+    // bifrost keypair + 28-byte pool_id from the fixture, matching the
+    // bifrost_id_pk published in the shared roster, so signed payloads
+    // verify across instances.
     let mut nets: Vec<Arc<HttpPeerNetwork>> = Vec::with_capacity(max_signers as usize);
     for i in 0..max_signers {
-        let net = Arc::new(HttpPeerNetwork::new());
+        let id = Identifier::try_from(i + 1).unwrap();
+        let keypair = *fixture.bifrost_keypairs.get(&id).unwrap();
+        let pool_id: [u8; 28] = fixture
+            .roster
+            .participants
+            .get(&id)
+            .unwrap()
+            .pool_id
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let net = Arc::new(HttpPeerNetwork::new(
+            bitcoin::secp256k1::Secp256k1::new(),
+            keypair,
+            pool_id,
+        ));
         let port = base_port + i;
         let app = router(net.shared_state());
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
@@ -53,10 +71,8 @@ async fn full_cycle_3_spos_over_http() {
     for (i, net) in nets.into_iter().enumerate() {
         let id = Identifier::try_from((i as u16) + 1).unwrap();
         let port = base_port + i as u16;
-        let chain: Arc<dyn CardanoChain> =
-            Arc::new(MockCardanoChain::new(fixture.clone()));
-        let pegin_source: Arc<dyn CardanoPegInSource> =
-            Arc::new(MockCardanoPegInSource::new());
+        let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+        let pegin_source: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
         let clock = clock.clone();
         let peers: Arc<dyn PeerNetwork> = net;
         let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
@@ -87,8 +103,16 @@ async fn full_cycle_3_spos_over_http() {
     // sighash).
     let tm = &tms[0];
     for (i, txin) in tm.unsigned_tx.input.iter().enumerate() {
-        assert_eq!(txin.witness.len(), 1, "input {i} witness should have 1 element");
+        assert_eq!(
+            txin.witness.len(),
+            1,
+            "input {i} witness should have 1 element"
+        );
         let elem = txin.witness.iter().next().unwrap();
-        assert_eq!(elem.len(), 64, "input {i} witness should be 64-byte schnorr sig");
+        assert_eq!(
+            elem.len(),
+            64,
+            "input {i} witness should be 64-byte schnorr sig"
+        );
     }
 }

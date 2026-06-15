@@ -13,7 +13,7 @@ use frost_secp256k1_tr::keys::dkg::{round1, round2};
 use serde::{Deserialize, Serialize};
 
 use super::auth::{self, AuthError};
-use super::canonical::{self, ShareEntry, POINT_LEN, POOL_ID_LEN, SHARE_LEN, SIG_LEN};
+use super::canonical::{self, POINT_LEN, POOL_ID_LEN, SHARE_LEN, SIG_LEN, ShareEntry};
 use super::frost_bridge::{self, BridgeError};
 
 #[derive(Debug)]
@@ -55,6 +55,39 @@ fn hex_n<const N: usize>(s: &str, what: &str) -> Result<[u8; N], WireError> {
     bytes
         .try_into()
         .map_err(|v: Vec<u8>| WireError::Field(format!("{what}: got {} bytes, want {N}", v.len())))
+}
+
+/// Convert a roster-held `pool_id` (`Vec<u8>`) to the fixed 28-byte array
+/// the canonical-bytes/URL helpers require.
+pub fn pool_id_array(pool_id: &[u8]) -> Result<[u8; POOL_ID_LEN], WireError> {
+    pool_id.try_into().map_err(|_| {
+        WireError::Field(format!(
+            "pool_id is {} bytes, want {POOL_ID_LEN}",
+            pool_id.len()
+        ))
+    })
+}
+
+/// The `(epoch, threshold, attempt)` namespace every DKG payload is bound
+/// to, both in its URL path and inside its signed canonical bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DkgNamespace {
+    pub epoch: u64,
+    pub threshold: u64,
+    pub attempt: u64,
+}
+
+impl DkgNamespace {
+    /// The normal namespace for `epoch`: the constant threshold label 51
+    /// (the >51%-stake DKG) and attempt 0. Attempt only advances on an
+    /// exceptional cryptographic-fault rerun (WI-014), not here.
+    pub fn new(epoch: u64) -> Self {
+        Self {
+            epoch,
+            threshold: canonical::THRESHOLD_51,
+            attempt: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -113,8 +146,14 @@ pub fn verify_round1(
     let sigma_i = hex_n::<SIG_LEN>(&wire.sigma_i, "sigma_i")?;
     let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
 
-    let canonical_bytes =
-        canonical::round1(epoch, threshold, attempt, peer_pool_id, &commitment, &sigma_i);
+    let canonical_bytes = canonical::round1(
+        epoch,
+        threshold,
+        attempt,
+        peer_pool_id,
+        &commitment,
+        &sigma_i,
+    );
     auth::verify_payload(secp, peer_bifrost_id_pk, &canonical_bytes, &signature)?;
 
     Ok(frost_bridge::round1_from_fields(&commitment, &sigma_i)?)
@@ -151,6 +190,7 @@ pub struct Round2Recipient<'a> {
 /// Build and sign this SPO's Round 2 payload: encrypt each recipient's
 /// share under a fresh ephemeral key, order by `recipient_pool_id`, sign
 /// the canonical bytes.
+#[allow(clippy::too_many_arguments)]
 pub fn build_round2<R: Rng + CryptoRng>(
     secp: &Secp256k1<All>,
     keypair: &Keypair,
@@ -174,7 +214,7 @@ pub fn build_round2<R: Rng + CryptoRng>(
         });
     }
     // Canonical ordering by recipient_pool_id; the JSON follows the same order.
-    entries.sort_by(|a, b| a.recipient_pool_id.cmp(&b.recipient_pool_id));
+    entries.sort_by_key(|e| e.recipient_pool_id);
 
     let canonical_bytes = canonical::round2(epoch, threshold, attempt, my_pool_id, &entries);
     let signature = auth::sign_payload(secp, keypair, &canonical_bytes);
@@ -234,9 +274,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use bitcoin::secp256k1::rand::rngs::OsRng;
-    use frost_secp256k1_tr as frost;
-    use frost::keys::dkg;
     use frost::Identifier;
+    use frost::keys::dkg;
+    use frost_secp256k1_tr as frost;
 
     fn id(n: u16) -> Identifier {
         Identifier::try_from(n).unwrap()
@@ -299,13 +339,28 @@ mod tests {
             bifrost_id_pk: &x2,
             package: pkg_for_2,
         }];
-        let wire =
-            build_round2(&secp, &kp1, 9, canonical::THRESHOLD_51, 0, &pool1, &recipients, &mut OsRng)
-                .unwrap();
+        let wire = build_round2(
+            &secp,
+            &kp1,
+            9,
+            canonical::THRESHOLD_51,
+            0,
+            &pool1,
+            &recipients,
+            &mut OsRng,
+        )
+        .unwrap();
 
         let parsed = verify_round2(
-            &secp, &pool1, &keypair_xonly(&secp, &kp1), &pool2, &sk2, 9,
-            canonical::THRESHOLD_51, 0, &wire,
+            &secp,
+            &pool1,
+            &keypair_xonly(&secp, &kp1),
+            &pool2,
+            &sk2,
+            9,
+            canonical::THRESHOLD_51,
+            0,
+            &wire,
         )
         .unwrap();
         assert_eq!(&parsed, pkg_for_2);
@@ -333,9 +388,17 @@ mod tests {
             bifrost_id_pk: &x2,
             package: pkgs.get(&id(2)).unwrap(),
         }];
-        let mut wire =
-            build_round2(&secp, &kp1, 9, canonical::THRESHOLD_51, 0, &pool1, &recipients, &mut OsRng)
-                .unwrap();
+        let mut wire = build_round2(
+            &secp,
+            &kp1,
+            9,
+            canonical::THRESHOLD_51,
+            0,
+            &pool1,
+            &recipients,
+            &mut OsRng,
+        )
+        .unwrap();
 
         // Flip a byte in the ciphertext: signature no longer matches canonical bytes.
         let mut ct = hex::decode(&wire.shares[0].ciphertext).unwrap();
@@ -343,8 +406,15 @@ mod tests {
         wire.shares[0].ciphertext = hex::encode(ct);
 
         let err = verify_round2(
-            &secp, &pool1, &kp1.x_only_public_key().0.serialize(), &pool2, &sk2, 9,
-            canonical::THRESHOLD_51, 0, &wire,
+            &secp,
+            &pool1,
+            &kp1.x_only_public_key().0.serialize(),
+            &pool2,
+            &sk2,
+            9,
+            canonical::THRESHOLD_51,
+            0,
+            &wire,
         );
         assert!(matches!(err, Err(WireError::Auth(_))));
     }

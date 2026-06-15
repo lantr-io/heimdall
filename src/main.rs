@@ -778,7 +778,18 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
         .unwrap_or_else(|| panic!("identifier {index} not in roster"));
     let port = port_from_url(&me.bifrost_url).unwrap_or_else(|e| panic!("{e}"));
 
-    let net = Arc::new(HttpPeerNetwork::new());
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let keypair = cfg
+        .load_bifrost_keypair(&secp)
+        .unwrap_or_else(|e| panic!("bifrost identity key required for the HTTP transport: {e}"));
+    let my_pool_id: [u8; 28] = me.pool_id.as_slice().try_into().unwrap_or_else(|_| {
+        panic!(
+            "this node's roster entry has no 28-byte pool_id (got {} bytes) — the \
+             authenticated DKG transport needs a registered on-chain roster",
+            me.pool_id.len()
+        )
+    });
+    let net = Arc::new(HttpPeerNetwork::new(secp, keypair, my_pool_id));
     let app = router(net.shared_state());
     let bind_addr = &cfg.http.bind_address;
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
