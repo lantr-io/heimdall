@@ -17,9 +17,10 @@
 //!   existing node and reproduce it with updated [`BanNodeData`] (same asset
 //!   name + link), and mint NO ban-policy token.
 //!
-//! This module currently provides the byte-exact redeemer encoders and the
-//! script reward-address helper the (forthcoming) tx builder sits on. The
-//! on-chain shapes (confirmed against the compiled `spo_bans` blueprint schema):
+//! This module currently provides the byte-exact redeemer encoders the
+//! (forthcoming) tx builder sits on. The ApplyBan withdrawal is keyed by the
+//! `spo_bans` reward address — see [`crate::cardano::blueprint::ParameterizedScript::reward_address`].
+//! The on-chain shapes (confirmed against the compiled `spo_bans` blueprint schema):
 //!
 //! ```text
 //! SpoBansWithdrawRedeemer = ApplyBan Constr(0, [ fault_input_index, registration_ref_input_index,
@@ -35,12 +36,9 @@
 //!
 //! The FaultProof burn uses [`super::fault_proof::burn_proof_redeemer`].
 
-use pallas_addresses::{
-    Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart, StakeAddress,
-};
 use pallas_primitives::PlutusData;
 
-use crate::cardano::plutus::{bytes, constr, int};
+use crate::cardano::plutus::{bytes, constr, int, option};
 
 // ---------------------------------------------------------------------------
 // Redeemer encoders
@@ -50,10 +48,7 @@ use crate::cardano::plutus::{bytes, constr, int};
 /// (the standard Aiken `Option` encoding).
 #[must_use]
 pub fn option_int(v: Option<i64>) -> PlutusData {
-    match v {
-        Some(i) => constr(0, vec![int(i)]),
-        None => constr(1, vec![]),
-    }
+    option(v.map(int))
 }
 
 /// `SpoBansWithdrawRedeemer::ApplyBan` — constructor 0, the 8 fields in the
@@ -104,43 +99,10 @@ pub fn ban_list_action_redeemer(withdraw_redeemer_index: i64) -> PlutusData {
     constr(0, vec![int(withdraw_redeemer_index)])
 }
 
-// ---------------------------------------------------------------------------
-// Script reward (stake) address
-// ---------------------------------------------------------------------------
-
-/// The bech32 reward address (`stake_test1…` / `stake1…`) of a script stake
-/// credential — the key for the ApplyBan withdrawal. The reward account bytes
-/// are a header byte (`0xF0` script+testnet / `0xF1` script+mainnet) followed
-/// by the 28-byte script hash; we build it via a Shelley address whose
-/// *delegation* part is the script hash (`StakeAddress` is derived from that).
-///
-/// Takes `mainnet: bool` rather than a `Network` so only the two valid networks
-/// are representable: both the `StakeAddress` conversion and `to_bech32` are
-/// then total (a `Network::Other(_)` would make the HRP encoding fail).
-#[must_use]
-pub fn script_reward_address(script_hash: &[u8; 28], mainnet: bool) -> String {
-    let network = if mainnet {
-        Network::Mainnet
-    } else {
-        Network::Testnet
-    };
-    let shelley = ShelleyAddress::new(
-        network,
-        // Payment part is unused by the StakeAddress derivation; reuse the hash.
-        ShelleyPaymentPart::script_hash((*script_hash).into()),
-        ShelleyDelegationPart::script_hash((*script_hash).into()),
-    );
-    StakeAddress::try_from(shelley)
-        .expect("a script delegation part always yields a StakeAddress")
-        .to_bech32()
-        .expect("bech32 of a mainnet/testnet stake address is total")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cardano::plutus::{self, as_constr};
-    use pallas_addresses::{Address, StakePayload};
     use pallas_codec::minicbor;
 
     #[test]
@@ -191,37 +153,6 @@ mod tests {
             let cbor = minicbor::to_vec(&pd).unwrap();
             let back: PlutusData = minicbor::decode(&cbor).unwrap();
             assert_eq!(back, pd);
-        }
-    }
-
-    #[test]
-    fn reward_address_is_script_keyed_and_network_tagged() {
-        let h = [0xABu8; 28];
-        let addr = script_reward_address(&h, false);
-        assert!(addr.starts_with("stake_test1"), "{addr}");
-        // Round-trip: it decodes to a script stake credential with our hash,
-        // and the reward-account header byte is 0xF0 (script + testnet).
-        let testnet_header = reward_account_header(&addr);
-        match Address::from_bech32(&addr).unwrap() {
-            Address::Stake(s) => match s.payload() {
-                StakePayload::Script(hash) => assert_eq!(hash.as_slice(), h),
-                StakePayload::Stake(_) => panic!("expected a SCRIPT stake payload"),
-            },
-            other => panic!("expected a stake address, got {other:?}"),
-        }
-        assert_eq!(testnet_header, 0xF0);
-        // Mainnet flips the network bit → 0xF1.
-        let main = script_reward_address(&h, true);
-        assert!(main.starts_with("stake1"), "{main}");
-        assert_eq!(reward_account_header(&main), 0xF1);
-    }
-
-    /// First byte of the reward account (header) decoded from a bech32 reward
-    /// address, via the generic `Address` (StakeAddress has no `from_bech32`).
-    fn reward_account_header(bech32: &str) -> u8 {
-        match Address::from_bech32(bech32).unwrap() {
-            Address::Stake(s) => s.to_vec()[0],
-            other => panic!("expected a stake address, got {other:?}"),
         }
     }
 }

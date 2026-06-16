@@ -73,6 +73,17 @@ pub fn bool_data(b: bool) -> PlutusData {
     constr(u64::from(b), vec![])
 }
 
+/// Aiken `Option`: `Some(x) = Constr(0, [x])`, `None = Constr(1, [])`. Pass the
+/// already-encoded inner datum. Centralizes the Some/None ctor-tag convention
+/// (previously open-coded at each list `link` / optional-field site).
+#[must_use]
+pub fn option(inner: Option<PlutusData>) -> PlutusData {
+    match inner {
+        Some(pd) => constr(0, vec![pd]),
+        None => constr(1, vec![]),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Decoding
 // ---------------------------------------------------------------------------

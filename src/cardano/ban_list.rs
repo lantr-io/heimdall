@@ -335,10 +335,7 @@ impl BanElement {
                 )],
             ),
         };
-        let link = match &self.link {
-            Some(k) => constr(0, vec![bytes(k)]),
-            None => constr(1, vec![]),
-        };
+        let link = plutus::option(self.link.as_deref().map(bytes));
         constr(0, vec![data, link])
     }
 

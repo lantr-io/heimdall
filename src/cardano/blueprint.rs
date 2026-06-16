@@ -20,7 +20,7 @@
 //! [`crate::cardano::treasury_bootstrap`]) can exist.
 
 use pallas_addresses::{
-    Address, Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
+    Address, Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart, StakeAddress,
 };
 use pallas_codec::minicbor;
 use pallas_crypto::hash::Hasher;
@@ -102,6 +102,32 @@ impl ParameterizedScript {
         Address::Shelley(shelley)
             .to_bech32()
             .expect("bech32 encode script address")
+    }
+
+    /// The bech32 reward (stake) address (`stake_test1…` / `stake1…`) of this
+    /// script's hash used as a stake credential — e.g. the key for a
+    /// withdraw-validator's zero-amount reward withdrawal (the ApplyBan action
+    /// on `spo_bans`). Sibling of [`Self::enterprise_address`]; both derive an
+    /// address from the script hash. Takes `mainnet: bool` (not `Network`) so
+    /// only the two valid networks are representable and the bech32 encoding is
+    /// total.
+    #[must_use]
+    pub fn reward_address(&self, mainnet: bool) -> String {
+        let network = if mainnet {
+            Network::Mainnet
+        } else {
+            Network::Testnet
+        };
+        let shelley = ShelleyAddress::new(
+            network,
+            // Payment part is unused by the StakeAddress derivation; reuse the hash.
+            ShelleyPaymentPart::script_hash(self.hash.into()),
+            ShelleyDelegationPart::script_hash(self.hash.into()),
+        );
+        StakeAddress::try_from(shelley)
+            .expect("a script delegation part always yields a StakeAddress")
+            .to_bech32()
+            .expect("bech32 of a mainnet/testnet stake address is total")
     }
 }
 
@@ -396,6 +422,36 @@ mod tests {
         .unwrap();
         let addr = applied.enterprise_address(Network::Mainnet);
         assert!(addr.starts_with("addr1w"), "mainnet script address: {addr}");
+    }
+
+    // reward_address: the script hash as a stake credential — the key for a
+    // withdraw validator's reward withdrawal (ApplyBan on spo_bans).
+    #[test]
+    fn reward_address_is_script_keyed_and_network_tagged() {
+        use pallas_addresses::StakePayload;
+        let script = ParameterizedScript {
+            cbor: vec![],
+            hash: [0xAB; 28],
+        };
+        let testnet = script.reward_address(false);
+        assert!(testnet.starts_with("stake_test1"), "{testnet}");
+        // Decodes to a SCRIPT stake credential carrying our hash.
+        match Address::from_bech32(&testnet).unwrap() {
+            Address::Stake(s) => match s.payload() {
+                StakePayload::Script(h) => assert_eq!(h.as_slice(), script.hash),
+                StakePayload::Stake(_) => panic!("expected a SCRIPT stake payload"),
+            },
+            other => panic!("expected a stake address, got {other:?}"),
+        }
+        // Reward-account header byte: 0xF0 script+testnet, 0xF1 script+mainnet.
+        let header = |b: &str| match Address::from_bech32(b).unwrap() {
+            Address::Stake(s) => s.to_vec()[0],
+            other => panic!("expected a stake address, got {other:?}"),
+        };
+        assert_eq!(header(&testnet), 0xF0);
+        let mainnet = script.reward_address(true);
+        assert!(mainnet.starts_with("stake1"), "{mainnet}");
+        assert_eq!(header(&mainnet), 0xF1);
     }
 
     // Valid hex that is not a CBOR-wrapped UPLC program must come back as a
