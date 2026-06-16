@@ -7,8 +7,10 @@
 //! **extended** ed25519 key (64 bytes), as used by all Cardano HD
 //! wallets.
 
-use pallas_addresses::{Address, Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
-use pallas_wallet::{hd::Bip32PrivateKey, PrivateKey};
+use pallas_addresses::{
+    Address, Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
+};
+use pallas_wallet::{PrivateKey, hd::Bip32PrivateKey};
 
 use crate::cardano::hash::blake2b_224;
 
@@ -24,9 +26,9 @@ pub fn derive_payment_key(mnemonic: &str) -> Result<PrivateKey, String> {
     let key = root
         .derive(HARDENED | 1852) // purpose
         .derive(HARDENED | 1815) // coin_type (ADA)
-        .derive(HARDENED | 0)    // account #0
-        .derive(0)               // external chain
-        .derive(0)               // address index #0
+        .derive(HARDENED | 0) // account #0
+        .derive(0) // external chain
+        .derive(0) // address index #0
         .to_ed25519_private_key();
     Ok(key)
 }
@@ -100,8 +102,7 @@ mod tests {
 
     // Standard BIP-39 test vector mnemonic. Same input must produce
     // the same address every time.
-    const TEST_MNEMONIC: &str =
-        "abandon abandon abandon abandon abandon abandon \
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon about";
 
     #[test]

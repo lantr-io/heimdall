@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use frost_secp256k1_tr as frost;
 use frost::{Identifier, keys::dkg};
+use frost_secp256k1_tr as frost;
 use rayon::prelude::*;
 
 /// Result of a completed DKG for one participant.
@@ -22,7 +22,9 @@ fn run_part1(
     BTreeMap<Identifier, dkg::round1::SecretPackage>,
     BTreeMap<Identifier, dkg::round1::Package>,
 ) {
-    println!("    part1: each SPO generates a random polynomial and publishes commitments + proof-of-knowledge");
+    println!(
+        "    part1: each SPO generates a random polynomial and publishes commitments + proof-of-knowledge"
+    );
     let t0 = Instant::now();
     let results: Vec<_> = identifiers
         .par_iter()
@@ -64,7 +66,9 @@ fn run_part1(
     }
     println!(
         "    part1: {}/{} done ({:.2?}) [parallel]",
-        max_signers, max_signers, t0.elapsed()
+        max_signers,
+        max_signers,
+        t0.elapsed()
     );
     (secrets, packages)
 }
@@ -80,7 +84,9 @@ fn run_part2(
     BTreeMap<Identifier, dkg::round2::SecretPackage>,
     BTreeMap<Identifier, BTreeMap<Identifier, dkg::round2::Package>>,
 ) {
-    println!("    part2: each SPO evaluates their polynomial at every other SPO's index and sends encrypted secret shares");
+    println!(
+        "    part2: each SPO evaluates their polynomial at every other SPO's index and sends encrypted secret shares"
+    );
     let t1 = Instant::now();
 
     // Pre-extract secrets into a vec so we can consume them in parallel
@@ -118,10 +124,7 @@ fn run_part2(
         round2_secrets.insert(id, secret2);
         round2_packages.insert(id, packages2);
     }
-    println!(
-        "    part2: done ({:.2?}) [parallel]",
-        t1.elapsed()
-    );
+    println!("    part2: done ({:.2?}) [parallel]", t1.elapsed());
     (round2_secrets, round2_packages)
 }
 
@@ -143,7 +146,9 @@ pub fn run_dkg_all_completions(min_signers: u16, max_signers: u16) -> FullDkgRes
         run_part2(&identifiers, round1_secrets, &round1_packages, max_signers);
 
     // Part 3: parallel for all participants
-    println!("    part3: each SPO verifies all received shares against published commitments (Feldman VSS), derives combined signing share and group public key");
+    println!(
+        "    part3: each SPO verifies all received shares against published commitments (Feldman VSS), derives combined signing share and group public key"
+    );
     let t2 = Instant::now();
     let n = max_signers as usize;
     let counter = AtomicUsize::new(0);

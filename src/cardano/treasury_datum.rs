@@ -66,10 +66,13 @@ pub fn treasury_from_btc_tx_bytes(
     btc_confirmed: bool,
     config: &TreasuryConfig,
 ) -> Result<TreasuryUtxo, TreasuryDatumError> {
-    let tx: Transaction = deserialize(tx_bytes)
-        .map_err(|e| TreasuryDatumError::BtcDeserialize(e.to_string()))?;
+    let tx: Transaction =
+        deserialize(tx_bytes).map_err(|e| TreasuryDatumError::BtcDeserialize(e.to_string()))?;
 
-    let out = tx.output.first().ok_or(TreasuryDatumError::NoTreasuryOutput)?;
+    let out = tx
+        .output
+        .first()
+        .ok_or(TreasuryDatumError::NoTreasuryOutput)?;
     let txid = tx.compute_txid();
 
     Ok(TreasuryUtxo {
@@ -125,10 +128,13 @@ pub fn parse_treasury_datum(
     config: &TreasuryConfig,
 ) -> Result<TreasuryUtxo, TreasuryDatumError> {
     let (tx_bytes, btc_confirmed) = extract_btc_tx_bytes(data)?;
-    let tx: Transaction = deserialize(&tx_bytes)
-        .map_err(|e| TreasuryDatumError::BtcDeserialize(e.to_string()))?;
+    let tx: Transaction =
+        deserialize(&tx_bytes).map_err(|e| TreasuryDatumError::BtcDeserialize(e.to_string()))?;
 
-    let out = tx.output.first().ok_or(TreasuryDatumError::NoTreasuryOutput)?;
+    let out = tx
+        .output
+        .first()
+        .ok_or(TreasuryDatumError::NoTreasuryOutput)?;
     let txid = tx.compute_txid();
 
     Ok(TreasuryUtxo {
@@ -193,9 +199,9 @@ mod tests {
         let datum = PlutusData::Constr(Constr {
             tag: 121,
             any_constructor: None,
-            fields: MaybeIndefArray::Def(vec![PlutusData::BoundedBytes(
-                BoundedBytes::from(tx_bytes),
-            )]),
+            fields: MaybeIndefArray::Def(vec![PlutusData::BoundedBytes(BoundedBytes::from(
+                tx_bytes,
+            ))]),
         });
 
         let cbor = pallas_codec::minicbor::to_vec(&datum).unwrap();

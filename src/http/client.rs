@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use frost_secp256k1_tr as frost;
 use frost::Identifier;
+use frost_secp256k1_tr as frost;
 
 use super::payloads::*;
 

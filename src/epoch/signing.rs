@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use frost_secp256k1_tr as frost;
 use frost::Identifier;
+use frost_secp256k1_tr as frost;
 
 use crate::epoch::log::id_short;
 use crate::epoch::state::{
@@ -54,7 +54,8 @@ pub async fn sign_phase(
     match round {
         SigningRound::Round1 => {
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "Sign round1: generating nonce commitments for {} input(s)",
                 num_inputs
             );
@@ -79,24 +80,26 @@ pub async fn sign_phase(
                         commitments,
                     })
                     .await?;
-                crate::epoch_log!(
-                    me, epoch,
-                    "  -> published commitments for input {i}"
-                );
+                crate::epoch_log!(me, epoch, "  -> published commitments for input {i}");
             }
 
             // Poll peers for round 1 commitments on every input.
             let peer_infos = roster.peers_of(me);
             for i in 0..num_inputs as u32 {
                 crate::epoch_log!(
-                    me, epoch,
+                    me,
+                    epoch,
                     "  waiting for round1 commitments on input {i} from {} peer(s)...",
                     peer_infos.len()
                 );
                 let map = collected.round1.entry(i).or_default();
                 poll_sign_round1(peers, clock, config, epoch, me, i, &peer_infos, map).await?;
             }
-            crate::epoch_log!(me, epoch, "  <- have all round1 commitments, advancing to round2");
+            crate::epoch_log!(
+                me,
+                epoch,
+                "  <- have all round1 commitments, advancing to round2"
+            );
 
             Ok(EpochPhase::Sign {
                 epoch,
@@ -111,7 +114,8 @@ pub async fn sign_phase(
 
         SigningRound::Round2 => {
             crate::epoch_log!(
-                me, epoch,
+                me,
+                epoch,
                 "Sign round2: computing tweaked signature shares for {} input(s)",
                 num_inputs
             );
@@ -126,17 +130,17 @@ pub async fn sign_phase(
                         EpochError::Transition(format!("missing round1 commitments for input {i}"))
                     })?
                     .clone();
-                let nonces = collected
-                    .nonces
-                    .get(&i)
-                    .ok_or_else(|| EpochError::Transition(format!("missing nonces for input {i}")))?;
+                let nonces = collected.nonces.get(&i).ok_or_else(|| {
+                    EpochError::Transition(format!("missing nonces for input {i}"))
+                })?;
 
                 let sighash = tm.sighashes[i as usize];
                 let signing_package = frost::SigningPackage::new(commitments, &sighash);
                 let merkle = tm.merkle_root_bytes(i as usize);
                 let merkle_ref = merkle.as_deref();
                 crate::epoch_log!(
-                    me, epoch,
+                    me,
+                    epoch,
                     "  input {i}: sighash={} merkle_root={}",
                     hex::encode(sighash),
                     merkle_ref
@@ -169,7 +173,8 @@ pub async fn sign_phase(
                 // Poll peers.
                 let peer_infos = roster.peers_of(me);
                 crate::epoch_log!(
-                    me, epoch,
+                    me,
+                    epoch,
                     "    waiting for round2 shares on input {i} from {} peer(s)...",
                     peer_infos.len()
                 );
@@ -188,7 +193,8 @@ pub async fn sign_phase(
                     .serialize()
                     .map_err(|e| EpochError::Frost(format!("sig serialize: {e}")))?;
                 crate::epoch_log!(
-                    me, epoch,
+                    me,
+                    epoch,
                     "    <- aggregated input {i} signature: {}",
                     hex::encode(&sig_bytes)
                 );
@@ -231,7 +237,8 @@ async fn poll_sign_round1(
             }
             if let Some(payload) = peers.fetch_sign_round1(epoch, peer, input_index).await? {
                 crate::epoch_log!(
-                    me, epoch,
+                    me,
+                    epoch,
                     "     received round1 commitments for input {input_index} from spo={} ({}/{})",
                     id_short(payload.identifier),
                     out.len() + 1,
@@ -273,7 +280,8 @@ async fn poll_sign_round2(
             }
             if let Some(payload) = peers.fetch_sign_round2(epoch, peer, input_index).await? {
                 crate::epoch_log!(
-                    me, epoch,
+                    me,
+                    epoch,
                     "     received round2 share for input {input_index} from spo={} ({}/{})",
                     id_short(payload.identifier),
                     out.len() + 1,
@@ -301,7 +309,7 @@ mod tests {
     use super::*;
     use crate::bitcoin::taproot::treasury_spend_info;
     use crate::bitcoin::tm_builder::{
-        build_tm, compute_sighashes, FeeParams, PegInInput, PegOutRequest, TreasuryInput,
+        FeeParams, PegInInput, PegOutRequest, TreasuryInput, build_tm, compute_sighashes,
     };
     use crate::epoch::dkg::dkg_phase;
     use crate::epoch::mocks::{MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock};
@@ -354,9 +362,11 @@ mod tests {
                     round,
                     roster,
                     collected,
-                } => dkg_phase(&peers, &clock, &rng, &config, epoch, round, roster, collected)
-                    .await
-                    .unwrap(),
+                } => dkg_phase(
+                    &peers, &clock, &rng, &config, epoch, round, roster, collected,
+                )
+                .await
+                .unwrap(),
                 EpochPhase::PublishKeys { group_keys, .. } => return group_keys,
                 other => panic!("unexpected: {}", other.name()),
             };
@@ -494,17 +504,8 @@ mod tests {
                             round,
                             collected,
                         } => sign_phase(
-                            &peers,
-                            &clock,
-                            &rng,
-                            &config,
-                            epoch,
-                            roster,
-                            cascade,
-                            group_keys,
-                            tm,
-                            round,
-                            collected,
+                            &peers, &clock, &rng, &config, epoch, roster, cascade, group_keys, tm,
+                            round, collected,
                         )
                         .await
                         .unwrap(),

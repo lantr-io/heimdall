@@ -58,8 +58,8 @@ impl WalletUtxo {
             .find(|a| a.unit == "lovelace")
             .map(|a| a.quantity.parse().unwrap_or(0))
             .unwrap_or(0);
-        let pure_ada = u.amount.iter().all(|a| a.unit == "lovelace")
-            && u.reference_script_hash.is_none();
+        let pure_ada =
+            u.amount.iter().all(|a| a.unit == "lovelace") && u.reference_script_hash.is_none();
         WalletUtxo {
             tx_hash: u.tx_hash.clone(),
             output_index: u.output_index,

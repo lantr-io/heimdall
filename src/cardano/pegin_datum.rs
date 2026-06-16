@@ -190,8 +190,8 @@ pub fn parse_pegin_request(
     let btc_tx_bytes = extract_raw_btc_tx(&plutus)?;
 
     // 2. Deserialize the referenced BTC tx.
-    let btc_tx: Transaction = deserialize(&btc_tx_bytes)
-        .map_err(|e| ParseError::InvalidBtcTx(e.to_string()))?;
+    let btc_tx: Transaction =
+        deserialize(&btc_tx_bytes).map_err(|e| ParseError::InvalidBtcTx(e.to_string()))?;
     let btc_txid = btc_tx.compute_txid();
 
     // 3. Recover the depositor x-only pubkey from the OP_RETURN beacon.
@@ -241,7 +241,7 @@ mod tests {
     use bitcoin::opcodes::all::OP_RETURN;
     use bitcoin::secp256k1::{Keypair, SecretKey};
     use bitcoin::{
-        absolute, script, transaction, Amount, OutPoint, Sequence, TxIn, TxOut, Witness,
+        Amount, OutPoint, Sequence, TxIn, TxOut, Witness, absolute, script, transaction,
     };
     use pallas_primitives::conway::Constr;
     use pallas_primitives::{BigInt, BoundedBytes, MaybeIndefArray};
@@ -416,7 +416,10 @@ mod tests {
     #[test]
     fn datum_raw_garbage() {
         let req = make_request(vec![0xFF, 0xFF, 0xFF]);
-        assert!(matches!(parse(&req).unwrap_err(), ParseError::BadDatumShape(_)));
+        assert!(matches!(
+            parse(&req).unwrap_err(),
+            ParseError::BadDatumShape(_)
+        ));
     }
 
     #[test]
@@ -437,7 +440,10 @@ mod tests {
         });
         let bytes = pallas_codec::minicbor::to_vec(&datum).unwrap();
         let req = make_request(bytes);
-        assert!(matches!(parse(&req).unwrap_err(), ParseError::BadDatumShape(_)));
+        assert!(matches!(
+            parse(&req).unwrap_err(),
+            ParseError::BadDatumShape(_)
+        ));
     }
 
     #[test]
@@ -454,7 +460,10 @@ mod tests {
         });
         let bytes = pallas_codec::minicbor::to_vec(&datum).unwrap();
         let req = make_request(bytes);
-        assert!(matches!(parse(&req).unwrap_err(), ParseError::BadDatumShape(_)));
+        assert!(matches!(
+            parse(&req).unwrap_err(),
+            ParseError::BadDatumShape(_)
+        ));
     }
 
     #[test]
@@ -475,7 +484,10 @@ mod tests {
         });
         let bytes = pallas_codec::minicbor::to_vec(&datum).unwrap();
         let req = make_request(bytes);
-        assert!(matches!(parse(&req).unwrap_err(), ParseError::BadDatumShape(_)));
+        assert!(matches!(
+            parse(&req).unwrap_err(),
+            ParseError::BadDatumShape(_)
+        ));
     }
 
     // ------ BTC tx parsing failures -------------------------------------
@@ -484,7 +496,10 @@ mod tests {
     fn btc_tx_garbage() {
         // Valid datum, but field[1] is not a valid BTC tx.
         let req = make_request(build_datum_bytes(vec![0xFF, 0xFF, 0xFF]));
-        assert!(matches!(parse(&req).unwrap_err(), ParseError::InvalidBtcTx(_)));
+        assert!(matches!(
+            parse(&req).unwrap_err(),
+            ParseError::InvalidBtcTx(_)
+        ));
     }
 
     // ------ Beacon failures ---------------------------------------------
@@ -565,7 +580,10 @@ mod tests {
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
-        assert!(matches!(parse(&req).unwrap_err(), ParseError::AmbiguousBeacon));
+        assert!(matches!(
+            parse(&req).unwrap_err(),
+            ParseError::AmbiguousBeacon
+        ));
     }
 
     // ------ Taproot-match failures --------------------------------------
@@ -586,7 +604,10 @@ mod tests {
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
-        assert!(matches!(parse(&req).unwrap_err(), ParseError::NoPegInOutput));
+        assert!(matches!(
+            parse(&req).unwrap_err(),
+            ParseError::NoPegInOutput
+        ));
     }
 
     #[test]
@@ -597,7 +618,10 @@ mod tests {
             script_pubkey: beacon_spk(xonly),
         }]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
-        assert!(matches!(parse(&req).unwrap_err(), ParseError::NoPegInOutput));
+        assert!(matches!(
+            parse(&req).unwrap_err(),
+            ParseError::NoPegInOutput
+        ));
     }
 
     #[test]
@@ -623,7 +647,10 @@ mod tests {
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
-        assert!(matches!(parse(&req).unwrap_err(), ParseError::NoPegInOutput));
+        assert!(matches!(
+            parse(&req).unwrap_err(),
+            ParseError::NoPegInOutput
+        ));
     }
 
     #[test]
@@ -645,7 +672,10 @@ mod tests {
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
-        assert!(matches!(parse(&req).unwrap_err(), ParseError::AmbiguousPegInOutput));
+        assert!(matches!(
+            parse(&req).unwrap_err(),
+            ParseError::AmbiguousPegInOutput
+        ));
     }
 
     #[test]
@@ -674,7 +704,10 @@ mod tests {
             script_pubkey: beacon_spk(invalid_xonly),
         }]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
-        assert!(matches!(parse(&req).unwrap_err(), ParseError::InvalidBeaconXonly(_)));
+        assert!(matches!(
+            parse(&req).unwrap_err(),
+            ParseError::InvalidBeaconXonly(_)
+        ));
     }
 
     // ------ Raw beacon parser tests -------------------------------------
@@ -692,6 +725,9 @@ mod tests {
             value: Amount::from_sat(100),
             script_pubkey: ScriptBuf::new(),
         }]);
-        assert!(matches!(parse_beacon(&tx).unwrap_err(), ParseError::NoBeacon));
+        assert!(matches!(
+            parse_beacon(&tx).unwrap_err(),
+            ParseError::NoBeacon
+        ));
     }
 }

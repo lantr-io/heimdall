@@ -62,7 +62,8 @@ fn test_3_of_3_dkg_per_participant() {
     let group_key = pubkey_packages[0].verifying_key();
     for pkg in &pubkey_packages[1..] {
         assert_eq!(
-            group_key, pkg.verifying_key(),
+            group_key,
+            pkg.verifying_key(),
             "all participants must derive the same group public key"
         );
     }
@@ -74,10 +75,7 @@ fn test_3_of_3_dkg_per_participant() {
         .collect();
     for i in 0..shares.len() {
         for j in (i + 1)..shares.len() {
-            assert_ne!(
-                shares[i], shares[j],
-                "signing shares must be distinct"
-            );
+            assert_ne!(shares[i], shares[j], "signing shares must be distinct");
         }
     }
 
@@ -147,7 +145,10 @@ fn test_2_of_3_dkg_per_participant() {
     }
 
     // Different shares
-    let shares: Vec<_> = key_packages.values().map(|kp| kp.signing_share().clone()).collect();
+    let shares: Vec<_> = key_packages
+        .values()
+        .map(|kp| kp.signing_share().clone())
+        .collect();
     assert_ne!(shares[0], shares[1]);
     assert_ne!(shares[1], shares[2]);
 }

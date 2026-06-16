@@ -19,10 +19,10 @@
 //! have an even Y, so dropping the parity byte in the x-only encoding
 //! never loses information.
 
-use frost_secp256k1_tr as frost;
+use frost::Signature;
 use frost::keys::dkg::{round1, round2};
 use frost::keys::{SigningShare, VerifiableSecretSharingCommitment};
-use frost::Signature;
+use frost_secp256k1_tr as frost;
 
 use super::canonical::{POINT_LEN, SHARE_LEN, SIG_LEN};
 
@@ -57,7 +57,8 @@ impl From<frost::Error> for BridgeError {
 }
 
 fn to_point(v: Vec<u8>) -> Result<[u8; POINT_LEN], BridgeError> {
-    v.try_into().map_err(|v: Vec<u8>| BridgeError::BadPointLen(v.len()))
+    v.try_into()
+        .map_err(|v: Vec<u8>| BridgeError::BadPointLen(v.len()))
 }
 
 /// Decompose a Round 1 package into the spec fields: the commitment
@@ -112,8 +113,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use frost::keys::dkg;
     use frost::Identifier;
+    use frost::keys::dkg;
 
     fn id(n: u16) -> Identifier {
         Identifier::try_from(n).unwrap()
@@ -127,7 +128,10 @@ mod tests {
         // t = min_signers = 2 commitment points, each 33 bytes; σ_i 64 bytes.
         assert_eq!(commitment.len(), 2);
         let rebuilt = round1_from_fields(&commitment, &sigma_i).unwrap();
-        assert_eq!(rebuilt, pkg, "round1 package must survive the wire round-trip");
+        assert_eq!(
+            rebuilt, pkg,
+            "round1 package must survive the wire round-trip"
+        );
     }
 
     #[test]
@@ -144,6 +148,9 @@ mod tests {
         let pkg_for_2 = packages.get(&id(2)).expect("a package addressed to peer 2");
         let share = round2_share_bytes(pkg_for_2).unwrap();
         let rebuilt = round2_from_share(&share).unwrap();
-        assert_eq!(&rebuilt, pkg_for_2, "round2 package must survive the share round-trip");
+        assert_eq!(
+            &rebuilt, pkg_for_2,
+            "round2 package must survive the share round-trip"
+        );
     }
 }

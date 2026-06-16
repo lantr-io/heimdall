@@ -230,8 +230,14 @@ pub struct Neighbor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProofStep {
     /// `neighbors` is 128 bytes = 4 × 32 (neighbor_8 ‖ neighbor_4 ‖ neighbor_2 ‖ neighbor_1).
-    Branch { skip: usize, neighbors: Vec<u8> },
-    Fork { skip: usize, neighbor: Neighbor },
+    Branch {
+        skip: usize,
+        neighbors: Vec<u8>,
+    },
+    Fork {
+        skip: usize,
+        neighbor: Neighbor,
+    },
     /// `key`/`value` are the neighbor leaf's 32-byte key-hash (path) and value-hash.
     Leaf {
         skip: usize,
@@ -426,7 +432,13 @@ fn do_excluding(path: &[u8], cursor: usize, proof: &[ProofStep]) -> Hash {
     }
 }
 
-fn do_branch(path: &[u8], cursor: usize, next_cursor: usize, root: &[u8], neighbors: &[u8]) -> Hash {
+fn do_branch(
+    path: &[u8],
+    cursor: usize,
+    next_cursor: usize,
+    root: &[u8],
+    neighbors: &[u8],
+) -> Hash {
     let branch = nibble(path, next_cursor) as i64;
     let prefix = nibbles(path, cursor, next_cursor);
     let n8 = &neighbors[0..DIGEST];
@@ -576,8 +588,9 @@ impl Node {
                 full_path,
                 value,
                 hash,
-            } => *hash
-                .get_or_init(|| combine(&suffix(full_path, *skip_start), &blake2b_256(value))),
+            } => {
+                *hash.get_or_init(|| combine(&suffix(full_path, *skip_start), &blake2b_256(value)))
+            }
             Node::Branch {
                 skip_start,
                 skip_len,
@@ -598,7 +611,11 @@ impl Node {
 /// Merkle root of 16 child hashes — the binary tree of `combine` that on-chain
 /// `merkle_16` reconstructs (16 → 8 → 4 → 2 → 1).
 fn merkle_root_16(children: &[Arc<Node>]) -> Hash {
-    debug_assert_eq!(children.len(), 16, "merkle_root_16 expects exactly 16 children");
+    debug_assert_eq!(
+        children.len(),
+        16,
+        "merkle_root_16 expects exactly 16 children"
+    );
     let mut level: Vec<Hash> = children.iter().map(|c| c.hash()).collect();
     while level.len() > 1 {
         level = level.chunks(2).map(|p| combine(&p[0], &p[1])).collect();
@@ -701,7 +718,13 @@ fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Result<Ar
                     children.clone(),
                     *size,
                 );
-                Ok(Node::branch(cursor, cp, path.to_vec(), new_children, size + 1))
+                Ok(Node::branch(
+                    cursor,
+                    cp,
+                    path.to_vec(),
+                    new_children,
+                    size + 1,
+                ))
             } else {
                 // Prefix matches → descend into the child.
                 let child_nibble = nibble(path, cursor + skip_len) as usize;
@@ -1036,14 +1059,28 @@ mod tests {
             neighbors: h(neighbors),
         };
         let proof: Proof = vec![
-            branch("bc13df27a19f8caf0bf922c900424025282a892ba8577095fd35256c9d553ca120b8645121ebc9057f7b28fa4c0032b1f49e616dfb8dbd88e4bffd7c0844d29b011b1af0993ac88158342583053094590c66847acd7890c86f6de0fde0f7ae2479eafca17f9659f252fa13ee353c879373a65ca371093525cf359fae1704cf4a"),
-            branch("255753863960985679b4e752d4b133322ff567d210ffbb10ee56e51177db057460b547fe42c6f44dfef8b3ecee35dfd4aa105d28b94778a3f1bb8211cf2679d7434b40848aebdd6565b59efdc781ffb5ca8a9f2b29f95a47d0bf01a09c38fa39359515ddb9d2d37a26bccb022968ef4c8e29a95c7c82edcbe561332ff79a51af"),
-            branch("9d95e34e6f74b59d4ea69943d2759c01fe9f986ff0c03c9e25ab561b23a413b77792fa78d9fbcb98922a4eed2df0ed70a2852ae8dbac8cff54b9024f229e66629136cfa60a569c464503a8b7779cb4a632ae052521750212848d1cc0ebed406e1ba4876c4fd168988c8fe9e226ed283f4d5f17134e811c3b5322bc9c494a598b"),
-            branch("b93c3b90e647f90beb9608aecf714e3fbafdb7f852cfebdbd8ff435df84a4116d10ccdbe4ea303efbf0f42f45d8dc4698c3890595be97e4b0f39001bde3f2ad95b8f6f450b1e85d00dacbd732b0c5bc3e8c92fc13d43028777decb669060558821db21a9b01ba5ddf6932708cd96d45d41a1a4211412a46fe41870968389ec96"),
-            branch("f89f9d06b48ecc0e1ea2e6a43a9047e1ff02ecf9f79b357091ffc0a7104bbb260908746f8e61ecc60dfe26b8d03bcc2f1318a2a95fa895e4d1aadbb917f9f2936b900c75ffe49081c265df9c7c329b9036a0efb46d5bac595a1dcb7c200e7d590000000000000000000000000000000000000000000000000000000000000000"),
+            branch(
+                "bc13df27a19f8caf0bf922c900424025282a892ba8577095fd35256c9d553ca120b8645121ebc9057f7b28fa4c0032b1f49e616dfb8dbd88e4bffd7c0844d29b011b1af0993ac88158342583053094590c66847acd7890c86f6de0fde0f7ae2479eafca17f9659f252fa13ee353c879373a65ca371093525cf359fae1704cf4a",
+            ),
+            branch(
+                "255753863960985679b4e752d4b133322ff567d210ffbb10ee56e51177db057460b547fe42c6f44dfef8b3ecee35dfd4aa105d28b94778a3f1bb8211cf2679d7434b40848aebdd6565b59efdc781ffb5ca8a9f2b29f95a47d0bf01a09c38fa39359515ddb9d2d37a26bccb022968ef4c8e29a95c7c82edcbe561332ff79a51af",
+            ),
+            branch(
+                "9d95e34e6f74b59d4ea69943d2759c01fe9f986ff0c03c9e25ab561b23a413b77792fa78d9fbcb98922a4eed2df0ed70a2852ae8dbac8cff54b9024f229e66629136cfa60a569c464503a8b7779cb4a632ae052521750212848d1cc0ebed406e1ba4876c4fd168988c8fe9e226ed283f4d5f17134e811c3b5322bc9c494a598b",
+            ),
+            branch(
+                "b93c3b90e647f90beb9608aecf714e3fbafdb7f852cfebdbd8ff435df84a4116d10ccdbe4ea303efbf0f42f45d8dc4698c3890595be97e4b0f39001bde3f2ad95b8f6f450b1e85d00dacbd732b0c5bc3e8c92fc13d43028777decb669060558821db21a9b01ba5ddf6932708cd96d45d41a1a4211412a46fe41870968389ec96",
+            ),
+            branch(
+                "f89f9d06b48ecc0e1ea2e6a43a9047e1ff02ecf9f79b357091ffc0a7104bbb260908746f8e61ecc60dfe26b8d03bcc2f1318a2a95fa895e4d1aadbb917f9f2936b900c75ffe49081c265df9c7c329b9036a0efb46d5bac595a1dcb7c200e7d590000000000000000000000000000000000000000000000000000000000000000",
+            ),
         ];
 
-        assert_eq!(&excluding(&block_hash, &proof).unwrap()[..], &r0[..], "excluding == old root");
+        assert_eq!(
+            &excluding(&block_hash, &proof).unwrap()[..],
+            &r0[..],
+            "excluding == old root"
+        );
         assert_eq!(
             &including(&block_hash, &block_body, &proof).unwrap()[..],
             &r1[..],
@@ -1097,10 +1134,24 @@ mod tests {
     #[test]
     fn insert_edge_case4_fork_empty_prefix() {
         let proof = vec![
-            branch(0, "d072e11c4f761d09ebe0c1df54b08d398977aa4e98e85e5e231f52dc32fdf8053861a5ea164ac3eb460e27f96ba934832bfc7b240dbf7be24d3fb7ae16f3e44fa965498aa2e219f45428bafc4f646a8f2b4d863bf730f802f81f4f713a465246cd28ad53627981fd212ebec41068fa0f4b0ae5e0e77af0143e296373c6c8f753"),
-            branch(0, "6c2cf6703c1b121726899e4f1de29cf483227d9e75d5d7948b62b5904c7f1011165b8313abcd4f1c33b85a5dabf8c5096039b3aba1c1fedda2e247810090173998f6f58a03bc17874bff8ba7eda08d25623911dff348f57da60b8545044dcbb175d27abc4c3e1b9aa0a3161ea0f8067ef39885c30399c164395b181747ba4f51"),
-            branch(0, "c5b1eb4266a20e13961f0b7b8f909a217141eecab5bbe3116665e382f87477fcf9a8a6a9e1e1cb7af32d1ffdf5c70643434337c3874d417de45f83e48f7c00afaf7180e918199dde712083a3f512483e89d756f25ddafe8b14b246499fe44dd3bda1f1a580cf7af9dd35c6ddfffa2ec8af0d41b00d7ca5ed25af8e54d4bef1f9"),
-            fork(1, 12, "", "136bca071d530710ba622dfd66fe1afb859d4f42d45f29ce252e862a92eb10c2"),
+            branch(
+                0,
+                "d072e11c4f761d09ebe0c1df54b08d398977aa4e98e85e5e231f52dc32fdf8053861a5ea164ac3eb460e27f96ba934832bfc7b240dbf7be24d3fb7ae16f3e44fa965498aa2e219f45428bafc4f646a8f2b4d863bf730f802f81f4f713a465246cd28ad53627981fd212ebec41068fa0f4b0ae5e0e77af0143e296373c6c8f753",
+            ),
+            branch(
+                0,
+                "6c2cf6703c1b121726899e4f1de29cf483227d9e75d5d7948b62b5904c7f1011165b8313abcd4f1c33b85a5dabf8c5096039b3aba1c1fedda2e247810090173998f6f58a03bc17874bff8ba7eda08d25623911dff348f57da60b8545044dcbb175d27abc4c3e1b9aa0a3161ea0f8067ef39885c30399c164395b181747ba4f51",
+            ),
+            branch(
+                0,
+                "c5b1eb4266a20e13961f0b7b8f909a217141eecab5bbe3116665e382f87477fcf9a8a6a9e1e1cb7af32d1ffdf5c70643434337c3874d417de45f83e48f7c00afaf7180e918199dde712083a3f512483e89d756f25ddafe8b14b246499fe44dd3bda1f1a580cf7af9dd35c6ddfffa2ec8af0d41b00d7ca5ed25af8e54d4bef1f9",
+            ),
+            fork(
+                1,
+                12,
+                "",
+                "136bca071d530710ba622dfd66fe1afb859d4f42d45f29ce252e862a92eb10c2",
+            ),
         ];
         check_insert(
             "76ff3670f2b81017d50354ca4a78792de31adbd23f456eec41d7a8c13fcdc91b",
@@ -1116,11 +1167,28 @@ mod tests {
     #[test]
     fn insert_edge_case7_fork_nonempty_prefix() {
         let proof = vec![
-            branch(0, "7391436705a8141e333c007c5ea3e046f9b6ce3200988f4323b337f1eb4e476e300fc77899d6c430dc56965b5171ed48ae947e00cf886ed36bd508f01ecdcfd0a61383bae3451edfa124b8b4a0d6a36f9634c9dcdb9684492bc1f1962a38247ba4ea8e58b84473436d6b6fc5fd47a3abef4959544f8e57bc62ba48131198e476"),
-            branch(0, "a8c0876243c8203192c45e572b91b84654915f3015e99fbf2a50d2d48bbdacf73a1077fa66a5e7159d0971ce3192d128158480293bd98923ea6614f444c91684b55f810f03a8a710183c7ffff4272817d630c6ffae2600accdedc9f656fa9283571838701edb01d0ec362c174d12243a426af448fb909d32ed51d8641c3a43b0"),
-            branch(0, "72302f4a439c2294ba4f6bef321f0f7bf497bb5c24335f2e1c8d0b49237410297674c4a5f9437696d4ed2145aad20cc0ef39bc139574941c9f24a4023706e7720d1a0c3d36e6748cabab8c24cb83a17b4a771f536a9fd361e1416f673ed43708b61ff685cecf3bd4a6118e3994e36e41e8dcaee8b47b2ea947968c0afca65b6e"),
-            branch(0, "f226865e02694067e1d0a17b3cb0f6c3d7e5186642a3ff1d8299573e3cac04673fced676fe9af960d3ed3d1e6138952993109b7ec62a3f38eae39fb89a06f04436b86983490a9c2488d8b690074fb3b6a487049f21b6de07dd27b8cfb6243fc3ab5d438a30e24aee9016ffb83a2c23ed7f316efac775c6c2eec64f41967e63c2"),
-            fork(1, 11, "0e", "8ffc29f174b749ee61bc9048cb600b4b7b9379227cf690a9268ffa26c5973738"),
+            branch(
+                0,
+                "7391436705a8141e333c007c5ea3e046f9b6ce3200988f4323b337f1eb4e476e300fc77899d6c430dc56965b5171ed48ae947e00cf886ed36bd508f01ecdcfd0a61383bae3451edfa124b8b4a0d6a36f9634c9dcdb9684492bc1f1962a38247ba4ea8e58b84473436d6b6fc5fd47a3abef4959544f8e57bc62ba48131198e476",
+            ),
+            branch(
+                0,
+                "a8c0876243c8203192c45e572b91b84654915f3015e99fbf2a50d2d48bbdacf73a1077fa66a5e7159d0971ce3192d128158480293bd98923ea6614f444c91684b55f810f03a8a710183c7ffff4272817d630c6ffae2600accdedc9f656fa9283571838701edb01d0ec362c174d12243a426af448fb909d32ed51d8641c3a43b0",
+            ),
+            branch(
+                0,
+                "72302f4a439c2294ba4f6bef321f0f7bf497bb5c24335f2e1c8d0b49237410297674c4a5f9437696d4ed2145aad20cc0ef39bc139574941c9f24a4023706e7720d1a0c3d36e6748cabab8c24cb83a17b4a771f536a9fd361e1416f673ed43708b61ff685cecf3bd4a6118e3994e36e41e8dcaee8b47b2ea947968c0afca65b6e",
+            ),
+            branch(
+                0,
+                "f226865e02694067e1d0a17b3cb0f6c3d7e5186642a3ff1d8299573e3cac04673fced676fe9af960d3ed3d1e6138952993109b7ec62a3f38eae39fb89a06f04436b86983490a9c2488d8b690074fb3b6a487049f21b6de07dd27b8cfb6243fc3ab5d438a30e24aee9016ffb83a2c23ed7f316efac775c6c2eec64f41967e63c2",
+            ),
+            fork(
+                1,
+                11,
+                "0e",
+                "8ffc29f174b749ee61bc9048cb600b4b7b9379227cf690a9268ffa26c5973738",
+            ),
         ];
         check_insert(
             "5032a544857633269c915dd4fb665d79a041d6d75ca795e24fc17a285cc1dece",
@@ -1136,12 +1204,32 @@ mod tests {
     #[test]
     fn insert_edge_case2_leaf_steps() {
         let proof = vec![
-            branch(0, "4c54bfc322fb7bc2e49ae21bf5fa560632e3ca42b5267eb115142e291e8ada4ecd0c58152bf064f0c7834dd72f69d12651739b32caaa3c986a87937f125b500f1426fccf2a456bce3c25b43206d9b429d56515580d086a959ca730325411b3aada6ac4d7221f787b97e1ce677fdadc412e824a9816281b1259b91addeb37bb2c"),
-            branch(0, "098745f495c99b7627f559ac8ed8165e2392e2261ef8990291f13705adf78fcf3dcca881d4b45aabe746e7041f743baaa831029e7890df9587858d8be5dce648e02f31fe2936417a393df8def15d7d0c021a66cdb33c3fdda941ae70614913cb116fd5e6c499b71e229b88f5106975cbe83a8c44d3619541d7ddd7eae0a355bc"),
-            branch(0, "9732c3266e468dd27c4bd16af5a6e60c1f556bf91700f51554cfa33aa26b8d30f33c27ab7c5c85ef006c78f56ecd7e8c77c5fadd7910e9b178801d554f244977026104fc4aede0864d405db792691c4e4534b06ae7f58366b640f13ecfa549afa046a157d2e9b6c0793a506942eb8ff50dfeb7c5e7a2a51814c4b3a4d6af6fa0"),
-            branch(0, "5f3065e998b5fa89bb33d9204546c5dba2b075adc542688dcc1773a490fa739ac69ff52c5f575e9f1912664c1ebef2f9498775350b0077a6b59fe012861c3715657146a239aaea12b3091054e5846771bba6f721b1835d025fa08d1fc5c9b1c40000000000000000000000000000000000000000000000000000000000000000"),
-            leaf(1, "2b5b0ba7a99e17d9fde58f14dee61cccda9e3e9627b2ba2732ebed551ea9eaa4", "3657998959985b7b75c734eb5b49d18cae9b353d00d811cb2c24ed6ed17b23d9"),
-            leaf(0, "2b5b063719f4b7644c71adef1439c9aa78d34e684677dd61db0adffcc21797ec", "4e397303e05277d98701446ee62f6f02bc013721fc12efba7300fb51ea935f9f"),
+            branch(
+                0,
+                "4c54bfc322fb7bc2e49ae21bf5fa560632e3ca42b5267eb115142e291e8ada4ecd0c58152bf064f0c7834dd72f69d12651739b32caaa3c986a87937f125b500f1426fccf2a456bce3c25b43206d9b429d56515580d086a959ca730325411b3aada6ac4d7221f787b97e1ce677fdadc412e824a9816281b1259b91addeb37bb2c",
+            ),
+            branch(
+                0,
+                "098745f495c99b7627f559ac8ed8165e2392e2261ef8990291f13705adf78fcf3dcca881d4b45aabe746e7041f743baaa831029e7890df9587858d8be5dce648e02f31fe2936417a393df8def15d7d0c021a66cdb33c3fdda941ae70614913cb116fd5e6c499b71e229b88f5106975cbe83a8c44d3619541d7ddd7eae0a355bc",
+            ),
+            branch(
+                0,
+                "9732c3266e468dd27c4bd16af5a6e60c1f556bf91700f51554cfa33aa26b8d30f33c27ab7c5c85ef006c78f56ecd7e8c77c5fadd7910e9b178801d554f244977026104fc4aede0864d405db792691c4e4534b06ae7f58366b640f13ecfa549afa046a157d2e9b6c0793a506942eb8ff50dfeb7c5e7a2a51814c4b3a4d6af6fa0",
+            ),
+            branch(
+                0,
+                "5f3065e998b5fa89bb33d9204546c5dba2b075adc542688dcc1773a490fa739ac69ff52c5f575e9f1912664c1ebef2f9498775350b0077a6b59fe012861c3715657146a239aaea12b3091054e5846771bba6f721b1835d025fa08d1fc5c9b1c40000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            leaf(
+                1,
+                "2b5b0ba7a99e17d9fde58f14dee61cccda9e3e9627b2ba2732ebed551ea9eaa4",
+                "3657998959985b7b75c734eb5b49d18cae9b353d00d811cb2c24ed6ed17b23d9",
+            ),
+            leaf(
+                0,
+                "2b5b063719f4b7644c71adef1439c9aa78d34e684677dd61db0adffcc21797ec",
+                "4e397303e05277d98701446ee62f6f02bc013721fc12efba7300fb51ea935f9f",
+            ),
         ];
         check_insert(
             "00489b47aa866ff55da4f24fa4801a6948871258fab39f22354f35b7c4f94412",
@@ -1176,7 +1264,10 @@ mod tests {
     #[test]
     fn trie_single_element_matches_empty_proof() {
         let t = Trie::empty().insert(b"spo-0", b"pool-0").unwrap();
-        assert_eq!(t.root_hash(), including(b"spo-0", b"pool-0", &vec![]).unwrap());
+        assert_eq!(
+            t.root_hash(),
+            including(b"spo-0", b"pool-0", &vec![]).unwrap()
+        );
         assert_eq!(t.get(b"spo-0"), Some(b"pool-0".to_vec()));
         assert_eq!(t.get(b"spo-1"), None);
         assert_eq!(t.prove_membership(b"spo-0"), Ok(vec![]));
@@ -1210,7 +1301,11 @@ mod tests {
         assert!(t.get(key).is_none());
 
         let proof = t.prove_non_membership(key).expect("key absent");
-        assert_eq!(excluding(key, &proof).unwrap(), t.root_hash(), "exclusion == old root");
+        assert_eq!(
+            excluding(key, &proof).unwrap(),
+            t.root_hash(),
+            "exclusion == old root"
+        );
         assert_eq!(
             including(key, value, &proof).unwrap(),
             t.insert(key, value).unwrap().root_hash(),
@@ -1237,7 +1332,11 @@ mod tests {
         let mut fork_seen = false;
         for (k, v) in &pairs {
             let proof = t.prove_membership(k).expect("key present");
-            assert_eq!(including(k, v, &proof).unwrap(), t.root_hash(), "inclusion for {k:?}");
+            assert_eq!(
+                including(k, v, &proof).unwrap(),
+                t.root_hash(),
+                "inclusion for {k:?}"
+            );
             fork_seen |= proof.iter().any(|s| matches!(s, ProofStep::Fork { .. }));
         }
         assert!(
@@ -1320,7 +1419,10 @@ mod tests {
             Err(MpfError::RootMismatch)
         );
         let new_root = t.insert(key, b"pool-new").unwrap().root_hash();
-        assert_eq!(verify_inclusion(key, b"pool-new", &proof, &new_root), Ok(()));
+        assert_eq!(
+            verify_inclusion(key, b"pool-new", &proof, &new_root),
+            Ok(())
+        );
     }
 
     // H4: Arc-shared nodes + OnceLock memoisation must keep Trie Send + Sync
@@ -1343,10 +1445,9 @@ mod tests {
         let t = Trie::from_pairs(pairs.iter().map(|(k, v)| (k, v))).unwrap();
         for (k, _) in &pairs {
             let deleted = t.delete(k).expect("key present");
-            let rebuilt = Trie::from_pairs(
-                pairs.iter().filter(|(pk, _)| pk != k).map(|(k, v)| (k, v)),
-            )
-            .unwrap();
+            let rebuilt =
+                Trie::from_pairs(pairs.iter().filter(|(pk, _)| pk != k).map(|(k, v)| (k, v)))
+                    .unwrap();
             assert_eq!(
                 deleted.root_hash(),
                 rebuilt.root_hash(),
@@ -1422,7 +1523,11 @@ mod tests {
 
         // delete → re-insert restores the exact root.
         let r0 = t30.root_hash();
-        let restored = t30.delete(b"spo-3").unwrap().insert(b"spo-3", b"pool-3").unwrap();
+        let restored = t30
+            .delete(b"spo-3")
+            .unwrap()
+            .insert(b"spo-3", b"pool-3")
+            .unwrap();
         assert_eq!(restored.root_hash(), r0);
     }
 }

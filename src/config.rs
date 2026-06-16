@@ -270,8 +270,7 @@ impl HeimdallConfig {
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(path.display().to_string(), e))?;
-        toml::from_str(&contents)
-            .map_err(|e| ConfigError::Parse(path.display().to_string(), e))
+        toml::from_str(&contents).map_err(|e| ConfigError::Parse(path.display().to_string(), e))
     }
 
     /// Load this SPO's bifrost identity keypair from `[bifrost].skey_path`.
@@ -338,10 +337,14 @@ pub fn load_bifrost_keypair_from(
         let meta = std::fs::metadata(path).map_err(|e| ConfigError::Io(display.clone(), e))?;
         let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
-            return Err(ConfigError::KeyPermsTooOpen { path: display, mode });
+            return Err(ConfigError::KeyPermsTooOpen {
+                path: display,
+                mode,
+            });
         }
     }
-    let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(display.clone(), e))?;
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| ConfigError::Io(display.clone(), e))?;
     let bytes = hex::decode(contents.trim())
         .map_err(|e| ConfigError::KeyParse(format!("{display}: not valid hex: {e}")))?;
     let sk = bitcoin::secp256k1::SecretKey::from_slice(&bytes)
@@ -358,7 +361,10 @@ pub enum ConfigError {
     /// `[bifrost].skey_path` was needed but not configured.
     MissingBifrostKey,
     /// The key file is readable by group/other (unix mode has `0o077` bits).
-    KeyPermsTooOpen { path: String, mode: u32 },
+    KeyPermsTooOpen {
+        path: String,
+        mode: u32,
+    },
     /// The key file's contents are not a valid 32-byte secp256k1 secret.
     KeyParse(String),
 }
@@ -450,10 +456,7 @@ fee_rate_sat_per_vb = 5
         assert_eq!(epoch.federation_timeout, demo.federation_timeout);
         assert_eq!(epoch.leader_timeout, demo.leader_timeout);
         assert_eq!(epoch.pegin_policy_id, demo.pegin_policy_id);
-        assert_eq!(
-            epoch.pegin_collection_window,
-            demo.pegin_collection_window
-        );
+        assert_eq!(epoch.pegin_collection_window, demo.pegin_collection_window);
         assert_eq!(epoch.pegin_poll_interval, demo.pegin_poll_interval);
         assert_eq!(
             epoch.pegin_refund_timeout_blocks,

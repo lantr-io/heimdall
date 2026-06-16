@@ -767,7 +767,8 @@ mod tests {
                 (b"pk-2".to_vec(), b"cc-pool".to_vec()),
             ]
         );
-        let trie = crate::cardano::mpf::Trie::from_pairs(pairs.iter().map(|(k, v)| (k, v))).unwrap();
+        let trie =
+            crate::cardano::mpf::Trie::from_pairs(pairs.iter().map(|(k, v)| (k, v))).unwrap();
         assert_eq!(trie.len(), 3);
     }
 }

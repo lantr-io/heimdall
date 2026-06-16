@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use frost_secp256k1_tr as frost;
 use frost::Identifier;
+use frost_secp256k1_tr as frost;
 use serde::{Deserialize, Serialize};
 
 /// DKG Round 1: an SPO's commitment package broadcast to every peer.
