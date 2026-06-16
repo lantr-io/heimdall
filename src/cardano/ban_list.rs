@@ -476,25 +476,15 @@ impl BanList {
     /// with a strictly greater pool_id (rules out cycles), and the walk must
     /// cover all nodes (rules out orphans / forks).
     fn check_chain(&self) -> Result<(), BanListError> {
-        let mut visited = 0usize;
-        let mut prev: Option<&[u8]> = None;
-        let mut cursor = self.root_link.as_deref();
-        while let Some(key) = cursor {
-            if prev.is_some_and(|p| key <= p) {
-                return Err(BanListError::NotAscending(key.to_vec()));
-            }
-            let entry = self
-                .nodes
-                .get(key)
-                .ok_or_else(|| BanListError::BrokenLink(key.to_vec()))?;
-            visited += 1;
-            prev = Some(key);
-            cursor = entry.link.as_deref();
-        }
-        if visited != self.nodes.len() {
-            return Err(BanListError::UnreachableNodes(self.nodes.len() - visited));
-        }
-        Ok(())
+        use crate::cardano::linked_list::{ChainError, validate_chain};
+        validate_chain(self.root_link.as_deref(), self.nodes.len(), |k| {
+            self.nodes.get(k).map(|e| e.link.as_deref())
+        })
+        .map_err(|e| match e {
+            ChainError::NotAscending(k) => BanListError::NotAscending(k),
+            ChainError::BrokenLink(k) => BanListError::BrokenLink(k),
+            ChainError::Unreachable(n) => BanListError::UnreachableNodes(n),
+        })
     }
 
     #[must_use]

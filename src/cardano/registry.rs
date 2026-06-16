@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 use pallas_codec::minicbor;
 use pallas_primitives::PlutusData;
 
+use crate::cardano::linked_list::validate_chain;
 use crate::cardano::plutus::{self, bytes, constr};
 
 /// Asset name of the root element's NFT (`registration_root_key` in
@@ -289,27 +290,18 @@ impl RegistryList {
 
     /// Walk the links from the root: every hop must land on a known node with
     /// a strictly greater key (rules out cycles), and the walk must cover all
-    /// nodes (rules out orphans / forks).
+    /// nodes (rules out orphans / forks). Shares the chain-walk invariant with
+    /// the ban list via [`crate::cardano::linked_list::validate_chain`].
     fn check_chain(&self) -> Result<(), RegistryError> {
-        let mut visited = 0usize;
-        let mut prev: Option<&[u8]> = None;
-        let mut cursor = self.root_link.as_deref();
-        while let Some(key) = cursor {
-            if prev.is_some_and(|p| key <= p) {
-                return Err(RegistryError::NotAscending(key.to_vec()));
-            }
-            let entry = self
-                .nodes
-                .get(key)
-                .ok_or_else(|| RegistryError::BrokenLink(key.to_vec()))?;
-            visited += 1;
-            prev = Some(key);
-            cursor = entry.link.as_deref();
-        }
-        if visited != self.nodes.len() {
-            return Err(RegistryError::UnreachableNodes(self.nodes.len() - visited));
-        }
-        Ok(())
+        use crate::cardano::linked_list::ChainError;
+        validate_chain(self.root_link.as_deref(), self.nodes.len(), |k| {
+            self.nodes.get(k).map(|e| e.link.as_deref())
+        })
+        .map_err(|e| match e {
+            ChainError::NotAscending(k) => RegistryError::NotAscending(k),
+            ChainError::BrokenLink(k) => RegistryError::BrokenLink(k),
+            ChainError::Unreachable(n) => RegistryError::UnreachableNodes(n),
+        })
     }
 
     /// Key of the first node (the root's link), if any.
