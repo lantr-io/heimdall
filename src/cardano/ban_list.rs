@@ -577,20 +577,82 @@ pub fn ban_snapshot(utxos: &[BfUtxo], policy_id_hex: &str) -> Result<BanList, Ba
 
 /// Where to read the on-chain ban list: the ban script address + policy,
 /// derived from the blueprint, the registry bootstrap outref (the ban policy
-/// is parameterized by the registry policy id), the parameterless
-/// fault_verifier hash, and the ban list's own one-shot bootstrap outref.
+/// is parameterized by the registry policy id), the authorized fault-verifier
+/// policy set + ban-schedule params ([`BanPolicyParams`]), and the ban list's
+/// own one-shot bootstrap outref.
 #[derive(Debug, Clone)]
 pub struct BanListSource {
     pub ban_address: String,
     pub ban_policy_hex: String,
 }
 
+/// The `spo_bans` deployment parameters baked into the ban policy id (and which
+/// an ApplyBan tx must reproduce in the `BanNodeData` it emits and its validity
+/// interval). Sourced from `[cardano]` config — they must match the values the
+/// deployed `spo_bans` was parameterized with, or every derived hash is wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanPolicyParams {
+    /// The authorized fault-verifier policies, in deployment order. The
+    /// contract's `ban_config_ok` requires exactly 3 distinct ids.
+    pub fault_proof_policies: Vec<[u8; 28]>,
+    pub base_ban_duration_ms: i64,
+    pub max_faults_before_permanent: i64,
+    pub max_validity_window_ms: i64,
+}
+
+impl BanPolicyParams {
+    /// Parse from `[cardano]` config. Every field is required — the values are
+    /// baked into the ban policy id, so there is no safe default.
+    pub fn from_config(cardano: &crate::config::CardanoConfig) -> Result<Self, BanListError> {
+        if cardano.fault_proof_policies.len() != 3 {
+            return Err(BanListError::Config(format!(
+                "cardano.fault_proof_policies must list exactly 3 policy ids (spo_bans \
+                 ban_config_ok requires 3 distinct fault verifiers); got {}",
+                cardano.fault_proof_policies.len()
+            )));
+        }
+        let fault_proof_policies = cardano
+            .fault_proof_policies
+            .iter()
+            .map(|h| {
+                hex::decode(h)
+                    .ok()
+                    .and_then(|v| <[u8; 28]>::try_from(v).ok())
+                    .ok_or_else(|| {
+                        BanListError::Config(format!(
+                            "cardano.fault_proof_policies: {h} is not a 28-byte hex policy id"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let req = |v: Option<i64>, name: &str| {
+            v.ok_or_else(|| {
+                BanListError::Config(format!(
+                    "cardano.{name} is required alongside cardano.ban_bootstrap"
+                ))
+            })
+        };
+        Ok(Self {
+            fault_proof_policies,
+            base_ban_duration_ms: req(cardano.base_ban_duration_ms, "base_ban_duration_ms")?,
+            max_faults_before_permanent: req(
+                cardano.max_faults_before_permanent,
+                "max_faults_before_permanent",
+            )?,
+            max_validity_window_ms: req(cardano.max_validity_window_ms, "max_validity_window_ms")?,
+        })
+    }
+}
+
 impl BanListSource {
-    /// Parameterize `spo_bans` from the blueprint and derive its address.
+    /// Parameterize `spo_bans` from the blueprint and derive its address. The
+    /// ban policy id is the 7-param `spo_bans` hash, so `params` must carry the
+    /// exact deployment values (see [`BanPolicyParams`]).
     pub fn from_blueprint(
         blueprint_path: &str,
         registry_bootstrap: &str,
         ban_bootstrap: &str,
+        params: &BanPolicyParams,
         mainnet: bool,
     ) -> Result<Self, BanListError> {
         let blueprint_json = std::fs::read_to_string(blueprint_path)
@@ -605,13 +667,28 @@ impl BanListSource {
         let registry =
             blueprint::spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
                 .map_err(|e| err("spos_registry", e))?;
-        let fault_policy =
+        // Guard the most dangerous misconfig: heimdall's own fault_verifier (the
+        // policy minting the FaultProofs heimdall publishes) MUST be one of the
+        // authorized 3, or those proofs could never be applied — and a wrong set
+        // silently derives the wrong ban address (→ an empty ban list → banned
+        // SPOs slipping into the roster).
+        let fault_verifier =
             blueprint::validator_hash(&blueprint_json, blueprint::FAULT_VERIFIER_TITLE)
                 .map_err(|e| err("fault_verifier", e))?;
+        if !params.fault_proof_policies.contains(&fault_verifier) {
+            return Err(BanListError::Config(format!(
+                "cardano.fault_proof_policies does not include the blueprint's fault_verifier \
+                 policy {} — heimdall's own FaultProofs could never be applied",
+                hex::encode(fault_verifier)
+            )));
+        }
         let bans = blueprint::spo_bans_script(
             &blueprint_json,
             &registry.hash,
-            &fault_policy,
+            &params.fault_proof_policies,
+            params.base_ban_duration_ms,
+            params.max_faults_before_permanent,
+            params.max_validity_window_ms,
             &ban_tx_id,
             u64::from(ban_index),
         )
@@ -629,7 +706,8 @@ impl BanListSource {
 
     /// Build from `[cardano]` config. The ban list is configured iff
     /// `ban_bootstrap` is set (`None` otherwise); it then also requires the
-    /// registry fields the ban policy is parameterized by.
+    /// registry fields the ban policy is parameterized by, plus the
+    /// fault-verifier policy set + ban-schedule params ([`BanPolicyParams`]).
     pub fn from_config(
         cardano: &crate::config::CardanoConfig,
     ) -> Result<Option<Self>, BanListError> {
@@ -647,11 +725,19 @@ impl BanListSource {
                     .into(),
             ));
         };
+        let params = BanPolicyParams::from_config(cardano)?;
         let mainnet = cardano
             .blockfrost_project_id
             .as_deref()
             .is_some_and(|p| p.starts_with("mainnet"));
-        Self::from_blueprint(blueprint_path, registry_bootstrap, ban_bootstrap, mainnet).map(Some)
+        Self::from_blueprint(
+            blueprint_path,
+            registry_bootstrap,
+            ban_bootstrap,
+            &params,
+            mainnet,
+        )
+        .map(Some)
     }
 
     /// Fetch the ban-list UTxOs and build the validated snapshot, retrying
@@ -1071,6 +1157,45 @@ mod tests {
         cardano.ban_bootstrap = Some(format!("{}:0", "aa".repeat(32)));
         assert!(matches!(
             BanListSource::from_config(&cardano),
+            Err(BanListError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn ban_policy_params_from_config_validates() {
+        let mut c = crate::config::CardanoConfig::default();
+        // no fault policies → not 3
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
+            Err(BanListError::Config(_))
+        ));
+        // exactly 3 28-byte policies but ban-schedule params missing
+        c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "33".repeat(28)];
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
+            Err(BanListError::Config(_))
+        ));
+        c.base_ban_duration_ms = Some(86_400_000);
+        c.max_faults_before_permanent = Some(3);
+        c.max_validity_window_ms = Some(600_000);
+        let p = BanPolicyParams::from_config(&c).unwrap();
+        assert_eq!(
+            p.fault_proof_policies,
+            vec![[0x11; 28], [0x22; 28], [0x33; 28]]
+        );
+        assert_eq!(p.base_ban_duration_ms, 86_400_000);
+        assert_eq!(p.max_faults_before_permanent, 3);
+        assert_eq!(p.max_validity_window_ms, 600_000);
+        // wrong count (2) → error
+        c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28)];
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
+            Err(BanListError::Config(_))
+        ));
+        // 3 entries but one is not 28 bytes (27) → error
+        c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "33".repeat(27)];
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
             Err(BanListError::Config(_))
         ));
     }

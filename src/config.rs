@@ -200,6 +200,21 @@ pub struct CardanoConfig {
     /// by the registry policy, so `registry_blueprint` + `registry_bootstrap`
     /// must be set alongside). Unset → the ban list is not read.
     pub ban_bootstrap: Option<String>,
+    /// The authorized fault-verifier policy ids (hex), in the exact order the
+    /// deployed `spo_bans` was parameterized with. The contract's
+    /// `ban_config_ok` requires **exactly 3 distinct** policies, and they are
+    /// baked into the ban policy id — a wrong/missing entry derives the wrong
+    /// ban address (and a silently empty ban list). Required alongside
+    /// `ban_bootstrap`.
+    pub fault_proof_policies: Vec<String>,
+    /// `spo_bans` ban-schedule params, baked into the ban policy id, so they
+    /// must match the deployment. `base_ban_duration_ms * 2^(n-1)` is the nth
+    /// ban's length; a pool becomes permanently banned at
+    /// `max_faults_before_permanent`; `max_validity_window_ms` bounds an
+    /// ApplyBan tx's validity interval. All required alongside `ban_bootstrap`.
+    pub base_ban_duration_ms: Option<i64>,
+    pub max_faults_before_permanent: Option<i64>,
+    pub max_validity_window_ms: Option<i64>,
 }
 
 impl Default for CardanoConfig {
@@ -224,6 +239,10 @@ impl Default for CardanoConfig {
             registry_bootstrap: None,
             treasury_info_asset_name: None,
             ban_bootstrap: None,
+            fault_proof_policies: Vec::new(),
+            base_ban_duration_ms: None,
+            max_faults_before_permanent: None,
+            max_validity_window_ms: None,
         }
     }
 }
