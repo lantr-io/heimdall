@@ -815,7 +815,12 @@ mod tests {
                     1,
                     vec![constr(
                         0,
-                        vec![bytes(b"x"), int(1), plutus::bool_data(false), plutus::array(vec![])],
+                        vec![
+                            bytes(b"x"),
+                            int(1),
+                            plutus::bool_data(false),
+                            plutus::array(vec![]),
+                        ],
                     )],
                 ),
                 none_link,
