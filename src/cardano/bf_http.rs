@@ -186,6 +186,11 @@ pub struct EpochWindow {
     /// a Plutus tx with `invalid_hereafter` exactly there is rejected with
     /// `TimeTranslationPastHorizon` when the script context is built.
     pub epoch_end_slot: u64,
+    /// POSIX time (ms) of `current_slot` (the latest block's wall time). With
+    /// 1-second post-Shelley slots, `posix_ms(slot) = block_time_ms + (slot −
+    /// current_slot) * 1000` — used to derive an ApplyBan validity interval's
+    /// POSIX upper bound (the `start_time` the `spo_bans` validator resolves).
+    pub block_time_ms: i64,
 }
 
 /// Fetch the epoch-boundary window from `/blocks/latest` (slot + wall time)
@@ -230,6 +235,7 @@ pub async fn fetch_epoch_window(base_url: &str, project_id: &str) -> Result<Epoc
     Ok(EpochWindow {
         current_slot,
         epoch_end_slot: (current_slot + remaining).saturating_sub(1),
+        block_time_ms: (block_time as i64) * 1000,
     })
 }
 
