@@ -207,6 +207,20 @@ pub fn validator_hash(blueprint_json: &str, title: &str) -> Result<[u8; 28], Blu
         .map_err(|_| BlueprintError::BadBlueprint(format!("{title}: hash is not 28 bytes")))
 }
 
+/// The parameterless `fault_verifier` minting policy as a ready-to-witness
+/// script. Unlike the state validators it takes no parameters, so its
+/// `compiledCode` IS the final program: the V3 hash of those bytes equals the
+/// blueprint's own `hash` field (= the FaultProof policy id), which
+/// [`validator_hash`] reads. Returning the full [`ParameterizedScript`] (not
+/// just the hash) lets the FaultProof mint tx builder provide the script as a
+/// witness without a separate ref-script deploy (the program is ~1 KB).
+pub fn fault_verifier_script(blueprint_json: &str) -> Result<ParameterizedScript, BlueprintError> {
+    let code = validator_compiled_code(blueprint_json, FAULT_VERIFIER_TITLE)?;
+    let cbor = hex::decode(code.trim()).map_err(|e| BlueprintError::BadHex(e.to_string()))?;
+    let hash = script_hash_v3(&cbor);
+    Ok(ParameterizedScript { cbor, hash })
+}
+
 /// `spo_bans` parameterized by the registry policy id (its
 /// `registration_script_hash`), the fault_verifier policy id, and its own
 /// one-shot bootstrap output ref. The resulting hash is the ban-list policy
@@ -253,10 +267,37 @@ mod tests {
     const TREASURY_INFO_APPLIED_HASH: &str =
         "c62f114c966a2ad65ecb27a871600b5b480b08ea98b5ff65625ac627";
 
+    // `bitcoin/fault_verifier.fault_verifier.mint` compiledCode + blueprint
+    // `hash` (ft-bifrost-bridge onchain/plutus.json). Parameterless, so the
+    // compiledCode IS the final program and its V3 hash is the policy id.
+    const FAULT_VERIFIER_CODE: &str = include_str!("../../tests/fixtures/fault_verifier_code.txt");
+    const FAULT_VERIFIER_HASH: &str = "c7aeb7beb3932e410971bce5283c24f1dc69a9db5106c6d9b62310d9";
+
     #[test]
     fn script_hash_v3_matches_blueprint() {
         let code = hex::decode(TREASURY_MOVEMENT_CODE).unwrap();
         assert_eq!(hex::encode(script_hash_v3(&code)), TREASURY_MOVEMENT_HASH);
+    }
+
+    // The parameterless fault_verifier script: cbor == compiledCode, and its V3
+    // hash matches the blueprint's own `hash` (what spo_bans is parameterized by
+    // and what FaultProof tokens are minted under).
+    #[test]
+    fn fault_verifier_script_hash_matches_blueprint() {
+        let blueprint = format!(
+            r#"{{"validators":[{{"title":"{FAULT_VERIFIER_TITLE}","compiledCode":"{}","hash":"{FAULT_VERIFIER_HASH}"}}]}}"#,
+            FAULT_VERIFIER_CODE.trim()
+        );
+        let script = fault_verifier_script(&blueprint).unwrap();
+        assert_eq!(script.hash_hex(), FAULT_VERIFIER_HASH);
+        assert_eq!(
+            script.hash,
+            validator_hash(&blueprint, FAULT_VERIFIER_TITLE).unwrap()
+        );
+        assert_eq!(
+            script.cbor,
+            hex::decode(FAULT_VERIFIER_CODE.trim()).unwrap()
+        );
     }
 
     // The full apply pipeline reproduces `aiken blueprint apply` byte-for-byte:

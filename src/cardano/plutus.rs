@@ -67,6 +67,12 @@ pub fn array(items: Vec<PlutusData>) -> PlutusData {
     PlutusData::Array(canonical(items))
 }
 
+/// Aiken `Bool`: `False = Constr(0, [])`, `True = Constr(1, [])`.
+#[must_use]
+pub fn bool_data(b: bool) -> PlutusData {
+    constr(u64::from(b), vec![])
+}
+
 // ---------------------------------------------------------------------------
 // Decoding
 // ---------------------------------------------------------------------------
@@ -84,6 +90,10 @@ pub enum PlutusError {
     NotBytes(usize),
     /// Field at index `usize` is not an `Int` (or exceeds `i64`).
     NotInt(usize),
+    /// Field at index `usize` is not an Aiken `Bool` (`Constr(0|1, [])`).
+    NotBool(usize),
+    /// Field at index `usize` is not a `List` (or holds a non-`ByteArray`).
+    NotList(usize),
 }
 
 impl std::fmt::Display for PlutusError {
@@ -96,6 +106,8 @@ impl std::fmt::Display for PlutusError {
             Self::MissingField(i) => write!(f, "missing field [{i}]"),
             Self::NotBytes(i) => write!(f, "field [{i}] is not a ByteArray"),
             Self::NotInt(i) => write!(f, "field [{i}] is not an Int (or exceeds i64)"),
+            Self::NotBool(i) => write!(f, "field [{i}] is not a Bool"),
+            Self::NotList(i) => write!(f, "field [{i}] is not a List<ByteArray>"),
         }
     }
 }
@@ -152,6 +164,32 @@ pub fn field_int(fields: &[PlutusData], i: usize) -> Result<i64, PlutusError> {
         Some(_) => Err(PlutusError::NotInt(i)),
         None => Err(PlutusError::MissingField(i)),
     }
+}
+
+/// The Aiken `Bool` field at index `i` (`Constr(0, [])`/`Constr(1, [])`).
+pub fn field_bool(fields: &[PlutusData], i: usize) -> Result<bool, PlutusError> {
+    let field = fields.get(i).ok_or(PlutusError::MissingField(i))?;
+    let (ctor, inner) = as_constr(field).map_err(|_| PlutusError::NotBool(i))?;
+    if !inner.is_empty() || ctor > 1 {
+        return Err(PlutusError::NotBool(i));
+    }
+    Ok(ctor == 1)
+}
+
+/// The `List<ByteArray>` field at index `i`.
+pub fn field_list_bytes(fields: &[PlutusData], i: usize) -> Result<Vec<Vec<u8>>, PlutusError> {
+    let items = match fields.get(i) {
+        Some(PlutusData::Array(MaybeIndefArray::Def(v) | MaybeIndefArray::Indef(v))) => v,
+        Some(_) => return Err(PlutusError::NotList(i)),
+        None => return Err(PlutusError::MissingField(i)),
+    };
+    items
+        .iter()
+        .map(|it| match it {
+            PlutusData::BoundedBytes(b) => Ok(Vec::<u8>::from(b.clone())),
+            _ => Err(PlutusError::NotList(i)),
+        })
+        .collect()
 }
 
 /// Big-endian magnitude bytes → `u128`, or `None` if wider than 16 bytes.

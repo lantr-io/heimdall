@@ -12,16 +12,16 @@
 //! ```text
 //! Element     = Constr(0, [ ElementData, Link ])
 //! ElementData = Constr(0, [ Constr(0, []) ])                     -- Root{BanListRootData}
-//!             | Constr(1, [ Constr(0, [ban_counter, ban_until_epoch]) ])  -- Node{BanNodeData}
+//!             | Constr(1, [ Constr(0, [ban_counter, ban_until_time, permanent, evidence_hashes]) ])  -- Node{BanNodeData}
 //! Link        = Constr(0, [ next_pool_id ])                      -- Some
 //!             | Constr(1, [])                                    -- None
 //! ```
 //!
-//! A ban is **active** for epoch `E` iff `ban_until_epoch > E`
-//! (`spo-bans.ak`: first ban sets `current_epoch + 1`, a repeat ban
-//! `current_epoch + 2^counter` — the read side only needs the comparison,
-//! not the schedule). The roster derivation (WI-012) subtracts
-//! [`BanList::active_bans`] from the registry snapshot.
+//! A ban is **active** at POSIX time `T` iff `permanent || ban_until_time > T`
+//! (`spo-bans.ak`: a ban's `ban_until_time` is `start + base·2^(counter-1)`,
+//! and a ban becomes `permanent` at `max_faults_before_permanent`). The roster
+//! derivation (WI-012) subtracts [`BanList::active_bans`] from the registry
+//! snapshot, passing the **epoch-boundary** time so every SPO agrees.
 //!
 //! An UN-BOOTSTRAPPED list (no `"ban-root"` NFT minted yet — WI-015) is a
 //! distinct, explicit error ([`BanListError::NotBootstrapped`]): it must not
@@ -48,25 +48,108 @@ pub const BAN_NODE_KEY_PREFIX: &[u8] = b"ban/";
 /// Max node key (pool_id) length: 32-byte asset name minus the prefix.
 const MAX_NODE_KEY_LEN: usize = 32 - BAN_NODE_KEY_PREFIX.len();
 
-/// `BanNodeData` — one pool's ban state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `BanNodeData` — one pool's ban state (`spo-bans.ak` evidence-bound model).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BanNodeData {
     /// How many times this pool has been banned (>= 1, validator-enforced).
     pub ban_counter: i64,
-    /// Epoch at which the ban EXPIRES: active iff `ban_until_epoch > epoch`
-    /// (so the last actively-banned epoch is `ban_until_epoch - 1`). A first
-    /// ban sets `current_epoch + 1` (spo-bans.ak), i.e. active for the
-    /// current epoch only.
-    pub ban_until_epoch: i64,
+    /// POSIX time (ms) at which the ban EXPIRES: active iff `permanent` or
+    /// `ban_until_time > T`. `spo-bans.ak` derives the comparison time from the
+    /// transaction validity interval; off-chain, the eligible-roster path must
+    /// pass the **epoch-boundary** time (deterministic across all SPOs, so the
+    /// roster is identical), never a node clock.
+    pub ban_until_time: i64,
+    /// A permanent ban never expires (set once `ban_counter` reaches the
+    /// validator's `max_faults_before_permanent`).
+    pub permanent: bool,
+    /// Fault evidence hashes already punished for this pool, newest first
+    /// (`spo_bans.ak` rejects re-banning on an `evidence_hash` already here).
+    pub evidence_hashes: Vec<Vec<u8>>,
 }
 
 impl BanNodeData {
-    /// Whether the ban is active for `epoch` (`ban_until_epoch > epoch`).
+    /// Whether the ban is active at POSIX time `now_ms`
+    /// (`permanent || ban_until_time > now_ms`).
     #[must_use]
-    pub fn active_for(&self, epoch: u64) -> bool {
-        // Epochs beyond i64 are unreachable on Cardano; saturate inactive.
-        i64::try_from(epoch).is_ok_and(|e| self.ban_until_epoch > e)
+    pub fn active_at(&self, now_ms: i64) -> bool {
+        self.permanent || self.ban_until_time > now_ms
     }
+
+    /// First ban for a pool — mirrors `spo-bans.ak` `first_ban_data` exactly,
+    /// so the ApplyBan output datum matches what the validator recomputes.
+    /// `start_time_ms` is the ban-start time the validator derives from the tx
+    /// validity interval; `base_ban_duration_ms` / `max_faults_before_permanent`
+    /// are the ban validator's parameters.
+    #[must_use]
+    pub fn first_ban(
+        evidence_hash: Vec<u8>,
+        start_time_ms: i64,
+        base_ban_duration_ms: i64,
+        max_faults_before_permanent: i64,
+    ) -> Self {
+        let ban_counter = 1;
+        Self {
+            ban_counter,
+            ban_until_time: start_time_ms + ban_duration(base_ban_duration_ms, ban_counter),
+            permanent: ban_counter >= max_faults_before_permanent,
+            evidence_hashes: vec![evidence_hash],
+        }
+    }
+
+    /// Repeated-ban update — mirrors `spo-bans.ak` `repeated_ban_transition_ok`,
+    /// which is the datum the validator actually requires: it calls the
+    /// `repeated_ban_data` helper (whose `permanent` is a throwaway `false`)
+    /// then **overrides** `permanent = new_ban_counter >= max_faults_before_permanent`.
+    /// So a reban escalates to permanent exactly like a first ban — we must
+    /// reproduce that, not the helper's `false`, or the output datum is rejected.
+    /// The new `evidence_hash` is **prepended** (Aiken `list.push` adds to the
+    /// front), keeping the on-chain list order byte-exact and the invariant
+    /// `len(evidence_hashes) == ban_counter` (spo-bans.ak:31).
+    #[must_use]
+    pub fn repeated_ban(
+        &self,
+        evidence_hash: Vec<u8>,
+        start_time_ms: i64,
+        base_ban_duration_ms: i64,
+        max_faults_before_permanent: i64,
+    ) -> Self {
+        let ban_counter = self.ban_counter + 1;
+        let mut evidence_hashes = Vec::with_capacity(self.evidence_hashes.len() + 1);
+        evidence_hashes.push(evidence_hash);
+        evidence_hashes.extend_from_slice(&self.evidence_hashes);
+        Self {
+            ban_counter,
+            ban_until_time: self
+                .ban_until_time
+                .max(start_time_ms)
+                .saturating_add(ban_duration(base_ban_duration_ms, ban_counter)),
+            permanent: ban_counter >= max_faults_before_permanent,
+            evidence_hashes,
+        }
+    }
+}
+
+/// `base_ban_duration_ms * 2^(ban_counter - 1)` (`spo-bans.ak` `ban_duration`).
+/// Saturates rather than overflowing — `ban_counter` is bounded by the
+/// validator's `max_faults_before_permanent`, so this never bites in practice.
+#[must_use]
+pub fn ban_duration(base_ban_duration_ms: i64, ban_counter: i64) -> i64 {
+    // Clamp the counter BEFORE subtracting so a non-positive `ban_counter`
+    // (this is `pub`, so not shielded by the decoder's `< 1` rejection) can't
+    // underflow `i64::MIN - 1`.
+    let exp = u32::try_from(ban_counter.max(1) - 1).unwrap_or(u32::MAX);
+    base_ban_duration_ms.saturating_mul(2i64.saturating_pow(exp))
+}
+
+/// The FaultProof token name `blake2b_256(pool_id || evidence_hash)` that
+/// `fault_verifier.ak` mints and `spo_bans.ak` recomputes + burns to bind the
+/// ban to a specific pool and piece of fault evidence.
+#[must_use]
+pub fn fault_token_name(pool_id: &[u8], evidence_hash: &[u8]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(pool_id.len() + evidence_hash.len());
+    buf.extend_from_slice(pool_id);
+    buf.extend_from_slice(evidence_hash);
+    crate::cardano::hash::blake2b_256(&buf)
 }
 
 /// `ElementData<BanListRootData, BanNodeData>`.
@@ -110,7 +193,7 @@ pub enum BanListError {
     /// Node asset name lacks the `"ban/"` prefix, or its key (pool_id) is
     /// empty / longer than 28 bytes.
     BadNodeKey(Vec<u8>),
-    /// `ban_counter < 1` or `ban_until_epoch < 0` — the validator can never
+    /// `ban_counter < 1` or `ban_until_time < 0` — the validator can never
     /// produce these.
     BadNodeData {
         pool_id: Vec<u8>,
@@ -226,7 +309,15 @@ impl BanElement {
             BanElementData::Root => constr(0, vec![constr(0, vec![])]),
             BanElementData::Node(n) => constr(
                 1,
-                vec![constr(0, vec![int(n.ban_counter), int(n.ban_until_epoch)])],
+                vec![constr(
+                    0,
+                    vec![
+                        int(n.ban_counter),
+                        int(n.ban_until_time),
+                        plutus::bool_data(n.permanent),
+                        plutus::array(n.evidence_hashes.iter().map(|h| bytes(h)).collect()),
+                    ],
+                )],
             ),
         };
         let link = match &self.link {
@@ -258,10 +349,12 @@ impl BanElement {
             1 => {
                 expect_len(data_fields, 1)?;
                 let node_fields = plutus::constr_fields(&data_fields[0], 0)?;
-                expect_len(node_fields, 2)?;
+                expect_len(node_fields, 4)?;
                 BanElementData::Node(BanNodeData {
                     ban_counter: plutus::field_int(node_fields, 0)?,
-                    ban_until_epoch: plutus::field_int(node_fields, 1)?,
+                    ban_until_time: plutus::field_int(node_fields, 1)?,
+                    permanent: plutus::field_bool(node_fields, 2)?,
+                    evidence_hashes: plutus::field_list_bytes(node_fields, 3)?,
                 })
             }
             other => return Err(BanListError::WrongConstructor(other)),
@@ -338,7 +431,14 @@ impl BanList {
                 let BanElementData::Node(data) = element.data else {
                     return Err(BanListError::KindMismatch(asset_name));
                 };
-                if data.ban_counter < 1 || data.ban_until_epoch < 0 {
+                // `spo-bans.ak` enforces these on-chain, so a genuine node
+                // always satisfies them; a violation means corrupt/forged state.
+                // The `len == ban_counter` invariant is the validator's
+                // `list.length(evidence_hashes) == ban_counter` (spo-bans.ak:31).
+                if data.ban_counter < 1
+                    || data.ban_until_time < 0
+                    || data.evidence_hashes.len() as i64 != data.ban_counter
+                {
                     return Err(BanListError::BadNodeData { pool_id });
                 }
                 let entry = NodeEntry {
@@ -406,19 +506,20 @@ impl BanList {
         self.nodes.iter().map(|(k, e)| (k.as_slice(), &e.data))
     }
 
-    /// Whether `pool_id` is banned for `epoch`.
+    /// Whether `pool_id` is banned at POSIX time `now_ms`.
     #[must_use]
-    pub fn is_banned(&self, pool_id: &[u8], epoch: u64) -> bool {
-        self.get(pool_id).is_some_and(|d| d.active_for(epoch))
+    pub fn is_banned(&self, pool_id: &[u8], now_ms: i64) -> bool {
+        self.get(pool_id).is_some_and(|d| d.active_at(now_ms))
     }
 
-    /// The pool_ids actively banned for `epoch` — the set the eligible
-    /// roster (WI-012) subtracts from the registry snapshot.
+    /// The pool_ids actively banned at POSIX time `now_ms` — the set the
+    /// eligible roster (WI-012) subtracts from the registry snapshot. Pass the
+    /// **epoch-boundary** time so every SPO derives the same roster.
     #[must_use]
-    pub fn active_bans(&self, epoch: u64) -> BTreeSet<Vec<u8>> {
+    pub fn active_bans(&self, now_ms: i64) -> BTreeSet<Vec<u8>> {
         self.nodes
             .iter()
-            .filter(|(_, e)| e.data.active_for(epoch))
+            .filter(|(_, e)| e.data.active_at(now_ms))
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -591,7 +692,10 @@ mod tests {
     fn node_data(counter: i64, until: i64) -> BanNodeData {
         BanNodeData {
             ban_counter: counter,
-            ban_until_epoch: until,
+            ban_until_time: until,
+            permanent: false,
+            // Satisfy the on-chain invariant len(evidence_hashes) == ban_counter.
+            evidence_hashes: (0..counter.max(0)).map(|i| vec![i as u8; 32]).collect(),
         }
     }
 
@@ -664,14 +768,16 @@ mod tests {
             link: None,
         };
         assert_eq!(hex::encode(root.to_cbor()), "d8799fd8799fd87980ffd87a80ff");
-        // Node{1, 10} link→"x": ints encoded inline.
+        // Node{counter:1, until:10, permanent:false=Constr(0,[]),
+        // evidence:[0u8;32]} link→"x": ban_counter and evidence_hashes length
+        // match (invariant), bool as Constr(0,[]), list as Indef array.
         let node = BanElement {
             data: BanElementData::Node(node_data(1, 10)),
             link: Some(b"x".to_vec()),
         };
         assert_eq!(
             hex::encode(node.to_cbor()),
-            "d8799fd87a9fd8799f010affffd8799f4178ffff"
+            "d8799fd87a9fd8799f010ad879809f58200000000000000000000000000000000000000000000000000000000000000000ffffffd8799f4178ffff"
         );
     }
 
@@ -689,7 +795,7 @@ mod tests {
             BanElement::from_plutus_data(&bad),
             Err(BanListError::WrongConstructor(2))
         ));
-        // BanNodeData must have 2 fields
+        // BanNodeData must have 4 fields
         let bad = constr(
             0,
             vec![constr(1, vec![constr(0, vec![int(1)])]), none_link.clone()],
@@ -697,15 +803,26 @@ mod tests {
         assert!(matches!(
             BanElement::from_plutus_data(&bad),
             Err(BanListError::FieldCount {
-                expected: 2,
+                expected: 4,
                 got: 1
             })
         ));
-        // BanNodeData fields must be Ints
+        // BanNodeData field 0 (ban_counter) must be an Int
         let bad = constr(
             0,
             vec![
-                constr(1, vec![constr(0, vec![bytes(b"x"), int(1)])]),
+                constr(
+                    1,
+                    vec![constr(
+                        0,
+                        vec![
+                            bytes(b"x"),
+                            int(1),
+                            plutus::bool_data(false),
+                            plutus::array(vec![]),
+                        ],
+                    )],
+                ),
                 none_link,
             ],
         );
@@ -716,6 +833,68 @@ mod tests {
     }
 
     #[test]
+    fn ban_transitions_mirror_the_contract() {
+        // first ban: counter 1, until = start + base, permanent iff 1 >= max.
+        let base = 1000;
+        let first = BanNodeData::first_ban(vec![0xAB; 32], 5000, base, 3);
+        assert_eq!(first.ban_counter, 1);
+        assert_eq!(first.ban_until_time, 5000 + base); // base * 2^0
+        assert!(!first.permanent); // 1 >= 3 is false
+        assert_eq!(first.evidence_hashes, vec![vec![0xAB; 32]]);
+        // max_faults_before_permanent = 1 → first ban is permanent.
+        assert!(BanNodeData::first_ban(vec![0u8; 32], 0, base, 1).permanent);
+
+        // reban: counter+1, until = max(old_until, start) + base*2^(counter-1),
+        // permanent = (new_counter >= max) [validator OVERRIDES the helper's
+        // throwaway false], new evidence prepended. max=3, counter=2 → not yet.
+        let second = first.repeated_ban(vec![0xCD; 32], 4000, base, 3);
+        assert_eq!(second.ban_counter, 2);
+        // max(6000, 4000) + base*2^1 = 6000 + 2000.
+        assert_eq!(second.ban_until_time, 6000 + 2 * base);
+        assert!(!second.permanent);
+        assert_eq!(second.evidence_hashes, vec![vec![0xCD; 32], vec![0xAB; 32]]);
+        // len(evidence_hashes) == ban_counter invariant (spo-bans.ak:31).
+        assert_eq!(second.evidence_hashes.len() as i64, second.ban_counter);
+
+        // A reban that REACHES max_faults_before_permanent escalates to permanent.
+        let crosses = first.repeated_ban(vec![0xEE; 32], 4000, base, 2);
+        assert_eq!(crosses.ban_counter, 2);
+        assert!(crosses.permanent); // 2 >= 2
+
+        assert_eq!(ban_duration(1000, 1), 1000);
+        assert_eq!(ban_duration(1000, 4), 8000); // 1000 * 2^3
+    }
+
+    #[test]
+    fn fault_token_name_is_blake2b_of_pool_and_evidence() {
+        let pool = [0x11u8; 28];
+        let evidence = [0x22u8; 32];
+        let mut concat = pool.to_vec();
+        concat.extend_from_slice(&evidence);
+        assert_eq!(
+            fault_token_name(&pool, &evidence),
+            crate::cardano::hash::blake2b_256(&concat)
+        );
+        // 32-byte asset name, distinct per (pool, evidence).
+        assert_ne!(
+            fault_token_name(&pool, &evidence),
+            fault_token_name(&pool, &[0x33u8; 32])
+        );
+    }
+
+    #[test]
+    fn active_at_uses_permanent_and_time() {
+        let temp = node_data(1, 1000); // permanent=false, until=1000
+        assert!(temp.active_at(999));
+        assert!(!temp.active_at(1000)); // strictly greater
+        let perm = BanNodeData {
+            permanent: true,
+            ..node_data(2, 0)
+        };
+        assert!(perm.active_at(i64::MAX)); // permanent never expires
+    }
+
+    #[test]
     fn reconstructs_list_and_reads_bans() {
         let list = two_node_list();
         assert_eq!(list.len(), 2);
@@ -723,7 +902,7 @@ mod tests {
         assert_eq!(keys, [b"aa-pool", b"bb-pool"]);
         assert_eq!(list.get(b"bb-pool"), Some(&node_data(2, 20)));
 
-        // active iff ban_until_epoch > epoch
+        // active iff permanent || ban_until_time > now_ms
         assert!(list.is_banned(b"aa-pool", 9));
         assert!(!list.is_banned(b"aa-pool", 10), "until == epoch is expired");
         assert!(!list.is_banned(b"zz-pool", 0), "unknown pool is not banned");

@@ -1723,25 +1723,30 @@ fn run_show_roster(
             .map_err(|e| e.to_string())?;
             println!("ban policy:        {}", source.ban_policy_hex);
             println!("ban address:       {}", source.ban_address);
+            // Ban activity is evaluated at the epoch boundary (chain-derived),
+            // the same deterministic time the live roster path uses.
+            let epoch_start_ms =
+                rt.block_on(bf_http::fetch_epoch_start_ms(&base_url, pid, epoch))?;
             match rt.block_on(source.fetch_ban_list(&base_url, pid)) {
                 Ok(bans) => {
-                    active_bans = bans.active_bans(epoch);
+                    active_bans = bans.active_bans(epoch_start_ms);
                     println!(
-                        "ban entries:       {} ({} active for epoch {epoch})",
+                        "ban entries:       {} ({} active at epoch {epoch} boundary)",
                         bans.len(),
                         active_bans.len()
                     );
                     for (pool_id, data) in bans.iter() {
-                        let state = if data.active_for(epoch) {
+                        let state = if data.active_at(epoch_start_ms) {
                             "ACTIVE"
                         } else {
                             "expired"
                         };
                         println!(
-                            "  pool {}  counter={} until_epoch={} [{state}]",
+                            "  pool {}  counter={} until_time={} permanent={} [{state}]",
                             hex::encode(pool_id),
                             data.ban_counter,
-                            data.ban_until_epoch
+                            data.ban_until_time,
+                            data.permanent
                         );
                     }
                 }

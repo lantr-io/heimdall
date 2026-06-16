@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use frost_secp256k1_tr::Identifier;
 
 use crate::cardano::ban_list::{BanListError, BanListSource};
+use crate::cardano::bf_http;
 use crate::cardano::hash::pool_id_bech32;
 use crate::cardano::roster::{
     FROST_MIN_PARTICIPANTS, RegistryRosterSource, RegistrySnapshot, RosterError,
@@ -357,6 +358,9 @@ impl DkgContext {
 pub enum DkgFetchError {
     Registry(RosterError),
     Ban(BanListError),
+    /// The epoch-boundary time query (`/epochs/{n}`) failed — distinct from a
+    /// ban-list problem so an `/epochs` outage isn't misdiagnosed as one.
+    EpochTime(String),
     /// A stake query for an eligible pool failed — fatal: `t` can't be
     /// computed honestly, so the attempt is void.
     Stake(String),
@@ -368,6 +372,7 @@ impl std::fmt::Display for DkgFetchError {
         match self {
             Self::Registry(e) => write!(f, "registry: {e}"),
             Self::Ban(e) => write!(f, "ban list: {e}"),
+            Self::EpochTime(e) => write!(f, "epoch time: {e}"),
             Self::Stake(e) => write!(f, "stake: {e}"),
             Self::Derive(e) => write!(f, "{e}"),
         }
@@ -383,12 +388,12 @@ pub async fn fetch_active_bans(
     bans: Option<&BanListSource>,
     base_url: &str,
     project_id: &str,
-    epoch: u64,
+    now_ms: i64,
 ) -> Result<BTreeSet<Vec<u8>>, BanListError> {
     match bans {
         None => Ok(BTreeSet::new()),
         Some(src) => match src.fetch_ban_list(base_url, project_id).await {
-            Ok(list) => Ok(list.active_bans(epoch)),
+            Ok(list) => Ok(list.active_bans(now_ms)),
             Err(BanListError::NotBootstrapped) => Ok(BTreeSet::new()),
             Err(e) => Err(e),
         },
@@ -426,11 +431,24 @@ pub async fn fetch_dkg_context(
     epoch: u64,
     attempt: u32,
 ) -> Result<DkgContext, DkgFetchError> {
-    let snapshot = registry
-        .fetch_snapshot(base_url, project_id)
-        .await
-        .map_err(DkgFetchError::Registry)?;
-    let active_bans = fetch_active_bans(bans, base_url, project_id, epoch)
+    // The registry snapshot and the epoch-boundary time are independent — fetch
+    // them concurrently. Ban activity is checked at that boundary time
+    // (chain-derived, not a node clock) so every SPO subtracts the same set and
+    // derives the same roster.
+    let (snapshot, epoch_start_ms) = tokio::try_join!(
+        async {
+            registry
+                .fetch_snapshot(base_url, project_id)
+                .await
+                .map_err(DkgFetchError::Registry)
+        },
+        async {
+            bf_http::fetch_epoch_start_ms(base_url, project_id, epoch)
+                .await
+                .map_err(DkgFetchError::EpochTime)
+        },
+    )?;
+    let active_bans = fetch_active_bans(bans, base_url, project_id, epoch_start_ms)
         .await
         .map_err(DkgFetchError::Ban)?;
     let eligible = eligible_pool_ids(&snapshot, &active_bans);
