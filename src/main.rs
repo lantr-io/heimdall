@@ -1276,6 +1276,36 @@ fn submit_tx_blockfrost(
         .map_err(|e| format!("blockfrost submit: {e}"))
 }
 
+/// The Cardano network of a bech32 address — testnet iff the `addr_test` HRP.
+/// Single source of truth for the on-chain command handlers (they previously
+/// open-coded this with inverted branch order, an easy place to drift).
+fn network_of(addr: &str) -> pallas_addresses::Network {
+    if addr.starts_with("addr_test") {
+        pallas_addresses::Network::Testnet
+    } else {
+        pallas_addresses::Network::Mainnet
+    }
+}
+
+/// The shared dry-run / `--submit` tail of the on-chain tx commands: on a dry
+/// run print the notice and stop; otherwise broadcast via Blockfrost and print
+/// the tx hash. Centralizes the user-facing wording so the copies can't drift.
+fn finish_tx(
+    cfg: &HeimdallConfig,
+    project_id: &str,
+    rt: &tokio::runtime::Runtime,
+    submit: bool,
+    signed_tx_hex: &str,
+) -> Result<(), String> {
+    if !submit {
+        println!("(dry run — pass --submit to broadcast via Blockfrost)");
+        return Ok(());
+    }
+    let tx_hash = submit_tx_blockfrost(cfg, project_id, signed_tx_hex, rt)?;
+    println!("submitted: tx_hash={tx_hash}");
+    Ok(())
+}
+
 /// Build (and with `submit`, broadcast) the registry-list bootstrap: the
 /// one-shot `Bootstrap` mint creating the `"reg-root"` anchor element.
 /// See `heimdall::cardano::register_spo`.
@@ -1355,13 +1385,7 @@ fn run_bootstrap_registry(
     println!("registry address:     {}", built.script_address);
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
-    if !submit {
-        println!("(dry run — pass --submit to broadcast via Blockfrost)");
-        return Ok(());
-    }
-    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
-    println!("submitted: tx_hash={tx_hash}");
-    Ok(())
+    finish_tx(cfg, pid, &rt, submit, &built.signed_tx_hex)
 }
 
 /// Build (and with `submit`, broadcast) the registry reference-script deploy.
@@ -1680,11 +1704,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     }
 
     // ── chain state ──
-    let network = if wallet_addr.starts_with("addr_test") {
-        pallas_addresses::Network::Testnet
-    } else {
-        pallas_addresses::Network::Mainnet
-    };
+    let network = network_of(&wallet_addr);
     let registry_addr = registry.enterprise_address(network);
     let treasury_addr = treasury.enterprise_address(network);
     let wallet_raw = rt
@@ -1756,13 +1776,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
-    if !args.submit {
-        println!("(dry run — pass --submit to broadcast via Blockfrost)");
-        return Ok(());
-    }
-    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
-    println!("submitted: tx_hash={tx_hash}");
-    Ok(())
+    finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex)
 }
 
 /// Build (and with `--submit`, broadcast) the `spo_bans.ApplyBan` tx: consume a
@@ -1823,12 +1837,8 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
-    let mainnet = !wallet_addr.starts_with("addr_test");
-    let network = if mainnet {
-        pallas_addresses::Network::Mainnet
-    } else {
-        pallas_addresses::Network::Testnet
-    };
+    let network = network_of(&wallet_addr);
+    let mainnet = matches!(network, pallas_addresses::Network::Mainnet);
     let ban_addr = spo_bans.enterprise_address(network);
     let registry_addr = registry.enterprise_address(network);
 
@@ -1953,13 +1963,7 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
-    if !args.submit {
-        println!("(dry run — pass --submit to broadcast via Blockfrost)");
-        return Ok(());
-    }
-    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
-    println!("submitted: tx_hash={tx_hash}");
-    Ok(())
+    finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex)
 }
 
 /// Build (and with `--submit`, broadcast) the `fault_verifier.PublishProof` tx:
@@ -2046,13 +2050,7 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
-    if !args.submit {
-        println!("(dry run — pass --submit to broadcast via Blockfrost)");
-        return Ok(());
-    }
-    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
-    println!("submitted: tx_hash={tx_hash}");
-    Ok(())
+    finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex)
 }
 
 /// Read + verify the on-chain SPO registry and print the DKG roster (WI-010).
