@@ -302,6 +302,31 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Build (and with --submit, broadcast) the fault_verifier.PublishProof tx:
+    /// mint the FaultProof token and park it at the wallet for a later
+    /// apply-ban to consume (WI-018).
+    FaultProofMint {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// Fault kind: `invalid-payload` or `equivocation`.
+        #[arg(long)]
+        kind: String,
+        /// The accused pool id (28-byte hex).
+        #[arg(long)]
+        accused_pool_id: String,
+        /// The protocol namespace hash (32-byte hex) — descriptive datum field.
+        #[arg(long)]
+        namespace_hash: String,
+        /// The fault evidence hash (32-byte hex) — binds the FaultProof token.
+        #[arg(long)]
+        evidence_hash: String,
+        /// Actually submit via Blockfrost.
+        #[arg(long)]
+        submit: bool,
+    },
     /// Read + verify the on-chain SPO registry and print the DKG roster:
     /// reconstructs the spos_registry linked list, cross-checks the rebuilt
     /// identity-trie root against the treasury_info datum, and orders
@@ -610,6 +635,29 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_apply_ban(&cfg, &args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::FaultProofMint {
+            config,
+            blueprint,
+            kind,
+            accused_pool_id,
+            namespace_hash,
+            evidence_hash,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            let args = FaultProofMintArgs {
+                blueprint,
+                kind,
+                accused_pool_id,
+                namespace_hash,
+                evidence_hash,
+                submit,
+            };
+            if let Err(e) = run_fault_proof_mint(&cfg, &args) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1406,6 +1454,16 @@ struct ApplyBanArgs {
     submit: bool,
 }
 
+/// fault-proof-mint CLI inputs.
+struct FaultProofMintArgs {
+    blueprint: String,
+    kind: String,
+    accused_pool_id: String,
+    namespace_hash: String,
+    evidence_hash: String,
+    submit: bool,
+}
+
 /// Parse a 32-byte secret-key argument: inline hex, a file containing hex, or
 /// a cardano-cli TextEnvelope file (`cborHex` = `"5820" || 32 bytes`).
 fn parse_key32(arg: &str, what: &str) -> Result<[u8; 32], String> {
@@ -1892,6 +1950,99 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     );
     println!(
         "validity:          slots [{invalid_before}, {invalid_hereafter}), start_time_ms {start_time_ms}"
+    );
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    if !args.submit {
+        println!("(dry run — pass --submit to broadcast via Blockfrost)");
+        return Ok(());
+    }
+    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
+    println!("submitted: tx_hash={tx_hash}");
+    Ok(())
+}
+
+/// Build (and with `--submit`, broadcast) the `fault_verifier.PublishProof` tx:
+/// mint the FaultProof token `blake2b_256(accused_pool_id || evidence_hash)` and
+/// park it at the wallet with the inline FaultProofDatum (WI-018 pt3b). A later
+/// `apply-ban` consumes + burns it.
+fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::fault_verifier_script;
+    use heimdall::cardano::fault_proof::{
+        FaultKind, FaultProofDatum, FaultProofMintRequest, build_fault_proof_mint_tx,
+    };
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = std::fs::read_to_string(&args.blueprint)
+        .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
+    let fault_vscript = fault_verifier_script(&blueprint_json)
+        .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
+
+    let kind = match args.kind.as_str() {
+        "invalid-payload" => FaultKind::InvalidPayload,
+        "equivocation" => FaultKind::Equivocation,
+        other => {
+            return Err(format!(
+                "--kind must be `invalid-payload` or `equivocation`, got `{other}`"
+            ));
+        }
+    };
+    let accused_pool_id: [u8; 28] = parse_hex_n(&args.accused_pool_id, "--accused-pool-id")?;
+    let namespace_hash: [u8; 32] = parse_hex_n(&args.namespace_hash, "--namespace-hash")?;
+    let evidence_hash: [u8; 32] = parse_hex_n(&args.evidence_hash, "--evidence-hash")?;
+    let fault = FaultProofDatum {
+        kind,
+        accused_pool_id: accused_pool_id.to_vec(),
+        namespace_hash: namespace_hash.to_vec(),
+        evidence_hash: evidence_hash.to_vec(),
+    };
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    let wallet_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let req = FaultProofMintRequest {
+        fault_verifier_script: &fault_vscript,
+        fault: &fault,
+        wallet_address: &wallet_addr,
+        wallet_utxos: &wallet_utxos,
+        key: &key,
+        cost_models: Some(cost_models),
+    };
+    let built =
+        build_fault_proof_mint_tx(&req).map_err(|e| format!("build fault-proof mint tx: {e}"))?;
+
+    println!("fault policy:      {}", built.policy_id_hex);
+    println!(
+        "FaultProof token:  {}.{}",
+        built.policy_id_hex,
+        hex::encode(built.token_name)
+    );
+    println!(
+        "parked at:         {} ({} lovelace) — spend with `apply-ban`",
+        built.proof_address, built.lovelace
+    );
+    println!(
+        "nonce input_ref:   {}:{}",
+        built.input_ref.0, built.input_ref.1
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
