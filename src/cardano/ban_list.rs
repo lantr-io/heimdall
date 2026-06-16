@@ -713,6 +713,18 @@ impl BanPolicyParams {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // ban_config_ok requires the 3 policies be DISTINCT; a duplicate derives
+        // a policy id no real deployment has → wrong ban address → silently empty
+        // ban list (banned SPOs slip into the roster). Distinctness always holds
+        // on a valid deployment, so reject it here as a config typo.
+        if fault_proof_policies.iter().collect::<BTreeSet<_>>().len() != fault_proof_policies.len()
+        {
+            return Err(BanListError::Config(
+                "cardano.fault_proof_policies has a duplicate entry — spo_bans \
+                 ban_config_ok requires 3 distinct fault verifiers"
+                    .into(),
+            ));
+        }
         let req = |v: Option<i64>, name: &str| {
             v.ok_or_else(|| {
                 BanListError::Config(format!(
@@ -720,14 +732,34 @@ impl BanPolicyParams {
                 ))
             })
         };
+        let base_ban_duration_ms = req(cardano.base_ban_duration_ms, "base_ban_duration_ms")?;
+        let max_faults_before_permanent = req(
+            cardano.max_faults_before_permanent,
+            "max_faults_before_permanent",
+        )?;
+        let max_validity_window_ms = req(cardano.max_validity_window_ms, "max_validity_window_ms")?;
+        // Match ban_config_ok's bounds — the params are baked into the policy id,
+        // so an out-of-range value silently derives the wrong ban address.
+        if base_ban_duration_ms <= 0 {
+            return Err(BanListError::Config(
+                "cardano.base_ban_duration_ms must be > 0".into(),
+            ));
+        }
+        if max_faults_before_permanent <= 0 {
+            return Err(BanListError::Config(
+                "cardano.max_faults_before_permanent must be > 0".into(),
+            ));
+        }
+        if max_validity_window_ms < 0 {
+            return Err(BanListError::Config(
+                "cardano.max_validity_window_ms must be >= 0".into(),
+            ));
+        }
         Ok(Self {
             fault_proof_policies,
-            base_ban_duration_ms: req(cardano.base_ban_duration_ms, "base_ban_duration_ms")?,
-            max_faults_before_permanent: req(
-                cardano.max_faults_before_permanent,
-                "max_faults_before_permanent",
-            )?,
-            max_validity_window_ms: req(cardano.max_validity_window_ms, "max_validity_window_ms")?,
+            base_ban_duration_ms,
+            max_faults_before_permanent,
+            max_validity_window_ms,
         })
     }
 }
@@ -1340,6 +1372,31 @@ mod tests {
         ));
         // 3 entries but one is not 28 bytes (27) → error
         c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "33".repeat(27)];
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
+            Err(BanListError::Config(_))
+        ));
+        // 3 entries but a DUPLICATE (count is 3, but not distinct) → error.
+        c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "11".repeat(28)];
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
+            Err(BanListError::Config(_))
+        ));
+        // Out-of-range ban-schedule params (contract bounds) → error.
+        c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "33".repeat(28)];
+        c.base_ban_duration_ms = Some(0); // must be > 0
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
+            Err(BanListError::Config(_))
+        ));
+        c.base_ban_duration_ms = Some(86_400_000);
+        c.max_faults_before_permanent = Some(0); // must be > 0
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
+            Err(BanListError::Config(_))
+        ));
+        c.max_faults_before_permanent = Some(3);
+        c.max_validity_window_ms = Some(-1); // must be >= 0
         assert!(matches!(
             BanPolicyParams::from_config(&c),
             Err(BanListError::Config(_))
