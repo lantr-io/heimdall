@@ -204,6 +204,9 @@ pub enum BanListError {
     NotAscending(Vec<u8>),
     /// Nodes exist that the chain from the root never reaches.
     UnreachableNodes(usize),
+    /// `plan_insert` was asked to first-ban a pool that is already banned —
+    /// that path is a reban (in-place update), not a list insert.
+    AlreadyBanned(Vec<u8>),
     // -- scan / fetch / config --
     /// A UTxO carrying ban-policy assets is not a well-formed element.
     BadElementUtxo(String),
@@ -247,6 +250,11 @@ impl std::fmt::Display for BanListError {
             Self::BrokenLink(k) => write!(f, "link to absent pool {}", hex::encode(k)),
             Self::NotAscending(k) => write!(f, "chain not ascending at pool {}", hex::encode(k)),
             Self::UnreachableNodes(n) => write!(f, "{n} node(s) unreachable from root"),
+            Self::AlreadyBanned(k) => write!(
+                f,
+                "pool {} is already banned (reban, not insert)",
+                hex::encode(k)
+            ),
             Self::BadElementUtxo(e) => write!(f, "ban element UTxO: {e}"),
             Self::Fetch(e) => write!(f, "fetch: {e}"),
             Self::Config(e) => write!(f, "ban-list source config: {e}"),
@@ -523,6 +531,86 @@ impl BanList {
             .map(|(k, _)| k.clone())
             .collect()
     }
+
+    /// The full element of a banned pool — its data and the bare pool_id of the
+    /// next node in chain order (`link`). A reban (in-place update) keeps the
+    /// same asset name + link, so it needs both. `None` if not banned.
+    #[must_use]
+    pub fn node(&self, pool_id: &[u8]) -> Option<(&BanNodeData, Option<&[u8]>)> {
+        self.nodes
+            .get(pool_id)
+            .map(|e| (&e.data, e.link.as_deref()))
+    }
+
+    /// Plan a FIRST-ban linked-list insert of `pool_id` — the off-chain analog
+    /// of `spo_bans.ak`'s `insert_ascending` (and a mirror of
+    /// `RegistryList::plan_insert`). Find the predecessor anchor (the greatest
+    /// banned pool_id `< pool_id`, or the root when none sorts below), relink it
+    /// to the new node, and give the new node the anchor's old link. `node_data`
+    /// is the [`BanNodeData::first_ban`] output. Errors if `pool_id` is already
+    /// banned — that path is a reban (in-place update), not an insert.
+    pub fn plan_insert(
+        &self,
+        pool_id: &[u8],
+        node_data: BanNodeData,
+    ) -> Result<BanInsert, BanListError> {
+        if pool_id.is_empty() || pool_id.len() > MAX_NODE_KEY_LEN {
+            return Err(BanListError::BadNodeKey(pool_id.to_vec()));
+        }
+        if self.nodes.contains_key(pool_id) {
+            return Err(BanListError::AlreadyBanned(pool_id.to_vec()));
+        }
+        // Predecessor anchor: greatest key < pool_id, else the root.
+        let (anchor_key, anchor_data, anchor_link) = match self
+            .nodes
+            .range::<[u8], _>((
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Excluded(pool_id),
+            ))
+            .next_back()
+        {
+            Some((key, entry)) => (
+                Some(key.clone()),
+                BanElementData::Node(entry.data.clone()),
+                entry.link.clone(),
+            ),
+            None => (None, BanElementData::Root, self.root_link.clone()),
+        };
+        // In a chain-checked list the anchor's successor sorts above the new key.
+        debug_assert!(anchor_link.as_deref().is_none_or(|l| l > pool_id));
+        let anchor_asset_name = match &anchor_key {
+            Some(key) => [BAN_NODE_KEY_PREFIX, key].concat(),
+            None => BAN_ROOT_KEY.to_vec(),
+        };
+        Ok(BanInsert {
+            anchor_asset_name,
+            continued_anchor: BanElement {
+                data: anchor_data,
+                link: Some(pool_id.to_vec()),
+            },
+            new_node_asset_name: [BAN_NODE_KEY_PREFIX, pool_id].concat(),
+            new_node: BanElement {
+                data: BanElementData::Node(node_data),
+                link: anchor_link,
+            },
+        })
+    }
+}
+
+/// A planned first-ban linked-list insert: which anchor element UTxO to spend,
+/// the continued-anchor + new-node datums, and the new node's NFT asset name.
+/// (The ban analog of `register_spo`'s `RegistryInsert`.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanInsert {
+    /// Asset name of the anchor element to spend (`"ban-root"` or
+    /// `"ban/" || predecessor_pool_id`).
+    pub anchor_asset_name: Vec<u8>,
+    /// Continued anchor: data unchanged, `link` → the new pool_id.
+    pub continued_anchor: BanElement,
+    /// New node NFT asset name (`"ban/" || pool_id`).
+    pub new_node_asset_name: Vec<u8>,
+    /// New ban node: `Node(node_data)`, `link` = the anchor's old link.
+    pub new_node: BanElement,
 }
 
 // ---------------------------------------------------------------------------
@@ -1143,6 +1231,64 @@ mod tests {
         assert!(matches!(
             ban_snapshot(&stray_only, BAN_POLICY),
             Err(BanListError::NotBootstrapped)
+        ));
+    }
+
+    #[test]
+    fn plan_insert_and_node_accessor() {
+        // root -> aa-pool(c1,until10,->bb-pool) -> bb-pool(c2,until20,->None)
+        let list = two_node_list();
+
+        // node() returns data + link (for reban).
+        assert_eq!(
+            list.node(b"aa-pool"),
+            Some((&node_data(1, 10), Some(b"bb-pool".as_slice())))
+        );
+        assert_eq!(list.node(b"bb-pool"), Some((&node_data(2, 20), None)));
+        assert!(list.node(b"zz").is_none());
+
+        // Insert "ba-pool" between aa-pool and bb-pool: anchor = aa-pool.
+        let data = node_data(1, 100);
+        let plan = list.plan_insert(b"ba-pool", data.clone()).unwrap();
+        assert_eq!(
+            plan.anchor_asset_name,
+            [BAN_NODE_KEY_PREFIX, b"aa-pool"].concat()
+        );
+        assert_eq!(
+            plan.continued_anchor.data,
+            BanElementData::Node(node_data(1, 10))
+        );
+        assert_eq!(
+            plan.continued_anchor.link.as_deref(),
+            Some(b"ba-pool".as_slice())
+        );
+        assert_eq!(
+            plan.new_node_asset_name,
+            [BAN_NODE_KEY_PREFIX, b"ba-pool"].concat()
+        );
+        assert_eq!(plan.new_node.data, BanElementData::Node(data));
+        // new node takes the anchor's old successor.
+        assert_eq!(plan.new_node.link.as_deref(), Some(b"bb-pool".as_slice()));
+
+        // Insert before all (sorts below aa-pool): anchor = root.
+        let plan0 = list.plan_insert(b"a0", node_data(1, 5)).unwrap();
+        assert_eq!(plan0.anchor_asset_name, BAN_ROOT_KEY);
+        assert_eq!(plan0.continued_anchor.data, BanElementData::Root);
+        assert_eq!(
+            plan0.continued_anchor.link.as_deref(),
+            Some(b"a0".as_slice())
+        );
+        assert_eq!(plan0.new_node.link.as_deref(), Some(b"aa-pool".as_slice()));
+
+        // Already banned → AlreadyBanned (that path is a reban).
+        assert!(matches!(
+            list.plan_insert(b"aa-pool", node_data(1, 5)),
+            Err(BanListError::AlreadyBanned(_))
+        ));
+        // Bad key length.
+        assert!(matches!(
+            list.plan_insert(&[1u8; 29], node_data(1, 5)),
+            Err(BanListError::BadNodeKey(_))
         ));
     }
 
