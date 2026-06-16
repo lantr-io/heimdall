@@ -45,8 +45,15 @@ pub const BAN_ROOT_KEY: &[u8] = b"ban-root";
 /// Prefix of every node's asset name (`ban_node_key_prefix`).
 pub const BAN_NODE_KEY_PREFIX: &[u8] = b"ban/";
 
-/// Max node key (pool_id) length: 32-byte asset name minus the prefix.
+/// Max node key length the reader tolerates: 32-byte asset name minus the
+/// prefix. Real keys are always [`POOL_ID_LEN`]; this only bounds defensive
+/// parsing of arbitrary on-chain state.
 const MAX_NODE_KEY_LEN: usize = 32 - BAN_NODE_KEY_PREFIX.len();
+
+/// A pool id is `blake2b_224(cold_vkey)` = 28 bytes; `spo_bans.ak`'s
+/// `is_pool_id` requires exactly this, so a first-ban [`BanList::plan_insert`]
+/// must too.
+const POOL_ID_LEN: usize = 28;
 
 /// `BanNodeData` — one pool's ban state (`spo-bans.ak` evidence-bound model).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +211,9 @@ pub enum BanListError {
     NotAscending(Vec<u8>),
     /// Nodes exist that the chain from the root never reaches.
     UnreachableNodes(usize),
+    /// `plan_insert` was asked to first-ban a pool that is already banned —
+    /// that path is a reban (in-place update), not a list insert.
+    AlreadyBanned(Vec<u8>),
     // -- scan / fetch / config --
     /// A UTxO carrying ban-policy assets is not a well-formed element.
     BadElementUtxo(String),
@@ -247,6 +257,11 @@ impl std::fmt::Display for BanListError {
             Self::BrokenLink(k) => write!(f, "link to absent pool {}", hex::encode(k)),
             Self::NotAscending(k) => write!(f, "chain not ascending at pool {}", hex::encode(k)),
             Self::UnreachableNodes(n) => write!(f, "{n} node(s) unreachable from root"),
+            Self::AlreadyBanned(k) => write!(
+                f,
+                "pool {} is already banned (reban, not insert)",
+                hex::encode(k)
+            ),
             Self::BadElementUtxo(e) => write!(f, "ban element UTxO: {e}"),
             Self::Fetch(e) => write!(f, "fetch: {e}"),
             Self::Config(e) => write!(f, "ban-list source config: {e}"),
@@ -320,10 +335,7 @@ impl BanElement {
                 )],
             ),
         };
-        let link = match &self.link {
-            Some(k) => constr(0, vec![bytes(k)]),
-            None => constr(1, vec![]),
-        };
+        let link = plutus::option(self.link.as_deref().map(bytes));
         constr(0, vec![data, link])
     }
 
@@ -523,6 +535,91 @@ impl BanList {
             .map(|(k, _)| k.clone())
             .collect()
     }
+
+    /// The full element of a banned pool — its data and the bare pool_id of the
+    /// next node in chain order (`link`). A reban (in-place update) keeps the
+    /// same asset name + link, so it needs both. `None` if not banned.
+    #[must_use]
+    pub fn node(&self, pool_id: &[u8]) -> Option<(&BanNodeData, Option<&[u8]>)> {
+        self.nodes
+            .get(pool_id)
+            .map(|e| (&e.data, e.link.as_deref()))
+    }
+
+    /// Plan a FIRST-ban linked-list insert of `pool_id` — the off-chain analog
+    /// of `spo_bans.ak`'s `insert_ascending` (and a mirror of
+    /// `RegistryList::plan_insert`). Find the predecessor anchor (the greatest
+    /// banned pool_id `< pool_id`, or the root when none sorts below), relink it
+    /// to the new node, and give the new node the anchor's old link. `node_data`
+    /// is the [`BanNodeData::first_ban`] output. Errors if `pool_id` is already
+    /// banned — that path is a reban (in-place update), not an insert.
+    pub fn plan_insert(
+        &self,
+        pool_id: &[u8],
+        node_data: BanNodeData,
+    ) -> Result<BanInsert, BanListError> {
+        // A ban node key is an accused pool_id; spo_bans.ak `is_pool_id` requires
+        // EXACTLY 28 bytes (blake2b_224). Be as strict as the validator so a
+        // mis-sized id is rejected here, not after fees/effort on-chain. (The
+        // reader stays lenient — it must parse whatever is already on-chain — but
+        // a first-ban plan is for a real, freshly-accused pool.)
+        if pool_id.len() != POOL_ID_LEN {
+            return Err(BanListError::BadNodeKey(pool_id.to_vec()));
+        }
+        if self.nodes.contains_key(pool_id) {
+            return Err(BanListError::AlreadyBanned(pool_id.to_vec()));
+        }
+        // Predecessor anchor: greatest key < pool_id, else the root.
+        let (anchor_key, anchor_data, anchor_link) = match self
+            .nodes
+            .range::<[u8], _>((
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Excluded(pool_id),
+            ))
+            .next_back()
+        {
+            Some((key, entry)) => (
+                Some(key.clone()),
+                BanElementData::Node(entry.data.clone()),
+                entry.link.clone(),
+            ),
+            None => (None, BanElementData::Root, self.root_link.clone()),
+        };
+        // In a chain-checked list the anchor's successor sorts above the new key.
+        debug_assert!(anchor_link.as_deref().is_none_or(|l| l > pool_id));
+        let anchor_asset_name = match &anchor_key {
+            Some(key) => [BAN_NODE_KEY_PREFIX, key].concat(),
+            None => BAN_ROOT_KEY.to_vec(),
+        };
+        Ok(BanInsert {
+            anchor_asset_name,
+            continued_anchor: BanElement {
+                data: anchor_data,
+                link: Some(pool_id.to_vec()),
+            },
+            new_node_asset_name: [BAN_NODE_KEY_PREFIX, pool_id].concat(),
+            new_node: BanElement {
+                data: BanElementData::Node(node_data),
+                link: anchor_link,
+            },
+        })
+    }
+}
+
+/// A planned first-ban linked-list insert: which anchor element UTxO to spend,
+/// the continued-anchor + new-node datums, and the new node's NFT asset name.
+/// (The ban analog of `register_spo`'s `RegistryInsert`.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanInsert {
+    /// Asset name of the anchor element to spend (`"ban-root"` or
+    /// `"ban/" || predecessor_pool_id`).
+    pub anchor_asset_name: Vec<u8>,
+    /// Continued anchor: data unchanged, `link` → the new pool_id.
+    pub continued_anchor: BanElement,
+    /// New node NFT asset name (`"ban/" || pool_id`).
+    pub new_node_asset_name: Vec<u8>,
+    /// New ban node: `Node(node_data)`, `link` = the anchor's old link.
+    pub new_node: BanElement,
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +722,18 @@ impl BanPolicyParams {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // ban_config_ok requires the 3 policies be DISTINCT; a duplicate derives
+        // a policy id no real deployment has → wrong ban address → silently empty
+        // ban list (banned SPOs slip into the roster). Distinctness always holds
+        // on a valid deployment, so reject it here as a config typo.
+        if fault_proof_policies.iter().collect::<BTreeSet<_>>().len() != fault_proof_policies.len()
+        {
+            return Err(BanListError::Config(
+                "cardano.fault_proof_policies has a duplicate entry — spo_bans \
+                 ban_config_ok requires 3 distinct fault verifiers"
+                    .into(),
+            ));
+        }
         let req = |v: Option<i64>, name: &str| {
             v.ok_or_else(|| {
                 BanListError::Config(format!(
@@ -632,14 +741,34 @@ impl BanPolicyParams {
                 ))
             })
         };
+        let base_ban_duration_ms = req(cardano.base_ban_duration_ms, "base_ban_duration_ms")?;
+        let max_faults_before_permanent = req(
+            cardano.max_faults_before_permanent,
+            "max_faults_before_permanent",
+        )?;
+        let max_validity_window_ms = req(cardano.max_validity_window_ms, "max_validity_window_ms")?;
+        // Match ban_config_ok's bounds — the params are baked into the policy id,
+        // so an out-of-range value silently derives the wrong ban address.
+        if base_ban_duration_ms <= 0 {
+            return Err(BanListError::Config(
+                "cardano.base_ban_duration_ms must be > 0".into(),
+            ));
+        }
+        if max_faults_before_permanent <= 0 {
+            return Err(BanListError::Config(
+                "cardano.max_faults_before_permanent must be > 0".into(),
+            ));
+        }
+        if max_validity_window_ms < 0 {
+            return Err(BanListError::Config(
+                "cardano.max_validity_window_ms must be >= 0".into(),
+            ));
+        }
         Ok(Self {
             fault_proof_policies,
-            base_ban_duration_ms: req(cardano.base_ban_duration_ms, "base_ban_duration_ms")?,
-            max_faults_before_permanent: req(
-                cardano.max_faults_before_permanent,
-                "max_faults_before_permanent",
-            )?,
-            max_validity_window_ms: req(cardano.max_validity_window_ms, "max_validity_window_ms")?,
+            base_ban_duration_ms,
+            max_faults_before_permanent,
+            max_validity_window_ms,
         })
     }
 }
@@ -1146,6 +1275,76 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn node_accessor_returns_data_and_link() {
+        // The reader tolerates short keys; node() exposes (data, link) for reban.
+        let list = two_node_list();
+        assert_eq!(
+            list.node(b"aa-pool"),
+            Some((&node_data(1, 10), Some(b"bb-pool".as_slice())))
+        );
+        assert_eq!(list.node(b"bb-pool"), Some((&node_data(2, 20), None)));
+        assert!(list.node(b"zz").is_none());
+    }
+
+    #[test]
+    fn plan_insert_links_correctly() {
+        // plan_insert requires EXACTLY-28-byte pool ids (is_pool_id), so build a
+        // 28-byte-keyed list: root -> lo -> hi.
+        let lo = [0x10u8; 28];
+        let hi = [0xf0u8; 28];
+        let list = BanList::from_elements([
+            root_elem(Some(&lo)),
+            node_elem(&lo, node_data(1, 10), Some(&hi)),
+            node_elem(&hi, node_data(2, 20), None),
+        ])
+        .unwrap();
+
+        // Insert mid (lo < mid < hi): anchor = lo, mid takes lo's old link (hi).
+        let mid = [0x80u8; 28];
+        let data = node_data(1, 100);
+        let plan = list.plan_insert(&mid, data.clone()).unwrap();
+        assert_eq!(plan.anchor_asset_name, [BAN_NODE_KEY_PREFIX, &lo].concat());
+        assert_eq!(
+            plan.continued_anchor.data,
+            BanElementData::Node(node_data(1, 10))
+        );
+        assert_eq!(plan.continued_anchor.link.as_deref(), Some(mid.as_slice()));
+        assert_eq!(
+            plan.new_node_asset_name,
+            [BAN_NODE_KEY_PREFIX, &mid].concat()
+        );
+        assert_eq!(plan.new_node.data, BanElementData::Node(data));
+        assert_eq!(plan.new_node.link.as_deref(), Some(hi.as_slice()));
+
+        // Insert below lo: anchor = root, new node takes root's old link (lo).
+        let below = [0x05u8; 28];
+        let plan0 = list.plan_insert(&below, node_data(1, 5)).unwrap();
+        assert_eq!(plan0.anchor_asset_name, BAN_ROOT_KEY);
+        assert_eq!(plan0.continued_anchor.data, BanElementData::Root);
+        assert_eq!(
+            plan0.continued_anchor.link.as_deref(),
+            Some(below.as_slice())
+        );
+        assert_eq!(plan0.new_node.link.as_deref(), Some(lo.as_slice()));
+
+        // Already banned → AlreadyBanned (that path is a reban, not an insert).
+        assert!(matches!(
+            list.plan_insert(&lo, node_data(1, 5)),
+            Err(BanListError::AlreadyBanned(_))
+        ));
+        // Not exactly 28 bytes → BadNodeKey (matches is_pool_id; was the gap).
+        for bad_len in [27usize, 29] {
+            assert!(
+                matches!(
+                    list.plan_insert(&vec![1u8; bad_len], node_data(1, 5)),
+                    Err(BanListError::BadNodeKey(_))
+                ),
+                "len {bad_len} must be rejected"
+            );
+        }
+    }
+
     // -- config plumbing -----------------------------------------------------
 
     #[test]
@@ -1194,6 +1393,31 @@ mod tests {
         ));
         // 3 entries but one is not 28 bytes (27) → error
         c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "33".repeat(27)];
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
+            Err(BanListError::Config(_))
+        ));
+        // 3 entries but a DUPLICATE (count is 3, but not distinct) → error.
+        c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "11".repeat(28)];
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
+            Err(BanListError::Config(_))
+        ));
+        // Out-of-range ban-schedule params (contract bounds) → error.
+        c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "33".repeat(28)];
+        c.base_ban_duration_ms = Some(0); // must be > 0
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
+            Err(BanListError::Config(_))
+        ));
+        c.base_ban_duration_ms = Some(86_400_000);
+        c.max_faults_before_permanent = Some(0); // must be > 0
+        assert!(matches!(
+            BanPolicyParams::from_config(&c),
+            Err(BanListError::Config(_))
+        ));
+        c.max_faults_before_permanent = Some(3);
+        c.max_validity_window_ms = Some(-1); // must be >= 0
         assert!(matches!(
             BanPolicyParams::from_config(&c),
             Err(BanListError::Config(_))

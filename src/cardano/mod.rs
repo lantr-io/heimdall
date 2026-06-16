@@ -10,6 +10,7 @@
 //! a one-line change at the demo entry point.
 
 pub mod always_ok;
+pub mod apply_ban;
 pub mod ban_list;
 pub mod bf_http;
 pub mod blockfrost_chain;
