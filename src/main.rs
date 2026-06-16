@@ -276,6 +276,32 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Build (and with --submit, broadcast) the spo_bans.ApplyBan tx: consume a
+    /// published FaultProof and write the ban-list node (WI-018). The
+    /// fault-policy set + ban-schedule params come from [cardano] config.
+    ApplyBan {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// The accused pool id (28-byte hex).
+        #[arg(long)]
+        accused_pool_id: String,
+        /// The fault evidence hash (32-byte hex) that binds the FaultProof token.
+        #[arg(long)]
+        evidence_hash: String,
+        /// The spo_bans reference-script UTxO (<tx_hash>:<index>): the script is
+        /// used three times in the tx and would not fit embedded.
+        #[arg(long)]
+        spo_bans_ref: String,
+        /// Actually submit via Blockfrost.
+        #[arg(long)]
+        submit: bool,
+    },
     /// Read + verify the on-chain SPO registry and print the DKG roster:
     /// reconstructs the spos_registry linked list, cross-checks the rebuilt
     /// identity-trie root against the treasury_info datum, and orders
@@ -561,6 +587,29 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_register_spo(&cfg, &args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::ApplyBan {
+            config,
+            blueprint,
+            registry_bootstrap,
+            accused_pool_id,
+            evidence_hash,
+            spo_bans_ref,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            let args = ApplyBanArgs {
+                blueprint,
+                registry_bootstrap,
+                accused_pool_id,
+                evidence_hash,
+                spo_bans_ref,
+                submit,
+            };
+            if let Err(e) = run_apply_ban(&cfg, &args) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1347,6 +1396,16 @@ struct RegisterSpoArgs {
     submit: bool,
 }
 
+/// apply-ban CLI inputs.
+struct ApplyBanArgs {
+    blueprint: String,
+    registry_bootstrap: String,
+    accused_pool_id: String,
+    evidence_hash: String,
+    spo_bans_ref: String,
+    submit: bool,
+}
+
 /// Parse a 32-byte secret-key argument: inline hex, a file containing hex, or
 /// a cardano-cli TextEnvelope file (`cborHex` = `"5820" || 32 bytes`).
 fn parse_key32(arg: &str, what: &str) -> Result<[u8; 32], String> {
@@ -1636,6 +1695,203 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         "membership token:  {}.{}",
         registry.hash_hex(),
         hex::encode(built.pool_id)
+    );
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    if !args.submit {
+        println!("(dry run — pass --submit to broadcast via Blockfrost)");
+        return Ok(());
+    }
+    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
+    println!("submitted: tx_hash={tx_hash}");
+    Ok(())
+}
+
+/// Build (and with `--submit`, broadcast) the `spo_bans.ApplyBan` tx: consume a
+/// published FaultProof and write the ban-list node (WI-018 pt4b). The
+/// fault-policy set + ban-schedule params come from `[cardano]` config (they
+/// are baked into the ban policy id).
+fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String> {
+    use heimdall::cardano::apply_ban::{ApplyBanRequest, FaultProofUtxo, build_apply_ban_tx};
+    use heimdall::cardano::ban_list::{BanPolicyParams, fault_token_name};
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{
+        fault_verifier_script, spo_bans_script, spos_registry_script,
+    };
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = std::fs::read_to_string(&args.blueprint)
+        .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let fault = fault_verifier_script(&blueprint_json)
+        .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
+
+    // The ban policy is config-pinned (ban bootstrap + fault-policy set + schedule).
+    let ban_bootstrap = cfg
+        .cardano
+        .ban_bootstrap
+        .as_deref()
+        .ok_or("cardano.ban_bootstrap required")?;
+    let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
+    let params = BanPolicyParams::from_config(&cfg.cardano).map_err(|e| e.to_string())?;
+    let spo_bans = spo_bans_script(
+        &blueprint_json,
+        &registry.hash,
+        &params.fault_proof_policies,
+        params.base_ban_duration_ms,
+        params.max_faults_before_permanent,
+        params.max_validity_window_ms,
+        &ban_tx_id,
+        u64::from(ban_index),
+    )
+    .map_err(|e| format!("parameterize spo_bans: {e}"))?;
+
+    let accused_pool_id: [u8; 28] = parse_hex_n(&args.accused_pool_id, "--accused-pool-id")?;
+    let evidence_hash: [u8; 32] = parse_hex_n(&args.evidence_hash, "--evidence-hash")?;
+    let (sb_tx, sb_ix) = parse_cardano_outref(&args.spo_bans_ref)?;
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    let mainnet = !wallet_addr.starts_with("addr_test");
+    let network = if mainnet {
+        pallas_addresses::Network::Mainnet
+    } else {
+        pallas_addresses::Network::Testnet
+    };
+    let ban_addr = spo_bans.enterprise_address(network);
+    let registry_addr = registry.enterprise_address(network);
+
+    println!("ban policy:        {}", spo_bans.hash_hex());
+    println!("ban address:       {ban_addr}");
+    println!(
+        "accused pool:      {} ({})",
+        hex::encode(accused_pool_id),
+        pool_id_bech32(&accused_pool_id)
+    );
+
+    let wallet_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let registry_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
+        .map_err(|e| format!("registry UTxO query: {e}"))?;
+    let ban_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &ban_addr))
+        .map_err(|e| format!("ban UTxO query: {e}"))?;
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+    let window = rt
+        .block_on(bf_http::fetch_epoch_window(&base_url, pid))
+        .map_err(|e| format!("epoch window: {e}"))?;
+
+    // Locate the parked FaultProof UTxO at the wallet (Part 3b output).
+    let token_name = fault_token_name(&accused_pool_id, &evidence_hash);
+    let fault_unit = format!("{}{}", fault.hash_hex(), hex::encode(token_name));
+    let lovelace_of = |u: &bf_http::BfUtxo| -> u64 {
+        u.amount
+            .iter()
+            .find(|a| a.unit == "lovelace")
+            .and_then(|a| a.quantity.parse().ok())
+            .unwrap_or(0)
+    };
+    let fault_bf = wallet_raw
+        .iter()
+        .find(|u| u.amount.iter().any(|a| a.unit == fault_unit))
+        .ok_or_else(|| {
+            format!(
+                "no FaultProof UTxO for this (pool, evidence) at the wallet — publish it first \
+                 (token {})",
+                hex::encode(token_name)
+            )
+        })?;
+    let fault_utxo = FaultProofUtxo {
+        tx_hash: fault_bf.tx_hash.clone(),
+        output_index: fault_bf.output_index,
+        lovelace: lovelace_of(fault_bf),
+    };
+
+    // Locate the accused pool's registry node — the read-only reference input.
+    let reg_unit = format!("{}{}", registry.hash_hex(), hex::encode(accused_pool_id));
+    let reg_node = registry_raw
+        .iter()
+        .find(|u| u.amount.iter().any(|a| a.unit == reg_unit))
+        .ok_or_else(|| {
+            format!(
+                "accused pool {} is not in the on-chain registry — cannot reference it",
+                hex::encode(accused_pool_id)
+            )
+        })?;
+
+    // Validity interval: [current_slot, current_slot + W), W*1s within both the
+    // ban validator's max_validity_window_ms and the epoch horizon. start_time
+    // is the POSIX-ms upper bound the validator resolves (drives BanNodeData).
+    // NOTE: the exact inclusivity of the resolved upper bound is ledger-defined;
+    // verify start_time against a real node on a devnet before relying on it.
+    let max_window_slots = (params.max_validity_window_ms / 1000).max(1) as u64;
+    let avail = window.epoch_end_slot.saturating_sub(window.current_slot);
+    let w = max_window_slots.min(avail);
+    let invalid_before = window.current_slot;
+    let invalid_hereafter = window.current_slot + w;
+    let start_time_ms = window.block_time_ms + (w as i64) * 1000;
+
+    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let req = ApplyBanRequest {
+        spo_bans_script: &spo_bans,
+        fault_verifier_script: &fault,
+        ban_params: &params,
+        accused_pool_id,
+        evidence_hash,
+        ban_utxos: &ban_raw,
+        fault_utxo: &fault_utxo,
+        registration_ref: (reg_node.tx_hash.clone(), reg_node.output_index),
+        spo_bans_ref: (hex::encode(sb_tx), sb_ix),
+        mainnet,
+        start_time_ms,
+        invalid_before,
+        invalid_hereafter,
+        wallet_address: &wallet_addr,
+        wallet_utxos: &wallet_utxos,
+        key: &key,
+        cost_models: Some(cost_models),
+    };
+    let built = build_apply_ban_tx(&req).map_err(|e| format!("build apply_ban tx: {e}"))?;
+
+    println!(
+        "action:            {}",
+        if built.first_ban {
+            "first ban (mint + insert)"
+        } else {
+            "reban (in-place update)"
+        }
+    );
+    println!(
+        "ban node:          {}.{} (counter {}, until {})",
+        spo_bans.hash_hex(),
+        hex::encode(&built.ban_node_asset_name),
+        built.ban_node.ban_counter,
+        built.ban_node.ban_until_time
+    );
+    println!(
+        "burned FaultProof: {}.{}",
+        fault.hash_hex(),
+        hex::encode(built.burned_fault_token)
+    );
+    println!(
+        "validity:          slots [{invalid_before}, {invalid_hereafter}), start_time_ms {start_time_ms}"
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
