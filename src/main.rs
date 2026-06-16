@@ -1707,17 +1707,23 @@ fn run_show_roster(
     // registry policy) so a --blueprint/--registry-bootstrap override can't
     // make the sections describe different deployments. ban_bootstrap is
     // config-only.
-    use heimdall::cardano::ban_list::{BanListError, BanListSource};
+    use heimdall::cardano::ban_list::{BanListError, BanListSource, BanPolicyParams};
     let mut active_bans: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     match cfg.cardano.ban_bootstrap.as_deref() {
         None => {
             println!("ban list:          (not configured — set cardano.ban_bootstrap)");
         }
         Some(ban_bootstrap) => {
+            // The fault-policy set + ban-schedule params are config-only (they
+            // are baked into the ban policy id), unlike --blueprint/--registry-
+            // bootstrap which may be CLI overrides.
+            let ban_params =
+                BanPolicyParams::from_config(&cfg.cardano).map_err(|e| e.to_string())?;
             let source = BanListSource::from_blueprint(
                 &blueprint,
                 &bootstrap,
                 ban_bootstrap,
+                &ban_params,
                 pid.starts_with("mainnet"),
             )
             .map_err(|e| e.to_string())?;

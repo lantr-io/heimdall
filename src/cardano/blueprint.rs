@@ -26,7 +26,7 @@ use pallas_codec::minicbor;
 use pallas_crypto::hash::Hasher;
 use pallas_primitives::{MaybeIndefArray, PlutusData};
 
-use crate::cardano::plutus::{bytes, int_from_u64};
+use crate::cardano::plutus::{array, bytes, int, int_from_u64};
 
 /// Blueprint title of the spos_registry minting policy (the membership-token
 /// policy; its hash is the `registry_policy_id`).
@@ -221,14 +221,33 @@ pub fn fault_verifier_script(blueprint_json: &str) -> Result<ParameterizedScript
     Ok(ParameterizedScript { cbor, hash })
 }
 
-/// `spo_bans` parameterized by the registry policy id (its
-/// `registration_script_hash`), the fault_verifier policy id, and its own
-/// one-shot bootstrap output ref. The resulting hash is the ban-list policy
-/// id; the enterprise address of the same hash holds the list elements.
+/// `spo_bans` parameterized by its full upstream parameter list (7 params, in
+/// the order the compiled validator declares them):
+///
+/// 1. `registration_script_hash` — the registry policy id (the registered-pool
+///    reference input is checked against it).
+/// 2. `fault_proof_policy_ids` — the authorized fault-verifier policies. The
+///    contract's `ban_config_ok` requires **exactly 3, all distinct**, and the
+///    hash is order-sensitive, so pass them in the exact deployment order.
+/// 3. `base_ban_duration_ms`, 4. `max_faults_before_permanent`,
+/// 5. `max_validity_window_ms` — ban-schedule params baked into the policy id
+///    (the same values must drive the `BanNodeData` an ApplyBan tx emits).
+/// 6/7. the one-shot bootstrap output ref.
+///
+/// The resulting hash is the ban-list policy id; the enterprise address of the
+/// same hash holds the list elements.
+///
+/// NOTE: this matches upstream FluidTokens `main` (WI-018). The earlier
+/// 4-parameter form (single fault policy, no ban-schedule params) predated the
+/// evidence-bound rework and derived the wrong hash/address.
+#[allow(clippy::too_many_arguments)]
 pub fn spo_bans_script(
     blueprint_json: &str,
-    registry_policy_id: &[u8; 28],
-    fault_proof_policy_id: &[u8; 28],
+    registration_script_hash: &[u8; 28],
+    fault_proof_policy_ids: &[[u8; 28]],
+    base_ban_duration_ms: i64,
+    max_faults_before_permanent: i64,
+    max_validity_window_ms: i64,
     bootstrap_tx_id: &[u8; 32],
     bootstrap_output_index: u64,
 ) -> Result<ParameterizedScript, BlueprintError> {
@@ -236,8 +255,11 @@ pub fn spo_bans_script(
     apply_params(
         &code,
         &[
-            bytes(registry_policy_id),
-            bytes(fault_proof_policy_id),
+            bytes(registration_script_hash),
+            array(fault_proof_policy_ids.iter().map(|p| bytes(p)).collect()),
+            int(base_ban_duration_ms),
+            int(max_faults_before_permanent),
+            int(max_validity_window_ms),
             bytes(bootstrap_tx_id),
             int_from_u64(bootstrap_output_index),
         ],
@@ -277,6 +299,40 @@ mod tests {
     fn script_hash_v3_matches_blueprint() {
         let code = hex::decode(TREASURY_MOVEMENT_CODE).unwrap();
         assert_eq!(hex::encode(script_hash_v3(&code)), TREASURY_MOVEMENT_HASH);
+    }
+
+    // `bitcoin/spo_bans.spo_bans` unapplied compiledCode + the hash
+    // `aiken blueprint apply` (v1.1.21) produces for the 7-param application in
+    // the test below. This pins the new bit — the `List<PolicyId>` param — which
+    // must be encoded as a canonical INDEFINITE-length CBOR array (`9f..ff`, what
+    // `plutus::array` emits and what the on-chain ban datum already uses). aiken
+    // is NOT length-form agnostic: a definite array (`83..`) hashes differently,
+    // so heimdall's encoding must match the deployment's canonical form.
+    const SPO_BANS_CODE: &str = include_str!("../../tests/fixtures/spo_bans_code.txt");
+
+    #[test]
+    fn spo_bans_script_matches_aiken_blueprint_apply() {
+        let blueprint = format!(
+            r#"{{"validators":[{{"title":"{SPO_BANS_TITLE}","compiledCode":"{}"}}]}}"#,
+            SPO_BANS_CODE.trim()
+        );
+        let script = spo_bans_script(
+            &blueprint,
+            &[0x11; 28],                           // registration_script_hash
+            &[[0x21; 28], [0x22; 28], [0x23; 28]], // fault_proof_policy_ids (3 distinct)
+            86_400_000,                            // base_ban_duration_ms
+            3,                                     // max_faults_before_permanent
+            600_000,                               // max_validity_window_ms
+            &[0xbb; 32],                           // bootstrap_tx_id
+            2,                                     // bootstrap_output_index
+        )
+        .unwrap();
+        // Equal hashes ⇒ byte-identical applied program ⇒ our List<PolicyId>
+        // (indefinite-array) param encoding matches `aiken blueprint apply`.
+        assert_eq!(
+            script.hash_hex(),
+            "1f99fd037b85246d376c3985b970be82a7c417f3f95cbdd075bd3ece"
+        );
     }
 
     // The parameterless fault_verifier script: cbor == compiledCode, and its V3
