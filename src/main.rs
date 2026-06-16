@@ -719,11 +719,22 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
                         "note: no ban list configured (cardano.ban_bootstrap) — roster not \
                          ban-filtered"
                     ),
-                    Err(e) => panic!("ban source config: {e}"),
+                    // Fail fast with a clear message — NOT a degrade-to-unfiltered:
+                    // an unread ban list would admit banned SPOs to the roster. A
+                    // misconfig (e.g. ban_bootstrap set but the fault-policy set /
+                    // ban-schedule params missing) must stop startup, not silently
+                    // disable ban filtering.
+                    Err(e) => {
+                        eprintln!("fatal: ban list config: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
             Ok(None) => {}
-            Err(e) => panic!("registry roster config: {e}"),
+            Err(e) => {
+                eprintln!("fatal: registry roster config: {e}");
+                std::process::exit(1);
+            }
         }
 
         let bf_chain = apply_tm_policy(bf_chain, &cfg).expect("invalid TM policy config");

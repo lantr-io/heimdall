@@ -45,8 +45,15 @@ pub const BAN_ROOT_KEY: &[u8] = b"ban-root";
 /// Prefix of every node's asset name (`ban_node_key_prefix`).
 pub const BAN_NODE_KEY_PREFIX: &[u8] = b"ban/";
 
-/// Max node key (pool_id) length: 32-byte asset name minus the prefix.
+/// Max node key length the reader tolerates: 32-byte asset name minus the
+/// prefix. Real keys are always [`POOL_ID_LEN`]; this only bounds defensive
+/// parsing of arbitrary on-chain state.
 const MAX_NODE_KEY_LEN: usize = 32 - BAN_NODE_KEY_PREFIX.len();
+
+/// A pool id is `blake2b_224(cold_vkey)` = 28 bytes; `spo_bans.ak`'s
+/// `is_pool_id` requires exactly this, so a first-ban [`BanList::plan_insert`]
+/// must too.
+const POOL_ID_LEN: usize = 28;
 
 /// `BanNodeData` — one pool's ban state (`spo-bans.ak` evidence-bound model).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,7 +561,12 @@ impl BanList {
         pool_id: &[u8],
         node_data: BanNodeData,
     ) -> Result<BanInsert, BanListError> {
-        if pool_id.is_empty() || pool_id.len() > MAX_NODE_KEY_LEN {
+        // A ban node key is an accused pool_id; spo_bans.ak `is_pool_id` requires
+        // EXACTLY 28 bytes (blake2b_224). Be as strict as the validator so a
+        // mis-sized id is rejected here, not after fees/effort on-chain. (The
+        // reader stays lenient — it must parse whatever is already on-chain — but
+        // a first-ban plan is for a real, freshly-accused pool.)
+        if pool_id.len() != POOL_ID_LEN {
             return Err(BanListError::BadNodeKey(pool_id.to_vec()));
         }
         if self.nodes.contains_key(pool_id) {
@@ -1267,61 +1279,73 @@ mod tests {
     }
 
     #[test]
-    fn plan_insert_and_node_accessor() {
-        // root -> aa-pool(c1,until10,->bb-pool) -> bb-pool(c2,until20,->None)
+    fn node_accessor_returns_data_and_link() {
+        // The reader tolerates short keys; node() exposes (data, link) for reban.
         let list = two_node_list();
-
-        // node() returns data + link (for reban).
         assert_eq!(
             list.node(b"aa-pool"),
             Some((&node_data(1, 10), Some(b"bb-pool".as_slice())))
         );
         assert_eq!(list.node(b"bb-pool"), Some((&node_data(2, 20), None)));
         assert!(list.node(b"zz").is_none());
+    }
 
-        // Insert "ba-pool" between aa-pool and bb-pool: anchor = aa-pool.
+    #[test]
+    fn plan_insert_links_correctly() {
+        // plan_insert requires EXACTLY-28-byte pool ids (is_pool_id), so build a
+        // 28-byte-keyed list: root -> lo -> hi.
+        let lo = [0x10u8; 28];
+        let hi = [0xf0u8; 28];
+        let list = BanList::from_elements([
+            root_elem(Some(&lo)),
+            node_elem(&lo, node_data(1, 10), Some(&hi)),
+            node_elem(&hi, node_data(2, 20), None),
+        ])
+        .unwrap();
+
+        // Insert mid (lo < mid < hi): anchor = lo, mid takes lo's old link (hi).
+        let mid = [0x80u8; 28];
         let data = node_data(1, 100);
-        let plan = list.plan_insert(b"ba-pool", data.clone()).unwrap();
-        assert_eq!(
-            plan.anchor_asset_name,
-            [BAN_NODE_KEY_PREFIX, b"aa-pool"].concat()
-        );
+        let plan = list.plan_insert(&mid, data.clone()).unwrap();
+        assert_eq!(plan.anchor_asset_name, [BAN_NODE_KEY_PREFIX, &lo].concat());
         assert_eq!(
             plan.continued_anchor.data,
             BanElementData::Node(node_data(1, 10))
         );
-        assert_eq!(
-            plan.continued_anchor.link.as_deref(),
-            Some(b"ba-pool".as_slice())
-        );
+        assert_eq!(plan.continued_anchor.link.as_deref(), Some(mid.as_slice()));
         assert_eq!(
             plan.new_node_asset_name,
-            [BAN_NODE_KEY_PREFIX, b"ba-pool"].concat()
+            [BAN_NODE_KEY_PREFIX, &mid].concat()
         );
         assert_eq!(plan.new_node.data, BanElementData::Node(data));
-        // new node takes the anchor's old successor.
-        assert_eq!(plan.new_node.link.as_deref(), Some(b"bb-pool".as_slice()));
+        assert_eq!(plan.new_node.link.as_deref(), Some(hi.as_slice()));
 
-        // Insert before all (sorts below aa-pool): anchor = root.
-        let plan0 = list.plan_insert(b"a0", node_data(1, 5)).unwrap();
+        // Insert below lo: anchor = root, new node takes root's old link (lo).
+        let below = [0x05u8; 28];
+        let plan0 = list.plan_insert(&below, node_data(1, 5)).unwrap();
         assert_eq!(plan0.anchor_asset_name, BAN_ROOT_KEY);
         assert_eq!(plan0.continued_anchor.data, BanElementData::Root);
         assert_eq!(
             plan0.continued_anchor.link.as_deref(),
-            Some(b"a0".as_slice())
+            Some(below.as_slice())
         );
-        assert_eq!(plan0.new_node.link.as_deref(), Some(b"aa-pool".as_slice()));
+        assert_eq!(plan0.new_node.link.as_deref(), Some(lo.as_slice()));
 
-        // Already banned → AlreadyBanned (that path is a reban).
+        // Already banned → AlreadyBanned (that path is a reban, not an insert).
         assert!(matches!(
-            list.plan_insert(b"aa-pool", node_data(1, 5)),
+            list.plan_insert(&lo, node_data(1, 5)),
             Err(BanListError::AlreadyBanned(_))
         ));
-        // Bad key length.
-        assert!(matches!(
-            list.plan_insert(&[1u8; 29], node_data(1, 5)),
-            Err(BanListError::BadNodeKey(_))
-        ));
+        // Not exactly 28 bytes → BadNodeKey (matches is_pool_id; was the gap).
+        for bad_len in [27usize, 29] {
+            assert!(
+                matches!(
+                    list.plan_insert(&vec![1u8; bad_len], node_data(1, 5)),
+                    Err(BanListError::BadNodeKey(_))
+                ),
+                "len {bad_len} must be rejected"
+            );
+        }
     }
 
     // -- config plumbing -----------------------------------------------------
