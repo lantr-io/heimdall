@@ -40,10 +40,7 @@
 //! the real verify (an upstream gap) will dominate the budget once it lands.
 
 use pallas_codec::minicbor;
-use pallas_codec::utils::{Bytes, NonEmptySet};
 use pallas_primitives::PlutusData;
-use pallas_primitives::conway::{Tx, VKeyWitness};
-use pallas_traverse::ComputeHash;
 use pallas_wallet::PrivateKey;
 use whisky::*;
 use whisky_pallas::WhiskyPallas;
@@ -52,6 +49,7 @@ use crate::cardano::ban_list::fault_token_name;
 use crate::cardano::blueprint::ParameterizedScript;
 use crate::cardano::plutus::{self, bytes, constr, int_from_u64};
 use crate::cardano::publish::WalletUtxo;
+use crate::cardano::tx_common::{sign_built_tx as common_sign_built_tx, whisky_network};
 use crate::cardano::wallet::pub_key_hash_hex;
 
 /// `FaultKind` — the on-chain fault category.
@@ -328,30 +326,7 @@ fn select_fee_and_collateral(
 /// Sign the whisky-built tx body with the wallet key and splice the vkey
 /// witness in (same flow as register_spo / treasury_bootstrap).
 fn sign_built_tx(unsigned_hex: &str, key: &PrivateKey) -> Result<String, FaultProofMintError> {
-    let unsigned_bytes = hex::decode(unsigned_hex)
-        .map_err(|e| FaultProofMintError::Build(format!("unsigned tx hex decode: {e}")))?;
-    let mut tx: Tx = minicbor::decode(&unsigned_bytes)
-        .map_err(|e| FaultProofMintError::Build(format!("tx minicbor decode: {e}")))?;
-
-    let body_hash = tx.transaction_body.compute_hash();
-    let signature = key.sign(body_hash);
-    let pk_bytes: [u8; 32] = key.public_key().into();
-    let vkey_witness = VKeyWitness {
-        vkey: Bytes::from(pk_bytes.to_vec()),
-        signature: Bytes::from(signature.as_ref().to_vec()),
-    };
-    let mut vkeys: Vec<VKeyWitness> = tx
-        .transaction_witness_set
-        .vkeywitness
-        .take()
-        .map(|set| set.to_vec())
-        .unwrap_or_default();
-    vkeys.push(vkey_witness);
-    tx.transaction_witness_set.vkeywitness = NonEmptySet::from_vec(vkeys);
-
-    let signed = minicbor::to_vec(&tx)
-        .map_err(|e| FaultProofMintError::Build(format!("signed tx encode: {e}")))?;
-    Ok(hex::encode(signed))
+    common_sign_built_tx(unsigned_hex, key).map_err(FaultProofMintError::Build)
 }
 
 /// Build + sign the `fault_verifier.PublishProof` mint tx: mint exactly one
@@ -435,10 +410,7 @@ pub fn build_fault_proof_mint_tx(
         required_signatures: vec![pub_key_hash_hex(req.key)],
         change_address: req.wallet_address.to_string(),
         signing_key: vec![],
-        network: Some(match &req.cost_models {
-            Some(cm) => whisky::Network::Custom(cm.clone()),
-            None => whisky::Network::Preprod,
-        }),
+        network: Some(whisky_network(&req.cost_models)),
         reference_inputs: vec![],
         withdrawals: vec![],
         mints: vec![MintItem::ScriptMint(ScriptMint {
@@ -498,7 +470,7 @@ mod tests {
     use crate::cardano::blueprint;
     use crate::cardano::wallet::{derive_payment_key, wallet_address};
     use pallas_codec::minicbor;
-    use pallas_primitives::conway::{DatumOption, PseudoTransactionOutput, Value};
+    use pallas_primitives::conway::{DatumOption, PseudoTransactionOutput, Tx, Value};
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 

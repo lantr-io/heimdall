@@ -42,6 +42,7 @@ use crate::cardano::mpf;
 use crate::cardano::plutus::{bytes, constr, int_from_u64};
 use crate::cardano::publish::WalletUtxo;
 use crate::cardano::treasury_info::TreasuryInfoDatum;
+use crate::cardano::tx_common::{network_from_address, whisky_network};
 use crate::cardano::wallet::pub_key_hash_hex;
 use crate::epoch::state::{EpochError, EpochResult};
 
@@ -156,12 +157,7 @@ pub fn build_treasury_bootstrap_tx(
     }
 
     let pkh = pub_key_hash_hex(key);
-    let testnet = wallet_address.starts_with("addr_test");
-    let network = if testnet {
-        pallas_addresses::Network::Testnet
-    } else {
-        pallas_addresses::Network::Mainnet
-    };
+    let network = network_from_address(wallet_address);
     let script_address = treasury_script.enterprise_address(network);
     let policy_id_hex = treasury_script.hash_hex();
 
@@ -245,10 +241,7 @@ pub fn build_treasury_bootstrap_tx(
         required_signatures: vec![pkh],
         change_address: wallet_address.to_string(),
         signing_key: vec![],
-        network: Some(match cost_models {
-            Some(cm) => whisky::Network::Custom(cm),
-            None => whisky::Network::Preprod,
-        }),
+        network: Some(whisky_network(&cost_models)),
         reference_inputs: vec![],
         withdrawals: vec![],
         mints: vec![MintItem::ScriptMint(ScriptMint {

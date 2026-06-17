@@ -28,6 +28,7 @@ use whisky::*;
 use whisky_pallas::WhiskyPallas;
 
 use crate::cardano::always_ok::{ALWAYS_OK_PLUTUS_CBOR_HEX, UNIT_REDEEMER_HEX};
+use crate::cardano::tx_common::whisky_network;
 use crate::cardano::wallet::pub_key_hash_hex;
 use crate::epoch::state::{EpochError, EpochResult};
 
@@ -172,10 +173,7 @@ pub fn build_oracle_update_tx(
         required_signatures: vec![pkh],
         change_address: wallet_address.to_string(),
         signing_key: vec![],
-        network: Some(match cost_models {
-            Some(cm) => whisky::Network::Custom(cm),
-            None => whisky::Network::Preprod,
-        }),
+        network: Some(whisky_network(&cost_models)),
         // Reference the TM-control UTxO so the validator's mint branch can read the authorized
         // minter from its datum (authenticated by the control NFT it carries).
         reference_inputs: control_ref
