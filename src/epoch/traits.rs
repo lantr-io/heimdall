@@ -71,6 +71,11 @@ pub trait CardanoChain: Send + Sync {
     /// immediately on first call so the demo runs exactly one cycle.
     async fn await_epoch_boundary(&self) -> EpochResult<EpochBoundaryEvent>;
 
+    /// The current chain epoch (non-blocking) — used to namespace the DKG
+    /// ceremony and to query the bootstrap roster at the right epoch. Unlike
+    /// [`Self::await_epoch_boundary`] it does not wait for a boundary.
+    async fn current_epoch(&self) -> EpochResult<u64>;
+
     /// Snapshot the SPO registry and produce the roster for `epoch`.
     /// In v0.2 the mock returns a hardcoded roster.
     async fn query_roster(&self, epoch: u64) -> EpochResult<Roster>;

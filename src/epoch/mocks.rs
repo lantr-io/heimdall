@@ -200,6 +200,10 @@ impl CardanoChain for MockCardanoChain {
         })
     }
 
+    async fn current_epoch(&self) -> EpochResult<u64> {
+        Ok(self.fixture.roster.epoch)
+    }
+
     async fn query_roster(&self, _epoch: u64) -> EpochResult<Roster> {
         Ok(self.fixture.roster.clone())
     }

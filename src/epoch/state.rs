@@ -66,6 +66,17 @@ impl Roster {
             .collect()
     }
 
+    /// Locate this node's own entry by its bifrost identity key (the spec's
+    /// `own_participant`): returns its FROST identifier + info, or `None` when
+    /// the key is not in the roster (not registered / banned / URL-excluded).
+    /// A `None` return must abort the ceremony rather than assume an index.
+    pub fn own_participant(&self, bifrost_id_pk: &[u8]) -> Option<(Identifier, &SpoInfo)> {
+        self.participants
+            .iter()
+            .find(|(_, info)| info.bifrost_id_pk.as_slice() == bifrost_id_pk)
+            .map(|(id, info)| (*id, info))
+    }
+
     /// Designated leader for the given attempt. Today this is just the
     /// lowest-identifier participant; future cuts will rotate on
     /// `leader_attempt` so a stuck leader can be replaced.
@@ -434,6 +445,40 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let back: Roster = serde_json::from_str(&json).unwrap();
         assert_eq!(r, back);
+    }
+
+    #[test]
+    fn own_participant_locates_self_by_bifrost_key() {
+        let mut participants = BTreeMap::new();
+        for i in 1u16..=3 {
+            let id = Identifier::try_from(i).unwrap();
+            participants.insert(
+                id,
+                SpoInfo {
+                    identifier: id,
+                    pool_id: vec![i as u8; 28],
+                    bifrost_url: format!("http://localhost:{}", 18500 + i),
+                    // distinct per-participant bifrost key
+                    bifrost_id_pk: vec![0xB0 + i as u8; 32],
+                },
+            );
+        }
+        let r = Roster {
+            epoch: 7,
+            min_signers: 2,
+            max_signers: 3,
+            participants,
+        };
+
+        // Found by its bifrost key → correct identifier + entry.
+        let (id, info) = r.own_participant(&vec![0xB2; 32]).expect("self in roster");
+        assert_eq!(id, Identifier::try_from(2u16).unwrap());
+        assert_eq!(info.pool_id, vec![2u8; 28]);
+
+        // An unknown key (not registered / banned / excluded) → None (must abort).
+        assert!(r.own_participant(&vec![0xFF; 32]).is_none());
+        // An empty key (legacy fixture) never matches a real entry.
+        assert!(r.own_participant(&[]).is_none());
     }
 
     #[test]
