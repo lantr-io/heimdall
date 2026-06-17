@@ -208,6 +208,20 @@ impl CardanoChain for MockCardanoChain {
         Ok(self.fixture.roster.clone())
     }
 
+    async fn query_dkg_context(
+        &self,
+        epoch: u64,
+        attempt: u32,
+    ) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
+        Ok(
+            crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(
+                &self.fixture.roster,
+                epoch,
+                attempt,
+            ),
+        )
+    }
+
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {
         let maybe_key = *self.treasury_y_51.lock().unwrap();
         let y_51 = maybe_key.unwrap_or(self.fixture.y_51);

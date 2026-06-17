@@ -348,6 +348,66 @@ impl DkgContext {
             .iter()
             .find(|p| p.bifrost_id_pk == bifrost_id_pk)
     }
+
+    /// Whether a qualified subset `Q` clears the DKG security gate: it must hold
+    /// at least `threshold` participants AND control strictly more than 51% of
+    /// the eligible stake. Mirrors WI-014 part 3 — the attempt aborts iff
+    /// `|Q| < t` OR `stake(Q) <= 51%` of [`Self::total_stake`]. Identifiers in
+    /// `qualified` that are not eligible participants are ignored. Stake is
+    /// summed in `u128` (lovelace × 100 overflows `u64` at realistic supply).
+    #[must_use]
+    pub fn quorum_ok(&self, qualified: &BTreeSet<Identifier>) -> bool {
+        let q: Vec<&DkgParticipant> = self
+            .participants
+            .iter()
+            .filter(|p| qualified.contains(&p.identifier))
+            .collect();
+        let stake: u128 = q.iter().map(|p| u128::from(p.active_stake)).sum();
+        // |Q| >= t (enough for a t-of-n key) AND stake(Q) > 51% of the eligible
+        // total (honest-majority DKG completion). Integer-exact, same bound and
+        // constant as `stake_weighted_threshold`; count in `usize` so a huge set
+        // can't wrap.
+        q.len() >= usize::from(self.threshold)
+            && stake * 100 > u128::from(self.total_stake) * SECURITY_THRESHOLD_PERCENT
+    }
+
+    /// Synthesize a context from a static [`Roster`] with EQUAL per-participant
+    /// stake (1 each), for the requested `(epoch, attempt)` — used by the
+    /// mock/fixture demo and the no-registry fallback, where real chain stake is
+    /// unavailable. `threshold` is the roster's configured FROST `min_signers`
+    /// (so the solo `1-of-1` path is preserved). NOTE the quorum gate's `> 51%`
+    /// stake arm is a SEPARATE honest-majority DKG-completion requirement: for
+    /// `n` where `min_signers <= 51%` (e.g. 2-of-4) completing the ceremony still
+    /// needs a stake majority (3) even though the resulting key signs at
+    /// `min_signers`. `index` is positional and equals `identifier as u16` only
+    /// while the roster's identifiers are the contiguous `1..=n` (true for the
+    /// fixture/fallback). Real deployments build the context from chain stake via
+    /// [`fetch_dkg_context`].
+    #[must_use]
+    pub fn from_roster_equal_stake(roster: &Roster, epoch: u64, attempt: u32) -> Self {
+        let participants = roster
+            .participants
+            .iter()
+            .enumerate()
+            .map(|(i, (id, info))| DkgParticipant {
+                index: (i as u16) + 1,
+                identifier: *id,
+                pool_id: info.pool_id.clone(),
+                bifrost_id_pk: info.bifrost_id_pk.clone(),
+                bifrost_url: info.bifrost_url.clone(),
+                active_stake: 1,
+            })
+            .collect::<Vec<_>>();
+        let total_stake = participants.len() as u64;
+        DkgContext {
+            epoch,
+            attempt,
+            threshold: roster.min_signers,
+            total_stake,
+            participants,
+            excluded: vec![],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +590,115 @@ mod tests {
         // ~22.5B ADA each in lovelace; product fits u128, not u64.
         let big = 22_500_000_000_000_000u64;
         assert_eq!(stake_weighted_threshold(&[big, big], big * 2), 2);
+    }
+
+    // ---- quorum gate (|Q| >= t AND stake(Q) > 51%) -----------------------
+
+    fn ctx_with(stakes: &[u64], threshold: u16) -> DkgContext {
+        let total: u64 = stakes.iter().sum();
+        let participants = stakes
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let ix = (i + 1) as u16;
+                DkgParticipant {
+                    index: ix,
+                    identifier: Identifier::try_from(ix).unwrap(),
+                    pool_id: vec![ix as u8; 28],
+                    bifrost_id_pk: vec![ix as u8; 32],
+                    bifrost_url: format!("http://localhost:{}", 18500 + ix),
+                    active_stake: s,
+                }
+            })
+            .collect();
+        DkgContext {
+            epoch: 1,
+            attempt: 0,
+            threshold,
+            total_stake: total,
+            participants,
+            excluded: vec![],
+        }
+    }
+
+    fn qset(ids: &[u16]) -> BTreeSet<Identifier> {
+        ids.iter()
+            .map(|&i| Identifier::try_from(i).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn quorum_gate_requires_threshold_count() {
+        // 40/40/20, t=2: any 2 clear 51% of stake, isolating the count gate.
+        let ctx = ctx_with(&[40, 40, 20], 2);
+        assert!(ctx.quorum_ok(&qset(&[1, 2, 3]))); // full set
+        assert!(ctx.quorum_ok(&qset(&[1, 2]))); // 2 >= t, 80% stake
+        assert!(!ctx.quorum_ok(&qset(&[1]))); // 1 < t → abort
+        assert!(!ctx.quorum_ok(&qset(&[]))); // empty → abort
+        assert!(!ctx.quorum_ok(&qset(&[1, 99]))); // unknown ids ignored → 1 < t
+    }
+
+    #[test]
+    fn quorum_gate_requires_strictly_more_than_51_percent_stake() {
+        // 50/30/20, t=2.
+        let ctx = ctx_with(&[50, 30, 20], 2);
+        assert!(!ctx.quorum_ok(&qset(&[2, 3]))); // count ok, 50% <= 51% → abort
+        assert!(ctx.quorum_ok(&qset(&[1, 3]))); // 70% > 51% → ok
+        assert!(ctx.quorum_ok(&qset(&[1, 2]))); // 80% > 51% → ok
+
+        // Exactly 51% must ABORT (the bound is strict >).
+        let tie = ctx_with(&[51, 49], 1);
+        assert!(!tie.quorum_ok(&qset(&[1]))); // 51% is not > 51%
+        assert!(tie.quorum_ok(&qset(&[1, 2]))); // 100% → ok
+    }
+
+    #[test]
+    fn quorum_gate_stake_arm_is_independent_of_threshold() {
+        // Equal stake n=4, t=2: the count gate (|Q| >= 2) and the stake gate
+        // (> 51% → >= 3 of 4) are INDEPENDENT. A set of exactly 2 meets t but is
+        // only 50% of stake → abort; honest-majority DKG completion needs 3.
+        let ctx = ctx_with(&[1, 1, 1, 1], 2);
+        assert!(!ctx.quorum_ok(&qset(&[1, 2]))); // count 2 >= t, but 50% <= 51%
+        assert!(ctx.quorum_ok(&qset(&[1, 2, 3]))); // 3, 75% > 51% → ok
+
+        // Degenerate: an empty eligible set never clears the gate.
+        let empty = ctx_with(&[], 2);
+        assert!(!empty.quorum_ok(&qset(&[1])));
+        assert!(!empty.quorum_ok(&qset(&[])));
+    }
+
+    #[test]
+    fn from_roster_equal_stake_drives_majority_gate() {
+        let mut participants = BTreeMap::new();
+        for i in 1u16..=3 {
+            let id = Identifier::try_from(i).unwrap();
+            participants.insert(
+                id,
+                SpoInfo {
+                    identifier: id,
+                    pool_id: vec![i as u8; 28],
+                    bifrost_url: format!("http://localhost:{}", 18500 + i),
+                    bifrost_id_pk: vec![i as u8; 32],
+                },
+            );
+        }
+        let roster = Roster {
+            epoch: 9,
+            min_signers: 2,
+            max_signers: 3,
+            participants,
+        };
+
+        // Uses the REQUESTED epoch (500), not the roster's own epoch (9).
+        let ctx = DkgContext::from_roster_equal_stake(&roster, 500, 4);
+        assert_eq!(ctx.epoch, 500);
+        assert_eq!(ctx.attempt, 4);
+        assert_eq!(ctx.threshold, 2);
+        assert_eq!(ctx.total_stake, 3);
+        assert!(ctx.participants.iter().all(|p| p.active_stake == 1));
+        // Equal stake → the gate is a >51%-by-count majority that also meets t.
+        assert!(ctx.quorum_ok(&qset(&[1, 2]))); // 2/3 = 66% > 51%, count 2 >= t
+        assert!(!ctx.quorum_ok(&qset(&[1]))); // count 1 < t (and 33% < 51%)
     }
 
     // ---- eligibility + context ------------------------------------------

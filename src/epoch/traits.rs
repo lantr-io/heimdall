@@ -80,6 +80,16 @@ pub trait CardanoChain: Send + Sync {
     /// In v0.2 the mock returns a hardcoded roster.
     async fn query_roster(&self, epoch: u64) -> EpochResult<Roster>;
 
+    /// Resolve the eligible DKG context (candidate set + per-participant stake +
+    /// stake-weighted threshold) for `(epoch, attempt)` — the stake-aware input
+    /// the ceremony's quorum gate needs. The mock / no-registry fallback
+    /// synthesize it from the static roster with equal stake.
+    async fn query_dkg_context(
+        &self,
+        epoch: u64,
+        attempt: u32,
+    ) -> EpochResult<crate::cardano::dkg_roster::DkgContext>;
+
     /// Current treasury UTxO state, as reported by the Cardano oracle.
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo>;
 

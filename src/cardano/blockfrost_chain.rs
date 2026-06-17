@@ -258,6 +258,35 @@ impl CardanoChain for BlockfrostCardanoChain {
         Ok(ctx.to_roster())
     }
 
+    async fn query_dkg_context(
+        &self,
+        epoch: u64,
+        attempt: u32,
+    ) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
+        match &self.registry_roster {
+            // Real eligible set + chain stake (registry − active bans).
+            Some(registry) => crate::cardano::dkg_roster::fetch_dkg_context(
+                registry,
+                self.ban_source.as_ref(),
+                &self.bf_base_url,
+                &self.bf_project_id,
+                epoch,
+                attempt,
+            )
+            .await
+            .map_err(|e| EpochError::Chain(format!("eligible roster: {e}"))),
+            // No registry configured → fall back to the static roster with equal
+            // stake (the quorum gate degrades to a >51%-by-count majority).
+            None => Ok(
+                crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(
+                    &self.fallback_roster,
+                    epoch,
+                    attempt,
+                ),
+            ),
+        }
+    }
+
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {
         let utxos = self
             .api
