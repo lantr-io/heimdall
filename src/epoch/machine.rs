@@ -56,6 +56,22 @@ use std::collections::BTreeMap;
 /// runs DKG → BuildTm → Sign → Submit → AwaitConfirm and then exits.
 /// Future cuts will instead loop back to `Idle` and wait for the next
 /// boundary.
+/// Backoff bounds for retriable phase errors (chain/peer/DKG). A persistent
+/// transient failure re-enters `Idle` with an exponentially growing wait,
+/// capped, so the node parks for the next boundary instead of dying or
+/// hot-looping (WI-010 / WI-014 error-handling feedback).
+const RETRY_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(2);
+const RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One dispatch step: advance to the next phase, or finish the cycle. Both
+/// variants are large but the value is constructed and consumed immediately in
+/// the loop (never stored), so boxing would only add an allocation.
+#[allow(clippy::large_enum_variant)]
+enum Step {
+    Next(EpochPhase),
+    Done(TreasuryMovement),
+}
+
 pub async fn run_epoch_loop(
     chain: Arc<dyn CardanoChain>,
     pegin_source: Arc<dyn CardanoPegInSource>,
@@ -66,84 +82,136 @@ pub async fn run_epoch_loop(
 ) -> EpochResult<TreasuryMovement> {
     let me = config.identity.identifier;
     let mut phase = EpochPhase::Idle;
+    let mut backoff = RETRY_BACKOFF_MIN;
     loop {
         crate::epoch_log!(me, current_epoch(&phase), "==> phase = {}", phase.name());
-        phase = match phase {
-            EpochPhase::Idle => idle_phase(&chain).await?,
-
-            EpochPhase::EpochStart { epoch } => epoch_start_phase(&chain, epoch).await?,
-
-            EpochPhase::Dkg {
-                round,
-                ctx,
-                collected,
-            } => dkg_phase(&peers, &clock, &rng, config, round, ctx, collected).await?,
-
-            EpochPhase::PublishKeys {
-                epoch,
-                roster,
-                group_keys,
-            } => publish_keys_phase(&chain, epoch, roster, group_keys).await?,
-
-            EpochPhase::CollectPegins {
-                epoch,
-                roster,
-                group_keys,
-            } => {
-                collect_pegins_phase(
-                    &chain,
-                    &pegin_source,
-                    &clock,
-                    config,
-                    epoch,
-                    roster,
-                    group_keys,
-                )
-                .await?
+        match step_phase(
+            phase,
+            &chain,
+            &pegin_source,
+            &peers,
+            &clock,
+            &rng,
+            config,
+            me,
+        )
+        .await
+        {
+            Ok(Step::Next(next)) => {
+                phase = next;
+                backoff = RETRY_BACKOFF_MIN; // progress → reset
             }
-
-            EpochPhase::BuildTm {
-                epoch,
-                roster,
-                group_keys,
-                frozen_pegins,
-            } => build_tm_phase(&chain, epoch, roster, group_keys, frozen_pegins).await?,
-
-            EpochPhase::Sign {
-                epoch,
-                roster,
-                cascade,
-                group_keys,
-                tm,
-                round,
-                collected,
-            } => {
-                sign_phase(
-                    &peers, &clock, &rng, config, epoch, roster, cascade, group_keys, tm, round,
-                    collected,
-                )
-                .await?
+            Ok(Step::Done(tm)) => return Ok(tm),
+            // Retriable (chain read, peer transport, signing timeout, fully
+            // aborted DKG attempt): back off and re-enter from the boundary,
+            // NEVER kill the node. A failed DKG attempt already reruns over a
+            // reduced set inside `dkg_phase`; reaching here means even that
+            // aborted, so wait for the next boundary and rebuild the context.
+            Err(e) if e.is_retriable() => {
+                crate::epoch_log!(
+                    me,
+                    current_epoch(&EpochPhase::Idle),
+                    "retriable error: {e}; backing off {:?} then re-entering Idle",
+                    backoff
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                phase = EpochPhase::Idle;
             }
-
-            EpochPhase::Submit {
-                epoch,
-                roster,
-                tm,
-                leader_attempt,
-            } => submit_phase(&chain, me, epoch, roster, tm, leader_attempt).await?,
-
-            EpochPhase::AwaitConfirm { tm, .. } => {
-                // First-cycle terminal: return the signed TM.
-                //
-                // TODO: in steady state this phase should poll the
-                // chain for inclusion of `cardano_tx_id` (once submit
-                // actually produces one), then transition back to
-                // `Idle` to wait for the next epoch boundary. Today we
-                // exit the loop unconditionally.
-                return Ok(tm);
-            }
-        };
+            // Fatal (logic/crypto bug, malformed tx): surface it. The caller
+            // logs and exits cleanly rather than panicking.
+            Err(e) => return Err(e),
+        }
     }
+}
+
+/// Dispatch one phase to its handler. Pure routing — the retry/backoff policy
+/// lives in [`run_epoch_loop`].
+#[allow(clippy::too_many_arguments)]
+async fn step_phase(
+    phase: EpochPhase,
+    chain: &Arc<dyn CardanoChain>,
+    pegin_source: &Arc<dyn CardanoPegInSource>,
+    peers: &Arc<dyn PeerNetwork>,
+    clock: &Arc<dyn Clock>,
+    rng: &Arc<dyn RngSource>,
+    config: &EpochConfig,
+    me: frost::Identifier,
+) -> EpochResult<Step> {
+    let next = match phase {
+        EpochPhase::Idle => idle_phase(chain).await?,
+
+        EpochPhase::EpochStart { epoch } => epoch_start_phase(chain, epoch).await?,
+
+        EpochPhase::Dkg {
+            round,
+            ctx,
+            collected,
+        } => dkg_phase(peers, clock, rng, config, round, ctx, collected).await?,
+
+        EpochPhase::PublishKeys {
+            epoch,
+            roster,
+            group_keys,
+        } => publish_keys_phase(chain, epoch, roster, group_keys).await?,
+
+        EpochPhase::CollectPegins {
+            epoch,
+            roster,
+            group_keys,
+        } => {
+            collect_pegins_phase(
+                chain,
+                pegin_source,
+                clock,
+                config,
+                epoch,
+                roster,
+                group_keys,
+            )
+            .await?
+        }
+
+        EpochPhase::BuildTm {
+            epoch,
+            roster,
+            group_keys,
+            frozen_pegins,
+        } => build_tm_phase(chain, epoch, roster, group_keys, frozen_pegins).await?,
+
+        EpochPhase::Sign {
+            epoch,
+            roster,
+            cascade,
+            group_keys,
+            tm,
+            round,
+            collected,
+        } => {
+            sign_phase(
+                peers, clock, rng, config, epoch, roster, cascade, group_keys, tm, round, collected,
+            )
+            .await?
+        }
+
+        EpochPhase::Submit {
+            epoch,
+            roster,
+            tm,
+            leader_attempt,
+        } => submit_phase(chain, me, epoch, roster, tm, leader_attempt).await?,
+
+        EpochPhase::AwaitConfirm { tm, .. } => {
+            // First-cycle terminal: return the signed TM.
+            //
+            // TODO: in steady state this phase should poll the chain for
+            // inclusion of `cardano_tx_id` (once submit actually produces one),
+            // then transition back to `Idle` to wait for the next epoch
+            // boundary. Today we finish the cycle unconditionally.
+            return Ok(Step::Done(tm));
+        }
+    };
+    Ok(Step::Next(next))
 }
 
 // ---------------------------------------------------------------------------

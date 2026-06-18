@@ -945,9 +945,20 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
     });
 
     let t0 = Instant::now();
-    let tm = run_epoch_loop(chain, pegin_source, peers, clock, rng, &config)
-        .await
-        .expect("epoch loop");
+    // The epoch loop treats chain-read / peer / aborted-DKG failures as
+    // retriable (it backs off and re-enters the boundary internally), so a
+    // returned Err is a genuinely fatal condition (a logic/crypto bug or
+    // malformed tx). Exit cleanly with a message instead of panicking — the
+    // node never dies on a transient failure (WI-014 error-handling feedback).
+    let tm = match run_epoch_loop(chain, pegin_source, peers, clock, rng, &config).await {
+        Ok(tm) => tm,
+        Err(e) => {
+            eprintln!("[demo] epoch loop terminated with a fatal error: {e}");
+            eprintln!("[demo] server still running on {bind_addr}:{port}; press Ctrl-C to exit.");
+            tokio::signal::ctrl_c().await.ok();
+            return;
+        }
+    };
     println!("Cycle complete ({:.2?})", t0.elapsed());
 
     // ── Bitcoin TM transaction summary ──────────────────────────────────────
