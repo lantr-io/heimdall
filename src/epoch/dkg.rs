@@ -139,7 +139,7 @@ pub async fn dkg_phase(
                     eligible.len(),
                     absent
                 );
-                rerun_or_abort(&ctx, &l1, "round1 incomplete")
+                rerun_or_abort(me, &ctx, DkgRound::Round1, &l1, "round1 incomplete")
             }
         }
 
@@ -250,7 +250,7 @@ pub async fn dkg_phase(
                     eligible.len(),
                     absent
                 );
-                rerun_or_abort(&ctx, &q, "round2 incomplete")
+                rerun_or_abort(me, &ctx, DkgRound::Round2, &q, "round2 incomplete")
             }
         }
 
@@ -329,14 +329,78 @@ pub async fn dkg_phase(
     }
 }
 
+/// Orchestration-layer fault evidence for one incomplete DKG round: the
+/// eligible participants that did NOT deliver a verifiable payload by the
+/// deadline (WI-014 #8). At this layer "absent" and "sent an unverifiable
+/// payload" are indistinguishable — the transport already dropped bad payloads
+/// to `Ok(None)` and separately retained their raw bytes for equivocation
+/// proofs, keyed by `(epoch, round, pool_id)`. This records WHICH participants
+/// to look those up for; turning it into a Plonk fault proof + on-chain ban is
+/// WI-019 (explicitly out of scope here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DkgExclusionEvidence {
+    pub epoch: u64,
+    pub attempt: u32,
+    pub round: DkgRound,
+    /// Excluded participants as `(identifier, pool_id)`, in identifier order.
+    pub excluded: Vec<(Identifier, Vec<u8>)>,
+}
+
+impl DkgExclusionEvidence {
+    /// The eligible participants of `ctx` not present in `survivors`.
+    #[must_use]
+    pub fn from_round(ctx: &DkgContext, round: DkgRound, survivors: &BTreeSet<Identifier>) -> Self {
+        let excluded = ctx
+            .participants
+            .iter()
+            .filter(|p| !survivors.contains(&p.identifier))
+            .map(|p| (p.identifier, p.pool_id.clone()))
+            .collect();
+        Self {
+            epoch: ctx.epoch,
+            attempt: ctx.attempt,
+            round,
+            excluded,
+        }
+    }
+
+    /// Human-readable `pool_id@id` list for structured logging.
+    fn summary(&self) -> String {
+        self.excluded
+            .iter()
+            .map(|(id, pool)| {
+                format!(
+                    "{}@{}",
+                    hex::encode(&pool[..pool.len().min(4)]),
+                    id_short(*id)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 /// After a round finished incomplete, decide between a reduced-set rerun and a
 /// fatal abort. Reruns iff the `survivors` clear the quorum gate AND there are
 /// still enough of them to run FROST DKG; otherwise the epoch's DKG is dead.
+/// Captures structured [`DkgExclusionEvidence`] for the excluded peers (WI-019).
 fn rerun_or_abort(
+    me: Identifier,
     ctx: &DkgContext,
+    round: DkgRound,
     survivors: &BTreeSet<Identifier>,
     why: &str,
 ) -> EpochResult<EpochPhase> {
+    let evidence = DkgExclusionEvidence::from_round(ctx, round, survivors);
+    crate::epoch_log!(
+        me,
+        ctx.epoch,
+        "  DKG fault evidence (attempt {}, {:?}): excluded [{}] — retained raw bytes available \
+         from the transport for WI-019 fault proofs",
+        ctx.attempt,
+        round,
+        evidence.summary()
+    );
     let eligible = ctx.participants.len();
     let abort = |reason: String| {
         Err(EpochError::DkgAborted {
@@ -625,6 +689,38 @@ mod tests {
         let err = check_dkg_output_coherent(id2, &kp1, &pkp1)
             .expect_err("share bound to the wrong participant must be rejected");
         assert!(matches!(err, EpochError::Frost(_)));
+    }
+
+    /// Fault evidence records exactly the eligible participants missing from the
+    /// survivor set, tagged with epoch/attempt/round — the structured hook
+    /// WI-019 correlates with the transport's retained raw bytes.
+    #[test]
+    fn exclusion_evidence_records_the_missing_participants() {
+        let roster = make_roster(3, 2);
+        let mut ctx = DkgContext::from_roster_equal_stake(&roster, 42, 1);
+        // give participants distinct pool_ids so the evidence carries them
+        for (i, p) in ctx.participants.iter_mut().enumerate() {
+            p.pool_id = vec![0xC0 + i as u8; 28];
+        }
+        let survivors: BTreeSet<_> = [Identifier::try_from(1u16).unwrap()]
+            .into_iter()
+            .chain(std::iter::once(Identifier::try_from(3u16).unwrap()))
+            .collect();
+        let ev = DkgExclusionEvidence::from_round(&ctx, DkgRound::Round2, &survivors);
+        assert_eq!(ev.epoch, 42);
+        assert_eq!(ev.attempt, 1);
+        assert_eq!(ev.round, DkgRound::Round2);
+        // only participant 2 is missing
+        assert_eq!(ev.excluded.len(), 1);
+        assert_eq!(ev.excluded[0].0, Identifier::try_from(2u16).unwrap());
+        assert_eq!(ev.excluded[0].1, vec![0xC1; 28]);
+        // a full survivor set yields no evidence
+        let all: BTreeSet<_> = ctx.participants.iter().map(|p| p.identifier).collect();
+        assert!(
+            DkgExclusionEvidence::from_round(&ctx, DkgRound::Round1, &all)
+                .excluded
+                .is_empty()
+        );
     }
 
     /// A solo SPO in a 3-candidate set: only itself publishes Round 1, the
