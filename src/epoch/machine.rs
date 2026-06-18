@@ -141,7 +141,7 @@ async fn step_phase(
     let next = match phase {
         EpochPhase::Idle => idle_phase(chain).await?,
 
-        EpochPhase::EpochStart { epoch } => epoch_start_phase(chain, epoch).await?,
+        EpochPhase::EpochStart { epoch } => epoch_start_phase(chain, config, epoch).await?,
 
         EpochPhase::Dkg {
             round,
@@ -223,7 +223,21 @@ async fn idle_phase(chain: &Arc<dyn CardanoChain>) -> EpochResult<EpochPhase> {
     Ok(EpochPhase::EpochStart { epoch: event.epoch })
 }
 
-async fn epoch_start_phase(chain: &Arc<dyn CardanoChain>, epoch: u64) -> EpochResult<EpochPhase> {
+async fn epoch_start_phase(
+    chain: &Arc<dyn CardanoChain>,
+    config: &EpochConfig,
+    epoch: u64,
+) -> EpochResult<EpochPhase> {
+    let me = config.identity.identifier;
+
+    // Restart recovery (WI-014 #5): if this epoch's DKG already ran and was
+    // persisted, reload the share and skip straight to PublishKeys — the
+    // ceremony is multi-round and expensive, and a mid-epoch crash must not
+    // re-run it (or lose the share).
+    if let Some(resumed) = try_resume_dkg(config, me, epoch)? {
+        return Ok(resumed);
+    }
+
     // Build the stake-aware DKG context for attempt 0. A failed attempt reruns
     // over a reduced candidate set with a bumped attempt inside `dkg_phase`
     // (DkgContext::reduced_to), so the chain is queried once at the boundary.
@@ -233,6 +247,54 @@ async fn epoch_start_phase(chain: &Arc<dyn CardanoChain>, epoch: u64) -> EpochRe
         ctx,
         collected: DkgCollected::default(),
     })
+}
+
+/// Reload a persisted DKG for `epoch` and turn it into a resume-to-PublishKeys
+/// phase, or `None` to run a fresh ceremony. Persisted state that doesn't bind
+/// this node, or is unreadable, is treated as stale (not an error) and ignored.
+fn try_resume_dkg(
+    config: &EpochConfig,
+    me: frost::Identifier,
+    epoch: u64,
+) -> EpochResult<Option<EpochPhase>> {
+    let Some(dir) = &config.state_dir else {
+        return Ok(None);
+    };
+    let Some(saved) = crate::epoch::persist::read_dkg_state(dir, epoch)? else {
+        return Ok(None);
+    };
+    match saved.to_group_keys() {
+        Ok(group_keys) if *group_keys.key_package.identifier() == me => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "resuming epoch {epoch} from persisted DKG (attempt {}) — skipping the ceremony",
+                saved.attempt
+            );
+            Ok(Some(EpochPhase::PublishKeys {
+                epoch,
+                roster: saved.roster,
+                group_keys,
+            }))
+        }
+        Ok(_) => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "persisted DKG for epoch {epoch} is bound to a different identity — ignoring, \
+                 running a fresh ceremony"
+            );
+            Ok(None)
+        }
+        Err(e) => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "persisted DKG for epoch {epoch} is unreadable ({e}) — running a fresh ceremony"
+            );
+            Ok(None)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +791,87 @@ mod tests {
     #[tokio::test]
     async fn full_cycle_2_of_2_all_derive_same_treasury() {
         multi_instance_same_treasury(2, 2).await;
+    }
+
+    /// WI-014 #5 restart recovery: with a persisted DKG for the epoch,
+    /// `epoch_start_phase` reloads the share and jumps to PublishKeys instead of
+    /// re-running the ceremony; without it, it proceeds to a fresh DKG.
+    #[tokio::test]
+    async fn epoch_start_resumes_from_persisted_dkg() {
+        use crate::epoch::persist::{PersistedDkg, write_dkg_state};
+        use crate::epoch::state::SpoInfo;
+        use crate::frost::participant;
+        use std::collections::BTreeMap;
+
+        // A real 2-of-2 DKG → node 1's KeyPackage + group package + roster.
+        let id1 = Identifier::try_from(1u16).unwrap();
+        let id2 = Identifier::try_from(2u16).unwrap();
+        let mut rng = rand::thread_rng();
+        let (s1, p1) = participant::dkg_part1(id1, 2, 2, &mut rng).unwrap();
+        let (s2, p2) = participant::dkg_part1(id2, 2, 2, &mut rng).unwrap();
+        let r1_1: BTreeMap<_, _> = [(id2, p2)].into_iter().collect();
+        let r1_2: BTreeMap<_, _> = [(id1, p1)].into_iter().collect();
+        let (s1r2, _) = participant::dkg_part2(s1, &r1_1).unwrap();
+        let (_, pk2) = participant::dkg_part2(s2, &r1_2).unwrap();
+        let r2_1: BTreeMap<_, _> = [(id2, pk2.get(&id1).unwrap().clone())]
+            .into_iter()
+            .collect();
+        let (kp1, pkp1) = participant::dkg_part3(&s1r2, &r1_1, &r2_1).unwrap();
+        let group_keys = GroupKeys {
+            verifying_key: *pkp1.verifying_key(),
+            public_key_package: pkp1,
+            key_package: kp1,
+        };
+        let mut participants = BTreeMap::new();
+        for i in 1u16..=2 {
+            let id = Identifier::try_from(i).unwrap();
+            participants.insert(
+                id,
+                SpoInfo {
+                    identifier: id,
+                    pool_id: vec![i as u8; 28],
+                    bifrost_url: format!("http://127.0.0.1:{}", 18700 + i),
+                    bifrost_id_pk: vec![i as u8; 32],
+                },
+            );
+        }
+        let roster = Roster {
+            epoch: 0,
+            min_signers: 2,
+            max_signers: 2,
+            participants,
+        };
+
+        let dir = std::env::temp_dir().join(format!("heimdall-resume-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_dkg_state(
+            &dir,
+            &PersistedDkg::from_output(0, 0, &roster, &group_keys).unwrap(),
+        )
+        .unwrap();
+
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(demo_static_fixture(2, 2, 18_700)));
+        let mut config = fast_config(id1);
+        config.state_dir = Some(dir.clone());
+
+        // With persisted state → resume straight to PublishKeys (no DKG).
+        match epoch_start_phase(&chain, &config, 0).await.unwrap() {
+            EpochPhase::PublishKeys { group_keys: gk, .. } => {
+                assert_eq!(gk.verifying_key, group_keys.verifying_key);
+                assert_eq!(*gk.key_package.identifier(), id1);
+            }
+            other => panic!("expected resume to PublishKeys, got {}", other.name()),
+        }
+
+        // No persisted state → fresh DKG (the mock chain serves the context).
+        config.state_dir = None;
+        assert!(matches!(
+            epoch_start_phase(&chain, &config, 0).await.unwrap(),
+            EpochPhase::Dkg { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

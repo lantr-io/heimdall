@@ -358,6 +358,10 @@ pub struct EpochConfig {
     /// Taproot's depositor refund leaf. Spec default is 4320 (~30 days);
     /// testnet4/preprod typically use a smaller value.
     pub pegin_refund_timeout_blocks: u16,
+    /// Directory for 0600 DKG-state persistence so the signing share survives
+    /// process restarts for the epoch (WI-014 #5). `None` → in-memory only (the
+    /// share is lost on restart and DKG re-runs next boundary).
+    pub state_dir: Option<std::path::PathBuf>,
 }
 
 impl EpochConfig {
@@ -378,6 +382,7 @@ impl EpochConfig {
             pegin_collection_window: Duration::from_secs(5),
             pegin_poll_interval: Duration::from_millis(1000),
             pegin_refund_timeout_blocks: 4320,
+            state_dir: None,
         }
     }
 }

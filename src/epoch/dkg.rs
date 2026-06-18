@@ -317,6 +317,36 @@ pub async fn dkg_phase(
                 key_package,
             };
 
+            // Persist the share so it survives a restart for the whole epoch
+            // (WI-014 #5). A persist failure is logged but NOT fatal: the share
+            // is valid in memory for this process, and aborting a completed DKG
+            // over a transient disk error (only to re-run the expensive ceremony,
+            // which may also fail to persist) is worse than running without
+            // restart-survival until the next successful write.
+            if let Some(dir) = &config.state_dir {
+                match crate::epoch::persist::PersistedDkg::from_output(
+                    epoch,
+                    attempt,
+                    &roster,
+                    &group_keys,
+                )
+                .and_then(|s| crate::epoch::persist::write_dkg_state(dir, &s))
+                {
+                    Ok(()) => crate::epoch_log!(
+                        me,
+                        epoch,
+                        "  -> DKG state persisted to {}",
+                        crate::epoch::persist::dkg_state_path(dir, epoch).display()
+                    ),
+                    Err(e) => crate::epoch_log!(
+                        me,
+                        epoch,
+                        "  WARNING: could not persist DKG state ({e}); share is in memory only \
+                         and will not survive a restart this epoch"
+                    ),
+                }
+            }
+
             // The roster handed to the rest of the cycle is the candidate set
             // that actually formed the key (the possibly-reduced `ctx`), so
             // signing draws from exactly the share-holders.

@@ -67,6 +67,9 @@ pub struct ProtocolConfig {
     pub leader_timeout_secs: u64,
     pub pegin_collection_window_secs: u64,
     pub pegin_poll_interval_ms: u64,
+    /// Directory for 0600 DKG-state persistence so the signing share survives
+    /// restarts for the epoch (WI-014). Unset → in-memory only.
+    pub state_dir: Option<String>,
 }
 
 impl Default for ProtocolConfig {
@@ -79,6 +82,7 @@ impl Default for ProtocolConfig {
             leader_timeout_secs: 10000,
             pegin_collection_window_secs: 5,
             pegin_poll_interval_ms: 1000,
+            state_dir: None,
         }
     }
 }
@@ -336,6 +340,11 @@ impl HeimdallConfig {
             ),
             pegin_poll_interval: Duration::from_millis(self.protocol.pegin_poll_interval_ms),
             pegin_refund_timeout_blocks: self.bitcoin.pegin_refund_timeout_blocks,
+            state_dir: self
+                .protocol
+                .state_dir
+                .as_deref()
+                .map(std::path::PathBuf::from),
         }
     }
 }

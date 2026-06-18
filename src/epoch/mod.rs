@@ -11,6 +11,7 @@ pub mod fixture;
 pub mod log;
 pub mod machine;
 pub mod mocks;
+pub mod persist;
 pub mod signing;
 pub mod state;
 pub mod traits;
