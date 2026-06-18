@@ -359,15 +359,16 @@ unaffected.
 
 ### 5a. `evidence_hash` derivation (WI-019) and the permissive-verify gap
 
-**Upstream gap (still open):** `fault-verifier.ak:42` is a `// TODO: Verify the
-submitted fault evidence/proof before minting FaultProof.` — today the validator
-checks only structural shape (input_ref spent, single token =
-`blake2b_256(pool_id ‖ evidence_hash)`, 28/32-byte lengths, datum-on-output). It
-verifies **no** evidence, so anyone can mint a forged FaultProof against any pool
-and ApplyBan will trust it. Real on-chain verification (Plonk/Halo2 verify for
-`InvalidPayload`, double-signature check for `Equivocation`) is FluidTokens
-contract work. **Until it lands, the `evidence_hash` preimage is not pinned by
-the contract** and any heimdall-side derivation is forward-looking.
+**Upstream gap (partially closed).** `fault-verifier.ak`'s `Equivocation` path is
+now verified on-chain (WI-019 — the double-signature check; see §5b), so that
+`evidence_hash` preimage is pinned. The `InvalidPayload` path is **still a
+permissive mock** (`PublishProof` checks only structural shape: input_ref spent,
+single token = `blake2b_256(pool_id ‖ evidence_hash)`, 28/32-byte lengths,
+datum-on-output) — it verifies **no** ZK evidence, so anyone can still mint a
+forged `InvalidPayload` FaultProof against any pool and ApplyBan will trust it.
+Real `InvalidPayload` verification (Plonk/Halo2) is blocked on the circuit-binding
+decision below, so its `evidence_hash` preimage, while pinned by the circuit, is
+not yet *verified* by the contract.
 
 **heimdall-side derivation (WI-019, `circuits::fault_evidence`):** given that
 gap, heimdall already wires captured WI-014 evidence → `evidence_hash` →
@@ -384,10 +385,10 @@ verify must check:
   (`μ·G − c·φ₀ ≠ R`, resp. `f_i(l)·G ≠ Σ_j l^j φ_{i,j}`).
 - **`Equivocation`** = `blake2b_256(min(a,b) ‖ max(a,b))` over the two conflicting
   BIP-340-signed payload byte strings (sorted ⇒ order-independent). There is **no
-  ZK** here; the misbehavior is the double-signature itself. This preimage is
-  **heimdall's choice** and is NOT yet pinned by any contract — when the upstream
-  `Equivocation` verify is defined it may require a different commitment, at which
-  point this derivation must be re-aligned.
+  ZK** here; the misbehavior is the double-signature itself. This preimage is now
+  **pinned by the contract**: the `fault-verifier.ak` `EquivocationProof` branch
+  (WI-019, 2026-06-18) recomputes exactly this hash on-chain (see §5b), so the
+  off-chain-derived token name and the on-chain check agree.
 
 **Authentication envelope (sign-the-hash, §9.2).** Each invalid-payload evidence
 type carries the accused's x-only `bifrost_id_pk`, the `(epoch, threshold,
@@ -407,32 +408,56 @@ is all the permissive mint needs today. Generating the actual ZK proof
 self-verifying but only needed once the on-chain verify checks proofs; it is
 gated out of the default test run (k=18/k=22, minutes) behind `#[ignore]`.
 
-**Remaining circuit-binding gap.** §9.2 has the verifier check the accused
-signature over `message_hash` AND bind the Halo2 proof to that same
-`message_hash`. The current `dkg_fault` circuit instead exposes
-`Poseidon(structured_fields)` and computes no SHA256 in-circuit, so nothing yet
-ties the proven public input to the `message_hash` the accused signed. Heimdall
-now *carries* both (so a submission is complete and the accused-signed check
-passes), but provably linking `Poseidon(fields)` ↔ `SHA256(canonical_bytes)` is
-upstream circuit work — the real content behind the `fault_verifier.ak:42` mock.
-For Round 2 specifically the signed payload holds the *encrypted* share while the
-circuit proves the *decrypted* one; binding those is the same class of upstream
-gap.
+**Remaining circuit-binding gap (the `InvalidPayload` blocker — FluidTokens
+design decision needed).** §9.2 has the verifier check the accused signature over
+`message_hash` AND bind the Halo2 proof to that same `message_hash`. But the
+`dkg_fault` circuit's public input is `Poseidon(structured_fields)`, while the
+accused signs `message_hash = SHA256(canonical_bytes)`; the circuit computes no
+SHA256 in-circuit. So a generated verifier would prove *"these fields encode an
+invalid PoK"* but **not** *"these fields are the ones inside the payload the
+accused actually signed."* Without that link the verifier is still **forgeable**:
+fabricate fields → produce a valid ZK proof about them → mint a FaultProof against
+an honest pool whose registered key never signed anything. Heimdall now *carries*
+both `message_hash` and the public input (so a submission is structurally
+complete and the signature check passes), but the proof and the signature are not
+yet tied together. Closing it requires either:
 
-ACTION: rebase the `feat/b1-confirm-tm-reference` fork branch on upstream `main`
-so the fault/ban section isn't worked from a stale copy. No FluidTokens spec PR
-is needed — the change is already merged upstream.
+- computing `SHA256(canonical_bytes)` **inside the circuit** and exposing
+  `message_hash` as the public input — a real, costly circuit change (SHA256-in-ZK
+  over a variable-length preimage), or
+- a **different binding scheme** — which is a FluidTokens protocol-design call,
+  not one heimdall can make unilaterally in their contract.
 
-### 5a. `fault_verifier.ak` verifies NO fault evidence yet — permissive mint (UNRESOLVED upstream gap)
+Until one is chosen, the `InvalidPayload` verifier cannot be made sound, so
+`fault_verifier.ak` keeps `InvalidPayload` as a permissive mock. (`Equivocation`
+has no such gap — it needs no ZK — and is now verified on-chain; see §5b.) For
+Round 2 specifically the signed payload also holds the *encrypted* share while
+the circuit proves the *decrypted* one; binding those is the same class of gap.
 
-*2026-06-17, recorded while closing out WI-016 (heimdall `src/cardano/fault_proof.rs`).*
+### 5b. `fault_verifier.ak` evidence verify — `Equivocation` now real, `InvalidPayload` still a mock
 
-The token-name + ban-policy *shape* above is settled, but the verifier that is
-supposed to gate minting is **not implemented upstream**. `fault-verifier.ak`'s
-`PublishProof` branch (ft-bifrost-bridge `feat/b1-confirm-tm-reference`,
-`onchain/validators/bitcoin/fault-verifier.ak:42`) carries a literal
-`// TODO: Verify the submitted fault evidence/proof before minting FaultProof.`
-and checks only **structural shape**:
+*2026-06-17, recorded while closing out WI-016. Updated 2026-06-18 (WI-019): the
+`Equivocation` branch is now implemented on-chain.*
+
+**Update (2026-06-18).** The `Equivocation` path is no longer a mock.
+`fault-verifier.ak` gained an `EquivocationProof` redeemer (carrying the accused
+`bifrost_id_pk`, the two conflicting canonical payloads, and their signatures)
+and a real verify branch implementing tech-doc §9.2: the two payloads differ,
+share the same 66-byte namespace header attributed to `accused_pool_id`, both
+BIP-340 signatures verify under `bifrost_id_pk` over `sha2_256(payload)` (the
+same `crypto.verify_schnorr_signature` primitive `spos-registry.ak` uses), and
+`fault.evidence_hash == blake2b_256(min(a,b) ‖ max(a,b))` (matching heimdall
+`EquivocationEvidence::evidence_hash`). Residual: it trusts the redeemer-supplied
+`bifrost_id_pk`; full soundness needs an `spos_registry` reference input binding
+`pool_id → bifrost_id_pk` (deliberately omitted, matching §9.2 which takes the
+key as given). `InvalidPayload` stays a mock pending the §5a binding decision.
+
+**Original record (the `InvalidPayload` gap, still open).** The token-name +
+ban-policy *shape* in §5 is settled, but the `InvalidPayload` verifier is **not
+implemented upstream**. `fault-verifier.ak`'s `PublishProof` branch
+(ft-bifrost-bridge `feat/b1-confirm-tm-reference`) carries a literal
+`// TODO: Verify the submitted InvalidPayload ZK proof before minting.` and
+checks only **structural shape**:
 
 - `find_input(self.inputs, input_ref)` — the `input_ref` outpoint is a spent input (anti-replay nonce);
 - exactly one token minted under the policy, named `blake2b_256(accused_pool_id ‖ evidence_hash)` (recomputed, not sliced);
