@@ -56,6 +56,22 @@ use std::collections::BTreeMap;
 /// runs DKG → BuildTm → Sign → Submit → AwaitConfirm and then exits.
 /// Future cuts will instead loop back to `Idle` and wait for the next
 /// boundary.
+/// Backoff bounds for retriable phase errors (chain/peer/DKG). A persistent
+/// transient failure re-enters `Idle` with an exponentially growing wait,
+/// capped, so the node parks for the next boundary instead of dying or
+/// hot-looping (WI-010 / WI-014 error-handling feedback).
+const RETRY_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(2);
+const RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One dispatch step: advance to the next phase, or finish the cycle. Both
+/// variants are large but the value is constructed and consumed immediately in
+/// the loop (never stored), so boxing would only add an allocation.
+#[allow(clippy::large_enum_variant)]
+enum Step {
+    Next(EpochPhase),
+    Done(TreasuryMovement),
+}
+
 pub async fn run_epoch_loop(
     chain: Arc<dyn CardanoChain>,
     pegin_source: Arc<dyn CardanoPegInSource>,
@@ -66,90 +82,136 @@ pub async fn run_epoch_loop(
 ) -> EpochResult<TreasuryMovement> {
     let me = config.identity.identifier;
     let mut phase = EpochPhase::Idle;
+    let mut backoff = RETRY_BACKOFF_MIN;
     loop {
         crate::epoch_log!(me, current_epoch(&phase), "==> phase = {}", phase.name());
-        phase = match phase {
-            EpochPhase::Idle => idle_phase(&chain).await?,
-
-            EpochPhase::EpochStart { epoch } => epoch_start_phase(&chain, epoch).await?,
-
-            EpochPhase::Dkg {
-                epoch,
-                round,
-                roster,
-                collected,
-            } => {
-                dkg_phase(
-                    &peers, &clock, &rng, config, epoch, round, roster, collected,
-                )
-                .await?
+        match step_phase(
+            phase,
+            &chain,
+            &pegin_source,
+            &peers,
+            &clock,
+            &rng,
+            config,
+            me,
+        )
+        .await
+        {
+            Ok(Step::Next(next)) => {
+                phase = next;
+                backoff = RETRY_BACKOFF_MIN; // progress → reset
             }
-
-            EpochPhase::PublishKeys {
-                epoch,
-                roster,
-                group_keys,
-            } => publish_keys_phase(&chain, epoch, roster, group_keys).await?,
-
-            EpochPhase::CollectPegins {
-                epoch,
-                roster,
-                group_keys,
-            } => {
-                collect_pegins_phase(
-                    &chain,
-                    &pegin_source,
-                    &clock,
-                    config,
-                    epoch,
-                    roster,
-                    group_keys,
-                )
-                .await?
+            Ok(Step::Done(tm)) => return Ok(tm),
+            // Retriable (chain read, peer transport, signing timeout, fully
+            // aborted DKG attempt): back off and re-enter from the boundary,
+            // NEVER kill the node. A failed DKG attempt already reruns over a
+            // reduced set inside `dkg_phase`; reaching here means even that
+            // aborted, so wait for the next boundary and rebuild the context.
+            Err(e) if e.is_retriable() => {
+                crate::epoch_log!(
+                    me,
+                    current_epoch(&EpochPhase::Idle),
+                    "retriable error: {e}; backing off {:?} then re-entering Idle",
+                    backoff
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                phase = EpochPhase::Idle;
             }
-
-            EpochPhase::BuildTm {
-                epoch,
-                roster,
-                group_keys,
-                frozen_pegins,
-            } => build_tm_phase(&chain, epoch, roster, group_keys, frozen_pegins).await?,
-
-            EpochPhase::Sign {
-                epoch,
-                roster,
-                cascade,
-                group_keys,
-                tm,
-                round,
-                collected,
-            } => {
-                sign_phase(
-                    &peers, &clock, &rng, config, epoch, roster, cascade, group_keys, tm, round,
-                    collected,
-                )
-                .await?
-            }
-
-            EpochPhase::Submit {
-                epoch,
-                roster,
-                tm,
-                leader_attempt,
-            } => submit_phase(&chain, me, epoch, roster, tm, leader_attempt).await?,
-
-            EpochPhase::AwaitConfirm { tm, .. } => {
-                // First-cycle terminal: return the signed TM.
-                //
-                // TODO: in steady state this phase should poll the
-                // chain for inclusion of `cardano_tx_id` (once submit
-                // actually produces one), then transition back to
-                // `Idle` to wait for the next epoch boundary. Today we
-                // exit the loop unconditionally.
-                return Ok(tm);
-            }
-        };
+            // Fatal (logic/crypto bug, malformed tx): surface it. The caller
+            // logs and exits cleanly rather than panicking.
+            Err(e) => return Err(e),
+        }
     }
+}
+
+/// Dispatch one phase to its handler. Pure routing — the retry/backoff policy
+/// lives in [`run_epoch_loop`].
+#[allow(clippy::too_many_arguments)]
+async fn step_phase(
+    phase: EpochPhase,
+    chain: &Arc<dyn CardanoChain>,
+    pegin_source: &Arc<dyn CardanoPegInSource>,
+    peers: &Arc<dyn PeerNetwork>,
+    clock: &Arc<dyn Clock>,
+    rng: &Arc<dyn RngSource>,
+    config: &EpochConfig,
+    me: frost::Identifier,
+) -> EpochResult<Step> {
+    let next = match phase {
+        EpochPhase::Idle => idle_phase(chain).await?,
+
+        EpochPhase::EpochStart { epoch } => epoch_start_phase(chain, config, epoch).await?,
+
+        EpochPhase::Dkg {
+            round,
+            ctx,
+            collected,
+        } => dkg_phase(peers, clock, rng, config, round, ctx, collected).await?,
+
+        EpochPhase::PublishKeys {
+            epoch,
+            roster,
+            group_keys,
+        } => publish_keys_phase(chain, epoch, roster, group_keys).await?,
+
+        EpochPhase::CollectPegins {
+            epoch,
+            roster,
+            group_keys,
+        } => {
+            collect_pegins_phase(
+                chain,
+                pegin_source,
+                clock,
+                config,
+                epoch,
+                roster,
+                group_keys,
+            )
+            .await?
+        }
+
+        EpochPhase::BuildTm {
+            epoch,
+            roster,
+            group_keys,
+            frozen_pegins,
+        } => build_tm_phase(chain, epoch, roster, group_keys, frozen_pegins).await?,
+
+        EpochPhase::Sign {
+            epoch,
+            roster,
+            cascade,
+            group_keys,
+            tm,
+            round,
+            collected,
+        } => {
+            sign_phase(
+                peers, clock, rng, config, epoch, roster, cascade, group_keys, tm, round, collected,
+            )
+            .await?
+        }
+
+        EpochPhase::Submit {
+            epoch,
+            roster,
+            tm,
+            leader_attempt,
+        } => submit_phase(chain, me, epoch, roster, tm, leader_attempt).await?,
+
+        EpochPhase::AwaitConfirm { tm, .. } => {
+            // First-cycle terminal: return the signed TM.
+            //
+            // TODO: in steady state this phase should poll the chain for
+            // inclusion of `cardano_tx_id` (once submit actually produces one),
+            // then transition back to `Idle` to wait for the next epoch
+            // boundary. Today we finish the cycle unconditionally.
+            return Ok(Step::Done(tm));
+        }
+    };
+    Ok(Step::Next(next))
 }
 
 // ---------------------------------------------------------------------------
@@ -161,14 +223,78 @@ async fn idle_phase(chain: &Arc<dyn CardanoChain>) -> EpochResult<EpochPhase> {
     Ok(EpochPhase::EpochStart { epoch: event.epoch })
 }
 
-async fn epoch_start_phase(chain: &Arc<dyn CardanoChain>, epoch: u64) -> EpochResult<EpochPhase> {
-    let roster = chain.query_roster(epoch).await?;
+async fn epoch_start_phase(
+    chain: &Arc<dyn CardanoChain>,
+    config: &EpochConfig,
+    epoch: u64,
+) -> EpochResult<EpochPhase> {
+    let me = config.identity.identifier;
+
+    // Restart recovery (WI-014 #5): if this epoch's DKG already ran and was
+    // persisted, reload the share and skip straight to PublishKeys — the
+    // ceremony is multi-round and expensive, and a mid-epoch crash must not
+    // re-run it (or lose the share).
+    if let Some(resumed) = try_resume_dkg(config, me, epoch)? {
+        return Ok(resumed);
+    }
+
+    // Build the stake-aware DKG context for attempt 0. A failed attempt reruns
+    // over a reduced candidate set with a bumped attempt inside `dkg_phase`
+    // (DkgContext::reduced_to), so the chain is queried once at the boundary.
+    let ctx = chain.query_dkg_context(epoch, 0).await?;
     Ok(EpochPhase::Dkg {
-        epoch,
         round: DkgRound::Round1,
-        roster,
+        ctx,
         collected: DkgCollected::default(),
     })
+}
+
+/// Reload a persisted DKG for `epoch` and turn it into a resume-to-PublishKeys
+/// phase, or `None` to run a fresh ceremony. Persisted state that doesn't bind
+/// this node, or is unreadable, is treated as stale (not an error) and ignored.
+fn try_resume_dkg(
+    config: &EpochConfig,
+    me: frost::Identifier,
+    epoch: u64,
+) -> EpochResult<Option<EpochPhase>> {
+    let Some(dir) = &config.state_dir else {
+        return Ok(None);
+    };
+    let Some(saved) = crate::epoch::persist::read_dkg_state(dir, epoch)? else {
+        return Ok(None);
+    };
+    match saved.to_group_keys() {
+        Ok(group_keys) if *group_keys.key_package.identifier() == me => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "resuming epoch {epoch} from persisted DKG (attempt {}) — skipping the ceremony",
+                saved.attempt
+            );
+            Ok(Some(EpochPhase::PublishKeys {
+                epoch,
+                roster: saved.roster,
+                group_keys,
+            }))
+        }
+        Ok(_) => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "persisted DKG for epoch {epoch} is bound to a different identity — ignoring, \
+                 running a fresh ceremony"
+            );
+            Ok(None)
+        }
+        Err(e) => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "persisted DKG for epoch {epoch} is unreadable ({e}) — running a fresh ceremony"
+            );
+            Ok(None)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +315,31 @@ async fn publish_keys_phase(
         epoch,
         "PublishKeys: group_key = {}",
         hex::encode(y_51.serialize())
+    );
+
+    // Finalize (WI-014 #4): derive the NEW treasury Taproot address from the
+    // just-derived FROST group key (Y_51, internal key) + the federation
+    // fallback key (Y_fed, script leaf) read from the treasury oracle — the
+    // address the epoch's handoff will move funds into. The same derivation
+    // drives the actual TM change output in `build_tm_phase`; logging it here
+    // makes the handoff destination visible the moment DKG completes. Y_51 is
+    // identical across all SPOs (checked in `dkg_phase`), so every SPO derives
+    // this same address.
+    let treasury = chain.query_treasury().await?;
+    let secp = Secp256k1::new();
+    let new_spend = treasury_spend_info(
+        &secp,
+        y_51,
+        treasury.y_fed,
+        treasury.federation_csv_blocks as u16,
+    );
+    let new_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(new_spend.output_key());
+    crate::epoch_log!(
+        me,
+        epoch,
+        "  -> new treasury: output_key={} scriptPubKey={}",
+        hex::encode(new_spend.output_key().to_x_only_public_key().serialize()),
+        hex::encode(new_spk.as_bytes())
     );
 
     chain.publish_group_key(y_51).await?;
@@ -542,8 +693,8 @@ fn frost_vk_to_xonly(vk: &frost::VerifyingKey) -> EpochResult<UntweakedPublicKey
 fn current_epoch(phase: &EpochPhase) -> u64 {
     match phase {
         EpochPhase::Idle => 0,
+        EpochPhase::Dkg { ctx, .. } => ctx.epoch,
         EpochPhase::EpochStart { epoch }
-        | EpochPhase::Dkg { epoch, .. }
         | EpochPhase::PublishKeys { epoch, .. }
         | EpochPhase::CollectPegins { epoch, .. }
         | EpochPhase::BuildTm { epoch, .. }
@@ -557,4 +708,174 @@ fn current_epoch(phase: &EpochPhase) -> u64 {
 #[allow(dead_code)]
 fn _hash_used() -> [u8; 32] {
     bitcoin::hashes::sha256::Hash::hash(&[]).to_byte_array()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cardano::mock::MockCardanoPegInSource;
+    use crate::epoch::fixture::demo_static_fixture;
+    use crate::epoch::mocks::{
+        MockCardanoChain, MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock,
+    };
+    use crate::epoch::state::SpoIdentity;
+    use frost::Identifier;
+    use std::time::Duration;
+
+    /// Tight timings so the full cycle runs in well under a second.
+    fn fast_config(id: Identifier) -> EpochConfig {
+        let mut config = EpochConfig::demo_default(SpoIdentity {
+            identifier: id,
+            port: 0,
+        });
+        config.dkg_round_timeout = Duration::from_millis(500);
+        config.poll_interval = Duration::from_millis(10);
+        config.pegin_collection_window = Duration::from_millis(40);
+        config.pegin_poll_interval = Duration::from_millis(10);
+        config.quorum51_timeout = Duration::from_millis(500);
+        config
+    }
+
+    /// WI-014 acceptance: N instances run the FULL epoch loop (DKG → finalize →
+    /// CollectPegins → BuildTm → Sign → Submit) against their own mock chains
+    /// over a shared peer hub, and must complete the cycle deriving the SAME
+    /// treasury movement — byte-identical unsigned TM (same txid), which embeds
+    /// the new treasury address as its change output. Identical txids across all
+    /// instances ⇒ identical Y_51 ⇒ identical treasury address.
+    async fn multi_instance_same_treasury(n: u16, t: u16) {
+        let fixture = demo_static_fixture(t, n, 18_600);
+        let hub = MockPeerHub::new();
+
+        let mut handles = Vec::new();
+        for i in 1..=n {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(h.await.unwrap().expect("epoch cycle completes"));
+        }
+
+        // All instances built the byte-identical treasury movement: same txid,
+        // and (no pegins / no pegouts in the fixture) exactly one output — the
+        // new treasury change locked under the freshly derived group key.
+        let txid0 = tms[0].txid;
+        for tm in &tms[1..] {
+            assert_eq!(
+                tm.txid, txid0,
+                "all SPOs must derive the identical TM / treasury address"
+            );
+        }
+        let change_spk = &tms[0].unsigned_tx.output[0].script_pubkey;
+        assert!(
+            change_spk.is_p2tr(),
+            "treasury change must be a P2TR (taproot) output"
+        );
+        for tm in &tms[1..] {
+            assert_eq!(
+                &tm.unsigned_tx.output[0].script_pubkey, change_spk,
+                "the new treasury scriptPubKey must be identical across SPOs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_cycle_2_of_2_all_derive_same_treasury() {
+        multi_instance_same_treasury(2, 2).await;
+    }
+
+    /// WI-014 #5 restart recovery: with a persisted DKG for the epoch,
+    /// `epoch_start_phase` reloads the share and jumps to PublishKeys instead of
+    /// re-running the ceremony; without it, it proceeds to a fresh DKG.
+    #[tokio::test]
+    async fn epoch_start_resumes_from_persisted_dkg() {
+        use crate::epoch::persist::{PersistedDkg, write_dkg_state};
+        use crate::epoch::state::SpoInfo;
+        use crate::frost::participant;
+        use std::collections::BTreeMap;
+
+        // A real 2-of-2 DKG → node 1's KeyPackage + group package + roster.
+        let id1 = Identifier::try_from(1u16).unwrap();
+        let id2 = Identifier::try_from(2u16).unwrap();
+        let mut rng = rand::thread_rng();
+        let (s1, p1) = participant::dkg_part1(id1, 2, 2, &mut rng).unwrap();
+        let (s2, p2) = participant::dkg_part1(id2, 2, 2, &mut rng).unwrap();
+        let r1_1: BTreeMap<_, _> = [(id2, p2)].into_iter().collect();
+        let r1_2: BTreeMap<_, _> = [(id1, p1)].into_iter().collect();
+        let (s1r2, _) = participant::dkg_part2(s1, &r1_1).unwrap();
+        let (_, pk2) = participant::dkg_part2(s2, &r1_2).unwrap();
+        let r2_1: BTreeMap<_, _> = [(id2, pk2.get(&id1).unwrap().clone())]
+            .into_iter()
+            .collect();
+        let (kp1, pkp1) = participant::dkg_part3(&s1r2, &r1_1, &r2_1).unwrap();
+        let group_keys = GroupKeys {
+            verifying_key: *pkp1.verifying_key(),
+            public_key_package: pkp1,
+            key_package: kp1,
+        };
+        let mut participants = BTreeMap::new();
+        for i in 1u16..=2 {
+            let id = Identifier::try_from(i).unwrap();
+            participants.insert(
+                id,
+                SpoInfo {
+                    identifier: id,
+                    pool_id: vec![i as u8; 28],
+                    bifrost_url: format!("http://127.0.0.1:{}", 18700 + i),
+                    bifrost_id_pk: vec![i as u8; 32],
+                },
+            );
+        }
+        let roster = Roster {
+            epoch: 0,
+            min_signers: 2,
+            max_signers: 2,
+            participants,
+        };
+
+        let dir = std::env::temp_dir().join(format!("heimdall-resume-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_dkg_state(
+            &dir,
+            &PersistedDkg::from_output(0, 0, &roster, &group_keys).unwrap(),
+        )
+        .unwrap();
+
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(demo_static_fixture(2, 2, 18_700)));
+        let mut config = fast_config(id1);
+        config.state_dir = Some(dir.clone());
+
+        // With persisted state → resume straight to PublishKeys (no DKG).
+        match epoch_start_phase(&chain, &config, 0).await.unwrap() {
+            EpochPhase::PublishKeys { group_keys: gk, .. } => {
+                assert_eq!(gk.verifying_key, group_keys.verifying_key);
+                assert_eq!(*gk.key_package.identifier(), id1);
+            }
+            other => panic!("expected resume to PublishKeys, got {}", other.name()),
+        }
+
+        // No persisted state → fresh DKG (the mock chain serves the context).
+        config.state_dir = None;
+        assert!(matches!(
+            epoch_start_phase(&chain, &config, 0).await.unwrap(),
+            EpochPhase::Dkg { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn full_cycle_3_of_3_all_derive_same_treasury() {
+        multi_instance_same_treasury(3, 3).await;
+    }
 }

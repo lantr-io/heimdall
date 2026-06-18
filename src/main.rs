@@ -42,9 +42,11 @@ enum Commands {
         /// compiled defaults. CLI flags override TOML values.
         #[arg(long)]
         config: Option<String>,
-        /// This SPO's 1-based index in the roster.
+        /// Legacy fallback: this SPO's 1-based roster index, used only for the
+        /// config/mock fixture demo (whose roster carries no bifrost_id_pk). With
+        /// a real on-chain roster the node identifies itself by its bifrost key.
         #[arg(long)]
-        index: u16,
+        index: Option<u16>,
         /// Minimum signers (threshold). Mock-chain only.
         #[arg(long)]
         min_signers: Option<u16>,
@@ -774,9 +776,7 @@ fn apply_tm_policy(
     }
 }
 
-async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
-    let id = Identifier::try_from(index).unwrap();
-
+async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) {
     // The fixture provides a fallback roster (SPO identities + ports)
     // until the on-chain SPO registry is wired.
     let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(&cfg);
@@ -907,17 +907,52 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
         Arc::new(OsRngSource)
     };
 
-    let roster = chain.query_roster(0).await.expect("query initial roster");
-    let me = roster
-        .participants
-        .get(&id)
-        .unwrap_or_else(|| panic!("identifier {index} not in roster"));
-    let port = port_from_url(&me.bifrost_url).unwrap_or_else(|e| panic!("{e}"));
-
+    // Identity (WI-014): this node's bifrost key locates its own roster entry
+    // (own_participant). The positional --index is a legacy fallback only for
+    // the config/mock fixture, whose SpoInfos carry no bifrost_id_pk.
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let keypair = cfg
         .load_bifrost_keypair(&secp)
         .unwrap_or_else(|e| panic!("bifrost identity key required for the HTTP transport: {e}"));
+    let bifrost_id_pk = keypair.x_only_public_key().0.serialize();
+
+    // WI-014: query the roster at the REAL current epoch (was hardcoded 0).
+    let epoch = chain
+        .current_epoch()
+        .await
+        .expect("query current chain epoch");
+    let roster = chain
+        .query_roster(epoch)
+        .await
+        .expect("query initial roster");
+
+    let (id, me) = match roster.own_participant(&bifrost_id_pk) {
+        Some((id, info)) => (id, info),
+        None => {
+            // Not in the roster by bifrost key. Against a real registry roster
+            // this is fatal (not registered / banned / bifrost_url excluded). Fall
+            // back to --index ONLY for the fixture demo (empty bifrost_id_pks).
+            let ix = index.unwrap_or_else(|| {
+                panic!(
+                    "this node's bifrost_id_pk ({}) is not in the eligible roster for epoch \
+                     {epoch} (not registered / banned / URL-excluded) and no --index fallback \
+                     was given — refusing to run DKG under an unknown identity",
+                    hex::encode(bifrost_id_pk)
+                )
+            });
+            let id = Identifier::try_from(ix).unwrap();
+            let info = roster
+                .participants
+                .get(&id)
+                .unwrap_or_else(|| panic!("--index {ix} is not in the roster"));
+            eprintln!(
+                "[demo] WARNING: bifrost_id_pk not found in roster; falling back to --index {ix} \
+                 (fixture/legacy demo only)"
+            );
+            (id, info)
+        }
+    };
+    let port = port_from_url(&me.bifrost_url).unwrap_or_else(|e| panic!("{e}"));
     let my_pool_id: [u8; 28] = me.pool_id.as_slice().try_into().unwrap_or_else(|_| {
         panic!(
             "this node's roster entry has no 28-byte pool_id (got {} bytes) — the \
@@ -925,6 +960,7 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
             me.pool_id.len()
         )
     });
+    let spo_label = hex::encode(&my_pool_id[..4]);
     let net = Arc::new(HttpPeerNetwork::new(secp, keypair, my_pool_id));
     let app = router(net.shared_state());
     let bind_addr = &cfg.http.bind_address;
@@ -936,7 +972,7 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
     });
 
     println!(
-        "=== Heimdall SPO #{index} ({}-of-{}) ===",
+        "=== Heimdall SPO {spo_label} ({}-of-{}) ===",
         roster.min_signers, roster.max_signers
     );
     println!("Listening on {bind_addr}:{port}");
@@ -952,9 +988,20 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
     });
 
     let t0 = Instant::now();
-    let tm = run_epoch_loop(chain, pegin_source, peers, clock, rng, &config)
-        .await
-        .expect("epoch loop");
+    // The epoch loop treats chain-read / peer / aborted-DKG failures as
+    // retriable (it backs off and re-enters the boundary internally), so a
+    // returned Err is a genuinely fatal condition (a logic/crypto bug or
+    // malformed tx). Exit cleanly with a message instead of panicking — the
+    // node never dies on a transient failure (WI-014 error-handling feedback).
+    let tm = match run_epoch_loop(chain, pegin_source, peers, clock, rng, &config).await {
+        Ok(tm) => tm,
+        Err(e) => {
+            eprintln!("[demo] epoch loop terminated with a fatal error: {e}");
+            eprintln!("[demo] server still running on {bind_addr}:{port}; press Ctrl-C to exit.");
+            tokio::signal::ctrl_c().await.ok();
+            return;
+        }
+    };
     println!("Cycle complete ({:.2?})", t0.elapsed());
 
     // ── Bitcoin TM transaction summary ──────────────────────────────────────
@@ -990,7 +1037,7 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
     println!("  size:    {} bytes", signed_bytes.len());
     println!("  hex:     {}", hex::encode(&signed_bytes));
 
-    println!("\n=== SPO #{index} cycle complete ===");
+    println!("\n=== SPO {spo_label} cycle complete ===");
 
     println!("Server still running on {bind_addr}:{port}; press Ctrl-C to exit.");
     tokio::signal::ctrl_c().await.ok();

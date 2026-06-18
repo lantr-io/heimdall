@@ -200,8 +200,26 @@ impl CardanoChain for MockCardanoChain {
         })
     }
 
+    async fn current_epoch(&self) -> EpochResult<u64> {
+        Ok(self.fixture.roster.epoch)
+    }
+
     async fn query_roster(&self, _epoch: u64) -> EpochResult<Roster> {
         Ok(self.fixture.roster.clone())
+    }
+
+    async fn query_dkg_context(
+        &self,
+        epoch: u64,
+        attempt: u32,
+    ) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
+        Ok(
+            crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(
+                &self.fixture.roster,
+                epoch,
+                attempt,
+            ),
+        )
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {

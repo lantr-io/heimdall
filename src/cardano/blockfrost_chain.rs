@@ -217,7 +217,23 @@ impl BlockfrostCardanoChain {
 #[async_trait]
 impl CardanoChain for BlockfrostCardanoChain {
     async fn await_epoch_boundary(&self) -> EpochResult<EpochBoundaryEvent> {
-        Ok(EpochBoundaryEvent { epoch: 0 })
+        // WI-014: deliver the REAL chain epoch — DKG payload namespaces and
+        // replay protection bind to (epoch, threshold, attempt), so a hardcoded
+        // 0 made every SPO publish under the wrong namespace. A chain-read
+        // failure is a retriable Chain error (the idle phase backs off and
+        // re-enters), never process death.
+        // TODO(WI-014): this returns the CURRENT epoch immediately rather than
+        // blocking until the next boundary; true boundary-waiting (poll until
+        // the epoch advances past the last-seen) lands with the loop hardening.
+        Ok(EpochBoundaryEvent {
+            epoch: self.current_epoch().await?,
+        })
+    }
+
+    async fn current_epoch(&self) -> EpochResult<u64> {
+        crate::cardano::bf_http::fetch_current_epoch(&self.bf_base_url, &self.bf_project_id)
+            .await
+            .map_err(|e| EpochError::Chain(format!("fetch current epoch: {e}")))
     }
 
     async fn query_roster(&self, epoch: u64) -> EpochResult<Roster> {
@@ -240,6 +256,35 @@ impl CardanoChain for BlockfrostCardanoChain {
         .await
         .map_err(|e| EpochError::Chain(format!("eligible roster: {e}")))?;
         Ok(ctx.to_roster())
+    }
+
+    async fn query_dkg_context(
+        &self,
+        epoch: u64,
+        attempt: u32,
+    ) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
+        match &self.registry_roster {
+            // Real eligible set + chain stake (registry − active bans).
+            Some(registry) => crate::cardano::dkg_roster::fetch_dkg_context(
+                registry,
+                self.ban_source.as_ref(),
+                &self.bf_base_url,
+                &self.bf_project_id,
+                epoch,
+                attempt,
+            )
+            .await
+            .map_err(|e| EpochError::Chain(format!("eligible roster: {e}"))),
+            // No registry configured → fall back to the static roster with equal
+            // stake (the quorum gate degrades to a >51%-by-count majority).
+            None => Ok(
+                crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(
+                    &self.fallback_roster,
+                    epoch,
+                    attempt,
+                ),
+            ),
+        }
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {

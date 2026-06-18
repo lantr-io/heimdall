@@ -13,6 +13,7 @@ use frost::Identifier;
 use frost_secp256k1_tr as frost;
 use serde::{Deserialize, Serialize};
 
+use crate::cardano::dkg_roster::DkgContext;
 use crate::cardano::pegin_datum::ParsedPegIn;
 
 // ---------------------------------------------------------------------------
@@ -64,6 +65,17 @@ impl Roster {
             .filter(|(id, _)| **id != of)
             .map(|(_, info)| info)
             .collect()
+    }
+
+    /// Locate this node's own entry by its bifrost identity key (the spec's
+    /// `own_participant`): returns its FROST identifier + info, or `None` when
+    /// the key is not in the roster (not registered / banned / URL-excluded).
+    /// A `None` return must abort the ceremony rather than assume an index.
+    pub fn own_participant(&self, bifrost_id_pk: &[u8]) -> Option<(Identifier, &SpoInfo)> {
+        self.participants
+            .iter()
+            .find(|(_, info)| info.bifrost_id_pk.as_slice() == bifrost_id_pk)
+            .map(|(id, info)| (*id, info))
     }
 
     /// Designated leader for the given attempt. Today this is just the
@@ -223,10 +235,15 @@ pub enum EpochPhase {
     EpochStart {
         epoch: u64,
     },
+    /// The DKG ceremony for one `(epoch, attempt)`. Carries the stake-aware
+    /// [`DkgContext`] (not just a [`Roster`]) because the abort/rerun gate is
+    /// stake-weighted: `ctx.epoch`/`ctx.attempt` namespace the payloads,
+    /// `ctx.to_roster()` drives the FROST parameters, and `ctx.quorum_ok` /
+    /// `ctx.reduced_to` decide whether an incomplete round reruns over a
+    /// reduced candidate set or aborts the epoch.
     Dkg {
-        epoch: u64,
         round: DkgRound,
-        roster: Roster,
+        ctx: DkgContext,
         collected: DkgCollected,
     },
     PublishKeys {
@@ -325,7 +342,17 @@ pub struct SpoIdentity {
 
 #[derive(Debug, Clone)]
 pub struct EpochConfig {
+    /// Relative per-round DKG poll window, used as the deadline when the chain
+    /// epoch boundary time is unknown (mock / no-registry fallback). When the
+    /// boundary IS known, the schedule-anchored [`Self::dkg_round1_offset`] /
+    /// [`Self::dkg_round2_offset`] take over.
     pub dkg_round_timeout: Duration,
+    /// Round 1 deadline as an offset from the epoch boundary (WI-014 #6). All
+    /// nodes anchor to the same chain-time instant, so they freeze the live
+    /// subset L1 together regardless of when each locally started the round.
+    pub dkg_round1_offset: Duration,
+    /// Round 2 deadline as an offset from the epoch boundary (> round 1).
+    pub dkg_round2_offset: Duration,
     pub poll_interval: Duration,
     pub quorum51_timeout: Duration,
     pub federation_timeout: Duration,
@@ -341,6 +368,10 @@ pub struct EpochConfig {
     /// Taproot's depositor refund leaf. Spec default is 4320 (~30 days);
     /// testnet4/preprod typically use a smaller value.
     pub pegin_refund_timeout_blocks: u16,
+    /// Directory for 0600 DKG-state persistence so the signing share survives
+    /// process restarts for the epoch (WI-014 #5). `None` → in-memory only (the
+    /// share is lost on restart and DKG re-runs next boundary).
+    pub state_dir: Option<std::path::PathBuf>,
 }
 
 impl EpochConfig {
@@ -352,6 +383,8 @@ impl EpochConfig {
     pub fn demo_default(identity: SpoIdentity) -> Self {
         Self {
             dkg_round_timeout: Duration::from_secs(300),
+            dkg_round1_offset: Duration::from_secs(120),
+            dkg_round2_offset: Duration::from_secs(240),
             poll_interval: Duration::from_millis(5000),
             quorum51_timeout: Duration::from_secs(300),
             federation_timeout: Duration::from_secs(300),
@@ -361,6 +394,7 @@ impl EpochConfig {
             pegin_collection_window: Duration::from_secs(5),
             pegin_poll_interval: Duration::from_millis(1000),
             pegin_refund_timeout_blocks: 4320,
+            state_dir: None,
         }
     }
 }
@@ -376,7 +410,22 @@ pub enum EpochError {
     // TODO: track which peers failed to deliver so the cascade / slashing
     // path can identify the misbehaving party. Today `PollTimeout` only
     // carries aggregate counts.
-    PollTimeout { got: usize, need: usize },
+    PollTimeout {
+        got: usize,
+        need: usize,
+    },
+    /// A DKG attempt could not complete (a peer was absent or provably faulty,
+    /// so the qualified set can't run `dkg_part2`/`part3`) AND the surviving
+    /// subset fails the quorum gate (`|Q| < t` or `stake(Q) <= 51%`) or is too
+    /// small to rerun. Fatal for this epoch's DKG — the caller backs off to the
+    /// next epoch boundary rather than killing the process.
+    DkgAborted {
+        epoch: u64,
+        attempt: u32,
+        qualified: usize,
+        eligible: usize,
+        reason: String,
+    },
     Peer(String),
     Chain(String),
     Transition(String),
@@ -391,6 +440,17 @@ impl std::fmt::Display for EpochError {
             Self::PollTimeout { got, need } => {
                 write!(f, "peer poll timed out: got {got}, need {need}")
             }
+            Self::DkgAborted {
+                epoch,
+                attempt,
+                qualified,
+                eligible,
+                reason,
+            } => write!(
+                f,
+                "DKG aborted at epoch {epoch} attempt {attempt}: {qualified}/{eligible} qualified \
+                 ({reason})"
+            ),
             Self::Peer(s) => write!(f, "peer network: {s}"),
             Self::Chain(s) => write!(f, "chain: {s}"),
             Self::Transition(s) => write!(f, "invalid phase transition: {s}"),
@@ -402,6 +462,27 @@ impl std::fmt::Display for EpochError {
 }
 
 impl std::error::Error for EpochError {}
+
+impl EpochError {
+    /// Whether the epoch loop should treat this as a transient, retriable
+    /// condition — back off and re-enter from the boundary — rather than a
+    /// fatal one that ends the process.
+    ///
+    /// Retriable: chain reads (`Chain`), peer transport (`Peer`), a signing
+    /// poll timeout (`PollTimeout`), and a fully-aborted DKG attempt
+    /// (`DkgAborted`) — all "try again next boundary" conditions, never node
+    /// death (WI-010 / WI-014 error-handling feedback). Fatal: `Frost`,
+    /// `TmBuild`, `SignatureVerify`, `Transition` — deterministic given their
+    /// inputs (a logic/crypto bug or malformed data), so a blind retry would
+    /// just loop on the same failure.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        matches!(
+            self,
+            Self::Chain(_) | Self::Peer(_) | Self::PollTimeout { .. } | Self::DkgAborted { .. }
+        )
+    }
+}
 
 pub type EpochResult<T> = Result<T, EpochError>;
 
@@ -434,6 +515,63 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let back: Roster = serde_json::from_str(&json).unwrap();
         assert_eq!(r, back);
+    }
+
+    #[test]
+    fn own_participant_locates_self_by_bifrost_key() {
+        let mut participants = BTreeMap::new();
+        for i in 1u16..=3 {
+            let id = Identifier::try_from(i).unwrap();
+            participants.insert(
+                id,
+                SpoInfo {
+                    identifier: id,
+                    pool_id: vec![i as u8; 28],
+                    bifrost_url: format!("http://localhost:{}", 18500 + i),
+                    // distinct per-participant bifrost key
+                    bifrost_id_pk: vec![0xB0 + i as u8; 32],
+                },
+            );
+        }
+        let r = Roster {
+            epoch: 7,
+            min_signers: 2,
+            max_signers: 3,
+            participants,
+        };
+
+        // Found by its bifrost key → correct identifier + entry.
+        let (id, info) = r.own_participant(&vec![0xB2; 32]).expect("self in roster");
+        assert_eq!(id, Identifier::try_from(2u16).unwrap());
+        assert_eq!(info.pool_id, vec![2u8; 28]);
+
+        // An unknown key (not registered / banned / excluded) → None (must abort).
+        assert!(r.own_participant(&vec![0xFF; 32]).is_none());
+        // An empty key (legacy fixture) never matches a real entry.
+        assert!(r.own_participant(&[]).is_none());
+    }
+
+    #[test]
+    fn error_retriability_classification() {
+        // Transient → retriable (back off, re-enter the boundary).
+        assert!(EpochError::Chain("blockfrost 502".into()).is_retriable());
+        assert!(EpochError::Peer("connection reset".into()).is_retriable());
+        assert!(EpochError::PollTimeout { got: 1, need: 3 }.is_retriable());
+        assert!(
+            EpochError::DkgAborted {
+                epoch: 7,
+                attempt: 2,
+                qualified: 1,
+                eligible: 3,
+                reason: "round1 incomplete".into(),
+            }
+            .is_retriable()
+        );
+        // Deterministic given inputs → fatal (a blind retry just loops).
+        assert!(!EpochError::Frost("dkg_part3".into()).is_retriable());
+        assert!(!EpochError::TmBuild("insufficient funds".into()).is_retriable());
+        assert!(!EpochError::Transition("missing round1 secret".into()).is_retriable());
+        assert!(!EpochError::SignatureVerify(0, "bad sig".into()).is_retriable());
     }
 
     #[test]

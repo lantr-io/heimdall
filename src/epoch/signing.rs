@@ -349,24 +349,21 @@ mod tests {
         roster: Roster,
     ) -> GroupKeys {
         let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let ctx = crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(&roster, 0, 0);
         let mut phase = EpochPhase::Dkg {
-            epoch: 0,
             round: DkgRound::Round1,
-            roster,
+            ctx,
             collected: DkgCollected::default(),
         };
         loop {
             phase = match phase {
                 EpochPhase::Dkg {
-                    epoch,
                     round,
-                    roster,
+                    ctx,
                     collected,
-                } => dkg_phase(
-                    &peers, &clock, &rng, &config, epoch, round, roster, collected,
-                )
-                .await
-                .unwrap(),
+                } => dkg_phase(&peers, &clock, &rng, &config, round, ctx, collected)
+                    .await
+                    .unwrap(),
                 EpochPhase::PublishKeys { group_keys, .. } => return group_keys,
                 other => panic!("unexpected: {}", other.name()),
             };
