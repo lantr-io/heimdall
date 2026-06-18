@@ -1,3 +1,17 @@
+//! Cardano-friendly Blake2b Fiat-Shamir transcript for Halo2/KZG proofs.
+//!
+//! The default halo2 transcripts hash with Keccak/Poseidon; a Plutus
+//! on-chain verifier can only cheaply recompute `blake2b_256`. This
+//! transcript drives the Fiat-Shamir challenge off an *accumulated* byte
+//! string hashed with `blake2b_256` (and a `blake2b_256(blake2b_256(..))`
+//! re-hash to widen the squeeze to 64 bytes), so the prover here and the
+//! eventual on-chain verifier derive identical challenges.
+//!
+//! Relocated from `benches/cardano_transcript.rs` (WI-019): proof
+//! generation is no longer bench-only — `circuits::fault_evidence` produces
+//! real DKG fault proofs from the library, and the benches now import this
+//! module from the crate instead of carrying their own copy.
+
 use std::{
     io::{self, Read, Write},
     marker::PhantomData,

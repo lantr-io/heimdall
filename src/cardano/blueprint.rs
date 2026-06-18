@@ -233,18 +233,19 @@ pub fn validator_hash(blueprint_json: &str, title: &str) -> Result<[u8; 28], Blu
         .map_err(|_| BlueprintError::BadBlueprint(format!("{title}: hash is not 28 bytes")))
 }
 
-/// The parameterless `fault_verifier` minting policy as a ready-to-witness
-/// script. Unlike the state validators it takes no parameters, so its
-/// `compiledCode` IS the final program: the V3 hash of those bytes equals the
-/// blueprint's own `hash` field (= the FaultProof policy id), which
-/// [`validator_hash`] reads. Returning the full [`ParameterizedScript`] (not
-/// just the hash) lets the FaultProof mint tx builder provide the script as a
-/// witness without a separate ref-script deploy (the program is ~1 KB).
-pub fn fault_verifier_script(blueprint_json: &str) -> Result<ParameterizedScript, BlueprintError> {
+/// The `fault_verifier` minting policy, parameterized by the `spos_registry`
+/// policy id (`registration_script_hash`). The EquivocationProof branch
+/// references the accused's registration node to bind `bifrost_id_pk →
+/// accused_pool_id`, so the validator is compiled against that registry policy —
+/// and BOTH fault kinds (InvalidPayload + Equivocation) mint under the resulting
+/// (parameterized) policy id. The applied hash is the FaultProof policy id; the
+/// returned cbor is provided as the mint witness.
+pub fn fault_verifier_script(
+    blueprint_json: &str,
+    registration_script_hash: &[u8; 28],
+) -> Result<ParameterizedScript, BlueprintError> {
     let code = validator_compiled_code(blueprint_json, FAULT_VERIFIER_TITLE)?;
-    let cbor = hex::decode(code.trim()).map_err(|e| BlueprintError::BadHex(e.to_string()))?;
-    let hash = script_hash_v3(&cbor);
-    Ok(ParameterizedScript { cbor, hash })
+    apply_params(&code, &[bytes(registration_script_hash)])
 }
 
 /// `spo_bans` parameterized by its full upstream parameter list (7 params, in
@@ -316,10 +317,11 @@ mod tests {
         "c62f114c966a2ad65ecb27a871600b5b480b08ea98b5ff65625ac627";
 
     // `bitcoin/fault_verifier.fault_verifier.mint` compiledCode + blueprint
-    // `hash` (ft-bifrost-bridge onchain/plutus.json). Parameterless, so the
-    // compiledCode IS the final program and its V3 hash is the policy id.
+    // `hash` (ft-bifrost-bridge onchain/plutus.json). Parameterized by
+    // `registration_script_hash`, so this is the UNAPPLIED program/hash; the
+    // FaultProof policy id is the hash after applying the registry param.
     const FAULT_VERIFIER_CODE: &str = include_str!("../../tests/fixtures/fault_verifier_code.txt");
-    const FAULT_VERIFIER_HASH: &str = "c7aeb7beb3932e410971bce5283c24f1dc69a9db5106c6d9b62310d9";
+    const FAULT_VERIFIER_HASH: &str = "3b3a74a942ee06b74e56ae07b1b336c33b5257771c686e0f41293cae";
 
     #[test]
     fn script_hash_v3_matches_blueprint() {
@@ -361,25 +363,31 @@ mod tests {
         );
     }
 
-    // The parameterless fault_verifier script: cbor == compiledCode, and its V3
-    // hash matches the blueprint's own `hash` (what spo_bans is parameterized by
-    // and what FaultProof tokens are minted under).
+    // fault_verifier is parameterized by registration_script_hash: applying it
+    // changes the program + policy id deterministically (the apply_params
+    // byte-exactness vs `aiken blueprint apply` is pinned by the spo_bans test
+    // and the full-apply-pipeline test below).
     #[test]
-    fn fault_verifier_script_hash_matches_blueprint() {
+    fn fault_verifier_script_applies_registry_param() {
         let blueprint = format!(
             r#"{{"validators":[{{"title":"{FAULT_VERIFIER_TITLE}","compiledCode":"{}","hash":"{FAULT_VERIFIER_HASH}"}}]}}"#,
             FAULT_VERIFIER_CODE.trim()
         );
-        let script = fault_verifier_script(&blueprint).unwrap();
-        assert_eq!(script.hash_hex(), FAULT_VERIFIER_HASH);
+        // Unapplied blueprint hash.
         assert_eq!(
-            script.hash,
-            validator_hash(&blueprint, FAULT_VERIFIER_TITLE).unwrap()
+            hex::encode(validator_hash(&blueprint, FAULT_VERIFIER_TITLE).unwrap()),
+            FAULT_VERIFIER_HASH
         );
-        assert_eq!(
-            script.cbor,
-            hex::decode(FAULT_VERIFIER_CODE.trim()).unwrap()
-        );
+        // Applying the registry param is deterministic and bakes it into the cbor.
+        let reg = [0x11u8; 28];
+        let s1 = fault_verifier_script(&blueprint, &reg).unwrap();
+        let s2 = fault_verifier_script(&blueprint, &reg).unwrap();
+        assert_eq!(s1.hash, s2.hash);
+        assert_ne!(s1.hash_hex(), FAULT_VERIFIER_HASH);
+        assert_ne!(s1.cbor, hex::decode(FAULT_VERIFIER_CODE.trim()).unwrap());
+        // A different registry → a different FaultProof policy id.
+        let other = fault_verifier_script(&blueprint, &[0x22u8; 28]).unwrap();
+        assert_ne!(s1.hash, other.hash);
     }
 
     // The full apply pipeline reproduces `aiken blueprint apply` byte-for-byte:

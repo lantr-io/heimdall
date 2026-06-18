@@ -337,18 +337,32 @@ enum Commands {
         /// Path to the bifrost Aiken blueprint (plutus.json).
         #[arg(long)]
         blueprint: String,
-        /// Fault kind: `invalid-payload` or `equivocation`.
+        /// The spos_registry one-shot bootstrap outref (<tx_hash>:<index>): the
+        /// fault_verifier policy is parameterized by the registry policy id (the
+        /// EquivocationProof branch references registration nodes).
         #[arg(long)]
-        kind: String,
-        /// The accused pool id (28-byte hex).
+        registry_bootstrap: String,
+        /// Derive `kind` + `namespace_hash` + `evidence_hash` from a captured
+        /// DKG-evidence JSON file (WI-019) instead of passing opaque hashes.
+        /// When set, --kind/--accused-pool-id/--namespace-hash/--evidence-hash
+        /// are ignored. See `run_fault_proof_mint` for the JSON shape.
         #[arg(long)]
-        accused_pool_id: String,
+        evidence_file: Option<String>,
+        /// Fault kind: `invalid-payload` or `equivocation`. Required unless
+        /// --evidence-file is given.
+        #[arg(long)]
+        kind: Option<String>,
+        /// The accused pool id (28-byte hex). Required unless --evidence-file.
+        #[arg(long)]
+        accused_pool_id: Option<String>,
         /// The protocol namespace hash (32-byte hex) — descriptive datum field.
+        /// Required unless --evidence-file.
         #[arg(long)]
-        namespace_hash: String,
+        namespace_hash: Option<String>,
         /// The fault evidence hash (32-byte hex) — binds the FaultProof token.
+        /// Required unless --evidence-file.
         #[arg(long)]
-        evidence_hash: String,
+        evidence_hash: Option<String>,
         /// Actually submit via Blockfrost.
         #[arg(long)]
         submit: bool,
@@ -687,6 +701,8 @@ fn main() {
         Commands::FaultProofMint {
             config,
             blueprint,
+            registry_bootstrap,
+            evidence_file,
             kind,
             accused_pool_id,
             namespace_hash,
@@ -696,6 +712,8 @@ fn main() {
             let cfg = load_config(config.as_deref());
             let args = FaultProofMintArgs {
                 blueprint,
+                registry_bootstrap,
+                evidence_file,
                 kind,
                 accused_pool_id,
                 namespace_hash,
@@ -1370,7 +1388,7 @@ fn submit_tx_blockfrost(
 /// Thin alias over the shared [`crate::cardano::tx_common::network_from_address`]
 /// (the single source of truth) for the on-chain command handlers.
 fn network_of(addr: &str) -> pallas_addresses::Network {
-    crate::cardano::tx_common::network_from_address(addr)
+    heimdall::cardano::tx_common::network_from_address(addr)
 }
 
 /// Byte size of a reference script attached to a one-shot bootstrap outref, if
@@ -1382,11 +1400,12 @@ fn fetch_one_shot_ref_script_size(
     rt: &tokio::runtime::Runtime,
     base_url: &str,
     pid: &str,
-    raw: &[bf_http::BfUtxo],
+    raw: &[heimdall::cardano::bf_http::BfUtxo],
     tx_hash_hex: &str,
     index: u32,
     label: &str,
 ) -> Result<Option<u64>, String> {
+    use heimdall::cardano::bf_http;
     let Some(h) = raw
         .iter()
         .find(|u| u.tx_hash == tx_hash_hex && u.output_index == index)
@@ -1696,10 +1715,12 @@ struct ApplyBanArgs {
 /// fault-proof-mint CLI inputs.
 struct FaultProofMintArgs {
     blueprint: String,
-    kind: String,
-    accused_pool_id: String,
-    namespace_hash: String,
-    evidence_hash: String,
+    registry_bootstrap: String,
+    evidence_file: Option<String>,
+    kind: Option<String>,
+    accused_pool_id: Option<String>,
+    namespace_hash: Option<String>,
+    evidence_hash: Option<String>,
     submit: bool,
 }
 
@@ -1733,6 +1754,237 @@ fn parse_hex_n<const N: usize>(arg: &str, what: &str) -> Result<[u8; N], String>
         .ok()
         .and_then(|v| v.try_into().ok())
         .ok_or_else(|| format!("{what}: expected {N} bytes of hex"))
+}
+
+/// Unwrap a CLI arg that is required unless `--evidence-file` supplies it.
+fn req_arg<'a>(arg: &'a Option<String>, what: &str) -> Result<&'a str, String> {
+    arg.as_deref()
+        .ok_or_else(|| format!("{what} is required (or pass --evidence-file)"))
+}
+
+fn parse_points(hexes: &[String]) -> Result<Vec<[u8; 33]>, String> {
+    hexes
+        .iter()
+        .enumerate()
+        .map(|(i, h)| parse_hex_n::<33>(h, &format!("commitment[{i}]")))
+        .collect()
+}
+
+/// Captured DKG misbehavior, the input to WI-019 `evidence_hash` derivation.
+/// Each shape carries the **authentication envelope** the spec requires (§9.2):
+/// the accused's x-only `bifrost_id_pk` and their BIP-340 `payload_signature`
+/// over `SHA256(canonical_bytes)`. `derive` verifies that signature before
+/// deriving anything — heimdall never forges a FaultProof against a payload the
+/// accused did not author.
+///
+/// One of three shapes selected by `kind`:
+/// - `"invalid-payload-round1"`: `identifier`, `commitments[]`, `sigma_i`, `payload_signature`
+/// - `"invalid-payload-round2"`: `recipient_index`, `sender_commitments[]`, `share`,
+///   `round2_canonical_bytes`, `payload_signature`
+/// - `"equivocation"`: `round` (`"round1"|"round2"`), `payload_a`/`signature_a`,
+///   `payload_b`/`signature_b` (payloads are the canonical signed bytes)
+///
+/// Shared header: `accused_pool_id` (28-byte hex), `bifrost_id_pk` (32-byte hex),
+/// `epoch`, `threshold`, `attempt`. All byte fields are hex.
+#[derive(serde::Deserialize)]
+struct EvidenceFile {
+    kind: String,
+    accused_pool_id: String,
+    bifrost_id_pk: String,
+    epoch: u64,
+    threshold: u64,
+    attempt: u64,
+    #[serde(default)]
+    identifier: Option<u16>,
+    #[serde(default)]
+    commitments: Option<Vec<String>>,
+    #[serde(default)]
+    sigma_i: Option<String>,
+    #[serde(default)]
+    recipient_index: Option<u16>,
+    #[serde(default)]
+    sender_commitments: Option<Vec<String>>,
+    #[serde(default)]
+    share: Option<String>,
+    #[serde(default)]
+    round2_canonical_bytes: Option<String>,
+    #[serde(default)]
+    payload_signature: Option<String>,
+    #[serde(default)]
+    round: Option<String>,
+    #[serde(default)]
+    payload_a: Option<String>,
+    #[serde(default)]
+    signature_a: Option<String>,
+    #[serde(default)]
+    payload_b: Option<String>,
+    #[serde(default)]
+    signature_b: Option<String>,
+}
+
+/// The datum fields `build_fault_proof_mint_tx` needs, derived from captured
+/// evidence, plus the on-chain `EquivocationProof` witness when applicable.
+#[derive(Debug)]
+struct DerivedFault {
+    kind: heimdall::cardano::fault_proof::FaultKind,
+    accused_pool_id: Vec<u8>,
+    namespace_hash: [u8; 32],
+    evidence_hash: [u8; 32],
+    /// `Some` iff `kind == Equivocation` — the two signed payloads the
+    /// `fault_verifier` EquivocationProof branch verifies.
+    equivocation: Option<DerivedEquivocation>,
+}
+
+#[derive(Debug)]
+struct DerivedEquivocation {
+    bifrost_id_pk: [u8; 32],
+    payload_a: Vec<u8>,
+    signature_a: [u8; 64],
+    payload_b: Vec<u8>,
+    signature_b: [u8; 64],
+}
+
+fn req_field<'a>(v: &'a Option<String>, what: &str) -> Result<&'a str, String> {
+    v.as_deref().ok_or(format!("evidence: missing `{what}`"))
+}
+
+fn decode_var(v: &Option<String>, what: &str) -> Result<Vec<u8>, String> {
+    hex::decode(req_field(v, what)?.trim()).map_err(|_| format!("{what}: bad hex"))
+}
+
+impl EvidenceFile {
+    /// Derive `(kind, accused_pool_id, namespace_hash, evidence_hash)` from the
+    /// captured evidence. Verifies the accused's payload signature and that the
+    /// evidence actually encodes a fault before deriving.
+    fn derive(&self) -> Result<DerivedFault, String> {
+        use heimdall::cardano::fault_proof::FaultKind;
+        use heimdall::circuits::fault_evidence as fe;
+
+        let accused_pool_id: [u8; 28] =
+            parse_hex_n(self.accused_pool_id.trim(), "accused_pool_id")?;
+        let bifrost_id_pk: [u8; 32] = parse_hex_n(self.bifrost_id_pk.trim(), "bifrost_id_pk")?;
+        let to_err = |e: fe::FaultEvidenceError| e.to_string();
+
+        match self.kind.as_str() {
+            "invalid-payload-round1" => {
+                let ev = fe::Round1PokFaultEvidence {
+                    epoch: self.epoch,
+                    threshold: self.threshold,
+                    attempt: self.attempt,
+                    accused_pool_id,
+                    bifrost_id_pk,
+                    identifier: self
+                        .identifier
+                        .ok_or("round1 evidence: missing `identifier`")?,
+                    commitments: parse_points(
+                        self.commitments
+                            .as_deref()
+                            .ok_or("round1 evidence: missing `commitments`")?,
+                    )?,
+                    sigma_i: parse_hex_n::<64>(req_field(&self.sigma_i, "sigma_i")?, "sigma_i")?,
+                    payload_signature: parse_hex_n::<64>(
+                        req_field(&self.payload_signature, "payload_signature")?,
+                        "payload_signature",
+                    )?,
+                };
+                ev.verify_payload_signature().map_err(to_err)?;
+                if !ev.is_fault().map_err(to_err)? {
+                    return Err("round1 evidence does not encode a fault (PoK verifies)".into());
+                }
+                Ok(DerivedFault {
+                    kind: FaultKind::InvalidPayload,
+                    accused_pool_id: accused_pool_id.to_vec(),
+                    namespace_hash: ev.namespace_hash(),
+                    evidence_hash: ev.evidence_hash().map_err(to_err)?,
+                    equivocation: None,
+                })
+            }
+            "invalid-payload-round2" => {
+                let ev = fe::Round2ShareFaultEvidence {
+                    epoch: self.epoch,
+                    threshold: self.threshold,
+                    attempt: self.attempt,
+                    accused_pool_id,
+                    bifrost_id_pk,
+                    recipient_index: self
+                        .recipient_index
+                        .ok_or("round2 evidence: missing `recipient_index`")?,
+                    sender_commitments: parse_points(
+                        self.sender_commitments
+                            .as_deref()
+                            .ok_or("round2 evidence: missing `sender_commitments`")?,
+                    )?,
+                    share: parse_hex_n::<32>(req_field(&self.share, "share")?, "share")?,
+                    round2_canonical_bytes: decode_var(
+                        &self.round2_canonical_bytes,
+                        "round2_canonical_bytes",
+                    )?,
+                    payload_signature: parse_hex_n::<64>(
+                        req_field(&self.payload_signature, "payload_signature")?,
+                        "payload_signature",
+                    )?,
+                };
+                ev.verify_payload_signature().map_err(to_err)?;
+                if !ev.is_fault().map_err(to_err)? {
+                    return Err("round2 evidence does not encode a fault (share verifies)".into());
+                }
+                Ok(DerivedFault {
+                    kind: FaultKind::InvalidPayload,
+                    accused_pool_id: accused_pool_id.to_vec(),
+                    namespace_hash: ev.namespace_hash(),
+                    evidence_hash: fe::round2_evidence_hash_dyn(&ev).map_err(to_err)?,
+                    equivocation: None,
+                })
+            }
+            "equivocation" => {
+                let phase = match self.round.as_deref() {
+                    Some("round1") => fe::NamespacePhase::Round1,
+                    Some("round2") => fe::NamespacePhase::Round2,
+                    other => {
+                        return Err(format!(
+                            "equivocation evidence: `round` must be round1|round2, got {other:?}"
+                        ));
+                    }
+                };
+                let ev = fe::EquivocationEvidence {
+                    epoch: self.epoch,
+                    threshold: self.threshold,
+                    attempt: self.attempt,
+                    phase,
+                    accused_pool_id,
+                    bifrost_id_pk,
+                    payload_a: decode_var(&self.payload_a, "payload_a")?,
+                    signature_a: parse_hex_n::<64>(
+                        req_field(&self.signature_a, "signature_a")?,
+                        "signature_a",
+                    )?,
+                    payload_b: decode_var(&self.payload_b, "payload_b")?,
+                    signature_b: parse_hex_n::<64>(
+                        req_field(&self.signature_b, "signature_b")?,
+                        "signature_b",
+                    )?,
+                };
+                ev.verify().map_err(to_err)?;
+                Ok(DerivedFault {
+                    kind: FaultKind::Equivocation,
+                    accused_pool_id: accused_pool_id.to_vec(),
+                    namespace_hash: ev.namespace_hash(),
+                    evidence_hash: ev.evidence_hash(),
+                    equivocation: Some(DerivedEquivocation {
+                        bifrost_id_pk: ev.bifrost_id_pk,
+                        payload_a: ev.payload_a,
+                        signature_a: ev.signature_a,
+                        payload_b: ev.payload_b,
+                        signature_b: ev.signature_b,
+                    }),
+                })
+            }
+            other => Err(format!(
+                "evidence `kind` must be invalid-payload-round1|invalid-payload-round2|\
+                 equivocation, got `{other}`"
+            )),
+        }
+    }
 }
 
 /// Bech32 (`pool1…`) form of the 28-byte pool key hash, as Blockfrost expects.
@@ -2017,7 +2269,7 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let fault = fault_verifier_script(&blueprint_json)
+    let fault = fault_verifier_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
 
     // The ban policy is config-pinned (ban bootstrap + fault-policy set + schedule).
@@ -2187,9 +2439,10 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
 /// `apply-ban` consumes + burns it.
 fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::fault_verifier_script;
+    use heimdall::cardano::blueprint::{fault_verifier_script, spos_registry_script};
     use heimdall::cardano::fault_proof::{
-        FaultKind, FaultProofDatum, FaultProofMintRequest, build_fault_proof_mint_tx,
+        EquivocationWitness, FaultKind, FaultProofDatum, FaultProofMintRequest,
+        build_fault_proof_mint_tx,
     };
     use heimdall::cardano::publish::WalletUtxo;
     use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
@@ -2200,26 +2453,68 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
 
     let blueprint_json = std::fs::read_to_string(&args.blueprint)
         .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
-    let fault_vscript = fault_verifier_script(&blueprint_json)
+    // The fault_verifier policy is parameterized by the spos_registry policy id
+    // (its EquivocationProof branch references registration nodes).
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let fault_vscript = fault_verifier_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
 
-    let kind = match args.kind.as_str() {
-        "invalid-payload" => FaultKind::InvalidPayload,
-        "equivocation" => FaultKind::Equivocation,
-        other => {
-            return Err(format!(
-                "--kind must be `invalid-payload` or `equivocation`, got `{other}`"
-            ));
+    // Two ways to supply the datum fields: derive them from a captured-evidence
+    // JSON file (WI-019 — real evidence_hash + equivocation witness), or pass
+    // them as opaque hex (InvalidPayload only).
+    let derived: DerivedFault = if let Some(path) = &args.evidence_file {
+        let json =
+            std::fs::read_to_string(path).map_err(|e| format!("read evidence file {path}: {e}"))?;
+        let ev: EvidenceFile =
+            serde_json::from_str(&json).map_err(|e| format!("parse evidence file {path}: {e}"))?;
+        let derived = ev.derive()?;
+        println!("derived from evidence ({}):", ev.kind);
+        println!("  evidence_hash:   {}", hex::encode(derived.evidence_hash));
+        println!("  namespace_hash:  {}", hex::encode(derived.namespace_hash));
+        derived
+    } else {
+        let kind = match args.kind.as_deref() {
+            Some("invalid-payload") => FaultKind::InvalidPayload,
+            Some("equivocation") => {
+                return Err(
+                    "equivocation faults require --evidence-file (the two signed payloads); \
+                     the opaque-hash path only supports invalid-payload"
+                        .into(),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "--kind must be `invalid-payload` (or pass --evidence-file), got {other:?}"
+                ));
+            }
+        };
+        let pool: [u8; 28] = parse_hex_n(
+            req_arg(&args.accused_pool_id, "--accused-pool-id")?,
+            "--accused-pool-id",
+        )?;
+        let ns: [u8; 32] = parse_hex_n(
+            req_arg(&args.namespace_hash, "--namespace-hash")?,
+            "--namespace-hash",
+        )?;
+        let ev: [u8; 32] = parse_hex_n(
+            req_arg(&args.evidence_hash, "--evidence-hash")?,
+            "--evidence-hash",
+        )?;
+        DerivedFault {
+            kind,
+            accused_pool_id: pool.to_vec(),
+            namespace_hash: ns,
+            evidence_hash: ev,
+            equivocation: None,
         }
     };
-    let accused_pool_id: [u8; 28] = parse_hex_n(&args.accused_pool_id, "--accused-pool-id")?;
-    let namespace_hash: [u8; 32] = parse_hex_n(&args.namespace_hash, "--namespace-hash")?;
-    let evidence_hash: [u8; 32] = parse_hex_n(&args.evidence_hash, "--evidence-hash")?;
     let fault = FaultProofDatum {
-        kind,
-        accused_pool_id: accused_pool_id.to_vec(),
-        namespace_hash: namespace_hash.to_vec(),
-        evidence_hash: evidence_hash.to_vec(),
+        kind: derived.kind,
+        accused_pool_id: derived.accused_pool_id.clone(),
+        namespace_hash: derived.namespace_hash.to_vec(),
+        evidence_hash: derived.evidence_hash.to_vec(),
     };
 
     let pid = cfg
@@ -2238,6 +2533,32 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
 
+    // For Equivocation, locate the accused's spos_registry node — added as a
+    // read-only reference input so the validator binds bifrost_id_pk to the pool.
+    let registration_ref: Option<(String, u32)> = if derived.equivocation.is_some() {
+        let registry_addr = registry.enterprise_address(network_of(&wallet_addr));
+        let registry_raw = rt
+            .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
+            .map_err(|e| format!("registry UTxO query: {e}"))?;
+        let reg_unit = format!(
+            "{}{}",
+            registry.hash_hex(),
+            hex::encode(&derived.accused_pool_id)
+        );
+        let node = registry_raw
+            .iter()
+            .find(|u| u.amount.iter().any(|a| a.unit == reg_unit))
+            .ok_or_else(|| {
+                format!(
+                    "accused pool {} is not in the on-chain registry — cannot reference it",
+                    hex::encode(&derived.accused_pool_id)
+                )
+            })?;
+        Some((node.tx_hash.clone(), node.output_index))
+    } else {
+        None
+    };
+
     let req = FaultProofMintRequest {
         fault_verifier_script: &fault_vscript,
         fault: &fault,
@@ -2245,6 +2566,19 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
         wallet_utxos: &wallet_utxos,
         key: &key,
         cost_models: Some(cost_models),
+        equivocation: derived.equivocation.as_ref().map(|e| EquivocationWitness {
+            bifrost_id_pk: &e.bifrost_id_pk,
+            payload_a: &e.payload_a,
+            signature_a: &e.signature_a,
+            payload_b: &e.payload_b,
+            signature_b: &e.signature_b,
+            registration_ref: {
+                let (h, i) = registration_ref
+                    .as_ref()
+                    .expect("equivocation => registration_ref set");
+                (h.as_str(), *i)
+            },
+        }),
     };
     let built =
         build_fault_proof_mint_tx(&req).map_err(|e| format!("build fault-proof mint tx: {e}"))?;
@@ -2950,5 +3284,178 @@ mod tests {
         let (hrp, data) = bitcoin::bech32::decode(&s).unwrap();
         assert_eq!(hrp.as_str(), "pool");
         assert_eq!(data, id);
+    }
+
+    // ---- WI-019: --evidence-file derivation glue ---------------------------
+
+    use super::EvidenceFile;
+    use bitcoin::secp256k1::rand::rngs::OsRng;
+    use bitcoin::secp256k1::{Keypair, Secp256k1};
+    use frost_secp256k1_tr::Identifier;
+    use heimdall::cardano::fault_proof::FaultKind;
+    use heimdall::circuits::fault_evidence as fe;
+    use heimdall::frost::participant;
+    use heimdall::http::{auth, canonical, frost_bridge};
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    fn corrupt_scalar(be: &[u8; 32]) -> [u8; 32] {
+        use halo2_base::halo2_proofs::halo2curves::ff::Field;
+        use halo2_base::halo2_proofs::halo2curves::secp256k1::Fq;
+        use heimdall::circuits::dkg_fault::{axiom_scalar_from_be_bytes, be_bytes_from_fq};
+        be_bytes_from_fq(axiom_scalar_from_be_bytes(be) + Fq::ONE)
+    }
+
+    /// A signed Round 1 PoK evidence; `corrupt` flips μ to make the PoK invalid.
+    fn signed_round1(corrupt: bool) -> fe::Round1PokFaultEvidence {
+        let mut rng = ChaCha20Rng::seed_from_u64(0xC1);
+        let (_s, pkg) =
+            participant::dkg_part1(Identifier::try_from(1u16).unwrap(), 3, 2, &mut rng).unwrap();
+        let (commitments, mut sigma_i) = frost_bridge::round1_fields(&pkg).unwrap();
+        if corrupt {
+            let mu: [u8; 32] = sigma_i[32..64].try_into().unwrap();
+            sigma_i[32..64].copy_from_slice(&corrupt_scalar(&mu));
+        }
+        let pool = [0x11u8; 28];
+        let canonical_bytes = canonical::round1(7, 51, 0, &pool, &commitments, &sigma_i);
+        let secp = Secp256k1::new();
+        let (sk, _pk) = secp.generate_keypair(&mut OsRng);
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        fe::Round1PokFaultEvidence {
+            epoch: 7,
+            threshold: 51,
+            attempt: 0,
+            accused_pool_id: pool,
+            bifrost_id_pk: kp.x_only_public_key().0.serialize(),
+            identifier: 1,
+            commitments,
+            sigma_i,
+            payload_signature: auth::sign_payload(&secp, &kp, &canonical_bytes),
+        }
+    }
+
+    fn round1_json(ev: &fe::Round1PokFaultEvidence) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "invalid-payload-round1",
+            "accused_pool_id": hex::encode(ev.accused_pool_id),
+            "bifrost_id_pk": hex::encode(ev.bifrost_id_pk),
+            "epoch": ev.epoch, "threshold": ev.threshold, "attempt": ev.attempt,
+            "identifier": ev.identifier,
+            "commitments": ev.commitments.iter().map(hex::encode).collect::<Vec<_>>(),
+            "sigma_i": hex::encode(ev.sigma_i),
+            "payload_signature": hex::encode(ev.payload_signature),
+        })
+    }
+
+    /// The CLI's JSON → derive() path reproduces the library's evidence_hash
+    /// for a Round 1 PoK fault, and binds the correct namespace + kind.
+    #[test]
+    fn evidence_file_round1_derives_library_hash() {
+        let ev = signed_round1(true);
+        let parsed: EvidenceFile = serde_json::from_value(round1_json(&ev)).unwrap();
+        let d = parsed.derive().unwrap();
+        assert_eq!(d.kind, FaultKind::InvalidPayload);
+        assert_eq!(d.accused_pool_id, ev.accused_pool_id.to_vec());
+        assert_eq!(d.evidence_hash, ev.evidence_hash().unwrap());
+        assert_eq!(d.namespace_hash, ev.namespace_hash());
+        assert!(d.equivocation.is_none());
+    }
+
+    /// A payload that actually verifies is rejected — no FaultProof for honest
+    /// behavior.
+    #[test]
+    fn evidence_file_round1_rejects_honest_payload() {
+        let parsed: EvidenceFile =
+            serde_json::from_value(round1_json(&signed_round1(false))).unwrap();
+        assert!(
+            parsed
+                .derive()
+                .unwrap_err()
+                .contains("does not encode a fault")
+        );
+    }
+
+    /// The CLI refuses to forge: evidence whose accused signature does not
+    /// verify is rejected before any hash is derived (spec §9.2).
+    #[test]
+    fn evidence_file_round1_rejects_bad_signature() {
+        let ev = signed_round1(true);
+        let mut json = round1_json(&ev);
+        let mut sig = ev.payload_signature;
+        sig[0] ^= 0x01;
+        json["payload_signature"] = serde_json::Value::String(hex::encode(sig));
+        let parsed: EvidenceFile = serde_json::from_value(json).unwrap();
+        assert!(parsed.derive().unwrap_err().contains("signature"));
+    }
+
+    fn signed_equivocation() -> fe::EquivocationEvidence {
+        let secp = Secp256k1::new();
+        let (sk, _pk) = secp.generate_keypair(&mut OsRng);
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let pool = [0x22u8; 28];
+        let mk = |seed: u64| {
+            let mut rng = ChaCha20Rng::seed_from_u64(seed);
+            let (_s, pkg) =
+                participant::dkg_part1(Identifier::try_from(1u16).unwrap(), 3, 2, &mut rng)
+                    .unwrap();
+            let (commitments, sigma_i) = frost_bridge::round1_fields(&pkg).unwrap();
+            let bytes = canonical::round1(3, 51, 1, &pool, &commitments, &sigma_i);
+            let sig = auth::sign_payload(&secp, &kp, &bytes);
+            (bytes, sig)
+        };
+        let (payload_a, signature_a) = mk(0xA1);
+        let (payload_b, signature_b) = mk(0xB2);
+        fe::EquivocationEvidence {
+            epoch: 3,
+            threshold: 51,
+            attempt: 1,
+            phase: fe::NamespacePhase::Round1,
+            accused_pool_id: pool,
+            bifrost_id_pk: kp.x_only_public_key().0.serialize(),
+            payload_a,
+            signature_a,
+            payload_b,
+            signature_b,
+        }
+    }
+
+    #[test]
+    fn evidence_file_equivocation_derives_sorted_hash() {
+        let ev = signed_equivocation();
+        let json = serde_json::json!({
+            "kind": "equivocation",
+            "accused_pool_id": hex::encode(ev.accused_pool_id),
+            "bifrost_id_pk": hex::encode(ev.bifrost_id_pk),
+            "epoch": ev.epoch, "threshold": ev.threshold, "attempt": ev.attempt,
+            "round": "round1",
+            "payload_a": hex::encode(&ev.payload_a),
+            "signature_a": hex::encode(ev.signature_a),
+            "payload_b": hex::encode(&ev.payload_b),
+            "signature_b": hex::encode(ev.signature_b),
+        });
+        let parsed: EvidenceFile = serde_json::from_value(json).unwrap();
+        let d = parsed.derive().unwrap();
+        assert_eq!(d.kind, FaultKind::Equivocation);
+        assert_eq!(d.accused_pool_id, ev.accused_pool_id.to_vec());
+        assert_eq!(d.evidence_hash, ev.evidence_hash());
+        assert_eq!(d.namespace_hash, ev.namespace_hash());
+        // the equivocation witness is carried through to the mint redeemer
+        let w = d.equivocation.expect("equivocation witness");
+        assert_eq!(w.bifrost_id_pk, ev.bifrost_id_pk);
+        assert_eq!(w.payload_a, ev.payload_a);
+        assert_eq!(w.signature_a, ev.signature_a);
+        assert_eq!(w.payload_b, ev.payload_b);
+        assert_eq!(w.signature_b, ev.signature_b);
+    }
+
+    #[test]
+    fn evidence_file_rejects_unknown_kind() {
+        let json = serde_json::json!({
+            "kind": "nonsense", "accused_pool_id": "22".repeat(28),
+            "bifrost_id_pk": "33".repeat(32),
+            "epoch": 0, "threshold": 51, "attempt": 0,
+        });
+        let parsed: EvidenceFile = serde_json::from_value(json).unwrap();
+        assert!(parsed.derive().unwrap_err().contains("kind"));
     }
 }
