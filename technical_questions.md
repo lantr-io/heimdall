@@ -357,6 +357,68 @@ mint token name + datum, ApplyBan redeemer carrying `accused_pool_id` +
 as **WI-018** (updates WI-016, blocks WI-017). The σ_i encoding (§4) is
 unaffected.
 
+### 5a. `evidence_hash` derivation (WI-019) and the permissive-verify gap
+
+**Upstream gap (still open):** `fault-verifier.ak:42` is a `// TODO: Verify the
+submitted fault evidence/proof before minting FaultProof.` — today the validator
+checks only structural shape (input_ref spent, single token =
+`blake2b_256(pool_id ‖ evidence_hash)`, 28/32-byte lengths, datum-on-output). It
+verifies **no** evidence, so anyone can mint a forged FaultProof against any pool
+and ApplyBan will trust it. Real on-chain verification (Plonk/Halo2 verify for
+`InvalidPayload`, double-signature check for `Equivocation`) is FluidTokens
+contract work. **Until it lands, the `evidence_hash` preimage is not pinned by
+the contract** and any heimdall-side derivation is forward-looking.
+
+**heimdall-side derivation (WI-019, `circuits::fault_evidence`):** given that
+gap, heimdall already wires captured WI-014 evidence → `evidence_hash` →
+`build_fault_proof_mint_tx`, choosing the preimage to match what the eventual
+verify must check:
+
+- **`InvalidPayload`** = the Axiom/Halo2 fault circuit's single public input,
+  `evidence_hash = Poseidon(message).to_repr()` (32-byte LE). This is **pinned by
+  the circuit**: the `dkg_fault` round1 PoK-fault / round2 share-fault circuits
+  expose exactly this digest, and the `dkg_fault_onchain` bench's generated
+  verifier binds the token name to those same bytes. So when the upstream verify
+  lands it recomputes the token name from the verified public input and they
+  match. The circuit attests the payload is genuinely faulty
+  (`μ·G − c·φ₀ ≠ R`, resp. `f_i(l)·G ≠ Σ_j l^j φ_{i,j}`).
+- **`Equivocation`** = `blake2b_256(min(a,b) ‖ max(a,b))` over the two conflicting
+  BIP-340-signed payload byte strings (sorted ⇒ order-independent). There is **no
+  ZK** here; the misbehavior is the double-signature itself. This preimage is
+  **heimdall's choice** and is NOT yet pinned by any contract — when the upstream
+  `Equivocation` verify is defined it may require a different commitment, at which
+  point this derivation must be re-aligned.
+
+**Authentication envelope (sign-the-hash, §9.2).** Each invalid-payload evidence
+type carries the accused's x-only `bifrost_id_pk`, the `(epoch, threshold,
+attempt, pool_id)` namespace, and the accused's BIP-340 `payload_signature` over
+`message_hash = SHA256(canonical_bytes)`; `canonical_bytes()` rebuilds the exact
+signed bytes from the structured fields. `verify_payload_signature()` confirms
+the accused authored the payload — `prove_*` and the CLI `--evidence-file` path
+both refuse to derive/forge a FaultProof for a payload the accused never signed.
+`Equivocation` carries two signed canonical payloads and `verify()`s both
+signatures + same-namespace + distinct, exactly as the equivocation policy will.
+`DkgFaultProof` exposes the full §9.2 submission set (`message_hash`,
+`payload_signature`, `bifrost_id_pk`, `evidence_hash`, proof, public inputs).
+
+Deriving the hash is a cheap host-side Poseidon/blake2b (no SRS, no proof) — that
+is all the permissive mint needs today. Generating the actual ZK proof
+(`prove_round1_pok_fault` / `prove_round2_share_fault`) is implemented and
+self-verifying but only needed once the on-chain verify checks proofs; it is
+gated out of the default test run (k=18/k=22, minutes) behind `#[ignore]`.
+
+**Remaining circuit-binding gap.** §9.2 has the verifier check the accused
+signature over `message_hash` AND bind the Halo2 proof to that same
+`message_hash`. The current `dkg_fault` circuit instead exposes
+`Poseidon(structured_fields)` and computes no SHA256 in-circuit, so nothing yet
+ties the proven public input to the `message_hash` the accused signed. Heimdall
+now *carries* both (so a submission is complete and the accused-signed check
+passes), but provably linking `Poseidon(fields)` ↔ `SHA256(canonical_bytes)` is
+upstream circuit work — the real content behind the `fault_verifier.ak:42` mock.
+For Round 2 specifically the signed payload holds the *encrypted* share while the
+circuit proves the *decrypted* one; binding those is the same class of upstream
+gap.
+
 ACTION: rebase the `feat/b1-confirm-tm-reference` fork branch on upstream `main`
 so the fault/ban section isn't worked from a stale copy. No FluidTokens spec PR
 is needed — the change is already merged upstream.

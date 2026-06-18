@@ -6,9 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod cardano_transcript;
-
-use cardano_transcript::{CardanoBlake2bRead, CardanoBlake2bWrite};
 use frost::{Ciphersuite, Identifier};
 use frost_secp256k1_tr as frost;
 use halo2_base::halo2_proofs::{
@@ -28,6 +25,7 @@ use halo2_base::halo2_proofs::{
     },
     transcript::{Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer},
 };
+use heimdall::circuits::cardano_transcript::{CardanoBlake2bRead, CardanoBlake2bWrite};
 use k256::{
     AffinePoint, EncodedPoint, ProjectivePoint, Scalar,
     elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint},
