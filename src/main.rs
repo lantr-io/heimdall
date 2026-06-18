@@ -276,6 +276,30 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Bootstrap the spo_bans ban list: spend the one-shot outref that
+    /// parameterizes the ban policy and mint the "ban-root" anchor NFT to the
+    /// ban script address (WI-015). Prints the signed tx, submits only with
+    /// --submit. Precondition for any apply-ban. The fault-policy set +
+    /// ban-schedule params come from [cardano] config.
+    BootstrapBanList {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap outref (<tx_hash>:<index>) —
+        /// its policy hash is a spo_bans parameter.
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// The spo_bans one-shot bootstrap outref (<tx_hash>:<index>). Must be an
+        /// unspent wallet UTxO, and should match cardano.ban_bootstrap (the value
+        /// apply-ban reads to re-derive the same ban policy).
+        #[arg(long)]
+        ban_bootstrap: String,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
     /// Build (and with --submit, broadcast) the spo_bans.ApplyBan tx: consume a
     /// published FaultProof and write the ban-list node (WI-018). The
     /// fault-policy set + ban-schedule params come from [cardano] config.
@@ -612,6 +636,25 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_register_spo(&cfg, &args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::BootstrapBanList {
+            config,
+            blueprint,
+            registry_bootstrap,
+            ban_bootstrap,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_bootstrap_ban_list(
+                &cfg,
+                &blueprint,
+                &registry_bootstrap,
+                &ban_bootstrap,
+                submit,
+            ) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1277,14 +1320,41 @@ fn submit_tx_blockfrost(
 }
 
 /// The Cardano network of a bech32 address — testnet iff the `addr_test` HRP.
-/// Single source of truth for the on-chain command handlers (they previously
-/// open-coded this with inverted branch order, an easy place to drift).
+/// Thin alias over the shared [`crate::cardano::tx_common::network_from_address`]
+/// (the single source of truth) for the on-chain command handlers.
 fn network_of(addr: &str) -> pallas_addresses::Network {
-    if addr.starts_with("addr_test") {
-        pallas_addresses::Network::Testnet
-    } else {
-        pallas_addresses::Network::Mainnet
-    }
+    crate::cardano::tx_common::network_from_address(addr)
+}
+
+/// Byte size of a reference script attached to a one-shot bootstrap outref, if
+/// any. The outref can't be swapped (it parameterizes the policy), so the Conway
+/// per-byte ref-script fee on spending it must be priced in explicitly (whisky's
+/// estimate can't see it). Shared by the registry and ban-list bootstrap
+/// commands; `label` tags the operator-facing note.
+fn fetch_one_shot_ref_script_size(
+    rt: &tokio::runtime::Runtime,
+    base_url: &str,
+    pid: &str,
+    raw: &[bf_http::BfUtxo],
+    tx_hash_hex: &str,
+    index: u32,
+    label: &str,
+) -> Result<Option<u64>, String> {
+    let Some(h) = raw
+        .iter()
+        .find(|u| u.tx_hash == tx_hash_hex && u.output_index == index)
+        .and_then(|u| u.reference_script_hash.as_deref())
+    else {
+        return Ok(None);
+    };
+    let size = rt
+        .block_on(bf_http::fetch_script_size(base_url, pid, h))
+        .map_err(|e| format!("one-shot ref script size: {e}"))?;
+    eprintln!(
+        "[{label}] note: the one-shot outref carries reference script {h} ({size} bytes) — \
+         adding the Conway ref-script fee"
+    );
+    Ok(Some(size))
 }
 
 /// The shared dry-run / `--submit` tail of the on-chain tx commands: on a dry
@@ -1351,23 +1421,15 @@ fn run_bootstrap_registry(
     // ref-script fee on spending it — fetch the size so the builder prices it
     // in explicitly (whisky's estimate cannot see it).
     let reg_tx_hash_hex = hex::encode(reg_tx_id);
-    let one_shot_ref_script_size = match raw
-        .iter()
-        .find(|u| u.tx_hash == reg_tx_hash_hex && u.output_index == reg_index)
-        .and_then(|u| u.reference_script_hash.as_deref())
-    {
-        Some(h) => {
-            let size = rt
-                .block_on(bf_http::fetch_script_size(&base_url, pid, h))
-                .map_err(|e| format!("one-shot ref script size: {e}"))?;
-            eprintln!(
-                "[bootstrap-registry] note: the one-shot outref carries reference script \
-                 {h} ({size} bytes) — adding the Conway ref-script fee"
-            );
-            Some(size)
-        }
-        None => None,
-    };
+    let one_shot_ref_script_size = fetch_one_shot_ref_script_size(
+        &rt,
+        &base_url,
+        pid,
+        &raw,
+        &reg_tx_hash_hex,
+        reg_index,
+        "bootstrap-registry",
+    )?;
 
     let built = build_registry_bootstrap_tx(
         &registry,
@@ -1383,6 +1445,112 @@ fn run_bootstrap_registry(
 
     println!("registry policy id:   {}", built.policy_id_hex);
     println!("registry address:     {}", built.script_address);
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    finish_tx(cfg, pid, &rt, submit, &built.signed_tx_hex)
+}
+
+/// Build (and with `submit`, broadcast) the ban-list bootstrap: the one-shot
+/// `Bootstrap` mint creating the `"ban-root"` anchor element (WI-015). The ban
+/// policy's fault-policy set + ban-schedule come from [cardano] config; the
+/// `--ban-bootstrap` outref should match `cardano.ban_bootstrap` (the value
+/// apply-ban reads). This must confirm before any apply-ban can be built.
+/// See `heimdall::cardano::apply_ban`.
+fn run_bootstrap_ban_list(
+    cfg: &HeimdallConfig,
+    blueprint_path: &str,
+    registry_bootstrap: &str,
+    ban_bootstrap: &str,
+    submit: bool,
+) -> Result<(), String> {
+    use heimdall::cardano::apply_ban::build_ban_bootstrap_tx;
+    use heimdall::cardano::ban_list::BanPolicyParams;
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{spo_bans_script, spos_registry_script};
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = std::fs::read_to_string(blueprint_path)
+        .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+
+    // The ban policy is parameterized by the registry hash + the fault-policy
+    // set + ban schedule + its own one-shot outref. Everything but the outref is
+    // config-pinned (shared with apply-ban) so the derived policy id matches.
+    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
+    // apply-ban derives the ban policy id from `cardano.ban_bootstrap`. If config
+    // pins a different outref than the one bootstrapped here, `ban-root` is minted
+    // under a policy apply-ban never queries — fail loudly instead of silently
+    // bootstrapping an unreachable list.
+    if let Some(cfg_ban) = cfg.cardano.ban_bootstrap.as_deref() {
+        let (cfg_tx_id, cfg_index) = parse_cardano_outref(cfg_ban)?;
+        if (cfg_tx_id, cfg_index) != (ban_tx_id, ban_index) {
+            return Err(format!(
+                "--ban-bootstrap ({ban_bootstrap}) does not match cardano.ban_bootstrap \
+                 ({cfg_ban}); apply-ban derives the ban policy from the config value, so \
+                 bootstrapping a different outref would mint ban-root under an unreachable policy"
+            ));
+        }
+    }
+    let params = BanPolicyParams::from_config(&cfg.cardano).map_err(|e| e.to_string())?;
+    let spo_bans = spo_bans_script(
+        &blueprint_json,
+        &registry.hash,
+        &params.fault_proof_policies,
+        params.base_ban_duration_ms,
+        params.max_faults_before_permanent,
+        params.max_validity_window_ms,
+        &ban_tx_id,
+        u64::from(ban_index),
+    )
+    .map_err(|e| format!("parameterize spo_bans: {e}"))?;
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let ban_tx_hash_hex = hex::encode(ban_tx_id);
+    let one_shot_ref_script_size = fetch_one_shot_ref_script_size(
+        &rt,
+        &base_url,
+        pid,
+        &raw,
+        &ban_tx_hash_hex,
+        ban_index,
+        "bootstrap-ban-list",
+    )?;
+
+    let built = build_ban_bootstrap_tx(
+        &spo_bans,
+        &ban_tx_hash_hex,
+        ban_index,
+        &wallet_addr,
+        &wallet_utxos,
+        &key,
+        one_shot_ref_script_size,
+        Some(cost_models),
+    )
+    .map_err(|e| format!("build ban bootstrap tx: {e}"))?;
+
+    println!("ban policy id:   {}", built.policy_id_hex);
+    println!("ban address:     {}", built.script_address);
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
     finish_tx(cfg, pid, &rt, submit, &built.signed_tx_hex)

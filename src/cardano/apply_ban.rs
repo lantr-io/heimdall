@@ -37,23 +37,26 @@
 //! The FaultProof burn uses [`super::fault_proof::burn_proof_redeemer`].
 
 use pallas_codec::minicbor;
-use pallas_codec::utils::{Bytes, NonEmptySet};
+use pallas_codec::utils::NonEmptySet;
 use pallas_primitives::PlutusData;
-use pallas_primitives::conway::{Tx, VKeyWitness};
-use pallas_traverse::ComputeHash;
+use pallas_primitives::conway::Tx;
 use pallas_wallet::PrivateKey;
 use whisky::*;
 use whisky_pallas::WhiskyPallas;
 
 use crate::cardano::ban_list::{
-    BAN_NODE_KEY_PREFIX, BanElement, BanElementData, BanList, BanListError, BanNodeData,
-    BanPolicyParams, BanUtxo, fault_token_name, find_ban_utxos,
+    BAN_NODE_KEY_PREFIX, BAN_ROOT_KEY, BanElement, BanElementData, BanList, BanListError,
+    BanNodeData, BanPolicyParams, BanUtxo, fault_token_name, find_ban_utxos,
 };
 use crate::cardano::bf_http::BfUtxo;
 use crate::cardano::blueprint::ParameterizedScript;
-use crate::cardano::fault_proof::burn_proof_redeemer;
+use crate::cardano::fault_proof::{burn_proof_redeemer, output_reference};
 use crate::cardano::plutus::{bytes, constr, int, option};
 use crate::cardano::publish::WalletUtxo;
+use crate::cardano::tx_common::{
+    BootstrapError, OneShotBootstrapParams, build_oneshot_bootstrap_tx, element_lovelace,
+    select_collateral, select_fee, sign_built_tx as common_sign_built_tx, whisky_network,
+};
 use crate::cardano::wallet::pub_key_hash_hex;
 
 // ---------------------------------------------------------------------------
@@ -131,6 +134,15 @@ pub enum ApplyBanError {
     EvidenceAlreadyApplied,
     Wallet(String),
     Build(String),
+}
+
+impl From<BootstrapError> for ApplyBanError {
+    fn from(e: BootstrapError) -> Self {
+        match e {
+            BootstrapError::Wallet(m) => ApplyBanError::Wallet(m),
+            BootstrapError::Build(m) => ApplyBanError::Build(m),
+        }
+    }
 }
 
 impl std::fmt::Display for ApplyBanError {
@@ -217,12 +229,6 @@ pub struct ApplyBanTx {
     pub burned_fault_token: [u8; 32],
 }
 
-/// Min-UTxO for a ban element output (datum-scaled, same conservative formula
-/// as the registry/treasury elements).
-fn element_lovelace(datum_cbor_len: usize) -> u64 {
-    std::cmp::max(2_000_000u64, (datum_cbor_len as u64 + 600) * 4310)
-}
-
 fn tx_id_bytes(tx_hash: &str) -> Result<[u8; 32], ApplyBanError> {
     hex::decode(tx_hash)
         .ok()
@@ -236,56 +242,94 @@ fn select_fee_and_collateral(
     wallet_utxos: &[WalletUtxo],
     min_fee_lovelace: u64,
 ) -> Result<(&WalletUtxo, &WalletUtxo), ApplyBanError> {
-    let fee = wallet_utxos
-        .iter()
-        .filter(|u| u.pure_ada)
-        .max_by_key(|u| u.lovelace)
-        .ok_or_else(|| ApplyBanError::Wallet("no clean wallet UTxOs for fees".into()))?;
-    if fee.lovelace < min_fee_lovelace {
-        return Err(ApplyBanError::Wallet(format!(
-            "largest wallet UTxO ({} lovelace) cannot cover the outputs plus fees (needs >= {min_fee_lovelace})",
-            fee.lovelace
-        )));
-    }
-    let coll = wallet_utxos
-        .iter()
-        .find(|u| {
-            u.lovelace >= 5_000_000
-                && u.pure_ada
-                && !(u.tx_hash == fee.tx_hash && u.output_index == fee.output_index)
-        })
-        .ok_or_else(|| {
-            ApplyBanError::Wallet(
-                "no pure-ADA wallet UTxO with >= 5 ADA for collateral, distinct from the fee input"
-                    .into(),
-            )
-        })?;
+    let fee = select_fee(wallet_utxos, min_fee_lovelace).map_err(ApplyBanError::Wallet)?;
+    let coll = select_collateral(wallet_utxos, &[fee]).map_err(ApplyBanError::Wallet)?;
     Ok((fee, coll))
 }
 
 fn sign_built_tx(unsigned_hex: &str, key: &PrivateKey) -> Result<String, ApplyBanError> {
-    let bytes = hex::decode(unsigned_hex)
-        .map_err(|e| ApplyBanError::Build(format!("unsigned tx hex decode: {e}")))?;
-    let mut tx: Tx = minicbor::decode(&bytes)
-        .map_err(|e| ApplyBanError::Build(format!("tx minicbor decode: {e}")))?;
-    let body_hash = tx.transaction_body.compute_hash();
-    let signature = key.sign(body_hash);
-    let pk: [u8; 32] = key.public_key().into();
-    let vkw = VKeyWitness {
-        vkey: Bytes::from(pk.to_vec()),
-        signature: Bytes::from(signature.as_ref().to_vec()),
+    common_sign_built_tx(unsigned_hex, key).map_err(ApplyBanError::Build)
+}
+
+// ---------------------------------------------------------------------------
+// Ban-list bootstrap (the "ban-root" anchor mint) — WI-015
+// ---------------------------------------------------------------------------
+
+/// A built (signed, unsubmitted) ban-list bootstrap tx.
+#[derive(Debug, Clone)]
+pub struct BanBootstrapTx {
+    pub signed_tx_hex: String,
+    /// `spo_bans` script hash = the ban-list policy id.
+    pub policy_id_hex: String,
+    /// Enterprise script address holding the ban-list elements.
+    pub script_address: String,
+}
+
+/// Build + sign the ban-list bootstrap: spend the one-shot outref that
+/// parameterizes `spo_bans` (it MUST be among `wallet_utxos`) and mint the
+/// `"ban-root"` anchor NFT to the ban script address with the
+/// `Element{Root(BanListRootData), link: None}` inline datum. This is the
+/// precondition for any `apply-ban` (the linked list must be initialized).
+///
+/// Mirrors [`crate::cardano::register_spo::build_registry_bootstrap_tx`]; the one
+/// material difference is the mint redeemer. `spo_bans`'s `Bootstrap { input_ref }`
+/// carries the one-shot `OutputReference`, and the validator asserts both that
+/// the input is spent and that `input_ref == OutputReference(bootstrap_tx_id,
+/// bootstrap_output_index)` — the exact outpoint baked into the policy params.
+/// The registry's `Bootstrap` is field-less by contrast.
+///
+/// `one_shot_ref_script_size`: byte size of a reference script on the one-shot
+/// UTxO, if any. The outref cannot be swapped (it parameterizes the policy), so
+/// the ledger's per-byte ref-script fee is added explicitly on a second build
+/// pass (whisky's estimate cannot see it).
+#[allow(clippy::too_many_arguments)]
+pub fn build_ban_bootstrap_tx(
+    spo_bans_script: &ParameterizedScript,
+    bootstrap_tx_hash: &str,
+    bootstrap_output_index: u32,
+    wallet_address: &str,
+    wallet_utxos: &[WalletUtxo],
+    key: &PrivateKey,
+    one_shot_ref_script_size: Option<u64>,
+    cost_models: Option<Vec<Vec<i64>>>,
+) -> Result<BanBootstrapTx, ApplyBanError> {
+    let root_element = BanElement {
+        data: BanElementData::Root,
+        link: None,
     };
-    let mut vkeys: Vec<VKeyWitness> = tx
-        .transaction_witness_set
-        .vkeywitness
-        .take()
-        .map(|s| s.to_vec())
-        .unwrap_or_default();
-    vkeys.push(vkw);
-    tx.transaction_witness_set.vkeywitness = NonEmptySet::from_vec(vkeys);
-    let signed = minicbor::to_vec(&tx)
-        .map_err(|e| ApplyBanError::Build(format!("signed tx encode: {e}")))?;
-    Ok(hex::encode(signed))
+    // `Bootstrap { input_ref }` = Constr(0, [OutputReference(one-shot)]); the
+    // outref must equal the one baked into the policy params (and be spent). The
+    // registry's `Bootstrap` is field-less by contrast — the one material
+    // difference between the two one-shot bootstraps.
+    let bootstrap_tx_id = tx_id_bytes(bootstrap_tx_hash)?;
+    let mint_redeemer_cbor = hex::encode(
+        minicbor::to_vec(constr(
+            0,
+            vec![output_reference(&bootstrap_tx_id, bootstrap_output_index)],
+        ))
+        .expect("redeemer CBOR encode"),
+    );
+
+    let built = build_oneshot_bootstrap_tx(OneShotBootstrapParams {
+        policy_script: spo_bans_script,
+        bootstrap_tx_hash,
+        bootstrap_output_index,
+        wallet_address,
+        wallet_utxos,
+        key,
+        one_shot_ref_script_size,
+        cost_models,
+        root_datum_cbor: root_element.to_cbor(),
+        root_asset_name: BAN_ROOT_KEY,
+        mint_redeemer_cbor,
+        outref_label: "ban",
+    })?;
+
+    Ok(BanBootstrapTx {
+        signed_tx_hex: built.signed_tx_hex,
+        policy_id_hex: built.policy_id_hex,
+        script_address: built.script_address,
+    })
 }
 
 /// `spo_bans` as a reference-script source (used by the withdraw, the anchor
@@ -631,10 +675,7 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
         required_signatures: vec![pub_key_hash_hex(req.key)],
         change_address: req.wallet_address.to_string(),
         signing_key: vec![],
-        network: Some(match &req.cost_models {
-            Some(cm) => whisky::Network::Custom(cm.clone()),
-            None => whisky::Network::Preprod,
-        }),
+        network: Some(whisky_network(&req.cost_models)),
         reference_inputs: vec![RefTxIn {
             tx_hash: req.registration_ref.0.clone(),
             tx_index: req.registration_ref.1,
@@ -927,6 +968,115 @@ mod tests {
             key,
             cost_models: None,
         }
+    }
+
+    #[test]
+    fn ban_bootstrap_end_to_end() {
+        use pallas_primitives::conway::{RedeemerTag, Redeemers};
+
+        let bans = spo_bans_script();
+        let policy_hex = bans.hash_hex();
+        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
+        let addr = wallet_address(&key);
+        // The one-shot that parameterizes spo_bans must be an unspent wallet UTxO.
+        let one_shot_tx = "aa".repeat(32);
+        let w = wallet(); // aa..#0 (50 ADA) + bb..#1 (6 ADA)
+
+        let built = build_ban_bootstrap_tx(&bans, &one_shot_tx, 0, &addr, &w, &key, None, None)
+            .expect("build ban bootstrap");
+        assert_eq!(built.policy_id_hex, policy_hex);
+
+        let tx: Tx = minicbor::decode(&hex::decode(&built.signed_tx_hex).unwrap()).unwrap();
+
+        // Mints exactly one "ban-root" NFT under the ban policy, nothing else.
+        assert_eq!(
+            mints(&tx),
+            vec![(policy_hex.clone(), hex::encode(BAN_ROOT_KEY), 1)],
+            "expected a single ban-root mint"
+        );
+
+        // The one-shot outpoint is among the spent inputs (the validator both
+        // requires it spent and pins input_ref to it).
+        assert!(
+            tx.transaction_body
+                .inputs
+                .iter()
+                .any(|i| hex::encode(i.transaction_id.as_slice()) == one_shot_tx && i.index == 0),
+            "one-shot input must be spent"
+        );
+
+        // Collateral must be pure-ADA AND disjoint from the spent inputs: here
+        // the one-shot (aa..#0) is the sole input, so collateral must be the
+        // OTHER UTxO (bb..#1), never the one-shot. (A UTxO that is both a spent
+        // input and collateral is rejected by the ledger at phase 1.)
+        let collateral = tx
+            .transaction_body
+            .collateral
+            .as_ref()
+            .expect("collateral present");
+        for c in collateral.iter() {
+            let c_op = (hex::encode(c.transaction_id.as_slice()), c.index);
+            assert!(
+                !tx.transaction_body
+                    .inputs
+                    .iter()
+                    .any(|i| (hex::encode(i.transaction_id.as_slice()), i.index) == c_op),
+                "collateral {c_op:?} must not also be a spending input"
+            );
+        }
+        assert!(
+            collateral.iter().any(
+                |c| hex::encode(c.transaction_id.as_slice()) == "bb".repeat(32) && c.index == 1
+            ),
+            "collateral must be the non-one-shot UTxO (bb..#1)"
+        );
+
+        // Output[0]: the Root anchor with no link — an initialized empty list.
+        let root = decode_ban_output(&tx, 0);
+        assert_eq!(root.data, BanElementData::Root);
+        assert!(root.link.is_none());
+
+        // The mint redeemer is Bootstrap = Constr(0, [OutputReference(one_shot, 0)]),
+        // and the OutputReference must equal the spent one-shot (≡ the policy param).
+        let redeemers = tx.transaction_witness_set.redeemer.as_ref().unwrap();
+        let mint_rdmr = match redeemers {
+            Redeemers::List(rs) => rs
+                .iter()
+                .find(|r| matches!(r.tag, RedeemerTag::Mint))
+                .expect("mint redeemer")
+                .data
+                .clone(),
+            Redeemers::Map(kv) => kv
+                .iter()
+                .find(|(k, _)| matches!(k.tag, RedeemerTag::Mint))
+                .expect("mint redeemer")
+                .1
+                .data
+                .clone(),
+        };
+        let f = plutus::constr_fields(&mint_rdmr, 0).unwrap();
+        assert_eq!(
+            f.len(),
+            1,
+            "Bootstrap carries one field (the OutputReference)"
+        );
+        let or = plutus::constr_fields(&f[0], 0).unwrap();
+        assert_eq!(
+            hex::encode(plutus::field_bytes(or, 0).unwrap()),
+            one_shot_tx
+        );
+        assert_eq!(plutus::field_int(or, 1).unwrap(), 0);
+
+        // Signed by the wallet key.
+        let pk: [u8; 32] = key.public_key().into();
+        assert!(
+            tx.transaction_witness_set
+                .vkeywitness
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v.vkey.as_slice() == pk)
+        );
     }
 
     #[test]

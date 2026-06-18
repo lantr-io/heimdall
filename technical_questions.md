@@ -360,3 +360,57 @@ unaffected.
 ACTION: rebase the `feat/b1-confirm-tm-reference` fork branch on upstream `main`
 so the fault/ban section isn't worked from a stale copy. No FluidTokens spec PR
 is needed — the change is already merged upstream.
+
+### 5a. `fault_verifier.ak` verifies NO fault evidence yet — permissive mint (UNRESOLVED upstream gap)
+
+*2026-06-17, recorded while closing out WI-016 (heimdall `src/cardano/fault_proof.rs`).*
+
+The token-name + ban-policy *shape* above is settled, but the verifier that is
+supposed to gate minting is **not implemented upstream**. `fault-verifier.ak`'s
+`PublishProof` branch (ft-bifrost-bridge `feat/b1-confirm-tm-reference`,
+`onchain/validators/bitcoin/fault-verifier.ak:42`) carries a literal
+`// TODO: Verify the submitted fault evidence/proof before minting FaultProof.`
+and checks only **structural shape**:
+
+- `find_input(self.inputs, input_ref)` — the `input_ref` outpoint is a spent input (anti-replay nonce);
+- exactly one token minted under the policy, named `blake2b_256(accused_pool_id ‖ evidence_hash)` (recomputed, not sliced);
+- `accused_pool_id` is 28 bytes, `evidence_hash` is 32 bytes, token name is 32 bytes;
+- `fault.accused_pool_id == accused_pool_id` (redeemer/datum agree);
+- exactly one output carries the token with `InlineDatum(fault)`.
+
+Nowhere does it check that `evidence_hash` commits to *real* misbehavior. So
+today **anyone can mint a well-formed FaultProof against any `pool_id` with an
+arbitrary 32-byte `evidence_hash`** — and because `spo_bans.ak` ApplyBan trusts
+the FaultProof token's existence (it re-derives + burns the name; it does not
+re-verify evidence either), that forged proof bans an arbitrary honest pool.
+This is a critical authorization gap in the upstream contract, not a heimdall bug.
+
+What real verification requires (FluidTokens **contract** work, not heimdall):
+
+- **InvalidPayload**: a ZK (Plonk/Halo2) verify that `evidence_hash` is the
+  public input of a valid DKG-fault proof (the secp256k1 fault predicate the
+  Axiom/Halo2 circuits in heimdall `src/circuits/dkg_fault.rs` already prove).
+  Likely split into separate round1 / round2 verifier policies (each ZK verify
+  is ~90% of the ex-unit budget — see §5's "plural policy" note).
+- **Equivocation**: an on-chain double-signature check that `evidence_hash`
+  binds two distinct BIP340-signed payloads for the same DKG namespace (the raw
+  conflicting bytes heimdall's WI-013 transport already retains, keyed by
+  namespace, in `src/http/peer_network.rs`).
+
+Heimdall stance / WI tracking:
+
+- The FaultProof mint + BurnProof **tx builders are done and tested** against
+  this permissive validator (WI-018 `fault_proof.rs`; `heimdall fault-proof-mint`
+  CLI), which is the intended preprod path until the verifier lands — the WI-016
+  ticket flags this gap as "do not block tx-building."
+- Deriving `evidence_hash` from **real** evidence (instead of today's opaque
+  `--evidence-hash` flag) is deferred: it needs (a) the DKG ceremony
+  orchestration that surfaces the fault (WI-014, still open) and (b) this
+  upstream verifier to *define the verified `evidence_hash` format* — until the
+  contract pins what it verifies, any heimdall-side derivation would be
+  speculative. Tracked as the WI-016 residual.
+
+ACTION: ask FluidTokens to implement the `fault-verifier.ak:42` evidence verify
+(per-fault-kind verifier policies), pinning the verified `evidence_hash` preimage
+for each kind. Until then the ban pipeline is functionally testable but NOT
+trust-minimized — flag prominently in any preprod/mainnet readiness review.

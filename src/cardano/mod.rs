@@ -39,6 +39,7 @@ pub mod treasury_bootstrap;
 pub mod treasury_datum;
 pub mod treasury_info;
 pub mod treasury_spend;
+pub mod tx_common;
 pub mod wallet;
 
 pub use pegin_source::{CardanoOutRef, CardanoPegInRequest, CardanoPegInSource};

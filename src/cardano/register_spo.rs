@@ -46,11 +46,9 @@ use bitcoin::hashes::{Hash as _, sha256};
 use bitcoin::key::Secp256k1;
 use bitcoin::secp256k1::{Keypair, Message, XOnlyPublicKey, schnorr};
 use pallas_codec::minicbor;
-use pallas_codec::utils::{Bytes, NonEmptySet};
 use pallas_crypto::key::ed25519;
 use pallas_primitives::PlutusData;
-use pallas_primitives::conway::{Tx, VKeyWitness};
-use pallas_traverse::ComputeHash;
+use pallas_primitives::conway::Tx;
 use pallas_wallet::PrivateKey;
 use whisky::*;
 use whisky_pallas::WhiskyPallas;
@@ -65,6 +63,11 @@ use crate::cardano::registry::{
 };
 use crate::cardano::treasury_info::{TreasuryInfoError, apply_registration, proof_to_plutus_data};
 use crate::cardano::treasury_spend::{TreasurySpendError, find_treasury_state, treasury_spend_leg};
+use crate::cardano::tx_common::{
+    BootstrapError, OneShotBootstrapParams, build_oneshot_bootstrap_tx, element_lovelace,
+    network_from_address, select_collateral, select_fee, sign_built_tx as common_sign_built_tx,
+    whisky_network,
+};
 use crate::cardano::wallet::pub_key_hash_hex;
 
 /// `registration_domain_separator` in `spos_registry.ak`.
@@ -89,6 +92,15 @@ pub enum RegisterSpoError {
     BadElementUtxo(String),
     Wallet(String),
     Build(String),
+}
+
+impl From<BootstrapError> for RegisterSpoError {
+    fn from(e: BootstrapError) -> Self {
+        match e {
+            BootstrapError::Wallet(m) => RegisterSpoError::Wallet(m),
+            BootstrapError::Build(m) => RegisterSpoError::Build(m),
+        }
+    }
 }
 
 impl std::fmt::Display for RegisterSpoError {
@@ -379,13 +391,6 @@ pub struct RegisterSpoTx {
     pub new_bifrost_identity_root: mpf::Hash,
 }
 
-/// Min-UTxO for a registry element output (same conservative datum-scaled
-/// formula as the treasury bootstrap: the locked value persists for the
-/// element's whole on-chain life).
-fn element_lovelace(datum_cbor_len: usize) -> u64 {
-    std::cmp::max(2_000_000u64, (datum_cbor_len as u64 + 600) * 4310)
-}
-
 /// Decode `tx_hash` hex into the 32-byte id whisky sorts inputs by.
 fn tx_id_bytes(tx_hash: &str) -> Result<[u8; 32], RegisterSpoError> {
     hex::decode(tx_hash)
@@ -401,54 +406,18 @@ fn select_fee_and_collateral(
     wallet_utxos: &[WalletUtxo],
     min_fee_lovelace: u64,
 ) -> Result<(&WalletUtxo, &WalletUtxo), RegisterSpoError> {
-    let fee_utxo = wallet_utxos
-        .iter()
-        .filter(|u| u.pure_ada)
-        .max_by_key(|u| u.lovelace)
-        .ok_or_else(|| RegisterSpoError::Wallet("no clean wallet UTxOs for fees".into()))?;
-    if fee_utxo.lovelace < min_fee_lovelace {
-        return Err(RegisterSpoError::Wallet(format!(
-            "largest wallet UTxO ({} lovelace) cannot cover the new outputs plus fees \
-             (needs >= {min_fee_lovelace}) — fund the wallet or consolidate UTxOs",
-            fee_utxo.lovelace
-        )));
-    }
-    let coll_utxo = wallet_utxos
-        .iter()
-        .find(|u| u.lovelace >= 5_000_000 && u.pure_ada)
-        .ok_or_else(|| {
-            RegisterSpoError::Wallet("no pure-ADA wallet UTxO with >= 5 ADA for collateral".into())
-        })?;
+    let fee_utxo = select_fee(wallet_utxos, min_fee_lovelace).map_err(RegisterSpoError::Wallet)?;
+    // Collateral must be pure-ADA and DISTINCT from the fee input — a UTxO cannot
+    // be both a spent input and collateral.
+    let coll_utxo =
+        select_collateral(wallet_utxos, &[fee_utxo]).map_err(RegisterSpoError::Wallet)?;
     Ok((fee_utxo, coll_utxo))
 }
 
 /// Sign the whisky-built tx body with the wallet key and splice the vkey
 /// witness in (same flow as the treasury bootstrap).
 fn sign_built_tx(unsigned_hex: &str, key: &PrivateKey) -> Result<String, RegisterSpoError> {
-    let unsigned_bytes = hex::decode(unsigned_hex)
-        .map_err(|e| RegisterSpoError::Build(format!("unsigned tx hex decode: {e}")))?;
-    let mut tx: Tx = minicbor::decode(&unsigned_bytes)
-        .map_err(|e| RegisterSpoError::Build(format!("tx minicbor decode: {e}")))?;
-
-    let body_hash = tx.transaction_body.compute_hash();
-    let signature = key.sign(body_hash);
-    let pk_bytes: [u8; 32] = key.public_key().into();
-    let vkey_witness = VKeyWitness {
-        vkey: Bytes::from(pk_bytes.to_vec()),
-        signature: Bytes::from(signature.as_ref().to_vec()),
-    };
-    let mut vkeys: Vec<VKeyWitness> = tx
-        .transaction_witness_set
-        .vkeywitness
-        .take()
-        .map(|set| set.to_vec())
-        .unwrap_or_default();
-    vkeys.push(vkey_witness);
-    tx.transaction_witness_set.vkeywitness = NonEmptySet::from_vec(vkeys);
-
-    let signed = minicbor::to_vec(&tx)
-        .map_err(|e| RegisterSpoError::Build(format!("signed tx encode: {e}")))?;
-    Ok(hex::encode(signed))
+    common_sign_built_tx(unsigned_hex, key).map_err(RegisterSpoError::Build)
 }
 
 /// Build + sign the register_spo tx. Verifies the registration signatures,
@@ -489,12 +458,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
     let (new_treasury_datum, absence_proof) =
         apply_registration(&state.datum, &identity_trie, &req.bifrost_id_pk, &pool_id)?;
 
-    let testnet = req.wallet_address.starts_with("addr_test");
-    let network = if testnet {
-        pallas_addresses::Network::Testnet
-    } else {
-        pallas_addresses::Network::Mainnet
-    };
+    let network = network_from_address(req.wallet_address);
     let registry_address = req.registry_script.enterprise_address(network);
 
     let (treasury_in, treasury_out) =
@@ -643,10 +607,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
         required_signatures: vec![pub_key_hash_hex(req.key)],
         change_address: req.wallet_address.to_string(),
         signing_key: vec![],
-        network: Some(match &req.cost_models {
-            Some(cm) => whisky::Network::Custom(cm.clone()),
-            None => whisky::Network::Preprod,
-        }),
+        network: Some(whisky_network(&req.cost_models)),
         reference_inputs: vec![],
         withdrawals: vec![],
         mints: vec![MintItem::ScriptMint(ScriptMint {
@@ -750,27 +711,6 @@ pub struct RegistryBootstrapTx {
     pub script_address: String,
 }
 
-/// Conway `minFeeRefScriptCostPerByte` (preprod + mainnet). Charged on
-/// reference scripts attached to SPENT inputs — which whisky's fee estimation
-/// does not model; the builder adds it explicitly when the one-shot is forced
-/// to be a ref-script UTxO.
-const REF_SCRIPT_FEE_PER_BYTE: u64 = 15;
-
-/// The Conway tiered ref-script fee (×1.2 per started 25600-byte tier).
-fn ref_script_fee(script_size: u64) -> u64 {
-    const TIER: u64 = 25_600;
-    let mut fee = 0f64;
-    let mut multiplier = 1f64;
-    let mut remaining = script_size;
-    while remaining >= TIER {
-        fee += TIER as f64 * multiplier * REF_SCRIPT_FEE_PER_BYTE as f64;
-        remaining -= TIER;
-        multiplier *= 1.2;
-    }
-    fee += remaining as f64 * multiplier * REF_SCRIPT_FEE_PER_BYTE as f64;
-    fee.ceil() as u64
-}
-
 /// Build + sign the registry-list bootstrap: spend the one-shot outref that
 /// parameterizes `spos_registry` (it MUST be among `wallet_utxos`) and mint
 /// the `"reg-root"` anchor NFT to the registry script address with the
@@ -792,166 +732,35 @@ pub fn build_registry_bootstrap_tx(
     one_shot_ref_script_size: Option<u64>,
     cost_models: Option<Vec<Vec<i64>>>,
 ) -> Result<RegistryBootstrapTx, RegisterSpoError> {
-    let one_shot = wallet_utxos
-        .iter()
-        .find(|u| u.tx_hash == bootstrap_tx_hash && u.output_index == bootstrap_output_index)
-        .ok_or_else(|| {
-            RegisterSpoError::Wallet(format!(
-                "registry bootstrap outref {bootstrap_tx_hash}#{bootstrap_output_index} is not \
-                 an unspent wallet UTxO — the parameterized policy can only validate a tx \
-                 spending exactly that outpoint"
-            ))
-        })?;
-
-    let testnet = wallet_address.starts_with("addr_test");
-    let network = if testnet {
-        pallas_addresses::Network::Testnet
-    } else {
-        pallas_addresses::Network::Mainnet
-    };
-    let policy_id_hex = registry_script.hash_hex();
-    let script_address = registry_script.enterprise_address(network);
-
     let root_element = RegistryElement {
         data: crate::cardano::registry::ElementData::Root,
         link: None,
     };
-    let root_datum_cbor = root_element.to_cbor();
-    let root_lovelace = element_lovelace(root_datum_cbor.len());
-
-    // The one-shot doubles as the fee input when rich enough; otherwise add
-    // the richest other wallet UTxO alongside it.
-    let mut inputs: Vec<&WalletUtxo> = vec![one_shot];
-    if one_shot.lovelace < root_lovelace + 1_000_000 {
-        let extra = wallet_utxos
-            .iter()
-            .filter(|u| !(u.tx_hash == one_shot.tx_hash && u.output_index == one_shot.output_index))
-            .max_by_key(|u| u.lovelace)
-            .filter(|u| one_shot.lovelace + u.lovelace >= root_lovelace + 1_000_000)
-            .ok_or_else(|| {
-                RegisterSpoError::Wallet(format!(
-                    "wallet cannot cover the {root_lovelace}-lovelace root output plus fees — \
-                     fund the wallet"
-                ))
-            })?;
-        inputs.push(extra);
-    }
-    let coll_utxo = wallet_utxos
-        .iter()
-        .find(|u| u.lovelace >= 5_000_000 && u.pure_ada)
-        .ok_or_else(|| {
-            RegisterSpoError::Wallet("no pure-ADA wallet UTxO with >= 5 ADA for collateral".into())
-        })?;
-
-    let root_unit = format!("{policy_id_hex}{}", hex::encode(REGISTRATION_ROOT_KEY));
-    let redeemer_hex =
+    // The registry's `Bootstrap` mint redeemer is field-less (`Constr(0, [])`) —
+    // the one material difference from the ban list's, which carries the one-shot
+    // `OutputReference`. Everything else is the shared one-shot bootstrap.
+    let mint_redeemer_cbor =
         hex::encode(minicbor::to_vec(bootstrap_mint_redeemer()).expect("redeemer CBOR encode"));
 
-    let build = |fee: Option<String>| -> Result<String, RegisterSpoError> {
-        let body = TxBuilderBody {
-            inputs: inputs
-                .iter()
-                .map(|u| {
-                    TxIn::PubKeyTxIn(PubKeyTxIn {
-                        tx_in: TxInParameter {
-                            tx_hash: u.tx_hash.clone(),
-                            tx_index: u.output_index,
-                            amount: Some(vec![Asset::new_from_str(
-                                "lovelace",
-                                &u.lovelace.to_string(),
-                            )]),
-                            address: Some(wallet_address.to_string()),
-                        },
-                    })
-                })
-                .collect(),
-            outputs: vec![Output {
-                address: script_address.clone(),
-                amount: vec![
-                    Asset::new_from_str("lovelace", &root_lovelace.to_string()),
-                    Asset::new_from_str(&root_unit, "1"),
-                ],
-                datum: Some(Datum::Inline(hex::encode(root_datum_cbor.clone()))),
-                reference_script: None,
-            }],
-            collaterals: vec![PubKeyTxIn {
-                tx_in: TxInParameter {
-                    tx_hash: coll_utxo.tx_hash.clone(),
-                    tx_index: coll_utxo.output_index,
-                    amount: Some(vec![Asset::new_from_str(
-                        "lovelace",
-                        &coll_utxo.lovelace.to_string(),
-                    )]),
-                    address: Some(wallet_address.to_string()),
-                },
-            }],
-            required_signatures: vec![pub_key_hash_hex(key)],
-            change_address: wallet_address.to_string(),
-            signing_key: vec![],
-            network: Some(match &cost_models {
-                Some(cm) => whisky::Network::Custom(cm.clone()),
-                None => whisky::Network::Preprod,
-            }),
-            reference_inputs: vec![],
-            withdrawals: vec![],
-            mints: vec![MintItem::ScriptMint(ScriptMint {
-                mint: MintParameter {
-                    policy_id: policy_id_hex.clone(),
-                    asset_name: hex::encode(REGISTRATION_ROOT_KEY),
-                    amount: 1,
-                },
-                redeemer: Some(Redeemer {
-                    data: redeemer_hex.clone(),
-                    // Bootstrap checks the one-shot is spent + the root output
-                    // shape — light.
-                    ex_units: Budget {
-                        mem: 2_000_000,
-                        steps: 900_000_000,
-                    },
-                }),
-                script_source: Some(ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
-                    script_cbor: registry_script.cbor_hex(),
-                    language_version: LanguageVersion::V3,
-                })),
-            })],
-            certificates: vec![],
-            votes: vec![],
-            fee,
-            change_datum: None,
-            metadata: vec![],
-            validity_range: ValidityRange {
-                invalid_before: None,
-                invalid_hereafter: None,
-            },
-            total_collateral: None,
-            collateral_return_address: None,
-        };
-        let mut pallas = WhiskyPallas::new(None);
-        pallas.tx_builder_body = body;
-        pallas
-            .serialize_tx_body()
-            .map_err(|e| RegisterSpoError::Build(format!("whisky tx build: {e:?}")))
-    };
-
-    // Pass 1: whisky's own fee estimate. When the one-shot carries a reference
-    // script, rebuild with that fee plus the ledger's ref-script charge (and a
-    // small margin for the changed fee bytes).
-    let mut unsigned_hex = build(None)?;
-    if let Some(script_size) = one_shot_ref_script_size {
-        let tx_bytes = hex::decode(&unsigned_hex)
-            .map_err(|e| RegisterSpoError::Build(format!("unsigned tx hex decode: {e}")))?;
-        let tx: Tx = minicbor::decode(&tx_bytes)
-            .map_err(|e| RegisterSpoError::Build(format!("tx minicbor decode: {e}")))?;
-        let auto_fee = tx.transaction_body.fee;
-        let fee = auto_fee + ref_script_fee(script_size) + 4_400;
-        unsigned_hex = build(Some(fee.to_string()))?;
-    }
-    let signed_tx_hex = sign_built_tx(&unsigned_hex, key)?;
+    let built = build_oneshot_bootstrap_tx(OneShotBootstrapParams {
+        policy_script: registry_script,
+        bootstrap_tx_hash,
+        bootstrap_output_index,
+        wallet_address,
+        wallet_utxos,
+        key,
+        one_shot_ref_script_size,
+        cost_models,
+        root_datum_cbor: root_element.to_cbor(),
+        root_asset_name: REGISTRATION_ROOT_KEY,
+        mint_redeemer_cbor,
+        outref_label: "registry",
+    })?;
 
     Ok(RegistryBootstrapTx {
-        signed_tx_hex,
-        policy_id_hex,
-        script_address,
+        signed_tx_hex: built.signed_tx_hex,
+        policy_id_hex: built.policy_id_hex,
+        script_address: built.script_address,
     })
 }
 
@@ -982,7 +791,10 @@ pub fn build_ref_script_deploy_tx(
 ) -> Result<RefScriptDeployTx, RegisterSpoError> {
     // Min-UTxO scales with the serialized output, dominated by the script.
     let ref_lovelace = (script.cbor.len() as u64 + 600) * 4310;
-    let (fee_utxo, _) = select_fee_and_collateral(wallet_utxos, ref_lovelace + 1_000_000)?;
+    // A ref-script deploy executes no scripts (collaterals: vec![] below), so it
+    // needs only a fee input — not a distinct collateral UTxO.
+    let fee_utxo =
+        select_fee(wallet_utxos, ref_lovelace + 1_000_000).map_err(RegisterSpoError::Wallet)?;
 
     let body = TxBuilderBody {
         inputs: vec![TxIn::PubKeyTxIn(PubKeyTxIn {
@@ -1012,10 +824,7 @@ pub fn build_ref_script_deploy_tx(
         required_signatures: vec![pub_key_hash_hex(key)],
         change_address: wallet_address.to_string(),
         signing_key: vec![],
-        network: Some(match cost_models {
-            Some(cm) => whisky::Network::Custom(cm),
-            None => whisky::Network::Preprod,
-        }),
+        network: Some(whisky_network(&cost_models)),
         reference_inputs: vec![],
         withdrawals: vec![],
         mints: vec![],
@@ -1339,12 +1148,21 @@ mod tests {
 
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
         let wallet_addr = crate::cardano::wallet::wallet_address(&key);
-        let wallet_utxos = vec![WalletUtxo {
-            tx_hash: "aa".repeat(32),
-            output_index: 0,
-            lovelace: 50_000_000,
-            pure_ada: true,
-        }];
+        let wallet_utxos = vec![
+            WalletUtxo {
+                tx_hash: "aa".repeat(32),
+                output_index: 0,
+                lovelace: 50_000_000,
+                pure_ada: true,
+            },
+            // Distinct pure-ADA collateral — the fee input can't double as collateral.
+            WalletUtxo {
+                tx_hash: "bb".repeat(32),
+                output_index: 1,
+                lovelace: 6_000_000,
+                pure_ada: true,
+            },
+        ];
 
         let sigs = test_sigs();
         let req = RegisterSpoRequest {
@@ -1596,12 +1414,21 @@ mod tests {
         let pool_id = test_pool_id();
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
         let wallet_addr = crate::cardano::wallet::wallet_address(&key);
-        let wallet_utxos = vec![WalletUtxo {
-            tx_hash: "aa".repeat(32),
-            output_index: 0,
-            lovelace: 50_000_000,
-            pure_ada: true,
-        }];
+        let wallet_utxos = vec![
+            WalletUtxo {
+                tx_hash: "aa".repeat(32),
+                output_index: 0,
+                lovelace: 50_000_000,
+                pure_ada: true,
+            },
+            // Distinct pure-ADA collateral — the fee input can't double as collateral.
+            WalletUtxo {
+                tx_hash: "bb".repeat(32),
+                output_index: 1,
+                lovelace: 6_000_000,
+                pure_ada: true,
+            },
+        ];
         let sigs = test_sigs();
 
         // Already registered: a node with OUR pool_id exists.
@@ -1719,7 +1546,15 @@ mod tests {
             lovelace: 50_000_000,
             pure_ada: true,
         };
-        let utxos = vec![one_shot];
+        // A distinct pure-ADA UTxO for collateral — collateral cannot reuse the
+        // one-shot (a UTxO can't be both a spent input and collateral).
+        let collateral_utxo = WalletUtxo {
+            tx_hash: "cc".repeat(32),
+            output_index: 0,
+            lovelace: 6_000_000,
+            pure_ada: true,
+        };
+        let utxos = vec![one_shot, collateral_utxo];
 
         let built = build_registry_bootstrap_tx(
             &registry,
@@ -1741,6 +1576,29 @@ mod tests {
                 .inputs
                 .iter()
                 .any(|i| i.transaction_id.as_slice() == [0xbb; 32] && i.index == 3)
+        );
+        // Collateral must be the distinct UTxO (cc..#0), never the one-shot —
+        // disjoint from the spending inputs (the ledger rejects an overlap).
+        let collateral = tx
+            .transaction_body
+            .collateral
+            .as_ref()
+            .expect("collateral present");
+        for c in collateral.iter() {
+            let c_op = (c.transaction_id.as_slice().to_vec(), c.index);
+            assert!(
+                !tx.transaction_body
+                    .inputs
+                    .iter()
+                    .any(|i| (i.transaction_id.as_slice().to_vec(), i.index) == c_op),
+                "collateral must not also be a spending input"
+            );
+        }
+        assert!(
+            collateral
+                .iter()
+                .any(|c| c.transaction_id.as_slice() == [0xcc; 32] && c.index == 0),
+            "collateral must be the distinct cc..#0 UTxO"
         );
         // Mint: exactly ("reg-root", +1) under the registry policy.
         let mint = tx.transaction_body.mint.as_ref().expect("mint present");
