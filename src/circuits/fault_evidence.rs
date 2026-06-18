@@ -911,10 +911,11 @@ mod tests {
     }
 
     fn fault_verifier_script() -> ParameterizedScript {
+        // Parameterized by a dummy spos_registry hash (the registry binding is
+        // verified on-chain, not by this builder).
         let code = include_str!("../../tests/fixtures/fault_verifier_code.txt");
-        let cbor = hex::decode(code.trim()).unwrap();
-        let hash = blueprint::script_hash_v3(&cbor);
-        ParameterizedScript { cbor, hash }
+        blueprint::apply_params(code.trim(), &[crate::cardano::plutus::bytes(&[0x11u8; 28])])
+            .unwrap()
     }
 
     fn wallet_utxos() -> Vec<WalletUtxo> {
@@ -977,6 +978,7 @@ mod tests {
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
         let addr = wallet_address(&key);
         let utxos = wallet_utxos();
+        let reg_tx = "cc".repeat(32);
         let built = build_fault_proof_mint_tx(&FaultProofMintRequest {
             fault_verifier_script: &script,
             fault: &datum,
@@ -990,6 +992,7 @@ mod tests {
                 signature_a: &ev.signature_a,
                 payload_b: &ev.payload_b,
                 signature_b: &ev.signature_b,
+                registration_ref: (&reg_tx, 0),
             }),
         })
         .expect("equivocation mint tx builds");

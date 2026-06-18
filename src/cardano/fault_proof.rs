@@ -204,16 +204,20 @@ pub fn burn_proof_redeemer() -> PlutusData {
     constr(1, vec![])
 }
 
-/// `EquivocationProof { input_ref, bifrost_id_pk, fault, payload_a, signature_a,
-/// payload_b, signature_b }` = `Constr(2, [...])`. The `fault_verifier`
-/// EquivocationProof branch (technical_documentation §9.2) verifies the two
-/// BIP-340 signatures and that `fault.evidence_hash` commits to the two
-/// payloads. Field order MUST match `bifrost/types/fault_verifier`.
+/// `EquivocationProof { input_ref, registration_ref_input_index, bifrost_id_pk,
+/// fault, payload_a, signature_a, payload_b, signature_b }` = `Constr(2, [...])`.
+/// The `fault_verifier` EquivocationProof branch (technical_documentation §9.2)
+/// verifies the two BIP-340 signatures, that `fault.evidence_hash` commits to the
+/// two payloads, and that `bifrost_id_pk` is the key registered for
+/// `accused_pool_id` in the `spos_registry` node at
+/// `registration_ref_input_index` in `reference_inputs`. Field order MUST match
+/// `bifrost/types/fault_verifier`.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn equivocation_proof_redeemer(
     input_ref_tx_id: &[u8],
     input_ref_index: u32,
+    registration_ref_input_index: u32,
     bifrost_id_pk: &[u8],
     fault: &FaultProofDatum,
     payload_a: &[u8],
@@ -225,6 +229,7 @@ pub fn equivocation_proof_redeemer(
         2,
         vec![
             output_reference(input_ref_tx_id, input_ref_index),
+            int_from_u64(u64::from(registration_ref_input_index)),
             bytes(bifrost_id_pk),
             fault.to_plutus_data(),
             bytes(payload_a),
@@ -289,14 +294,19 @@ pub struct EquivocationWitness<'a> {
     pub signature_a: &'a [u8],
     pub payload_b: &'a [u8],
     pub signature_b: &'a [u8],
+    /// `(tx_hash, output_index)` of the accused's `spos_registry` node UTxO —
+    /// added as a read-only reference input so the validator can read the
+    /// registered `bifrost_id_pk` and bind it to `accused_pool_id`.
+    pub registration_ref: (&'a str, u32),
 }
 
 /// Everything [`build_fault_proof_mint_tx`] needs. UTxOs are caller-fetched so
 /// the builder stays pure/testable; `wallet_utxos` pays the fee (and supplies
 /// the anti-replay nonce input) plus collateral.
 pub struct FaultProofMintRequest<'a> {
-    /// The parameterless `fault_verifier` minting policy (cbor + hash), loaded
-    /// via [`crate::cardano::blueprint::fault_verifier_script`].
+    /// The `fault_verifier` minting policy (cbor + hash), parameterized by the
+    /// `spos_registry` policy id via
+    /// [`crate::cardano::blueprint::fault_verifier_script`].
     pub fault_verifier_script: &'a ParameterizedScript,
     /// The fully-formed datum to park on-chain. Its `accused_pool_id` (28B) and
     /// `evidence_hash` (32B) determine the minted token name; `namespace_hash`
@@ -426,23 +436,39 @@ pub fn build_fault_proof_mint_tx(
     // InvalidPayload → PublishProof (the permissive mock); Equivocation →
     // EquivocationProof (the real §9.2 double-signature check), which needs the
     // two signed payloads.
-    let redeemer = match (req.fault.kind, &req.equivocation) {
-        (FaultKind::InvalidPayload, None) => publish_proof_redeemer(
-            &nonce_tx_id,
-            fee_utxo.output_index,
-            &req.fault.accused_pool_id,
-            req.fault,
+    let (redeemer, reference_inputs) = match (req.fault.kind, &req.equivocation) {
+        (FaultKind::InvalidPayload, None) => (
+            publish_proof_redeemer(
+                &nonce_tx_id,
+                fee_utxo.output_index,
+                &req.fault.accused_pool_id,
+                req.fault,
+            ),
+            Vec::new(),
         ),
-        (FaultKind::Equivocation, Some(w)) => equivocation_proof_redeemer(
-            &nonce_tx_id,
-            fee_utxo.output_index,
-            w.bifrost_id_pk,
-            req.fault,
-            w.payload_a,
-            w.signature_a,
-            w.payload_b,
-            w.signature_b,
-        ),
+        (FaultKind::Equivocation, Some(w)) => {
+            // The accused's registration node is the sole reference input, so its
+            // index is 0 (no other ref inputs; the fault_verifier script is
+            // provided inline, not as a ref script).
+            let registration_ref_input_index = 0;
+            let redeemer = equivocation_proof_redeemer(
+                &nonce_tx_id,
+                fee_utxo.output_index,
+                registration_ref_input_index,
+                w.bifrost_id_pk,
+                req.fault,
+                w.payload_a,
+                w.signature_a,
+                w.payload_b,
+                w.signature_b,
+            );
+            let refs = vec![RefTxIn {
+                tx_hash: w.registration_ref.0.to_string(),
+                tx_index: w.registration_ref.1,
+                script_size: None,
+            }];
+            (redeemer, refs)
+        }
         (FaultKind::Equivocation, None) => {
             return Err(FaultProofMintError::MissingEquivocationWitness);
         }
@@ -491,7 +517,7 @@ pub fn build_fault_proof_mint_tx(
         change_address: req.wallet_address.to_string(),
         signing_key: vec![],
         network: Some(whisky_network(&req.cost_models)),
-        reference_inputs: vec![],
+        reference_inputs,
         withdrawals: vec![],
         mints: vec![MintItem::ScriptMint(ScriptMint {
             mint: MintParameter {
@@ -628,12 +654,11 @@ mod tests {
     // ---- FaultProof mint tx builder ----------------------------------------
 
     fn fault_verifier_script() -> ParameterizedScript {
-        // The real upstream compiledCode (parameterless); its V3 hash is the
-        // FaultProof policy id — see blueprint::fault_verifier_script.
+        // Parameterized by a dummy spos_registry hash. The registry binding is
+        // verified on-chain (aiken), not by this tx builder, so any 28-byte
+        // value gives a representative policy id.
         let code = include_str!("../../tests/fixtures/fault_verifier_code.txt");
-        let cbor = hex::decode(code.trim()).unwrap();
-        let hash = blueprint::script_hash_v3(&cbor);
-        ParameterizedScript { cbor, hash }
+        blueprint::apply_params(code.trim(), &[bytes(&[0x11u8; 28])]).unwrap()
     }
 
     /// Two pure-ADA UTxOs: the richer (`aa…:0`) funds fees + the nonce, the
@@ -707,6 +732,7 @@ mod tests {
                 signature_a: w.signature_a,
                 payload_b: w.payload_b,
                 signature_b: w.signature_b,
+                registration_ref: w.registration_ref,
             }),
         })
     }
@@ -874,12 +900,14 @@ mod tests {
             ..datum()
         };
         let (pk, pa, sa, pb, sb) = equiv_witness();
+        let reg_tx = "cc".repeat(32);
         let w = EquivocationWitness {
             bifrost_id_pk: &pk,
             payload_a: &pa,
             signature_a: &sa,
             payload_b: &pb,
             signature_b: &sb,
+            registration_ref: (&reg_tx, 0),
         };
         let built = build_equivocation(&fault, &w).expect("equivocation mint builds");
         let tx: Tx = minicbor::decode(&hex::decode(&built.signed_tx_hex).unwrap()).unwrap();
@@ -889,24 +917,26 @@ mod tests {
     }
 
     #[test]
-    fn equivocation_redeemer_is_constr2_with_seven_fields() {
+    fn equivocation_redeemer_is_constr2_with_eight_fields() {
         let (pk, pa, sa, pb, sb) = equiv_witness();
-        let r = equivocation_proof_redeemer(&[0xCD; 32], 5, &pk, &datum(), &pa, &sa, &pb, &sb);
+        // input_ref_index = 5, registration_ref_input_index = 7.
+        let r = equivocation_proof_redeemer(&[0xCD; 32], 5, 7, &pk, &datum(), &pa, &sa, &pb, &sb);
         let fields = plutus::constr_fields(&r, 2).unwrap();
-        assert_eq!(fields.len(), 7);
+        assert_eq!(fields.len(), 8);
         // field 0 = OutputReference Constr(0, [tx_id(32B), index]).
         let (oref_c, oref_f) = plutus::as_constr(&fields[0]).unwrap();
         assert_eq!(oref_c, 0);
         assert_eq!(plutus::field_int(oref_f, 1).unwrap(), 5);
-        assert_eq!(plutus::field_bytes(fields, 1).unwrap(), pk); // bifrost_id_pk
+        assert_eq!(plutus::field_int(fields, 1).unwrap(), 7); // registration_ref_input_index
+        assert_eq!(plutus::field_bytes(fields, 2).unwrap(), pk); // bifrost_id_pk
         assert_eq!(
-            FaultProofDatum::from_plutus_data(&fields[2]).unwrap(),
+            FaultProofDatum::from_plutus_data(&fields[3]).unwrap(),
             datum()
         );
-        assert_eq!(plutus::field_bytes(fields, 3).unwrap(), pa);
-        assert_eq!(plutus::field_bytes(fields, 4).unwrap(), sa);
-        assert_eq!(plutus::field_bytes(fields, 5).unwrap(), pb);
-        assert_eq!(plutus::field_bytes(fields, 6).unwrap(), sb);
+        assert_eq!(plutus::field_bytes(fields, 4).unwrap(), pa);
+        assert_eq!(plutus::field_bytes(fields, 5).unwrap(), sa);
+        assert_eq!(plutus::field_bytes(fields, 6).unwrap(), pb);
+        assert_eq!(plutus::field_bytes(fields, 7).unwrap(), sb);
     }
 
     #[test]
@@ -924,12 +954,14 @@ mod tests {
     #[test]
     fn invalid_payload_with_witness_is_rejected() {
         let (pk, pa, sa, pb, sb) = equiv_witness();
+        let reg_tx = "cc".repeat(32);
         let w = EquivocationWitness {
             bifrost_id_pk: &pk,
             payload_a: &pa,
             signature_a: &sa,
             payload_b: &pb,
             signature_b: &sb,
+            registration_ref: (&reg_tx, 0),
         };
         // datum() is InvalidPayload — a witness must not be supplied.
         assert!(matches!(

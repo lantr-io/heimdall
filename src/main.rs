@@ -337,6 +337,11 @@ enum Commands {
         /// Path to the bifrost Aiken blueprint (plutus.json).
         #[arg(long)]
         blueprint: String,
+        /// The spos_registry one-shot bootstrap outref (<tx_hash>:<index>): the
+        /// fault_verifier policy is parameterized by the registry policy id (the
+        /// EquivocationProof branch references registration nodes).
+        #[arg(long)]
+        registry_bootstrap: String,
         /// Derive `kind` + `namespace_hash` + `evidence_hash` from a captured
         /// DKG-evidence JSON file (WI-019) instead of passing opaque hashes.
         /// When set, --kind/--accused-pool-id/--namespace-hash/--evidence-hash
@@ -696,6 +701,7 @@ fn main() {
         Commands::FaultProofMint {
             config,
             blueprint,
+            registry_bootstrap,
             evidence_file,
             kind,
             accused_pool_id,
@@ -706,6 +712,7 @@ fn main() {
             let cfg = load_config(config.as_deref());
             let args = FaultProofMintArgs {
                 blueprint,
+                registry_bootstrap,
                 evidence_file,
                 kind,
                 accused_pool_id,
@@ -1708,6 +1715,7 @@ struct ApplyBanArgs {
 /// fault-proof-mint CLI inputs.
 struct FaultProofMintArgs {
     blueprint: String,
+    registry_bootstrap: String,
     evidence_file: Option<String>,
     kind: Option<String>,
     accused_pool_id: Option<String>,
@@ -2261,7 +2269,7 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let fault = fault_verifier_script(&blueprint_json)
+    let fault = fault_verifier_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
 
     // The ban policy is config-pinned (ban bootstrap + fault-policy set + schedule).
@@ -2431,7 +2439,7 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
 /// `apply-ban` consumes + burns it.
 fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::fault_verifier_script;
+    use heimdall::cardano::blueprint::{fault_verifier_script, spos_registry_script};
     use heimdall::cardano::fault_proof::{
         EquivocationWitness, FaultKind, FaultProofDatum, FaultProofMintRequest,
         build_fault_proof_mint_tx,
@@ -2445,7 +2453,12 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
 
     let blueprint_json = std::fs::read_to_string(&args.blueprint)
         .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
-    let fault_vscript = fault_verifier_script(&blueprint_json)
+    // The fault_verifier policy is parameterized by the spos_registry policy id
+    // (its EquivocationProof branch references registration nodes).
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let fault_vscript = fault_verifier_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
 
     // Two ways to supply the datum fields: derive them from a captured-evidence
@@ -2520,6 +2533,32 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
 
+    // For Equivocation, locate the accused's spos_registry node — added as a
+    // read-only reference input so the validator binds bifrost_id_pk to the pool.
+    let registration_ref: Option<(String, u32)> = if derived.equivocation.is_some() {
+        let registry_addr = registry.enterprise_address(network_of(&wallet_addr));
+        let registry_raw = rt
+            .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
+            .map_err(|e| format!("registry UTxO query: {e}"))?;
+        let reg_unit = format!(
+            "{}{}",
+            registry.hash_hex(),
+            hex::encode(&derived.accused_pool_id)
+        );
+        let node = registry_raw
+            .iter()
+            .find(|u| u.amount.iter().any(|a| a.unit == reg_unit))
+            .ok_or_else(|| {
+                format!(
+                    "accused pool {} is not in the on-chain registry — cannot reference it",
+                    hex::encode(&derived.accused_pool_id)
+                )
+            })?;
+        Some((node.tx_hash.clone(), node.output_index))
+    } else {
+        None
+    };
+
     let req = FaultProofMintRequest {
         fault_verifier_script: &fault_vscript,
         fault: &fault,
@@ -2533,6 +2572,12 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
             signature_a: &e.signature_a,
             payload_b: &e.payload_b,
             signature_b: &e.signature_b,
+            registration_ref: {
+                let (h, i) = registration_ref
+                    .as_ref()
+                    .expect("equivocation => registration_ref set");
+                (h.as_str(), *i)
+            },
         }),
     };
     let built =
