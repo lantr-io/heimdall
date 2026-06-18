@@ -1381,7 +1381,7 @@ fn submit_tx_blockfrost(
 /// Thin alias over the shared [`crate::cardano::tx_common::network_from_address`]
 /// (the single source of truth) for the on-chain command handlers.
 fn network_of(addr: &str) -> pallas_addresses::Network {
-    crate::cardano::tx_common::network_from_address(addr)
+    heimdall::cardano::tx_common::network_from_address(addr)
 }
 
 /// Byte size of a reference script attached to a one-shot bootstrap outref, if
@@ -1393,11 +1393,12 @@ fn fetch_one_shot_ref_script_size(
     rt: &tokio::runtime::Runtime,
     base_url: &str,
     pid: &str,
-    raw: &[bf_http::BfUtxo],
+    raw: &[heimdall::cardano::bf_http::BfUtxo],
     tx_hash_hex: &str,
     index: u32,
     label: &str,
 ) -> Result<Option<u64>, String> {
+    use heimdall::cardano::bf_http;
     let Some(h) = raw
         .iter()
         .find(|u| u.tx_hash == tx_hash_hex && u.output_index == index)
