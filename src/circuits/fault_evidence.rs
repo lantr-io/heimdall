@@ -759,7 +759,9 @@ mod tests {
     use super::*;
     use crate::cardano::ban_list::fault_token_name;
     use crate::cardano::blueprint::{self, ParameterizedScript};
-    use crate::cardano::fault_proof::{FaultProofMintRequest, build_fault_proof_mint_tx};
+    use crate::cardano::fault_proof::{
+        EquivocationWitness, FaultProofMintRequest, build_fault_proof_mint_tx,
+    };
     use crate::cardano::publish::WalletUtxo;
     use crate::cardano::wallet::{derive_payment_key, wallet_address};
     use crate::circuits::dkg_fault::{axiom_scalar_from_be_bytes, be_bytes_from_fq};
@@ -949,12 +951,51 @@ mod tests {
             wallet_utxos: &utxos,
             key: &key,
             cost_models: None,
+            equivocation: None,
         })
         .expect("mint tx builds from derived evidence_hash");
         assert_eq!(
             built.token_name,
             fault_token_name(&accused_pool_id, &evidence_hash),
             "token name must bind the derived evidence_hash"
+        );
+        assert!(!built.signed_tx_hex.is_empty());
+    }
+
+    /// Equivocation mints via the `EquivocationProof` redeemer, carrying the
+    /// two signed payloads from the evidence.
+    fn assert_equivocation_mints(ev: &EquivocationEvidence) {
+        let evidence_hash = ev.evidence_hash();
+        let accused_pool_id = ev.accused_pool_id.to_vec();
+        let datum = fault_proof_datum(
+            FaultKind::Equivocation,
+            accused_pool_id.clone(),
+            ev.namespace_hash(),
+            evidence_hash,
+        );
+        let script = fault_verifier_script();
+        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
+        let addr = wallet_address(&key);
+        let utxos = wallet_utxos();
+        let built = build_fault_proof_mint_tx(&FaultProofMintRequest {
+            fault_verifier_script: &script,
+            fault: &datum,
+            wallet_address: &addr,
+            wallet_utxos: &utxos,
+            key: &key,
+            cost_models: None,
+            equivocation: Some(EquivocationWitness {
+                bifrost_id_pk: &ev.bifrost_id_pk,
+                payload_a: &ev.payload_a,
+                signature_a: &ev.signature_a,
+                payload_b: &ev.payload_b,
+                signature_b: &ev.signature_b,
+            }),
+        })
+        .expect("equivocation mint tx builds");
+        assert_eq!(
+            built.token_name,
+            fault_token_name(&accused_pool_id, &evidence_hash)
         );
         assert!(!built.signed_tx_hex.is_empty());
     }
@@ -1129,8 +1170,7 @@ mod tests {
 
     #[test]
     fn equivocation_evidence_hash_mints_fault_proof() {
-        let ev = equivocation_evidence();
-        assert_mints_with(ev.evidence_hash(), FaultKind::Equivocation);
+        assert_equivocation_mints(&equivocation_evidence());
     }
 
     // ---- the full ZK path (slow: k=18/k=22 keygen + prove) -----------------

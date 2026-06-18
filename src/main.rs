@@ -1814,14 +1814,27 @@ struct EvidenceFile {
     signature_b: Option<String>,
 }
 
-/// `(kind, accused_pool_id, namespace_hash, evidence_hash)` derived from
-/// captured evidence — the four datum fields `build_fault_proof_mint_tx` needs.
-type DerivedFault = (
-    heimdall::cardano::fault_proof::FaultKind,
-    Vec<u8>,
-    [u8; 32],
-    [u8; 32],
-);
+/// The datum fields `build_fault_proof_mint_tx` needs, derived from captured
+/// evidence, plus the on-chain `EquivocationProof` witness when applicable.
+#[derive(Debug)]
+struct DerivedFault {
+    kind: heimdall::cardano::fault_proof::FaultKind,
+    accused_pool_id: Vec<u8>,
+    namespace_hash: [u8; 32],
+    evidence_hash: [u8; 32],
+    /// `Some` iff `kind == Equivocation` — the two signed payloads the
+    /// `fault_verifier` EquivocationProof branch verifies.
+    equivocation: Option<DerivedEquivocation>,
+}
+
+#[derive(Debug)]
+struct DerivedEquivocation {
+    bifrost_id_pk: [u8; 32],
+    payload_a: Vec<u8>,
+    signature_a: [u8; 64],
+    payload_b: Vec<u8>,
+    signature_b: [u8; 64],
+}
 
 fn req_field<'a>(v: &'a Option<String>, what: &str) -> Result<&'a str, String> {
     v.as_deref().ok_or(format!("evidence: missing `{what}`"))
@@ -1870,12 +1883,13 @@ impl EvidenceFile {
                 if !ev.is_fault().map_err(to_err)? {
                     return Err("round1 evidence does not encode a fault (PoK verifies)".into());
                 }
-                Ok((
-                    FaultKind::InvalidPayload,
-                    accused_pool_id.to_vec(),
-                    ev.namespace_hash(),
-                    ev.evidence_hash().map_err(to_err)?,
-                ))
+                Ok(DerivedFault {
+                    kind: FaultKind::InvalidPayload,
+                    accused_pool_id: accused_pool_id.to_vec(),
+                    namespace_hash: ev.namespace_hash(),
+                    evidence_hash: ev.evidence_hash().map_err(to_err)?,
+                    equivocation: None,
+                })
             }
             "invalid-payload-round2" => {
                 let ev = fe::Round2ShareFaultEvidence {
@@ -1906,12 +1920,13 @@ impl EvidenceFile {
                 if !ev.is_fault().map_err(to_err)? {
                     return Err("round2 evidence does not encode a fault (share verifies)".into());
                 }
-                Ok((
-                    FaultKind::InvalidPayload,
-                    accused_pool_id.to_vec(),
-                    ev.namespace_hash(),
-                    fe::round2_evidence_hash_dyn(&ev).map_err(to_err)?,
-                ))
+                Ok(DerivedFault {
+                    kind: FaultKind::InvalidPayload,
+                    accused_pool_id: accused_pool_id.to_vec(),
+                    namespace_hash: ev.namespace_hash(),
+                    evidence_hash: fe::round2_evidence_hash_dyn(&ev).map_err(to_err)?,
+                    equivocation: None,
+                })
             }
             "equivocation" => {
                 let phase = match self.round.as_deref() {
@@ -1942,12 +1957,19 @@ impl EvidenceFile {
                     )?,
                 };
                 ev.verify().map_err(to_err)?;
-                Ok((
-                    FaultKind::Equivocation,
-                    accused_pool_id.to_vec(),
-                    ev.namespace_hash(),
-                    ev.evidence_hash(),
-                ))
+                Ok(DerivedFault {
+                    kind: FaultKind::Equivocation,
+                    accused_pool_id: accused_pool_id.to_vec(),
+                    namespace_hash: ev.namespace_hash(),
+                    evidence_hash: ev.evidence_hash(),
+                    equivocation: Some(DerivedEquivocation {
+                        bifrost_id_pk: ev.bifrost_id_pk,
+                        payload_a: ev.payload_a,
+                        signature_a: ev.signature_a,
+                        payload_b: ev.payload_b,
+                        signature_b: ev.signature_b,
+                    }),
+                })
             }
             other => Err(format!(
                 "evidence `kind` must be invalid-payload-round1|invalid-payload-round2|\
@@ -2411,7 +2433,8 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::fault_verifier_script;
     use heimdall::cardano::fault_proof::{
-        FaultKind, FaultProofDatum, FaultProofMintRequest, build_fault_proof_mint_tx,
+        EquivocationWitness, FaultKind, FaultProofDatum, FaultProofMintRequest,
+        build_fault_proof_mint_tx,
     };
     use heimdall::cardano::publish::WalletUtxo;
     use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
@@ -2426,48 +2449,59 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
 
     // Two ways to supply the datum fields: derive them from a captured-evidence
-    // JSON file (WI-019 — real evidence_hash), or pass them as opaque hex.
-    let (kind, accused_pool_id, namespace_hash, evidence_hash) =
-        if let Some(path) = &args.evidence_file {
-            let json = std::fs::read_to_string(path)
-                .map_err(|e| format!("read evidence file {path}: {e}"))?;
-            let ev: EvidenceFile = serde_json::from_str(&json)
-                .map_err(|e| format!("parse evidence file {path}: {e}"))?;
-            let derived = ev.derive()?;
-            println!("derived from evidence ({}):", ev.kind);
-            println!("  evidence_hash:   {}", hex::encode(derived.3));
-            println!("  namespace_hash:  {}", hex::encode(derived.2));
-            derived
-        } else {
-            let kind = match args.kind.as_deref() {
-                Some("invalid-payload") => FaultKind::InvalidPayload,
-                Some("equivocation") => FaultKind::Equivocation,
-                other => {
-                    return Err(format!(
-                        "--kind must be `invalid-payload` or `equivocation` (or pass \
-                         --evidence-file), got {other:?}"
-                    ));
-                }
-            };
-            let pool: [u8; 28] = parse_hex_n(
-                req_arg(&args.accused_pool_id, "--accused-pool-id")?,
-                "--accused-pool-id",
-            )?;
-            let ns: [u8; 32] = parse_hex_n(
-                req_arg(&args.namespace_hash, "--namespace-hash")?,
-                "--namespace-hash",
-            )?;
-            let ev: [u8; 32] = parse_hex_n(
-                req_arg(&args.evidence_hash, "--evidence-hash")?,
-                "--evidence-hash",
-            )?;
-            (kind, pool.to_vec(), ns, ev)
+    // JSON file (WI-019 — real evidence_hash + equivocation witness), or pass
+    // them as opaque hex (InvalidPayload only).
+    let derived: DerivedFault = if let Some(path) = &args.evidence_file {
+        let json =
+            std::fs::read_to_string(path).map_err(|e| format!("read evidence file {path}: {e}"))?;
+        let ev: EvidenceFile =
+            serde_json::from_str(&json).map_err(|e| format!("parse evidence file {path}: {e}"))?;
+        let derived = ev.derive()?;
+        println!("derived from evidence ({}):", ev.kind);
+        println!("  evidence_hash:   {}", hex::encode(derived.evidence_hash));
+        println!("  namespace_hash:  {}", hex::encode(derived.namespace_hash));
+        derived
+    } else {
+        let kind = match args.kind.as_deref() {
+            Some("invalid-payload") => FaultKind::InvalidPayload,
+            Some("equivocation") => {
+                return Err(
+                    "equivocation faults require --evidence-file (the two signed payloads); \
+                     the opaque-hash path only supports invalid-payload"
+                        .into(),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "--kind must be `invalid-payload` (or pass --evidence-file), got {other:?}"
+                ));
+            }
         };
+        let pool: [u8; 28] = parse_hex_n(
+            req_arg(&args.accused_pool_id, "--accused-pool-id")?,
+            "--accused-pool-id",
+        )?;
+        let ns: [u8; 32] = parse_hex_n(
+            req_arg(&args.namespace_hash, "--namespace-hash")?,
+            "--namespace-hash",
+        )?;
+        let ev: [u8; 32] = parse_hex_n(
+            req_arg(&args.evidence_hash, "--evidence-hash")?,
+            "--evidence-hash",
+        )?;
+        DerivedFault {
+            kind,
+            accused_pool_id: pool.to_vec(),
+            namespace_hash: ns,
+            evidence_hash: ev,
+            equivocation: None,
+        }
+    };
     let fault = FaultProofDatum {
-        kind,
-        accused_pool_id,
-        namespace_hash: namespace_hash.to_vec(),
-        evidence_hash: evidence_hash.to_vec(),
+        kind: derived.kind,
+        accused_pool_id: derived.accused_pool_id.clone(),
+        namespace_hash: derived.namespace_hash.to_vec(),
+        evidence_hash: derived.evidence_hash.to_vec(),
     };
 
     let pid = cfg
@@ -2493,6 +2527,13 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
         wallet_utxos: &wallet_utxos,
         key: &key,
         cost_models: Some(cost_models),
+        equivocation: derived.equivocation.as_ref().map(|e| EquivocationWitness {
+            bifrost_id_pk: &e.bifrost_id_pk,
+            payload_a: &e.payload_a,
+            signature_a: &e.signature_a,
+            payload_b: &e.payload_b,
+            signature_b: &e.signature_b,
+        }),
     };
     let built =
         build_fault_proof_mint_tx(&req).map_err(|e| format!("build fault-proof mint tx: {e}"))?;
@@ -3267,11 +3308,12 @@ mod tests {
     fn evidence_file_round1_derives_library_hash() {
         let ev = signed_round1(true);
         let parsed: EvidenceFile = serde_json::from_value(round1_json(&ev)).unwrap();
-        let (kind, pool, ns, hash) = parsed.derive().unwrap();
-        assert_eq!(kind, FaultKind::InvalidPayload);
-        assert_eq!(pool, ev.accused_pool_id.to_vec());
-        assert_eq!(hash, ev.evidence_hash().unwrap());
-        assert_eq!(ns, ev.namespace_hash());
+        let d = parsed.derive().unwrap();
+        assert_eq!(d.kind, FaultKind::InvalidPayload);
+        assert_eq!(d.accused_pool_id, ev.accused_pool_id.to_vec());
+        assert_eq!(d.evidence_hash, ev.evidence_hash().unwrap());
+        assert_eq!(d.namespace_hash, ev.namespace_hash());
+        assert!(d.equivocation.is_none());
     }
 
     /// A payload that actually verifies is rejected — no FaultProof for honest
@@ -3347,11 +3389,18 @@ mod tests {
             "signature_b": hex::encode(ev.signature_b),
         });
         let parsed: EvidenceFile = serde_json::from_value(json).unwrap();
-        let (kind, pool, ns, hash) = parsed.derive().unwrap();
-        assert_eq!(kind, FaultKind::Equivocation);
-        assert_eq!(pool, ev.accused_pool_id.to_vec());
-        assert_eq!(hash, ev.evidence_hash());
-        assert_eq!(ns, ev.namespace_hash());
+        let d = parsed.derive().unwrap();
+        assert_eq!(d.kind, FaultKind::Equivocation);
+        assert_eq!(d.accused_pool_id, ev.accused_pool_id.to_vec());
+        assert_eq!(d.evidence_hash, ev.evidence_hash());
+        assert_eq!(d.namespace_hash, ev.namespace_hash());
+        // the equivocation witness is carried through to the mint redeemer
+        let w = d.equivocation.expect("equivocation witness");
+        assert_eq!(w.bifrost_id_pk, ev.bifrost_id_pk);
+        assert_eq!(w.payload_a, ev.payload_a);
+        assert_eq!(w.signature_a, ev.signature_a);
+        assert_eq!(w.payload_b, ev.payload_b);
+        assert_eq!(w.signature_b, ev.signature_b);
     }
 
     #[test]
