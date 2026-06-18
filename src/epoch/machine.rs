@@ -74,16 +74,10 @@ pub async fn run_epoch_loop(
             EpochPhase::EpochStart { epoch } => epoch_start_phase(&chain, epoch).await?,
 
             EpochPhase::Dkg {
-                epoch,
                 round,
-                roster,
+                ctx,
                 collected,
-            } => {
-                dkg_phase(
-                    &peers, &clock, &rng, config, epoch, round, roster, collected,
-                )
-                .await?
-            }
+            } => dkg_phase(&peers, &clock, &rng, config, round, ctx, collected).await?,
 
             EpochPhase::PublishKeys {
                 epoch,
@@ -162,11 +156,13 @@ async fn idle_phase(chain: &Arc<dyn CardanoChain>) -> EpochResult<EpochPhase> {
 }
 
 async fn epoch_start_phase(chain: &Arc<dyn CardanoChain>, epoch: u64) -> EpochResult<EpochPhase> {
-    let roster = chain.query_roster(epoch).await?;
+    // Build the stake-aware DKG context for attempt 0. A failed attempt reruns
+    // over a reduced candidate set with a bumped attempt inside `dkg_phase`
+    // (DkgContext::reduced_to), so the chain is queried once at the boundary.
+    let ctx = chain.query_dkg_context(epoch, 0).await?;
     Ok(EpochPhase::Dkg {
-        epoch,
         round: DkgRound::Round1,
-        roster,
+        ctx,
         collected: DkgCollected::default(),
     })
 }
@@ -542,8 +538,8 @@ fn frost_vk_to_xonly(vk: &frost::VerifyingKey) -> EpochResult<UntweakedPublicKey
 fn current_epoch(phase: &EpochPhase) -> u64 {
     match phase {
         EpochPhase::Idle => 0,
+        EpochPhase::Dkg { ctx, .. } => ctx.epoch,
         EpochPhase::EpochStart { epoch }
-        | EpochPhase::Dkg { epoch, .. }
         | EpochPhase::PublishKeys { epoch, .. }
         | EpochPhase::CollectPegins { epoch, .. }
         | EpochPhase::BuildTm { epoch, .. }

@@ -13,6 +13,7 @@ use frost::Identifier;
 use frost_secp256k1_tr as frost;
 use serde::{Deserialize, Serialize};
 
+use crate::cardano::dkg_roster::DkgContext;
 use crate::cardano::pegin_datum::ParsedPegIn;
 
 // ---------------------------------------------------------------------------
@@ -234,10 +235,15 @@ pub enum EpochPhase {
     EpochStart {
         epoch: u64,
     },
+    /// The DKG ceremony for one `(epoch, attempt)`. Carries the stake-aware
+    /// [`DkgContext`] (not just a [`Roster`]) because the abort/rerun gate is
+    /// stake-weighted: `ctx.epoch`/`ctx.attempt` namespace the payloads,
+    /// `ctx.to_roster()` drives the FROST parameters, and `ctx.quorum_ok` /
+    /// `ctx.reduced_to` decide whether an incomplete round reruns over a
+    /// reduced candidate set or aborts the epoch.
     Dkg {
-        epoch: u64,
         round: DkgRound,
-        roster: Roster,
+        ctx: DkgContext,
         collected: DkgCollected,
     },
     PublishKeys {
@@ -387,7 +393,22 @@ pub enum EpochError {
     // TODO: track which peers failed to deliver so the cascade / slashing
     // path can identify the misbehaving party. Today `PollTimeout` only
     // carries aggregate counts.
-    PollTimeout { got: usize, need: usize },
+    PollTimeout {
+        got: usize,
+        need: usize,
+    },
+    /// A DKG attempt could not complete (a peer was absent or provably faulty,
+    /// so the qualified set can't run `dkg_part2`/`part3`) AND the surviving
+    /// subset fails the quorum gate (`|Q| < t` or `stake(Q) <= 51%`) or is too
+    /// small to rerun. Fatal for this epoch's DKG — the caller backs off to the
+    /// next epoch boundary rather than killing the process.
+    DkgAborted {
+        epoch: u64,
+        attempt: u32,
+        qualified: usize,
+        eligible: usize,
+        reason: String,
+    },
     Peer(String),
     Chain(String),
     Transition(String),
@@ -402,6 +423,17 @@ impl std::fmt::Display for EpochError {
             Self::PollTimeout { got, need } => {
                 write!(f, "peer poll timed out: got {got}, need {need}")
             }
+            Self::DkgAborted {
+                epoch,
+                attempt,
+                qualified,
+                eligible,
+                reason,
+            } => write!(
+                f,
+                "DKG aborted at epoch {epoch} attempt {attempt}: {qualified}/{eligible} qualified \
+                 ({reason})"
+            ),
             Self::Peer(s) => write!(f, "peer network: {s}"),
             Self::Chain(s) => write!(f, "chain: {s}"),
             Self::Transition(s) => write!(f, "invalid phase transition: {s}"),

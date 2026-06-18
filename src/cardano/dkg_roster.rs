@@ -371,6 +371,57 @@ impl DkgContext {
             && stake * 100 > u128::from(self.total_stake) * SECURITY_THRESHOLD_PERCENT
     }
 
+    /// Build the candidate context for the NEXT attempt after a failed
+    /// ceremony, keeping only the `survivors` (the participants who completed
+    /// the round that aborted — `L1` after Round 1, `Q` after Round 2). The
+    /// threshold and total stake are re-derived over the survivors alone (a
+    /// fresh stake-weighted `t`), and `attempt` is bumped by one so every rerun
+    /// payload is re-namespaced. Returns `None` when the survivors are below
+    /// [`FROST_MIN_PARTICIPANTS`] or carry no stake — there is nothing left to
+    /// rerun and the epoch's DKG is dead.
+    ///
+    /// Each survivor KEEPS its original FROST [`Identifier`] (a field element —
+    /// frost-core does not require contiguous `1..=n`, only `max_signers`
+    /// distinct ones), so all honest nodes that observed the same survivor set
+    /// derive the identical reduced context. The positional [`DkgParticipant::index`]
+    /// is left as-is and so may become non-contiguous; `identifier` is the
+    /// source of truth for the ceremony, `index` is a display hint only.
+    ///
+    /// NOTE: the `> 51%` arm of [`Self::quorum_ok`] on the reduced context is
+    /// relative to the survivors' total, not the original epoch stake — the
+    /// spec's "restart DKG with the reduced candidate set after slashing"
+    /// re-bases the honest-majority requirement on whoever remains eligible.
+    #[must_use]
+    pub fn reduced_to(&self, survivors: &BTreeSet<Identifier>) -> Option<DkgContext> {
+        let kept: Vec<DkgParticipant> = self
+            .participants
+            .iter()
+            .filter(|p| survivors.contains(&p.identifier))
+            .cloned()
+            .collect();
+        if kept.len() < usize::from(FROST_MIN_PARTICIPANTS) {
+            return None;
+        }
+        let total: u64 = kept.iter().map(|p| p.active_stake).sum();
+        if total == 0 {
+            return None;
+        }
+        let n = u16::try_from(kept.len()).ok()?;
+        let stakes: Vec<u64> = kept.iter().map(|p| p.active_stake).collect();
+        let threshold = stake_weighted_threshold(&stakes, total).min(n);
+        Some(DkgContext {
+            epoch: self.epoch,
+            attempt: self.attempt + 1,
+            threshold,
+            total_stake: total,
+            participants: kept,
+            // Carry the prior exclusions forward for diagnostics; the dropped
+            // survivors (this attempt's absent/faulty peers) are tracked as
+            // fault evidence by the ceremony, not re-derived here.
+            excluded: self.excluded.clone(),
+        })
+    }
+
     /// Synthesize a context from a static [`Roster`] with EQUAL per-participant
     /// stake (1 each), for the requested `(epoch, attempt)` — used by the
     /// mock/fixture demo and the no-registry fallback, where real chain stake is
@@ -699,6 +750,59 @@ mod tests {
         // Equal stake → the gate is a >51%-by-count majority that also meets t.
         assert!(ctx.quorum_ok(&qset(&[1, 2]))); // 2/3 = 66% > 51%, count 2 >= t
         assert!(!ctx.quorum_ok(&qset(&[1]))); // count 1 < t (and 33% < 51%)
+    }
+
+    // ---- reduced_to (failed-attempt rerun candidate set) ----------------
+
+    #[test]
+    fn reduced_to_drops_non_survivors_and_bumps_attempt() {
+        // 40/40/20, t=2, attempt 3. Survivors {1,3} (peer 2 absent/faulty).
+        let ctx = ctx_with(&[40, 40, 20], 2);
+        let ctx = DkgContext { attempt: 3, ..ctx };
+        let reduced = ctx
+            .reduced_to(&qset(&[1, 3]))
+            .expect("2 survivors >= FROST_MIN");
+        assert_eq!(reduced.attempt, 4); // bumped
+        assert_eq!(reduced.epoch, ctx.epoch); // epoch unchanged
+        assert_eq!(reduced.participants.len(), 2);
+        assert_eq!(reduced.total_stake, 60); // 40 + 20, re-based on survivors
+        // Original identifiers kept (1 and 3), NOT renumbered to 1,2. The
+        // positional `index` rides along unchanged, so it stays non-contiguous.
+        let ids: Vec<Identifier> = reduced.participants.iter().map(|p| p.identifier).collect();
+        assert_eq!(
+            ids,
+            vec![
+                Identifier::try_from(1u16).unwrap(),
+                Identifier::try_from(3u16).unwrap()
+            ]
+        );
+        let idxs: Vec<u16> = reduced.participants.iter().map(|p| p.index).collect();
+        assert_eq!(idxs, vec![1, 3]);
+        // Threshold re-derived over survivors' stake (40,20 of 60: weakest-1=20
+        // = 33% <= 51% → need both → t=2).
+        assert_eq!(reduced.threshold, 2);
+        // The reduced full set clears its own (re-based) gate.
+        assert!(reduced.quorum_ok(&qset(&[1, 3])));
+    }
+
+    #[test]
+    fn reduced_to_below_frost_min_is_dead() {
+        let ctx = ctx_with(&[40, 40, 20], 2);
+        // A single survivor cannot run FROST DKG → None (epoch DKG is dead).
+        assert!(ctx.reduced_to(&qset(&[1])).is_none());
+        assert!(ctx.reduced_to(&qset(&[])).is_none());
+        // An unknown id is simply not a survivor.
+        assert!(ctx.reduced_to(&qset(&[1, 99])).is_none());
+    }
+
+    #[test]
+    fn reduced_to_recomputes_threshold_on_survivor_stake() {
+        // 10/10/80, t=3. Survivors {1,2} (the whale dropped): 10/10 of 20, the
+        // weakest-1 = 50% <= 51% → both needed → t=2 (was 3).
+        let ctx = ctx_with(&[10, 10, 80], 3);
+        let reduced = ctx.reduced_to(&qset(&[1, 2])).unwrap();
+        assert_eq!(reduced.threshold, 2);
+        assert_eq!(reduced.total_stake, 20);
     }
 
     // ---- eligibility + context ------------------------------------------

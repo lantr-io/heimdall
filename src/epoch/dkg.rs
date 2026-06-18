@@ -1,46 +1,74 @@
-//! DKG phase order -- Round1 -> Round2 -> Part3
+//! DKG phase order -- Round1 -> Round2 -> Part3, with a stake-weighted
+//! abort/rerun gate (WI-014 #3).
+//!
+//! Each `(epoch, attempt)` runs the full FROST DKG over the attempt's
+//! candidate set ([`DkgContext`]). frost-core's `dkg_part2`/`part3` require
+//! the *entire* candidate set to contribute (`round1_packages.len() ==
+//! max_signers - 1`), so there is no "complete with a subset" within a single
+//! attempt. When a peer is absent or provably faulty:
+//!
+//!   - the surviving subset — `L1` (valid Round 1 publishers) after Round 1, or
+//!     `Q` (valid Round 2 senders) after Round 2 — is put through the quorum
+//!     gate [`DkgContext::quorum_ok`];
+//!   - if it clears the gate, [`DkgContext::reduced_to`] builds the next
+//!     attempt's candidate set (bumped attempt, re-based stake-weighted
+//!     threshold) and the ceremony reruns from Round 1 over the reduced set;
+//!   - if it fails the gate (or is too small to run FROST DKG), the epoch's DKG
+//!     is dead ([`EpochError::DkgAborted`]) and the caller backs off to the next
+//!     boundary rather than killing the process.
+//!
+//! The happy path (everyone contributes → `Q == C`, no reduction) needs no
+//! rerun and is what the multi-instance acceptance test exercises.
+//!
+//! TODO (WI-019): the transport drops invalid peer payloads (bad PoK / bad
+//! decrypted share) as `Ok(None)` and retains the raw bytes as fault evidence.
+//! This layer sees such peers only as "absent" (missing from `L1`/`Q`). Wiring
+//! the retained evidence through to a FaultProof is WI-019; here a faulty peer
+//! and an offline peer are handled identically (excluded, candidate set
+//! reduced).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
 
+use crate::cardano::dkg_roster::DkgContext;
 use crate::epoch::log::{id_short, short_hex};
 use crate::epoch::state::SpoInfo;
 use crate::epoch::state::{
-    DkgCollected, DkgRound, EpochConfig, EpochError, EpochPhase, EpochResult, GroupKeys, Roster,
+    DkgCollected, DkgRound, EpochConfig, EpochError, EpochPhase, EpochResult, GroupKeys,
 };
 use crate::epoch::traits::{Clock, PeerNetwork, RngSource};
 use crate::frost::participant;
 use crate::http::wire::DkgNamespace;
 
-/// Drive one DKG sub-round and produce the next phase.
-///
-/// TODO: misbehavior detection. `dkg_part2`/`dkg_part3` return errors
-/// that identify the bad peer by `Identifier`, but currently we flatten
-/// them into `EpochError::Frost(String)` and abort the whole epoch.
-///
-/// In the real world, we're supposed to slash the misbehaving SPO via a
-/// FROST-signed membership exit, restart DKG with the reduced candidate set,
-/// and submit a Halo2 DKG fault proof to the Cardano fault verifier.
+/// Drive one DKG sub-round for `ctx` and produce the next phase: the next
+/// sub-round, a reduced-set rerun at Round 1, or (at Part 3) `PublishKeys`.
 pub async fn dkg_phase(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
     rng: &Arc<dyn RngSource>,
     config: &EpochConfig,
-    epoch: u64,
     round: DkgRound,
-    roster: Roster,
+    ctx: DkgContext,
     mut collected: DkgCollected,
 ) -> EpochResult<EpochPhase> {
     let me = config.identity.identifier;
+    let epoch = ctx.epoch;
+    let attempt = ctx.attempt;
+    // Every payload (and its replay binding) is namespaced by the attempt, so a
+    // stale previous-attempt package can never be replayed into a rerun.
+    let ns = DkgNamespace::for_attempt(epoch, u64::from(attempt));
+    let roster = ctx.to_roster();
+    let eligible: BTreeSet<Identifier> = roster.participants.keys().copied().collect();
+
     match round {
         DkgRound::Round1 => {
             crate::epoch_log!(
                 me,
                 epoch,
-                "DKG round1: generating secret polynomial and commitments \
+                "DKG round1 (attempt {attempt}): generating secret polynomial and commitments \
                  (n={}, t={})",
                 roster.max_signers,
                 roster.min_signers
@@ -62,52 +90,65 @@ pub async fn dkg_phase(
                 short_hex(&pkg_bytes, 16)
             );
 
-            peers
-                .publish_dkg_round1(DkgNamespace::new(epoch), &package)
-                .await?;
+            peers.publish_dkg_round1(ns, &package).await?;
             crate::epoch_log!(me, epoch, "  -> round1 package published to local server");
 
             collected.round1_mine = Some(secret);
             collected.round1_peers.insert(me, package);
 
-            // Poll peers until we have everyone's round 1 package.
+            // Poll peers' Round 1 packages until the deadline. The valid
+            // publishers (plus self) form the live subset L1.
             let peer_infos = roster.peers_of(me);
             crate::epoch_log!(
                 me,
                 epoch,
-                "  waiting for round1 packages from {} peer(s)...",
+                "  waiting for round1 packages from {} peer(s) until deadline...",
                 peer_infos.len()
             );
             poll_dkg_round1(
                 peers,
                 clock,
                 config,
-                epoch,
+                ns,
                 me,
                 &peer_infos,
                 &mut collected.round1_peers,
             )
             .await?;
-            crate::epoch_log!(
-                me,
-                epoch,
-                "  <- have all {} round1 packages, advancing to round2",
-                collected.round1_peers.len()
-            );
 
-            Ok(EpochPhase::Dkg {
-                epoch,
-                round: DkgRound::Round2,
-                roster,
-                collected,
-            })
+            let l1: BTreeSet<Identifier> = collected.round1_peers.keys().copied().collect();
+            if l1 == eligible {
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "  <- all {} round1 packages in, advancing to round2",
+                    l1.len()
+                );
+                Ok(EpochPhase::Dkg {
+                    round: DkgRound::Round2,
+                    ctx,
+                    collected,
+                })
+            } else {
+                let absent: Vec<_> = eligible.difference(&l1).map(|id| id_short(*id)).collect();
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "  round1 incomplete at deadline: {}/{} published; missing/faulty: {:?}",
+                    l1.len(),
+                    eligible.len(),
+                    absent
+                );
+                rerun_or_abort(&ctx, &l1, "round1 incomplete")
+            }
         }
 
         DkgRound::Round2 => {
             crate::epoch_log!(
                 me,
                 epoch,
-                "DKG round2: computing per-peer secret shares from round1 packages"
+                "DKG round2 (attempt {attempt}): computing per-peer secret shares from round1 \
+                 packages"
             );
 
             let secret = collected
@@ -115,7 +156,9 @@ pub async fn dkg_phase(
                 .take()
                 .ok_or_else(|| EpochError::Transition("missing round1 secret".into()))?;
 
-            // Pass all peers' round1 packages except our own
+            // All peers' round1 packages except our own. We only reach Round 2
+            // when L1 == the full candidate set, so this is exactly the
+            // `max_signers - 1` packages dkg_part2 requires.
             let peer_round1: BTreeMap<_, _> = collected
                 .round1_peers
                 .iter()
@@ -140,9 +183,8 @@ pub async fn dkg_phase(
                 );
             }
 
-            // Pair each share with its recipient's SpoInfo so the transport
-            // can encrypt under that peer's bifrost_id_pk and address it by
-            // pool_id.
+            // Pair each share with its recipient's SpoInfo so the transport can
+            // encrypt under that peer's bifrost_id_pk and address it by pool_id.
             let recipients: Vec<(SpoInfo, _)> = round2_packages
                 .into_iter()
                 .map(|(rid, pkg)| {
@@ -159,9 +201,7 @@ pub async fn dkg_phase(
                         })
                 })
                 .collect::<Result<_, _>>()?;
-            peers
-                .publish_dkg_round2(DkgNamespace::new(epoch), &recipients)
-                .await?;
+            peers.publish_dkg_round2(ns, &recipients).await?;
             crate::epoch_log!(me, epoch, "  -> round2 packages published");
 
             collected.round2_mine = Some(round2_secret);
@@ -170,39 +210,55 @@ pub async fn dkg_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "  waiting for round2 shares addressed to me from {} peer(s)...",
+                "  waiting for round2 shares addressed to me from {} peer(s) until deadline...",
                 peer_infos.len()
             );
             poll_dkg_round2(
                 peers,
                 clock,
                 config,
-                epoch,
+                ns,
                 me,
                 &peer_infos,
                 &mut collected.round2_peers,
             )
             .await?;
-            crate::epoch_log!(
-                me,
-                epoch,
-                "  <- have all {} round2 shares, advancing to part3",
-                collected.round2_peers.len()
-            );
 
-            Ok(EpochPhase::Dkg {
-                epoch,
-                round: DkgRound::Part3,
-                roster,
-                collected,
-            })
+            // Q = self (always qualifies — it produced its own shares) ∪ the
+            // peers whose valid Round 2 share we decrypted+verified.
+            let mut q: BTreeSet<Identifier> = collected.round2_peers.keys().copied().collect();
+            q.insert(me);
+            if q == eligible {
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "  <- all {} round2 shares in, advancing to part3",
+                    collected.round2_peers.len()
+                );
+                Ok(EpochPhase::Dkg {
+                    round: DkgRound::Part3,
+                    ctx,
+                    collected,
+                })
+            } else {
+                let absent: Vec<_> = eligible.difference(&q).map(|id| id_short(*id)).collect();
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "  round2 incomplete at deadline: {}/{} qualified; missing/faulty: {:?}",
+                    q.len(),
+                    eligible.len(),
+                    absent
+                );
+                rerun_or_abort(&ctx, &q, "round2 incomplete")
+            }
         }
 
         DkgRound::Part3 => {
             crate::epoch_log!(
                 me,
                 epoch,
-                "DKG part3: combining shares into final KeyPackage + group key"
+                "DKG part3 (attempt {attempt}): combining shares into final KeyPackage + group key"
             );
 
             let round2_secret = collected
@@ -244,6 +300,9 @@ pub async fn dkg_phase(
                 key_package,
             };
 
+            // The roster handed to the rest of the cycle is the candidate set
+            // that actually formed the key (the possibly-reduced `ctx`), so
+            // signing draws from exactly the share-holders.
             Ok(EpochPhase::PublishKeys {
                 epoch,
                 roster,
@@ -253,29 +312,66 @@ pub async fn dkg_phase(
     }
 }
 
+/// After a round finished incomplete, decide between a reduced-set rerun and a
+/// fatal abort. Reruns iff the `survivors` clear the quorum gate AND there are
+/// still enough of them to run FROST DKG; otherwise the epoch's DKG is dead.
+fn rerun_or_abort(
+    ctx: &DkgContext,
+    survivors: &BTreeSet<Identifier>,
+    why: &str,
+) -> EpochResult<EpochPhase> {
+    let eligible = ctx.participants.len();
+    let abort = |reason: String| {
+        Err(EpochError::DkgAborted {
+            epoch: ctx.epoch,
+            attempt: ctx.attempt,
+            qualified: survivors.len(),
+            eligible,
+            reason,
+        })
+    };
+    if !ctx.quorum_ok(survivors) {
+        return abort(format!(
+            "{why}; surviving subset fails the threshold / >51%-stake quorum gate"
+        ));
+    }
+    match ctx.reduced_to(survivors) {
+        Some(reduced) => Ok(EpochPhase::Dkg {
+            round: DkgRound::Round1,
+            ctx: reduced,
+            collected: DkgCollected::default(),
+        }),
+        // quorum_ok already implies |survivors| >= threshold >= 2, so this is a
+        // defensive guard (e.g. zero survivor stake) rather than a reachable arm.
+        None => abort(format!("{why}; too few survivors to rerun FROST DKG")),
+    }
+}
+
+/// Poll peers' Round 1 packages until everyone has published or the round
+/// deadline passes — whichever comes first. Unlike a hard timeout, an
+/// incomplete deadline is NOT an error: the caller inspects `out` to form the
+/// live subset L1 and decides rerun-vs-abort. A peer-network read error still
+/// propagates (the transport already maps unverifiable payloads to `Ok(None)`).
 async fn poll_dkg_round1(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
     config: &EpochConfig,
-    epoch: u64,
+    ns: DkgNamespace,
     me: Identifier,
-    peer_infos: &[&crate::epoch::state::SpoInfo],
+    peer_infos: &[&SpoInfo],
     out: &mut BTreeMap<Identifier, frost::keys::dkg::round1::Package>,
 ) -> EpochResult<()> {
-    let need = peer_infos.len() + out.len(); // we already inserted self
+    let need = peer_infos.len() + out.len(); // out already holds self
     let deadline = clock.deadline(config.dkg_round_timeout);
-    while out.len() < need {
+    loop {
         for peer in peer_infos {
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            if let Some(pkg) = peers
-                .fetch_dkg_round1(DkgNamespace::new(epoch), peer)
-                .await?
-            {
+            if let Some(pkg) = peers.fetch_dkg_round1(ns, peer).await? {
                 crate::epoch_log!(
                     me,
-                    epoch,
+                    ns.epoch,
                     "     received round1 package from spo={} ({}/{})",
                     id_short(peer.identifier),
                     out.len() + 1,
@@ -284,14 +380,47 @@ async fn poll_dkg_round1(
                 out.insert(peer.identifier, pkg);
             }
         }
-        if out.len() >= need {
+        if out.len() >= need || clock.now() >= deadline {
             break;
         }
-        if clock.now() >= deadline {
-            return Err(EpochError::PollTimeout {
-                got: out.len(),
-                need,
-            });
+        tokio::time::sleep(config.poll_interval).await;
+    }
+    Ok(())
+}
+
+/// Poll peers' Round 2 shares addressed to us until all arrive or the deadline
+/// passes. Same contract as [`poll_dkg_round1`]: an incomplete deadline returns
+/// the partial set (→ qualified subset Q), not an error.
+async fn poll_dkg_round2(
+    peers: &Arc<dyn PeerNetwork>,
+    clock: &Arc<dyn Clock>,
+    config: &EpochConfig,
+    ns: DkgNamespace,
+    me: Identifier,
+    peer_infos: &[&SpoInfo],
+    out: &mut BTreeMap<Identifier, frost::keys::dkg::round2::Package>,
+) -> EpochResult<()> {
+    let need = peer_infos.len();
+    let deadline = clock.deadline(config.dkg_round_timeout);
+    loop {
+        for peer in peer_infos {
+            if out.contains_key(&peer.identifier) {
+                continue;
+            }
+            if let Some(pkg) = peers.fetch_dkg_round2(ns, peer).await? {
+                crate::epoch_log!(
+                    me,
+                    ns.epoch,
+                    "     received round2 share from spo={} ({}/{})",
+                    id_short(peer.identifier),
+                    out.len() + 1,
+                    need
+                );
+                out.insert(peer.identifier, pkg);
+            }
+        }
+        if out.len() >= need || clock.now() >= deadline {
+            break;
         }
         tokio::time::sleep(config.poll_interval).await;
     }
@@ -302,7 +431,7 @@ async fn poll_dkg_round1(
 mod tests {
     use super::*;
     use crate::epoch::mocks::{MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock};
-    use crate::epoch::state::{EpochConfig, SpoIdentity, SpoInfo};
+    use crate::epoch::state::{EpochConfig, Roster, SpoIdentity, SpoInfo};
     use std::time::Duration;
 
     fn make_roster(n: u16, threshold: u16) -> Roster {
@@ -334,128 +463,106 @@ mod tests {
         roster: Roster,
     ) -> EpochResult<GroupKeys> {
         let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let ctx = DkgContext::from_roster_equal_stake(&roster, 0, 0);
         let mut phase = EpochPhase::Dkg {
-            epoch: 0,
             round: DkgRound::Round1,
-            roster,
+            ctx,
             collected: DkgCollected::default(),
         };
         loop {
             phase = match phase {
                 EpochPhase::Dkg {
-                    epoch,
                     round,
-                    roster,
+                    ctx,
                     collected,
-                } => {
-                    dkg_phase(
-                        &peers, &clock, &rng, &config, epoch, round, roster, collected,
-                    )
-                    .await?
-                }
+                } => dkg_phase(&peers, &clock, &rng, &config, round, ctx, collected).await?,
                 EpochPhase::PublishKeys { group_keys, .. } => return Ok(group_keys),
                 other => panic!("unexpected phase: {}", other.name()),
             };
         }
     }
 
-    #[tokio::test]
-    async fn dkg_3_of_3_happy_path() {
+    /// Spawn `ids` SPOs against a shared hub and drive each through DKG.
+    async fn run_ceremony(roster: Roster, ids: &[u16]) -> Vec<EpochResult<GroupKeys>> {
         let hub = MockPeerHub::new();
-        let roster = make_roster(3, 2);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-
         let mut handles = Vec::new();
-        for i in 1..=3u16 {
+        for &i in ids {
             let id = Identifier::try_from(i).unwrap();
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock = clock.clone();
-            let config = EpochConfig::demo_default(SpoIdentity {
+            let mut config = EpochConfig::demo_default(SpoIdentity {
                 identifier: id,
                 port: 0,
             });
+            // Tight timing so the absent-peer reruns don't make the test slow.
+            config.dkg_round_timeout = Duration::from_millis(250);
+            config.poll_interval = Duration::from_millis(10);
             let roster = roster.clone();
             handles.push(tokio::spawn(async move {
                 drive_dkg(peers, clock, config, roster).await
             }));
         }
-
-        let mut group_keys = Vec::new();
+        let mut out = Vec::new();
         for h in handles {
-            group_keys.push(h.await.unwrap().expect("dkg ok"));
+            out.push(h.await.unwrap());
         }
+        out
+    }
 
-        // All SPOs derive the same verifying key.
-        let vk0 = group_keys[0].verifying_key;
-        for gk in &group_keys[1..] {
-            assert_eq!(gk.verifying_key, vk0);
+    fn assert_same_group_key(results: &[EpochResult<GroupKeys>]) {
+        let keys: Vec<_> = results
+            .iter()
+            .map(|r| r.as_ref().expect("dkg ok").verifying_key)
+            .collect();
+        for gk in &keys[1..] {
+            assert_eq!(*gk, keys[0], "all SPOs must derive the same Y_51");
         }
     }
 
     #[tokio::test]
-    async fn dkg_round1_poll_times_out() {
-        let hub = MockPeerHub::new();
-        let roster = make_roster(3, 2);
-        let id = Identifier::try_from(1u16).unwrap();
-        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub));
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let mut config = EpochConfig::demo_default(SpoIdentity {
-            identifier: id,
-            port: 0,
-        });
-        config.dkg_round_timeout = Duration::from_millis(150);
-        config.poll_interval = Duration::from_millis(20);
+    async fn dkg_3_of_3_happy_path() {
+        let results = run_ceremony(make_roster(3, 2), &[1, 2, 3]).await;
+        assert_same_group_key(&results);
+    }
 
-        // Only SPO 1 runs — peers never publish, so this must time out.
-        let result = drive_dkg(peers, clock, config, roster).await;
-        match result {
-            Err(EpochError::PollTimeout { .. }) => {}
-            other => panic!("expected PollTimeout, got {:?}", other.map(|_| "ok")),
+    /// The smallest ceremony frost-core supports (it rejects min_signers < 2),
+    /// i.e. the "solo" replacement: two instances complete and agree on Y_51.
+    #[tokio::test]
+    async fn dkg_2_of_2_happy_path() {
+        let results = run_ceremony(make_roster(2, 2), &[1, 2]).await;
+        assert_same_group_key(&results);
+    }
+
+    /// A 3-candidate ceremony where one peer never shows up. The two survivors
+    /// both observe L1 = {1,2}, which clears the quorum gate (2/3 stake > 51%),
+    /// so they rerun as a reduced 2-of-2 (attempt 1) and complete with the same
+    /// Y_51 — exercising the poll-to-subset → gate → reduced-rerun path.
+    #[tokio::test]
+    async fn dkg_absent_peer_reduces_and_reruns() {
+        let results = run_ceremony(make_roster(3, 2), &[1, 2]).await; // SPO 3 never spawns
+        assert_same_group_key(&results);
+    }
+
+    /// A solo SPO in a 3-candidate set: only itself publishes Round 1, the
+    /// survivor subset {self} fails the count gate (1 < t=2), so the attempt
+    /// aborts fatally rather than hanging or completing under-quorum.
+    #[tokio::test]
+    async fn dkg_round1_incomplete_aborts_below_quorum() {
+        let results = run_ceremony(make_roster(3, 2), &[1]).await;
+        match &results[0] {
+            Err(EpochError::DkgAborted {
+                qualified,
+                eligible,
+                ..
+            }) => {
+                assert_eq!(*qualified, 1);
+                assert_eq!(*eligible, 3);
+            }
+            other => panic!(
+                "expected DkgAborted, got {:?}",
+                other.as_ref().map(|_| "ok")
+            ),
         }
     }
-}
-
-async fn poll_dkg_round2(
-    peers: &Arc<dyn PeerNetwork>,
-    clock: &Arc<dyn Clock>,
-    config: &EpochConfig,
-    epoch: u64,
-    me: Identifier,
-    peer_infos: &[&crate::epoch::state::SpoInfo],
-    out: &mut BTreeMap<Identifier, frost::keys::dkg::round2::Package>,
-) -> EpochResult<()> {
-    let need = peer_infos.len();
-    let deadline = clock.deadline(config.dkg_round_timeout);
-    while out.len() < need {
-        for peer in peer_infos {
-            if out.contains_key(&peer.identifier) {
-                continue;
-            }
-            if let Some(pkg) = peers
-                .fetch_dkg_round2(DkgNamespace::new(epoch), peer)
-                .await?
-            {
-                crate::epoch_log!(
-                    me,
-                    epoch,
-                    "     received round2 share from spo={} ({}/{})",
-                    id_short(peer.identifier),
-                    out.len() + 1,
-                    need
-                );
-                out.insert(peer.identifier, pkg);
-            }
-        }
-        if out.len() >= need {
-            break;
-        }
-        if clock.now() >= deadline {
-            return Err(EpochError::PollTimeout {
-                got: out.len(),
-                need,
-            });
-        }
-        tokio::time::sleep(config.poll_interval).await;
-    }
-    Ok(())
 }

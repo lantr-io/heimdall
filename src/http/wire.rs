@@ -80,12 +80,23 @@ pub struct DkgNamespace {
 impl DkgNamespace {
     /// The normal namespace for `epoch`: the constant threshold label 51
     /// (the >51%-stake DKG) and attempt 0. Attempt only advances on an
-    /// exceptional cryptographic-fault rerun (WI-014), not here.
+    /// exceptional cryptographic-fault rerun (WI-014) — see [`Self::for_attempt`].
     pub fn new(epoch: u64) -> Self {
+        Self::for_attempt(epoch, 0)
+    }
+
+    /// The namespace for a specific DKG `attempt` of `epoch`. A failed
+    /// ceremony (a peer absent or provably faulty so the qualified set can't
+    /// run `dkg_part2`/`part3`) reruns over a reduced candidate set under
+    /// `attempt + 1`, which re-namespaces every payload so a stale
+    /// previous-attempt package can never be replayed into the rerun. The
+    /// `threshold` label stays the constant 51 (the >51%-stake DKG); the
+    /// FROST signing `t` lives in the roster, not here.
+    pub fn for_attempt(epoch: u64, attempt: u64) -> Self {
         Self {
             epoch,
             threshold: canonical::THRESHOLD_51,
-            attempt: 0,
+            attempt,
         }
     }
 }
