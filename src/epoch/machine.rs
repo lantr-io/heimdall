@@ -647,3 +647,92 @@ fn current_epoch(phase: &EpochPhase) -> u64 {
 fn _hash_used() -> [u8; 32] {
     bitcoin::hashes::sha256::Hash::hash(&[]).to_byte_array()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cardano::mock::MockCardanoPegInSource;
+    use crate::epoch::fixture::demo_static_fixture;
+    use crate::epoch::mocks::{
+        MockCardanoChain, MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock,
+    };
+    use crate::epoch::state::SpoIdentity;
+    use frost::Identifier;
+    use std::time::Duration;
+
+    /// Tight timings so the full cycle runs in well under a second.
+    fn fast_config(id: Identifier) -> EpochConfig {
+        let mut config = EpochConfig::demo_default(SpoIdentity {
+            identifier: id,
+            port: 0,
+        });
+        config.dkg_round_timeout = Duration::from_millis(500);
+        config.poll_interval = Duration::from_millis(10);
+        config.pegin_collection_window = Duration::from_millis(40);
+        config.pegin_poll_interval = Duration::from_millis(10);
+        config.quorum51_timeout = Duration::from_millis(500);
+        config
+    }
+
+    /// WI-014 acceptance: N instances run the FULL epoch loop (DKG → finalize →
+    /// CollectPegins → BuildTm → Sign → Submit) against their own mock chains
+    /// over a shared peer hub, and must complete the cycle deriving the SAME
+    /// treasury movement — byte-identical unsigned TM (same txid), which embeds
+    /// the new treasury address as its change output. Identical txids across all
+    /// instances ⇒ identical Y_51 ⇒ identical treasury address.
+    async fn multi_instance_same_treasury(n: u16, t: u16) {
+        let fixture = demo_static_fixture(t, n, 18_600);
+        let hub = MockPeerHub::new();
+
+        let mut handles = Vec::new();
+        for i in 1..=n {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(h.await.unwrap().expect("epoch cycle completes"));
+        }
+
+        // All instances built the byte-identical treasury movement: same txid,
+        // and (no pegins / no pegouts in the fixture) exactly one output — the
+        // new treasury change locked under the freshly derived group key.
+        let txid0 = tms[0].txid;
+        for tm in &tms[1..] {
+            assert_eq!(
+                tm.txid, txid0,
+                "all SPOs must derive the identical TM / treasury address"
+            );
+        }
+        let change_spk = &tms[0].unsigned_tx.output[0].script_pubkey;
+        assert!(
+            change_spk.is_p2tr(),
+            "treasury change must be a P2TR (taproot) output"
+        );
+        for tm in &tms[1..] {
+            assert_eq!(
+                &tm.unsigned_tx.output[0].script_pubkey, change_spk,
+                "the new treasury scriptPubKey must be identical across SPOs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_cycle_2_of_2_all_derive_same_treasury() {
+        multi_instance_same_treasury(2, 2).await;
+    }
+
+    #[tokio::test]
+    async fn full_cycle_3_of_3_all_derive_same_treasury() {
+        multi_instance_same_treasury(3, 3).await;
+    }
+}
