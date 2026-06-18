@@ -187,6 +187,31 @@ async fn publish_keys_phase(
         hex::encode(y_51.serialize())
     );
 
+    // Finalize (WI-014 #4): derive the NEW treasury Taproot address from the
+    // just-derived FROST group key (Y_51, internal key) + the federation
+    // fallback key (Y_fed, script leaf) read from the treasury oracle — the
+    // address the epoch's handoff will move funds into. The same derivation
+    // drives the actual TM change output in `build_tm_phase`; logging it here
+    // makes the handoff destination visible the moment DKG completes. Y_51 is
+    // identical across all SPOs (checked in `dkg_phase`), so every SPO derives
+    // this same address.
+    let treasury = chain.query_treasury().await?;
+    let secp = Secp256k1::new();
+    let new_spend = treasury_spend_info(
+        &secp,
+        y_51,
+        treasury.y_fed,
+        treasury.federation_csv_blocks as u16,
+    );
+    let new_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(new_spend.output_key());
+    crate::epoch_log!(
+        me,
+        epoch,
+        "  -> new treasury: output_key={} scriptPubKey={}",
+        hex::encode(new_spend.output_key().to_x_only_public_key().serialize()),
+        hex::encode(new_spk.as_bytes())
+    );
+
     chain.publish_group_key(y_51).await?;
 
     Ok(EpochPhase::CollectPegins {

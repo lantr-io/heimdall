@@ -276,6 +276,23 @@ pub async fn dkg_phase(
                 participant::dkg_part3(round2_secret, &peer_round1, &collected.round2_peers)
                     .map_err(|e| EpochError::Frost(format!("dkg_part3: {e}")))?;
 
+            // Identical-Y_51 sanity check (WI-014 #4). Y_51 is the deterministic
+            // output of dkg_part3 over the qualified set's published Round 1 + 2
+            // payloads, which every honest node holds identically — so every node
+            // derives the SAME Y_51 (and hence the same treasury address). That
+            // cross-node guarantee is asserted by the multi-instance acceptance
+            // test (all SPOs' verifying_key + treasury address match). Note it is
+            // NOT the naive Σ_l φ_{l,0} of the wire commitments: frost-secp256k1-tr
+            // applies BIP-340 even-Y normalization per contribution inside the
+            // ceremony, so the signing key differs from the raw commitment sum.
+            //
+            // Locally we assert part3's two outputs are coherent: the KeyPackage
+            // (this node's share) and the PublicKeyPackage (the published group)
+            // must carry the same group key, and the package must list this
+            // node's verification share. A mismatch means a corrupt part3 output —
+            // abort before locking funds under an incoherent key.
+            check_dkg_output_coherent(me, &key_package, &public_key_package)?;
+
             let vk_bytes = public_key_package
                 .verifying_key()
                 .serialize()
@@ -344,6 +361,37 @@ fn rerun_or_abort(
         // quorum_ok already implies |survivors| >= threshold >= 2, so this is a
         // defensive guard (e.g. zero survivor stake) rather than a reachable arm.
         None => abort(format!("{why}; too few survivors to rerun FROST DKG")),
+    }
+}
+
+/// Assert dkg_part3's two outputs are internally coherent: the [`KeyPackage`]
+/// (this node's signing share) and the [`PublicKeyPackage`] (the published
+/// group) must agree on the group key, and the package must publish this node's
+/// verification share. part3 builds both from the same commitments, so a
+/// mismatch indicates a corrupt output and the key must not lock funds. The
+/// cross-node identical-Y_51 property itself follows from part3 being a pure,
+/// deterministic function of the qualified set's shared Round 1+2 payloads, and
+/// is asserted end-to-end by the multi-instance acceptance test.
+fn check_dkg_output_coherent(
+    me: Identifier,
+    key_package: &frost::keys::KeyPackage,
+    public_key_package: &frost::keys::PublicKeyPackage,
+) -> EpochResult<()> {
+    if key_package.verifying_key() != public_key_package.verifying_key() {
+        return Err(EpochError::Frost(
+            "dkg_part3 incoherent: KeyPackage and PublicKeyPackage group keys differ".into(),
+        ));
+    }
+    match public_key_package.verifying_shares().get(&me) {
+        Some(share) if share == key_package.verifying_share() => Ok(()),
+        Some(_) => Err(EpochError::Frost(format!(
+            "dkg_part3 incoherent: published verification share for {} != my own",
+            id_short(me)
+        ))),
+        None => Err(EpochError::Frost(format!(
+            "dkg_part3 incoherent: no verification share for {} in the group package",
+            id_short(me)
+        ))),
     }
 }
 
@@ -542,6 +590,41 @@ mod tests {
     async fn dkg_absent_peer_reduces_and_reruns() {
         let results = run_ceremony(make_roster(3, 2), &[1, 2]).await; // SPO 3 never spawns
         assert_same_group_key(&results);
+    }
+
+    /// The finalize coherence check accepts a real part3 output (group keys
+    /// agree, this node's verification share is published) and rejects an
+    /// output whose published share belongs to a different participant.
+    #[test]
+    fn dkg_output_coherence_accepts_real_rejects_wrong_share() {
+        use crate::frost::participant;
+        let id1 = Identifier::try_from(1u16).unwrap();
+        let id2 = Identifier::try_from(2u16).unwrap();
+        let mut rng = rand::thread_rng();
+        let (s1, p1) = participant::dkg_part1(id1, 2, 2, &mut rng).unwrap();
+        let (s2, p2) = participant::dkg_part1(id2, 2, 2, &mut rng).unwrap();
+
+        // Each participant's "others" Round 1 set is the single other peer.
+        let r1_seen_by_1: BTreeMap<_, _> = [(id2, p2)].into_iter().collect();
+        let r1_seen_by_2: BTreeMap<_, _> = [(id1, p1)].into_iter().collect();
+        let (s1r2, _) = participant::dkg_part2(s1, &r1_seen_by_1).unwrap();
+        let (_, pkgs2) = participant::dkg_part2(s2, &r1_seen_by_2).unwrap();
+        // The share participant 2 addressed to participant 1.
+        let r2_seen_by_1: BTreeMap<_, _> = [(id2, pkgs2.get(&id1).unwrap().clone())]
+            .into_iter()
+            .collect();
+        let (kp1, pkp1) = participant::dkg_part3(&s1r2, &r1_seen_by_1, &r2_seen_by_1).unwrap();
+
+        // Real part3 output for participant 1 → coherent. (The group package is
+        // shared, so it also coheres with participant 2's own KeyPackage under
+        // id2 — verification shares are public and identical across nodes.)
+        check_dkg_output_coherent(id1, &kp1, &pkp1).expect("real part3 output is coherent");
+
+        // Claiming to be id2 while presenting id1's KeyPackage: the share the
+        // package publishes for id2 is not id1's signing share → rejected.
+        let err = check_dkg_output_coherent(id2, &kp1, &pkp1)
+            .expect_err("share bound to the wrong participant must be rejected");
+        assert!(matches!(err, EpochError::Frost(_)));
     }
 
     /// A solo SPO in a 3-candidate set: only itself publishes Round 1, the
