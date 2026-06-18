@@ -61,6 +61,10 @@ impl Default for BifrostConfig {
 #[serde(default)]
 pub struct ProtocolConfig {
     pub dkg_round_timeout_secs: u64,
+    /// DKG Round 1/2 deadlines as offsets (seconds) from the epoch boundary
+    /// (WI-014 #6). Tunable for preprod; the spec budget is ~minutes.
+    pub dkg_round1_offset_secs: u64,
+    pub dkg_round2_offset_secs: u64,
     pub poll_interval_ms: u64,
     pub quorum51_timeout_secs: u64,
     pub federation_timeout_secs: u64,
@@ -76,6 +80,8 @@ impl Default for ProtocolConfig {
     fn default() -> Self {
         Self {
             dkg_round_timeout_secs: 300,
+            dkg_round1_offset_secs: 120,
+            dkg_round2_offset_secs: 240,
             poll_interval_ms: 5000,
             quorum51_timeout_secs: 300,
             federation_timeout_secs: 300,
@@ -329,6 +335,8 @@ impl HeimdallConfig {
 
         EpochConfig {
             dkg_round_timeout: Duration::from_secs(self.protocol.dkg_round_timeout_secs),
+            dkg_round1_offset: Duration::from_secs(self.protocol.dkg_round1_offset_secs),
+            dkg_round2_offset: Duration::from_secs(self.protocol.dkg_round2_offset_secs),
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
             quorum51_timeout: Duration::from_secs(self.protocol.quorum51_timeout_secs),
             federation_timeout: Duration::from_secs(self.protocol.federation_timeout_secs),

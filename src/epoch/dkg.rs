@@ -29,6 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
@@ -57,6 +58,7 @@ pub async fn dkg_phase(
     let me = config.identity.identifier;
     let epoch = ctx.epoch;
     let attempt = ctx.attempt;
+    let epoch_start_ms = ctx.epoch_start_ms;
     // Every payload (and its replay binding) is namespaced by the attempt, so a
     // stale previous-attempt package can never be replayed into a rerun.
     let ns = DkgNamespace::for_attempt(epoch, u64::from(attempt));
@@ -96,14 +98,21 @@ pub async fn dkg_phase(
             collected.round1_mine = Some(secret);
             collected.round1_peers.insert(me, package);
 
-            // Poll peers' Round 1 packages until the deadline. The valid
-            // publishers (plus self) form the live subset L1.
+            // Poll peers' Round 1 packages until the schedule-anchored deadline.
+            // The valid publishers (plus self) form the live subset L1.
             let peer_infos = roster.peers_of(me);
+            let deadline = round_deadline(
+                clock,
+                epoch_start_ms,
+                config.dkg_round1_offset,
+                config.dkg_round_timeout,
+            );
             crate::epoch_log!(
                 me,
                 epoch,
-                "  waiting for round1 packages from {} peer(s) until deadline...",
-                peer_infos.len()
+                "  waiting for round1 packages from {} peer(s) until deadline (anchored={})...",
+                peer_infos.len(),
+                epoch_start_ms.is_some()
             );
             poll_dkg_round1(
                 peers,
@@ -112,6 +121,7 @@ pub async fn dkg_phase(
                 ns,
                 me,
                 &peer_infos,
+                deadline,
                 &mut collected.round1_peers,
             )
             .await?;
@@ -207,11 +217,19 @@ pub async fn dkg_phase(
             collected.round2_mine = Some(round2_secret);
 
             let peer_infos = roster.peers_of(me);
+            let deadline = round_deadline(
+                clock,
+                epoch_start_ms,
+                config.dkg_round2_offset,
+                config.dkg_round_timeout,
+            );
             crate::epoch_log!(
                 me,
                 epoch,
-                "  waiting for round2 shares addressed to me from {} peer(s) until deadline...",
-                peer_infos.len()
+                "  waiting for round2 shares addressed to me from {} peer(s) until deadline \
+                 (anchored={})...",
+                peer_infos.len(),
+                epoch_start_ms.is_some()
             );
             poll_dkg_round2(
                 peers,
@@ -220,6 +238,7 @@ pub async fn dkg_phase(
                 ns,
                 me,
                 &peer_infos,
+                deadline,
                 &mut collected.round2_peers,
             )
             .await?;
@@ -489,11 +508,53 @@ fn check_dkg_output_coherent(
     }
 }
 
+/// The poll deadline for a DKG round (WI-014 #6). When the epoch boundary time
+/// is known (`epoch_start_ms`, from the chain schedule), the deadline is
+/// ABSOLUTE — `boundary + offset` — so every node freezes its live/qualified
+/// subset at the same chain-time instant regardless of when it locally entered
+/// the round; that keeps `L1`/`Q` (and any reduced-set rerun) agreeing across
+/// honest nodes. Without it (mock / no-registry fallback), the fixed relative
+/// `fallback` window from now is used. The absolute target is converted to a
+/// monotonic [`Instant`] via the local wall clock; over the few-minute DKG
+/// window the two advance together, so a clock skew between nodes only shifts
+/// the freeze by that skew, not unboundedly.
+fn round_deadline(
+    clock: &Arc<dyn Clock>,
+    epoch_start_ms: Option<i64>,
+    offset: Duration,
+    fallback: Duration,
+) -> Instant {
+    match epoch_start_ms {
+        Some(boundary) => clock.now() + remaining_to_offset(boundary, offset, wall_now_ms()),
+        None => clock.deadline(fallback),
+    }
+}
+
+/// Remaining wall-clock wait from `now_ms` until `boundary + offset`, saturating
+/// at zero once the deadline has passed. Pure, for testability.
+fn remaining_to_offset(boundary_ms: i64, offset: Duration, now_ms: i64) -> Duration {
+    let offset_ms = i64::try_from(offset.as_millis()).unwrap_or(i64::MAX);
+    let remaining = boundary_ms.saturating_add(offset_ms).saturating_sub(now_ms);
+    u64::try_from(remaining)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Current wall-clock time in Unix milliseconds, for schedule anchoring. Before
+/// the Unix epoch (clock badly wrong) → 0.
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 /// Poll peers' Round 1 packages until everyone has published or the round
 /// deadline passes — whichever comes first. Unlike a hard timeout, an
 /// incomplete deadline is NOT an error: the caller inspects `out` to form the
 /// live subset L1 and decides rerun-vs-abort. A peer-network read error still
 /// propagates (the transport already maps unverifiable payloads to `Ok(None)`).
+#[allow(clippy::too_many_arguments)]
 async fn poll_dkg_round1(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
@@ -501,10 +562,10 @@ async fn poll_dkg_round1(
     ns: DkgNamespace,
     me: Identifier,
     peer_infos: &[&SpoInfo],
+    deadline: Instant,
     out: &mut BTreeMap<Identifier, frost::keys::dkg::round1::Package>,
 ) -> EpochResult<()> {
     let need = peer_infos.len() + out.len(); // out already holds self
-    let deadline = clock.deadline(config.dkg_round_timeout);
     loop {
         for peer in peer_infos {
             if out.contains_key(&peer.identifier) {
@@ -533,6 +594,7 @@ async fn poll_dkg_round1(
 /// Poll peers' Round 2 shares addressed to us until all arrive or the deadline
 /// passes. Same contract as [`poll_dkg_round1`]: an incomplete deadline returns
 /// the partial set (→ qualified subset Q), not an error.
+#[allow(clippy::too_many_arguments)]
 async fn poll_dkg_round2(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
@@ -540,10 +602,10 @@ async fn poll_dkg_round2(
     ns: DkgNamespace,
     me: Identifier,
     peer_infos: &[&SpoInfo],
+    deadline: Instant,
     out: &mut BTreeMap<Identifier, frost::keys::dkg::round2::Package>,
 ) -> EpochResult<()> {
     let need = peer_infos.len();
-    let deadline = clock.deadline(config.dkg_round_timeout);
     loop {
         for peer in peer_infos {
             if out.contains_key(&peer.identifier) {
@@ -719,6 +781,35 @@ mod tests {
         let err = check_dkg_output_coherent(id2, &kp1, &pkp1)
             .expect_err("share bound to the wrong participant must be rejected");
         assert!(matches!(err, EpochError::Frost(_)));
+    }
+
+    /// Schedule-anchored deadlines are absolute: the remaining wait is
+    /// `boundary + offset − now`, saturating at zero once past — so a node that
+    /// enters the round late gets a shorter window and every node freezes at the
+    /// same chain-time instant.
+    #[test]
+    fn remaining_to_offset_anchors_to_the_boundary() {
+        let boundary = 1_000_000i64;
+        // 30s into the round, round-1 offset 120s → 90s left.
+        assert_eq!(
+            remaining_to_offset(boundary, Duration::from_secs(120), boundary + 30_000),
+            Duration::from_secs(90)
+        );
+        // exactly at the deadline → zero.
+        assert_eq!(
+            remaining_to_offset(boundary, Duration::from_secs(120), boundary + 120_000),
+            Duration::ZERO
+        );
+        // already past the deadline → zero, never negative.
+        assert_eq!(
+            remaining_to_offset(boundary, Duration::from_secs(120), boundary + 500_000),
+            Duration::ZERO
+        );
+        // a node that starts before the boundary waits the full offset + lead.
+        assert_eq!(
+            remaining_to_offset(boundary, Duration::from_secs(120), boundary - 10_000),
+            Duration::from_secs(130)
+        );
     }
 
     /// Fault evidence records exactly the eligible participants missing from the

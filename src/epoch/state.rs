@@ -342,7 +342,17 @@ pub struct SpoIdentity {
 
 #[derive(Debug, Clone)]
 pub struct EpochConfig {
+    /// Relative per-round DKG poll window, used as the deadline when the chain
+    /// epoch boundary time is unknown (mock / no-registry fallback). When the
+    /// boundary IS known, the schedule-anchored [`Self::dkg_round1_offset`] /
+    /// [`Self::dkg_round2_offset`] take over.
     pub dkg_round_timeout: Duration,
+    /// Round 1 deadline as an offset from the epoch boundary (WI-014 #6). All
+    /// nodes anchor to the same chain-time instant, so they freeze the live
+    /// subset L1 together regardless of when each locally started the round.
+    pub dkg_round1_offset: Duration,
+    /// Round 2 deadline as an offset from the epoch boundary (> round 1).
+    pub dkg_round2_offset: Duration,
     pub poll_interval: Duration,
     pub quorum51_timeout: Duration,
     pub federation_timeout: Duration,
@@ -373,6 +383,8 @@ impl EpochConfig {
     pub fn demo_default(identity: SpoIdentity) -> Self {
         Self {
             dkg_round_timeout: Duration::from_secs(300),
+            dkg_round1_offset: Duration::from_secs(120),
+            dkg_round2_offset: Duration::from_secs(240),
             poll_interval: Duration::from_millis(5000),
             quorum51_timeout: Duration::from_secs(300),
             federation_timeout: Duration::from_secs(300),
