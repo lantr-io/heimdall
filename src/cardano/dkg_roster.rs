@@ -45,7 +45,7 @@ use crate::cardano::roster::{
     FROST_MIN_PARTICIPANTS, RegistryRosterSource, RegistrySnapshot, RosterError,
     validate_bifrost_url,
 };
-use crate::cardano::stake::fetch_pool_stake;
+use crate::cardano::stake::{StakeSource, fetch_pool_stake_src};
 use crate::epoch::state::{Roster, SpoInfo};
 
 /// Security threshold as a percentage of total eligible stake: any `t`
@@ -531,6 +531,8 @@ pub async fn fetch_eligible_stakes(
     base_url: &str,
     project_id: &str,
     pool_ids: &[Vec<u8>],
+    source: StakeSource,
+    epoch: u64,
 ) -> Result<BTreeMap<Vec<u8>, u64>, String> {
     let mut stakes = BTreeMap::new();
     for pool_id in pool_ids {
@@ -538,7 +540,9 @@ pub async fn fetch_eligible_stakes(
             .as_slice()
             .try_into()
             .map_err(|_| format!("pool_id is not 28 bytes: {}", hex::encode(pool_id)))?;
-        let stake = fetch_pool_stake(base_url, project_id, &pool_id_bech32(&arr)).await?;
+        let stake =
+            fetch_pool_stake_src(source, base_url, project_id, epoch, &pool_id_bech32(&arr))
+                .await?;
         stakes.insert(pool_id.clone(), stake.active_stake);
     }
     Ok(stakes)
@@ -553,6 +557,7 @@ pub async fn fetch_dkg_context(
     bans: Option<&BanListSource>,
     base_url: &str,
     project_id: &str,
+    stake_source: StakeSource,
     epoch: u64,
     attempt: u32,
 ) -> Result<DkgContext, DkgFetchError> {
@@ -577,7 +582,7 @@ pub async fn fetch_dkg_context(
         .await
         .map_err(DkgFetchError::Ban)?;
     let eligible = eligible_pool_ids(&snapshot, &active_bans);
-    let stakes = fetch_eligible_stakes(base_url, project_id, &eligible)
+    let stakes = fetch_eligible_stakes(base_url, project_id, &eligible, stake_source, epoch)
         .await
         .map_err(DkgFetchError::Stake)?;
     let mut ctx = derive_dkg_context(&snapshot, &active_bans, &stakes, epoch, attempt)

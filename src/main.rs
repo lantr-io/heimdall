@@ -856,6 +856,13 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
             cfg.cardano.oracle_constructor,
         );
 
+        // Per-pool stake source for the DKG threshold (default Blockfrost;
+        // "yaci_store" for a local yaci-devkit devnet).
+        let stake_source =
+            heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
+                .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
+        bf_chain = bf_chain.with_stake_source(stake_source);
+
         // On-chain SPO registry roster (WI-010): configured via
         // cardano.{registry_blueprint, registry_bootstrap, treasury_info_asset_name}.
         // Without it query_roster serves the fixture roster.
@@ -925,14 +932,13 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
         Arc::new(OsRngSource)
     };
 
-    // Identity (WI-014): this node's bifrost key locates its own roster entry
-    // (own_participant). The positional --index is a legacy fallback only for
-    // the config/mock fixture, whose SpoInfos carry no bifrost_id_pk.
+    // Identity (WI-014/WI-023): with an on-chain registry, this node's bifrost
+    // key (from [bifrost].skey_path) locates its own roster entry
+    // (own_participant). For the no-registry local demo there is no configured
+    // key — the per-node identity AND its secret come from `--index` via the
+    // fixture's deterministic keypairs.
     let secp = bitcoin::secp256k1::Secp256k1::new();
-    let keypair = cfg
-        .load_bifrost_keypair(&secp)
-        .unwrap_or_else(|e| panic!("bifrost identity key required for the HTTP transport: {e}"));
-    let bifrost_id_pk = keypair.x_only_public_key().0.serialize();
+    let configured_keypair = cfg.load_bifrost_keypair(&secp).ok();
 
     // WI-014: query the roster at the REAL current epoch (was hardcoded 0).
     let epoch = chain
@@ -944,30 +950,63 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
         .await
         .expect("query initial roster");
 
-    let (id, me) = match roster.own_participant(&bifrost_id_pk) {
-        Some((id, info)) => (id, info),
+    let (id, me, keypair) = match configured_keypair {
+        // A [bifrost].skey_path was configured: locate ourselves by that key.
+        Some(kp) => {
+            let bifrost_id_pk = kp.x_only_public_key().0.serialize();
+            match roster.own_participant(&bifrost_id_pk) {
+                Some((id, info)) => (id, info.clone(), kp),
+                None => {
+                    // Not in the roster by bifrost key. Against a real registry
+                    // roster this is fatal (not registered / banned / URL-excluded).
+                    // Fall back to --index ONLY for the legacy fixture demo.
+                    let ix = index.unwrap_or_else(|| {
+                        panic!(
+                            "this node's bifrost_id_pk ({}) is not in the eligible roster for \
+                             epoch {epoch} (not registered / banned / URL-excluded) and no \
+                             --index fallback was given — refusing to run DKG under an unknown \
+                             identity",
+                            hex::encode(bifrost_id_pk)
+                        )
+                    });
+                    let id = Identifier::try_from(ix).unwrap();
+                    let info = roster
+                        .participants
+                        .get(&id)
+                        .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
+                        .clone();
+                    eprintln!(
+                        "[demo] WARNING: bifrost_id_pk not found in roster; falling back to \
+                         --index {ix} (fixture/legacy demo only)"
+                    );
+                    (id, info, kp)
+                }
+            }
+        }
+        // No configured key (WI-023 no-registry demo): both identity and secret
+        // come from --index via the fixture's deterministic keypairs, so 3
+        // processes sharing one config differ only by `--index`.
         None => {
-            // Not in the roster by bifrost key. Against a real registry roster
-            // this is fatal (not registered / banned / bifrost_url excluded). Fall
-            // back to --index ONLY for the fixture demo (empty bifrost_id_pks).
             let ix = index.unwrap_or_else(|| {
                 panic!(
-                    "this node's bifrost_id_pk ({}) is not in the eligible roster for epoch \
-                     {epoch} (not registered / banned / URL-excluded) and no --index fallback \
-                     was given — refusing to run DKG under an unknown identity",
-                    hex::encode(bifrost_id_pk)
+                    "no bifrost identity key — set [bifrost].skey_path (on-chain registry \
+                     deployments) or pass --index N for the local no-registry fixture demo"
                 )
             });
             let id = Identifier::try_from(ix).unwrap();
             let info = roster
                 .participants
                 .get(&id)
-                .unwrap_or_else(|| panic!("--index {ix} is not in the roster"));
-            eprintln!(
-                "[demo] WARNING: bifrost_id_pk not found in roster; falling back to --index {ix} \
-                 (fixture/legacy demo only)"
-            );
-            (id, info)
+                .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
+                .clone();
+            let kp = *fixture.bifrost_keypairs.get(&id).unwrap_or_else(|| {
+                panic!(
+                    "--index {ix}: no fixture bifrost keypair — the no-registry demo derives \
+                     each node's key from the fixture; set [bifrost].skey_path for a registry \
+                     deployment"
+                )
+            });
+            (id, info, kp)
         }
     };
     let port = port_from_url(&me.bifrost_url).unwrap_or_else(|e| panic!("{e}"));
@@ -2005,7 +2044,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         registration_message, verify_registration,
     };
     use heimdall::cardano::registry::REGISTRATION_ROOT_KEY;
-    use heimdall::cardano::stake::{check_min_stake, fetch_pool_stake};
+    use heimdall::cardano::stake::{StakeSource, check_min_stake, fetch_pool_stake_src};
     use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
     use pallas_crypto::key::ed25519;
 
@@ -2131,10 +2170,24 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
     // ── R2 min-stake gate: gates submission; a dry run only warns ──
+    let stake_source = StakeSource::from_config(cfg.cardano.stake_source.as_deref())?;
     match cfg.cardano.min_stake_lovelace {
         Some(threshold) => {
+            // yaci-store reads stake per-epoch; Blockfrost ignores the epoch.
+            let epoch = match stake_source {
+                StakeSource::YaciStore => rt
+                    .block_on(bf_http::fetch_current_epoch(&base_url, pid))
+                    .map_err(|e| format!("min-stake gate (epoch): {e}"))?,
+                StakeSource::Blockfrost => 0,
+            };
             let stake = rt
-                .block_on(fetch_pool_stake(&base_url, pid, &pool_id_bech32(&pool_id)))
+                .block_on(fetch_pool_stake_src(
+                    stake_source,
+                    &base_url,
+                    pid,
+                    epoch,
+                    &pool_id_bech32(&pool_id),
+                ))
                 .map_err(|e| format!("min-stake gate: {e}"))?;
             let chk = check_min_stake(&stake, threshold);
             println!(
@@ -2735,7 +2788,16 @@ fn run_show_roster(
         derive_dkg_context, eligible_pool_ids, fetch_eligible_stakes,
     };
     let eligible = eligible_pool_ids(&snapshot, &active_bans);
-    match rt.block_on(fetch_eligible_stakes(&base_url, pid, &eligible)) {
+    let stake_source =
+        heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
+            .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
+    match rt.block_on(fetch_eligible_stakes(
+        &base_url,
+        pid,
+        &eligible,
+        stake_source,
+        epoch,
+    )) {
         Ok(stakes) => match derive_dkg_context(&snapshot, &active_bans, &stakes, epoch, 0) {
             Ok(ctx) => {
                 println!(
