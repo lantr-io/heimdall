@@ -178,6 +178,12 @@ pub struct CardanoConfig {
     /// here. `None` → no gate configured (the caller must error rather than
     /// admit unconditionally).
     pub min_stake_lovelace: Option<u64>,
+    /// Where the DKG roster threshold + R2 gate read per-pool active stake.
+    /// `None`/`"blockfrost"` (default) → Blockfrost `/pools/{id}.active_stake`
+    /// (preprod/mainnet). `"yaci_store"` → a local yaci-devkit devnet, which
+    /// has no `/pools/{id}`; stake is read from
+    /// `/epochs/{epoch}/pools/{id}/stake`. See `cardano::stake::StakeSource`.
+    pub stake_source: Option<String>,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
     pub submit_oracle: bool,
@@ -241,6 +247,7 @@ impl Default for CardanoConfig {
             treasury_asset_name: None,
             mnemonic: None,
             min_stake_lovelace: None,
+            stake_source: None,
             submit_oracle: true,
             oracle_constructor: 0,
             tm_script_cbor: None,

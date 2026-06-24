@@ -50,6 +50,9 @@ pub struct BlockfrostCardanoChain {
     /// computing the threshold (WI-012). `None` → no ban filtering (e.g.
     /// before the ban list is bootstrapped, WI-015).
     ban_source: Option<crate::cardano::ban_list::BanListSource>,
+    /// Where per-pool active stake is read for the DKG threshold. Defaults to
+    /// Blockfrost (`/pools/{id}`); set to `YaciStore` for a local devnet.
+    stake_source: crate::cardano::stake::StakeSource,
     /// Mnemonic-derived payment key for the Cardano wallet that pays
     /// fees. `None` means publishing is disabled (dry run).
     payment_key: Option<PrivateKey>,
@@ -109,6 +112,7 @@ impl BlockfrostCardanoChain {
             fallback_roster,
             registry_roster: None,
             ban_source: None,
+            stake_source: crate::cardano::stake::StakeSource::Blockfrost,
             payment_key: None,
             wallet_base_address: None,
             treasury_y_51: Mutex::new(None),
@@ -149,6 +153,13 @@ impl BlockfrostCardanoChain {
     /// (WI-012). Only meaningful alongside [`Self::with_registry_roster`].
     pub fn with_ban_source(mut self, source: crate::cardano::ban_list::BanListSource) -> Self {
         self.ban_source = Some(source);
+        self
+    }
+
+    /// Select where per-pool active stake is read (Blockfrost vs a local
+    /// yaci-devkit devnet). Only meaningful alongside [`Self::with_registry_roster`].
+    pub fn with_stake_source(mut self, source: crate::cardano::stake::StakeSource) -> Self {
+        self.stake_source = source;
         self
     }
 
@@ -250,6 +261,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             self.ban_source.as_ref(),
             &self.bf_base_url,
             &self.bf_project_id,
+            self.stake_source,
             epoch,
             0,
         )
@@ -270,6 +282,7 @@ impl CardanoChain for BlockfrostCardanoChain {
                 self.ban_source.as_ref(),
                 &self.bf_base_url,
                 &self.bf_project_id,
+                self.stake_source,
                 epoch,
                 attempt,
             )

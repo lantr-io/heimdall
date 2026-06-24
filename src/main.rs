@@ -856,6 +856,13 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
             cfg.cardano.oracle_constructor,
         );
 
+        // Per-pool stake source for the DKG threshold (default Blockfrost;
+        // "yaci_store" for a local yaci-devkit devnet).
+        let stake_source =
+            heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
+                .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
+        bf_chain = bf_chain.with_stake_source(stake_source);
+
         // On-chain SPO registry roster (WI-010): configured via
         // cardano.{registry_blueprint, registry_bootstrap, treasury_info_asset_name}.
         // Without it query_roster serves the fixture roster.
@@ -2037,7 +2044,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         registration_message, verify_registration,
     };
     use heimdall::cardano::registry::REGISTRATION_ROOT_KEY;
-    use heimdall::cardano::stake::{check_min_stake, fetch_pool_stake};
+    use heimdall::cardano::stake::{StakeSource, check_min_stake, fetch_pool_stake_src};
     use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
     use pallas_crypto::key::ed25519;
 
@@ -2163,10 +2170,24 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
     // ── R2 min-stake gate: gates submission; a dry run only warns ──
+    let stake_source = StakeSource::from_config(cfg.cardano.stake_source.as_deref())?;
     match cfg.cardano.min_stake_lovelace {
         Some(threshold) => {
+            // yaci-store reads stake per-epoch; Blockfrost ignores the epoch.
+            let epoch = match stake_source {
+                StakeSource::YaciStore => rt
+                    .block_on(bf_http::fetch_current_epoch(&base_url, pid))
+                    .map_err(|e| format!("min-stake gate (epoch): {e}"))?,
+                StakeSource::Blockfrost => 0,
+            };
             let stake = rt
-                .block_on(fetch_pool_stake(&base_url, pid, &pool_id_bech32(&pool_id)))
+                .block_on(fetch_pool_stake_src(
+                    stake_source,
+                    &base_url,
+                    pid,
+                    epoch,
+                    &pool_id_bech32(&pool_id),
+                ))
                 .map_err(|e| format!("min-stake gate: {e}"))?;
             let chk = check_min_stake(&stake, threshold);
             println!(
@@ -2767,7 +2788,16 @@ fn run_show_roster(
         derive_dkg_context, eligible_pool_ids, fetch_eligible_stakes,
     };
     let eligible = eligible_pool_ids(&snapshot, &active_bans);
-    match rt.block_on(fetch_eligible_stakes(&base_url, pid, &eligible)) {
+    let stake_source =
+        heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
+            .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
+    match rt.block_on(fetch_eligible_stakes(
+        &base_url,
+        pid,
+        &eligible,
+        stake_source,
+        epoch,
+    )) {
         Ok(stakes) => match derive_dkg_context(&snapshot, &active_bans, &stakes, epoch, 0) {
             Ok(ctx) => {
                 println!(
