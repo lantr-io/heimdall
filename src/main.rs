@@ -925,14 +925,13 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
         Arc::new(OsRngSource)
     };
 
-    // Identity (WI-014): this node's bifrost key locates its own roster entry
-    // (own_participant). The positional --index is a legacy fallback only for
-    // the config/mock fixture, whose SpoInfos carry no bifrost_id_pk.
+    // Identity (WI-014/WI-023): with an on-chain registry, this node's bifrost
+    // key (from [bifrost].skey_path) locates its own roster entry
+    // (own_participant). For the no-registry local demo there is no configured
+    // key — the per-node identity AND its secret come from `--index` via the
+    // fixture's deterministic keypairs.
     let secp = bitcoin::secp256k1::Secp256k1::new();
-    let keypair = cfg
-        .load_bifrost_keypair(&secp)
-        .unwrap_or_else(|e| panic!("bifrost identity key required for the HTTP transport: {e}"));
-    let bifrost_id_pk = keypair.x_only_public_key().0.serialize();
+    let configured_keypair = cfg.load_bifrost_keypair(&secp).ok();
 
     // WI-014: query the roster at the REAL current epoch (was hardcoded 0).
     let epoch = chain
@@ -944,30 +943,63 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
         .await
         .expect("query initial roster");
 
-    let (id, me) = match roster.own_participant(&bifrost_id_pk) {
-        Some((id, info)) => (id, info),
+    let (id, me, keypair) = match configured_keypair {
+        // A [bifrost].skey_path was configured: locate ourselves by that key.
+        Some(kp) => {
+            let bifrost_id_pk = kp.x_only_public_key().0.serialize();
+            match roster.own_participant(&bifrost_id_pk) {
+                Some((id, info)) => (id, info.clone(), kp),
+                None => {
+                    // Not in the roster by bifrost key. Against a real registry
+                    // roster this is fatal (not registered / banned / URL-excluded).
+                    // Fall back to --index ONLY for the legacy fixture demo.
+                    let ix = index.unwrap_or_else(|| {
+                        panic!(
+                            "this node's bifrost_id_pk ({}) is not in the eligible roster for \
+                             epoch {epoch} (not registered / banned / URL-excluded) and no \
+                             --index fallback was given — refusing to run DKG under an unknown \
+                             identity",
+                            hex::encode(bifrost_id_pk)
+                        )
+                    });
+                    let id = Identifier::try_from(ix).unwrap();
+                    let info = roster
+                        .participants
+                        .get(&id)
+                        .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
+                        .clone();
+                    eprintln!(
+                        "[demo] WARNING: bifrost_id_pk not found in roster; falling back to \
+                         --index {ix} (fixture/legacy demo only)"
+                    );
+                    (id, info, kp)
+                }
+            }
+        }
+        // No configured key (WI-023 no-registry demo): both identity and secret
+        // come from --index via the fixture's deterministic keypairs, so 3
+        // processes sharing one config differ only by `--index`.
         None => {
-            // Not in the roster by bifrost key. Against a real registry roster
-            // this is fatal (not registered / banned / bifrost_url excluded). Fall
-            // back to --index ONLY for the fixture demo (empty bifrost_id_pks).
             let ix = index.unwrap_or_else(|| {
                 panic!(
-                    "this node's bifrost_id_pk ({}) is not in the eligible roster for epoch \
-                     {epoch} (not registered / banned / URL-excluded) and no --index fallback \
-                     was given — refusing to run DKG under an unknown identity",
-                    hex::encode(bifrost_id_pk)
+                    "no bifrost identity key — set [bifrost].skey_path (on-chain registry \
+                     deployments) or pass --index N for the local no-registry fixture demo"
                 )
             });
             let id = Identifier::try_from(ix).unwrap();
             let info = roster
                 .participants
                 .get(&id)
-                .unwrap_or_else(|| panic!("--index {ix} is not in the roster"));
-            eprintln!(
-                "[demo] WARNING: bifrost_id_pk not found in roster; falling back to --index {ix} \
-                 (fixture/legacy demo only)"
-            );
-            (id, info)
+                .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
+                .clone();
+            let kp = *fixture.bifrost_keypairs.get(&id).unwrap_or_else(|| {
+                panic!(
+                    "--index {ix}: no fixture bifrost keypair — the no-registry demo derives \
+                     each node's key from the fixture; set [bifrost].skey_path for a registry \
+                     deployment"
+                )
+            });
+            (id, info, kp)
         }
     };
     let port = port_from_url(&me.bifrost_url).unwrap_or_else(|e| panic!("{e}"));

@@ -137,19 +137,33 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
     )
     .unwrap();
 
+    // Deterministic per-SPO identities (WI-023): the no-registry demo runs
+    // `max_signers` real processes that talk over the authenticated HTTP
+    // transport, which addresses peers by `bifrost_url` and verifies them by
+    // `pool_id` / `bifrost_id_pk`. Populate those (and the matching secret
+    // keypairs) the same way `demo_static_fixture` does — secret = [0x11..,i],
+    // pool_id = [i;28] — so every node computes the identical roster and each
+    // can load the key matching its own `--index`. (Empty placeholders here
+    // used to panic `run_demo`'s 28-byte pool_id check.)
     let mut participants = BTreeMap::new();
+    let mut bifrost_keypairs = BTreeMap::new();
     for i in 1..=cfg.demo.max_signers {
         let id = Identifier::try_from(i).unwrap();
         let port = cfg.http.base_port + (i - 1);
+        let mut seed = [0x11u8; 32];
+        seed[31] = i as u8;
+        let keypair = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&seed).unwrap());
+        let bifrost_id_pk = keypair.x_only_public_key().0.serialize().to_vec();
         participants.insert(
             id,
             SpoInfo {
                 identifier: id,
-                pool_id: vec![],
+                pool_id: vec![i as u8; 28],
                 bifrost_url: format!("http://{}:{}", cfg.http.bind_address, port),
-                bifrost_id_pk: vec![],
+                bifrost_id_pk,
             },
         );
+        bifrost_keypairs.insert(id, keypair);
     }
 
     StaticFixture {
@@ -183,8 +197,10 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
         pegouts: vec![],
         fee_rate_sat_per_vb: cfg.bitcoin.fee_rate_sat_per_vb,
         per_pegout_fee: Amount::from_sat(cfg.bitcoin.per_pegout_fee_sat),
-        // The config-driven `run` path loads each node's key from its own
-        // [bifrost].skey_path, not from the fixture.
-        bifrost_keypairs: BTreeMap::new(),
+        // WI-023: the no-registry demo derives each node's key from `--index`
+        // via these fixture keypairs. A real on-chain-registry deployment
+        // ignores them and loads each node's key from its own
+        // [bifrost].skey_path (matched to the registered bifrost_id_pk).
+        bifrost_keypairs,
     }
 }
