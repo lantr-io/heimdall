@@ -8,4 +8,6 @@ docs/local/
 # Generated peg-in demo output.
 /data/
 heimdall-preprod.toml
+heimdall-devnet.toml
 project/target/
+heimdall-bip322.toml

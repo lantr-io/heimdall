@@ -221,7 +221,15 @@ impl BlockfrostCardanoChain {
         .await
         .map_err(|e| EpochError::Chain(format!("blockfrost wallet UTxO query: {e}")))?;
 
-        Ok(utxos.iter().map(WalletUtxo::from_bf).collect())
+        // The oracle-update tx only needs ADA (fee + new-UTxO min-ADA + script collateral) and runs a
+        // minting script — feed coin-selection only PURE-ADA UTxOs. A token-bearing fee input drops
+        // those tokens from the change (ValueNotConservedUTxO) and a token-bearing collateral fails
+        // (CollateralContainsNonADA); the wallet's token UTxOs are irrelevant to this tx.
+        Ok(utxos
+            .iter()
+            .map(WalletUtxo::from_bf)
+            .filter(|u| u.pure_ada)
+            .collect())
     }
 }
 

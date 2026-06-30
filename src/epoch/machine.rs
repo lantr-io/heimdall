@@ -396,7 +396,9 @@ async fn collect_pegins_phase(
             if accepted.contains_key(&req.cardano_utxo) {
                 continue;
             }
-            match parse_pegin_request(&req, treasury.y_fed, refund_timeout) {
+            // Peg-in internal key is Y_51 (the FROST group key), not Y_fed —
+            // see parse_pegin_request / commit 6af7c67.
+            match parse_pegin_request(&req, treasury.y_51, refund_timeout) {
                 Ok(parsed) => {
                     accepted.insert(req.cardano_utxo.clone(), parsed);
                 }

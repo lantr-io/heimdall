@@ -2865,7 +2865,7 @@ fn run_sweep_pegins(
     use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
     use heimdall::bitcoin::taproot::treasury_spend_info;
     use heimdall::bitcoin::tm_builder::{
-        PegInInput, PegOutRequest, TreasuryInput, build_tm, sign_tm_single_key,
+        PegInInput, PegOutRequest, TreasuryInput, build_tm, sign_tm_frost,
     };
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
@@ -2874,9 +2874,27 @@ fn run_sweep_pegins(
     use heimdall::cardano::pegin_datum::parse_pegin_request;
     use heimdall::cardano::pegin_source::CardanoPegInSource;
     use heimdall::cardano::pegout_datum::fetch_pegout_requests;
+    use heimdall::frost::dkg::run_demo_dkg;
 
     let secp = Secp256k1::new();
-    let (sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    let (_sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    // Peg-in internal key + treasury key-path = the FROST group key Y_51, NOT the fe-seed y_fed
+    // (commit 6af7c67 wrongly switched these to y_fed for the demo). Reproduce the deterministic
+    // demo DKG to recover Y_51 + every signing share, then FROST-sign the TM. y_fed survives only
+    // as the treasury federation fallback leaf.
+    let dkg = run_demo_dkg(
+        b"heimdall-demo-seed-v1-0123456789",
+        cfg.demo.min_signers,
+        cfg.demo.max_signers,
+    );
+    let vk = dkg
+        .public_key_package
+        .verifying_key()
+        .serialize()
+        .map_err(|e| format!("group verifying key serialize: {e}"))?;
+    let y_51 = bitcoin::key::UntweakedPublicKey::from_slice(&vk[1..33])
+        .map_err(|e| format!("group key x-only: {e}"))?;
+    println!("  FROST group key Y_51: {}", hex::encode(&vk[1..33]));
     let csv = csv_blocks_u16(cfg)?;
     let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
 
@@ -2920,8 +2938,16 @@ fn run_sweep_pegins(
     // scriptPubKey — reuse it directly rather than re-deriving.
     let mut pegin_inputs = Vec::with_capacity(reqs.len());
     for req in &reqs {
-        let parsed = parse_pegin_request(req, y_fed, refund_timeout)
-            .map_err(|e| format!("parse_pegin_request: {e}"))?;
+        // Skip PIRs that don't reconstruct under Y_51 (other bridges' deposits, or encodings we
+        // don't yet support) rather than aborting the whole sweep — a TM sweeps the valid peg-ins
+        // and drops the rest. Mirrors the daemon's collect_pegins drop behaviour.
+        let parsed = match parse_pegin_request(req, y_51, refund_timeout) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("  dropped peg-in {:?}: {e}", req.cardano_utxo);
+                continue;
+            }
+        };
         println!(
             "  peg-in {}:{} — {} sat (depositor {})",
             parsed.btc_txid,
@@ -2982,7 +3008,7 @@ fn run_sweep_pegins(
     }
 
     let treasury_outpoint = parse_outpoint(treasury_outpoint)?;
-    let treasury_spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv);
+    let treasury_spend_info = treasury_spend_info(&secp, y_51, y_fed, csv);
     let treasury_spk = ScriptBuf::new_p2tr_tweaked(treasury_spend_info.output_key());
 
     // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..] = one
@@ -3023,8 +3049,8 @@ fn run_sweep_pegins(
         ));
     }
 
-    let signed =
-        sign_tm_single_key(&secp, &unsigned, &sk).map_err(|e| format!("sign sweep: {e}"))?;
+    let signed = sign_tm_frost(&unsigned, &dkg.key_packages, &dkg.public_key_package)
+        .map_err(|e| format!("FROST sign sweep: {e}"))?;
     let local_raw = bitcoin::consensus::encode::serialize(&signed);
     // If an existing-on-Bitcoin TM is provided, the effective tx posted to Cardano is THAT one,
     // not the locally-built one. Deserialize it so every subsequent print (txid, inputs, outputs)

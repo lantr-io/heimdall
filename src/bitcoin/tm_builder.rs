@@ -478,10 +478,103 @@ pub fn sign_tm_single_key(
     Ok(tx)
 }
 
+/// FROST analogue of [`sign_tm_single_key`]: sign every key-path TM input with a
+/// set of FROST signing shares, applying each input's BIP-341 taptweak. Use this
+/// when the inputs are keyed to the FROST group key `Y_51` (treasury key-path +
+/// `Y_51`-internal peg-ins) rather than a single federation key — a single
+/// `secret` cannot produce a valid `Y_51` signature.
+///
+/// All `key_packages` sign in this process (the demo cohort, reproduced via
+/// [`crate::frost::dkg::run_demo_dkg`]); a real multi-SPO deployment drives the
+/// identical per-input commit → tweaked-sign → aggregate rounds across the
+/// network instead (`epoch::signing::sign_phase`). Returns the witnessed tx.
+pub fn sign_tm_frost(
+    unsigned: &UnsignedTm,
+    key_packages: &std::collections::BTreeMap<
+        frost_secp256k1_tr::Identifier,
+        frost_secp256k1_tr::keys::KeyPackage,
+    >,
+    public_key_package: &frost_secp256k1_tr::keys::PublicKeyPackage,
+) -> Result<Transaction, String> {
+    use crate::frost::participant;
+    use bitcoin::hashes::{HashEngine, sha256};
+    use frost_secp256k1_tr as frost;
+    use rand_core::SeedableRng;
+    use std::collections::BTreeMap;
+
+    let n = unsigned.tx.input.len();
+    if unsigned.prevouts.len() != n || unsigned.input_spend_info.len() != n {
+        return Err(format!(
+            "malformed UnsignedTm: {n} inputs but {} prevouts / {} spend-infos",
+            unsigned.prevouts.len(),
+            unsigned.input_spend_info.len()
+        ));
+    }
+    let sighashes = compute_sighashes(unsigned);
+    let mut tx = unsigned.tx.clone();
+
+    for (i, ((txin, spend_info), sighash)) in tx
+        .input
+        .iter_mut()
+        .zip(unsigned.input_spend_info.iter())
+        .zip(sighashes.iter())
+        .enumerate()
+    {
+        // The BIP-341 key-path tweak = this input's script-tree merkle root.
+        let merkle_root: Option<[u8; 32]> = spend_info.merkle_root().map(|h| h.to_byte_array());
+        let mr: Option<&[u8]> = merkle_root.as_ref().map(|b| b.as_slice());
+
+        // Round 1: per-signer nonce + commitment. Deterministic-but-unique nonce
+        // per (input, signer) — safe because each signs exactly one message.
+        let mut nonces = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for (j, (id, kp)) in key_packages.iter().enumerate() {
+            let mut eng = sha256::Hash::engine();
+            eng.input(b"heimdall-sweep-nonce-v1");
+            eng.input(&(i as u32).to_le_bytes());
+            eng.input(&(j as u32).to_le_bytes());
+            let mut rng =
+                rand_chacha::ChaCha20Rng::from_seed(sha256::Hash::from_engine(eng).to_byte_array());
+            let (sn, sc) = participant::sign_round1(kp, &mut rng);
+            nonces.insert(*id, sn);
+            commitments.insert(*id, sc);
+        }
+
+        let signing_package = frost::SigningPackage::new(commitments, sighash);
+
+        // Round 2: tweaked signature share per signer, then aggregate.
+        let mut shares = BTreeMap::new();
+        for (id, kp) in key_packages.iter() {
+            let share = participant::sign_round2_with_tweak(&signing_package, &nonces[id], kp, mr)
+                .map_err(|e| format!("input {i} sign_round2: {e}"))?;
+            shares.insert(*id, share);
+        }
+        let sig = participant::sign_aggregate_with_tweak(
+            &signing_package,
+            &shares,
+            public_key_package,
+            mr,
+        )
+        .map_err(|e| format!("input {i} aggregate: {e}"))?;
+
+        let sig_bytes = sig
+            .serialize()
+            .map_err(|e| format!("input {i} sig serialize: {e}"))?;
+        let schnorr = bitcoin::secp256k1::schnorr::Signature::from_slice(&sig_bytes)
+            .map_err(|e| format!("input {i} schnorr from_slice: {e}"))?;
+        let tap_sig = bitcoin::taproot::Signature {
+            signature: schnorr,
+            sighash_type: TapSighashType::Default,
+        };
+        txin.witness = Witness::p2tr_key_spend(&tap_sig);
+    }
+    Ok(tx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitcoin::taproot::treasury_spend_info;
+    use crate::bitcoin::taproot::{pegin_spend_info, treasury_spend_info};
     use bitcoin::secp256k1::{Keypair, Secp256k1};
 
     fn xonly_from_seed(seed: [u8; 32]) -> bitcoin::key::UntweakedPublicKey {
@@ -592,6 +685,72 @@ mod tests {
             let outkey = tm.input_spend_info[i].output_key().to_x_only_public_key();
             secp.verify_schnorr(&sig, &msg, &outkey)
                 .unwrap_or_else(|e| panic!("input {i} sig invalid under output key: {e}"));
+        }
+    }
+
+    // --- FROST signer (Y_51-keyed inputs) ---
+
+    #[test]
+    fn test_frost_signer_verifies_under_output_key() {
+        use crate::frost::dkg::run_demo_dkg;
+
+        let secp = Secp256k1::new();
+        // Reproduce the demo DKG; the TM inputs are keyed to the group key Y_51,
+        // which a single federation key cannot sign for.
+        let dkg = run_demo_dkg(b"heimdall-demo-seed-v1-0123456789", 2, 3);
+        let vk = dkg.public_key_package.verifying_key().serialize().unwrap();
+        let y_51 = bitcoin::key::UntweakedPublicKey::from_slice(&vk[1..33]).unwrap();
+        // Sanity: this is the live deployment's Y_51.
+        assert_eq!(
+            hex::encode(&vk[1..33]),
+            "b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854"
+        );
+
+        let y_fed = xonly_from_seed([3u8; 32]);
+        let depositor = xonly_from_seed([7u8; 32]);
+        let treasury_si = treasury_spend_info(&secp, y_51, y_fed, 144);
+        let pegin_si = pegin_spend_info(&secp, y_51, depositor, 720);
+
+        let tm = build_tm(
+            TreasuryInput {
+                outpoint: OutPoint {
+                    txid: make_txid(0xAA),
+                    vout: 0,
+                },
+                value: Amount::from_sat(1_000_000),
+                spend_info: treasury_si,
+            },
+            vec![PegInInput {
+                outpoint: OutPoint {
+                    txid: make_txid(0xBB),
+                    vout: 0,
+                },
+                value: Amount::from_sat(5_714),
+                spend_info: pegin_si,
+            }],
+            vec![],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+
+        let signed = sign_tm_frost(&tm, &dkg.key_packages, &dkg.public_key_package).unwrap();
+        let sighashes = compute_sighashes(&tm);
+
+        assert_eq!(signed.input.len(), 2);
+        for (i, txin) in signed.input.iter().enumerate() {
+            let items = txin.witness.to_vec();
+            assert_eq!(items.len(), 1, "input {i}: key-path witness is one element");
+            assert_eq!(
+                items[0].len(),
+                64,
+                "input {i}: Default-sighash sig is 64 bytes"
+            );
+            let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(&items[0]).unwrap();
+            let msg = bitcoin::secp256k1::Message::from_digest(sighashes[i]);
+            let outkey = tm.input_spend_info[i].output_key().to_x_only_public_key();
+            secp.verify_schnorr(&sig, &msg, &outkey)
+                .unwrap_or_else(|e| panic!("input {i} FROST sig invalid under output key: {e}"));
         }
     }
 

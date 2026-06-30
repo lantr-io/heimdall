@@ -199,6 +199,79 @@ pub fn run_dkg_all_completions(min_signers: u16, max_signers: u16) -> FullDkgRes
     }
 }
 
+/// Reproduce the **deterministic demo DKG** (seed `heimdall-demo-seed-v1-…`,
+/// context `dkg1`) in a single process, returning every participant's key
+/// package + the shared group key. This lets the demo sweep FROST-sign a
+/// `Y_51`-keyed TM with no live cohort — it derives the exact same group key /
+/// shares a real multi-process demo run does. (A production deployment instead
+/// loads each SPO's own share from persisted DKG state; this is demo-only.)
+pub fn run_demo_dkg(seed: &[u8], min_signers: u16, max_signers: u16) -> FullDkgResult {
+    use crate::frost::participant;
+    use bitcoin::hashes::{Hash, HashEngine, sha256};
+    use rand_core::SeedableRng;
+
+    // Each participant's Round-1 RNG is `ChaCha20(sha256(seed ‖ "dkg1"))` — the
+    // same construction as `mocks::SeededRngSource::rng(b"dkg1")`.
+    let dkg_rng = || {
+        let mut eng = sha256::Hash::engine();
+        eng.input(seed);
+        eng.input(b"dkg1");
+        rand_chacha::ChaCha20Rng::from_seed(sha256::Hash::from_engine(eng).to_byte_array())
+    };
+    let ids: Vec<Identifier> = (1..=max_signers)
+        .map(|i| Identifier::try_from(i).unwrap())
+        .collect();
+
+    let mut r1_secrets = BTreeMap::new();
+    let mut r1_packages = BTreeMap::new();
+    for &id in &ids {
+        let mut rng = dkg_rng();
+        let (s, p) =
+            participant::dkg_part1(id, max_signers, min_signers, &mut rng).expect("demo dkg part1");
+        r1_secrets.insert(id, s);
+        r1_packages.insert(id, p);
+    }
+
+    let mut r2_secrets = BTreeMap::new();
+    let mut r2_packages: BTreeMap<Identifier, BTreeMap<Identifier, dkg::round2::Package>> =
+        BTreeMap::new();
+    for &id in &ids {
+        let others: BTreeMap<_, _> = r1_packages
+            .iter()
+            .filter(|(k, _)| **k != id)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let (s2, p2) = participant::dkg_part2(r1_secrets.remove(&id).unwrap(), &others)
+            .expect("demo dkg part2");
+        r2_secrets.insert(id, s2);
+        r2_packages.insert(id, p2);
+    }
+
+    let mut key_packages = BTreeMap::new();
+    let mut public_key_package = None;
+    for &id in &ids {
+        let r1_others: BTreeMap<_, _> = r1_packages
+            .iter()
+            .filter(|(k, _)| **k != id)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let r2_for_me: BTreeMap<_, _> = r2_packages
+            .iter()
+            .filter(|(k, _)| **k != id)
+            .map(|(sender, m)| (*sender, m[&id].clone()))
+            .collect();
+        let (kp, pkp) = participant::dkg_part3(&r2_secrets[&id], &r1_others, &r2_for_me)
+            .expect("demo dkg part3");
+        key_packages.insert(id, kp);
+        public_key_package = Some(pkp);
+    }
+
+    FullDkgResult {
+        key_packages,
+        public_key_package: public_key_package.unwrap(),
+    }
+}
+
 /// Run DKG rounds 1+2 (parallelized) then part3 for a single participant.
 pub fn run_dkg_single_completion(
     min_signers: u16,
