@@ -20,7 +20,7 @@
 //!    `(txid, vout, value)` becomes the TM input.
 
 use bitcoin::consensus::encode::deserialize;
-use bitcoin::key::{Secp256k1, UntweakedPublicKey};
+use bitcoin::key::{Secp256k1, TapTweak, UntweakedPublicKey};
 use bitcoin::taproot::TaprootSpendInfo;
 use bitcoin::{Amount, ScriptBuf, Transaction, Txid};
 use pallas_primitives::PlutusData;
@@ -176,12 +176,13 @@ pub fn parse_beacon(tx: &Transaction) -> Result<UntweakedPublicKey, ParseError> 
 
 /// Parse and validate a raw Cardano peg-in request.
 ///
-/// `y_fed` comes from the current on-chain treasury oracle;
-/// `refund_timeout` is a protocol parameter (720 blocks per demo,
-/// overridable per-network).
+/// `pegin_internal_key` is the peg-in Taproot internal key — per spec the
+/// 51% FROST group key `Y_51` from the on-chain treasury oracle (at bootstrap
+/// this equals `Y_fed`). `refund_timeout` is a protocol parameter (720 blocks
+/// per demo, overridable per-network).
 pub fn parse_pegin_request(
     req: &CardanoPegInRequest,
-    y_fed: UntweakedPublicKey,
+    pegin_internal_key: UntweakedPublicKey,
     refund_timeout: u16,
 ) -> Result<ParsedPegIn, ParseError> {
     // 1. Decode the Cardano datum: we only trust field[1] (raw tx).
@@ -200,7 +201,15 @@ pub fn parse_pegin_request(
     // 4. Reconstruct the spec-defined peg-in Taproot address and find
     //    the unique output paying to it.
     let secp = Secp256k1::new();
-    let spend_info = pegin_spend_info(&secp, y_fed, depositor_xonly_pubkey, refund_timeout);
+    // Demo / third-party construction: the depositor refund leaf is keyed to
+    // the depositor's BIP-86 key-path output key (so a normal Taproot wallet can
+    // sign the refund), and the internal key is Y_51 — the 51% FROST quorum
+    // sweeps via the key path.
+    let refund_leaf_key = depositor_xonly_pubkey
+        .tap_tweak(&secp, None)
+        .0
+        .to_x_only_public_key();
+    let spend_info = pegin_spend_info(&secp, pegin_internal_key, refund_leaf_key, refund_timeout);
     let expected_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
 
     let mut matches = btc_tx
@@ -270,7 +279,8 @@ mod tests {
         let secp = Secp256k1::new();
         let depositor =
             UntweakedPublicKey::from_slice(&depositor_xonly_bytes).expect("valid xonly");
-        let si = pegin_spend_info(&secp, test_y_fed(), depositor, REFUND_TIMEOUT);
+        let refund_leaf_key = depositor.tap_tweak(&secp, None).0.to_x_only_public_key();
+        let si = pegin_spend_info(&secp, test_y_fed(), refund_leaf_key, REFUND_TIMEOUT);
         ScriptBuf::new_p2tr_tweaked(si.output_key())
     }
 

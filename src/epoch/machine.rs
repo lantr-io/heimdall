@@ -371,8 +371,8 @@ async fn collect_pegins_phase(
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
 
-    // Pull current Y_fed from the on-chain treasury oracle. The
-    // peg-in Taproot Q is derived per-depositor inside
+    // Pull the current treasury (Y_51) from the on-chain treasury oracle.
+    // The peg-in Taproot Q is derived per-depositor inside
     // `parse_pegin_request` using the OP_RETURN beacon xonly pubkey.
     let treasury = chain.query_treasury().await?;
     let refund_timeout = config.pegin_refund_timeout_blocks;
@@ -396,7 +396,7 @@ async fn collect_pegins_phase(
             if accepted.contains_key(&req.cardano_utxo) {
                 continue;
             }
-            match parse_pegin_request(&req, treasury.y_fed, refund_timeout) {
+            match parse_pegin_request(&req, treasury.y_51, refund_timeout) {
                 Ok(parsed) => {
                     accepted.insert(req.cardano_utxo.clone(), parsed);
                 }
