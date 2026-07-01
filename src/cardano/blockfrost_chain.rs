@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use bitcoin::Transaction;
 use bitcoin::consensus::deserialize;
-use blockfrost::{BlockFrostSettings, BlockfrostAPI, Pagination};
+use blockfrost::{BlockFrostSettings, BlockfrostAPI};
 use pallas_codec::minicbor;
 use pallas_primitives::conway::PlutusData;
 use pallas_wallet::PrivateKey;
@@ -29,6 +29,9 @@ use crate::epoch::state::{EpochError, EpochResult, Roster};
 use crate::epoch::traits::{CardanoChain, EpochBoundaryEvent, PegOutRequestUtxo, TreasuryUtxo};
 
 pub struct BlockfrostCardanoChain {
+    /// Pooled Blockfrost client — used ONLY for `transactions_submit` (the leader's
+    /// oracle-update POST). Reads go through fresh `bf_http` clients instead: the
+    /// pooled keep-alive connection goes stale during the staggered-start DKG wait.
     api: BlockfrostAPI,
     /// Bech32 address holding the treasury oracle UTxOs.
     treasury_address: String,
@@ -323,11 +326,20 @@ impl CardanoChain for BlockfrostCardanoChain {
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {
-        let utxos = self
-            .api
-            .addresses_utxos(&self.treasury_address, Pagination::all())
-            .await
-            .map_err(|e| EpochError::Chain(format!("blockfrost treasury query: {e}")))?;
+        // Raw HTTP with a fresh client per call (like query_wallet_utxos), NOT the
+        // pooled `BlockfrostAPI`. The pooled keep-alive connection goes stale during
+        // a staggered-start DKG wait (the node talks only to peers for tens of
+        // seconds while the connection sits idle and the server closes it), so a
+        // reused connection fails the post-DKG treasury query with "error sending
+        // request". A fresh client sidesteps that and also tolerates backends
+        // (yaci-devkit) whose UTxO JSON omits `tx_index`.
+        let utxos = crate::cardano::bf_http::fetch_address_utxos(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            &self.treasury_address,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("blockfrost treasury query: {e}")))?;
 
         let asset_unit = format!(
             "{}{}",
