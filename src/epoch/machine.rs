@@ -633,6 +633,20 @@ async fn submit_phase(
 
     let tx_bytes = bitcoin::consensus::encode::serialize(&signed_tx);
 
+    // Every participant assembles the *identical* witnessed tx (same FROST
+    // group signature, deterministic build), so logging the raw hex on every
+    // node makes the "all SPOs saw the same signed transaction" moment visible
+    // across all terminals — the point at which the epoch's signing round is
+    // complete. The leader additionally submits it below.
+    crate::epoch_log!(
+        me,
+        epoch,
+        "Submit: signed treasury movement — txid={} ({} bytes)\n    raw tx: {}",
+        tm.txid,
+        tx_bytes.len(),
+        hex::encode(&tx_bytes)
+    );
+
     // Only the designated leader broadcasts. Everyone else assembles
     // the witnessed tx, holds it, and waits — they'd take over on a
     // future leader-timeout cascade.
