@@ -27,6 +27,14 @@ pub struct TreasuryConfig {
     pub federation_csv_blocks: u32,
     pub fee_rate_sat_per_vb: u64,
     pub per_pegout_fee: Amount,
+    /// The current treasury Bitcoin UTxO, tracked OFF-CHAIN by the SPO (spec
+    /// §640/§1677: "known from the previous TM's change output, or from protocol
+    /// bootstrap"). heimdall builds every TM, so in steady state it knows its own
+    /// output 0; for the first TM it comes from bootstrap. The on-chain TM datum is
+    /// read ONLY for `btc_confirmed` — the treasury pointer is not re-derived from
+    /// it. Sourced from config `bitcoin.treasury_txid / treasury_vout / treasury_amount_sat`.
+    pub treasury_outpoint: bitcoin::OutPoint,
+    pub treasury_value: Amount,
 }
 
 #[derive(Debug)]
@@ -171,6 +179,8 @@ mod tests {
             federation_csv_blocks: 144,
             fee_rate_sat_per_vb: 1,
             per_pegout_fee: Amount::from_sat(1_000),
+            treasury_outpoint: OutPoint::null(),
+            treasury_value: Amount::from_sat(10_000_000),
         }
     }
 

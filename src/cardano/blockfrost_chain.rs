@@ -1,10 +1,12 @@
 //! `CardanoChain` backed by Blockfrost.
 //!
-//! Finds the treasury oracle UTxO by scanning all UTxOs at the
-//! treasury address and picking the most recent one that carries a
-//! datum. The datum is `Constr(X, [BoundedBytes(raw_btc_tx)])` —
-//! we extract the BTC tx hex from the JSON, deserialize, and take
-//! output 0 as the treasury.
+//! Reads the on-chain TM UTxO at the treasury address ONLY for the
+//! `btc_confirmed` signal (datum constructor: 0 = Unconfirmed, 1 =
+//! Confirmed). The treasury Bitcoin UTxO itself (outpoint + value) is
+//! tracked OFF-CHAIN by the SPO per spec §640/§1677 and comes from
+//! `TreasuryConfig` (config `bitcoin.treasury_txid/vout/amount`), not
+//! from parsing the datum — the Confirmed datum carries only a
+//! `btc_txid` identifier + metadata (§638), never a full tx.
 //!
 //! `submit_signed_tm` builds a Cardano transaction that **creates a
 //! new UTxO** at the treasury address with the signed BTC tx as an
@@ -14,8 +16,6 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use bitcoin::Transaction;
-use bitcoin::consensus::deserialize;
 use blockfrost::{BlockFrostSettings, BlockfrostAPI};
 use pallas_codec::minicbor;
 use pallas_primitives::conway::PlutusData;
@@ -377,34 +377,21 @@ impl CardanoChain for BlockfrostCardanoChain {
             "[blockfrost] treasury datum: constructor={constructor} btc_confirmed={btc_confirmed}"
         );
 
-        let tx_bytes = match constr.fields.first() {
-            Some(PlutusData::BoundedBytes(bb)) => {
-                let v: Vec<u8> = bb.clone().into();
-                v
-            }
-            _ => {
-                return Err(EpochError::Chain(
-                    "treasury datum Constr has no BoundedBytes field".into(),
-                ));
-            }
-        };
-        let tx: Transaction = deserialize(&tx_bytes)
-            .map_err(|e| EpochError::Chain(format!("BTC tx deserialize: {e}")))?;
-
-        let out = tx
-            .output
-            .first()
-            .ok_or_else(|| EpochError::Chain("BTC tx in treasury datum has no outputs".into()))?;
-        let txid = tx.compute_txid();
-
+        // Spec §640/§1677: the current treasury Bitcoin UTxO is tracked OFF-CHAIN by
+        // the SPO — known from the previous TM's change output (heimdall builds every
+        // TM, so it knows its own output 0) or from protocol bootstrap for the first
+        // TM. It is NOT re-derived from this datum: the Confirmed TM datum carries only
+        // `btc_txid` + metadata (§638), so parsing its first field as a full Bitcoin tx
+        // was never correct in steady state. The datum is used solely for the
+        // `btc_confirmed` signal (read above); the outpoint + value come from config.
         let maybe_key = *self.treasury_y_51.lock().unwrap();
         let y_51 = maybe_key.unwrap_or(self.treasury_config.y_51);
         // After DKG: Y_fed = Y_51 = FROST group key (same key everywhere).
         let y_fed = maybe_key.unwrap_or(self.treasury_config.y_fed);
 
         Ok(TreasuryUtxo {
-            outpoint: bitcoin::OutPoint { txid, vout: 0 },
-            value: out.value,
+            outpoint: self.treasury_config.treasury_outpoint,
+            value: self.treasury_config.treasury_value,
             y_51,
             y_fed,
             federation_csv_blocks: self.treasury_config.federation_csv_blocks,

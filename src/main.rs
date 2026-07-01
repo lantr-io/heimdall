@@ -822,6 +822,8 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
             federation_csv_blocks: fixture.federation_csv_blocks,
             fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
             per_pegout_fee: fixture.per_pegout_fee,
+            treasury_outpoint: fixture.treasury_outpoint,
+            treasury_value: fixture.treasury_value,
         };
         let mut bf_chain = BlockfrostCardanoChain::new(
             project_id,
@@ -3202,6 +3204,8 @@ fn run_sweep_pegins(
             federation_csv_blocks: fixture.federation_csv_blocks,
             fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
             per_pegout_fee: fixture.per_pegout_fee,
+            treasury_outpoint: fixture.treasury_outpoint,
+            treasury_value: fixture.treasury_value,
         };
         let mut chain = BlockfrostCardanoChain::new(
             project_id,
