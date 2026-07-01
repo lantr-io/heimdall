@@ -6,9 +6,9 @@
 # group key. --deterministic makes it reproducible: all three converge on
 #     Y_51 = b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854
 # Ctrl-C after the "PublishKeys: group_key = …" line (this is DKG-only; ignore CollectPegins/BuildTm).
-set -euo pipefail
+set -eu
 
-HD="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # heimdall repo root
+HD="$(cd "$(dirname "$0")/../.." && pwd)"   # heimdall repo root
 cd "$HD"
 
 BP="$HD/.b814cca.plutus.json"

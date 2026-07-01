@@ -4,9 +4,9 @@
 # Prints the 4 registered SPOs (the spos_registry linked list) and the stake-weighted
 # DKG roster = 2 of 3: the 3 real-stake pools (20 ADA each); the stake-less legacy SPO
 # 5ae193ab… is excluded (cardano.demo_exclude_unstaked = true).
-set -euo pipefail
+set -eu
 
-HD="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # heimdall repo root
+HD="$(cd "$(dirname "$0")/../.." && pwd)"   # heimdall repo root
 cd "$HD"
 
 # heimdall-preprod.toml pins registry_blueprint at this saved b814cca copy; extract if missing.

@@ -11,9 +11,9 @@
 # registry the build refuses with `registry: pool_id already registered` — that error IS the proof
 # it is on-chain. To actually build/broadcast a registration, run against a fresh (re-bootstrapped)
 # registry. Kept here as the exact, reproducible command + params.
-set -euo pipefail
+set -eu
 
-HD="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # heimdall repo root
+HD="$(cd "$(dirname "$0")/../.." && pwd)"   # heimdall repo root
 cd "$HD"
 
 # The 2026-06-11 registry was deployed with the ft-bifrost-bridge `b814cca` blueprint; pin it
