@@ -2830,11 +2830,15 @@ fn run_show_roster(
                         );
                     }
                     for ex in &ctx.excluded {
-                        println!(
-                            "  excluded pool {}: {}",
-                            hex::encode(&ex.pool_id),
-                            ex.reason
-                        );
+                        // `demo_exclude_unstaked` excludes no-stake pools by adding them to the
+                        // ban set, so `ex.reason` would read "banned" — relabel those accurately
+                        // (they were NOT banned/slashed, just have no resolvable Cardano stake).
+                        let reason = if exclude_unstaked && !active_bans.contains(&ex.pool_id) {
+                            "no active stake (excluded via demo_exclude_unstaked)".to_string()
+                        } else {
+                            ex.reason.to_string()
+                        };
+                        println!("  excluded pool {}: {}", hex::encode(&ex.pool_id), reason);
                     }
                 }
                 Err(e) => println!("DKG roster:        cannot derive ({e})"),
