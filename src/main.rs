@@ -862,6 +862,7 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
             heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
                 .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
         bf_chain = bf_chain.with_stake_source(stake_source);
+        bf_chain = bf_chain.with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked);
 
         // On-chain SPO registry roster (WI-010): configured via
         // cardano.{registry_blueprint, registry_bootstrap, treasury_info_asset_name}.
@@ -2791,40 +2792,54 @@ fn run_show_roster(
     let stake_source =
         heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
             .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
+    let exclude_unstaked = cfg.cardano.demo_exclude_unstaked;
     match rt.block_on(fetch_eligible_stakes(
         &base_url,
         pid,
         &eligible,
         stake_source,
         epoch,
+        exclude_unstaked,
     )) {
-        Ok(stakes) => match derive_dkg_context(&snapshot, &active_bans, &stakes, epoch, 0) {
-            Ok(ctx) => {
-                println!(
-                    "DKG roster (epoch {epoch}; threshold {} of {}, total stake {}):",
-                    ctx.threshold,
-                    ctx.participants.len(),
-                    ctx.total_stake
-                );
-                for p in &ctx.participants {
-                    println!(
-                        "  #{:<3} pk {}  stake={} {}",
-                        p.index,
-                        hex::encode(&p.bifrost_id_pk),
-                        p.active_stake,
-                        p.bifrost_url
-                    );
-                }
-                for ex in &ctx.excluded {
-                    println!(
-                        "  excluded pool {}: {}",
-                        hex::encode(&ex.pool_id),
-                        ex.reason
-                    );
+        Ok(stakes) => {
+            // DEMO-ONLY: drop pools whose stake was skipped (mirrors the demo
+            // path) so the threshold below reflects only resolvable-stake pools.
+            let mut bans = active_bans.clone();
+            if exclude_unstaked {
+                for pid2 in &eligible {
+                    if !stakes.contains_key(pid2) {
+                        bans.insert(pid2.clone());
+                    }
                 }
             }
-            Err(e) => println!("DKG roster:        cannot derive ({e})"),
-        },
+            match derive_dkg_context(&snapshot, &bans, &stakes, epoch, 0) {
+                Ok(ctx) => {
+                    println!(
+                        "DKG roster (epoch {epoch}; threshold {} of {}, total stake {}):",
+                        ctx.threshold,
+                        ctx.participants.len(),
+                        ctx.total_stake
+                    );
+                    for p in &ctx.participants {
+                        println!(
+                            "  #{:<3} pk {}  stake={} {}",
+                            p.index,
+                            hex::encode(&p.bifrost_id_pk),
+                            p.active_stake,
+                            p.bifrost_url
+                        );
+                    }
+                    for ex in &ctx.excluded {
+                        println!(
+                            "  excluded pool {}: {}",
+                            hex::encode(&ex.pool_id),
+                            ex.reason
+                        );
+                    }
+                }
+                Err(e) => println!("DKG roster:        cannot derive ({e})"),
+            }
+        }
         // A stake query failure is fatal for a real ceremony (the threshold
         // can't be computed), but tolerated in this read-only diagnostic so
         // the registry + ban sections above still print — synthetic preprod

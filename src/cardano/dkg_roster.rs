@@ -533,6 +533,10 @@ pub async fn fetch_eligible_stakes(
     pool_ids: &[Vec<u8>],
     source: StakeSource,
     epoch: u64,
+    // DEMO-ONLY: when true, a pool whose stake can't be resolved is skipped
+    // (omitted from the map) instead of failing the whole fetch. The caller
+    // then excludes those pools from the roster. Default false in production.
+    exclude_unstaked: bool,
 ) -> Result<BTreeMap<Vec<u8>, u64>, String> {
     let mut stakes = BTreeMap::new();
     for pool_id in pool_ids {
@@ -540,10 +544,19 @@ pub async fn fetch_eligible_stakes(
             .as_slice()
             .try_into()
             .map_err(|_| format!("pool_id is not 28 bytes: {}", hex::encode(pool_id)))?;
-        let stake =
-            fetch_pool_stake_src(source, base_url, project_id, epoch, &pool_id_bech32(&arr))
-                .await?;
-        stakes.insert(pool_id.clone(), stake.active_stake);
+        match fetch_pool_stake_src(source, base_url, project_id, epoch, &pool_id_bech32(&arr)).await
+        {
+            Ok(stake) => {
+                stakes.insert(pool_id.clone(), stake.active_stake);
+            }
+            Err(e) if exclude_unstaked => {
+                eprintln!(
+                    "[demo] excluding pool {} from roster: stake unresolved ({e})",
+                    pool_id_bech32(&arr)
+                );
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(stakes)
 }
@@ -560,6 +573,9 @@ pub async fn fetch_dkg_context(
     stake_source: StakeSource,
     epoch: u64,
     attempt: u32,
+    // DEMO-ONLY: exclude eligible pools whose stake can't be resolved instead of
+    // failing the whole roster (`MissingStake`). Default false in production.
+    exclude_unstaked: bool,
 ) -> Result<DkgContext, DkgFetchError> {
     // The registry snapshot and the epoch-boundary time are independent — fetch
     // them concurrently. Ban activity is checked at that boundary time
@@ -582,10 +598,28 @@ pub async fn fetch_dkg_context(
         .await
         .map_err(DkgFetchError::Ban)?;
     let eligible = eligible_pool_ids(&snapshot, &active_bans);
-    let stakes = fetch_eligible_stakes(base_url, project_id, &eligible, stake_source, epoch)
-        .await
-        .map_err(DkgFetchError::Stake)?;
-    let mut ctx = derive_dkg_context(&snapshot, &active_bans, &stakes, epoch, attempt)
+    let stakes = fetch_eligible_stakes(
+        base_url,
+        project_id,
+        &eligible,
+        stake_source,
+        epoch,
+        exclude_unstaked,
+    )
+    .await
+    .map_err(DkgFetchError::Stake)?;
+    // DEMO-ONLY: pools whose stake was skipped above are dropped from the roster
+    // by adding them to the exclusion (ban) set, so the derivation sees only
+    // resolvable-stake pools rather than erroring on `MissingStake`.
+    let mut bans = active_bans;
+    if exclude_unstaked {
+        for pid in &eligible {
+            if !stakes.contains_key(pid) {
+                bans.insert(pid.clone());
+            }
+        }
+    }
+    let mut ctx = derive_dkg_context(&snapshot, &bans, &stakes, epoch, attempt)
         .map_err(DkgFetchError::Derive)?;
     // Anchor the ceremony's round deadlines to the chain epoch boundary (WI-014
     // #6), so every node freezes L1/Q at the same chain-time instant.

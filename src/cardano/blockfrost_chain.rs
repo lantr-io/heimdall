@@ -53,6 +53,10 @@ pub struct BlockfrostCardanoChain {
     /// Where per-pool active stake is read for the DKG threshold. Defaults to
     /// Blockfrost (`/pools/{id}`); set to `YaciStore` for a local devnet.
     stake_source: crate::cardano::stake::StakeSource,
+    /// DEMO-ONLY: when true, eligible pools whose Cardano stake can't be
+    /// resolved are excluded from the roster instead of failing the whole
+    /// stake-weighted derivation. Default false.
+    demo_exclude_unstaked: bool,
     /// Mnemonic-derived payment key for the Cardano wallet that pays
     /// fees. `None` means publishing is disabled (dry run).
     payment_key: Option<PrivateKey>,
@@ -113,6 +117,7 @@ impl BlockfrostCardanoChain {
             registry_roster: None,
             ban_source: None,
             stake_source: crate::cardano::stake::StakeSource::Blockfrost,
+            demo_exclude_unstaked: false,
             payment_key: None,
             wallet_base_address: None,
             treasury_y_51: Mutex::new(None),
@@ -160,6 +165,13 @@ impl BlockfrostCardanoChain {
     /// yaci-devkit devnet). Only meaningful alongside [`Self::with_registry_roster`].
     pub fn with_stake_source(mut self, source: crate::cardano::stake::StakeSource) -> Self {
         self.stake_source = source;
+        self
+    }
+
+    /// DEMO-ONLY: exclude eligible pools whose Cardano stake can't be resolved
+    /// from the roster (instead of failing the stake-weighted derivation).
+    pub fn with_demo_exclude_unstaked(mut self, v: bool) -> Self {
+        self.demo_exclude_unstaked = v;
         self
     }
 
@@ -272,6 +284,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             self.stake_source,
             epoch,
             0,
+            self.demo_exclude_unstaked,
         )
         .await
         .map_err(|e| EpochError::Chain(format!("eligible roster: {e}")))?;
@@ -293,6 +306,7 @@ impl CardanoChain for BlockfrostCardanoChain {
                 self.stake_source,
                 epoch,
                 attempt,
+                self.demo_exclude_unstaked,
             )
             .await
             .map_err(|e| EpochError::Chain(format!("eligible roster: {e}"))),

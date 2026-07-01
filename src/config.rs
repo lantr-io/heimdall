@@ -184,6 +184,13 @@ pub struct CardanoConfig {
     /// has no `/pools/{id}`; stake is read from
     /// `/epochs/{epoch}/pools/{id}/stake`. See `cardano::stake::StakeSource`.
     pub stake_source: Option<String>,
+    /// DEMO-ONLY. When true, an eligible registered SPO whose Cardano stake
+    /// cannot be resolved (404 / retired / not a real stake pool) is *excluded*
+    /// from the DKG roster instead of making the whole stake-weighted derivation
+    /// fatal (`MissingStake`). Lets a screencast run the registry-driven DKG over
+    /// the real-stake pools while a legacy synthetic SPO sits in the registry.
+    /// Default false — production must never silently drop a registered member.
+    pub demo_exclude_unstaked: bool,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
     pub submit_oracle: bool,
@@ -248,6 +255,7 @@ impl Default for CardanoConfig {
             mnemonic: None,
             min_stake_lovelace: None,
             stake_source: None,
+            demo_exclude_unstaked: false,
             submit_oracle: true,
             oracle_constructor: 0,
             tm_script_cbor: None,
