@@ -1,0 +1,46 @@
+# Heimdall — LOCAL multi-process DKG demo config (WI-023).
+#
+# Deliberately has NO [cardano] section: with neither cardano.blockfrost_project_id
+# nor cardano.socket_path set, `heimdall demo` runs the full MockCardanoChain path
+# (no live chain, no Blockfrost, no bitcoind). The roster comes from the keyed
+# fixture built from [demo] + [http] below, so three instances that share THIS file
+# and differ only by `--index {1,2,3}` discover each other on 127.0.0.1:18500-18502,
+# run a real HTTP DKG, and all derive the IDENTICAL group key Y_51.
+#
+# This is the DKG half of docs/local/instructions/run-dkz.md. It is intentionally
+# decoupled from the preprod SPO registry: synthetic registered pools have zero
+# stake, which the stake-weighted on-chain DKG roster (fetch_dkg_context) treats as
+# fatal — so the ceremony itself runs locally on the equal-stake fixture roster.
+
+[protocol]
+# Short timeouts so the demo converges quickly on camera. The mock chain has no
+# epoch schedule, so the DKG uses these relative per-round timeouts.
+dkg_round_timeout_secs = 60
+poll_interval_ms = 1000
+quorum51_timeout_secs = 60
+federation_timeout_secs = 60
+leader_timeout_secs = 60
+pegin_collection_window_secs = 2
+pegin_poll_interval_ms = 500
+
+[bitcoin]
+network = "testnet4"
+fee_rate_sat_per_vb = 1
+per_pegout_fee_sat = 1000
+federation_csv_blocks = 144
+# Bootstrap federation key Y_fed (x-only 0ce472ae…). The DKG derives a NEW group
+# key Y_51 that REPLACES this for the treasury handoff — Y_51 != Y_fed by design.
+y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe"
+# Synthetic treasury UTxO the fixture hands to the (unbroadcast) Treasury Movement.
+treasury_txid = "478b7ae50b71603aca16c97d3ee974f98e4ecc55b875fe34fe3cd6afc97f1317"
+treasury_vout = 0
+treasury_amount_sat = 9999887
+submit = false           # never broadcast — this is an offline demo
+
+[http]
+bind_address = "127.0.0.1"
+base_port = 18500        # SPO i listens on base_port + (i - 1)
+
+[demo]
+min_signers = 2          # threshold t
+max_signers = 3          # total SPOs n

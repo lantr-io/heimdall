@@ -371,8 +371,8 @@ async fn collect_pegins_phase(
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
 
-    // Pull the current treasury (Y_51) from the on-chain treasury oracle.
-    // The peg-in Taproot Q is derived per-depositor inside
+    // Pull current Y_fed from the on-chain treasury oracle. The
+    // peg-in Taproot Q is derived per-depositor inside
     // `parse_pegin_request` using the OP_RETURN beacon xonly pubkey.
     let treasury = chain.query_treasury().await?;
     let refund_timeout = config.pegin_refund_timeout_blocks;
@@ -396,6 +396,8 @@ async fn collect_pegins_phase(
             if accepted.contains_key(&req.cardano_utxo) {
                 continue;
             }
+            // Peg-in internal key is Y_51 (the FROST group key), not Y_fed —
+            // see parse_pegin_request / commit 6af7c67.
             match parse_pegin_request(&req, treasury.y_51, refund_timeout) {
                 Ok(parsed) => {
                     accepted.insert(req.cardano_utxo.clone(), parsed);
@@ -630,6 +632,20 @@ async fn submit_phase(
     }
 
     let tx_bytes = bitcoin::consensus::encode::serialize(&signed_tx);
+
+    // Every participant assembles the *identical* witnessed tx (same FROST
+    // group signature, deterministic build), so logging the raw hex on every
+    // node makes the "all SPOs saw the same signed transaction" moment visible
+    // across all terminals — the point at which the epoch's signing round is
+    // complete. The leader additionally submits it below.
+    crate::epoch_log!(
+        me,
+        epoch,
+        "Submit: signed treasury movement — txid={} ({} bytes)\n    raw tx: {}",
+        tm.txid,
+        tx_bytes.len(),
+        hex::encode(&tx_bytes)
+    );
 
     // Only the designated leader broadcasts. Everyone else assembles
     // the witnessed tx, holds it, and waits — they'd take over on a

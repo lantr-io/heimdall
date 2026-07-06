@@ -431,6 +431,12 @@ enum Commands {
         /// these bytes; Bitcoin broadcast is skipped regardless of `bitcoin.submit`.
         #[arg(long)]
         existing_tm_hex: Option<String>,
+        /// Peg-in BTC outpoint(s) `<txid>:<vout>` to DROP from the sweep even though their
+        /// PegInRequest still sits at the peg-in address. Use for deposits already swept into
+        /// the current treasury whose PIR was never consumed by a mint — re-including them would
+        /// double-spend an outpoint that no longer exists. Repeatable.
+        #[arg(long = "exclude-pegin")]
+        exclude_pegin: Vec<String>,
     },
 }
 
@@ -750,6 +756,7 @@ fn main() {
             bridged_token_unit,
             broadcast,
             existing_tm_hex,
+            exclude_pegin,
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_sweep_pegins(
@@ -764,6 +771,7 @@ fn main() {
                 &bridged_token_unit,
                 broadcast,
                 existing_tm_hex.as_deref(),
+                &exclude_pegin,
             ) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
@@ -822,6 +830,8 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
             federation_csv_blocks: fixture.federation_csv_blocks,
             fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
             per_pegout_fee: fixture.per_pegout_fee,
+            treasury_outpoint: fixture.treasury_outpoint,
+            treasury_value: fixture.treasury_value,
         };
         let mut bf_chain = BlockfrostCardanoChain::new(
             project_id,
@@ -855,6 +865,14 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
             cfg.cardano.submit_oracle,
             cfg.cardano.oracle_constructor,
         );
+
+        // Per-pool stake source for the DKG threshold (default Blockfrost;
+        // "yaci_store" for a local yaci-devkit devnet).
+        let stake_source =
+            heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
+                .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
+        bf_chain = bf_chain.with_stake_source(stake_source);
+        bf_chain = bf_chain.with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked);
 
         // On-chain SPO registry roster (WI-010): configured via
         // cardano.{registry_blueprint, registry_bootstrap, treasury_info_asset_name}.
@@ -925,14 +943,13 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
         Arc::new(OsRngSource)
     };
 
-    // Identity (WI-014): this node's bifrost key locates its own roster entry
-    // (own_participant). The positional --index is a legacy fallback only for
-    // the config/mock fixture, whose SpoInfos carry no bifrost_id_pk.
+    // Identity (WI-014/WI-023): with an on-chain registry, this node's bifrost
+    // key (from [bifrost].skey_path) locates its own roster entry
+    // (own_participant). For the no-registry local demo there is no configured
+    // key — the per-node identity AND its secret come from `--index` via the
+    // fixture's deterministic keypairs.
     let secp = bitcoin::secp256k1::Secp256k1::new();
-    let keypair = cfg
-        .load_bifrost_keypair(&secp)
-        .unwrap_or_else(|e| panic!("bifrost identity key required for the HTTP transport: {e}"));
-    let bifrost_id_pk = keypair.x_only_public_key().0.serialize();
+    let configured_keypair = cfg.load_bifrost_keypair(&secp).ok();
 
     // WI-014: query the roster at the REAL current epoch (was hardcoded 0).
     let epoch = chain
@@ -944,30 +961,63 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
         .await
         .expect("query initial roster");
 
-    let (id, me) = match roster.own_participant(&bifrost_id_pk) {
-        Some((id, info)) => (id, info),
+    let (id, me, keypair) = match configured_keypair {
+        // A [bifrost].skey_path was configured: locate ourselves by that key.
+        Some(kp) => {
+            let bifrost_id_pk = kp.x_only_public_key().0.serialize();
+            match roster.own_participant(&bifrost_id_pk) {
+                Some((id, info)) => (id, info.clone(), kp),
+                None => {
+                    // Not in the roster by bifrost key. Against a real registry
+                    // roster this is fatal (not registered / banned / URL-excluded).
+                    // Fall back to --index ONLY for the legacy fixture demo.
+                    let ix = index.unwrap_or_else(|| {
+                        panic!(
+                            "this node's bifrost_id_pk ({}) is not in the eligible roster for \
+                             epoch {epoch} (not registered / banned / URL-excluded) and no \
+                             --index fallback was given — refusing to run DKG under an unknown \
+                             identity",
+                            hex::encode(bifrost_id_pk)
+                        )
+                    });
+                    let id = Identifier::try_from(ix).unwrap();
+                    let info = roster
+                        .participants
+                        .get(&id)
+                        .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
+                        .clone();
+                    eprintln!(
+                        "[demo] WARNING: bifrost_id_pk not found in roster; falling back to \
+                         --index {ix} (fixture/legacy demo only)"
+                    );
+                    (id, info, kp)
+                }
+            }
+        }
+        // No configured key (WI-023 no-registry demo): both identity and secret
+        // come from --index via the fixture's deterministic keypairs, so 3
+        // processes sharing one config differ only by `--index`.
         None => {
-            // Not in the roster by bifrost key. Against a real registry roster
-            // this is fatal (not registered / banned / bifrost_url excluded). Fall
-            // back to --index ONLY for the fixture demo (empty bifrost_id_pks).
             let ix = index.unwrap_or_else(|| {
                 panic!(
-                    "this node's bifrost_id_pk ({}) is not in the eligible roster for epoch \
-                     {epoch} (not registered / banned / URL-excluded) and no --index fallback \
-                     was given — refusing to run DKG under an unknown identity",
-                    hex::encode(bifrost_id_pk)
+                    "no bifrost identity key — set [bifrost].skey_path (on-chain registry \
+                     deployments) or pass --index N for the local no-registry fixture demo"
                 )
             });
             let id = Identifier::try_from(ix).unwrap();
             let info = roster
                 .participants
                 .get(&id)
-                .unwrap_or_else(|| panic!("--index {ix} is not in the roster"));
-            eprintln!(
-                "[demo] WARNING: bifrost_id_pk not found in roster; falling back to --index {ix} \
-                 (fixture/legacy demo only)"
-            );
-            (id, info)
+                .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
+                .clone();
+            let kp = *fixture.bifrost_keypairs.get(&id).unwrap_or_else(|| {
+                panic!(
+                    "--index {ix}: no fixture bifrost keypair — the no-registry demo derives \
+                     each node's key from the fixture; set [bifrost].skey_path for a registry \
+                     deployment"
+                )
+            });
+            (id, info, kp)
         }
     };
     let port = port_from_url(&me.bifrost_url).unwrap_or_else(|e| panic!("{e}"));
@@ -2005,7 +2055,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         registration_message, verify_registration,
     };
     use heimdall::cardano::registry::REGISTRATION_ROOT_KEY;
-    use heimdall::cardano::stake::{check_min_stake, fetch_pool_stake};
+    use heimdall::cardano::stake::{StakeSource, check_min_stake, fetch_pool_stake_src};
     use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
     use pallas_crypto::key::ed25519;
 
@@ -2131,10 +2181,24 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
     // ── R2 min-stake gate: gates submission; a dry run only warns ──
+    let stake_source = StakeSource::from_config(cfg.cardano.stake_source.as_deref())?;
     match cfg.cardano.min_stake_lovelace {
         Some(threshold) => {
+            // yaci-store reads stake per-epoch; Blockfrost ignores the epoch.
+            let epoch = match stake_source {
+                StakeSource::YaciStore => rt
+                    .block_on(bf_http::fetch_current_epoch(&base_url, pid))
+                    .map_err(|e| format!("min-stake gate (epoch): {e}"))?,
+                StakeSource::Blockfrost => 0,
+            };
             let stake = rt
-                .block_on(fetch_pool_stake(&base_url, pid, &pool_id_bech32(&pool_id)))
+                .block_on(fetch_pool_stake_src(
+                    stake_source,
+                    &base_url,
+                    pid,
+                    epoch,
+                    &pool_id_bech32(&pool_id),
+                ))
                 .map_err(|e| format!("min-stake gate: {e}"))?;
             let chk = check_min_stake(&stake, threshold);
             println!(
@@ -2735,34 +2799,61 @@ fn run_show_roster(
         derive_dkg_context, eligible_pool_ids, fetch_eligible_stakes,
     };
     let eligible = eligible_pool_ids(&snapshot, &active_bans);
-    match rt.block_on(fetch_eligible_stakes(&base_url, pid, &eligible)) {
-        Ok(stakes) => match derive_dkg_context(&snapshot, &active_bans, &stakes, epoch, 0) {
-            Ok(ctx) => {
-                println!(
-                    "DKG roster (epoch {epoch}; threshold {} of {}, total stake {}):",
-                    ctx.threshold,
-                    ctx.participants.len(),
-                    ctx.total_stake
-                );
-                for p in &ctx.participants {
-                    println!(
-                        "  #{:<3} pk {}  stake={} {}",
-                        p.index,
-                        hex::encode(&p.bifrost_id_pk),
-                        p.active_stake,
-                        p.bifrost_url
-                    );
-                }
-                for ex in &ctx.excluded {
-                    println!(
-                        "  excluded pool {}: {}",
-                        hex::encode(&ex.pool_id),
-                        ex.reason
-                    );
+    let stake_source =
+        heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
+            .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
+    let exclude_unstaked = cfg.cardano.demo_exclude_unstaked;
+    match rt.block_on(fetch_eligible_stakes(
+        &base_url,
+        pid,
+        &eligible,
+        stake_source,
+        epoch,
+        exclude_unstaked,
+    )) {
+        Ok(stakes) => {
+            // DEMO-ONLY: drop pools whose stake was skipped (mirrors the demo
+            // path) so the threshold below reflects only resolvable-stake pools.
+            let mut bans = active_bans.clone();
+            if exclude_unstaked {
+                for pid2 in &eligible {
+                    if !stakes.contains_key(pid2) {
+                        bans.insert(pid2.clone());
+                    }
                 }
             }
-            Err(e) => println!("DKG roster:        cannot derive ({e})"),
-        },
+            match derive_dkg_context(&snapshot, &bans, &stakes, epoch, 0) {
+                Ok(ctx) => {
+                    println!(
+                        "DKG roster (epoch {epoch}; threshold {} of {}, total stake {}):",
+                        ctx.threshold,
+                        ctx.participants.len(),
+                        ctx.total_stake
+                    );
+                    for p in &ctx.participants {
+                        println!(
+                            "  #{:<3} pk {}  stake={} {}",
+                            p.index,
+                            hex::encode(&p.bifrost_id_pk),
+                            p.active_stake,
+                            p.bifrost_url
+                        );
+                    }
+                    for ex in &ctx.excluded {
+                        // `demo_exclude_unstaked` excludes no-stake pools by adding them to the
+                        // ban set, so `ex.reason` would read "banned" — relabel those accurately
+                        // (they were NOT banned/slashed, just have no resolvable Cardano stake).
+                        let reason = if exclude_unstaked && !active_bans.contains(&ex.pool_id) {
+                            "no active stake (excluded via demo_exclude_unstaked)".to_string()
+                        } else {
+                            ex.reason.to_string()
+                        };
+                        println!("  excluded pool {}: {}", hex::encode(&ex.pool_id), reason);
+                    }
+                }
+                Err(e) => println!("DKG roster:        cannot derive ({e})"),
+            }
+        }
         // A stake query failure is fatal for a real ceremony (the threshold
         // can't be computed), but tolerated in this read-only diagnostic so
         // the registry + ban sections above still print — synthetic preprod
@@ -2798,12 +2889,13 @@ fn run_sweep_pegins(
     bridged_token_unit: &str,
     broadcast: bool,
     existing_tm_hex: Option<&str>,
+    exclude_pegin: &[String],
 ) -> Result<(), String> {
     use bitcoin::key::Secp256k1;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
     use heimdall::bitcoin::taproot::treasury_spend_info;
     use heimdall::bitcoin::tm_builder::{
-        PegInInput, PegOutRequest, TreasuryInput, build_tm, sign_tm_single_key,
+        PegInInput, PegOutRequest, TreasuryInput, build_tm, sign_tm_frost,
     };
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
@@ -2812,9 +2904,27 @@ fn run_sweep_pegins(
     use heimdall::cardano::pegin_datum::parse_pegin_request;
     use heimdall::cardano::pegin_source::CardanoPegInSource;
     use heimdall::cardano::pegout_datum::fetch_pegout_requests;
+    use heimdall::frost::dkg::run_demo_dkg;
 
     let secp = Secp256k1::new();
-    let (sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    let (_sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    // Peg-in internal key + treasury key-path = the FROST group key Y_51, NOT the fe-seed y_fed
+    // (commit 6af7c67 wrongly switched these to y_fed for the demo). Reproduce the deterministic
+    // demo DKG to recover Y_51 + every signing share, then FROST-sign the TM. y_fed survives only
+    // as the treasury federation fallback leaf.
+    let dkg = run_demo_dkg(
+        b"heimdall-demo-seed-v1-0123456789",
+        cfg.demo.min_signers,
+        cfg.demo.max_signers,
+    );
+    let vk = dkg
+        .public_key_package
+        .verifying_key()
+        .serialize()
+        .map_err(|e| format!("group verifying key serialize: {e}"))?;
+    let y_51 = bitcoin::key::UntweakedPublicKey::from_slice(&vk[1..33])
+        .map_err(|e| format!("group key x-only: {e}"))?;
+    println!("  FROST group key Y_51: {}", hex::encode(&vk[1..33]));
     let csv = csv_blocks_u16(cfg)?;
     let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
 
@@ -2853,13 +2963,43 @@ fn run_sweep_pegins(
         reqs.len()
     );
 
+    // Operator-supplied drop list: BTC outpoints whose PIR lingers on Cardano but whose deposit
+    // is already inside the current treasury (swept by an earlier TM, never minted). Re-including
+    // them would spend a UTxO that no longer exists, so drop them before building.
+    let excluded: std::collections::HashSet<bitcoin::OutPoint> = exclude_pegin
+        .iter()
+        .map(|s| parse_outpoint(s))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("--exclude-pegin: {e}"))?;
+
     // Each parse reconstructs and matches the peg-in P2TR, so the returned
     // `spend_info` is itself proof the spend info matches the on-chain
     // scriptPubKey — reuse it directly rather than re-deriving.
     let mut pegin_inputs = Vec::with_capacity(reqs.len());
     for req in &reqs {
-        let parsed = parse_pegin_request(req, y_fed, refund_timeout)
-            .map_err(|e| format!("parse_pegin_request: {e}"))?;
+        // Skip PIRs that don't reconstruct under Y_51 (other bridges' deposits, or encodings we
+        // don't yet support) rather than aborting the whole sweep — a TM sweeps the valid peg-ins
+        // and drops the rest. Mirrors the daemon's collect_pegins drop behaviour.
+        let parsed = match parse_pegin_request(req, y_51, refund_timeout) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("  dropped peg-in {:?}: {e}", req.cardano_utxo);
+                continue;
+            }
+        };
+        let outpoint = OutPoint {
+            txid: parsed.btc_txid,
+            vout: parsed.btc_vout,
+        };
+        if excluded.contains(&outpoint) {
+            println!(
+                "  excluded peg-in {}:{} — {} sat (--exclude-pegin: already in treasury)",
+                parsed.btc_txid,
+                parsed.btc_vout,
+                parsed.value.to_sat(),
+            );
+            continue;
+        }
         println!(
             "  peg-in {}:{} — {} sat (depositor {})",
             parsed.btc_txid,
@@ -2868,10 +3008,7 @@ fn run_sweep_pegins(
             hex::encode(parsed.depositor_xonly_pubkey.serialize()),
         );
         pegin_inputs.push(PegInInput {
-            outpoint: OutPoint {
-                txid: parsed.btc_txid,
-                vout: parsed.btc_vout,
-            },
+            outpoint,
             value: parsed.value,
             spend_info: parsed.spend_info,
         });
@@ -2920,7 +3057,7 @@ fn run_sweep_pegins(
     }
 
     let treasury_outpoint = parse_outpoint(treasury_outpoint)?;
-    let treasury_spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv);
+    let treasury_spend_info = treasury_spend_info(&secp, y_51, y_fed, csv);
     let treasury_spk = ScriptBuf::new_p2tr_tweaked(treasury_spend_info.output_key());
 
     // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..] = one
@@ -2961,8 +3098,8 @@ fn run_sweep_pegins(
         ));
     }
 
-    let signed =
-        sign_tm_single_key(&secp, &unsigned, &sk).map_err(|e| format!("sign sweep: {e}"))?;
+    let signed = sign_tm_frost(&unsigned, &dkg.key_packages, &dkg.public_key_package)
+        .map_err(|e| format!("FROST sign sweep: {e}"))?;
     let local_raw = bitcoin::consensus::encode::serialize(&signed);
     // If an existing-on-Bitcoin TM is provided, the effective tx posted to Cardano is THAT one,
     // not the locally-built one. Deserialize it so every subsequent print (txid, inputs, outputs)
@@ -3095,6 +3232,8 @@ fn run_sweep_pegins(
             federation_csv_blocks: fixture.federation_csv_blocks,
             fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
             per_pegout_fee: fixture.per_pegout_fee,
+            treasury_outpoint: fixture.treasury_outpoint,
+            treasury_value: fixture.treasury_value,
         };
         let mut chain = BlockfrostCardanoChain::new(
             project_id,

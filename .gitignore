@@ -8,4 +8,11 @@ docs/local/
 # Generated peg-in demo output.
 /data/
 heimdall-preprod.toml
+heimdall-devnet.toml
 project/target/
+heimdall-bip322.toml
+# run-dkz screencast demo artifacts (2026-06-30): per-SPO configs, bifrost secret-key
+# files (0600), and the saved b814cca blueprint the on-chain registry was deployed with.
+heimdall-spo*.toml
+.spo*.bifrost.skey
+.b814cca.plutus.json

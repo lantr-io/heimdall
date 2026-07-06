@@ -525,7 +525,19 @@ fn round_deadline(
     fallback: Duration,
 ) -> Instant {
     match epoch_start_ms {
-        Some(boundary) => clock.now() + remaining_to_offset(boundary, offset, wall_now_ms()),
+        Some(boundary) => {
+            let remaining = remaining_to_offset(boundary, offset, wall_now_ms());
+            // A *stale* anchor — `boundary + offset` already elapsed — collapses the window to
+            // zero, leaving a node no time to poll for peers' packages (every retry then fails
+            // identically). This happens whenever the ceremony runs well after the epoch boundary
+            // (e.g. a mid-epoch demo). Fall back to the relative window so the round still has time
+            // to converge. At a real epoch-boundary DKG `remaining > 0`, so anchoring is preserved.
+            if remaining.is_zero() {
+                clock.deadline(fallback)
+            } else {
+                clock.now() + remaining
+            }
+        }
         None => clock.deadline(fallback),
     }
 }

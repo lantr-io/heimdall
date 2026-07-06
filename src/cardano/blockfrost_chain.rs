@@ -1,10 +1,12 @@
 //! `CardanoChain` backed by Blockfrost.
 //!
-//! Finds the treasury oracle UTxO by scanning all UTxOs at the
-//! treasury address and picking the most recent one that carries a
-//! datum. The datum is `Constr(X, [BoundedBytes(raw_btc_tx)])` —
-//! we extract the BTC tx hex from the JSON, deserialize, and take
-//! output 0 as the treasury.
+//! Reads the on-chain TM UTxO at the treasury address ONLY for the
+//! `btc_confirmed` signal (datum constructor: 0 = Unconfirmed, 1 =
+//! Confirmed). The treasury Bitcoin UTxO itself (outpoint + value) is
+//! tracked OFF-CHAIN by the SPO per spec §640/§1677 and comes from
+//! `TreasuryConfig` (config `bitcoin.treasury_txid/vout/amount`), not
+//! from parsing the datum — the Confirmed datum carries only a
+//! `btc_txid` identifier + metadata (§638), never a full tx.
 //!
 //! `submit_signed_tm` builds a Cardano transaction that **creates a
 //! new UTxO** at the treasury address with the signed BTC tx as an
@@ -14,9 +16,7 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use bitcoin::Transaction;
-use bitcoin::consensus::deserialize;
-use blockfrost::{BlockFrostSettings, BlockfrostAPI, Pagination};
+use blockfrost::{BlockFrostSettings, BlockfrostAPI};
 use pallas_codec::minicbor;
 use pallas_primitives::conway::PlutusData;
 use pallas_wallet::PrivateKey;
@@ -29,6 +29,9 @@ use crate::epoch::state::{EpochError, EpochResult, Roster};
 use crate::epoch::traits::{CardanoChain, EpochBoundaryEvent, PegOutRequestUtxo, TreasuryUtxo};
 
 pub struct BlockfrostCardanoChain {
+    /// Pooled Blockfrost client — used ONLY for `transactions_submit` (the leader's
+    /// oracle-update POST). Reads go through fresh `bf_http` clients instead: the
+    /// pooled keep-alive connection goes stale during the staggered-start DKG wait.
     api: BlockfrostAPI,
     /// Bech32 address holding the treasury oracle UTxOs.
     treasury_address: String,
@@ -50,6 +53,13 @@ pub struct BlockfrostCardanoChain {
     /// computing the threshold (WI-012). `None` → no ban filtering (e.g.
     /// before the ban list is bootstrapped, WI-015).
     ban_source: Option<crate::cardano::ban_list::BanListSource>,
+    /// Where per-pool active stake is read for the DKG threshold. Defaults to
+    /// Blockfrost (`/pools/{id}`); set to `YaciStore` for a local devnet.
+    stake_source: crate::cardano::stake::StakeSource,
+    /// DEMO-ONLY: when true, eligible pools whose Cardano stake can't be
+    /// resolved are excluded from the roster instead of failing the whole
+    /// stake-weighted derivation. Default false.
+    demo_exclude_unstaked: bool,
     /// Mnemonic-derived payment key for the Cardano wallet that pays
     /// fees. `None` means publishing is disabled (dry run).
     payment_key: Option<PrivateKey>,
@@ -109,6 +119,8 @@ impl BlockfrostCardanoChain {
             fallback_roster,
             registry_roster: None,
             ban_source: None,
+            stake_source: crate::cardano::stake::StakeSource::Blockfrost,
+            demo_exclude_unstaked: false,
             payment_key: None,
             wallet_base_address: None,
             treasury_y_51: Mutex::new(None),
@@ -149,6 +161,20 @@ impl BlockfrostCardanoChain {
     /// (WI-012). Only meaningful alongside [`Self::with_registry_roster`].
     pub fn with_ban_source(mut self, source: crate::cardano::ban_list::BanListSource) -> Self {
         self.ban_source = Some(source);
+        self
+    }
+
+    /// Select where per-pool active stake is read (Blockfrost vs a local
+    /// yaci-devkit devnet). Only meaningful alongside [`Self::with_registry_roster`].
+    pub fn with_stake_source(mut self, source: crate::cardano::stake::StakeSource) -> Self {
+        self.stake_source = source;
+        self
+    }
+
+    /// DEMO-ONLY: exclude eligible pools whose Cardano stake can't be resolved
+    /// from the roster (instead of failing the stake-weighted derivation).
+    pub fn with_demo_exclude_unstaked(mut self, v: bool) -> Self {
+        self.demo_exclude_unstaked = v;
         self
     }
 
@@ -210,7 +236,15 @@ impl BlockfrostCardanoChain {
         .await
         .map_err(|e| EpochError::Chain(format!("blockfrost wallet UTxO query: {e}")))?;
 
-        Ok(utxos.iter().map(WalletUtxo::from_bf).collect())
+        // The oracle-update tx only needs ADA (fee + new-UTxO min-ADA + script collateral) and runs a
+        // minting script — feed coin-selection only PURE-ADA UTxOs. A token-bearing fee input drops
+        // those tokens from the change (ValueNotConservedUTxO) and a token-bearing collateral fails
+        // (CollateralContainsNonADA); the wallet's token UTxOs are irrelevant to this tx.
+        Ok(utxos
+            .iter()
+            .map(WalletUtxo::from_bf)
+            .filter(|u| u.pure_ada)
+            .collect())
     }
 }
 
@@ -250,8 +284,10 @@ impl CardanoChain for BlockfrostCardanoChain {
             self.ban_source.as_ref(),
             &self.bf_base_url,
             &self.bf_project_id,
+            self.stake_source,
             epoch,
             0,
+            self.demo_exclude_unstaked,
         )
         .await
         .map_err(|e| EpochError::Chain(format!("eligible roster: {e}")))?;
@@ -270,8 +306,10 @@ impl CardanoChain for BlockfrostCardanoChain {
                 self.ban_source.as_ref(),
                 &self.bf_base_url,
                 &self.bf_project_id,
+                self.stake_source,
                 epoch,
                 attempt,
+                self.demo_exclude_unstaked,
             )
             .await
             .map_err(|e| EpochError::Chain(format!("eligible roster: {e}"))),
@@ -288,11 +326,20 @@ impl CardanoChain for BlockfrostCardanoChain {
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {
-        let utxos = self
-            .api
-            .addresses_utxos(&self.treasury_address, Pagination::all())
-            .await
-            .map_err(|e| EpochError::Chain(format!("blockfrost treasury query: {e}")))?;
+        // Raw HTTP with a fresh client per call (like query_wallet_utxos), NOT the
+        // pooled `BlockfrostAPI`. The pooled keep-alive connection goes stale during
+        // a staggered-start DKG wait (the node talks only to peers for tens of
+        // seconds while the connection sits idle and the server closes it), so a
+        // reused connection fails the post-DKG treasury query with "error sending
+        // request". A fresh client sidesteps that and also tolerates backends
+        // (yaci-devkit) whose UTxO JSON omits `tx_index`.
+        let utxos = crate::cardano::bf_http::fetch_address_utxos(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            &self.treasury_address,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("blockfrost treasury query: {e}")))?;
 
         let asset_unit = format!(
             "{}{}",
@@ -330,34 +377,21 @@ impl CardanoChain for BlockfrostCardanoChain {
             "[blockfrost] treasury datum: constructor={constructor} btc_confirmed={btc_confirmed}"
         );
 
-        let tx_bytes = match constr.fields.first() {
-            Some(PlutusData::BoundedBytes(bb)) => {
-                let v: Vec<u8> = bb.clone().into();
-                v
-            }
-            _ => {
-                return Err(EpochError::Chain(
-                    "treasury datum Constr has no BoundedBytes field".into(),
-                ));
-            }
-        };
-        let tx: Transaction = deserialize(&tx_bytes)
-            .map_err(|e| EpochError::Chain(format!("BTC tx deserialize: {e}")))?;
-
-        let out = tx
-            .output
-            .first()
-            .ok_or_else(|| EpochError::Chain("BTC tx in treasury datum has no outputs".into()))?;
-        let txid = tx.compute_txid();
-
+        // Spec §640/§1677: the current treasury Bitcoin UTxO is tracked OFF-CHAIN by
+        // the SPO — known from the previous TM's change output (heimdall builds every
+        // TM, so it knows its own output 0) or from protocol bootstrap for the first
+        // TM. It is NOT re-derived from this datum: the Confirmed TM datum carries only
+        // `btc_txid` + metadata (§638), so parsing its first field as a full Bitcoin tx
+        // was never correct in steady state. The datum is used solely for the
+        // `btc_confirmed` signal (read above); the outpoint + value come from config.
         let maybe_key = *self.treasury_y_51.lock().unwrap();
         let y_51 = maybe_key.unwrap_or(self.treasury_config.y_51);
         // After DKG: Y_fed = Y_51 = FROST group key (same key everywhere).
         let y_fed = maybe_key.unwrap_or(self.treasury_config.y_fed);
 
         Ok(TreasuryUtxo {
-            outpoint: bitcoin::OutPoint { txid, vout: 0 },
-            value: out.value,
+            outpoint: self.treasury_config.treasury_outpoint,
+            value: self.treasury_config.treasury_value,
             y_51,
             y_fed,
             federation_csv_blocks: self.treasury_config.federation_csv_blocks,

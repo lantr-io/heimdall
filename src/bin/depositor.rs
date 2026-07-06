@@ -12,7 +12,8 @@
 //! ```text
 //! Input  0..N : funding UTXO(s) (P2WPKH controlled by depositor WIF) — signed
 //! Output 0    : peg-in P2TR (internal key Y_fed, single leaf = depositor refund)
-//! Output 1    : OP_RETURN "BFR" || depositor_xonly (32 bytes)  [Bifrost beacon]
+//! Output 1    : OP_RETURN "BFR" || depositor_auth_outputkey (32 bytes)  [Bifrost beacon]
+//!               (depositor's key-path Taproot output key = the BIP-322 completion key)
 //! Output 2    : P2WPKH change back to depositor
 //! ```
 //!
@@ -150,6 +151,10 @@ fn run() -> Result<(), String> {
         "depositor x-only:    {}",
         hex::encode(depositor_xonly.serialize())
     );
+    eprintln!(
+        "depositor auth P2TR: {}  (sign the BIP-322 completion here)",
+        Address::p2tr(&secp, depositor_xonly, None, network)
+    );
     eprintln!("depositor P2WPKH:    {depositor_p2wpkh}");
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
@@ -249,7 +254,13 @@ fn run() -> Result<(), String> {
     }
 
     let pegin_spk = pegin_addr.script_pubkey();
-    let beacon_spk = build_beacon_spk(depositor_xonly.serialize());
+    // Beacon carries the depositor's key-path Taproot output key — the key the completion's
+    // BIP-322 signature verifies against — NOT the raw internal x-only.
+    let depositor_auth_spk = ScriptBuf::new_p2tr(&secp, depositor_xonly, None);
+    let depositor_auth_outputkey: [u8; 32] = depositor_auth_spk.as_bytes()[2..34]
+        .try_into()
+        .expect("p2tr scriptPubKey is OP_1 PUSH32 <32-byte key>");
+    let beacon_spk = build_beacon_spk(depositor_auth_outputkey);
     let change_spk = ScriptBuf::new_p2wpkh(&depositor_compressed.wpubkey_hash());
     let funding_spk = change_spk.clone();
 
