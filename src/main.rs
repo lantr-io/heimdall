@@ -431,6 +431,12 @@ enum Commands {
         /// these bytes; Bitcoin broadcast is skipped regardless of `bitcoin.submit`.
         #[arg(long)]
         existing_tm_hex: Option<String>,
+        /// Peg-in BTC outpoint(s) `<txid>:<vout>` to DROP from the sweep even though their
+        /// PegInRequest still sits at the peg-in address. Use for deposits already swept into
+        /// the current treasury whose PIR was never consumed by a mint — re-including them would
+        /// double-spend an outpoint that no longer exists. Repeatable.
+        #[arg(long = "exclude-pegin")]
+        exclude_pegin: Vec<String>,
     },
 }
 
@@ -750,6 +756,7 @@ fn main() {
             bridged_token_unit,
             broadcast,
             existing_tm_hex,
+            exclude_pegin,
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_sweep_pegins(
@@ -764,6 +771,7 @@ fn main() {
                 &bridged_token_unit,
                 broadcast,
                 existing_tm_hex.as_deref(),
+                &exclude_pegin,
             ) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
@@ -2881,6 +2889,7 @@ fn run_sweep_pegins(
     bridged_token_unit: &str,
     broadcast: bool,
     existing_tm_hex: Option<&str>,
+    exclude_pegin: &[String],
 ) -> Result<(), String> {
     use bitcoin::key::Secp256k1;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
@@ -2954,6 +2963,15 @@ fn run_sweep_pegins(
         reqs.len()
     );
 
+    // Operator-supplied drop list: BTC outpoints whose PIR lingers on Cardano but whose deposit
+    // is already inside the current treasury (swept by an earlier TM, never minted). Re-including
+    // them would spend a UTxO that no longer exists, so drop them before building.
+    let excluded: std::collections::HashSet<bitcoin::OutPoint> = exclude_pegin
+        .iter()
+        .map(|s| parse_outpoint(s))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("--exclude-pegin: {e}"))?;
+
     // Each parse reconstructs and matches the peg-in P2TR, so the returned
     // `spend_info` is itself proof the spend info matches the on-chain
     // scriptPubKey — reuse it directly rather than re-deriving.
@@ -2969,6 +2987,19 @@ fn run_sweep_pegins(
                 continue;
             }
         };
+        let outpoint = OutPoint {
+            txid: parsed.btc_txid,
+            vout: parsed.btc_vout,
+        };
+        if excluded.contains(&outpoint) {
+            println!(
+                "  excluded peg-in {}:{} — {} sat (--exclude-pegin: already in treasury)",
+                parsed.btc_txid,
+                parsed.btc_vout,
+                parsed.value.to_sat(),
+            );
+            continue;
+        }
         println!(
             "  peg-in {}:{} — {} sat (depositor {})",
             parsed.btc_txid,
@@ -2977,10 +3008,7 @@ fn run_sweep_pegins(
             hex::encode(parsed.depositor_xonly_pubkey.serialize()),
         );
         pegin_inputs.push(PegInInput {
-            outpoint: OutPoint {
-                txid: parsed.btc_txid,
-                vout: parsed.btc_vout,
-            },
+            outpoint,
             value: parsed.value,
             spend_info: parsed.spend_info,
         });
