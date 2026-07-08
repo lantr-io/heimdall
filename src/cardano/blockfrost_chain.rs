@@ -30,7 +30,7 @@ use crate::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
 use crate::cardano::publish::{WalletUtxo, build_oracle_update_tx};
 use crate::cardano::treasury_datum::{
     ConfirmedTm, TreasuryConfig, TreasuryDatumError, parse_confirmed_tm_datum,
-    unconfirmed_tm_spends, unspent_tips,
+    select_spendable_tip, unconfirmed_tm_spends,
 };
 use crate::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 use crate::epoch::state::{EpochError, EpochResult, Roster};
@@ -344,6 +344,8 @@ impl CardanoChain for BlockfrostCardanoChain {
         let TmScan {
             confirmed,
             in_flight_spends,
+            parse_failures,
+            opaque_unconfirmed,
         } = scan_tm_utxos(
             &self.bf_base_url,
             &self.bf_project_id,
@@ -352,6 +354,16 @@ impl CardanoChain for BlockfrostCardanoChain {
         )
         .await
         .map_err(EpochError::Chain)?;
+
+        // A marker-token TM UTxO is NFT-mint-gated, so a datum we cannot parse is a
+        // REAL TM we dropped — chain-following an incomplete set can promote an
+        // already-spent parent to a false tip. Refuse rather than mis-root/misdirect.
+        if parse_failures > 0 {
+            return Err(EpochError::Chain(format!(
+                "{parse_failures} marker-token TM datum(s) failed to parse — refusing to \
+                 chain-source the treasury (would risk mis-rooting the movement chain)"
+            )));
+        }
 
         // The treasury's Taproot internal key (Y_51). After DKG, publish_group_key
         // stores the FROST group key here; at bootstrap it is the config Y_51.
@@ -369,7 +381,9 @@ impl CardanoChain for BlockfrostCardanoChain {
                         .into(),
                 ));
             }
-            let btc_confirmed = !in_flight_spends.contains(&cfg_out);
+            // An unreadable in-flight movement could be spending this outpoint; be
+            // conservative and treat it as not-yet-free.
+            let btc_confirmed = !in_flight_spends.contains(&cfg_out) && opaque_unconfirmed == 0;
             eprintln!(
                 "[blockfrost] no Confirmed TM yet — bootstrap treasury from config {cfg_out} \
                  (btc_confirmed={btc_confirmed})"
@@ -386,78 +400,51 @@ impl CardanoChain for BlockfrostCardanoChain {
             });
         }
 
-        // Chain-follow to the unspent tip(s). The treasury tree's key-path key is
+        // Chain-follow to the tip we can spend. The treasury tree's key-path key is
         // Y_51; the script-path (federation-CSV) leaf is the federation key, which
-        // does NOT rotate with DKG. Rebuild each tip's scriptPubKey from candidate
-        // leaves — the federation seed (production) and, defensively, Y_51 itself
-        // (the demo's collapsed Y_fed=Y_51 convention) — to disambiguate divergent
-        // lineages and recover the exact y_fed for the input spend.
+        // does NOT rotate with DKG. Try each candidate leaf — the federation seed
+        // (production) and, defensively, Y_51 itself (the demo's collapsed
+        // Y_fed=Y_51 convention) — through the SAME `select_spendable_tip` the CLI /
+        // mover path uses, keeping whichever matched so the input spend rebuilds the
+        // exact tree. No candidate matches -> hard error (never sign an outpoint whose
+        // on-chain scriptPubKey we cannot reconstruct).
         let secp = bitcoin::key::Secp256k1::new();
+        let csv_u16 = csv_to_u16(csv)?;
         let mut leaf_candidates = vec![self.treasury_config.y_fed];
         if y_51 != self.treasury_config.y_fed {
             leaf_candidates.push(y_51);
         }
-        let spk_for = |y_fed: bitcoin::key::UntweakedPublicKey| {
-            bitcoin::ScriptBuf::new_p2tr_tweaked(
-                treasury_spend_info(&secp, y_51, y_fed, csv as u16).output_key(),
-            )
-        };
-
-        let tips = unspent_tips(&confirmed);
-        // Pair each unspent tip with the candidate leaf whose rebuilt SPK it matches.
-        let matched: Vec<(&ConfirmedTm, bitcoin::key::UntweakedPublicKey)> = tips
-            .iter()
-            .filter_map(|t| {
-                leaf_candidates
-                    .iter()
-                    .find(|&&y_fed| t.treasury_spk() == Some(spk_for(y_fed).as_bytes()))
-                    .map(|&y_fed| (*t, y_fed))
-            })
-            .collect();
-
-        let (tip, y_fed) = match (tips.len(), matched.len()) {
-            (0, _) => {
-                return Err(EpochError::Chain(
-                    "confirmed TMs exist but none is an unspent tip (a cycle, or the tip's datum \
-                     is unreadable)"
-                        .into(),
-                ));
+        let mut selected: Option<(&ConfirmedTm, bitcoin::key::UntweakedPublicKey)> = None;
+        let mut last_err: Option<String> = None;
+        for &y_fed in &leaf_candidates {
+            let spk = bitcoin::ScriptBuf::new_p2tr_tweaked(
+                treasury_spend_info(&secp, y_51, y_fed, csv_u16).output_key(),
+            );
+            match select_spendable_tip(&confirmed, spk.as_bytes()) {
+                Ok(tip) => {
+                    selected = Some((tip, y_fed));
+                    break;
+                }
+                Err(e) => last_err = Some(e.to_string()),
             }
-            // Exactly one tip matches our keys — the normal case, and the
-            // disambiguator when several unspent lineages coexist.
-            (_, 1) => matched[0],
-            // A single unspent tip we cannot rebuild from our keys. Don't hard-fail:
-            // this call also logs the handoff address before publish_group_key sets
-            // Y_51, and the eventual signing / output[0] check catches a real mismatch.
-            (1, 0) => {
-                eprintln!(
-                    "[blockfrost] WARNING: sole treasury tip {} scriptPubKey does not match the \
-                     current keys; proceeding (signing will validate)",
-                    tips[0].treasury_outpoint().txid
-                );
-                (tips[0], self.treasury_config.y_fed)
-            }
-            (_, 0) => {
-                return Err(EpochError::Chain(format!(
-                    "{} unspent treasury tips, none match the current keys — cannot pick the \
-                     treasury to move",
-                    tips.len()
-                )));
-            }
-            (_, n) => {
-                return Err(EpochError::Chain(format!(
-                    "ambiguous treasury tip: {n} unspent Confirmed TMs match the current keys"
-                )));
-            }
-        };
+        }
+        let (tip, y_fed) = selected.ok_or_else(|| {
+            EpochError::Chain(format!(
+                "no Confirmed TM tip is spendable under the current treasury keys \
+                 ({} confirmed TM(s)): {}",
+                confirmed.len(),
+                last_err.unwrap_or_else(|| "no candidate keys".into()),
+            ))
+        })?;
 
         let outpoint = tip.treasury_outpoint();
         let value = tip
             .treasury_value()
             .ok_or_else(|| EpochError::Chain("treasury tip datum has no outputs".into()))?;
-        // A movement already in flight against this tip → not yet safe to build the
-        // next TM; report btc_confirmed=false so BuildTm waits for it to confirm.
-        let btc_confirmed = !in_flight_spends.contains(&outpoint);
+        // A movement already in flight against this tip — or an in-flight movement we
+        // could not read — means it is not yet safe to build the next TM; report
+        // btc_confirmed=false so BuildTm waits for confirmation.
+        let btc_confirmed = !in_flight_spends.contains(&outpoint) && opaque_unconfirmed == 0;
         eprintln!(
             "[blockfrost] treasury tip {}:{} = {} sat ({} confirmed TM(s), in_flight={}, btc_confirmed={})",
             outpoint.txid,
@@ -608,6 +595,17 @@ impl CardanoChain for BlockfrostCardanoChain {
 // Shared TM-UTxO scan (WI-028) — used by `query_treasury` and the sweep CLI.
 // ---------------------------------------------------------------------------
 
+/// Convert the u32 federation CSV to the u16 the Taproot leaf timelock needs,
+/// erroring (never silently truncating) on overflow — so every treasury-sourcing
+/// path derives the same scriptPubKey from the same config.
+pub fn csv_to_u16(csv: u32) -> EpochResult<u16> {
+    u16::try_from(csv).map_err(|_| {
+        EpochError::Chain(format!(
+            "federation_csv_blocks {csv} exceeds the 16-bit CSV limit"
+        ))
+    })
+}
+
 /// Result of scanning the TM validator address for treasury movements.
 pub struct TmScan {
     /// Every Confirmed (Constr 1) TM datum found — the chain-follow input.
@@ -616,13 +614,23 @@ pub struct TmScan {
     /// flight. If the selected tip's outpoint is in here, a new TM must NOT be
     /// built off it yet (wait for confirmation).
     pub in_flight_spends: HashSet<bitcoin::OutPoint>,
+    /// Count of marker-token UTxOs whose datum failed to hex/CBOR-decode or parse
+    /// as a Confirmed TM. Because the marker token is NFT-mint-gated, each is a
+    /// REAL TM we could not read — a non-zero count makes the chain-follow
+    /// untrustworthy (a dropped tip promotes an already-spent parent).
+    pub parse_failures: usize,
+    /// Count of Unconfirmed (Constr 0) TMs whose raw BTC tx would not deserialize,
+    /// so we could not learn which outpoint they spend. Treated as a possible
+    /// in-flight movement against the tip (fail closed, never double-post).
+    pub opaque_unconfirmed: usize,
 }
 
 /// Scan every marker-token (`asset_unit`) TM UTxO at `address` via Blockfrost and
 /// parse the datums. Uses a fresh HTTP client per call (the pooled keep-alive
-/// goes stale across the staggered-start DKG wait). Unparseable datums are
-/// logged and skipped, never fatal — a stray UTxO at the address can't abort the
-/// whole treasury query.
+/// goes stale across the staggered-start DKG wait). Unparseable datums are logged
+/// and COUNTED (`parse_failures` / `opaque_unconfirmed`) rather than aborting the
+/// scan — the caller decides whether the counts make the result untrustworthy
+/// (they do for chain-following, since a marker token is NFT-mint-gated).
 pub async fn scan_tm_utxos(
     base_url: &str,
     project_id: &str,
@@ -635,6 +643,8 @@ pub async fn scan_tm_utxos(
 
     let mut confirmed: Vec<ConfirmedTm> = Vec::new();
     let mut in_flight_spends: HashSet<bitcoin::OutPoint> = HashSet::new();
+    let mut parse_failures: usize = 0;
+    let mut opaque_unconfirmed: usize = 0;
     for u in &utxos {
         let Some(datum_hex) = u.inline_datum.as_deref() else {
             continue;
@@ -645,29 +655,41 @@ pub async fn scan_tm_utxos(
         let datum_cbor = match hex::decode(datum_hex) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("[tm-scan] skip TM datum (hex decode): {e}");
+                eprintln!("[tm-scan] marker-token TM datum failed hex decode: {e}");
+                parse_failures += 1;
                 continue;
             }
         };
         let datum: PlutusData = match minicbor::decode(&datum_cbor) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[tm-scan] skip TM datum (cbor decode): {e}");
+                eprintln!("[tm-scan] marker-token TM datum failed CBOR decode: {e}");
+                parse_failures += 1;
                 continue;
             }
         };
         match parse_confirmed_tm_datum(&datum) {
             Ok(tm) => confirmed.push(tm),
-            Err(TreasuryDatumError::NotConfirmed) => {
-                if let Some(spends) = unconfirmed_tm_spends(&datum) {
-                    in_flight_spends.extend(spends);
+            Err(TreasuryDatumError::NotConfirmed) => match unconfirmed_tm_spends(&datum) {
+                Some(spends) => in_flight_spends.extend(spends),
+                None => {
+                    eprintln!(
+                        "[tm-scan] Unconfirmed TM datum's BTC tx did not deserialize — \
+                         treating as a possible in-flight movement"
+                    );
+                    opaque_unconfirmed += 1;
                 }
+            },
+            Err(e) => {
+                eprintln!("[tm-scan] marker-token Confirmed TM datum failed to parse: {e}");
+                parse_failures += 1;
             }
-            Err(e) => eprintln!("[tm-scan] skip unparseable TM datum: {e}"),
         }
     }
     Ok(TmScan {
         confirmed,
         in_flight_spends,
+        parse_failures,
+        opaque_unconfirmed,
     })
 }
