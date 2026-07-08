@@ -482,14 +482,28 @@ pub fn unspent_tips(confirmed: &[ConfirmedTm]) -> Vec<&ConfirmedTm> {
         }
     }
 
-    // Candidates whose treasury output nobody spent, deduped by btc_txid.
-    let mut seen_txids: HashSet<[u8; 32]> = HashSet::new();
+    // Candidates whose treasury output nobody spent, deduped on the FULL
+    // treasury-output identity (btc_txid + output[0] SPK + value) rather than the
+    // txid alone. Byte-identical re-confirmations (two Cardano UTxOs, same datum)
+    // still collapse, but two datums that share a btc_txid yet DISAGREE on
+    // output[0] — only possible via a fabricated TM (binocular
+    // TreasuryMovementValidator's unenforced tx-match TODO) — stay distinct
+    // candidates, so the scriptPubKey match in `select_spendable_tip` resolves
+    // them deterministically (not by Blockfrost's UTxO order), and a
+    // same-SPK-but-different-value conflict surfaces as Ambiguous rather than
+    // silently feeding a bogus treasury value into `build_tm`.
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut tips: Vec<&ConfirmedTm> = Vec::new();
     for tm in confirmed {
         if spent.contains(tm.treasury_outpoint_key().as_slice()) {
             continue;
         }
-        if seen_txids.insert(tm.btc_txid) {
+        let mut ident = tm.btc_txid.to_vec();
+        if let Some(out) = tm.outputs.first() {
+            ident.extend_from_slice(&out.script_pub_key);
+            ident.extend_from_slice(&out.amount.to_le_bytes());
+        }
+        if seen.insert(ident) {
             tips.push(tm);
         }
     }
@@ -800,6 +814,45 @@ mod tests {
         assert!(matches!(
             select_spendable_tip(&set, &[0x51, 0x20, 0xBB]),
             Err(TipSelectError::SpkMismatch { .. })
+        ));
+    }
+
+    /// Two datums sharing a btc_txid but with DIFFERENT treasury SPKs (a
+    /// fabricated TM) stay distinct after dedup, so the SPK match deterministically
+    /// picks ours regardless of scan order — not Blockfrost-order dependent.
+    #[test]
+    fn dedup_keeps_conflicting_same_txid_distinct() {
+        let ours = vec![0x51, 0x20, 0xAA];
+        let theirs = vec![0x51, 0x20, 0xBB];
+        let mine = tm_spk([0x11; 32], None, ours.clone());
+        let fake = tm_spk([0x11; 32], None, theirs);
+
+        let set1 = [mine.clone(), fake.clone()];
+        assert_eq!(
+            select_spendable_tip(&set1, &ours).unwrap().treasury_spk(),
+            Some(ours.as_slice())
+        );
+        // Reversed order resolves to the same tip.
+        let set2 = [fake, mine];
+        assert_eq!(
+            select_spendable_tip(&set2, &ours).unwrap().treasury_spk(),
+            Some(ours.as_slice())
+        );
+    }
+
+    /// Same btc_txid + same SPK but different VALUE → both match our keys →
+    /// Ambiguous (refuse) rather than silently feeding a bogus treasury value.
+    #[test]
+    fn dedup_same_txid_same_spk_diff_value_is_ambiguous() {
+        let ours = vec![0x51, 0x20, 0xAA];
+        let mut a = tm_spk([0x11; 32], None, ours.clone());
+        a.outputs[0].amount = 100_000;
+        let mut b = tm_spk([0x11; 32], None, ours.clone());
+        b.outputs[0].amount = 200_000;
+        let set = [a, b];
+        assert!(matches!(
+            select_spendable_tip(&set, &ours),
+            Err(TipSelectError::Ambiguous(_))
         ));
     }
 }
