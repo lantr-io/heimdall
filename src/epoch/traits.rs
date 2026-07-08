@@ -60,8 +60,11 @@ pub struct TreasuryUtxo {
     pub federation_csv_blocks: u32,
     pub fee_rate_sat_per_vb: u64,
     pub per_pegout_fee: bitcoin::Amount,
-    /// Whether the Bitcoin transaction in the oracle datum has been
-    /// confirmed on Bitcoin. A new treasury movement can only begin once the previous one is confirmed.
+    /// Whether it is safe to begin the NEXT treasury movement off this UTxO.
+    /// A new movement can only begin once the previous one is confirmed, so the
+    /// Blockfrost impl (WI-028) sets this false when an Unconfirmed TM (or an
+    /// in-flight TM it could not read) is already spending this tip; the mock
+    /// reports a simple always-confirmed treasury.
     pub btc_confirmed: bool,
 }
 

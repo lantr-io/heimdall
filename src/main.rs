@@ -2983,7 +2983,7 @@ fn run_mover(
         println!(
             "\n═══ auto-mover tick #{tick} (interval {interval_secs}s, broadcast={broadcast}) ═══"
         );
-        match run_sweep_pegins(
+        let result = run_sweep_pegins(
             cfg,
             cardano_socket,
             cardano_magic,
@@ -2997,16 +2997,18 @@ fn run_mover(
             None, // no existing-tm override
             exclude_pegin,
             true, // auto_mode → busy/idle skips instead of erroring
-        ) {
-            Ok(()) => {}
-            Err(e) => eprintln!("[mover] tick #{tick} error (continuing): {e}"),
-        }
+        );
+        // In --once mode (documented "for testing") propagate the tick result so the
+        // process exit code reflects success/failure. In the continuous loop a tick
+        // error is logged and the loop keeps going.
         if once {
-            break;
+            return result;
+        }
+        if let Err(e) = result {
+            eprintln!("[mover] tick #{tick} error (continuing): {e}");
         }
         std::thread::sleep(Duration::from_secs(interval_secs));
     }
-    Ok(())
 }
 
 /// Read-only `show-treasury`: chain-source the current treasury from Cardano and
@@ -3031,8 +3033,7 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
         .ok_or("cardano.blockfrost_project_id not set")?;
     let base_url = heimdall::cardano::bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
     let policy = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
-    let asset_name = cfg.cardano.treasury_asset_name.clone().unwrap_or_default();
-    let asset_unit = format!("{policy}{asset_name}");
+    let asset_unit = format!("{policy}{}", treasury_asset_name_hex(cfg));
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let scan = rt.block_on(scan_tm_utxos(&base_url, pid, address, &asset_unit))?;
@@ -3041,6 +3042,15 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
     println!("marker unit:          {asset_unit}");
     println!("confirmed TMs:        {}", scan.confirmed.len());
     println!("in-flight spends:     {}", scan.in_flight_spends.len());
+    println!("parse failures:       {}", scan.parse_failures);
+    println!("opaque unconfirmed:   {}", scan.opaque_unconfirmed);
+    if scan.parse_failures > 0 {
+        println!(
+            "  ⚠ {} marker-token TM datum(s) failed to parse — chain-source would REFUSE \
+             (mis-root risk)",
+            scan.parse_failures
+        );
+    }
 
     // Our expected treasury keys: demo Y_51 (deterministic DKG) + federation seed + csv.
     let secp = Secp256k1::new();
@@ -3126,18 +3136,30 @@ struct ChainTip {
     in_flight: bool,
 }
 
+/// The treasury marker-token asset name (hex). Shared by every treasury-sourcing
+/// path so they scan the SAME token unit; the real TM validator uses an empty
+/// asset name, the always-ok scaffold uses "TMTx".
+fn treasury_asset_name_hex(cfg: &HeimdallConfig) -> String {
+    cfg.cardano
+        .treasury_asset_name
+        .clone()
+        .unwrap_or_else(|| hex::encode("TMTx"))
+}
+
 /// Chain-source the current Bitcoin treasury UTxO from the Cardano tip
 /// Confirmed-TM (WI-028): scan the TM validator address, chain-follow the
 /// Confirmed datums to the tip whose scriptPubKey matches `expected_spk`, and
 /// return its outpoint + value. `in_flight` is set when an Unconfirmed TM already
-/// spends the tip — the caller decides whether to wait (auto-mover) or error
-/// (one-shot sweep), so we never build a second TM off an unconfirmed treasury.
+/// spends the tip (or an in-flight TM we could not read) — the caller decides
+/// whether to wait (auto-mover) or error (one-shot sweep), so we never build a
+/// second TM off an unconfirmed treasury. Before the first TM confirms, falls
+/// back to the bootstrap `bitcoin.treasury_txid/vout/amount` config.
 async fn fetch_chain_treasury_tip(
     cfg: &HeimdallConfig,
     expected_spk: &[u8],
 ) -> Result<ChainTip, String> {
     use heimdall::cardano::blockfrost_chain::scan_tm_utxos;
-    use heimdall::cardano::treasury_datum::select_spendable_tip;
+    use heimdall::cardano::treasury_datum::{TipSelectError, select_spendable_tip};
 
     let pid = cfg.cardano.blockfrost_project_id.as_deref().ok_or(
         "chain-sourced treasury requires cardano.blockfrost_project_id \
@@ -3150,14 +3172,51 @@ async fn fetch_chain_treasury_tip(
         .ok_or("chain-sourced treasury requires cardano.treasury_address")?;
     let base_url = heimdall::cardano::bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
     let policy = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
-    let asset_name = cfg.cardano.treasury_asset_name.clone().unwrap_or_default();
-    let asset_unit = format!("{policy}{asset_name}");
+    let asset_unit = format!("{policy}{}", treasury_asset_name_hex(cfg));
 
     let scan = scan_tm_utxos(&base_url, pid, address, &asset_unit).await?;
-    let tip = select_spendable_tip(&scan.confirmed, expected_spk)
-        .map_err(|e| format!("treasury tip selection: {e}"))?;
+
+    // A marker-token datum we could not read is a real TM we dropped; chain-follow
+    // on an incomplete set can promote an already-spent parent to a false tip.
+    if scan.parse_failures > 0 {
+        return Err(format!(
+            "{} marker-token TM datum(s) failed to parse — refusing to chain-source the \
+             treasury (would risk re-spending an already-moved UTxO); pass --treasury-outpoint \
+             to override",
+            scan.parse_failures
+        ));
+    }
+
+    let tip = match select_spendable_tip(&scan.confirmed, expected_spk) {
+        Ok(t) => t,
+        // Fresh bridge: no Confirmed TM yet — bootstrap from config, same as the
+        // epoch daemon's query_treasury does, so the auto-mover can post the FIRST TM.
+        Err(TipSelectError::NoConfirmedTms) => {
+            let (Some(txid), Some(vout), Some(amount)) = (
+                cfg.bitcoin.treasury_txid.as_deref(),
+                cfg.bitcoin.treasury_vout,
+                cfg.bitcoin.treasury_amount_sat,
+            ) else {
+                return Err(
+                    "no Confirmed TM on-chain yet and no bootstrap bitcoin.treasury_txid/\
+                     treasury_vout/treasury_amount_sat configured (or pass --treasury-outpoint)"
+                        .to_string(),
+                );
+            };
+            let outpoint = parse_outpoint(&format!("{txid}:{vout}"))?;
+            let in_flight =
+                scan.in_flight_spends.contains(&outpoint) || scan.opaque_unconfirmed > 0;
+            println!("  treasury (bootstrap from config — no Confirmed TM yet): {outpoint}");
+            return Ok(ChainTip {
+                outpoint,
+                value: bitcoin::Amount::from_sat(amount),
+                in_flight,
+            });
+        }
+        Err(e) => return Err(format!("treasury tip selection: {e}")),
+    };
     let outpoint = tip.treasury_outpoint();
-    let in_flight = scan.in_flight_spends.contains(&outpoint);
+    let in_flight = scan.in_flight_spends.contains(&outpoint) || scan.opaque_unconfirmed > 0;
     let value = tip
         .treasury_value()
         .ok_or("treasury tip datum has no outputs")?;

@@ -325,22 +325,36 @@ async fn publish_keys_phase(
     // makes the handoff destination visible the moment DKG completes. Y_51 is
     // identical across all SPOs (checked in `dkg_phase`), so every SPO derives
     // this same address.
-    let treasury = chain.query_treasury().await?;
-    let secp = Secp256k1::new();
-    let new_spend = treasury_spend_info(
-        &secp,
-        y_51,
-        treasury.y_fed,
-        treasury.federation_csv_blocks as u16,
-    );
-    let new_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(new_spend.output_key());
-    crate::epoch_log!(
-        me,
-        epoch,
-        "  -> new treasury: output_key={} scriptPubKey={}",
-        hex::encode(new_spend.output_key().to_x_only_public_key().serialize()),
-        hex::encode(new_spk.as_bytes())
-    );
+    //
+    // This runs BEFORE `publish_group_key` sets the group key, so `query_treasury`
+    // may not yet be able to match the current on-chain tip to our keys. That is a
+    // hard error there (never sign an unmatched tip), but here it is only an
+    // address preview — so treat a failure as non-fatal and continue to the actual
+    // handoff, where `build_tm_phase` re-queries with the published key.
+    match chain.query_treasury().await {
+        Ok(treasury) => {
+            let secp = Secp256k1::new();
+            let new_spend = treasury_spend_info(
+                &secp,
+                y_51,
+                treasury.y_fed,
+                treasury.federation_csv_blocks as u16,
+            );
+            let new_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(new_spend.output_key());
+            crate::epoch_log!(
+                me,
+                epoch,
+                "  -> new treasury: output_key={} scriptPubKey={}",
+                hex::encode(new_spend.output_key().to_x_only_public_key().serialize()),
+                hex::encode(new_spk.as_bytes())
+            );
+        }
+        Err(e) => crate::epoch_log!(
+            me,
+            epoch,
+            "  (new treasury address preview unavailable pre-handoff: {e})"
+        ),
+    }
 
     chain.publish_group_key(y_51).await?;
 
