@@ -401,11 +401,13 @@ enum Commands {
         #[arg(long)]
         cardano_magic: u64,
         /// Bech32 address of the peg-in script holding the PegInRequest UTxOs.
+        /// Falls back to `cardano.pegin_script_address` if omitted.
         #[arg(long)]
-        pegin_script_address: String,
+        pegin_script_address: Option<String>,
         /// Peg-in policy ID as 56 hex chars (28 bytes).
+        /// Falls back to `cardano.pegin_policy_id` if omitted.
         #[arg(long)]
-        pegin_policy_id: String,
+        pegin_policy_id: Option<String>,
         /// Current treasury outpoint to sweep, as <txid>:<vout>. Omit (together with
         /// --treasury-amount-sat) to chain-source the treasury from the Cardano tip
         /// Confirmed-TM (WI-028); pass both to override.
@@ -414,16 +416,15 @@ enum Commands {
         /// Treasury input amount in satoshis. Omit to chain-source from Cardano.
         #[arg(long, requires = "treasury_outpoint")]
         treasury_amount_sat: Option<u64>,
-        /// Bech32 address of the `peg_out.ak` script holding PegOut UTxOs. A Treasury Movement
-        /// collects EVERY pending peg-out here (technical_documentation §"Treasury Movement
-        /// (Bitcoin)": "pay every pending peg-out") alongside every confirmed peg-in. Destination +
-        /// amount come from each on-chain PegOut UTxO, never from the CLI.
+        /// Bech32 address of the `peg_out.ak` script holding PegOut UTxOs (the TM pays every
+        /// pending peg-out there; destination + amount come from each on-chain PegOut UTxO).
+        /// Falls back to `cardano.pegout_script_address` if omitted.
         #[arg(long)]
-        pegout_script_address: String,
+        pegout_script_address: Option<String>,
         /// The bridged-token (fBTC) unit `<policy_hex><asset_name_hex>` used to read each PegOut
-        /// UTxO's locked amount from its value.
+        /// UTxO's locked amount. Falls back to `cardano.bridged_token_unit` if omitted.
         #[arg(long)]
-        bridged_token_unit: String,
+        bridged_token_unit: Option<String>,
         /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
         #[arg(long)]
         broadcast: bool,
@@ -462,18 +463,24 @@ enum Commands {
     RunMover {
         #[arg(long)]
         config: Option<String>,
-        #[arg(long)]
+        /// N2C socket — unused on the Blockfrost path the mover uses; defaulted so a
+        /// config-driven mover needs only `--config`.
+        #[arg(long, default_value = "/dev/null")]
         cardano_socket: String,
-        #[arg(long)]
+        #[arg(long, default_value_t = 1)]
         cardano_magic: u64,
+        /// Falls back to `cardano.pegin_script_address` if omitted.
         #[arg(long)]
-        pegin_script_address: String,
+        pegin_script_address: Option<String>,
+        /// Falls back to `cardano.pegin_policy_id` if omitted.
         #[arg(long)]
-        pegin_policy_id: String,
+        pegin_policy_id: Option<String>,
+        /// Falls back to `cardano.pegout_script_address` if omitted.
         #[arg(long)]
-        pegout_script_address: String,
+        pegout_script_address: Option<String>,
+        /// Falls back to `cardano.bridged_token_unit` if omitted.
         #[arg(long)]
-        bridged_token_unit: String,
+        bridged_token_unit: Option<String>,
         /// Seconds between ticks.
         #[arg(long, default_value_t = 60)]
         interval_secs: u64,
@@ -498,6 +505,15 @@ fn load_config(path: Option<&str>) -> HeimdallConfig {
         }),
         None => HeimdallConfig::default(),
     }
+}
+
+/// Resolve a per-bridge value from the CLI flag (override) else the config, exiting
+/// with a message that names both the `--flag` and the `cardano.<key>` it can come from.
+fn resolve_arg(cli: Option<String>, cfg_val: Option<&String>, flag: &str, cfg_key: &str) -> String {
+    cli.or_else(|| cfg_val.cloned()).unwrap_or_else(|| {
+        eprintln!("Error: pass --{flag} or set cardano.{cfg_key} in the config");
+        std::process::exit(1);
+    })
 }
 
 fn main() {
@@ -809,6 +825,32 @@ fn main() {
             exclude_pegin,
         } => {
             let cfg = load_config(config.as_deref());
+            // CLI flags override; otherwise fall back to the [cardano] config.
+            let c = &cfg.cardano;
+            let pegin_script_address = resolve_arg(
+                pegin_script_address,
+                c.pegin_script_address.as_ref(),
+                "pegin-script-address",
+                "pegin_script_address",
+            );
+            let pegin_policy_id = resolve_arg(
+                pegin_policy_id,
+                c.pegin_policy_id.as_ref(),
+                "pegin-policy-id",
+                "pegin_policy_id",
+            );
+            let pegout_script_address = resolve_arg(
+                pegout_script_address,
+                c.pegout_script_address.as_ref(),
+                "pegout-script-address",
+                "pegout_script_address",
+            );
+            let bridged_token_unit = resolve_arg(
+                bridged_token_unit,
+                c.bridged_token_unit.as_ref(),
+                "bridged-token-unit",
+                "bridged_token_unit",
+            );
             if let Err(e) = run_sweep_pegins(
                 &cfg,
                 &cardano_socket,
@@ -842,6 +884,32 @@ fn main() {
             exclude_pegin,
         } => {
             let cfg = load_config(config.as_deref());
+            // CLI flags override; otherwise fall back to the [cardano] config.
+            let c = &cfg.cardano;
+            let pegin_script_address = resolve_arg(
+                pegin_script_address,
+                c.pegin_script_address.as_ref(),
+                "pegin-script-address",
+                "pegin_script_address",
+            );
+            let pegin_policy_id = resolve_arg(
+                pegin_policy_id,
+                c.pegin_policy_id.as_ref(),
+                "pegin-policy-id",
+                "pegin_policy_id",
+            );
+            let pegout_script_address = resolve_arg(
+                pegout_script_address,
+                c.pegout_script_address.as_ref(),
+                "pegout-script-address",
+                "pegout_script_address",
+            );
+            let bridged_token_unit = resolve_arg(
+                bridged_token_unit,
+                c.bridged_token_unit.as_ref(),
+                "bridged-token-unit",
+                "bridged_token_unit",
+            );
             if let Err(e) = run_mover(
                 &cfg,
                 &cardano_socket,

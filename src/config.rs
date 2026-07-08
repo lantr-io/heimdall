@@ -167,6 +167,13 @@ pub struct CardanoConfig {
     pub network_magic: Option<u64>,
     pub pegin_script_address: Option<String>,
     pub pegin_policy_id: Option<String>,
+    /// Bech32 address of the `peg_out.ak` script holding PegOut UTxOs. Read by
+    /// `sweep-pegins` / `run-mover` when `--pegout-script-address` is not passed.
+    pub pegout_script_address: Option<String>,
+    /// The bridged-token (fBTC) unit `<policy_hex><asset_name_hex>` used to read each
+    /// PegOut UTxO's locked amount. Read by `sweep-pegins` / `run-mover` when
+    /// `--bridged-token-unit` is not passed.
+    pub bridged_token_unit: Option<String>,
     pub treasury_address: Option<String>,
     pub treasury_policy_id: Option<String>,
     pub treasury_asset_name: Option<String>,
@@ -249,6 +256,8 @@ impl Default for CardanoConfig {
             network_magic: None,
             pegin_script_address: None,
             pegin_policy_id: None,
+            pegout_script_address: None,
+            bridged_token_unit: None,
             treasury_address: None,
             treasury_policy_id: None,
             treasury_asset_name: None,
