@@ -406,12 +406,14 @@ enum Commands {
         /// Peg-in policy ID as 56 hex chars (28 bytes).
         #[arg(long)]
         pegin_policy_id: String,
-        /// Current treasury outpoint to sweep, as <txid>:<vout>.
-        #[arg(long)]
-        treasury_outpoint: String,
-        /// Treasury input amount in satoshis.
-        #[arg(long)]
-        treasury_amount_sat: u64,
+        /// Current treasury outpoint to sweep, as <txid>:<vout>. Omit (together with
+        /// --treasury-amount-sat) to chain-source the treasury from the Cardano tip
+        /// Confirmed-TM (WI-028); pass both to override.
+        #[arg(long, requires = "treasury_amount_sat")]
+        treasury_outpoint: Option<String>,
+        /// Treasury input amount in satoshis. Omit to chain-source from Cardano.
+        #[arg(long, requires = "treasury_outpoint")]
+        treasury_amount_sat: Option<u64>,
         /// Bech32 address of the `peg_out.ak` script holding PegOut UTxOs. A Treasury Movement
         /// collects EVERY pending peg-out here (technical_documentation §"Treasury Movement
         /// (Bitcoin)": "pay every pending peg-out") alongside every confirmed peg-in. Destination +
@@ -435,6 +437,54 @@ enum Commands {
         /// PegInRequest still sits at the peg-in address. Use for deposits already swept into
         /// the current treasury whose PIR was never consumed by a mint — re-including them would
         /// double-spend an outpoint that no longer exists. Repeatable.
+        #[arg(long = "exclude-pegin")]
+        exclude_pegin: Vec<String>,
+    },
+    /// Read-only: chain-source the current Bitcoin treasury from Cardano state
+    /// (WI-028). Scans the TM validator address (`cardano.treasury_address`),
+    /// chain-follows the Confirmed TMs to the unspent tip, and prints its
+    /// outpoint / value / scriptPubKey, whether it matches the demo Y_51 treasury
+    /// keys, and whether a movement is already in flight against it. Posts
+    /// nothing — the same read the auto-mover and `sweep-pegins` use to source
+    /// the treasury.
+    ShowTreasury {
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Background auto-mover (WI-028): every `--interval-secs`, chain-source the
+    /// current treasury from Cardano (no config edits), collect pending peg-ins +
+    /// peg-outs, and — if the treasury is free and there is work — build, FROST-sign
+    /// and post the next Treasury Movement. Skips ticks when nothing is pending or a
+    /// movement is already in flight (waits for binocular `confirm-tmtx` to advance
+    /// the tip). Runs on the CURRENT contracts with no leader election, so run ONE
+    /// instance per bridge. Use `--once` for a single tick and omit `--broadcast`
+    /// for a dry run (build + print, no post).
+    RunMover {
+        #[arg(long)]
+        config: Option<String>,
+        #[arg(long)]
+        cardano_socket: String,
+        #[arg(long)]
+        cardano_magic: u64,
+        #[arg(long)]
+        pegin_script_address: String,
+        #[arg(long)]
+        pegin_policy_id: String,
+        #[arg(long)]
+        pegout_script_address: String,
+        #[arg(long)]
+        bridged_token_unit: String,
+        /// Seconds between ticks.
+        #[arg(long, default_value_t = 60)]
+        interval_secs: u64,
+        /// Run a single tick and exit (for testing).
+        #[arg(long)]
+        once: bool,
+        /// Post the built TM (Cardano + optional Bitcoin per config). Omit for a dry run.
+        #[arg(long)]
+        broadcast: bool,
+        /// Peg-in BTC outpoint(s) `<txid>:<vout>` to DROP from every sweep (see
+        /// `sweep-pegins --exclude-pegin`). Repeatable.
         #[arg(long = "exclude-pegin")]
         exclude_pegin: Vec<String>,
     },
@@ -765,14 +815,53 @@ fn main() {
                 cardano_magic,
                 &pegin_script_address,
                 &pegin_policy_id,
-                &treasury_outpoint,
+                treasury_outpoint.as_deref(),
                 treasury_amount_sat,
                 &pegout_script_address,
                 &bridged_token_unit,
                 broadcast,
                 existing_tm_hex.as_deref(),
                 &exclude_pegin,
+                false, // auto_mode
             ) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::RunMover {
+            config,
+            cardano_socket,
+            cardano_magic,
+            pegin_script_address,
+            pegin_policy_id,
+            pegout_script_address,
+            bridged_token_unit,
+            interval_secs,
+            once,
+            broadcast,
+            exclude_pegin,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_mover(
+                &cfg,
+                &cardano_socket,
+                cardano_magic,
+                &pegin_script_address,
+                &pegin_policy_id,
+                &pegout_script_address,
+                &bridged_token_unit,
+                interval_secs,
+                once,
+                broadcast,
+                &exclude_pegin,
+            ) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::ShowTreasury { config } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_show_treasury(&cfg) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -2866,6 +2955,219 @@ fn run_show_roster(
     Ok(())
 }
 
+/// Background auto-mover loop (WI-028): periodically chain-source the treasury and
+/// post the next Treasury Movement when there is work AND the treasury is free.
+/// Reuses `run_sweep_pegins` in `auto_mode` (busy / idle → skip, not error) so a
+/// transient failure never kills the loop; pacing is implicit — a just-posted
+/// movement shows up as in-flight on the next tick and is skipped until binocular
+/// `confirm-tmtx` advances the tip. No leader election (WI-027): run ONE instance.
+#[allow(clippy::too_many_arguments)]
+fn run_mover(
+    cfg: &HeimdallConfig,
+    cardano_socket: &str,
+    cardano_magic: u64,
+    pegin_script_address: &str,
+    pegin_policy_id: &str,
+    pegout_script_address: &str,
+    bridged_token_unit: &str,
+    interval_secs: u64,
+    once: bool,
+    broadcast: bool,
+    exclude_pegin: &[String],
+) -> Result<(), String> {
+    use std::time::Duration;
+
+    let mut tick: u64 = 0;
+    loop {
+        tick += 1;
+        println!(
+            "\n═══ auto-mover tick #{tick} (interval {interval_secs}s, broadcast={broadcast}) ═══"
+        );
+        match run_sweep_pegins(
+            cfg,
+            cardano_socket,
+            cardano_magic,
+            pegin_script_address,
+            pegin_policy_id,
+            None, // chain-source the treasury (WI-028)
+            None,
+            pegout_script_address,
+            bridged_token_unit,
+            broadcast,
+            None, // no existing-tm override
+            exclude_pegin,
+            true, // auto_mode → busy/idle skips instead of erroring
+        ) {
+            Ok(()) => {}
+            Err(e) => eprintln!("[mover] tick #{tick} error (continuing): {e}"),
+        }
+        if once {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(interval_secs));
+    }
+    Ok(())
+}
+
+/// Read-only `show-treasury`: chain-source the current treasury from Cardano and
+/// print it. The safe way to test WI-028 against a live network — posts nothing.
+fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
+    use bitcoin::ScriptBuf;
+    use bitcoin::key::Secp256k1;
+    use heimdall::bitcoin::taproot::treasury_spend_info;
+    use heimdall::cardano::blockfrost_chain::scan_tm_utxos;
+    use heimdall::cardano::treasury_datum::unspent_tips;
+    use heimdall::frost::dkg::run_demo_dkg;
+
+    let address = cfg
+        .cardano
+        .treasury_address
+        .as_deref()
+        .ok_or("cardano.treasury_address not set")?;
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id not set")?;
+    let base_url = heimdall::cardano::bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let policy = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
+    let asset_name = cfg.cardano.treasury_asset_name.clone().unwrap_or_default();
+    let asset_unit = format!("{policy}{asset_name}");
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let scan = rt.block_on(scan_tm_utxos(&base_url, pid, address, &asset_unit))?;
+
+    println!("TM validator address: {address}");
+    println!("marker unit:          {asset_unit}");
+    println!("confirmed TMs:        {}", scan.confirmed.len());
+    println!("in-flight spends:     {}", scan.in_flight_spends.len());
+
+    // Our expected treasury keys: demo Y_51 (deterministic DKG) + federation seed + csv.
+    let secp = Secp256k1::new();
+    let (_sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    let dkg = run_demo_dkg(
+        b"heimdall-demo-seed-v1-0123456789",
+        cfg.demo.min_signers,
+        cfg.demo.max_signers,
+    );
+    let vk = dkg
+        .public_key_package
+        .verifying_key()
+        .serialize()
+        .map_err(|e| format!("group verifying key serialize: {e}"))?;
+    let y_51 = bitcoin::key::UntweakedPublicKey::from_slice(&vk[1..33])
+        .map_err(|e| format!("group key x-only: {e}"))?;
+    let csv = csv_blocks_u16(cfg)?;
+    let expected_spk =
+        ScriptBuf::new_p2tr_tweaked(treasury_spend_info(&secp, y_51, y_fed, csv).output_key());
+    println!("our Y_51:             {}", hex::encode(&vk[1..33]));
+    println!(
+        "expected treasury spk: {}",
+        hex::encode(expected_spk.as_bytes())
+    );
+
+    let tips = unspent_tips(&scan.confirmed);
+    println!("\nunspent tips: {}", tips.len());
+    let mut current = None;
+    for t in &tips {
+        let op = t.treasury_outpoint();
+        let val = t.treasury_value().map(|v| v.to_sat()).unwrap_or(0);
+        let spk = t.treasury_spk().map(hex::encode).unwrap_or_default();
+        let is_ours = t.treasury_spk() == Some(expected_spk.as_bytes());
+        let in_flight = scan.in_flight_spends.contains(&op);
+        println!(
+            "  {op}  {val} sat  spk={spk}{}{}",
+            if is_ours {
+                "  ← MATCHES our keys (current treasury)"
+            } else {
+                ""
+            },
+            if in_flight {
+                "  [movement IN FLIGHT]"
+            } else {
+                ""
+            },
+        );
+        if is_ours {
+            current = Some((op, val, in_flight));
+        }
+    }
+
+    match current {
+        Some((op, val, in_flight)) => {
+            println!("\nCURRENT TREASURY: {op} — {val} sat");
+            if in_flight {
+                println!(
+                    "  a movement is already in flight against it — NOT free to move \
+                     (wait for confirm-tmtx)"
+                );
+            } else {
+                println!(
+                    "  free to move — the auto-mover / sweep-pegins would build the next TM off this"
+                );
+            }
+        }
+        None if tips.is_empty() => {
+            println!("\nno unspent tip — bootstrap (config) treasury would be used")
+        }
+        None => println!(
+            "\nno unspent tip matches our keys ({} tip(s)) — check keys/config",
+            tips.len()
+        ),
+    }
+    Ok(())
+}
+
+/// The chain-sourced treasury tip: outpoint + value, and whether a movement is
+/// already in flight against it (an Unconfirmed TM already spends it).
+struct ChainTip {
+    outpoint: bitcoin::OutPoint,
+    value: bitcoin::Amount,
+    in_flight: bool,
+}
+
+/// Chain-source the current Bitcoin treasury UTxO from the Cardano tip
+/// Confirmed-TM (WI-028): scan the TM validator address, chain-follow the
+/// Confirmed datums to the tip whose scriptPubKey matches `expected_spk`, and
+/// return its outpoint + value. `in_flight` is set when an Unconfirmed TM already
+/// spends the tip — the caller decides whether to wait (auto-mover) or error
+/// (one-shot sweep), so we never build a second TM off an unconfirmed treasury.
+async fn fetch_chain_treasury_tip(
+    cfg: &HeimdallConfig,
+    expected_spk: &[u8],
+) -> Result<ChainTip, String> {
+    use heimdall::cardano::blockfrost_chain::scan_tm_utxos;
+    use heimdall::cardano::treasury_datum::select_spendable_tip;
+
+    let pid = cfg.cardano.blockfrost_project_id.as_deref().ok_or(
+        "chain-sourced treasury requires cardano.blockfrost_project_id \
+         (or pass --treasury-outpoint and --treasury-amount-sat)",
+    )?;
+    let address = cfg
+        .cardano
+        .treasury_address
+        .as_deref()
+        .ok_or("chain-sourced treasury requires cardano.treasury_address")?;
+    let base_url = heimdall::cardano::bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let policy = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
+    let asset_name = cfg.cardano.treasury_asset_name.clone().unwrap_or_default();
+    let asset_unit = format!("{policy}{asset_name}");
+
+    let scan = scan_tm_utxos(&base_url, pid, address, &asset_unit).await?;
+    let tip = select_spendable_tip(&scan.confirmed, expected_spk)
+        .map_err(|e| format!("treasury tip selection: {e}"))?;
+    let outpoint = tip.treasury_outpoint();
+    let in_flight = scan.in_flight_spends.contains(&outpoint);
+    let value = tip
+        .treasury_value()
+        .ok_or("treasury tip datum has no outputs")?;
+    Ok(ChainTip {
+        outpoint,
+        value,
+        in_flight,
+    })
+}
+
 /// Scan binocular's on-chain `PegInRequest` UTxOs over N2C, then build, sign and
 /// (optionally) broadcast the Treasury Movement sweeping the current treasury +
 /// all discovered deposits into a new treasury `output[0]`.
@@ -2874,8 +3176,8 @@ fn run_show_roster(
 /// validated by `parse_pegin_request`, which reconstructs the peg-in P2TR from
 /// `(y_fed, depositor_xonly, refund_timeout)` and requires a matching output —
 /// so a successful parse is itself proof the spend-info matches the on-chain
-/// scriptPubKey. The treasury input is passed by arg (its Cardano oracle UTxO is
-/// not required for the pure-Bitcoin sweep).
+/// scriptPubKey. The treasury input is chain-sourced from the Cardano tip
+/// Confirmed-TM (WI-028) unless overridden by `--treasury-outpoint`.
 #[allow(clippy::too_many_arguments)]
 fn run_sweep_pegins(
     cfg: &HeimdallConfig,
@@ -2883,13 +3185,18 @@ fn run_sweep_pegins(
     cardano_magic: u64,
     pegin_script_address: &str,
     pegin_policy_id: &str,
-    treasury_outpoint: &str,
-    treasury_amount_sat: u64,
+    treasury_outpoint: Option<&str>,
+    treasury_amount_sat: Option<u64>,
     pegout_script_address: &str,
     bridged_token_unit: &str,
     broadcast: bool,
     existing_tm_hex: Option<&str>,
     exclude_pegin: &[String],
+    // Auto-mover mode (WI-028 background loop): a treasury movement already in
+    // flight, or nothing pending to sweep, is a no-op skip (returns Ok) rather
+    // than an error — so the loop just waits for the next tick. One-shot
+    // `sweep-pegins` passes false (busy/idle stays an explicit outcome).
+    auto_mode: bool,
 ) -> Result<(), String> {
     use bitcoin::key::Secp256k1;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
@@ -3056,9 +3363,53 @@ fn run_sweep_pegins(
         });
     }
 
-    let treasury_outpoint = parse_outpoint(treasury_outpoint)?;
+    // Auto-mover: with nothing pending, don't post a treasury→treasury self-move
+    // (it would just burn fee) — skip this tick.
+    if auto_mode && pegin_inputs.is_empty() && pegout_requests.is_empty() {
+        println!("[mover] nothing to sweep (0 peg-ins, 0 peg-outs) — skipping tick");
+        return Ok(());
+    }
+
     let treasury_spend_info = treasury_spend_info(&secp, y_51, y_fed, csv);
     let treasury_spk = ScriptBuf::new_p2tr_tweaked(treasury_spend_info.output_key());
+
+    // Treasury input: an explicit --treasury-outpoint/--treasury-amount-sat pair
+    // overrides; otherwise chain-source it from the Cardano tip Confirmed-TM
+    // (WI-028) so no manual config edit is needed after each movement.
+    let (treasury_outpoint, treasury_amount_sat) = match (treasury_outpoint, treasury_amount_sat) {
+        (Some(o), Some(a)) => {
+            println!("  treasury (CLI override): {o} — {a} sat");
+            (parse_outpoint(o)?, a)
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(
+                "pass BOTH --treasury-outpoint and --treasury-amount-sat, or NEITHER \
+                        (to chain-source the treasury from the Cardano tip Confirmed-TM)"
+                    .to_string(),
+            );
+        }
+        (None, None) => {
+            let tip = rt.block_on(fetch_chain_treasury_tip(cfg, treasury_spk.as_bytes()))?;
+            if tip.in_flight {
+                let msg = format!(
+                    "a treasury movement is already in flight spending tip {} — wait for \
+                     confirm-tmtx before sweeping again",
+                    tip.outpoint
+                );
+                if auto_mode {
+                    println!("[mover] {msg} (skipping tick)");
+                    return Ok(());
+                }
+                return Err(format!("{msg} (or override with --treasury-outpoint)"));
+            }
+            println!(
+                "  treasury (Cardano tip Confirmed-TM): {} — {} sat",
+                tip.outpoint,
+                tip.value.to_sat()
+            );
+            (tip.outpoint, tip.value.to_sat())
+        }
+    };
 
     // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..] = one
     // payment per peg-out (sorted by scriptPubKey inside build_tm).
