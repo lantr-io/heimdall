@@ -3297,35 +3297,22 @@ fn treasury_asset_name_hex(cfg: &HeimdallConfig) -> String {
         .unwrap_or_else(|| hex::encode("TMTx"))
 }
 
-/// Chain-source the current Bitcoin treasury UTxO from the Cardano tip
-/// Confirmed-TM (WI-028): scan the TM validator address, chain-follow the
-/// Confirmed datums to the tip whose scriptPubKey matches `expected_spk`, and
-/// return its outpoint + value. `in_flight` is set when an Unconfirmed TM already
-/// spends the tip (or an in-flight TM we could not read) — the caller decides
-/// whether to wait (auto-mover) or error (one-shot sweep), so we never build a
-/// second TM off an unconfirmed treasury. Before the first TM confirms, falls
-/// back to the bootstrap `bitcoin.treasury_txid/vout/amount` config.
-async fn fetch_chain_treasury_tip(
+/// Chain-source the current Bitcoin treasury UTxO from a pre-fetched TM-UTxO
+/// scan (WI-028): chain-follow the Confirmed datums to the tip whose scriptPubKey
+/// matches `expected_spk`, and return its outpoint + value. `in_flight` is set
+/// when a VIABLE Unconfirmed TM already spends the tip (or an unreadable one) —
+/// the caller decides whether to wait (auto-mover) or error (one-shot sweep), so
+/// we never build a second TM off an unconfirmed treasury. Before the first TM
+/// confirms, falls back to the bootstrap `bitcoin.treasury_txid/vout/amount`.
+///
+/// Takes the scan by ref so the sweep path scans the validator address ONCE and
+/// reuses it for both the peg-in guard and this tip selection.
+fn select_chain_tip(
     cfg: &HeimdallConfig,
     expected_spk: &[u8],
+    scan: &heimdall::cardano::blockfrost_chain::TmScan,
 ) -> Result<ChainTip, String> {
-    use heimdall::cardano::blockfrost_chain::scan_tm_utxos;
     use heimdall::cardano::treasury_datum::{TipSelectError, select_spendable_tip};
-
-    let pid = cfg.cardano.blockfrost_project_id.as_deref().ok_or(
-        "chain-sourced treasury requires cardano.blockfrost_project_id \
-         (or pass --treasury-outpoint and --treasury-amount-sat)",
-    )?;
-    let address = cfg
-        .cardano
-        .treasury_address
-        .as_deref()
-        .ok_or("chain-sourced treasury requires cardano.treasury_address")?;
-    let base_url = heimdall::cardano::bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
-    let policy = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
-    let asset_unit = format!("{policy}{}", treasury_asset_name_hex(cfg));
-
-    let scan = scan_tm_utxos(&base_url, pid, address, &asset_unit).await?;
 
     // A marker-token datum we could not read is a real TM we dropped; chain-follow
     // on an incomplete set can promote an already-spent parent to a false tip.
@@ -3489,13 +3476,9 @@ fn run_sweep_pegins(
         .collect::<Result<_, _>>()
         .map_err(|e| format!("--exclude-pegin: {e}"))?;
 
-    // Auto-skip peg-ins Cardano already shows as handled — WITHOUT querying Bitcoin.
-    // A peg-in whose deposit is in a Confirmed TM's swept inputs (oracle-verified
-    // spent) or committed to a viable in-flight TM would build an invalid/duplicate
-    // TM. Because `pegin-complete` (fBTC mint) is the depositor's choice and may
-    // never happen, the on-chain PIR can linger forever after its deposit is swept;
-    // we detect that from the Confirmed/Unconfirmed TM datums, not the open PIR.
-    let auto_consumed: std::collections::HashSet<bitcoin::OutPoint> =
+    // Scan the TM validator UTxOs ONCE (Cardano) — reused for the peg-in guard here
+    // AND the chain-sourced treasury tip below, so a mover tick scans only once.
+    let tm_scan: Option<heimdall::cardano::blockfrost_chain::TmScan> =
         match cfg.cardano.blockfrost_project_id.as_deref() {
             Some(pid) => {
                 let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
@@ -3506,7 +3489,7 @@ fn run_sweep_pegins(
                     treasury_asset_name_hex(cfg)
                 );
                 if address.is_empty() {
-                    std::collections::HashSet::new()
+                    None
                 } else {
                     match rt.block_on(heimdall::cardano::blockfrost_chain::scan_tm_utxos(
                         &base_url,
@@ -3514,20 +3497,31 @@ fn run_sweep_pegins(
                         &address,
                         &asset_unit,
                     )) {
-                        Ok(scan) => {
-                            let mut s = scan.consumed;
-                            s.extend(scan.in_flight_spends);
-                            s
-                        }
+                        Ok(scan) => Some(scan),
                         Err(e) => {
-                            eprintln!("[sweep] could not scan TM UTxOs for peg-in auto-skip: {e}");
-                            std::collections::HashSet::new()
+                            eprintln!("[sweep] could not scan TM UTxOs: {e}");
+                            None
                         }
                     }
                 }
             }
-            None => std::collections::HashSet::new(),
+            None => None,
         };
+
+    // Auto-skip peg-ins Cardano already shows as handled — WITHOUT querying Bitcoin.
+    // A peg-in whose deposit is in a Confirmed TM's swept inputs (oracle-verified
+    // spent) or committed to a viable in-flight TM would build an invalid/duplicate
+    // TM. Because `pegin-complete` (fBTC mint) is the depositor's choice and may
+    // never happen, the on-chain PIR can linger forever after its deposit is swept;
+    // we detect that from the Confirmed/Unconfirmed TM datums, not the open PIR.
+    let auto_consumed: std::collections::HashSet<bitcoin::OutPoint> = tm_scan
+        .as_ref()
+        .map(|s| {
+            let mut c = s.consumed.clone();
+            c.extend(s.in_flight_spends.iter().copied());
+            c
+        })
+        .unwrap_or_default();
 
     // Each parse reconstructs and matches the peg-in P2TR, so the returned
     // `spend_info` is itself proof the spend info matches the on-chain
@@ -3649,7 +3643,11 @@ fn run_sweep_pegins(
             );
         }
         (None, None) => {
-            let tip = rt.block_on(fetch_chain_treasury_tip(cfg, treasury_spk.as_bytes()))?;
+            let scan = tm_scan.as_ref().ok_or(
+                "chain-sourced treasury requires cardano.blockfrost_project_id + \
+                 cardano.treasury_address (or pass --treasury-outpoint and --treasury-amount-sat)",
+            )?;
+            let tip = select_chain_tip(cfg, treasury_spk.as_bytes(), scan)?;
             if tip.in_flight {
                 let msg = format!(
                     "a treasury movement is already in flight spending tip {} — wait for \
