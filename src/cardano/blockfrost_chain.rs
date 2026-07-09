@@ -719,8 +719,11 @@ pub async fn scan_tm_utxos(
         .flat_map(|tm| tm.swept_outpoints())
         .collect();
 
-    // Chain "now" for the staleness deadline (only when configured) — chain time,
-    // never a local clock, so every operator agrees.
+    // Staleness pass (opt-in): a viable-by-inputs Unconfirmed TM that has been
+    // on-chain longer than `deadline_secs` (chain-now − its Cardano block time)
+    // never confirmed, so treat it as DEAD too — the time-based catch for a
+    // movement heimdall can't otherwise see is doomed (e.g. a peg-in refunded
+    // outside a TM). Fetch chain time once, then each candidate's block time.
     let now: Option<i64> = match deadline_secs {
         Some(_) => {
             match crate::cardano::bf_http::fetch_latest_block_time(base_url, project_id).await {
@@ -733,24 +736,13 @@ pub async fn scan_tm_utxos(
         }
         None => None,
     };
-
-    // `in_flight_spends` counts only VIABLE Unconfirmed TMs. A TM is DEAD (excluded)
-    // if it (a) spends an already-`consumed` outpoint — a double-spend that can
-    // never confirm — or (b) has been unconfirmed past `deadline_secs` (it never
-    // confirmed, so treat it as dead even though heimdall can't see WHY, e.g. a
-    // refunded peg-in). Excluding a dead TM stops it blocking the tip / reserving
-    // its peg-ins = the auto-unblock.
-    let mut in_flight_spends: HashSet<bitcoin::OutPoint> = HashSet::new();
-    for tm in &mut unconfirmed {
-        if tm.inputs.iter().any(|i| consumed.contains(i)) {
-            eprintln!(
-                "[tm-scan] Unconfirmed TM {} spends an already-swept input — dead, ignoring \
-                 (will never confirm)",
-                tm.btc_txid
-            );
-            continue;
-        }
-        if let (Some(deadline), Some(now)) = (deadline_secs, now) {
+    let mut stale: HashSet<bitcoin::Txid> = HashSet::new();
+    if let (Some(deadline), Some(now)) = (deadline_secs, now) {
+        for tm in &mut unconfirmed {
+            // Consumed-dead ones are excluded by `viable_in_flight_spends` anyway.
+            if tm.inputs.iter().any(|i| consumed.contains(i)) {
+                continue;
+            }
             match crate::cardano::bf_http::fetch_tx_block_time(
                 base_url,
                 project_id,
@@ -767,7 +759,7 @@ pub async fn scan_tm_utxos(
                              deadline) — treating as dead/stale, ignoring",
                             tm.btc_txid
                         );
-                        continue;
+                        stale.insert(tm.btc_txid);
                     }
                 }
                 Err(e) => eprintln!(
@@ -776,8 +768,20 @@ pub async fn scan_tm_utxos(
                 ),
             }
         }
-        in_flight_spends.extend(tm.inputs.iter().copied());
     }
+
+    // `viable_in_flight_spends` drops consumed-dead TMs; also drop the stale set
+    // (cloning only when there is something to drop, i.e. the deadline fired).
+    let in_flight_spends = if stale.is_empty() {
+        viable_in_flight_spends(&consumed, &unconfirmed)
+    } else {
+        let live: Vec<UnconfirmedTm> = unconfirmed
+            .iter()
+            .filter(|t| !stale.contains(&t.btc_txid))
+            .cloned()
+            .collect();
+        viable_in_flight_spends(&consumed, &live)
+    };
 
     Ok(TmScan {
         confirmed,
@@ -787,4 +791,98 @@ pub async fn scan_tm_utxos(
         unconfirmed,
         consumed,
     })
+}
+
+/// The VIABLE in-flight spends: the union of the inputs of every Unconfirmed TM
+/// that is NOT dead. An Unconfirmed TM is **dead** when its BTC tx spends an
+/// already-`consumed` outpoint — one a Confirmed (hence oracle-verified, mined) TM
+/// already spent — because that is a double-spend which can never confirm. A dead
+/// TM must therefore neither block the treasury tip nor reserve a peg-in (the
+/// auto-unblock). Only the returned outpoints gate the tip / peg-in guards.
+fn viable_in_flight_spends(
+    consumed: &HashSet<bitcoin::OutPoint>,
+    unconfirmed: &[UnconfirmedTm],
+) -> HashSet<bitcoin::OutPoint> {
+    let mut in_flight_spends: HashSet<bitcoin::OutPoint> = HashSet::new();
+    for tm in unconfirmed {
+        let dead = tm.inputs.iter().any(|i| consumed.contains(i));
+        if dead {
+            eprintln!(
+                "[tm-scan] Unconfirmed TM {} spends an already-swept input — dead, ignoring \
+                 (will never confirm)",
+                tm.btc_txid
+            );
+            continue;
+        }
+        in_flight_spends.extend(tm.inputs.iter().copied());
+    }
+    in_flight_spends
+}
+
+#[cfg(test)]
+mod tests {
+    use super::viable_in_flight_spends;
+    use crate::cardano::treasury_datum::UnconfirmedTm;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
+    use std::collections::HashSet;
+
+    fn op(txid: u8, vout: u32) -> OutPoint {
+        OutPoint {
+            txid: Txid::from_byte_array([txid; 32]),
+            vout,
+        }
+    }
+
+    fn unconf(txid: u8, inputs: &[OutPoint]) -> UnconfirmedTm {
+        UnconfirmedTm {
+            btc_txid: Txid::from_byte_array([txid; 32]),
+            inputs: inputs.to_vec(),
+            outputs: vec![(Amount::from_sat(1), ScriptBuf::new())],
+            cardano_tx_hash: String::new(),
+            block_time: None,
+        }
+    }
+
+    /// A viable in-flight TM (no input already swept) contributes all its inputs —
+    /// the tip guard must treat the treasury it spends as in-flight and wait.
+    #[test]
+    fn viable_tm_reserves_its_inputs() {
+        let consumed = HashSet::new(); // nothing swept yet
+        let tip = op(0xAB, 0);
+        let deposit = op(0xCD, 1);
+        let spends = viable_in_flight_spends(&consumed, &[unconf(0x01, &[tip, deposit])]);
+        assert!(spends.contains(&tip));
+        assert!(spends.contains(&deposit));
+    }
+
+    /// A dead in-flight TM (spends an already-`consumed` outpoint) contributes
+    /// NOTHING — the auto-unblock: it must not block the tip or reserve a peg-in.
+    #[test]
+    fn dead_tm_reserves_nothing() {
+        let swept_deposit = op(0xCD, 1);
+        let consumed = HashSet::from([swept_deposit]); // a Confirmed TM already spent it
+        let tip = op(0xAB, 0);
+        // Re-spends the live tip + the already-swept deposit → double-spend → dead.
+        let spends = viable_in_flight_spends(&consumed, &[unconf(0x02, &[tip, swept_deposit])]);
+        assert!(
+            spends.is_empty(),
+            "dead TM must reserve nothing, got {spends:?}"
+        );
+    }
+
+    /// Mixed set: only the viable movement's inputs survive; the dead one on the
+    /// same tip is dropped, so the tip is NOT considered in-flight by the dead TM.
+    #[test]
+    fn dead_and_viable_are_separated() {
+        let swept = op(0xCD, 1);
+        let consumed = HashSet::from([swept]);
+        let tip = op(0xAB, 0);
+        let fresh_deposit = op(0xEF, 2);
+        let dead = unconf(0x02, &[tip, swept]);
+        let viable = unconf(0x03, &[fresh_deposit]);
+        let spends = viable_in_flight_spends(&consumed, &[dead, viable]);
+        assert_eq!(spends, HashSet::from([fresh_deposit]));
+        assert!(!spends.contains(&tip));
+    }
 }

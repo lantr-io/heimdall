@@ -900,4 +900,58 @@ mod tests {
             Err(TipSelectError::Ambiguous(_))
         ));
     }
+
+    /// A 36-byte swept key decodes to the outpoint it was built from — the
+    /// encoding must be byte-exact (txid internal order ++ vout LE), since it
+    /// feeds the `consumed` set that gates dead-TM detection and peg-in skipping.
+    #[test]
+    fn swept_key_roundtrips_to_outpoint() {
+        let txid_bytes = [0xAB; 32];
+        for vout in [0u32, 1, 7, 0x0100, u32::MAX] {
+            let key = outpoint_key(txid_bytes, vout);
+            let op = outpoint_from_swept_key(&key).expect("36-byte key decodes");
+            assert_eq!(op.txid, Txid::from_byte_array(txid_bytes));
+            assert_eq!(op.vout, vout);
+        }
+    }
+
+    /// Wrong-length keys are rejected (None) rather than silently mis-decoding.
+    #[test]
+    fn swept_key_rejects_bad_length() {
+        assert!(outpoint_from_swept_key(&[0u8; 35]).is_none());
+        assert!(outpoint_from_swept_key(&[0u8; 37]).is_none());
+        assert!(outpoint_from_swept_key(&[]).is_none());
+    }
+
+    /// `swept_outpoints` decodes every input a Confirmed TM consumed — input 0 is
+    /// the previous treasury, the rest are swept peg-in deposits.
+    #[test]
+    fn swept_outpoints_decodes_all_inputs() {
+        let tm = ConfirmedTm {
+            btc_txid: [0xCC; 32],
+            swept_inputs: vec![
+                outpoint_key([0xAA; 32], 0), // prev treasury
+                outpoint_key([0xBB; 32], 3), // a swept deposit
+            ],
+            outputs: vec![TmOutput {
+                script_pub_key: vec![0x51, 0x20],
+                amount: 42,
+            }],
+        };
+        let ops = tm.swept_outpoints();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0], OutPoint { txid: Txid::from_byte_array([0xAA; 32]), vout: 0 });
+        assert_eq!(ops[1], OutPoint { txid: Txid::from_byte_array([0xBB; 32]), vout: 3 });
+    }
+
+    /// A malformed (non-36-byte) swept key is dropped, not panicked on.
+    #[test]
+    fn swept_outpoints_skips_malformed_key() {
+        let tm = ConfirmedTm {
+            btc_txid: [0xCC; 32],
+            swept_inputs: vec![outpoint_key([0xAA; 32], 0), vec![0x00; 10]],
+            outputs: vec![],
+        };
+        assert_eq!(tm.swept_outpoints().len(), 1);
+    }
 }
