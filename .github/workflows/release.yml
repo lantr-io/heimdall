@@ -60,3 +60,25 @@ jobs:
             --notes "Static x86_64-linux (musl) build of heimdall, from ${{ github.sha }}." \
             ${{ inputs.prerelease && '--prerelease' || '' }} \
             dist/heimdall dist/heimdall.sha256
+
+  notify:
+    name: discord
+    needs: release
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+    steps:
+      - name: Report release status
+        if: env.DISCORD_WEBHOOK != ''
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ env.DISCORD_WEBHOOK }}
+          status: ${{ needs.release.result }}
+          title: "[${{ github.event.repository.name }}] ${{ needs.release.result == 'success' && '🚀' || '❌' }} Release v${{ inputs.version }} - ${{ github.actor }}"
+          description: "${{ needs.release.result == 'success' && format('Published [v{0}]({1}/{2}/releases/tag/v{0})', inputs.version, github.server_url, github.repository) || 'Release build failed' }}"
+          url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          username: "GitHub Actions"
+          avatar_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png"
+          nodetail: true
+          notimestamp: true

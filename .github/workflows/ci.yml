@@ -43,3 +43,25 @@ jobs:
         run: cargo build --locked --all-targets
       - name: cargo test
         run: cargo test --locked
+
+  notify:
+    name: discord
+    needs: [lint, test]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+    steps:
+      - name: Report build status
+        if: env.DISCORD_WEBHOOK != ''
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ env.DISCORD_WEBHOOK }}
+          status: ${{ (needs.lint.result == 'success' && needs.test.result == 'success') && 'success' || 'failure' }}
+          title: "[${{ github.event.repository.name }}] ${{ (needs.lint.result == 'success' && needs.test.result == 'success') && '✅' || '❌' }} CI - ${{ github.actor }} on ${{ github.ref_name }}"
+          description: "[${{ github.event.head_commit.message }}](${{ github.event.head_commit.url }})"
+          url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          username: "GitHub Actions"
+          avatar_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png"
+          nodetail: true
+          notimestamp: true
