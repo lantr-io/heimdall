@@ -940,8 +940,20 @@ mod tests {
         };
         let ops = tm.swept_outpoints();
         assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0], OutPoint { txid: Txid::from_byte_array([0xAA; 32]), vout: 0 });
-        assert_eq!(ops[1], OutPoint { txid: Txid::from_byte_array([0xBB; 32]), vout: 3 });
+        assert_eq!(
+            ops[0],
+            OutPoint {
+                txid: Txid::from_byte_array([0xAA; 32]),
+                vout: 0
+            }
+        );
+        assert_eq!(
+            ops[1],
+            OutPoint {
+                txid: Txid::from_byte_array([0xBB; 32]),
+                vout: 3
+            }
+        );
     }
 
     /// A malformed (non-36-byte) swept key is dropped, not panicked on.
