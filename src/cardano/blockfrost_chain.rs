@@ -705,12 +705,30 @@ pub async fn scan_tm_utxos(
         .flat_map(|tm| tm.swept_outpoints())
         .collect();
 
-    // `in_flight_spends` counts only VIABLE Unconfirmed TMs — one whose BTC tx
-    // spends an already-`consumed` outpoint is a double-spend that can never
-    // confirm (dead), so it must NOT block the tip or reserve a peg-in. This is
-    // the auto-unblock: a stuck movement stops being treated as in-flight.
+    let in_flight_spends = viable_in_flight_spends(&consumed, &unconfirmed);
+
+    Ok(TmScan {
+        confirmed,
+        in_flight_spends,
+        parse_failures,
+        opaque_unconfirmed,
+        unconfirmed,
+        consumed,
+    })
+}
+
+/// The VIABLE in-flight spends: the union of the inputs of every Unconfirmed TM
+/// that is NOT dead. An Unconfirmed TM is **dead** when its BTC tx spends an
+/// already-`consumed` outpoint — one a Confirmed (hence oracle-verified, mined) TM
+/// already spent — because that is a double-spend which can never confirm. A dead
+/// TM must therefore neither block the treasury tip nor reserve a peg-in (the
+/// auto-unblock). Only the returned outpoints gate the tip / peg-in guards.
+fn viable_in_flight_spends(
+    consumed: &HashSet<bitcoin::OutPoint>,
+    unconfirmed: &[UnconfirmedTm],
+) -> HashSet<bitcoin::OutPoint> {
     let mut in_flight_spends: HashSet<bitcoin::OutPoint> = HashSet::new();
-    for tm in &unconfirmed {
+    for tm in unconfirmed {
         let dead = tm.inputs.iter().any(|i| consumed.contains(i));
         if dead {
             eprintln!(
@@ -722,13 +740,68 @@ pub async fn scan_tm_utxos(
         }
         in_flight_spends.extend(tm.inputs.iter().copied());
     }
+    in_flight_spends
+}
 
-    Ok(TmScan {
-        confirmed,
-        in_flight_spends,
-        parse_failures,
-        opaque_unconfirmed,
-        unconfirmed,
-        consumed,
-    })
+#[cfg(test)]
+mod tests {
+    use super::viable_in_flight_spends;
+    use crate::cardano::treasury_datum::UnconfirmedTm;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
+    use std::collections::HashSet;
+
+    fn op(txid: u8, vout: u32) -> OutPoint {
+        OutPoint {
+            txid: Txid::from_byte_array([txid; 32]),
+            vout,
+        }
+    }
+
+    fn unconf(txid: u8, inputs: &[OutPoint]) -> UnconfirmedTm {
+        UnconfirmedTm {
+            btc_txid: Txid::from_byte_array([txid; 32]),
+            inputs: inputs.to_vec(),
+            outputs: vec![(Amount::from_sat(1), ScriptBuf::new())],
+        }
+    }
+
+    /// A viable in-flight TM (no input already swept) contributes all its inputs —
+    /// the tip guard must treat the treasury it spends as in-flight and wait.
+    #[test]
+    fn viable_tm_reserves_its_inputs() {
+        let consumed = HashSet::new(); // nothing swept yet
+        let tip = op(0xAB, 0);
+        let deposit = op(0xCD, 1);
+        let spends = viable_in_flight_spends(&consumed, &[unconf(0x01, &[tip, deposit])]);
+        assert!(spends.contains(&tip));
+        assert!(spends.contains(&deposit));
+    }
+
+    /// A dead in-flight TM (spends an already-`consumed` outpoint) contributes
+    /// NOTHING — the auto-unblock: it must not block the tip or reserve a peg-in.
+    #[test]
+    fn dead_tm_reserves_nothing() {
+        let swept_deposit = op(0xCD, 1);
+        let consumed = HashSet::from([swept_deposit]); // a Confirmed TM already spent it
+        let tip = op(0xAB, 0);
+        // Re-spends the live tip + the already-swept deposit → double-spend → dead.
+        let spends = viable_in_flight_spends(&consumed, &[unconf(0x02, &[tip, swept_deposit])]);
+        assert!(spends.is_empty(), "dead TM must reserve nothing, got {spends:?}");
+    }
+
+    /// Mixed set: only the viable movement's inputs survive; the dead one on the
+    /// same tip is dropped, so the tip is NOT considered in-flight by the dead TM.
+    #[test]
+    fn dead_and_viable_are_separated() {
+        let swept = op(0xCD, 1);
+        let consumed = HashSet::from([swept]);
+        let tip = op(0xAB, 0);
+        let fresh_deposit = op(0xEF, 2);
+        let dead = unconf(0x02, &[tip, swept]);
+        let viable = unconf(0x03, &[fresh_deposit]);
+        let spends = viable_in_flight_spends(&consumed, &[dead, viable]);
+        assert_eq!(spends, HashSet::from([fresh_deposit]));
+        assert!(!spends.contains(&tip));
+    }
 }
