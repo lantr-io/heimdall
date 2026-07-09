@@ -352,6 +352,9 @@ impl CardanoChain for BlockfrostCardanoChain {
             &self.bf_project_id,
             &self.treasury_address,
             &asset_unit,
+            // Staleness deadline is applied on the mover/sweep path (run_sweep_pegins);
+            // the epoch-machine daemon does not thread it through TreasuryConfig yet.
+            None,
         )
         .await
         .map_err(EpochError::Chain)?;
@@ -641,11 +644,19 @@ pub struct TmScan {
 /// and COUNTED (`parse_failures` / `opaque_unconfirmed`) rather than aborting the
 /// scan — the caller decides whether the counts make the result untrustworthy
 /// (they do for chain-following, since a marker token is NFT-mint-gated).
+///
+/// `deadline_secs` (opt-in): an Unconfirmed TM still on-chain longer than this
+/// (chain-now − its Cardano block time) is treated as DEAD/stale and excluded
+/// from `in_flight_spends` — the time-based catch for a never-confirmable movement
+/// heimdall can't detect otherwise (e.g. a peg-in refunded outside a Confirmed
+/// TM). Costs one `/blocks/latest` + one `/txs/{hash}` per viable in-flight TM;
+/// `None` skips all of that.
 pub async fn scan_tm_utxos(
     base_url: &str,
     project_id: &str,
     address: &str,
     asset_unit: &str,
+    deadline_secs: Option<u64>,
 ) -> Result<TmScan, String> {
     let utxos = crate::cardano::bf_http::fetch_address_utxos(base_url, project_id, address)
         .await
@@ -681,7 +692,10 @@ pub async fn scan_tm_utxos(
         match parse_confirmed_tm_datum(&datum) {
             Ok(tm) => confirmed.push(tm),
             Err(TreasuryDatumError::NotConfirmed) => match parse_unconfirmed_tm(&datum) {
-                Some(tm) => unconfirmed.push(tm),
+                Some(mut tm) => {
+                    tm.cardano_tx_hash = u.tx_hash.clone();
+                    unconfirmed.push(tm);
+                }
                 None => {
                     eprintln!(
                         "[tm-scan] Unconfirmed TM datum's BTC tx did not deserialize — \
@@ -705,20 +719,62 @@ pub async fn scan_tm_utxos(
         .flat_map(|tm| tm.swept_outpoints())
         .collect();
 
-    // `in_flight_spends` counts only VIABLE Unconfirmed TMs — one whose BTC tx
-    // spends an already-`consumed` outpoint is a double-spend that can never
-    // confirm (dead), so it must NOT block the tip or reserve a peg-in. This is
-    // the auto-unblock: a stuck movement stops being treated as in-flight.
+    // Chain "now" for the staleness deadline (only when configured) — chain time,
+    // never a local clock, so every operator agrees.
+    let now: Option<i64> = match deadline_secs {
+        Some(_) => {
+            match crate::cardano::bf_http::fetch_latest_block_time(base_url, project_id).await {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("[tm-scan] could not read chain time for staleness deadline: {e}");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    // `in_flight_spends` counts only VIABLE Unconfirmed TMs. A TM is DEAD (excluded)
+    // if it (a) spends an already-`consumed` outpoint — a double-spend that can
+    // never confirm — or (b) has been unconfirmed past `deadline_secs` (it never
+    // confirmed, so treat it as dead even though heimdall can't see WHY, e.g. a
+    // refunded peg-in). Excluding a dead TM stops it blocking the tip / reserving
+    // its peg-ins = the auto-unblock.
     let mut in_flight_spends: HashSet<bitcoin::OutPoint> = HashSet::new();
-    for tm in &unconfirmed {
-        let dead = tm.inputs.iter().any(|i| consumed.contains(i));
-        if dead {
+    for tm in &mut unconfirmed {
+        if tm.inputs.iter().any(|i| consumed.contains(i)) {
             eprintln!(
                 "[tm-scan] Unconfirmed TM {} spends an already-swept input — dead, ignoring \
                  (will never confirm)",
                 tm.btc_txid
             );
             continue;
+        }
+        if let (Some(deadline), Some(now)) = (deadline_secs, now) {
+            match crate::cardano::bf_http::fetch_tx_block_time(
+                base_url,
+                project_id,
+                &tm.cardano_tx_hash,
+            )
+            .await
+            {
+                Ok(bt) => {
+                    tm.block_time = Some(bt);
+                    let age = now.saturating_sub(bt);
+                    if age > deadline as i64 {
+                        eprintln!(
+                            "[tm-scan] Unconfirmed TM {} unconfirmed for {age}s (> {deadline}s \
+                             deadline) — treating as dead/stale, ignoring",
+                            tm.btc_txid
+                        );
+                        continue;
+                    }
+                }
+                Err(e) => eprintln!(
+                    "[tm-scan] could not read block time for TM {} ({e}) — not applying staleness",
+                    tm.btc_txid
+                ),
+            }
         }
         in_flight_spends.extend(tm.inputs.iter().copied());
     }

@@ -3104,7 +3104,13 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
     let asset_unit = format!("{policy}{}", treasury_asset_name_hex(cfg));
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    let scan = rt.block_on(scan_tm_utxos(&base_url, pid, address, &asset_unit))?;
+    let scan = rt.block_on(scan_tm_utxos(
+        &base_url,
+        pid,
+        address,
+        &asset_unit,
+        cfg.bitcoin.inflight_deadline_secs,
+    ))?;
 
     println!("TM validator address: {address}");
     println!("marker unit:          {asset_unit}");
@@ -3496,6 +3502,7 @@ fn run_sweep_pegins(
                         pid,
                         &address,
                         &asset_unit,
+                        cfg.bitcoin.inflight_deadline_secs,
                     )) {
                         Ok(scan) => Some(scan),
                         Err(e) => {
