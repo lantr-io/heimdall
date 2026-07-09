@@ -417,10 +417,18 @@ pub struct UnconfirmedTm {
     pub btc_txid: bitcoin::Txid,
     pub inputs: Vec<OutPoint>,
     pub outputs: Vec<(Amount, bitcoin::ScriptBuf)>,
+    /// The Cardano tx that created this Unconfirmed-TM UTxO — filled by the
+    /// scanner (not the datum). Used to look up its block time for the staleness
+    /// deadline (chain-now − block time = how long it has been unconfirmed).
+    pub cardano_tx_hash: String,
+    /// POSIX block time (secs) of `cardano_tx_hash`, filled by the scanner only
+    /// when a staleness deadline is configured. `None` = not looked up.
+    pub block_time: Option<i64>,
 }
 
 /// Parse an Unconfirmed (Constr 0) TM datum into its full BTC tx shape. Returns
-/// `None` unless the datum is a deserializable Unconfirmed TM.
+/// `None` unless the datum is a deserializable Unconfirmed TM. The Cardano
+/// metadata (`cardano_tx_hash` / `block_time`) is filled by the scanner.
 pub fn parse_unconfirmed_tm(data: &PlutusData) -> Option<UnconfirmedTm> {
     let (tx_bytes, btc_confirmed) = extract_btc_tx_bytes(data).ok()?;
     if btc_confirmed {
@@ -435,6 +443,8 @@ pub fn parse_unconfirmed_tm(data: &PlutusData) -> Option<UnconfirmedTm> {
             .iter()
             .map(|o| (o.value, o.script_pubkey.clone()))
             .collect(),
+        cardano_tx_hash: String::new(),
+        block_time: None,
     })
 }
 

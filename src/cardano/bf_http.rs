@@ -132,6 +132,47 @@ pub async fn fetch_current_epoch(base_url: &str, project_id: &str) -> Result<u64
         .ok_or_else(|| "epochs/latest: missing/non-numeric `epoch`".to_string())
 }
 
+/// Chain "now" — the latest block's POSIX time (seconds), from `/blocks/latest`.
+/// Used as the reference clock for the in-flight staleness deadline (chain time,
+/// never a local node clock).
+pub async fn fetch_latest_block_time(base_url: &str, project_id: &str) -> Result<i64, String> {
+    let url = format!("{base_url}/blocks/latest");
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("blocks/latest request: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("blocks/latest json: {e}"))?;
+    v.get("time")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "blocks/latest: missing/non-numeric `time`".to_string())
+}
+
+/// The POSIX block-time (seconds) of the Cardano tx `tx_hash`, from `/txs/{hash}`.
+/// The age of an Unconfirmed TM UTxO = chain-now − this.
+pub async fn fetch_tx_block_time(
+    base_url: &str,
+    project_id: &str,
+    tx_hash: &str,
+) -> Result<i64, String> {
+    let url = format!("{base_url}/txs/{tx_hash}");
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("txs/{tx_hash} request: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("txs/{tx_hash} json: {e}"))?;
+    v.get("block_time")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("txs/{tx_hash}: missing/non-numeric `block_time`"))
+}
+
 /// POSIX start time (ms) of `epoch`, from `/epochs/{epoch}`. This is the
 /// epoch-boundary time the eligible-roster ban check compares against — using a
 /// chain-derived boundary (not a node clock) so every SPO derives the same

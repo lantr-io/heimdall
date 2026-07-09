@@ -120,6 +120,14 @@ pub struct BitcoinConfig {
     /// refund leaf. Spec default 4320 (~30 days); override for
     /// testnet4/preprod which use shorter timeouts.
     pub pegin_refund_timeout_blocks: u16,
+    /// Opt-in staleness deadline (seconds). An Unconfirmed TM still on-chain this
+    /// long after its Cardano block (chain time − block time) is treated as DEAD —
+    /// it never confirmed, so it stops blocking the tip and reserving its peg-ins.
+    /// Catches never-confirmable movements heimdall can't otherwise see (a peg-in
+    /// refunded/spent outside a Confirmed TM). `None` = disabled (block forever).
+    /// MUST exceed the worst-case confirmation time (oracle maturation window +
+    /// margin) so a live movement always confirms before the deadline.
+    pub inflight_deadline_secs: Option<u64>,
 }
 
 impl Default for BitcoinConfig {
@@ -138,6 +146,7 @@ impl Default for BitcoinConfig {
             treasury_vout: None,
             treasury_amount_sat: None,
             pegin_refund_timeout_blocks: 4320,
+            inflight_deadline_secs: None,
         }
     }
 }
