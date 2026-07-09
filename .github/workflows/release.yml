@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (no leading v), e.g. 0.2.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as a pre-release"
+        required: false
+        type: boolean
+        default: false
+
+# Needed to create the release and its tag.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build + publish
+    runs-on: ubuntu-latest
+    # Build inside the same image deploy/build-linux.sh uses, so the release binary is
+    # byte-for-byte the product of the same recipe (deploy/build-musl.sh).
+    container: rust:alpine
+    steps:
+      # git must exist BEFORE checkout so we get real history + tags (build.rs reads them).
+      # github-cli publishes the release from inside the container.
+      - name: Install git + gh
+        run: apk add --no-cache git github-cli
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build static musl binary
+        env:
+          HEIMDALL_VERSION_OVERRIDE: ${{ inputs.version }}
+          OUT_DIR: dist
+        run: sh deploy/build-musl.sh
+
+      - name: Checksum
+        run: |
+          cd dist
+          sha256sum heimdall > heimdall.sha256
+          cat heimdall.sha256
+
+      - name: Report embedded version
+        run: ./dist/heimdall --version
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ inputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "v${{ inputs.version }}" \
+            --notes "Static x86_64-linux (musl) build of heimdall, from ${{ github.sha }}." \
+            ${{ inputs.prerelease && '--prerelease' || '' }} \
+            dist/heimdall dist/heimdall.sha256

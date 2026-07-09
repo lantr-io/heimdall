@@ -25,6 +25,7 @@ done
 mkdir -p "$ROOT/deploy/out"
 
 echo "==> Building static musl heimdall in $IMAGE (linux/amd64)"
+# The actual build recipe lives in deploy/build-musl.sh so local and CI builds stay identical.
 docker run --rm -i --platform linux/amd64 \
     -v "$ROOT":/src:ro \
     -v "$CARGO_VOL":/cargo \
@@ -32,28 +33,9 @@ docker run --rm -i --platform linux/amd64 \
     -v "$ROOT/deploy/out":/out \
     -e CARGO_HOME=/cargo \
     -e CARGO_TARGET_DIR=/target \
-    -e OPENSSL_STATIC=1 \
-    -e OPENSSL_NO_VENDOR=1 \
-    -e PKG_CONFIG_ALL_STATIC=1 \
+    -e OUT_DIR=/out \
     -w /src \
-    "$IMAGE" sh -eus <<'BUILD'
-    echo "--> Installing build deps"
-    apk add --no-cache build-base musl-dev perl make pkgconfig \
-        openssl-dev openssl-libs-static >/dev/null
-
-    echo "--> cargo build --release --locked --bin heimdall"
-    cargo build --release --locked --bin heimdall
-
-    echo "--> Verifying the binary is static"
-    file /target/release/heimdall
-    # `ldd` on a static musl binary prints "Not a valid dynamic program" / no deps — that's success.
-    ldd /target/release/heimdall 2>&1 || true
-
-    cp /target/release/heimdall /out/heimdall
-    strip /out/heimdall || true
-    echo "--> Wrote /out/heimdall"
-    ls -lh /out/heimdall
-BUILD
+    "$IMAGE" sh -eus < "$ROOT/deploy/build-musl.sh"
 
 echo "==> Done. Binary at deploy/out/heimdall"
 file "$ROOT/deploy/out/heimdall"

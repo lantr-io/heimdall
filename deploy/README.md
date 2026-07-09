@@ -40,6 +40,22 @@ Builds the static musl binary (`deploy/build-linux.sh`), copies it to
 `/var/lib/heimdall/heimdall`, and restarts the service. No `nixos-rebuild` needed — that's only
 for changes to the service definition.
 
+## Deploying a published release (no local build)
+
+Cut a release from the **Release** GitHub Action (Actions tab → Release → Run workflow, enter a
+version like `0.2.0`). It builds the same static musl binary in `rust:alpine` — via the shared
+`deploy/build-musl.sh` recipe — and publishes it as `heimdall` (+ `heimdall.sha256`) on a
+`v0.2.0` release. Then ship that exact artifact to the box:
+
+```bash
+deploy/deploy.sh root@dev.lantr.io --release v0.2.0
+```
+
+This downloads the release asset with `gh release download`, verifies the checksum, and installs +
+restarts as usual (no local Docker build). Requires the `gh` CLI authenticated to `lantr-io/heimdall`.
+Confirm what's running with `ssh root@dev.lantr.io '/var/lib/heimdall/heimdall --version'` — it
+prints the embedded version + commit, e.g. `heimdall 0.2.0 (abc1234 2026-07-09)`.
+
 ## Building only
 
 ```bash

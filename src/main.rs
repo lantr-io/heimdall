@@ -19,7 +19,11 @@ use heimdall::http::peer_network::HttpPeerNetwork;
 use heimdall::http::server::router;
 
 #[derive(Parser)]
-#[command(name = "heimdall", about = "Bifrost Bridge SPO program")]
+#[command(
+    name = "heimdall",
+    about = "Bifrost Bridge SPO program",
+    version = env!("HEIMDALL_VERSION")
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
