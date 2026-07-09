@@ -29,8 +29,8 @@ use crate::bitcoin::taproot::treasury_spend_info;
 use crate::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
 use crate::cardano::publish::{WalletUtxo, build_oracle_update_tx};
 use crate::cardano::treasury_datum::{
-    ConfirmedTm, TreasuryConfig, TreasuryDatumError, parse_confirmed_tm_datum,
-    select_spendable_tip, unconfirmed_tm_spends,
+    ConfirmedTm, TreasuryConfig, TreasuryDatumError, UnconfirmedTm, parse_confirmed_tm_datum,
+    parse_unconfirmed_tm, select_spendable_tip,
 };
 use crate::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 use crate::epoch::state::{EpochError, EpochResult, Roster};
@@ -346,6 +346,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             in_flight_spends,
             parse_failures,
             opaque_unconfirmed,
+            ..
         } = scan_tm_utxos(
             &self.bf_base_url,
             &self.bf_project_id,
@@ -623,6 +624,15 @@ pub struct TmScan {
     /// so we could not learn which outpoint they spend. Treated as a possible
     /// in-flight movement against the tip (fail closed, never double-post).
     pub opaque_unconfirmed: usize,
+    /// Every readable Unconfirmed (Constr 0) TM — its BTC txid, inputs, outputs.
+    /// Kept separately (all of them, dead or live) so callers can diagnose WHICH
+    /// movement blocks the tip and what it references.
+    pub unconfirmed: Vec<UnconfirmedTm>,
+    /// Every outpoint spent by a Confirmed TM — DEFINITIVELY spent on Bitcoin
+    /// (Confirmed = oracle-verified mined). heimdall's Bitcoin-spent view, sourced
+    /// purely from Cardano. Used to skip already-swept peg-ins and to detect dead
+    /// (never-confirmable) in-flight movements without ever querying Bitcoin.
+    pub consumed: HashSet<bitcoin::OutPoint>,
 }
 
 /// Scan every marker-token (`asset_unit`) TM UTxO at `address` via Blockfrost and
@@ -642,9 +652,9 @@ pub async fn scan_tm_utxos(
         .map_err(|e| format!("blockfrost treasury query: {e}"))?;
 
     let mut confirmed: Vec<ConfirmedTm> = Vec::new();
-    let mut in_flight_spends: HashSet<bitcoin::OutPoint> = HashSet::new();
     let mut parse_failures: usize = 0;
     let mut opaque_unconfirmed: usize = 0;
+    let mut unconfirmed: Vec<UnconfirmedTm> = Vec::new();
     for u in &utxos {
         let Some(datum_hex) = u.inline_datum.as_deref() else {
             continue;
@@ -670,8 +680,8 @@ pub async fn scan_tm_utxos(
         };
         match parse_confirmed_tm_datum(&datum) {
             Ok(tm) => confirmed.push(tm),
-            Err(TreasuryDatumError::NotConfirmed) => match unconfirmed_tm_spends(&datum) {
-                Some(spends) => in_flight_spends.extend(spends),
+            Err(TreasuryDatumError::NotConfirmed) => match parse_unconfirmed_tm(&datum) {
+                Some(tm) => unconfirmed.push(tm),
                 None => {
                     eprintln!(
                         "[tm-scan] Unconfirmed TM datum's BTC tx did not deserialize — \
@@ -686,10 +696,39 @@ pub async fn scan_tm_utxos(
             }
         }
     }
+
+    // `consumed` = every outpoint spent by a Confirmed TM. Because Confirmed means
+    // the oracle verified the BTC tx is mined, these are DEFINITIVELY spent on
+    // Bitcoin — heimdall's Bitcoin-spent view sourced purely from Cardano.
+    let consumed: HashSet<bitcoin::OutPoint> = confirmed
+        .iter()
+        .flat_map(|tm| tm.swept_outpoints())
+        .collect();
+
+    // `in_flight_spends` counts only VIABLE Unconfirmed TMs — one whose BTC tx
+    // spends an already-`consumed` outpoint is a double-spend that can never
+    // confirm (dead), so it must NOT block the tip or reserve a peg-in. This is
+    // the auto-unblock: a stuck movement stops being treated as in-flight.
+    let mut in_flight_spends: HashSet<bitcoin::OutPoint> = HashSet::new();
+    for tm in &unconfirmed {
+        let dead = tm.inputs.iter().any(|i| consumed.contains(i));
+        if dead {
+            eprintln!(
+                "[tm-scan] Unconfirmed TM {} spends an already-swept input — dead, ignoring \
+                 (will never confirm)",
+                tm.btc_txid
+            );
+            continue;
+        }
+        in_flight_spends.extend(tm.inputs.iter().copied());
+    }
+
     Ok(TmScan {
         confirmed,
         in_flight_spends,
         parse_failures,
         opaque_unconfirmed,
+        unconfirmed,
+        consumed,
     })
 }

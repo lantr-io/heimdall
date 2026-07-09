@@ -3193,6 +3193,89 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
             tips.len()
         ),
     }
+
+    // Diagnose "why can't the mover advance": list the in-flight (Unconfirmed)
+    // movements and flag the one(s) that spend the current tip — those block the
+    // mover, and if any can never confirm (a spent/missing BTC input) it deadlocks.
+    let tip_op = current.map(|(op, _, _)| op);
+    if !scan.unconfirmed.is_empty() || scan.opaque_unconfirmed > 0 {
+        println!(
+            "\nin-flight (Unconfirmed) movements: {}",
+            scan.unconfirmed.len()
+        );
+        for u in &scan.unconfirmed {
+            // Dead = spends an input a Confirmed TM already swept (oracle-verified
+            // spent) → can never confirm → auto-ignored, no longer blocks the tip.
+            let dead = u.inputs.iter().any(|i| scan.consumed.contains(i));
+            let spends_tip = tip_op.is_some_and(|t| u.inputs.contains(&t));
+            let tag = if dead {
+                "   ← DEAD (spends an already-swept input; can never confirm — auto-ignored)"
+            } else if spends_tip {
+                "   ← SPENDS THE CURRENT TIP (blocks the mover)"
+            } else {
+                ""
+            };
+            println!(
+                "  btc {} — {} input(s), {} output(s){}",
+                u.btc_txid,
+                u.inputs.len(),
+                u.outputs.len(),
+                tag,
+            );
+            for inp in &u.inputs {
+                let mut mark = String::new();
+                if tip_op == Some(*inp) {
+                    mark.push_str("   (= current treasury tip)");
+                }
+                if scan.consumed.contains(inp) {
+                    mark.push_str("   (ALREADY SWEPT — spent per a Confirmed TM)");
+                }
+                println!("      in  {}:{}{}", inp.txid, inp.vout, mark);
+            }
+            for (val, spk) in &u.outputs {
+                println!(
+                    "      out {} sat  {}",
+                    val.to_sat(),
+                    hex::encode(spk.as_bytes())
+                );
+            }
+        }
+        if scan.opaque_unconfirmed > 0 {
+            println!(
+                "  + {} unreadable Unconfirmed TM(s) (BTC tx did not deserialize) — treated as \
+                 blocking (fail-closed)",
+                scan.opaque_unconfirmed
+            );
+        }
+        if let Some(t) = tip_op {
+            let viable_blockers = scan
+                .unconfirmed
+                .iter()
+                .filter(|u| {
+                    u.inputs.contains(&t) && !u.inputs.iter().any(|i| scan.consumed.contains(i))
+                })
+                .count();
+            let dead_blockers = scan
+                .unconfirmed
+                .iter()
+                .filter(|u| {
+                    u.inputs.contains(&t) && u.inputs.iter().any(|i| scan.consumed.contains(i))
+                })
+                .count();
+            if viable_blockers > 0 || scan.opaque_unconfirmed > 0 {
+                println!(
+                    "\nBLOCKED: {viable_blockers} live in-flight movement(s) spend the current tip \
+                     {t} — the mover waits for one to confirm."
+                );
+            } else if dead_blockers > 0 {
+                println!(
+                    "\nNOT BLOCKED: the {dead_blockers} in-flight movement(s) on the tip are DEAD \
+                     (they spend an already-swept input) — auto-ignored, so the mover treats the tip \
+                     as free and will build a fresh TM."
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3406,6 +3489,46 @@ fn run_sweep_pegins(
         .collect::<Result<_, _>>()
         .map_err(|e| format!("--exclude-pegin: {e}"))?;
 
+    // Auto-skip peg-ins Cardano already shows as handled — WITHOUT querying Bitcoin.
+    // A peg-in whose deposit is in a Confirmed TM's swept inputs (oracle-verified
+    // spent) or committed to a viable in-flight TM would build an invalid/duplicate
+    // TM. Because `pegin-complete` (fBTC mint) is the depositor's choice and may
+    // never happen, the on-chain PIR can linger forever after its deposit is swept;
+    // we detect that from the Confirmed/Unconfirmed TM datums, not the open PIR.
+    let auto_consumed: std::collections::HashSet<bitcoin::OutPoint> =
+        match cfg.cardano.blockfrost_project_id.as_deref() {
+            Some(pid) => {
+                let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+                let address = cfg.cardano.treasury_address.clone().unwrap_or_default();
+                let asset_unit = format!(
+                    "{}{}",
+                    cfg.cardano.treasury_policy_id.clone().unwrap_or_default(),
+                    treasury_asset_name_hex(cfg)
+                );
+                if address.is_empty() {
+                    std::collections::HashSet::new()
+                } else {
+                    match rt.block_on(heimdall::cardano::blockfrost_chain::scan_tm_utxos(
+                        &base_url,
+                        pid,
+                        &address,
+                        &asset_unit,
+                    )) {
+                        Ok(scan) => {
+                            let mut s = scan.consumed;
+                            s.extend(scan.in_flight_spends);
+                            s
+                        }
+                        Err(e) => {
+                            eprintln!("[sweep] could not scan TM UTxOs for peg-in auto-skip: {e}");
+                            std::collections::HashSet::new()
+                        }
+                    }
+                }
+            }
+            None => std::collections::HashSet::new(),
+        };
+
     // Each parse reconstructs and matches the peg-in P2TR, so the returned
     // `spend_info` is itself proof the spend info matches the on-chain
     // scriptPubKey — reuse it directly rather than re-deriving.
@@ -3428,6 +3551,16 @@ fn run_sweep_pegins(
         if excluded.contains(&outpoint) {
             println!(
                 "  excluded peg-in {}:{} — {} sat (--exclude-pegin: already in treasury)",
+                parsed.btc_txid,
+                parsed.btc_vout,
+                parsed.value.to_sat(),
+            );
+            continue;
+        }
+        if auto_consumed.contains(&outpoint) {
+            println!(
+                "  auto-skip peg-in {}:{} — {} sat (already swept into a Confirmed TM or committed \
+                 to a live in-flight TM per Cardano; its PIR just isn't minted yet)",
                 parsed.btc_txid,
                 parsed.btc_vout,
                 parsed.value.to_sat(),

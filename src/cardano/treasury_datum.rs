@@ -298,6 +298,29 @@ impl ConfirmedTm {
     pub fn treasury_spk(&self) -> Option<&[u8]> {
         self.outputs.first().map(|o| o.script_pub_key.as_slice())
     }
+
+    /// The Bitcoin outpoints this TM consumed (its `swept_peg_in_utxo_ids`, incl.
+    /// the previous treasury), decoded from the 36-byte keys. Because a Confirmed
+    /// TM is oracle-verified — its BTC tx is mined — these outpoints are
+    /// **definitively spent on Bitcoin**, which is how heimdall knows what's spent
+    /// WITHOUT querying Bitcoin directly (it reads Bitcoin state via the oracle).
+    pub fn swept_outpoints(&self) -> Vec<OutPoint> {
+        self.swept_inputs
+            .iter()
+            .filter_map(|k| outpoint_from_swept_key(k))
+            .collect()
+    }
+}
+
+/// Decode a 36-byte swept-input key (`prev_txid(32, internal) ++ vout(4, LE)`) —
+/// the encoding used in `swept_peg_in_utxo_ids` — into an [`OutPoint`].
+pub fn outpoint_from_swept_key(k: &[u8]) -> Option<OutPoint> {
+    if k.len() != 36 {
+        return None;
+    }
+    let txid = Txid::from_byte_array(k[..32].try_into().ok()?);
+    let vout = u32::from_le_bytes(k[32..36].try_into().ok()?);
+    Some(OutPoint { txid, vout })
 }
 
 /// Parse a **Confirmed** (Constr 1) treasury-movement datum.
@@ -401,6 +424,36 @@ pub fn unconfirmed_tm_spends(data: &PlutusData) -> Option<Vec<OutPoint>> {
     }
     let tx: Transaction = deserialize(&tx_bytes).ok()?;
     Some(tx.input.iter().map(|i| i.previous_output).collect())
+}
+
+/// A parsed Unconfirmed (Constr 0) TM datum — the signed BTC tx's identity, its
+/// inputs (what it spends), and its outputs. Used to diagnose WHY the treasury is
+/// blocked: which in-flight movement spends the current tip and what its BTC leg
+/// references (a spent/missing input can never confirm, deadlocking the mover).
+#[derive(Debug, Clone)]
+pub struct UnconfirmedTm {
+    pub btc_txid: bitcoin::Txid,
+    pub inputs: Vec<OutPoint>,
+    pub outputs: Vec<(Amount, bitcoin::ScriptBuf)>,
+}
+
+/// Parse an Unconfirmed (Constr 0) TM datum into its full BTC tx shape. Returns
+/// `None` unless the datum is a deserializable Unconfirmed TM.
+pub fn parse_unconfirmed_tm(data: &PlutusData) -> Option<UnconfirmedTm> {
+    let (tx_bytes, btc_confirmed) = extract_btc_tx_bytes(data).ok()?;
+    if btc_confirmed {
+        return None;
+    }
+    let tx: Transaction = deserialize(&tx_bytes).ok()?;
+    Some(UnconfirmedTm {
+        btc_txid: tx.compute_txid(),
+        inputs: tx.input.iter().map(|i| i.previous_output).collect(),
+        outputs: tx
+            .output
+            .iter()
+            .map(|o| (o.value, o.script_pubkey.clone()))
+            .collect(),
+    })
 }
 
 /// Parse a single `PegOutEntry` = `Constr(0, [BoundedBytes(spk), BigInt(amount)])`.
