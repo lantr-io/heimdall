@@ -408,24 +408,6 @@ pub fn parse_confirmed_tm_datum(data: &PlutusData) -> Result<ConfirmedTm, Treasu
     })
 }
 
-/// The input outpoints spent by an **Unconfirmed** (Constr 0) TM datum, read
-/// from its raw signed BTC tx. Returns `None` unless the datum is a
-/// deserializable Unconfirmed TM.
-///
-/// Used to detect a treasury movement already in flight against the current
-/// confirmed tip: if some Unconfirmed TM already spends `(tip_txid, 0)`, heimdall
-/// must wait for it to confirm rather than build+post a second TM off the same
-/// treasury (the cadence gate — a treasury movement can only begin once the
-/// previous one is confirmed).
-pub fn unconfirmed_tm_spends(data: &PlutusData) -> Option<Vec<OutPoint>> {
-    let (tx_bytes, btc_confirmed) = extract_btc_tx_bytes(data).ok()?;
-    if btc_confirmed {
-        return None; // a Confirmed datum is not a raw tx
-    }
-    let tx: Transaction = deserialize(&tx_bytes).ok()?;
-    Some(tx.input.iter().map(|i| i.previous_output).collect())
-}
-
 /// A parsed Unconfirmed (Constr 0) TM datum — the signed BTC tx's identity, its
 /// inputs (what it spends), and its outputs. Used to diagnose WHY the treasury is
 /// blocked: which in-flight movement spends the current tip and what its BTC leg
