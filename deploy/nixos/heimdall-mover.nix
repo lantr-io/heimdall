@@ -40,8 +40,14 @@ in
 
     intervalSecs = lib.mkOption {
       type = lib.types.int;
-      default = 60;
-      description = "Seconds between auto-mover ticks (--interval-secs).";
+      default = 900;
+      description = ''
+        Seconds between auto-mover ticks (--interval-secs). Default 900 (15 min):
+        the bridge runs on multi-day timescales (TMs span 1+ Cardano epochs, peg-ins
+        need ~100 BTC confirmations, and a movement can't advance until the previous
+        one confirms), so nothing actionable changes minute-to-minute — a shorter
+        interval just multiplies idle Blockfrost scans.
+      '';
     };
 
     broadcast = lib.mkOption {
