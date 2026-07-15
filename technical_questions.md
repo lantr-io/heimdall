@@ -147,6 +147,17 @@ with the spec elaborated in tandem). Concrete work:
 
 Dependency: (a) → (b,c,d) → (e).
 
+*Update 2026-07-15 (params-UTxO revision, `e261b6b`):* items (b)/(c) changed shape. The Config
+stays **immutable** (`config.ak` `spend = False` is now normative — no governance spend branch
+needed); the tunables move to a new **Operational parameters UTxO**
+(`{min_stake, fee_rate_sat_per_vb, per_pegout_fee (floor), min_peg_out_fbtc}`, group-signed
+updates, read by no on-chain validator → updates invalidate no in-flight txs), and the effective
+`per_pegout_fee` is **pinned per PegOutDatum at lock time** — the verifiers compare against the
+datum fee, closing a theft race found in review (fee raise after a TM paid → completion bricked +
+cancel double-pay). New contract-CR items: the params contract, the PegOutDatum fee field, Config
+fields #18–20 (genesis outpoint + params NFT identity). heimdall (e): read fee params from the
+params UTxO at the batch snapshot slot.
+
 **Signing-model sub-question — RESOLVED 2026-07-15: (A) exact, "Model A′".**
 Every SPO reconstructs the identical tx; `fee_rate_sat_per_vb` is an exact
 consensus value in the Config, and fee-market agility comes from the roster
