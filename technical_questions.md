@@ -248,7 +248,21 @@ verifiers in `fault_proof_policy_ids`). heimdall matches it — WI-016/017/018
 delivered; WI-019 derives the real `evidence_hash`. The one open FluidTokens
 question is the §5a InvalidPayload ZK-verify binding.
 
-### 5a. InvalidPayload fault verifier — permissive mock; a FluidTokens binding decision is needed
+### 5a. InvalidPayload fault verifier — binding scheme RESOLVED 2026-07-15 (spec); implementation open
+
+*Resolution (spec-gaps review, `b732ad1` on `docs/spec-gaps-fill`) — "Option B, self-committing
+payloads":* every fault-provable payload (DKG R1/R2, sign R2) appends `poseidon_commit =
+Poseidon(structured_fields)` as the final 32 bytes of its canonical layout; the on-chain verifier
+recomputes `sha2_256(full bytes)`, verifies the accused's signature, slices the trailer, and
+requires the ZK public input to equal it — collision resistance welds proof to signature, framing
+needs a second preimage. Mismatched commitments are malformed transport (fetch-time rule → treated
+as never published). Round-2 binding: HKDF replaced by the Poseidon KDF
+(`k = Poseidon("bifrost-dkg-share" ‖ ss.x ‖ recipient_pool_id)`), circuit statement = two secp
+scalar mults + Poseidon + XOR + commitment check. WI-022 becomes implementation: add the trailer
+to the WI-013 transport + fetch validation, switch the KDF, point the circuits' public input at
+the commitment, and implement the real verifier policies (upstream mock replacement). Note the
+"FluidTokens design call" framing is retired — per the spec's new §Scope and normativity, the
+spec decides and code diverging from it is a CR. Original analysis below for history.
 
 The `fault_verifier` `PublishProof` (InvalidPayload) branch is still a permissive
 mock — it checks only structural shape (token name, 28/32-byte lengths,
