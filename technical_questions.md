@@ -147,15 +147,19 @@ with the spec elaborated in tandem). Concrete work:
 
 Dependency: (a) → (b,c,d) → (e).
 
-**Signing-model sub-question (open).** Whether the fee must be an *exact*
-consensus value or a governance-set *bound* depends on the FROST signing model:
-(A) every SPO independently reconstructs the identical tx (exact value
-required), vs (B) a leader proposes the tx and each signer validates-then-signs
-(a bound suffices, and signers must NEVER blind-sign — they validate inputs,
-peg-out destinations/amounts at gross − fee, treasury next-address, and that
-the fee is within bounds). (B) handles real-time Bitcoin fee movement better. A
-governance-updatable Config UTxO (c) supports either. To be decided with the
-spec elaboration (a).
+**Signing-model sub-question — RESOLVED 2026-07-15: (A) exact, "Model A′".**
+Every SPO reconstructs the identical tx; `fee_rate_sat_per_vb` is an exact
+consensus value in the Config, and fee-market agility comes from the roster
+group-signing Config parameter updates (an explicit collective act — each
+signer sanity-checks the rate; refusal just keeps the old rate). The
+leader-proposed-fee alternative (and full model B) was rejected: a low-ball
+proposal is valid-looking, unpunishable, deniable, and detected only after a
+wasted signing ceremony + hours of Bitcoin-confirmation ambiguity. Stuck-TM
+recovery = fee-update ceremony → rebuild the same frozen batch at the new rate
+(new txid/namespace, fresh nonces) → re-sign → the replacement races the stuck
+original (the TM chain absorbs the loser). tm.json is now signed
+(sign-the-hash) like every other payload. Spec: `docs/spec-gaps-fill`
+(`e021c2e`).
 
 ### 2d. Minimum peg-out fBTC value belongs in the Config (not just off-chain skip)
 
