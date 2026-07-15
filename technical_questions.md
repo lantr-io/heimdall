@@ -186,7 +186,15 @@ Config #14) as the recovery path. Remaining for the §2 contract changes (b):
 the Config fee/min fields + governance spend branch + enabling the two TM
 verifiers — no `peg_out.ak` lock-time change.
 
-## 3. Update-Y (treasury key rotation) — contract gap OPEN (spec resolved upstream)
+## 3. Update-Y (treasury key rotation) — contract gap OPEN (spec now fully in the .md)
+
+*Update 2026-07-15 (spec-gaps review):* the Update-Y transaction is now fully specified in
+`technical_documentation.md` (branch `docs/spec-gaps-fill`, `f502755`): a Transaction-catalog
+entry — spends the Treasury state UTxO, only `current_spos_frost_key` changes, authorized by
+BIP340 under the **spent** datum's key over
+`sha2_256("bifrost-update-y" ‖ spent_outpoint ‖ epoch ‖ new_key)`, permissionless submission,
+Phase-1 handled by K1 seeding the field with $Y_{federation}$. The **code-ward gap below stands
+unchanged** (no rotation branch in `treasury.ak`; gates K2).
 
 Spec resolved upstream (`8b042f9`): Update-Y is in the Transaction catalog,
 authorized by a FROST group signature from the **current** (outgoing) roster,
