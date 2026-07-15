@@ -170,15 +170,21 @@ the unfulfillable PegOut UTxO on-chain (the user must Cancel to reclaim), and
 the skip threshold is only deterministic across SPOs if `per_peg_out_fee` is a
 consensus value (2b).
 
-The proper fix is on-chain: **add a `min_peg_out_fbtc` value to `ConfigDatum`
-and have `peg_out.ak` reject a lock whose fBTC value is below it.** Then
-sub-dust peg-outs cannot be created in the first place, the griefing vector is
-closed at the source, and the off-chain skip becomes a belt-and-suspenders
-guard rather than the only defense. The minimum must be ≥ `per_peg_out_fee +
-dust` (and realistically higher, since the spec already positions Bifrost for
-large liquidity moves, not retail-size withdrawals). **Question for
-FluidTokens:** add `min_peg_out_fbtc` to the Config and enforce it in
-`peg_out.ak` at lock time — folded into the §2 code-ward contract changes (b).
+~~The proper fix is on-chain: add a `min_peg_out_fbtc` value to `ConfigDatum`
+and have `peg_out.ak` reject a lock whose fBTC value is below it.~~
+
+**Update 2026-07-15 (spec-gaps review, `docs/spec-gaps-fill`):** the lock-time
+enforcement ask is **withdrawn** — creating a script output runs no validator
+on Cardano, so `peg_out.ak` *cannot* reject a lock (only a co-required beacon
+mint could, and analysis showed no lock-time check is security-critical: a bad
+request harms only its creator). What is now normative in the spec instead:
+`min_peg_out_fbtc` as ConfigDatum field #20 (consensus value), the
+**deterministic skip rule** in TM construction (the actual griefing defense —
+heimdall's `build_tm` already implements it), normative client-side checks at
+request creation, and the **proof-based Cancel** (not-produced verifier,
+Config #14) as the recovery path. Remaining for the §2 contract changes (b):
+the Config fee/min fields + governance spend branch + enabling the two TM
+verifiers — no `peg_out.ak` lock-time change.
 
 ## 3. Update-Y (treasury key rotation) — contract gap OPEN (spec resolved upstream)
 
