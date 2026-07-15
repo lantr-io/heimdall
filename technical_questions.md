@@ -147,7 +147,7 @@ with the spec elaborated in tandem). Concrete work:
 
 Dependency: (a) → (b,c,d) → (e).
 
-*Update 2026-07-15 (params-UTxO revision, `e261b6b`):* items (b)/(c) changed shape. The Config
+*Update 2026-07-15 (params-UTxO revision, `b96c7f9`):* items (b)/(c) changed shape. The Config
 stays **immutable** (`config.ak` `spend = False` is now normative — no governance spend branch
 needed); the tunables move to a new **Operational parameters UTxO**
 (`{min_stake, fee_rate_sat_per_vb, per_pegout_fee (floor), min_peg_out_fbtc}`, group-signed
@@ -170,7 +170,7 @@ recovery = fee-update ceremony → rebuild the same frozen batch at the new rate
 (new txid/namespace, fresh nonces) → re-sign → the replacement races the stuck
 original (the TM chain absorbs the loser). tm.json is now signed
 (sign-the-hash) like every other payload. Spec: `docs/spec-gaps-fill`
-(`e021c2e`).
+(`859d170`).
 
 ### 2d. Minimum peg-out fBTC value belongs in the Config (not just off-chain skip)
 
@@ -204,7 +204,7 @@ verifiers — no `peg_out.ak` lock-time change.
 ## 3. Update-Y (treasury key rotation) — contract gap OPEN (spec now fully in the .md)
 
 *Update 2026-07-15 (spec-gaps review):* the Update-Y transaction is now fully specified in
-`technical_documentation.md` (branch `docs/spec-gaps-fill`, `f502755`): a Transaction-catalog
+`technical_documentation.md` (branch `docs/spec-gaps-fill`, `28bc7fe`): a Transaction-catalog
 entry — spends the Treasury state UTxO, only `current_spos_frost_key` changes, authorized by
 BIP340 under the **spent** datum's key over
 `sha2_256("bifrost-update-y" ‖ spent_outpoint ‖ epoch ‖ new_key)`, permissionless submission,
@@ -250,7 +250,7 @@ question is the §5a InvalidPayload ZK-verify binding.
 
 ### 5a. InvalidPayload fault verifier — binding scheme RESOLVED 2026-07-15 (spec); implementation open
 
-*Resolution (spec-gaps review, `b732ad1` on `docs/spec-gaps-fill`) — "Option B, self-committing
+*Resolution (spec-gaps review, `1e26700` on `docs/spec-gaps-fill`) — "Option B, self-committing
 payloads":* every fault-provable payload (DKG R1/R2, sign R2) appends `poseidon_commit =
 Poseidon(structured_fields)` as the final 32 bytes of its canonical layout; the on-chain verifier
 recomputes `sha2_256(full bytes)`, verifies the accused's signature, slices the trailer, and
