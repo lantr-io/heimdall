@@ -28,14 +28,17 @@ The implemented DKG fault cases are:
 - Round 2 invalid share fault.
 
 The on-chain benchmark generates an Aiken minting policy that verifies the
-Halo2 proof, verifies the SPO signature over the circuit public input, and
-mints exactly one fault token whose name is:
+Halo2 proof with two public inputs:
 
 ```text
-blake2b_256(pool_id || circuit_public_input)
+[evidence_hash, pool_id]
 ```
 
-where `pool_id = blake2b_224(spo_vkey)` in the benchmark harness.
+It mints exactly one fault token whose name is:
+
+```text
+blake2b_256(pool_id || evidence_hash)
+```
 
 ## Build
 

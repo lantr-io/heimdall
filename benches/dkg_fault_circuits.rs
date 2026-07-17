@@ -40,13 +40,15 @@ use heimdall::circuits::dkg_fault::{
     build_round1_digest_fault_prover_circuit, build_round1_keygen_circuit,
     build_round1_prover_circuit, build_round2_digest_fault_keygen_circuit,
     build_round2_digest_fault_prover_circuit, build_round2_keygen_circuit,
-    build_round2_prover_circuit, is_identity, round1_digest_residual, round1_hdk_challenge,
-    round1_message_digest, round1_residual, round2_message_digest, round2_residual,
+    build_round2_prover_circuit, is_identity, round1_digest_fault_public_inputs,
+    round1_digest_residual, round1_hdk_challenge, round1_residual,
+    round2_digest_fault_public_inputs, round2_residual,
 };
 use heimdall::frost::participant;
 
 const ROUND2_T: usize = 2;
 const ROUND2_INDEX_BITS: usize = 16;
+const BENCH_POOL_ID: [u8; 28] = [0x51; 28];
 
 fn main() {
     println!(
@@ -103,7 +105,7 @@ fn run_round1_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
         case.digest_witness.challenge,
         round1_hdk_challenge(&case.digest_witness)
     );
-    let expected_digest = round1_message_digest(params, &case.digest_witness);
+    let expected_public_inputs = round1_digest_fault_public_inputs(params, &case.digest_witness);
     let (keygen_builder, stats) =
         build_round1_digest_fault_keygen_circuit(params, &case.digest_witness);
     let setup = setup(params);
@@ -121,7 +123,7 @@ fn run_round1_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
         params,
         &case.digest_witness,
     );
-    assert_eq!(public_instances, vec![expected_digest]);
+    assert_eq!(public_instances, expected_public_inputs);
     let computed = round1_digest_residual(&case.digest_witness);
     assert_ne!(computed, case.digest_witness.transcript_r);
     run_proof_case(
@@ -130,7 +132,7 @@ fn run_round1_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
         prover_builder,
         &public_instances,
         &case.name,
-        "public input = Poseidon(message), circuit derives HDKG and asserts D != R",
+        "public inputs = [Poseidon(pool_id, message), pool_id], circuit derives HDKG and asserts D != R",
     );
 }
 
@@ -173,8 +175,8 @@ fn run_round2_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
         .into_iter()
         .find(|case| !case.expect_identity_residual)
         .expect("round 2 corrupted fixture");
-    let expected_digest =
-        round2_message_digest::<ROUND2_T, ROUND2_INDEX_BITS>(params, &case.witness);
+    let expected_public_inputs =
+        round2_digest_fault_public_inputs::<ROUND2_T, ROUND2_INDEX_BITS>(params, &case.witness);
     let (keygen_builder, stats) = build_round2_digest_fault_keygen_circuit::<
         ROUND2_T,
         ROUND2_INDEX_BITS,
@@ -195,7 +197,7 @@ fn run_round2_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
             params,
             &case.witness,
         );
-    assert_eq!(public_instances, vec![expected_digest]);
+    assert_eq!(public_instances, expected_public_inputs);
     let computed = round2_residual(&case.witness);
     assert!(!is_identity(&computed));
     run_proof_case(
@@ -204,7 +206,7 @@ fn run_round2_digest_fault_benchmark(params: AxiomDkgCircuitParams) {
         prover_builder,
         &public_instances,
         &case.name,
-        "public input = Poseidon(message), circuit asserts D != identity",
+        "public inputs = [Poseidon(pool_id, message), pool_id], circuit asserts D != identity",
     );
 }
 
@@ -423,6 +425,7 @@ fn round1_fixtures() -> Vec<Round1Case> {
         };
         let transcript_r = axiom_point_from_projective(transcript_r_projective);
         let digest_witness = DkgRound1PokDigestFaultWitness {
+            accused_pool_id: BENCH_POOL_ID,
             identifier: u64::from(participant_identifier),
             mu,
             challenge,
@@ -509,6 +512,7 @@ fn round2_fixtures() -> Vec<Round2Case> {
     .map(|(name, share, expect_identity)| Round2Case {
         name: name.to_string(),
         witness: DkgRound2ShareFaultWitness {
+            accused_pool_id: BENCH_POOL_ID,
             share,
             participant_index,
             commitments: commitments.clone(),

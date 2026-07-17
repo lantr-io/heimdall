@@ -30,7 +30,6 @@ use k256::{
     AffinePoint, EncodedPoint, ProjectivePoint, Scalar,
     elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint},
 };
-use pallas_crypto::key::ed25519;
 use plutus_halo2_verifier_gen::plutus_gen::{
     AxiomShplonkAikenOutputPaths, generate_axiom_shplonk_aiken_from_vk_and_instances,
 };
@@ -43,20 +42,22 @@ use heimdall::circuits::dkg_fault::{
     DkgRound2ShareFaultWitness, axiom_point_from_compressed, axiom_point_from_projective,
     axiom_scalar_from_be_bytes, build_round1_digest_fault_keygen_circuit,
     build_round1_digest_fault_prover_circuit, build_round2_digest_fault_keygen_circuit,
-    build_round2_digest_fault_prover_circuit, is_identity, round1_digest_residual,
-    round1_hdk_challenge, round1_message_digest, round2_message_digest, round2_residual,
+    build_round2_digest_fault_prover_circuit, is_identity, round1_digest_fault_public_inputs,
+    round1_digest_residual, round1_hdk_challenge, round1_message_digest,
+    round2_digest_fault_public_inputs, round2_message_digest, round2_residual,
 };
 use heimdall::frost::participant;
 
 const ROUND2_T: usize = 2;
 const ROUND2_INDEX_BITS: usize = 16;
+const BENCH_POOL_ID: [u8; 28] = [0x51; 28];
 const TARGET_ROOT: &str = "target/dkg_fault_onchain";
 const DEFAULT_MAX_TX_EX_MEM: u64 = 16_500_000;
 const DEFAULT_MAX_TX_EX_CPU: u64 = 10_000_000_000;
 const GENERATE_ONLY_ENV: &str = "DKG_FAULT_ONCHAIN_GENERATE_ONLY";
 const AIKEN_TOML: &str = r#"name = "heimdall/dkg_fault_onchain_benchmark"
 version = "0.0.0"
-compiler = "v1.1.21"
+compiler = "v1.1.23"
 plutus = "v3"
 license = "Apache-2.0"
 description = "Generated DKG fault proof on-chain benchmark project"
@@ -312,7 +313,8 @@ fn prove_round1_digest_fault_case(
     let witness_time = witness_start.elapsed();
 
     let expected_digest = round1_message_digest(params, &case.witness);
-    assert_eq!(public_instances, vec![expected_digest]);
+    let expected_public_inputs = round1_digest_fault_public_inputs(params, &case.witness);
+    assert_eq!(public_instances, expected_public_inputs);
     assert_eq!(case.witness.challenge, round1_hdk_challenge(&case.witness));
     let computed = round1_digest_residual(&case.witness);
     assert_eq!(
@@ -327,9 +329,10 @@ fn prove_round1_digest_fault_case(
         prover_builder,
         public_instances,
         expected_digest,
+        case.witness.accused_pool_id,
         case.name.clone(),
         witness_time,
-        "public input = signed Poseidon(message), circuit derives HDKG and asserts D != R",
+        "public inputs = [Poseidon(pool_id, message), pool_id], circuit derives HDKG and asserts D != R",
     )
 }
 
@@ -352,7 +355,9 @@ fn prove_round2_digest_fault_case(
 
     let expected_digest =
         round2_message_digest::<ROUND2_T, ROUND2_INDEX_BITS>(params, &case.witness);
-    assert_eq!(public_instances, vec![expected_digest]);
+    let expected_public_inputs =
+        round2_digest_fault_public_inputs::<ROUND2_T, ROUND2_INDEX_BITS>(params, &case.witness);
+    assert_eq!(public_instances, expected_public_inputs);
     let computed = round2_residual(&case.witness);
     assert!(!is_identity(&computed));
 
@@ -362,9 +367,10 @@ fn prove_round2_digest_fault_case(
         prover_builder,
         public_instances,
         expected_digest,
+        case.witness.accused_pool_id,
         case.name.clone(),
         witness_time,
-        "public input = signed Poseidon(message), circuit asserts D != identity",
+        "public inputs = [Poseidon(pool_id, message), pool_id], circuit asserts D != identity",
     )
 }
 
@@ -374,6 +380,7 @@ fn prove_digest_artifact<C>(
     circuit: C,
     public_instances: Vec<BlsFr>,
     digest: BlsFr,
+    pool_id: [u8; 28],
     name: String,
     witness_time: Duration,
     host_check: &'static str,
@@ -389,14 +396,12 @@ where
     verify(setup, pk, &proof, &public_instances);
     let verify_time = verify_start.elapsed();
 
-    let (spo_vkey, spo_sig) = sign_digest(digest);
     DigestProofArtifact {
         name,
         proof,
         public_instances,
         digest,
-        spo_vkey,
-        spo_sig,
+        pool_id,
         host_check,
         witness_time,
         proof_time,
@@ -542,7 +547,7 @@ fn digest_policy_source(
 
     let mut source = r#"use aiken/collection/dict
 use aiken/collection/list
-use aiken/crypto.{blake2b_224, blake2b_256, verify_ed25519_signature}
+use aiken/crypto.{blake2b_256}
 use aiken/crypto/bls12_381/scalar.{from_bytes_little_endian}
 use aiken/primitive/bytearray
 use cardano/address
@@ -555,9 +560,8 @@ use proof_verifier.{verifier}
 
 pub type FaultRedeemer {
   proof: ByteArray,
-  digest: ByteArray,
-  spo_vkey: ByteArray,
-  spo_sig: ByteArray,
+  evidence_hash: ByteArray,
+  accused_pool_id: ByteArray,
 }
 
 validator dkg_fault_mint {
@@ -575,13 +579,20 @@ pub fn validate_fault(
   policy_id: PolicyId,
   self: Transaction,
 ) -> Bool {
-  let public_inputs = [from_bytes_little_endian(redeemer.digest)]
-  let token_name = fault_token_name(redeemer.spo_vkey, redeemer.digest)
+  let public_inputs = [
+    from_bytes_little_endian(redeemer.evidence_hash),
+    from_bytes_little_endian(redeemer.accused_pool_id),
+  ]
+  let token_name = fault_token_name(
+    redeemer.accused_pool_id,
+    redeemer.evidence_hash,
+  )
   expect [Pair(minted_token_name, 1)] =
     dict.to_pairs(tokens(self.mint, policy_id))
   and {
+    bytearray.length(redeemer.evidence_hash) == 32,
+    bytearray.length(redeemer.accused_pool_id) == 28,
     minted_token_name == token_name,
-    verify_ed25519_signature(redeemer.spo_vkey, redeemer.digest, redeemer.spo_sig),
     verifier(redeemer.proof, public_inputs),
     output_contains_token(self, policy_id, token_name),
     list.length(self.inputs) == 2,
@@ -589,9 +600,8 @@ pub fn validate_fault(
   }
 }
 
-pub fn fault_token_name(spo_vkey: ByteArray, public_input: ByteArray) -> ByteArray {
-  let pool_id = blake2b_224(spo_vkey)
-  blake2b_256(bytearray.concat(pool_id, public_input))
+pub fn fault_token_name(accused_pool_id: ByteArray, evidence_hash: ByteArray) -> ByteArray {
+  blake2b_256(bytearray.concat(accused_pool_id, evidence_hash))
 }
 
 fn output_contains_token(
@@ -611,42 +621,34 @@ const policy_id =
 const corrupted_proof =
   #"__CORRUPTED_PROOF__"
 
-const corrupted_digest =
+const corrupted_evidence_hash =
   #"__CORRUPTED_DIGEST__"
 
-const corrupted_spo_vkey =
-  #"__CORRUPTED_SPO_VKEY__"
-
-const corrupted_spo_sig =
-  #"__CORRUPTED_SPO_SIG__"
+const corrupted_pool_id =
+  #"__CORRUPTED_POOL_ID__"
 
 const honest_proof =
   #"__HONEST_PROOF__"
 
-const honest_digest =
+const honest_evidence_hash =
   #"__HONEST_DIGEST__"
 
-const honest_spo_vkey =
-  #"__HONEST_SPO_VKEY__"
-
-const honest_spo_sig =
-  #"__HONEST_SPO_SIG__"
+const honest_pool_id =
+  #"__HONEST_POOL_ID__"
 
 fn corrupted_redeemer() -> FaultRedeemer {
   FaultRedeemer {
     proof: corrupted_proof,
-    digest: corrupted_digest,
-    spo_vkey: corrupted_spo_vkey,
-    spo_sig: corrupted_spo_sig,
+    evidence_hash: corrupted_evidence_hash,
+    accused_pool_id: corrupted_pool_id,
   }
 }
 
 fn honest_redeemer() -> FaultRedeemer {
   FaultRedeemer {
     proof: honest_proof,
-    digest: honest_digest,
-    spo_vkey: honest_spo_vkey,
-    spo_sig: honest_spo_sig,
+    evidence_hash: honest_evidence_hash,
+    accused_pool_id: honest_pool_id,
   }
 }
 
@@ -676,7 +678,10 @@ fn input(index: Int) -> Input {
 }
 
 fn tx(redeemer: FaultRedeemer) -> Transaction {
-  let token_name = fault_token_name(redeemer.spo_vkey, redeemer.digest)
+  let token_name = fault_token_name(
+    redeemer.accused_pool_id,
+    redeemer.evidence_hash,
+  )
   let token_output_value =
     assets.from_lovelace(1_500_000)
       |> assets.add(policy_id, token_name, 1)
@@ -710,12 +715,10 @@ test __REJECT_NAME__() fail {
         ("__POLICY_ID__", policy_id.to_string()),
         ("__CORRUPTED_PROOF__", hex::encode(&corrupted.proof)),
         ("__CORRUPTED_DIGEST__", bls_scalar_hex(corrupted.digest)),
-        ("__CORRUPTED_SPO_VKEY__", hex::encode(corrupted.spo_vkey)),
-        ("__CORRUPTED_SPO_SIG__", hex::encode(corrupted.spo_sig)),
+        ("__CORRUPTED_POOL_ID__", hex::encode(corrupted.pool_id)),
         ("__HONEST_PROOF__", hex::encode(&honest.proof)),
         ("__HONEST_DIGEST__", bls_scalar_hex(honest.digest)),
-        ("__HONEST_SPO_VKEY__", hex::encode(honest.spo_vkey)),
-        ("__HONEST_SPO_SIG__", hex::encode(honest.spo_sig)),
+        ("__HONEST_POOL_ID__", hex::encode(honest.pool_id)),
         ("__BENCHMARK_NAME__", benchmark_name),
         ("__REJECT_NAME__", reject_name),
     ];
@@ -751,18 +754,6 @@ use dkg_fault_mint.{{FaultRedeemer, fault_token_name}}
 
 fn bls_scalar_hex(scalar: BlsFr) -> String {
     hex::encode(scalar.to_repr())
-}
-
-fn sign_digest(digest: BlsFr) -> ([u8; 32], [u8; 64]) {
-    let key = ed25519::SecretKey::from([0x42; 32]);
-    let message = digest.to_repr();
-    let vkey: [u8; 32] = key.public_key().into();
-    let sig: [u8; 64] = key
-        .sign(message)
-        .as_ref()
-        .try_into()
-        .expect("ed25519 signature is 64 bytes");
-    (vkey, sig)
 }
 
 fn run_aiken_check(project_dir: &Path) -> String {
@@ -953,8 +944,7 @@ struct DigestProofArtifact {
     proof: Vec<u8>,
     public_instances: Vec<BlsFr>,
     digest: BlsFr,
-    spo_vkey: [u8; 32],
-    spo_sig: [u8; 64],
+    pool_id: [u8; 28],
     host_check: &'static str,
     witness_time: Duration,
     proof_time: Duration,
@@ -963,15 +953,13 @@ struct DigestProofArtifact {
 
 impl DigestProofArtifact {
     fn with_digest(&self, name: &str, digest: BlsFr) -> Self {
-        let (spo_vkey, spo_sig) = sign_digest(digest);
         Self {
             name: name.to_string(),
             proof: self.proof.clone(),
-            public_instances: vec![digest],
+            public_instances: vec![digest, self.public_instances[1]],
             digest,
-            spo_vkey,
-            spo_sig,
-            host_check: "signed digest does not match proof public input",
+            pool_id: self.pool_id,
+            host_check: "redeemer evidence hash does not match proof public input",
             witness_time: Duration::ZERO,
             proof_time: Duration::ZERO,
             verify_time: Duration::ZERO,
@@ -1034,6 +1022,7 @@ fn round1_fixtures() -> Vec<Round1Case> {
         let transcript_r_bytes = compressed_from_projective(transcript_r_projective);
         let challenge = round1_challenge(identifier, &phi0_bytes, &transcript_r_bytes);
         let witness = DkgRound1PokDigestFaultWitness {
+            accused_pool_id: BENCH_POOL_ID,
             identifier: u64::from(participant_identifier),
             mu,
             challenge,
@@ -1118,6 +1107,7 @@ fn round2_fixtures() -> Vec<Round2Case> {
     .map(|(name, share, expect_identity)| Round2Case {
         name: name.to_string(),
         witness: DkgRound2ShareFaultWitness {
+            accused_pool_id: BENCH_POOL_ID,
             share,
             participant_index,
             commitments: commitments.clone(),

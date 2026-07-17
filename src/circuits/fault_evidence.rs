@@ -10,10 +10,11 @@
 //!    malformed PoK, or a sender's commitments + a decrypted bad share, or
 //!    two conflicting signed payloads) are the inputs here.
 //! 2. **The Axiom/Halo2 fault PROVER** (`circuits::dkg_fault`) — round1
-//!    PoK-fault and round2 share-fault circuits whose single public input is
-//!    `Poseidon(message)` (a `BlsFr`). The circuit *attests* that the
-//!    committed payload is genuinely faulty (`μ·G − c·φ₀ ≠ R`, resp.
-//!    `f_i(l)·G ≠ Σ_j l^j φ_{i,j}`).
+//!    PoK-fault and round2 share-fault circuits whose public inputs are
+//!    `[evidence_hash, pool_id]`, where
+//!    `evidence_hash = Poseidon(pool_id, message_fields)`. The circuit
+//!    *attests* that the committed payload is genuinely faulty
+//!    (`μ·G − c·φ₀ ≠ R`, resp. `f_i(l)·G ≠ Σ_j l^j φ_{i,j}`).
 //! 3. **The WI-016 mint tx** (`cardano::fault_proof::build_fault_proof_mint_tx`)
 //!    — mints the `FaultProof` token named `blake2b_256(pool_id ‖ evidence_hash)`.
 //!
@@ -40,18 +41,13 @@
 //! ## The bridge — `evidence_hash`
 //!
 //! - `InvalidPayload`: `evidence_hash = digest.to_repr()` — the 32-byte little-
-//!   endian serialization of the circuit's public input. The on-chain
-//!   `fault_token_name` preimage uses exactly these bytes (see the
-//!   `dkg_fault_onchain` bench, which signs/binds `digest.to_repr()`), so when
-//!   the upstream ZK verify lands it can recompute the token name from the
-//!   verified public input and they must match. NOTE: connecting that Poseidon
-//!   public input to the SHA256 `message_hash` the accused signed is still an
-//!   upstream circuit concern (the circuit does not compute SHA256) — see
-//!   `technical_questions.md` §5a.
+//!   endian serialization of public input 0. Public input 1 is the 28-byte
+//!   accused `pool_id` interpreted as a little-endian BLS scalar. The generated
+//!   verifier must pass exactly `[evidence_hash, pool_id]`, and the on-chain
+//!   token name is `blake2b_256(pool_id || evidence_hash)`.
 //! - `Equivocation`: no ZK. `evidence_hash = blake2b_256(min(a,b) ‖ max(a,b))`
 //!   over the two conflicting signed payload byte strings. Sorting makes it
-//!   order-independent. This preimage is heimdall's choice, not yet pinned by
-//!   the (permissive) contract.
+//!   order-independent.
 //!
 //! ## Cost
 //!
@@ -94,11 +90,12 @@ use crate::cardano::fault_proof::{FaultKind, FaultProofDatum};
 use crate::cardano::hash::blake2b_256;
 use crate::circuits::cardano_transcript::{CardanoBlake2bRead, CardanoBlake2bWrite};
 use crate::circuits::dkg_fault::{
-    AxiomDkgCircuitParams, DkgRound1PokDigestFaultWitness, DkgRound2ShareFaultWitness,
-    axiom_point_from_compressed, build_round1_digest_fault_keygen_circuit,
-    build_round1_digest_fault_prover_circuit, build_round2_digest_fault_keygen_circuit,
-    build_round2_digest_fault_prover_circuit, is_identity, round1_digest_residual,
-    round1_hdk_challenge, round1_message_digest, round2_message_digest, round2_residual,
+    AxiomDkgCircuitParams, DKG_POOL_ID_BYTES, DkgRound1PokDigestFaultWitness,
+    DkgRound2ShareFaultWitness, axiom_point_from_compressed,
+    build_round1_digest_fault_keygen_circuit, build_round1_digest_fault_prover_circuit,
+    build_round2_digest_fault_keygen_circuit, build_round2_digest_fault_prover_circuit,
+    is_identity, round1_digest_fault_public_inputs, round1_digest_residual, round1_hdk_challenge,
+    round2_digest_fault_public_inputs, round2_residual,
 };
 use crate::http::{auth, canonical};
 
@@ -107,7 +104,7 @@ use crate::http::{auth, canonical};
 pub const DKG_INDEX_BITS: usize = 16;
 
 /// 28-byte `blake2b_224(cold_vkey)` pool id.
-const POOL_ID_LEN: usize = 28;
+const POOL_ID_LEN: usize = DKG_POOL_ID_BYTES;
 
 /// Anything that can go wrong turning captured bytes into a fault proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +371,7 @@ impl Round1PokFaultEvidence {
         r_compressed[1..].copy_from_slice(&self.sigma_i[0..32]);
         let transcript_r = checked_point(&r_compressed)?;
         let probe = DkgRound1PokDigestFaultWitness {
+            accused_pool_id: self.accused_pool_id,
             identifier: u64::from(self.identifier),
             mu,
             challenge: Fq::ZERO,
@@ -390,11 +388,16 @@ impl Round1PokFaultEvidence {
         Ok(round1_digest_residual(&w) != w.transcript_r)
     }
 
-    /// The 32-byte `evidence_hash` = the circuit public input `Poseidon(msg)`.
-    /// Cheap: no proof, no SRS.
-    pub fn evidence_hash(&self) -> Result<[u8; 32], FaultEvidenceError> {
+    /// The circuit public inputs: `[evidence_hash, pool_id]`.
+    pub fn public_inputs(&self) -> Result<Vec<BlsFr>, FaultEvidenceError> {
         let w = self.witness()?;
-        Ok(digest_bytes(round1_message_digest(round1_params(), &w)))
+        Ok(round1_digest_fault_public_inputs(round1_params(), &w))
+    }
+
+    /// The 32-byte `evidence_hash` = the first circuit public input,
+    /// `Poseidon(pool_id, msg)`. Cheap: no proof, no SRS.
+    pub fn evidence_hash(&self) -> Result<[u8; 32], FaultEvidenceError> {
+        Ok(digest_bytes(self.public_inputs()?[0]))
     }
 }
 
@@ -437,6 +440,7 @@ impl Round2ShareFaultEvidence {
             .map(checked_point)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DkgRound2ShareFaultWitness {
+            accused_pool_id: self.accused_pool_id,
             share,
             participant_index: u64::from(self.recipient_index),
             commitments,
@@ -450,9 +454,9 @@ impl Round2ShareFaultEvidence {
         Ok(!is_identity(&round2_residual(&w)))
     }
 
-    /// The 32-byte `evidence_hash` for the configured threshold `T`.
-    /// `T` must equal `sender_commitments.len()`.
-    pub fn evidence_hash<const T: usize>(&self) -> Result<[u8; 32], FaultEvidenceError> {
+    /// The circuit public inputs for the configured threshold `T`:
+    /// `[evidence_hash, pool_id]`. `T` must equal `sender_commitments.len()`.
+    pub fn public_inputs<const T: usize>(&self) -> Result<Vec<BlsFr>, FaultEvidenceError> {
         if self.sender_commitments.len() != T {
             return Err(FaultEvidenceError::ThresholdMismatch {
                 expected: T,
@@ -460,10 +464,16 @@ impl Round2ShareFaultEvidence {
             });
         }
         let w = self.witness()?;
-        Ok(digest_bytes(round2_message_digest::<T, DKG_INDEX_BITS>(
+        Ok(round2_digest_fault_public_inputs::<T, DKG_INDEX_BITS>(
             round2_params(),
             &w,
-        )))
+        ))
+    }
+
+    /// The 32-byte `evidence_hash` for the configured threshold `T` = the first
+    /// circuit public input. `T` must equal `sender_commitments.len()`.
+    pub fn evidence_hash<const T: usize>(&self) -> Result<[u8; 32], FaultEvidenceError> {
+        Ok(digest_bytes(self.public_inputs::<T>()?[0]))
     }
 }
 
@@ -596,12 +606,13 @@ pub fn fault_proof_datum(
 // ---------------------------------------------------------------------------
 
 /// A generated DKG fault proof. Carries everything a §9.2 direct-fault
-/// submission needs: the `evidence_hash` (== the public input, binds the token
-/// name), the `message_hash` the accused signed, that signature, and the
-/// accused key — plus the proof and raw public instances.
+/// submission needs: the accused `pool_id`, the `evidence_hash` (public input
+/// 0), the `message_hash` the accused signed, that signature, and the accused
+/// key — plus the proof and raw public instances.
 #[derive(Debug, Clone)]
 pub struct DkgFaultProof {
     pub kind: FaultKind,
+    pub accused_pool_id: [u8; POOL_ID_LEN],
     pub evidence_hash: [u8; 32],
     pub message_hash: [u8; 32],
     pub payload_signature: [u8; 64],
@@ -703,6 +714,7 @@ pub fn prove_round1_pok_fault(
     verify(srs, &pk, &proof, &public_instances)?;
     Ok(DkgFaultProof {
         kind: FaultKind::InvalidPayload,
+        accused_pool_id: evidence.accused_pool_id,
         evidence_hash: digest_bytes(public_instances[0]),
         message_hash: evidence.message_hash(),
         payload_signature: evidence.payload_signature,
@@ -745,6 +757,7 @@ pub fn prove_round2_share_fault<const T: usize>(
     verify(srs, &pk, &proof, &public_instances)?;
     Ok(DkgFaultProof {
         kind: FaultKind::InvalidPayload,
+        accused_pool_id: evidence.accused_pool_id,
         evidence_hash: digest_bytes(public_instances[0]),
         message_hash: evidence.message_hash(),
         payload_signature: evidence.payload_signature,
@@ -764,7 +777,10 @@ mod tests {
     };
     use crate::cardano::publish::WalletUtxo;
     use crate::cardano::wallet::{derive_payment_key, wallet_address};
-    use crate::circuits::dkg_fault::{axiom_scalar_from_be_bytes, be_bytes_from_fq};
+    use crate::circuits::dkg_fault::{
+        axiom_scalar_from_be_bytes, be_bytes_from_fq, pool_id_public_input, round1_message_digest,
+        round2_message_digest,
+    };
     use crate::frost::participant;
     use crate::http::frost_bridge;
     use bitcoin::secp256k1::rand::rngs::OsRng;
@@ -1010,6 +1026,10 @@ mod tests {
         let w = ev.witness().unwrap();
         let expect = digest_bytes(round1_message_digest(round1_params(), &w));
         assert_eq!(ev.evidence_hash().unwrap(), expect);
+        let public_inputs = ev.public_inputs().unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(digest_bytes(public_inputs[0]), expect);
+        assert_eq!(public_inputs[1], pool_id_public_input(&POOL));
     }
 
     #[test]
@@ -1085,6 +1105,10 @@ mod tests {
             &w,
         ));
         assert_eq!(ev.evidence_hash::<FIXTURE_T>().unwrap(), expect);
+        let public_inputs = ev.public_inputs::<FIXTURE_T>().unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(digest_bytes(public_inputs[0]), expect);
+        assert_eq!(public_inputs[1], pool_id_public_input(&POOL));
     }
 
     #[test]
@@ -1185,6 +1209,7 @@ mod tests {
         let srs = insecure_test_srs(round1_params());
         let proof = prove_round1_pok_fault(&srs, &ev).expect("round1 fault proof");
         assert!(!proof.proof.is_empty());
+        assert_eq!(proof.accused_pool_id, ev.accused_pool_id);
         assert_eq!(proof.evidence_hash, ev.evidence_hash().unwrap());
         assert_eq!(proof.message_hash, ev.message_hash());
         assert_eq!(proof.bifrost_id_pk, ev.bifrost_id_pk);
@@ -1198,6 +1223,7 @@ mod tests {
         let srs = insecure_test_srs(round2_params());
         let proof = prove_round2_share_fault::<FIXTURE_T>(&srs, &ev).expect("round2 fault proof");
         assert!(!proof.proof.is_empty());
+        assert_eq!(proof.accused_pool_id, ev.accused_pool_id);
         assert_eq!(
             proof.evidence_hash,
             ev.evidence_hash::<FIXTURE_T>().unwrap()

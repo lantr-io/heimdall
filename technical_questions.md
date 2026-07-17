@@ -215,30 +215,28 @@ Token name = `blake2b_256(pool_id ‖ evidence_hash)`; pool binding by recompute
 `ban_until_time = start_time_ms + base_ban_duration_ms·2^(n−1)`; dedup by the ban
 node's `evidence_hashes` list with a `permanent` cap at
 `max_faults_before_permanent`; multi-policy (separate round1/round2/equivocation
-verifiers in `fault_proof_policy_ids`). heimdall matches it — WI-016/017/018
-delivered; WI-019 derives the real `evidence_hash`. The one open FluidTokens
-question is the §5a InvalidPayload ZK-verify binding.
+verifiers in `fault_proof_policy_ids`). heimdall derives the DKG invalid-payload
+`evidence_hash` as public input 0 of the Halo2 proof and exposes the accused
+`pool_id` as public input 1. The circuit includes the same pool id in the
+Poseidon preimage, so the generated verifier can be called with:
 
-### 5a. InvalidPayload fault verifier — permissive mock; a FluidTokens binding decision is needed
+```text
+[evidence_hash, pool_id]
+```
 
-The `fault_verifier` `PublishProof` (InvalidPayload) branch is still a permissive
-mock — it checks only structural shape (token name, 28/32-byte lengths,
-datum-on-output), **no ZK verify** — so anyone can mint a forged InvalidPayload
-FaultProof against any pool, and ApplyBan trusts it.
+and the token name remains:
 
-**The open question (FluidTokens design call):** a real ZK verify needs the proof
-bound to the payload the accused *signed*. The `dkg_fault` circuit's public input
-is `Poseidon(structured_fields)`, but the accused signs
-`message_hash = SHA256(canonical_bytes)`; nothing ties them, so a generated
-verifier is forgeable (fabricate fields → valid proof → ban an honest pool).
-Closing it needs either (a) computing `SHA256(canonical_bytes)` **in-circuit** and
-exposing `message_hash` as the public input (costly SHA256-in-ZK over a
-variable-length preimage), or (b) an alternative binding scheme. Round 2
-additionally needs the encrypted↔decrypted share binding. Once chosen, the
-per-kind ZK verifier policies can be wired (the heimdall circuits already prove
-the fault predicate). Until then the InvalidPayload ban path is functionally
-testable but NOT trust-minimized — flag in any preprod/mainnet readiness review.
-Tracked as WI-022.
+```text
+blake2b_256(pool_id || evidence_hash)
+```
+
+### 5a. InvalidPayload fault verifier wiring
+
+The Bifrost invalid-payload publish branches fail closed until the generated
+Halo2 verifiers are wired. The expected verifier boundary is the two-input
+shape above. The verifier policy must check the public-input count and order,
+convert `accused_pool_id` to the same little-endian BLS scalar as Heimdall, and
+mint exactly `blake2b_256(accused_pool_id || evidence_hash)`.
 
 (Equivocation is **not** an open FluidTokens question: the verifier is *our* code
 — FluidTokens PR #20, open — implementing their spec §9.2, and its remaining
