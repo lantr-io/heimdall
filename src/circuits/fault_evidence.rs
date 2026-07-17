@@ -24,10 +24,10 @@
 //! payload. The protocol uses the **sign-the-hash** scheme: every DKG payload
 //! carries a BIP-340 signature by the accused's `bifrost_id_pk` over
 //! `message_hash = SHA256(canonical_bytes)`. A direct-fault submission therefore
-//! carries (§9.2): `message_hash` (32B) + the accused signature (64B) + the
-//! Halo2 proof + its public inputs; the verifier policy checks
-//! `verifySchnorrSecp256k1Signature(bifrost_id_pk, message_hash, signature)` AND
-//! the proof.
+//! carries (§9.2): the signed canonical payload bytes + the accused signature
+//! (64B) + the Halo2 proof + its public inputs; the verifier policy checks
+//! `verifySchnorrSecp256k1Signature(bifrost_id_pk, SHA256(canonical_bytes),
+//! signature)` AND the proof.
 //!
 //! So every invalid-payload evidence type here carries the accused's
 //! `bifrost_id_pk`, the `(epoch, threshold, attempt, pool_id)` namespace, and
@@ -42,9 +42,10 @@
 //!
 //! - `InvalidPayload`: `evidence_hash = digest.to_repr()` — the 32-byte little-
 //!   endian serialization of public input 0. Public input 1 is the 28-byte
-//!   accused `pool_id` interpreted as a little-endian BLS scalar. The generated
-//!   verifier must pass exactly `[evidence_hash, pool_id]`, and the on-chain
-//!   token name is `blake2b_256(pool_id || evidence_hash)`.
+//!   accused `pool_id` interpreted as a little-endian BLS scalar. The signed
+//!   DKG payload carries this `evidence_hash`, so the generated verifier must
+//!   pass exactly `[evidence_hash, pool_id]`, and the on-chain token name is
+//!   `blake2b_256(pool_id || evidence_hash)`.
 //! - `Equivocation`: no ZK. `evidence_hash = blake2b_256(min(a,b) ‖ max(a,b))`
 //!   over the two conflicting signed payload byte strings. Sorting makes it
 //!   order-independent.
@@ -95,7 +96,7 @@ use crate::circuits::dkg_fault::{
     build_round1_digest_fault_keygen_circuit, build_round1_digest_fault_prover_circuit,
     build_round2_digest_fault_keygen_circuit, build_round2_digest_fault_prover_circuit,
     is_identity, round1_digest_fault_public_inputs, round1_digest_residual, round1_hdk_challenge,
-    round2_digest_fault_public_inputs, round2_residual,
+    round1_message_digest, round2_digest_fault_public_inputs, round2_residual,
 };
 use crate::http::{auth, canonical};
 
@@ -206,8 +207,9 @@ fn verify_sig(
 ///
 /// The remaining fields are the **authentication envelope**: the accused signed
 /// `SHA256(canonical_bytes)` — where `canonical_bytes` is rebuilt from the
-/// namespace + `commitments` + `sigma_i` — with `bifrost_id_pk`. So the same
-/// bytes the circuit proves invalid are the bytes the accused authenticated.
+/// namespace + `commitments` + `sigma_i` + `evidence_hash` — with
+/// `bifrost_id_pk`. So the same evidence hash the circuit opens is the one the
+/// accused authenticated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Round1PokFaultEvidence {
     pub epoch: u64,
@@ -231,9 +233,8 @@ pub struct Round1PokFaultEvidence {
 ///
 /// `round2_canonical_bytes` are the full Round 2 payload (the encrypted-share
 /// vector) the sender BIP-340-signed; `message_hash = SHA256(round2_canonical_bytes)`.
-/// Binding the *decrypted* `share` to a ciphertext inside those bytes is an
-/// upstream circuit concern (the `dkg_fault` circuit takes the plaintext share,
-/// not the ECDH decryption) — see `technical_questions.md` §5a.
+/// The selected share entry carries this circuit's `evidence_hash`; the
+/// on-chain policy checks that the opened ciphertext/pad matches the entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Round2ShareFaultEvidence {
     pub epoch: u64,
@@ -312,25 +313,83 @@ pub fn round2_params() -> AxiomDkgCircuitParams {
     AxiomDkgCircuitParams::round2_digest_fault()
 }
 
+pub fn round1_evidence_hash_from_fields(
+    accused_pool_id: &[u8; POOL_ID_LEN],
+    identifier: u16,
+    commitments: &[[u8; 33]],
+    sigma_i: &[u8; 64],
+) -> Result<[u8; 32], FaultEvidenceError> {
+    let phi0 = checked_point(
+        commitments
+            .first()
+            .ok_or(FaultEvidenceError::NoCommitments)?,
+    )?;
+    let mu_bytes: [u8; 32] = sigma_i[32..64].try_into().expect("64-byte sigma");
+    let mu = checked_scalar(&mu_bytes)?;
+    let mut r_compressed = [0u8; 33];
+    r_compressed[0] = 0x02;
+    r_compressed[1..].copy_from_slice(&sigma_i[0..32]);
+    let transcript_r = checked_point(&r_compressed)?;
+    let witness = DkgRound1PokDigestFaultWitness {
+        accused_pool_id: *accused_pool_id,
+        identifier: u64::from(identifier),
+        mu,
+        challenge: Fq::ZERO,
+        phi0,
+        transcript_r,
+    };
+    Ok(digest_bytes(round1_message_digest(
+        round1_params(),
+        &witness,
+    )))
+}
+
+pub fn round2_evidence_hash_from_fields_dyn(
+    accused_pool_id: &[u8; POOL_ID_LEN],
+    recipient_index: u16,
+    sender_commitments: &[[u8; 33]],
+    share: &[u8; 32],
+) -> Result<[u8; 32], FaultEvidenceError> {
+    let evidence = Round2ShareFaultEvidence {
+        epoch: 0,
+        threshold: 0,
+        attempt: 0,
+        accused_pool_id: *accused_pool_id,
+        bifrost_id_pk: [0u8; 32],
+        recipient_index,
+        sender_commitments: sender_commitments.to_vec(),
+        share: *share,
+        round2_canonical_bytes: Vec::new(),
+        payload_signature: [0u8; 64],
+    };
+    round2_evidence_hash_dyn(&evidence)
+}
+
 impl Round1PokFaultEvidence {
-    /// The exact bytes the accused signed: `TAG_R1 ‖ namespace ‖ φ… ‖ σ_i`.
-    #[must_use]
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        canonical::round1(
+    /// The exact bytes the accused signed:
+    /// `TAG_R1 ‖ namespace ‖ φ… ‖ σ_i ‖ evidence_hash`.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, FaultEvidenceError> {
+        let evidence_hash = self.evidence_hash()?;
+        Ok(canonical::round1(
             self.epoch,
             self.threshold,
             self.attempt,
             &self.accused_pool_id,
             &self.commitments,
             &self.sigma_i,
-        )
+            &evidence_hash,
+        ))
     }
 
     /// `message_hash = SHA256(canonical_bytes)` — the §9.2 submission field the
     /// fault verifier checks the accused signature against.
     #[must_use]
     pub fn message_hash(&self) -> [u8; 32] {
-        sha256(&self.canonical_bytes())
+        sha256(
+            &self
+                .canonical_bytes()
+                .expect("validated round1 evidence has canonical bytes"),
+        )
     }
 
     /// Confirm the accused actually authored this payload (BIP-340 over
@@ -338,7 +397,7 @@ impl Round1PokFaultEvidence {
     pub fn verify_payload_signature(&self) -> Result<(), FaultEvidenceError> {
         verify_sig(
             &self.bifrost_id_pk,
-            &self.canonical_bytes(),
+            &self.canonical_bytes()?,
             &self.payload_signature,
         )
     }
@@ -775,6 +834,7 @@ mod tests {
     use crate::cardano::fault_proof::{
         EquivocationWitness, FaultProofMintRequest, build_fault_proof_mint_tx,
     };
+    use crate::cardano::hash::blake2b_256;
     use crate::cardano::publish::WalletUtxo;
     use crate::cardano::wallet::{derive_payment_key, wallet_address};
     use crate::circuits::dkg_fault::{
@@ -826,7 +886,17 @@ mod tests {
             let mu: [u8; 32] = sigma_i[32..64].try_into().unwrap();
             sigma_i[32..64].copy_from_slice(&corrupt_scalar_be(&mu));
         }
-        let canonical = canonical::round1(EPOCH, THRESHOLD, ATTEMPT, &POOL, &commitments, &sigma_i);
+        let evidence_hash =
+            round1_evidence_hash_from_fields(&POOL, identifier, &commitments, &sigma_i).unwrap();
+        let canonical = canonical::round1(
+            EPOCH,
+            THRESHOLD,
+            ATTEMPT,
+            &POOL,
+            &commitments,
+            &sigma_i,
+            &evidence_hash,
+        );
         let (secp, kp, bifrost_id_pk) = accused_key();
         let payload_signature = auth::sign_payload(&secp, &kp, &canonical);
         Round1PokFaultEvidence {
@@ -874,10 +944,16 @@ mod tests {
         let share = frost_bridge::round2_share_bytes(&round2[&recipient]).unwrap();
         let (sender_commitments, _sigma) = frost_bridge::round1_fields(&packages[&sender]).unwrap();
         let bad_share = corrupt_scalar_be(&share);
+        let evidence_hash =
+            round2_evidence_hash_from_fields_dyn(&POOL, 2, &sender_commitments, &bad_share)
+                .unwrap();
         let entry = canonical::ShareEntry {
             recipient_pool_id: [0x22; POOL_ID_LEN],
+            recipient_identifier: 2,
             ephemeral_pk: sender_commitments[0],
             ciphertext: bad_share,
+            pad_commit: blake2b_256(&[0u8; 32]),
+            evidence_hash,
         };
         let round2_canonical_bytes = canonical::round2(EPOCH, THRESHOLD, ATTEMPT, &POOL, &[entry]);
         let (secp, kp, bifrost_id_pk) = accused_key();
@@ -906,7 +982,17 @@ mod tests {
                 participant::dkg_part1(Identifier::try_from(1u16).unwrap(), 3, 2, &mut rng)
                     .unwrap();
             let (commitments, sigma_i) = frost_bridge::round1_fields(&pkg).unwrap();
-            let bytes = canonical::round1(EPOCH, THRESHOLD, ATTEMPT, &POOL, &commitments, &sigma_i);
+            let evidence_hash =
+                round1_evidence_hash_from_fields(&POOL, 1, &commitments, &sigma_i).unwrap();
+            let bytes = canonical::round1(
+                EPOCH,
+                THRESHOLD,
+                ATTEMPT,
+                &POOL,
+                &commitments,
+                &sigma_i,
+                &evidence_hash,
+            );
             let sig = auth::sign_payload(&secp, &kp, &bytes);
             (bytes, sig)
         };
@@ -1043,7 +1129,7 @@ mod tests {
     #[test]
     fn round1_message_hash_is_sha256_of_canonical() {
         let ev = round1_fault_evidence();
-        assert_eq!(ev.message_hash(), sha256(&ev.canonical_bytes()));
+        assert_eq!(ev.message_hash(), sha256(&ev.canonical_bytes().unwrap()));
     }
 
     #[test]
@@ -1149,8 +1235,17 @@ mod tests {
         let (_s, pkg) =
             participant::dkg_part1(Identifier::try_from(1u16).unwrap(), 3, 2, &mut rng).unwrap();
         let (commitments, sigma_i) = frost_bridge::round1_fields(&pkg).unwrap();
-        let other_ns =
-            canonical::round1(EPOCH, THRESHOLD, ATTEMPT + 1, &POOL, &commitments, &sigma_i);
+        let evidence_hash =
+            round1_evidence_hash_from_fields(&POOL, 1, &commitments, &sigma_i).unwrap();
+        let other_ns = canonical::round1(
+            EPOCH,
+            THRESHOLD,
+            ATTEMPT + 1,
+            &POOL,
+            &commitments,
+            &sigma_i,
+            &evidence_hash,
+        );
         ev.bifrost_id_pk = pk;
         ev.signature_a = auth::sign_payload(&secp, &kp, &ev.payload_a); // keep a valid
         ev.signature_b = auth::sign_payload(&secp, &kp, &other_ns);

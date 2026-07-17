@@ -102,6 +102,7 @@ impl PeerNetwork for HttpPeerNetwork {
     async fn publish_dkg_round1(
         &self,
         ns: DkgNamespace,
+        identifier: frost_secp256k1_tr::Identifier,
         package: &round1::Package,
     ) -> EpochResult<()> {
         let wire = wire::build_round1(
@@ -111,6 +112,7 @@ impl PeerNetwork for HttpPeerNetwork {
             ns.threshold,
             ns.attempt,
             &self.my_pool_id,
+            identifier_to_pool_id(identifier),
             package,
         )
         .map_err(peer_err)?;
@@ -126,12 +128,15 @@ impl PeerNetwork for HttpPeerNetwork {
     async fn publish_dkg_round2(
         &self,
         ns: DkgNamespace,
+        _sender_identifier: frost_secp256k1_tr::Identifier,
+        sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
         recipients: &[(SpoInfo, round2::Package)],
     ) -> EpochResult<()> {
         let mut recips: Vec<Round2Recipient> = Vec::with_capacity(recipients.len());
         for (info, pkg) in recipients {
             recips.push(Round2Recipient {
                 pool_id: pool_id_arr(&info.pool_id)?,
+                identifier: identifier_to_pool_id(info.identifier),
                 bifrost_id_pk: &info.bifrost_id_pk,
                 package: pkg,
             });
@@ -143,6 +148,7 @@ impl PeerNetwork for HttpPeerNetwork {
             ns.threshold,
             ns.attempt,
             &self.my_pool_id,
+            sender_commitments,
             &recips,
             &mut OsRng,
         )
@@ -203,6 +209,7 @@ impl PeerNetwork for HttpPeerNetwork {
             ns.epoch,
             ns.threshold,
             ns.attempt,
+            identifier_to_pool_id(peer.identifier),
             &wire,
         ) {
             Ok(pkg) => Ok(Some(pkg)),
@@ -222,6 +229,8 @@ impl PeerNetwork for HttpPeerNetwork {
         &self,
         ns: DkgNamespace,
         peer: &SpoInfo,
+        recipient_identifier: frost_secp256k1_tr::Identifier,
+        sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
     ) -> EpochResult<Option<round2::Package>> {
         let pool_hex = hex::encode(&peer.pool_id);
         let url = format!(
@@ -249,7 +258,9 @@ impl PeerNetwork for HttpPeerNetwork {
             &peer_pool,
             &peer.bifrost_id_pk,
             &self.my_pool_id,
+            identifier_to_pool_id(recipient_identifier),
             &self.keypair.secret_key(),
+            sender_commitments,
             ns.epoch,
             ns.threshold,
             ns.attempt,
@@ -390,7 +401,7 @@ mod tests {
         // net1 publishes its real Round 1 package (signed inside publish).
         let ns = DkgNamespace::new(7);
         let (_secret, pkg1) = dkg::part1(id(1), 3, 2, OsRng).unwrap();
-        net1.publish_dkg_round1(ns, &pkg1).await.unwrap();
+        net1.publish_dkg_round1(ns, id(1), &pkg1).await.unwrap();
 
         // net2 fetches over real HTTP, verifying against net1's identity key.
         let peer1 = peer_info(1, &pool1, &url1, &pk1);
@@ -434,8 +445,10 @@ mod tests {
         let ns = DkgNamespace::new(7);
 
         // Real frost round2 package from sender 1 addressed to peer 2.
-        let (s1, _p1) = dkg::part1(id(1), 2, 2, OsRng).unwrap();
+        let (s1, p1) = dkg::part1(id(1), 2, 2, OsRng).unwrap();
         let (_s2, p2) = dkg::part1(id(2), 2, 2, OsRng).unwrap();
+        let (sender_commitments, _sigma_i) =
+            crate::http::frost_bridge::round1_fields(&p1).expect("round1 fields");
         let mut r1 = std::collections::BTreeMap::new();
         r1.insert(id(2), p2);
         let (_s1r2, pkgs) = dkg::part2(s1, &r1).unwrap();
@@ -443,15 +456,24 @@ mod tests {
 
         // net1 publishes the encrypted share addressed to net2's identity.
         let recip2 = peer_info(2, &pool2, "", &pk2);
-        net1.publish_dkg_round2(ns, &[(recip2, pkg_for_2.clone())])
-            .await
-            .unwrap();
+        net1.publish_dkg_round2(
+            ns,
+            id(1),
+            &sender_commitments,
+            &[(recip2, pkg_for_2.clone())],
+        )
+        .await
+        .unwrap();
 
         // net2 fetches, verifies net1's signature, decrypts its share.
         let peer1 = peer_info(1, &pool1, &url1, &pk1);
         let mut got = None;
         for _ in 0..50 {
-            if let Some(p) = net2.fetch_dkg_round2(ns, &peer1).await.unwrap() {
+            if let Some(p) = net2
+                .fetch_dkg_round2(ns, &peer1, id(2), &sender_commitments)
+                .await
+                .unwrap()
+            {
                 got = Some(p);
                 break;
             }

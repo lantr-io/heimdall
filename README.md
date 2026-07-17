@@ -34,6 +34,10 @@ Halo2 proof with two public inputs:
 [evidence_hash, pool_id]
 ```
 
+Heimdall signs canonical DKG payload bytes that carry the same
+`evidence_hash`, so Bifrost can verify the accused SPO's BIP-340 signature over
+the payload and compare the signed evidence hash with the Halo2 public input.
+
 It mints exactly one fault token whose name is:
 
 ```text

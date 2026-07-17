@@ -4076,7 +4076,10 @@ mod tests {
             sigma_i[32..64].copy_from_slice(&corrupt_scalar(&mu));
         }
         let pool = [0x11u8; 28];
-        let canonical_bytes = canonical::round1(7, 51, 0, &pool, &commitments, &sigma_i);
+        let evidence_hash =
+            fe::round1_evidence_hash_from_fields(&pool, 1, &commitments, &sigma_i).unwrap();
+        let canonical_bytes =
+            canonical::round1(7, 51, 0, &pool, &commitments, &sigma_i, &evidence_hash);
         let secp = Secp256k1::new();
         let (sk, _pk) = secp.generate_keypair(&mut OsRng);
         let kp = Keypair::from_secret_key(&secp, &sk);
@@ -4158,7 +4161,9 @@ mod tests {
                 participant::dkg_part1(Identifier::try_from(1u16).unwrap(), 3, 2, &mut rng)
                     .unwrap();
             let (commitments, sigma_i) = frost_bridge::round1_fields(&pkg).unwrap();
-            let bytes = canonical::round1(3, 51, 1, &pool, &commitments, &sigma_i);
+            let evidence_hash =
+                fe::round1_evidence_hash_from_fields(&pool, 1, &commitments, &sigma_i).unwrap();
+            let bytes = canonical::round1(3, 51, 1, &pool, &commitments, &sigma_i, &evidence_hash);
             let sig = auth::sign_payload(&secp, &kp, &bytes);
             (bytes, sig)
         };

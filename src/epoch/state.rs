@@ -31,16 +31,11 @@ pub struct SpoInfo {
     #[serde(default)]
     pub pool_id: Vec<u8>,
     pub bifrost_url: String,
-    /// Reserved for BIP-340 payload authentication. Not enforced in v0.2.
+    /// BIP-340 identity key used to authenticate peer payloads.
     ///
-    /// TODO: every DKG/sign payload delivered over the HTTP peer
-    /// protocol should be signed under this key (BIP-340 Schnorr over
-    /// secp256k1) and verified on receipt. Today publish/fetch accept
-    /// unauthenticated JSON — a MITM or a dishonest peer can inject
-    /// arbitrary commitments.
-    /// FIXME: also need replay protection — payloads should bind to
-    /// `(epoch, round, input_index)` under the signature so an old
-    /// payload can't be replayed into a new session.
+    /// DKG HTTP payloads are signed under this key and bind their replay
+    /// namespace in the canonical bytes. Signing payloads still need the same
+    /// end-to-end treatment before signing-share fault proofs are implemented.
     #[serde(default)]
     pub bifrost_id_pk: Vec<u8>,
 }

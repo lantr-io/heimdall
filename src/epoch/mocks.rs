@@ -330,6 +330,7 @@ impl PeerNetwork for MockPeerNetwork {
     async fn publish_dkg_round1(
         &self,
         ns: DkgNamespace,
+        _identifier: Identifier,
         package: &round1::Package,
     ) -> EpochResult<()> {
         let pkg = package.clone();
@@ -341,6 +342,8 @@ impl PeerNetwork for MockPeerNetwork {
     async fn publish_dkg_round2(
         &self,
         ns: DkgNamespace,
+        _sender_identifier: Identifier,
+        _sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
         recipients: &[(SpoInfo, round2::Package)],
     ) -> EpochResult<()> {
         with_slot(&self.hub, self.me, |s| {
@@ -387,6 +390,8 @@ impl PeerNetwork for MockPeerNetwork {
         &self,
         ns: DkgNamespace,
         peer: &SpoInfo,
+        _recipient_identifier: Identifier,
+        _sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
     ) -> EpochResult<Option<round2::Package>> {
         // Return the share `peer` addressed to us (self.me) in this namespace.
         Ok(with_slot(&self.hub, peer.identifier, |s| {
@@ -452,7 +457,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let (_, pkg) = participant::dkg_part1(id1, 3, 2, &mut rng).unwrap();
         let ns = DkgNamespace::new(0);
-        net1.publish_dkg_round1(ns, &pkg).await.unwrap();
+        net1.publish_dkg_round1(ns, id1, &pkg).await.unwrap();
 
         let info1 = SpoInfo {
             identifier: id1,

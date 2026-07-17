@@ -13,9 +13,11 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use frost_secp256k1_tr::Identifier;
 use frost_secp256k1_tr::keys::dkg::{round1, round2};
 
 use crate::epoch::state::{EpochResult, Roster, SpoInfo};
+use crate::http::canonical::POINT_LEN;
 use crate::http::payloads::{Sign1Payload, Sign2Payload};
 use crate::http::wire::DkgNamespace;
 
@@ -153,6 +155,7 @@ pub trait PeerNetwork: Send + Sync {
     async fn publish_dkg_round1(
         &self,
         ns: DkgNamespace,
+        identifier: Identifier,
         package: &round1::Package,
     ) -> EpochResult<()>;
     /// Publish Round 2: one encrypted share per recipient. Each entry pairs
@@ -161,6 +164,8 @@ pub trait PeerNetwork: Send + Sync {
     async fn publish_dkg_round2(
         &self,
         ns: DkgNamespace,
+        sender_identifier: Identifier,
+        sender_commitments: &[[u8; POINT_LEN]],
         recipients: &[(SpoInfo, round2::Package)],
     ) -> EpochResult<()>;
     async fn publish_sign_round1(&self, payload: Sign1Payload) -> EpochResult<()>;
@@ -175,6 +180,8 @@ pub trait PeerNetwork: Send + Sync {
         &self,
         ns: DkgNamespace,
         peer: &SpoInfo,
+        recipient_identifier: Identifier,
+        sender_commitments: &[[u8; POINT_LEN]],
     ) -> EpochResult<Option<round2::Package>>;
     async fn fetch_sign_round1(
         &self,

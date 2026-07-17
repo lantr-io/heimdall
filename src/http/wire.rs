@@ -13,8 +13,12 @@ use frost_secp256k1_tr::keys::dkg::{round1, round2};
 use serde::{Deserialize, Serialize};
 
 use super::auth::{self, AuthError};
-use super::canonical::{self, POINT_LEN, POOL_ID_LEN, SHARE_LEN, SIG_LEN, ShareEntry};
+use super::canonical::{
+    self, EVIDENCE_HASH_LEN, PAD_COMMIT_LEN, POINT_LEN, POOL_ID_LEN, SHARE_LEN, SIG_LEN, ShareEntry,
+};
 use super::frost_bridge::{self, BridgeError};
+use crate::cardano::hash::blake2b_256;
+use crate::circuits::fault_evidence;
 
 #[derive(Debug)]
 pub enum WireError {
@@ -112,6 +116,8 @@ pub struct Dkg1Wire {
     pub commitment: Vec<String>,
     /// Proof of knowledge σ_i, hex (64 bytes).
     pub sigma_i: String,
+    /// Circuit public input 0 for this Round 1 payload, hex (32 bytes).
+    pub poseidon_commit: String,
     /// BIP-340 signature over `SHA256(canonical_bytes)`, hex (64 bytes).
     pub signature: String,
 }
@@ -124,15 +130,31 @@ pub fn build_round1(
     threshold: u64,
     attempt: u64,
     my_pool_id: &[u8; POOL_ID_LEN],
+    my_identifier: u16,
     package: &round1::Package,
 ) -> Result<Dkg1Wire, WireError> {
     let (commitment, sigma_i) = frost_bridge::round1_fields(package)?;
-    let canonical_bytes =
-        canonical::round1(epoch, threshold, attempt, my_pool_id, &commitment, &sigma_i);
+    let poseidon_commit = fault_evidence::round1_evidence_hash_from_fields(
+        my_pool_id,
+        my_identifier,
+        &commitment,
+        &sigma_i,
+    )
+    .map_err(|e| WireError::Field(format!("poseidon_commit: {e}")))?;
+    let canonical_bytes = canonical::round1(
+        epoch,
+        threshold,
+        attempt,
+        my_pool_id,
+        &commitment,
+        &sigma_i,
+        &poseidon_commit,
+    );
     let signature = auth::sign_payload(secp, keypair, &canonical_bytes);
     Ok(Dkg1Wire {
         commitment: commitment.iter().map(hex::encode).collect(),
         sigma_i: hex::encode(sigma_i),
+        poseidon_commit: hex::encode(poseidon_commit),
         signature: hex::encode(signature),
     })
 }
@@ -147,6 +169,7 @@ pub fn verify_round1(
     epoch: u64,
     threshold: u64,
     attempt: u64,
+    peer_identifier: u16,
     wire: &Dkg1Wire,
 ) -> Result<round1::Package, WireError> {
     let commitment = wire
@@ -155,7 +178,18 @@ pub fn verify_round1(
         .map(|h| hex_n::<POINT_LEN>(h, "commitment"))
         .collect::<Result<Vec<_>, _>>()?;
     let sigma_i = hex_n::<SIG_LEN>(&wire.sigma_i, "sigma_i")?;
+    let poseidon_commit = hex_n::<EVIDENCE_HASH_LEN>(&wire.poseidon_commit, "poseidon_commit")?;
     let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
+    let expected_commit = fault_evidence::round1_evidence_hash_from_fields(
+        peer_pool_id,
+        peer_identifier,
+        &commitment,
+        &sigma_i,
+    )
+    .map_err(|e| WireError::Field(format!("poseidon_commit: {e}")))?;
+    if poseidon_commit != expected_commit {
+        return Err(WireError::Field("poseidon_commit mismatch".into()));
+    }
 
     let canonical_bytes = canonical::round1(
         epoch,
@@ -164,6 +198,7 @@ pub fn verify_round1(
         peer_pool_id,
         &commitment,
         &sigma_i,
+        &poseidon_commit,
     );
     auth::verify_payload(secp, peer_bifrost_id_pk, &canonical_bytes, &signature)?;
 
@@ -178,8 +213,11 @@ pub fn verify_round1(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShareWire {
     pub recipient_pool_id: String, // hex, 28 bytes
-    pub ephemeral_pk: String,      // hex, 33 bytes
-    pub ciphertext: String,        // hex, 32 bytes
+    pub recipient_frost_identifier: u16,
+    pub ephemeral_pk: String,  // hex, 33 bytes
+    pub ciphertext: String,    // hex, 32 bytes
+    pub pad_commit: String,    // hex, 32 bytes
+    pub evidence_hash: String, // hex, 32 bytes
 }
 
 /// Round 2 payload: per-recipient encrypted shares, authenticated.
@@ -194,6 +232,7 @@ pub struct Dkg2Wire {
 /// (to encrypt under), and the frost package addressed to them.
 pub struct Round2Recipient<'a> {
     pub pool_id: [u8; POOL_ID_LEN],
+    pub identifier: u16,
     pub bifrost_id_pk: &'a [u8],
     pub package: &'a round2::Package,
 }
@@ -209,6 +248,7 @@ pub fn build_round2<R: Rng + CryptoRng>(
     threshold: u64,
     attempt: u64,
     my_pool_id: &[u8; POOL_ID_LEN],
+    sender_commitments: &[[u8; POINT_LEN]],
     recipients: &[Round2Recipient],
     rng: &mut R,
 ) -> Result<Dkg2Wire, WireError> {
@@ -216,12 +256,22 @@ pub fn build_round2<R: Rng + CryptoRng>(
     for r in recipients {
         let share = frost_bridge::round2_share_bytes(r.package)?;
         let ephemeral_sk = SecretKey::new(rng);
-        let (ephemeral_pk, ciphertext) =
-            auth::encrypt_share(secp, &ephemeral_sk, r.bifrost_id_pk, &share)?;
+        let (ephemeral_pk, ciphertext, pad) =
+            auth::encrypt_share_with_pad(secp, &ephemeral_sk, r.bifrost_id_pk, &share)?;
+        let evidence_hash = fault_evidence::round2_evidence_hash_from_fields_dyn(
+            my_pool_id,
+            r.identifier,
+            sender_commitments,
+            &share,
+        )
+        .map_err(|e| WireError::Field(format!("evidence_hash: {e}")))?;
         entries.push(ShareEntry {
             recipient_pool_id: r.pool_id,
+            recipient_identifier: u64::from(r.identifier),
             ephemeral_pk,
             ciphertext,
+            pad_commit: blake2b_256(&pad),
+            evidence_hash,
         });
     }
     // Canonical ordering by recipient_pool_id; the JSON follows the same order.
@@ -235,8 +285,12 @@ pub fn build_round2<R: Rng + CryptoRng>(
             .iter()
             .map(|e| ShareWire {
                 recipient_pool_id: hex::encode(e.recipient_pool_id),
+                recipient_frost_identifier: u16::try_from(e.recipient_identifier)
+                    .expect("recipient identifier came from u16"),
                 ephemeral_pk: hex::encode(e.ephemeral_pk),
                 ciphertext: hex::encode(e.ciphertext),
+                pad_commit: hex::encode(e.pad_commit),
+                evidence_hash: hex::encode(e.evidence_hash),
             })
             .collect(),
         signature: hex::encode(signature),
@@ -251,7 +305,9 @@ pub fn verify_round2(
     sender_pool_id: &[u8; POOL_ID_LEN],
     sender_bifrost_id_pk: &[u8],
     my_pool_id: &[u8; POOL_ID_LEN],
+    my_identifier: u16,
     my_bifrost_sk: &SecretKey,
+    sender_commitments: &[[u8; POINT_LEN]],
     epoch: u64,
     threshold: u64,
     attempt: u64,
@@ -261,8 +317,11 @@ pub fn verify_round2(
     for s in &wire.shares {
         entries.push(ShareEntry {
             recipient_pool_id: hex_n::<POOL_ID_LEN>(&s.recipient_pool_id, "recipient_pool_id")?,
+            recipient_identifier: u64::from(s.recipient_frost_identifier),
             ephemeral_pk: hex_n::<POINT_LEN>(&s.ephemeral_pk, "ephemeral_pk")?,
             ciphertext: hex_n::<SHARE_LEN>(&s.ciphertext, "ciphertext")?,
+            pad_commit: hex_n::<PAD_COMMIT_LEN>(&s.pad_commit, "pad_commit")?,
+            evidence_hash: hex_n::<EVIDENCE_HASH_LEN>(&s.evidence_hash, "evidence_hash")?,
         });
     }
     let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
@@ -275,7 +334,26 @@ pub fn verify_round2(
         .iter()
         .find(|e| &e.recipient_pool_id == my_pool_id)
         .ok_or(WireError::NoShareForUs)?;
-    let share = auth::decrypt_share(secp, my_bifrost_sk, &mine.ephemeral_pk, &mine.ciphertext)?;
+    if mine.recipient_identifier != u64::from(my_identifier) {
+        return Err(WireError::Field(
+            "recipient_frost_identifier mismatch".into(),
+        ));
+    }
+    let (share, pad) =
+        auth::decrypt_share_with_pad(secp, my_bifrost_sk, &mine.ephemeral_pk, &mine.ciphertext)?;
+    if blake2b_256(&pad) != mine.pad_commit {
+        return Err(WireError::Field("pad_commit mismatch".into()));
+    }
+    let expected_evidence_hash = fault_evidence::round2_evidence_hash_from_fields_dyn(
+        sender_pool_id,
+        my_identifier,
+        sender_commitments,
+        &share,
+    )
+    .map_err(|e| WireError::Field(format!("evidence_hash: {e}")))?;
+    if expected_evidence_hash != mine.evidence_hash {
+        return Err(WireError::Field("evidence_hash mismatch".into()));
+    }
     Ok(frost_bridge::round2_from_share(&share)?)
 }
 
@@ -307,11 +385,24 @@ mod tests {
         let pool = [3u8; POOL_ID_LEN];
         let (_s, pkg) = dkg::part1(id(1), 3, 2, OsRng).unwrap();
 
-        let wire = build_round1(&secp, &kp, 9, canonical::THRESHOLD_51, 0, &pool, &pkg).unwrap();
+        let wire = build_round1(&secp, &kp, 9, canonical::THRESHOLD_51, 0, &pool, 1, &pkg).unwrap();
         assert_eq!(wire.commitment.len(), 2);
+        assert_eq!(
+            hex::decode(&wire.poseidon_commit).unwrap().len(),
+            EVIDENCE_HASH_LEN
+        );
 
-        let parsed =
-            verify_round1(&secp, &pool, &xonly, 9, canonical::THRESHOLD_51, 0, &wire).unwrap();
+        let parsed = verify_round1(
+            &secp,
+            &pool,
+            &xonly,
+            9,
+            canonical::THRESHOLD_51,
+            0,
+            1,
+            &wire,
+        )
+        .unwrap();
         assert_eq!(parsed, pkg);
     }
 
@@ -321,10 +412,19 @@ mod tests {
         let (_sk, kp, xonly) = keypair(&secp);
         let pool = [3u8; POOL_ID_LEN];
         let (_s, pkg) = dkg::part1(id(1), 3, 2, OsRng).unwrap();
-        let wire = build_round1(&secp, &kp, 9, canonical::THRESHOLD_51, 0, &pool, &pkg).unwrap();
+        let wire = build_round1(&secp, &kp, 9, canonical::THRESHOLD_51, 0, &pool, 1, &pkg).unwrap();
 
         // Wrong epoch -> different canonical bytes -> signature must fail.
-        let err = verify_round1(&secp, &pool, &xonly, 10, canonical::THRESHOLD_51, 0, &wire);
+        let err = verify_round1(
+            &secp,
+            &pool,
+            &xonly,
+            10,
+            canonical::THRESHOLD_51,
+            0,
+            1,
+            &wire,
+        );
         assert!(matches!(err, Err(WireError::Auth(_))));
     }
 
@@ -338,8 +438,9 @@ mod tests {
         let pool2 = [2u8; POOL_ID_LEN];
 
         // Real frost round2 package from sender 1, addressed to peer 2.
-        let (s1, _p1) = dkg::part1(id(1), 2, 2, OsRng).unwrap();
+        let (s1, p1) = dkg::part1(id(1), 2, 2, OsRng).unwrap();
         let (_s2, p2) = dkg::part1(id(2), 2, 2, OsRng).unwrap();
+        let (sender_commitments, _sigma_i) = frost_bridge::round1_fields(&p1).unwrap();
         let mut r1 = BTreeMap::new();
         r1.insert(id(2), p2);
         let (_s1r2, pkgs) = dkg::part2(s1, &r1).unwrap();
@@ -347,6 +448,7 @@ mod tests {
 
         let recipients = vec![Round2Recipient {
             pool_id: pool2,
+            identifier: 2,
             bifrost_id_pk: &x2,
             package: pkg_for_2,
         }];
@@ -357,6 +459,7 @@ mod tests {
             canonical::THRESHOLD_51,
             0,
             &pool1,
+            &sender_commitments,
             &recipients,
             &mut OsRng,
         )
@@ -367,7 +470,9 @@ mod tests {
             &pool1,
             &keypair_xonly(&secp, &kp1),
             &pool2,
+            2,
             &sk2,
+            &sender_commitments,
             9,
             canonical::THRESHOLD_51,
             0,
@@ -389,13 +494,15 @@ mod tests {
         let (sk2, _kp2, x2) = keypair(&secp);
         let pool1 = [1u8; POOL_ID_LEN];
         let pool2 = [2u8; POOL_ID_LEN];
-        let (s1, _p1) = dkg::part1(id(1), 2, 2, OsRng).unwrap();
+        let (s1, p1) = dkg::part1(id(1), 2, 2, OsRng).unwrap();
         let (_s2, p2) = dkg::part1(id(2), 2, 2, OsRng).unwrap();
+        let (sender_commitments, _sigma_i) = frost_bridge::round1_fields(&p1).unwrap();
         let mut r1 = BTreeMap::new();
         r1.insert(id(2), p2);
         let (_s1r2, pkgs) = dkg::part2(s1, &r1).unwrap();
         let recipients = vec![Round2Recipient {
             pool_id: pool2,
+            identifier: 2,
             bifrost_id_pk: &x2,
             package: pkgs.get(&id(2)).unwrap(),
         }];
@@ -406,6 +513,7 @@ mod tests {
             canonical::THRESHOLD_51,
             0,
             &pool1,
+            &sender_commitments,
             &recipients,
             &mut OsRng,
         )
@@ -421,7 +529,9 @@ mod tests {
             &pool1,
             &kp1.x_only_public_key().0.serialize(),
             &pool2,
+            2,
             &sk2,
+            &sender_commitments,
             9,
             canonical::THRESHOLD_51,
             0,

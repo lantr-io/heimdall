@@ -21,11 +21,11 @@
 //! rerun and is what the multi-instance acceptance test exercises.
 //!
 //! TODO (WI-019): the transport drops invalid peer payloads (bad PoK / bad
-//! decrypted share) as `Ok(None)` and retains the raw bytes as fault evidence.
-//! This layer sees such peers only as "absent" (missing from `L1`/`Q`). Wiring
-//! the retained evidence through to a FaultProof is WI-019; here a faulty peer
-//! and an offline peer are handled identically (excluded, candidate set
-//! reduced).
+//! decrypted share) as `Ok(None)`. The DKG wire format is signed and carries the
+//! circuit evidence hash, but this orchestration layer still sees bad peers only
+//! as "absent" (missing from `L1`/`Q`). Wiring retained transport evidence
+//! through to FaultProof publication is WI-019; here a faulty peer and an
+//! offline peer are handled identically (excluded, candidate set reduced).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -42,6 +42,7 @@ use crate::epoch::state::{
 };
 use crate::epoch::traits::{Clock, PeerNetwork, RngSource};
 use crate::frost::participant;
+use crate::http::frost_bridge;
 use crate::http::wire::DkgNamespace;
 
 /// Drive one DKG sub-round for `ctx` and produce the next phase: the next
@@ -92,7 +93,7 @@ pub async fn dkg_phase(
                 short_hex(&pkg_bytes, 16)
             );
 
-            peers.publish_dkg_round1(ns, &package).await?;
+            peers.publish_dkg_round1(ns, me, &package).await?;
             crate::epoch_log!(me, epoch, "  -> round1 package published to local server");
 
             collected.round1_mine = Some(secret);
@@ -211,7 +212,15 @@ pub async fn dkg_phase(
                         })
                 })
                 .collect::<Result<_, _>>()?;
-            peers.publish_dkg_round2(ns, &recipients).await?;
+            let my_round1 = collected
+                .round1_peers
+                .get(&me)
+                .ok_or_else(|| EpochError::Transition("missing own round1 package".into()))?;
+            let (my_commitments, _sigma_i) = frost_bridge::round1_fields(my_round1)
+                .map_err(|e| EpochError::Frost(format!("round1 fields: {e}")))?;
+            peers
+                .publish_dkg_round2(ns, me, &my_commitments, &recipients)
+                .await?;
             crate::epoch_log!(me, epoch, "  -> round2 packages published");
 
             collected.round2_mine = Some(round2_secret);
@@ -239,6 +248,7 @@ pub async fn dkg_phase(
                 me,
                 &peer_infos,
                 deadline,
+                &collected.round1_peers,
                 &mut collected.round2_peers,
             )
             .await?;
@@ -384,7 +394,7 @@ pub async fn dkg_phase(
 /// payload" are indistinguishable — the transport already dropped bad payloads
 /// to `Ok(None)` and separately retained their raw bytes for equivocation
 /// proofs, keyed by `(epoch, round, pool_id)`. This records WHICH participants
-/// to look those up for; turning it into a Plonk fault proof + on-chain ban is
+/// to look those up for; turning it into a Halo2 fault proof + on-chain ban is
 /// WI-019 (explicitly out of scope here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DkgExclusionEvidence {
@@ -615,6 +625,7 @@ async fn poll_dkg_round2(
     me: Identifier,
     peer_infos: &[&SpoInfo],
     deadline: Instant,
+    round1_packages: &BTreeMap<Identifier, frost::keys::dkg::round1::Package>,
     out: &mut BTreeMap<Identifier, frost::keys::dkg::round2::Package>,
 ) -> EpochResult<()> {
     let need = peer_infos.len();
@@ -623,7 +634,15 @@ async fn poll_dkg_round2(
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            if let Some(pkg) = peers.fetch_dkg_round2(ns, peer).await? {
+            let Some(sender_round1) = round1_packages.get(&peer.identifier) else {
+                continue;
+            };
+            let (sender_commitments, _sigma_i) = frost_bridge::round1_fields(sender_round1)
+                .map_err(|e| EpochError::Frost(format!("round1 fields: {e}")))?;
+            if let Some(pkg) = peers
+                .fetch_dkg_round2(ns, peer, me, &sender_commitments)
+                .await?
+            {
                 crate::epoch_log!(
                     me,
                     ns.epoch,
