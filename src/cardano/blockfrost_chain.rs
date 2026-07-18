@@ -476,6 +476,18 @@ impl CardanoChain for BlockfrostCardanoChain {
         Ok(())
     }
 
+    async fn publish_dkg_fault_and_apply_ban(
+        &self,
+        evidence: crate::epoch::traits::DkgFaultEvidence,
+    ) -> EpochResult<()> {
+        Err(EpochError::Chain(format!(
+            "automatic DKG fault publication is not wired for live Cardano yet \
+             (kind={}, accused_pool_id={})",
+            evidence.kind_label(),
+            hex::encode(evidence.accused_pool_id())
+        )))
+    }
+
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>> {
         Ok(vec![])
     }

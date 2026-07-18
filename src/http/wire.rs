@@ -19,6 +19,9 @@ use super::canonical::{
 use super::frost_bridge::{self, BridgeError};
 use crate::cardano::hash::blake2b_256;
 use crate::circuits::fault_evidence;
+use crate::circuits::fault_evidence::{
+    EquivocationEvidence, NamespacePhase, Round1PokFaultEvidence, Round2ShareFaultEvidence,
+};
 
 #[derive(Debug)]
 pub enum WireError {
@@ -59,6 +62,19 @@ fn hex_n<const N: usize>(s: &str, what: &str) -> Result<[u8; N], WireError> {
     bytes
         .try_into()
         .map_err(|v: Vec<u8>| WireError::Field(format!("{what}: got {} bytes, want {N}", v.len())))
+}
+
+fn bifrost_pk_array(peer_bifrost_id_pk: &[u8]) -> Result<[u8; 32], WireError> {
+    peer_bifrost_id_pk.try_into().map_err(|_| {
+        WireError::Field(format!(
+            "bifrost_id_pk is {} bytes, want 32",
+            peer_bifrost_id_pk.len()
+        ))
+    })
+}
+
+fn fault_err(context: &str, e: fault_evidence::FaultEvidenceError) -> WireError {
+    WireError::Field(format!("{context}: {e}"))
 }
 
 /// Convert a roster-held `pool_id` (`Vec<u8>`) to the fixed 28-byte array
@@ -163,7 +179,7 @@ pub fn build_round1(
 /// expected namespace, then rebuild the frost package. The caller must
 /// already have matched `peer_pool_id`/`bifrost_id_pk` to the polled peer.
 pub fn verify_round1(
-    secp: &Secp256k1<All>,
+    _secp: &Secp256k1<All>,
     peer_pool_id: &[u8; POOL_ID_LEN],
     peer_bifrost_id_pk: &[u8],
     epoch: u64,
@@ -172,6 +188,40 @@ pub fn verify_round1(
     peer_identifier: u16,
     wire: &Dkg1Wire,
 ) -> Result<round1::Package, WireError> {
+    let evidence = round1_fault_evidence(
+        peer_pool_id,
+        peer_bifrost_id_pk,
+        epoch,
+        threshold,
+        attempt,
+        peer_identifier,
+        wire,
+    )?;
+    if evidence
+        .is_fault()
+        .map_err(|e| fault_err("round1 PoK", e))?
+    {
+        return Err(WireError::Field(
+            "round1 proof of knowledge is invalid".into(),
+        ));
+    }
+    Ok(frost_bridge::round1_from_fields(
+        &evidence.commitments,
+        &evidence.sigma_i,
+    )?)
+}
+
+fn round1_signed_fields(
+    wire: &Dkg1Wire,
+) -> Result<
+    (
+        Vec<[u8; POINT_LEN]>,
+        [u8; SIG_LEN],
+        [u8; EVIDENCE_HASH_LEN],
+        [u8; SIG_LEN],
+    ),
+    WireError,
+> {
     let commitment = wire
         .commitment
         .iter()
@@ -180,17 +230,66 @@ pub fn verify_round1(
     let sigma_i = hex_n::<SIG_LEN>(&wire.sigma_i, "sigma_i")?;
     let poseidon_commit = hex_n::<EVIDENCE_HASH_LEN>(&wire.poseidon_commit, "poseidon_commit")?;
     let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
-    let expected_commit = fault_evidence::round1_evidence_hash_from_fields(
-        peer_pool_id,
-        peer_identifier,
-        &commitment,
-        &sigma_i,
-    )
-    .map_err(|e| WireError::Field(format!("poseidon_commit: {e}")))?;
-    if poseidon_commit != expected_commit {
+    Ok((commitment, sigma_i, poseidon_commit, signature))
+}
+
+/// Rebuild the signed Round 1 evidence envelope from a JSON payload.
+///
+/// This verifies the accused's BIP-340 signature and the payload's advertised
+/// `poseidon_commit`, but does not require the PoK to be bad. Call
+/// [`Round1PokFaultEvidence::is_fault`] to distinguish a punishable invalid
+/// payload from an honest one.
+pub fn round1_fault_evidence(
+    peer_pool_id: &[u8; POOL_ID_LEN],
+    peer_bifrost_id_pk: &[u8],
+    epoch: u64,
+    threshold: u64,
+    attempt: u64,
+    peer_identifier: u16,
+    wire: &Dkg1Wire,
+) -> Result<Round1PokFaultEvidence, WireError> {
+    let (commitment, sigma_i, poseidon_commit, signature) = round1_signed_fields(wire)?;
+    let ev = Round1PokFaultEvidence {
+        epoch,
+        threshold,
+        attempt,
+        accused_pool_id: *peer_pool_id,
+        bifrost_id_pk: bifrost_pk_array(peer_bifrost_id_pk)?,
+        identifier: peer_identifier,
+        commitments: commitment,
+        sigma_i,
+        payload_signature: signature,
+    };
+    if poseidon_commit
+        != ev
+            .evidence_hash()
+            .map_err(|e| fault_err("poseidon_commit", e))?
+    {
         return Err(WireError::Field("poseidon_commit mismatch".into()));
     }
+    let canonical_bytes = ev
+        .canonical_bytes()
+        .map_err(|e| fault_err("round1 canonical bytes", e))?;
+    auth::verify_payload(
+        &Secp256k1::new(),
+        peer_bifrost_id_pk,
+        &canonical_bytes,
+        &signature,
+    )?;
+    Ok(ev)
+}
 
+/// The canonical bytes and signature from a Round 1 payload, suitable for an
+/// equivocation proof.
+pub fn round1_signed_payload(
+    peer_pool_id: &[u8; POOL_ID_LEN],
+    peer_bifrost_id_pk: &[u8],
+    epoch: u64,
+    threshold: u64,
+    attempt: u64,
+    wire: &Dkg1Wire,
+) -> Result<(Vec<u8>, [u8; SIG_LEN]), WireError> {
+    let (commitment, sigma_i, poseidon_commit, signature) = round1_signed_fields(wire)?;
     let canonical_bytes = canonical::round1(
         epoch,
         threshold,
@@ -200,9 +299,13 @@ pub fn verify_round1(
         &sigma_i,
         &poseidon_commit,
     );
-    auth::verify_payload(secp, peer_bifrost_id_pk, &canonical_bytes, &signature)?;
-
-    Ok(frost_bridge::round1_from_fields(&commitment, &sigma_i)?)
+    auth::verify_payload(
+        &Secp256k1::new(),
+        peer_bifrost_id_pk,
+        &canonical_bytes,
+        &signature,
+    )?;
+    Ok((canonical_bytes, signature))
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +416,32 @@ pub fn verify_round2(
     attempt: u64,
     wire: &Dkg2Wire,
 ) -> Result<round2::Package, WireError> {
-    let mut entries: Vec<ShareEntry> = Vec::with_capacity(wire.shares.len());
+    let evidence = round2_fault_evidence(
+        secp,
+        sender_pool_id,
+        sender_bifrost_id_pk,
+        my_pool_id,
+        my_identifier,
+        my_bifrost_sk,
+        sender_commitments,
+        epoch,
+        threshold,
+        attempt,
+        wire,
+    )?;
+    if evidence
+        .is_fault()
+        .map_err(|e| fault_err("round2 share", e))?
+    {
+        return Err(WireError::Field(
+            "round2 share is inconsistent with sender commitments".into(),
+        ));
+    }
+    Ok(frost_bridge::round2_from_share(&evidence.share)?)
+}
+
+fn round2_entries(wire: &Dkg2Wire) -> Result<Vec<ShareEntry>, WireError> {
+    let mut entries = Vec::with_capacity(wire.shares.len());
     for s in &wire.shares {
         entries.push(ShareEntry {
             recipient_pool_id: hex_n::<POOL_ID_LEN>(&s.recipient_pool_id, "recipient_pool_id")?,
@@ -324,9 +452,30 @@ pub fn verify_round2(
             evidence_hash: hex_n::<EVIDENCE_HASH_LEN>(&s.evidence_hash, "evidence_hash")?,
         });
     }
-    let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
+    Ok(entries)
+}
 
-    // canonical::round2 sorts internally, so input order does not matter.
+/// Rebuild the signed Round 2 evidence envelope from a JSON payload addressed
+/// to this SPO. This verifies the sender signature, decrypts this recipient's
+/// share, checks the pad commitment and advertised `evidence_hash`, but does
+/// not require the share to be bad. Call [`Round2ShareFaultEvidence::is_fault`]
+/// before treating it as punishable.
+#[allow(clippy::too_many_arguments)]
+pub fn round2_fault_evidence(
+    secp: &Secp256k1<All>,
+    sender_pool_id: &[u8; POOL_ID_LEN],
+    sender_bifrost_id_pk: &[u8],
+    my_pool_id: &[u8; POOL_ID_LEN],
+    my_identifier: u16,
+    my_bifrost_sk: &SecretKey,
+    sender_commitments: &[[u8; POINT_LEN]],
+    epoch: u64,
+    threshold: u64,
+    attempt: u64,
+    wire: &Dkg2Wire,
+) -> Result<Round2ShareFaultEvidence, WireError> {
+    let entries = round2_entries(wire)?;
+    let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
     let canonical_bytes = canonical::round2(epoch, threshold, attempt, sender_pool_id, &entries);
     auth::verify_payload(secp, sender_bifrost_id_pk, &canonical_bytes, &signature)?;
 
@@ -344,17 +493,136 @@ pub fn verify_round2(
     if blake2b_256(&pad) != mine.pad_commit {
         return Err(WireError::Field("pad_commit mismatch".into()));
     }
-    let expected_evidence_hash = fault_evidence::round2_evidence_hash_from_fields_dyn(
-        sender_pool_id,
-        my_identifier,
-        sender_commitments,
-        &share,
-    )
-    .map_err(|e| WireError::Field(format!("evidence_hash: {e}")))?;
-    if expected_evidence_hash != mine.evidence_hash {
+
+    let ev = Round2ShareFaultEvidence {
+        epoch,
+        threshold,
+        attempt,
+        accused_pool_id: *sender_pool_id,
+        bifrost_id_pk: bifrost_pk_array(sender_bifrost_id_pk)?,
+        recipient_index: my_identifier,
+        sender_commitments: sender_commitments.to_vec(),
+        share,
+        round2_canonical_bytes: canonical_bytes,
+        payload_signature: signature,
+    };
+    if fault_evidence::round2_evidence_hash_dyn(&ev).map_err(|e| fault_err("evidence_hash", e))?
+        != mine.evidence_hash
+    {
         return Err(WireError::Field("evidence_hash mismatch".into()));
     }
-    Ok(frost_bridge::round2_from_share(&share)?)
+    Ok(ev)
+}
+
+/// The canonical bytes and signature from a Round 2 payload, suitable for an
+/// equivocation proof.
+pub fn round2_signed_payload(
+    secp: &Secp256k1<All>,
+    sender_pool_id: &[u8; POOL_ID_LEN],
+    sender_bifrost_id_pk: &[u8],
+    epoch: u64,
+    threshold: u64,
+    attempt: u64,
+    wire: &Dkg2Wire,
+) -> Result<(Vec<u8>, [u8; SIG_LEN]), WireError> {
+    let entries = round2_entries(wire)?;
+    let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
+    let canonical_bytes = canonical::round2(epoch, threshold, attempt, sender_pool_id, &entries);
+    auth::verify_payload(secp, sender_bifrost_id_pk, &canonical_bytes, &signature)?;
+    Ok((canonical_bytes, signature))
+}
+
+/// Build equivocation evidence from two already-fetched same-namespace Round 1
+/// JSON payloads.
+#[allow(clippy::too_many_arguments)]
+pub fn round1_equivocation_evidence(
+    peer_pool_id: &[u8; POOL_ID_LEN],
+    peer_bifrost_id_pk: &[u8],
+    epoch: u64,
+    threshold: u64,
+    attempt: u64,
+    a: &Dkg1Wire,
+    b: &Dkg1Wire,
+) -> Result<EquivocationEvidence, WireError> {
+    let (payload_a, signature_a) = round1_signed_payload(
+        peer_pool_id,
+        peer_bifrost_id_pk,
+        epoch,
+        threshold,
+        attempt,
+        a,
+    )?;
+    let (payload_b, signature_b) = round1_signed_payload(
+        peer_pool_id,
+        peer_bifrost_id_pk,
+        epoch,
+        threshold,
+        attempt,
+        b,
+    )?;
+    let ev = EquivocationEvidence {
+        epoch,
+        threshold,
+        attempt,
+        phase: NamespacePhase::Round1,
+        accused_pool_id: *peer_pool_id,
+        bifrost_id_pk: bifrost_pk_array(peer_bifrost_id_pk)?,
+        payload_a,
+        signature_a,
+        payload_b,
+        signature_b,
+    };
+    ev.verify()
+        .map_err(|e| fault_err("round1 equivocation", e))?;
+    Ok(ev)
+}
+
+/// Build equivocation evidence from two already-fetched same-namespace Round 2
+/// JSON payloads.
+#[allow(clippy::too_many_arguments)]
+pub fn round2_equivocation_evidence(
+    secp: &Secp256k1<All>,
+    sender_pool_id: &[u8; POOL_ID_LEN],
+    sender_bifrost_id_pk: &[u8],
+    epoch: u64,
+    threshold: u64,
+    attempt: u64,
+    a: &Dkg2Wire,
+    b: &Dkg2Wire,
+) -> Result<EquivocationEvidence, WireError> {
+    let (payload_a, signature_a) = round2_signed_payload(
+        secp,
+        sender_pool_id,
+        sender_bifrost_id_pk,
+        epoch,
+        threshold,
+        attempt,
+        a,
+    )?;
+    let (payload_b, signature_b) = round2_signed_payload(
+        secp,
+        sender_pool_id,
+        sender_bifrost_id_pk,
+        epoch,
+        threshold,
+        attempt,
+        b,
+    )?;
+    let ev = EquivocationEvidence {
+        epoch,
+        threshold,
+        attempt,
+        phase: NamespacePhase::Round2,
+        accused_pool_id: *sender_pool_id,
+        bifrost_id_pk: bifrost_pk_array(sender_bifrost_id_pk)?,
+        payload_a,
+        signature_a,
+        payload_b,
+        signature_b,
+    };
+    ev.verify()
+        .map_err(|e| fault_err("round2 equivocation", e))?;
+    Ok(ev)
 }
 
 #[cfg(test)]

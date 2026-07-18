@@ -16,6 +16,9 @@ use async_trait::async_trait;
 use frost_secp256k1_tr::Identifier;
 use frost_secp256k1_tr::keys::dkg::{round1, round2};
 
+use crate::circuits::fault_evidence::{
+    EquivocationEvidence, Round1PokFaultEvidence, Round2ShareFaultEvidence,
+};
 use crate::epoch::state::{EpochResult, Roster, SpoInfo};
 use crate::http::canonical::POINT_LEN;
 use crate::http::payloads::{Sign1Payload, Sign2Payload};
@@ -70,6 +73,39 @@ pub struct TreasuryUtxo {
     pub btc_confirmed: bool,
 }
 
+/// Provable DKG misbehavior captured by the peer transport.
+///
+/// Missing peers are not faults by themselves. These variants are only returned
+/// when the transport can show either a signed invalid payload or two conflicting
+/// signed payloads from the same `(epoch, threshold, attempt, round, pool_id)`
+/// namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DkgFaultEvidence {
+    Round1InvalidPayload(Round1PokFaultEvidence),
+    Round2InvalidPayload(Round2ShareFaultEvidence),
+    Equivocation(EquivocationEvidence),
+}
+
+impl DkgFaultEvidence {
+    #[must_use]
+    pub fn accused_pool_id(&self) -> &[u8; 28] {
+        match self {
+            Self::Round1InvalidPayload(ev) => &ev.accused_pool_id,
+            Self::Round2InvalidPayload(ev) => &ev.accused_pool_id,
+            Self::Equivocation(ev) => &ev.accused_pool_id,
+        }
+    }
+
+    #[must_use]
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Round1InvalidPayload(_) => "round1-invalid-payload",
+            Self::Round2InvalidPayload(_) => "round2-invalid-payload",
+            Self::Equivocation(_) => "equivocation",
+        }
+    }
+}
+
 #[async_trait]
 pub trait CardanoChain: Send + Sync {
     /// Block until the next epoch boundary is observed. The mock returns
@@ -119,6 +155,15 @@ pub trait CardanoChain: Send + Sync {
     /// sign for. In production this posts the key to the on-chain
     /// treasury oracle.
     async fn publish_group_key(&self, y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()>;
+
+    /// Publish a DKG fault proof and apply the corresponding SPO ban.
+    ///
+    /// Implementations must only return `Ok(())` after the fault has been
+    /// submitted to the configured ban flow or recorded by an explicit test
+    /// double. DKG calls this only for provable evidence supplied by
+    /// [`PeerNetwork`]; absent peers are reduced out of the candidate set but
+    /// are not banned.
+    async fn publish_dkg_fault_and_apply_ban(&self, evidence: DkgFaultEvidence) -> EpochResult<()>;
 
     /// Submit a Bitcoin tx (in v0.2 the mock just records it).
     ///
@@ -183,6 +228,20 @@ pub trait PeerNetwork: Send + Sync {
         recipient_identifier: Identifier,
         sender_commitments: &[[u8; POINT_LEN]],
     ) -> EpochResult<Option<round2::Package>>;
+    /// Return provable Round 1 faults retained while fetching `peer`'s payload.
+    async fn dkg_round1_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+    ) -> EpochResult<Vec<DkgFaultEvidence>>;
+    /// Return provable Round 2 faults retained while fetching `peer`'s payload.
+    async fn dkg_round2_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+        recipient_identifier: Identifier,
+        sender_commitments: &[[u8; POINT_LEN]],
+    ) -> EpochResult<Vec<DkgFaultEvidence>>;
     async fn fetch_sign_round1(
         &self,
         epoch: u64,

@@ -312,7 +312,9 @@ mod tests {
         FeeParams, PegInInput, PegOutRequest, TreasuryInput, build_tm, compute_sighashes,
     };
     use crate::epoch::dkg::dkg_phase;
-    use crate::epoch::mocks::{MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock};
+    use crate::epoch::mocks::{
+        MockCardanoChain, MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock,
+    };
     use crate::epoch::state::{
         DkgCollected, DkgRound, EpochConfig, SignCollected, SpoIdentity, SpoInfo,
     };
@@ -349,6 +351,11 @@ mod tests {
         roster: Roster,
     ) -> GroupKeys {
         let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let chain: Arc<dyn crate::epoch::traits::CardanoChain> = Arc::new(MockCardanoChain::demo(
+            roster.min_signers,
+            roster.max_signers,
+            0,
+        ));
         let ctx = crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(&roster, 0, 0);
         let mut phase = EpochPhase::Dkg {
             round: DkgRound::Round1,
@@ -361,7 +368,7 @@ mod tests {
                     round,
                     ctx,
                     collected,
-                } => dkg_phase(&peers, &clock, &rng, &config, round, ctx, collected)
+                } => dkg_phase(&chain, &peers, &clock, &rng, &config, round, ctx, collected)
                     .await
                     .unwrap(),
                 EpochPhase::PublishKeys { group_keys, .. } => return group_keys,

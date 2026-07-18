@@ -20,12 +20,11 @@
 //! The happy path (everyone contributes → `Q == C`, no reduction) needs no
 //! rerun and is what the multi-instance acceptance test exercises.
 //!
-//! TODO (WI-019): the transport drops invalid peer payloads (bad PoK / bad
-//! decrypted share) as `Ok(None)`. The DKG wire format is signed and carries the
-//! circuit evidence hash, but this orchestration layer still sees bad peers only
-//! as "absent" (missing from `L1`/`Q`). Wiring retained transport evidence
-//! through to FaultProof publication is WI-019; here a faulty peer and an
-//! offline peer are handled identically (excluded, candidate set reduced).
+//! The transport drops invalid peer payloads (bad PoK / bad decrypted share) as
+//! `Ok(None)` and retains signed evidence. When a deadline leaves peers outside
+//! `L1`/`Q`, the orchestration layer asks the transport for provable evidence
+//! and hands any such evidence to the chain ban flow. Plain absence is not
+//! punishable; absent peers are only excluded from a reduced rerun.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -40,7 +39,7 @@ use crate::epoch::state::SpoInfo;
 use crate::epoch::state::{
     DkgCollected, DkgRound, EpochConfig, EpochError, EpochPhase, EpochResult, GroupKeys,
 };
-use crate::epoch::traits::{Clock, PeerNetwork, RngSource};
+use crate::epoch::traits::{CardanoChain, Clock, DkgFaultEvidence, PeerNetwork, RngSource};
 use crate::frost::participant;
 use crate::http::frost_bridge;
 use crate::http::wire::DkgNamespace;
@@ -48,6 +47,7 @@ use crate::http::wire::DkgNamespace;
 /// Drive one DKG sub-round for `ctx` and produce the next phase: the next
 /// sub-round, a reduced-set rerun at Round 1, or (at Part 3) `PublishKeys`.
 pub async fn dkg_phase(
+    chain: &Arc<dyn CardanoChain>,
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
     rng: &Arc<dyn RngSource>,
@@ -150,6 +150,7 @@ pub async fn dkg_phase(
                     eligible.len(),
                     absent
                 );
+                report_round1_faults(chain, peers, ns, me, &ctx, &l1).await?;
                 rerun_or_abort(me, &ctx, DkgRound::Round1, &l1, "round1 incomplete")
             }
         }
@@ -279,6 +280,8 @@ pub async fn dkg_phase(
                     eligible.len(),
                     absent
                 );
+                report_round2_faults(chain, peers, ns, me, &ctx, &q, &collected.round1_peers)
+                    .await?;
                 rerun_or_abort(me, &ctx, DkgRound::Round2, &q, "round2 incomplete")
             }
         }
@@ -388,14 +391,11 @@ pub async fn dkg_phase(
     }
 }
 
-/// Orchestration-layer fault evidence for one incomplete DKG round: the
+/// Orchestration-layer exclusion evidence for one incomplete DKG round: the
 /// eligible participants that did NOT deliver a verifiable payload by the
-/// deadline (WI-014 #8). At this layer "absent" and "sent an unverifiable
-/// payload" are indistinguishable — the transport already dropped bad payloads
-/// to `Ok(None)` and separately retained their raw bytes for equivocation
-/// proofs, keyed by `(epoch, round, pool_id)`. This records WHICH participants
-/// to look those up for; turning it into a Halo2 fault proof + on-chain ban is
-/// WI-019 (explicitly out of scope here).
+/// deadline. This records which participants to ask the transport about.
+/// Absence alone is not punishable; only retained signed invalid-payload or
+/// equivocation evidence is sent to the chain ban flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DkgExclusionEvidence {
     pub epoch: u64,
@@ -442,7 +442,6 @@ impl DkgExclusionEvidence {
 /// After a round finished incomplete, decide between a reduced-set rerun and a
 /// fatal abort. Reruns iff the `survivors` clear the quorum gate AND there are
 /// still enough of them to run FROST DKG; otherwise the epoch's DKG is dead.
-/// Captures structured [`DkgExclusionEvidence`] for the excluded peers (WI-019).
 fn rerun_or_abort(
     me: Identifier,
     ctx: &DkgContext,
@@ -454,8 +453,7 @@ fn rerun_or_abort(
     crate::epoch_log!(
         me,
         ctx.epoch,
-        "  DKG fault evidence (attempt {}, {:?}): excluded [{}] — retained raw bytes available \
-         from the transport for WI-019 fault proofs",
+        "  DKG exclusions (attempt {}, {:?}): excluded [{}]",
         ctx.attempt,
         round,
         evidence.summary()
@@ -485,6 +483,105 @@ fn rerun_or_abort(
         // defensive guard (e.g. zero survivor stake) rather than a reachable arm.
         None => abort(format!("{why}; too few survivors to rerun FROST DKG")),
     }
+}
+
+async fn report_round1_faults(
+    chain: &Arc<dyn CardanoChain>,
+    peers: &Arc<dyn PeerNetwork>,
+    ns: DkgNamespace,
+    me: Identifier,
+    ctx: &DkgContext,
+    survivors: &BTreeSet<Identifier>,
+) -> EpochResult<()> {
+    let evidence = DkgExclusionEvidence::from_round(ctx, DkgRound::Round1, survivors);
+    for (peer, fault) in round1_faults_for_excluded(peers, ns, ctx, &evidence).await? {
+        publish_detected_fault(chain, me, ctx.epoch, peer, fault).await?;
+    }
+    Ok(())
+}
+
+async fn report_round2_faults(
+    chain: &Arc<dyn CardanoChain>,
+    peers: &Arc<dyn PeerNetwork>,
+    ns: DkgNamespace,
+    me: Identifier,
+    ctx: &DkgContext,
+    survivors: &BTreeSet<Identifier>,
+    round1_packages: &BTreeMap<Identifier, frost::keys::dkg::round1::Package>,
+) -> EpochResult<()> {
+    let evidence = DkgExclusionEvidence::from_round(ctx, DkgRound::Round2, survivors);
+    for (peer, fault) in
+        round2_faults_for_excluded(peers, ns, me, ctx, &evidence, round1_packages).await?
+    {
+        publish_detected_fault(chain, me, ctx.epoch, peer, fault).await?;
+    }
+    Ok(())
+}
+
+async fn round1_faults_for_excluded(
+    peers: &Arc<dyn PeerNetwork>,
+    ns: DkgNamespace,
+    ctx: &DkgContext,
+    evidence: &DkgExclusionEvidence,
+) -> EpochResult<Vec<(SpoInfo, DkgFaultEvidence)>> {
+    let roster = ctx.to_roster();
+    let mut out = Vec::new();
+    for (id, _) in &evidence.excluded {
+        let Some(peer) = roster.participants.get(id) else {
+            continue;
+        };
+        for fault in peers.dkg_round1_fault_evidence(ns, peer).await? {
+            out.push((peer.clone(), fault));
+        }
+    }
+    Ok(out)
+}
+
+async fn round2_faults_for_excluded(
+    peers: &Arc<dyn PeerNetwork>,
+    ns: DkgNamespace,
+    me: Identifier,
+    ctx: &DkgContext,
+    evidence: &DkgExclusionEvidence,
+    round1_packages: &BTreeMap<Identifier, frost::keys::dkg::round1::Package>,
+) -> EpochResult<Vec<(SpoInfo, DkgFaultEvidence)>> {
+    let roster = ctx.to_roster();
+    let mut out = Vec::new();
+    for (id, _) in &evidence.excluded {
+        let Some(peer) = roster.participants.get(id) else {
+            continue;
+        };
+        let Some(sender_round1) = round1_packages.get(id) else {
+            continue;
+        };
+        let (sender_commitments, _sigma_i) = frost_bridge::round1_fields(sender_round1)
+            .map_err(|e| EpochError::Frost(format!("round1 fields: {e}")))?;
+        for fault in peers
+            .dkg_round2_fault_evidence(ns, peer, me, &sender_commitments)
+            .await?
+        {
+            out.push((peer.clone(), fault));
+        }
+    }
+    Ok(out)
+}
+
+async fn publish_detected_fault(
+    chain: &Arc<dyn CardanoChain>,
+    me: Identifier,
+    epoch: u64,
+    peer: SpoInfo,
+    fault: DkgFaultEvidence,
+) -> EpochResult<()> {
+    crate::epoch_log!(
+        me,
+        epoch,
+        "  -> publishing DKG fault: kind={} accused={} spo={}",
+        fault.kind_label(),
+        hex::encode(fault.accused_pool_id()),
+        id_short(peer.identifier)
+    );
+    chain.publish_dkg_fault_and_apply_ban(fault).await
 }
 
 /// Assert dkg_part3's two outputs are internally coherent: the [`KeyPackage`]
@@ -665,8 +762,12 @@ async fn poll_dkg_round2(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::epoch::mocks::{MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock};
+    use crate::circuits::fault_evidence::{EquivocationEvidence, NamespacePhase};
+    use crate::epoch::mocks::{
+        MockCardanoChain, MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock,
+    };
     use crate::epoch::state::{EpochConfig, Roster, SpoIdentity, SpoInfo};
+    use crate::http::canonical::THRESHOLD_51;
     use std::time::Duration;
 
     fn make_roster(n: u16, threshold: u16) -> Roster {
@@ -692,6 +793,7 @@ mod tests {
     }
 
     async fn drive_dkg(
+        chain: Arc<dyn CardanoChain>,
         peers: Arc<dyn PeerNetwork>,
         clock: Arc<dyn Clock>,
         config: EpochConfig,
@@ -710,7 +812,9 @@ mod tests {
                     round,
                     ctx,
                     collected,
-                } => dkg_phase(&peers, &clock, &rng, &config, round, ctx, collected).await?,
+                } => {
+                    dkg_phase(&chain, &peers, &clock, &rng, &config, round, ctx, collected).await?
+                }
                 EpochPhase::PublishKeys { group_keys, .. } => return Ok(group_keys),
                 other => panic!("unexpected phase: {}", other.name()),
             };
@@ -724,6 +828,11 @@ mod tests {
         let mut handles = Vec::new();
         for &i in ids {
             let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::demo(
+                roster.min_signers,
+                roster.max_signers,
+                0,
+            ));
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock = clock.clone();
             let mut config = EpochConfig::demo_default(SpoIdentity {
@@ -735,7 +844,7 @@ mod tests {
             config.poll_interval = Duration::from_millis(10);
             let roster = roster.clone();
             handles.push(tokio::spawn(async move {
-                drive_dkg(peers, clock, config, roster).await
+                drive_dkg(chain, peers, clock, config, roster).await
             }));
         }
         let mut out = Vec::new();
@@ -753,6 +862,21 @@ mod tests {
         for gk in &keys[1..] {
             assert_eq!(*gk, keys[0], "all SPOs must derive the same Y_51");
         }
+    }
+
+    fn dummy_equivocation(epoch: u64, accused_pool_id: [u8; 28]) -> DkgFaultEvidence {
+        DkgFaultEvidence::Equivocation(EquivocationEvidence {
+            epoch,
+            threshold: THRESHOLD_51,
+            attempt: 0,
+            phase: NamespacePhase::Round1,
+            accused_pool_id,
+            bifrost_id_pk: [0x42; 32],
+            payload_a: b"payload-a".to_vec(),
+            signature_a: [0xA1; 64],
+            payload_b: b"payload-b".to_vec(),
+            signature_b: [0xB2; 64],
+        })
     }
 
     #[tokio::test]
@@ -777,6 +901,64 @@ mod tests {
     async fn dkg_absent_peer_reduces_and_reruns() {
         let results = run_ceremony(make_roster(3, 2), &[1, 2]).await; // SPO 3 never spawns
         assert_same_group_key(&results);
+    }
+
+    #[tokio::test]
+    async fn incomplete_round_reports_retained_fault_evidence() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let accused = Identifier::try_from(2u16).unwrap();
+        let mut roster = make_roster(3, 2);
+        for (i, participant) in roster.participants.values_mut().enumerate() {
+            participant.pool_id = vec![0xC0 + i as u8; 28];
+        }
+        let accused_pool: [u8; 28] = roster
+            .participants
+            .get(&accused)
+            .unwrap()
+            .pool_id
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let ctx = DkgContext::from_roster_equal_stake(&roster, 0, 0);
+        let hub = MockPeerHub::new();
+        hub.push_round1_fault_evidence(
+            DkgNamespace::for_attempt(0, 0),
+            accused,
+            dummy_equivocation(0, accused_pool),
+        );
+        let mock_chain = Arc::new(MockCardanoChain::demo(2, 3, 0));
+        let recorded = mock_chain.dkg_faults();
+        let chain: Arc<dyn CardanoChain> = mock_chain;
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let mut config = EpochConfig::demo_default(SpoIdentity {
+            identifier: me,
+            port: 0,
+        });
+        config.dkg_round_timeout = Duration::from_millis(20);
+        config.poll_interval = Duration::from_millis(5);
+
+        let result = dkg_phase(
+            &chain,
+            &peers,
+            &clock,
+            &rng,
+            &config,
+            DkgRound::Round1,
+            ctx,
+            DkgCollected::default(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EpochError::DkgAborted { .. })),
+            "the one-survivor ceremony should still abort after reporting evidence"
+        );
+        let faults = recorded.lock().unwrap();
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].kind_label(), "equivocation");
+        assert_eq!(faults[0].accused_pool_id(), &accused_pool);
     }
 
     /// The finalize coherence check accepts a real part3 output (group keys
@@ -843,9 +1025,9 @@ mod tests {
         );
     }
 
-    /// Fault evidence records exactly the eligible participants missing from the
-    /// survivor set, tagged with epoch/attempt/round — the structured hook
-    /// WI-019 correlates with the transport's retained raw bytes.
+    /// Exclusion evidence records exactly the eligible participants missing from
+    /// the survivor set, tagged with epoch/attempt/round, so DKG can ask the
+    /// peer transport whether any of them produced provable fault evidence.
     #[test]
     fn exclusion_evidence_records_the_missing_participants() {
         let roster = make_roster(3, 2);

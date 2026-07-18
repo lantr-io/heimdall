@@ -24,12 +24,31 @@ use super::payloads::{Sign1Payload, Sign2Payload};
 use super::server::{AppState, DkgRoundKey, SharedState};
 use super::wire::{self, Dkg1Wire, Dkg2Wire, DkgNamespace, Round2Recipient};
 use crate::epoch::state::{EpochError, EpochResult, SpoInfo};
-use crate::epoch::traits::PeerNetwork;
+use crate::epoch::traits::{DkgFaultEvidence, PeerNetwork};
 
 /// Key under which a fetched peer payload's raw bytes are retained for
 /// equivocation evidence: a re-fetch returning *different* bytes for the
 /// same key is itself the proof of a double-publish.
 type EvidenceKey = (u64, u64, u64, DkgRoundKey, Vec<u8>);
+
+#[derive(Debug, Clone)]
+struct RetainedDkgPayloads {
+    first: Vec<u8>,
+    conflicts: Vec<Vec<u8>>,
+}
+
+impl RetainedDkgPayloads {
+    fn distinct_payloads(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(1 + self.conflicts.len());
+        out.push(self.first.clone());
+        for payload in &self.conflicts {
+            if !out.iter().any(|seen| seen == payload) {
+                out.push(payload.clone());
+            }
+        }
+        out
+    }
+}
 
 /// HTTP-backed `PeerNetwork`. One instance per SPO; holds this SPO's
 /// bifrost identity keypair (to sign publishes / decrypt shares) and its
@@ -40,7 +59,7 @@ pub struct HttpPeerNetwork {
     secp: Secp256k1<All>,
     keypair: Keypair,
     my_pool_id: [u8; POOL_ID_LEN],
-    evidence: Arc<Mutex<BTreeMap<EvidenceKey, Vec<u8>>>>,
+    evidence: Arc<Mutex<BTreeMap<EvidenceKey, RetainedDkgPayloads>>>,
 }
 
 impl HttpPeerNetwork {
@@ -69,8 +88,8 @@ impl HttpPeerNetwork {
     /// here; the first-seen bytes are kept (the conflict is the evidence).
     fn retain_evidence(&self, key: EvidenceKey, bytes: &[u8], peer_pool_id: &[u8]) {
         let mut ev = self.evidence.lock().expect("evidence mutex");
-        match ev.get(&key) {
-            Some(prev) if prev.as_slice() != bytes => {
+        match ev.get_mut(&key) {
+            Some(prev) if prev.first.as_slice() != bytes => {
                 eprintln!(
                     "EQUIVOCATION: peer {} published two distinct payloads for \
                      (epoch={}, threshold={}, attempt={}, round={:?})",
@@ -80,12 +99,46 @@ impl HttpPeerNetwork {
                     key.2,
                     key.3
                 );
+                if !prev
+                    .conflicts
+                    .iter()
+                    .any(|stored| stored.as_slice() == bytes)
+                {
+                    prev.conflicts.push(bytes.to_vec());
+                }
             }
             Some(_) => {}
             None => {
-                ev.insert(key, bytes.to_vec());
+                ev.insert(
+                    key,
+                    RetainedDkgPayloads {
+                        first: bytes.to_vec(),
+                        conflicts: Vec::new(),
+                    },
+                );
             }
         }
+    }
+
+    fn retained_payloads(
+        &self,
+        ns: DkgNamespace,
+        round: DkgRoundKey,
+        peer_pool_id: &[u8],
+    ) -> Vec<Vec<u8>> {
+        let key = (
+            ns.epoch,
+            ns.threshold,
+            ns.attempt,
+            round,
+            peer_pool_id.to_vec(),
+        );
+        self.evidence
+            .lock()
+            .expect("evidence mutex")
+            .get(&key)
+            .map(RetainedDkgPayloads::distinct_payloads)
+            .unwrap_or_default()
     }
 }
 
@@ -95,6 +148,133 @@ fn peer_err(e: impl std::fmt::Display) -> EpochError {
 
 fn pool_id_arr(pool_id: &[u8]) -> EpochResult<[u8; POOL_ID_LEN]> {
     wire::pool_id_array(pool_id).map_err(peer_err)
+}
+
+fn push_round1_faults_from_payloads(
+    out: &mut Vec<DkgFaultEvidence>,
+    ns: DkgNamespace,
+    peer: &SpoInfo,
+    peer_pool: &[u8; POOL_ID_LEN],
+    payloads: &[Vec<u8>],
+) {
+    for bytes in payloads {
+        let Ok(wire) = serde_json::from_slice::<Dkg1Wire>(bytes) else {
+            continue;
+        };
+        let Ok(evidence) = wire::round1_fault_evidence(
+            peer_pool,
+            &peer.bifrost_id_pk,
+            ns.epoch,
+            ns.threshold,
+            ns.attempt,
+            super::client::identifier_to_pool_id(peer.identifier),
+            &wire,
+        ) else {
+            continue;
+        };
+        if matches!(evidence.is_fault(), Ok(true)) {
+            out.push(DkgFaultEvidence::Round1InvalidPayload(evidence));
+        }
+    }
+}
+
+fn push_round2_faults_from_payloads(
+    net: &HttpPeerNetwork,
+    out: &mut Vec<DkgFaultEvidence>,
+    ns: DkgNamespace,
+    peer: &SpoInfo,
+    peer_pool: &[u8; POOL_ID_LEN],
+    recipient_identifier: frost_secp256k1_tr::Identifier,
+    sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
+    payloads: &[Vec<u8>],
+) {
+    for bytes in payloads {
+        let Ok(wire) = serde_json::from_slice::<Dkg2Wire>(bytes) else {
+            continue;
+        };
+        let Ok(evidence) = wire::round2_fault_evidence(
+            &net.secp,
+            peer_pool,
+            &peer.bifrost_id_pk,
+            &net.my_pool_id,
+            super::client::identifier_to_pool_id(recipient_identifier),
+            &net.keypair.secret_key(),
+            sender_commitments,
+            ns.epoch,
+            ns.threshold,
+            ns.attempt,
+            &wire,
+        ) else {
+            continue;
+        };
+        if matches!(evidence.is_fault(), Ok(true)) {
+            out.push(DkgFaultEvidence::Round2InvalidPayload(evidence));
+        }
+    }
+}
+
+fn push_round1_equivocations(
+    out: &mut Vec<DkgFaultEvidence>,
+    ns: DkgNamespace,
+    peer: &SpoInfo,
+    peer_pool: &[u8; POOL_ID_LEN],
+    payloads: &[Vec<u8>],
+) {
+    let Some((first, rest)) = payloads.split_first() else {
+        return;
+    };
+    let Ok(first_wire) = serde_json::from_slice::<Dkg1Wire>(first) else {
+        return;
+    };
+    for bytes in rest {
+        let Ok(other_wire) = serde_json::from_slice::<Dkg1Wire>(bytes) else {
+            continue;
+        };
+        if let Ok(evidence) = wire::round1_equivocation_evidence(
+            peer_pool,
+            &peer.bifrost_id_pk,
+            ns.epoch,
+            ns.threshold,
+            ns.attempt,
+            &first_wire,
+            &other_wire,
+        ) {
+            out.push(DkgFaultEvidence::Equivocation(evidence));
+        }
+    }
+}
+
+fn push_round2_equivocations(
+    net: &HttpPeerNetwork,
+    out: &mut Vec<DkgFaultEvidence>,
+    ns: DkgNamespace,
+    peer: &SpoInfo,
+    peer_pool: &[u8; POOL_ID_LEN],
+    payloads: &[Vec<u8>],
+) {
+    let Some((first, rest)) = payloads.split_first() else {
+        return;
+    };
+    let Ok(first_wire) = serde_json::from_slice::<Dkg2Wire>(first) else {
+        return;
+    };
+    for bytes in rest {
+        let Ok(other_wire) = serde_json::from_slice::<Dkg2Wire>(bytes) else {
+            continue;
+        };
+        if let Ok(evidence) = wire::round2_equivocation_evidence(
+            &net.secp,
+            peer_pool,
+            &peer.bifrost_id_pk,
+            ns.epoch,
+            ns.threshold,
+            ns.attempt,
+            &first_wire,
+            &other_wire,
+        ) {
+            out.push(DkgFaultEvidence::Equivocation(evidence));
+        }
+    }
 }
 
 #[async_trait]
@@ -275,6 +455,43 @@ impl PeerNetwork for HttpPeerNetwork {
                 Ok(None)
             }
         }
+    }
+
+    async fn dkg_round1_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+    ) -> EpochResult<Vec<DkgFaultEvidence>> {
+        let peer_pool = pool_id_arr(&peer.pool_id)?;
+        let payloads = self.retained_payloads(ns, DkgRoundKey::Round1, &peer.pool_id);
+        let mut out = Vec::new();
+        push_round1_faults_from_payloads(&mut out, ns, peer, &peer_pool, &payloads);
+        push_round1_equivocations(&mut out, ns, peer, &peer_pool, &payloads);
+        Ok(out)
+    }
+
+    async fn dkg_round2_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+        recipient_identifier: frost_secp256k1_tr::Identifier,
+        sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
+    ) -> EpochResult<Vec<DkgFaultEvidence>> {
+        let peer_pool = pool_id_arr(&peer.pool_id)?;
+        let payloads = self.retained_payloads(ns, DkgRoundKey::Round2, &peer.pool_id);
+        let mut out = Vec::new();
+        push_round2_faults_from_payloads(
+            self,
+            &mut out,
+            ns,
+            peer,
+            &peer_pool,
+            recipient_identifier,
+            sender_commitments,
+            &payloads,
+        );
+        push_round2_equivocations(self, &mut out, ns, peer, &peer_pool, &payloads);
+        Ok(out)
     }
 
     async fn fetch_sign_round1(

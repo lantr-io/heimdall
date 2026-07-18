@@ -147,7 +147,7 @@ async fn step_phase(
             round,
             ctx,
             collected,
-        } => dkg_phase(peers, clock, rng, config, round, ctx, collected).await?,
+        } => dkg_phase(chain, peers, clock, rng, config, round, ctx, collected).await?,
 
         EpochPhase::PublishKeys {
             epoch,

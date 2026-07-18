@@ -31,8 +31,8 @@ use tokio::sync::Notify;
 use crate::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
 use crate::epoch::state::{EpochError, EpochResult, Roster, SpoInfo};
 use crate::epoch::traits::{
-    CardanoChain, Clock, CycleRng, EpochBoundaryEvent, PeerNetwork, PegOutRequestUtxo, RngSource,
-    TreasuryUtxo,
+    CardanoChain, Clock, CycleRng, DkgFaultEvidence, EpochBoundaryEvent, PeerNetwork,
+    PegOutRequestUtxo, RngSource, TreasuryUtxo,
 };
 use crate::http::payloads::{Sign1Payload, Sign2Payload};
 use crate::http::wire::DkgNamespace;
@@ -134,6 +134,7 @@ pub struct MockCardanoChain {
     /// Optional Bitcoin RPC config. When set, `submit_signed_tm` also
     /// broadcasts the signed BTC tx to the node via `sendrawtransaction`.
     btc_rpc: Option<BtcRpcConfig>,
+    dkg_faults: Arc<Mutex<Vec<DkgFaultEvidence>>>,
 }
 
 impl MockCardanoChain {
@@ -144,6 +145,7 @@ impl MockCardanoChain {
             submitted_txs: Arc::new(Mutex::new(Vec::new())),
             treasury_y_51: Mutex::new(None),
             btc_rpc: None,
+            dkg_faults: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -178,6 +180,10 @@ impl MockCardanoChain {
 
     pub fn submitted_txs(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
         self.submitted_txs.clone()
+    }
+
+    pub fn dkg_faults(&self) -> Arc<Mutex<Vec<DkgFaultEvidence>>> {
+        self.dkg_faults.clone()
     }
 }
 
@@ -244,6 +250,11 @@ impl CardanoChain for MockCardanoChain {
         Ok(())
     }
 
+    async fn publish_dkg_fault_and_apply_ban(&self, evidence: DkgFaultEvidence) -> EpochResult<()> {
+        self.dkg_faults.lock().unwrap().push(evidence);
+        Ok(())
+    }
+
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>> {
         Ok(self
             .fixture
@@ -293,16 +304,66 @@ struct PeerSlot {
     sign2: BTreeMap<u32, Sign2Payload>,
 }
 
+type MockFaultKey = (u64, u64, u64, u8, Identifier);
+
 /// Shared blackboard that all in-process `MockPeerNetwork`s read/write.
 #[derive(Debug, Default)]
 pub struct MockPeerHub {
     slots: Mutex<BTreeMap<Identifier, PeerSlot>>,
+    dkg_faults: Mutex<BTreeMap<MockFaultKey, Vec<DkgFaultEvidence>>>,
     notify: Notify,
 }
 
 impl MockPeerHub {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub fn push_round1_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        accused: Identifier,
+        evidence: DkgFaultEvidence,
+    ) {
+        self.push_fault_evidence(ns, 1, accused, evidence);
+    }
+
+    pub fn push_round2_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        accused: Identifier,
+        evidence: DkgFaultEvidence,
+    ) {
+        self.push_fault_evidence(ns, 2, accused, evidence);
+    }
+
+    fn push_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        round: u8,
+        accused: Identifier,
+        evidence: DkgFaultEvidence,
+    ) {
+        self.dkg_faults
+            .lock()
+            .unwrap()
+            .entry((ns.epoch, ns.threshold, ns.attempt, round, accused))
+            .or_default()
+            .push(evidence);
+    }
+
+    fn fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        round: u8,
+        accused: Identifier,
+    ) -> Vec<DkgFaultEvidence> {
+        self.dkg_faults
+            .lock()
+            .unwrap()
+            .get(&(ns.epoch, ns.threshold, ns.attempt, round, accused))
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -400,6 +461,24 @@ impl PeerNetwork for MockPeerNetwork {
                 .filter(|(slot_ns, _)| *slot_ns == ns)
                 .map(|(_, pkg)| pkg.clone())
         }))
+    }
+
+    async fn dkg_round1_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+    ) -> EpochResult<Vec<DkgFaultEvidence>> {
+        Ok(self.hub.fault_evidence(ns, 1, peer.identifier))
+    }
+
+    async fn dkg_round2_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+        _recipient_identifier: Identifier,
+        _sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
+    ) -> EpochResult<Vec<DkgFaultEvidence>> {
+        Ok(self.hub.fault_evidence(ns, 2, peer.identifier))
     }
 
     async fn fetch_sign_round1(
