@@ -341,17 +341,37 @@ pub async fn fetch_cost_models(base_url: &str, project_id: &str) -> Result<Vec<V
         .ok_or_else(|| "parameters: no cost_models_raw/cost_models".to_string())?;
     let mut out = Vec::with_capacity(3);
     for lang in ["PlutusV1", "PlutusV2", "PlutusV3"] {
-        let arr = raw
+        let entry = raw
             .get(lang)
-            .and_then(|x| x.as_array())
-            .ok_or_else(|| format!("parameters: cost_models[{lang}] not an array"))?;
-        let nums: Vec<i64> = arr
-            .iter()
-            .map(|n| {
-                n.as_i64()
-                    .ok_or_else(|| format!("cost_models[{lang}]: non-int entry"))
-            })
-            .collect::<Result<_, _>>()?;
+            .ok_or_else(|| format!("parameters: no cost_models[{lang}]"))?;
+        let nums: Vec<i64> = if let Some(arr) = entry.as_array() {
+            arr.iter()
+                .map(|n| {
+                    n.as_i64()
+                        .ok_or_else(|| format!("cost_models[{lang}]: non-int entry"))
+                })
+                .collect::<Result<_, _>>()?
+        } else if let Some(map) = entry.as_object() {
+            // yaci-store serves ONLY the named-map form (no cost_models_raw).
+            // The ledger's canonical array order for cost models is the
+            // alphabetical order of the parameter names, so a key-sorted
+            // flatten reproduces it — and any deviation is self-checking: a
+            // wrong order breaks the script integrity hash and the chain
+            // rejects the tx.
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            entries
+                .into_iter()
+                .map(|(k, n)| {
+                    n.as_i64()
+                        .ok_or_else(|| format!("cost_models[{lang}].{k}: non-int entry"))
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            return Err(format!(
+                "parameters: cost_models[{lang}] is neither an array nor a map"
+            ));
+        };
         out.push(nums);
     }
     Ok(out)
