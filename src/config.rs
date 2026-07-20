@@ -63,8 +63,10 @@ pub struct ProtocolConfig {
     pub dkg_round_timeout_secs: u64,
     /// Ceremony-window grid pitch (N21): a node entering DKG sleeps to the
     /// next `epoch_boundary + k·dkg_window` line so staggered starts and
-    /// abort-retries all join the same ceremony schedule. Must comfortably
-    /// exceed `dkg_round2_offset_secs`.
+    /// abort-retries all join the same ceremony schedule. MUST exceed
+    /// `dkg_round2_offset_secs` by more than the ~2 s retry backoff — a node
+    /// aborting a window must reach the very next grid line, or cohorts one
+    /// line apart can cycle phase-locked and never merge.
     pub dkg_window_secs: u64,
     /// Pre-ceremony health gate (N21): how long to wait for the whole DKG
     /// roster to answer `/health` before starting without the missing peers.

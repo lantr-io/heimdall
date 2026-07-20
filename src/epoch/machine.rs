@@ -1031,7 +1031,12 @@ mod tests {
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
             let mut config = fast_config(id);
-            config.dkg_window = Duration::from_millis(1000);
+            // Must satisfy the self-healing inequality (see `dkg_window` docs):
+            // dkg_round1_offset (2s) + retry backoff (2s) < window, so if the
+            // rare entry race splits the cohorts one line apart, an aborting
+            // node reaches the very next line and the cohorts merge instead of
+            // cycling phase-locked (which would hang this test).
+            config.dkg_window = Duration::from_secs(5);
             config.dkg_join_wait = Duration::from_secs(20);
             config.dkg_round1_offset = Duration::from_secs(2);
             config.dkg_round2_offset = Duration::from_secs(4);

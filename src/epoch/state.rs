@@ -355,7 +355,10 @@ pub struct EpochConfig {
     /// (`epoch_boundary + k·dkg_window`), so every node — however late it
     /// started, or re-entering after an aborted attempt — runs the ceremony
     /// on the same schedule and under the same per-window attempt namespace.
-    /// Should comfortably exceed `dkg_round2_offset`.
+    /// MUST exceed `dkg_round2_offset` by more than the retry backoff (~2 s):
+    /// a node that aborts a window has to reach the very next grid line, or
+    /// two cohorts that entered one line apart can cycle phase-locked and
+    /// never merge.
     pub dkg_window: Duration,
     /// Upper bound on the pre-ceremony health gate (N21): how long a node
     /// waits for every roster peer to answer `/health` before proceeding
