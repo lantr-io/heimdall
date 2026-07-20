@@ -620,9 +620,11 @@ Unconfirmed records, and a fake tip would deadlock the `btc_confirmed` polling l
   cross-process safety (mover vs daemon) at the cost of a bounded liveness DoS: with
   permissionless minting anyone can post a correctly-linked but unsigned Unconfirmed record
   spending the tip (min-ADA cost per post; the mover's staleness deadline bounds the stall).
-- `publish.rs` mints the TM NFT with the `TmMintRedeemer`: `Genesis` (Constr 0, referencing the
-  Config UTxO) before the first TM confirms, `Chain(0)` (Constr 1, referencing the tip Confirmed
-  record; the tx has exactly one reference input so the sorted index is always 0) afterwards.
+- `publish.rs` mints the TM NFT with the `TmMintRedeemer`: `Genesis(0)` (Constr 0 [0],
+  referencing the Config UTxO) before the first TM confirms, `Chain(0)` (Constr 1 [0],
+  referencing the tip Confirmed record) afterwards. Both variants carry the 0-based
+  reference-input index of their anchor; the tx has exactly one reference input, so the sorted
+  index is always 0.
 - Local treasury config and `tm_control_ref` are removed; `[cardano]` gains `config_address`,
   `config_nft_policy_id`, `config_nft_asset_name`.
 

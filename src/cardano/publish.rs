@@ -202,12 +202,17 @@ pub fn build_oracle_update_tx(
                 amount: 1,
             },
             redeemer: Some(Redeemer {
-                // Real validator: TmMintRedeemer — Genesis = Constr(0, []), Chain(refInputIdx)
-                // = Constr(1, [0]) (single reference input → sorted index 0). Scaffold: unit.
+                // Real validator: TmMintRedeemer — Genesis(configRefInputIdx) = Constr(0, [0]),
+                // Chain(prevTmRefInputIdx) = Constr(1, [0]). Both carry the 0-based
+                // reference-input index of their anchor; the tx has exactly ONE reference
+                // input, so the sorted index is always 0. Scaffold: unit.
                 data: match (tm_script_cbor, mint_ref) {
                     (Some(_), Some((_, _, true))) => hex::encode(
-                        minicbor::to_vec(&crate::cardano::plutus::constr(0, vec![]))
-                            .expect("redeemer CBOR encode"),
+                        minicbor::to_vec(&crate::cardano::plutus::constr(
+                            0,
+                            vec![crate::cardano::plutus::int(0)],
+                        ))
+                        .expect("redeemer CBOR encode"),
                     ),
                     (Some(_), Some((_, _, false))) => hex::encode(
                         minicbor::to_vec(&crate::cardano::plutus::constr(
