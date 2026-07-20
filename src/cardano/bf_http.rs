@@ -151,6 +151,34 @@ pub async fn fetch_latest_block_time(base_url: &str, project_id: &str) -> Result
         .ok_or_else(|| "blocks/latest: missing/non-numeric `time`".to_string())
 }
 
+/// The latest block's `(slot, posix_time_secs)` from `/blocks/latest`. The slot anchors
+/// tx validity bounds (`invalid_hereafter`); the time seeds the TM datum's `created` field
+/// (the TM mint policy requires `created` within 1h of the tx's validity upper bound).
+pub async fn fetch_latest_block_slot_time(
+    base_url: &str,
+    project_id: &str,
+) -> Result<(u64, i64), String> {
+    let url = format!("{base_url}/blocks/latest");
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("blocks/latest request: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("blocks/latest json: {e}"))?;
+    let slot = v
+        .get("slot")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "blocks/latest: missing/non-numeric `slot`".to_string())?;
+    let time = v
+        .get("time")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "blocks/latest: missing/non-numeric `time`".to_string())?;
+    Ok((slot, time))
+}
+
 /// The POSIX block-time (seconds) of the Cardano tx `tx_hash`, from `/txs/{hash}`.
 /// The age of an Unconfirmed TM UTxO = chain-now − this.
 pub async fn fetch_tx_block_time(

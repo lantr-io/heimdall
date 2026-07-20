@@ -708,6 +708,15 @@ impl CardanoChain for BlockfrostCardanoChain {
             None
         };
 
+        // Latest chain slot + time: seeds the datum's `created` and the finite
+        // `invalid_hereafter` the TM mint policy requires (created-anchoring check).
+        let latest_slot_time = crate::cardano::bf_http::fetch_latest_block_slot_time(
+            &self.bf_base_url,
+            &self.bf_project_id,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("fetch latest block slot/time: {e}")))?;
+
         let signed_tx_hex = build_oracle_update_tx(
             &self.treasury_address,
             wallet_addr,
@@ -720,6 +729,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             self.tm_script_cbor.as_deref(),
             mint_ref.as_ref().map(|(h, i, g)| (h.as_str(), *i, *g)),
             Some(cost_models),
+            latest_slot_time,
         )?;
 
         let cardano_tx_cbor = hex::decode(&signed_tx_hex)

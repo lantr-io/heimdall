@@ -184,7 +184,9 @@ fn extract_btc_tx_bytes(data: &PlutusData) -> Result<(Vec<u8>, bool), TreasuryDa
         other => return Err(TreasuryDatumError::WrongTag(other)),
     };
 
-    if fields.len() != 1 {
+    // Unconfirmed = [signed_btc_tx, creator, created] since provenance was added; only
+    // field 0 (the raw BTC tx) is read here. Accept >= 1 for pre-provenance datums.
+    if fields.is_empty() {
         return Err(TreasuryDatumError::FieldCount {
             expected: 1,
             got: fields.len(),
@@ -344,7 +346,9 @@ pub fn parse_confirmed_tm_datum(data: &PlutusData) -> Result<ConfirmedTm, Treasu
         122 => {}
         other => return Err(TreasuryDatumError::WrongTag(other)),
     }
-    if fields.len() != 3 {
+    // Confirmed = [btc_txid, swept, fulfilled, creator, created] since provenance was
+    // added; only the first 3 are read here. Accept >= 3 for pre-provenance records.
+    if fields.len() < 3 {
         return Err(TreasuryDatumError::FieldCount {
             expected: 3,
             got: fields.len(),
