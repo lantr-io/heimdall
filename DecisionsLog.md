@@ -614,9 +614,12 @@ Unconfirmed records, and a fake tip would deadlock the `btc_confirmed` polling l
   record is indexed by the outpoint it spent (`swept[0]`); the tip's `(btc_txid, 0)` valued at
   `fulfilled[0].amount` is the current treasury. Genesis anchor value comes from bitcoind
   `gettxout`.
-- `btc_confirmed` now means "our last-submitted TM txid has reached the chain tip" (tracked
-  in-process). Attacker-posted Unconfirmed records cannot influence the gate: only Confirmed
-  records (Bitcoin-proven) move the tip.
+- `btc_confirmed` combines two signals: the WI-028 in-flight scan (no Unconfirmed record spends
+  the tip, no opaque unconfirmed) AND "our last-submitted TM txid has reached the chain tip"
+  (tracked in-process, restart-safe against a lost Cardano post). The in-flight signal keeps
+  cross-process safety (mover vs daemon) at the cost of a bounded liveness DoS: with
+  permissionless minting anyone can post a correctly-linked but unsigned Unconfirmed record
+  spending the tip (min-ADA cost per post; the mover's staleness deadline bounds the stall).
 - `publish.rs` mints the TM NFT with the `TmMintRedeemer`: `Genesis` (Constr 0, referencing the
   Config UTxO) before the first TM confirms, `Chain(0)` (Constr 1, referencing the tip Confirmed
   record; the tx has exactly one reference input so the sorted index is always 0) afterwards.
@@ -628,7 +631,9 @@ Unconfirmed records, and a fake tip would deadlock the `btc_confirmed` polling l
 - Single source of truth on-chain; heimdall restart loses only the in-flight-TM marker, which is
   harmless (a rebuilt TM double-spending our own mempool tx is rejected by Bitcoin; the next
   poll sees the advanced tip).
-- CLI commands with explicit `--treasury-outpoint` flags keep them for manual use.
+- CLI commands with explicit `--treasury-outpoint` flags keep them for manual use; the
+  sweep/mover path requires them for the FIRST movement (its tip selection is sync and does not
+  read the Cardano config anchor).
 
 ### Reference
 
