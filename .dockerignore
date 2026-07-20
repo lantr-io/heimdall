@@ -1,0 +1,10 @@
+# Docker build context hygiene: the bench (ft-bifrost-bridge/
+# bitfrost-test-scenarios) builds images from this repo as context.
+# Keep .git — build.rs embeds the git version.
+target/
+.run-dkz-logs/
+.keys/
+data/
+anthill-todo/
+.claude/
+*.toml.bak-*
