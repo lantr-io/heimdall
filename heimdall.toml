@@ -25,14 +25,11 @@ rpc_url = "http://127.0.0.1:48332"   # testnet4 RPC (bitcoind -testnet4)
 rpc_user = "bitcoin"
 rpc_pass = "bitcoin"
 submit = false          # broadcast signed BTC tx to rpc_url (false: binocular relay does it)
-# FROST treasury UTXO. The treasury Taproot KEY (from y_fed_seed_hex) is network-independent; only
-# the address encoding changes per network: regtest bcrt1peqh8qtp…q7h2wvk == testnet4
-# tb1peqh8qtppcrw98qewlv59kupv5rs9g9g4gwctzqcwa25pn6md7a0qnwqgev (same witness program).
-# STALE: txid/amount below are old REGTEST-chain values — that UTXO doesn't exist on testnet4. Fund
-# tb1peqh8qtp… on testnet4 and set treasury_txid/vout/amount to that UTXO.
-treasury_txid = "478b7ae50b71603aca16c97d3ee974f98e4ecc55b875fe34fe3cd6afc97f1317"
-treasury_vout = 0
-treasury_amount_sat = 9999887
+# The FROST treasury UTXO is no longer configured locally. The initial (anchor) outpoint lives
+# on-chain in the bridge Config UTxO (field 11, set by `binocular deploy-bridge` /
+# `binocular update-config`), and the current treasury is resolved by walking the Confirmed
+# Treasury Movement chain from that anchor (see [cardano] config_address below). The genesis
+# anchor's satoshi value is fetched via rpc_url gettxout.
 
 [cardano]
 blockfrost_project_id = "preprodsTOaoyjcqGmy4SOSazxuHkbuXFOOkp8f"
@@ -40,13 +37,11 @@ blockfrost_project_id = "preprodsTOaoyjcqGmy4SOSazxuHkbuXFOOkp8f"
 # network_magic = 1
 # pegin_script_address = "addr_test1..."
 # pegin_policy_id = "abcdef..."
-# TM UTxO address = binocular's TreasuryMovementValidator, now parameterized by
-# (oracle script hash, TM-control NFT policy, TM-control NFT name). STALE/PLACEHOLDER: the value
-# below was for the earlier authority-pkh-param version; the validator was refactored so the
-# authorized minter lives in an NFT-authenticated control datum (address no longer depends on any
-# key). TODO: deploy the TM-control one-shot NFT + control UTxO, set binocular
-# bridge.tm-control-nft-{policy,name}, then `binocular info` prints the real TM address — paste it
-# here. Until then this address is wrong and confirm-tmtx/relay will not find the UTxO.
+# TM UTxO address = binocular's TreasuryMovementValidator, parameterized by
+# (oracle script hash, config NFT policy, config NFT asset name). STALE/PLACEHOLDER: the value
+# below predates the confirmed-chain refactor. After deploying, `binocular info` prints the real
+# TM address — paste it here. Until then this address is wrong and confirm-tmtx/relay will not
+# find the UTxO.
 treasury_address = "addr_test1wq3ywdhmjku42uv2pcmy0dwcnycl2slcnswnfapsg7f5z4cd30duu"
 # Marker token (identity NFT riding Unconfirmed→Confirmed); always-ok policy, minted by publish.rs.
 treasury_policy_id = "eafdc4d9733275d3e06cfe5fe54a13fff3ba5baa8d65636260537907"
@@ -55,13 +50,18 @@ treasury_asset_name = "544d5478"
 # Setting mnemonic here would override the env var.
 submit_oracle = true   # publish oracle-update UTxO to Cardano after signing
 oracle_constructor = 0 # 0 = unconfirmed TM tx (Binocular sets 1 on BTC confirmation)
+# Bridge Config UTxO locator: its field 11 (initial_btc_treasury_utxo) anchors the Treasury
+# Movement chain that query_treasury walks. Values from `binocular deploy-bridge` output.
+# config_address = "addr_test1..."                    # the config script address
+# config_nft_policy_id = "<config NFT policy, 56 hex>"
+# config_nft_asset_name = "424946434647"              # "BIFCFG" hex
 # To mint the TM NFT under the REAL TreasuryMovementValidator policy (instead of the always-ok
-# scaffold), set both of the following (from `binocular tm-script` + `binocular deploy-bridge`), AND
-# change treasury_policy_id above to the validator's script hash (the `policy_id` tm-script prints,
-# == treasury_address credential) and treasury_asset_name to "" (the validator counts the empty-name
-# token). publish.rs then references the control UTxO + signs with the authorized (wallet) key.
+# scaffold), set tm_script_cbor (from `binocular tm-script`) alongside the config_* fields above,
+# AND change treasury_policy_id above to the validator's script hash (the `policy_id` tm-script
+# prints, == treasury_address credential) and treasury_asset_name to "" (the validator counts the
+# empty-name token). Minting is permissionless: the redeemer proves the posted TM spends the
+# current treasury outpoint (config anchor or previous Confirmed TM record's output 0).
 # tm_script_cbor = "<cbor from `binocular tm-script`>"
-# tm_control_ref = "<control-utxo tx_hash>#<index>"   # the TM-control UTxO from deploy-bridge
 
 [http]
 bind_address = "127.0.0.1"

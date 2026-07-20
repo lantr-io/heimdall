@@ -112,10 +112,6 @@ pub struct BitcoinConfig {
     /// Whether to broadcast the signed BTC tx to the Bitcoin node via
     /// `sendrawtransaction`. Requires `rpc_url`. Default: true (when rpc_url set).
     pub submit: bool,
-    /// Override the demo mock treasury UTXO with a real on-chain UTXO.
-    pub treasury_txid: Option<String>,
-    pub treasury_vout: Option<u32>,
-    pub treasury_amount_sat: Option<u64>,
     /// Depositor refund timelock (BTC blocks) in the peg-in Taproot's
     /// refund leaf. Spec default 4320 (~30 days); override for
     /// testnet4/preprod which use shorter timeouts.
@@ -142,9 +138,6 @@ impl Default for BitcoinConfig {
             rpc_user: None,
             rpc_pass: None,
             submit: true,
-            treasury_txid: None,
-            treasury_vout: None,
-            treasury_amount_sat: None,
             pegin_refund_timeout_blocks: 4320,
             inflight_deadline_secs: None,
         }
@@ -214,14 +207,20 @@ pub struct CardanoConfig {
     /// 0 = unconfirmed TM tx (Binocular will update to 1 on Bitcoin confirmation).
     /// Default: 0.
     pub oracle_constructor: u8,
-    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). When set (with
-    /// `tm_control_ref`), the TM NFT is minted under the real validator policy — then
+    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). When set (with the
+    /// `config_*` fields below), the TM NFT is minted under the real validator policy — then
     /// `treasury_policy_id` must be the validator's script hash and `treasury_asset_name` empty.
     /// When unset, the always-ok scaffold policy is used.
     pub tm_script_cbor: Option<String>,
-    /// The TM-control UTxO outpoint `<tx_hash>#<index>` to reference (carries the authorized-minter
-    /// datum). Required alongside `tm_script_cbor`.
-    pub tm_control_ref: Option<String>,
+    /// Bech32 address of the bridge Config UTxO (the config script address, from
+    /// `binocular deploy-bridge`). The Config UTxO's field 11 (initial_btc_treasury_utxo)
+    /// anchors the Treasury Movement chain; the first TM mint references it.
+    pub config_address: Option<String>,
+    /// Config NFT policy id (56 hex chars) locating the Config UTxO. Required alongside
+    /// `tm_script_cbor` and `config_address`.
+    pub config_nft_policy_id: Option<String>,
+    /// Config NFT asset name (hex). Required alongside `config_nft_policy_id`.
+    pub config_nft_asset_name: Option<String>,
     /// Path to the bifrost Aiken blueprint (plutus.json) holding the compiled
     /// spos_registry + treasury_info validators. Together with
     /// `registry_bootstrap` and `treasury_info_asset_name` this switches
@@ -291,7 +290,9 @@ impl Default for CardanoConfig {
             submit_oracle: true,
             oracle_constructor: 0,
             tm_script_cbor: None,
-            tm_control_ref: None,
+            config_address: None,
+            config_nft_policy_id: None,
+            config_nft_asset_name: None,
             registry_blueprint: None,
             registry_bootstrap: None,
             treasury_info_asset_name: None,
