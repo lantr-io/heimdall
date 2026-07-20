@@ -12,12 +12,17 @@
 //!
 //! Constructor 0 = unconfirmed TM tx (confirmed = constructor 1, set
 //! by Binocular after Bitcoin inclusion proof). The new UTxO also
-//! carries 1 freshly-minted treasury marker token (using the Plutus V3
-//! always-succeeds minting policy `ALWAYS_OK_PLUTUS_CBOR_HEX`).
+//! carries 1 freshly-minted TM NFT: under the real
+//! TreasuryMovementValidator policy the mint is permissionless but
+//! gated by chain linkage — the redeemer names the Config UTxO
+//! (Genesis) or the predecessor Confirmed record (Chain) as a
+//! reference input and the validator checks the embedded BTC tx
+//! spends that treasury outpoint. The always-ok scaffold policy
+//! (`ALWAYS_OK_PLUTUS_CBOR_HEX`) remains the no-script fallback.
 //!
 //! The old oracle UTxO is NOT spent — old confirmed UTxOs are needed
-//! for minting fBTC proofs. The most recent UTxO at the treasury
-//! address (with a datum) is always used as the current oracle.
+//! for minting fBTC proofs. The current treasury is resolved by
+//! walking the Confirmed TM chain (see `cardano::tm_chain`).
 
 use pallas_codec::minicbor;
 use pallas_codec::utils::{Bytes, NonEmptySet};
@@ -102,12 +107,15 @@ pub fn build_oracle_update_tx(
     wallet_utxos: &[WalletUtxo],
     key: &PrivateKey,
     // When `Some`, mint the TM NFT under the real TreasuryMovementValidator policy (CBOR from
-    // `binocular tm-script`) and reference the TM-control UTxO `(tx_hash, index)` so the validator
-    // can read the authorized minter. `treasury_policy_id` must then be the validator's script hash
+    // `binocular tm-script`). `treasury_policy_id` must then be the validator's script hash
     // and `treasury_asset_name_hex` empty (the validator counts the empty-name token). When `None`,
     // falls back to the always-ok scaffold policy (legacy).
     tm_script_cbor: Option<&str>,
-    control_ref: Option<(&str, u32)>,
+    // The chain-linkage mint reference `(tx_hash, index, is_genesis)`: the Config UTxO
+    // (Genesis redeemer, before the first TM confirms) or the tip Confirmed TM record
+    // (Chain redeemer). Required alongside `tm_script_cbor`. The tx has exactly ONE
+    // reference input, so the Chain redeemer's reference-input index is always 0.
+    mint_ref: Option<(&str, u32, bool)>,
     // When `Some`, the network's live Plutus cost models `[V1, V2, V3]` (from Blockfrost). Used via
     // `Network::Custom` so the script-integrity hash matches the ledger's even when whisky's
     // hardcoded per-network cost models are stale. `None` → whisky's built-in Preprod models.
@@ -174,10 +182,11 @@ pub fn build_oracle_update_tx(
         change_address: wallet_address.to_string(),
         signing_key: vec![],
         network: Some(whisky_network(&cost_models)),
-        // Reference the TM-control UTxO so the validator's mint branch can read the authorized
-        // minter from its datum (authenticated by the control NFT it carries).
-        reference_inputs: control_ref
-            .map(|(h, i)| {
+        // Reference the chain-linkage anchor so the validator's mint branch can verify the
+        // embedded BTC tx spends the current treasury outpoint: the Config UTxO (Genesis)
+        // or the predecessor Confirmed TM record (Chain).
+        reference_inputs: mint_ref
+            .map(|(h, i, _)| {
                 vec![RefTxIn {
                     tx_hash: h.to_string(),
                     tx_index: i,
@@ -193,10 +202,26 @@ pub fn build_oracle_update_tx(
                 amount: 1,
             },
             redeemer: Some(Redeemer {
-                data: UNIT_REDEEMER_HEX.to_string(),
-                // Generous budget for the real TreasuryMovementValidator mint branch (reads the
-                // control reference datum, checks the signature + NFT qty). The always-ok scaffold
-                // needed ~14k mem; the validator needs much more. Well within Conway tx limits.
+                // Real validator: TmMintRedeemer — Genesis = Constr(0, []), Chain(refInputIdx)
+                // = Constr(1, [0]) (single reference input → sorted index 0). Scaffold: unit.
+                data: match (tm_script_cbor, mint_ref) {
+                    (Some(_), Some((_, _, true))) => hex::encode(
+                        minicbor::to_vec(&crate::cardano::plutus::constr(0, vec![]))
+                            .expect("redeemer CBOR encode"),
+                    ),
+                    (Some(_), Some((_, _, false))) => hex::encode(
+                        minicbor::to_vec(&crate::cardano::plutus::constr(
+                            1,
+                            vec![crate::cardano::plutus::int(0)],
+                        ))
+                        .expect("redeemer CBOR encode"),
+                    ),
+                    _ => UNIT_REDEEMER_HEX.to_string(),
+                },
+                // Generous budget for the real TreasuryMovementValidator mint branch (parses the
+                // embedded BTC tx's first input, reads the reference datum, checks the NFT
+                // binding). The always-ok scaffold needed ~14k mem; the validator needs much
+                // more. Well within Conway tx limits.
                 ex_units: Budget {
                     mem: 2_000_000,
                     steps: 900_000_000,

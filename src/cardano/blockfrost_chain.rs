@@ -1,26 +1,32 @@
 //! `CardanoChain` backed by Blockfrost.
 //!
-//! Derives the current Bitcoin treasury UTxO from Cardano chain state (WI-028):
-//! `query_treasury` scans every TM UTxO at the treasury address, parses the
-//! Confirmed (Constr 1) datums, and chain-follows them to the tip — the TM whose
-//! own treasury output nobody has swept. Outpoint `(btc_txid, 0)`, value, and
-//! scriptPubKey all come from the tip datum; the tip's SPK must match the current
-//! treasury keys (both selecting among divergent lineages and proving we can sign
-//! it). The local `bitcoin.treasury_txid/vout/amount` config is now only a
-//! bootstrap fallback for before the first TM confirms. Unconfirmed (Constr 0)
+//! Derives the current Bitcoin treasury UTxO from Cardano chain state (WI-028 +
+//! DEC-022): `query_treasury` scans every TM UTxO at the treasury address,
+//! parses the Confirmed (Constr 1) datums, and chain-follows them to the tip —
+//! the TM whose own treasury output nobody has swept. Outpoint `(btc_txid, 0)`,
+//! value, and scriptPubKey all come from the tip datum; the tip's SPK must match
+//! the current treasury keys (both selecting among divergent lineages and
+//! proving we can sign it). Before the first TM confirms, the treasury is the
+//! anchor outpoint from the bridge Config UTxO's field 11
+//! (`initial_btc_treasury_utxo`, located by the config NFT), priced via bitcoind
+//! `gettxout` — there is no local treasury configuration. Unconfirmed (Constr 0)
 //! datums are inspected only to detect a movement already in flight against the
 //! tip, so heimdall waits instead of double-posting.
 //!
-//! `submit_signed_tm` builds a Cardano transaction that **creates a
-//! new UTxO** at the treasury address with the signed BTC tx as an
-//! inline datum. The old oracle UTxO is NOT spent — old confirmed
-//! UTxOs are kept on-chain for minting proofs.
+//! `submit_signed_tm` builds a Cardano transaction that **creates a new
+//! UTxO** at the treasury address with the signed BTC tx as an inline datum,
+//! minting the TM NFT with the chain-linkage redeemer (Genesis when no TM has
+//! confirmed yet, Chain(0) referencing the tip Confirmed record otherwise).
+//! The old oracle UTxO is NOT spent — old confirmed UTxOs are kept on-chain
+//! for minting proofs.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use blockfrost::{BlockFrostSettings, BlockfrostAPI};
+use bitcoin::Transaction;
+use bitcoin::consensus::deserialize;
+use blockfrost::{BlockFrostSettings, BlockfrostAPI, Pagination};
 use pallas_codec::minicbor;
 use pallas_primitives::conway::PlutusData;
 use pallas_wallet::PrivateKey;
@@ -94,9 +100,15 @@ pub struct BlockfrostCardanoChain {
     /// this policy (and `treasury_policy_id` must be its hash, `treasury_asset_name_hex` empty); else
     /// the always-ok scaffold is used.
     tm_script_cbor: Option<String>,
-    /// The TM-control UTxO `(tx_hash, index)` to reference so the validator can read the authorized
-    /// minter. Required alongside `tm_script_cbor`.
-    tm_control_ref: Option<(String, u32)>,
+    /// Bech32 address of the bridge Config UTxO and the config NFT unit
+    /// (policy_id ++ asset_name hex) that authenticates it. The Config UTxO's field 11
+    /// (initial_btc_treasury_utxo) anchors the TM chain. Required for treasury resolution.
+    config_address: Option<String>,
+    config_nft_unit: Option<String>,
+    /// The txid of the last TM this process submitted. `query_treasury` reports
+    /// `btc_confirmed = false` until that txid becomes the Confirmed chain tip, so the
+    /// epoch machine waits for its own in-flight TM instead of double-spending the tip.
+    last_submitted_txid: Mutex<Option<bitcoin::Txid>>,
 }
 
 impl BlockfrostCardanoChain {
@@ -137,21 +149,24 @@ impl BlockfrostCardanoChain {
             submit_oracle: true,
             oracle_constructor: 0,
             tm_script_cbor: None,
-            tm_control_ref: None,
+            config_address: None,
+            config_nft_unit: None,
+            last_submitted_txid: Mutex::new(None),
         }
     }
 
     /// Mint the TM NFT under the real TreasuryMovementValidator policy (CBOR from
-    /// `binocular tm-script`), referencing the TM-control UTxO `(tx_hash, index)`. Without this the
-    /// always-ok scaffold policy is used.
-    pub fn with_tm_policy(
-        mut self,
-        script_cbor: &str,
-        control_tx_hash: &str,
-        control_index: u32,
-    ) -> Self {
+    /// `binocular tm-script`). Without this the always-ok scaffold policy is used.
+    pub fn with_tm_policy(mut self, script_cbor: &str) -> Self {
         self.tm_script_cbor = Some(script_cbor.to_string());
-        self.tm_control_ref = Some((control_tx_hash.to_string(), control_index));
+        self
+    }
+
+    /// Locate the bridge Config UTxO (address + config NFT unit `policy_id ++ asset_name`).
+    /// Its field 11 (initial_btc_treasury_utxo) anchors the Treasury Movement chain.
+    pub fn with_config_utxo(mut self, address: &str, nft_unit: &str) -> Self {
+        self.config_address = Some(address.to_string());
+        self.config_nft_unit = Some(nft_unit.to_string());
         self
     }
 
@@ -227,6 +242,98 @@ impl BlockfrostCardanoChain {
         self.payment_key = Some(key);
         self.wallet_base_address = Some(base_addr);
         Ok(self)
+    }
+
+    /// Read the Config UTxO's field 11 (initial_btc_treasury_utxo). Returns the 36-byte
+    /// anchor outpoint and the config UTxO's Cardano outpoint (the Genesis mint reference).
+    async fn query_config_anchor(&self) -> EpochResult<([u8; 36], (String, u32))> {
+        let (addr, unit) = match (&self.config_address, &self.config_nft_unit) {
+            (Some(a), Some(u)) => (a, u),
+            _ => {
+                return Err(EpochError::Chain(
+                    "cardano.config_address / config_nft_policy_id not set — required to \
+                     resolve the treasury anchor (config field 11)"
+                        .into(),
+                ));
+            }
+        };
+        let utxos = self
+            .api
+            .addresses_utxos(addr, Pagination::all())
+            .await
+            .map_err(|e| EpochError::Chain(format!("blockfrost config query: {e}")))?;
+        let utxo = utxos
+            .iter()
+            .find(|u| u.inline_datum.is_some() && u.amount.iter().any(|a| &a.unit == unit))
+            .ok_or_else(|| {
+                EpochError::Chain(format!(
+                    "no Config UTxO with NFT {unit} and an inline datum at {addr}"
+                ))
+            })?;
+        let datum_cbor = hex::decode(utxo.inline_datum.as_deref().unwrap())
+            .map_err(|e| EpochError::Chain(format!("config datum hex decode: {e}")))?;
+        let datum: PlutusData = minicbor::decode(&datum_cbor)
+            .map_err(|e| EpochError::Chain(format!("config datum CBOR decode: {e}")))?;
+        let fields = crate::cardano::plutus::constr_fields(&datum, 0)
+            .map_err(|e| EpochError::Chain(format!("config datum: {e}")))?;
+        if fields.len() < 12 {
+            return Err(EpochError::Chain(format!(
+                "config datum has {} fields — no treasury anchor (field 11); run \
+                 `binocular update-config` to migrate the deployed config",
+                fields.len()
+            )));
+        }
+        let anchor_bytes = crate::cardano::plutus::field_bytes(fields, 11)
+            .map_err(|e| EpochError::Chain(format!("config field 11: {e}")))?;
+        let anchor: [u8; 36] = anchor_bytes.try_into().map_err(|v: Vec<u8>| {
+            EpochError::Chain(format!(
+                "config field 11 must be a 36-byte outpoint, got {} bytes",
+                v.len()
+            ))
+        })?;
+        Ok((anchor, (utxo.tx_hash.clone(), utxo.output_index as u32)))
+    }
+
+    /// All Confirmed TM records at the treasury address carrying the TM NFT, parsed for
+    /// the chain walk. Unconfirmed records and garbage datums are skipped.
+    async fn query_confirmed_records(
+        &self,
+    ) -> EpochResult<Vec<crate::cardano::tm_chain::ConfirmedTm>> {
+        let utxos = self
+            .api
+            .addresses_utxos(&self.treasury_address, Pagination::all())
+            .await
+            .map_err(|e| EpochError::Chain(format!("blockfrost treasury query: {e}")))?;
+        let nft_unit = format!(
+            "{}{}",
+            self.treasury_policy_id, self.treasury_asset_name_hex
+        );
+        let mut records = Vec::new();
+        for u in &utxos {
+            let Some(datum_hex) = u.inline_datum.as_deref() else {
+                continue;
+            };
+            if !u.amount.iter().any(|a| a.unit == nft_unit) {
+                continue;
+            }
+            let Ok(cbor) = hex::decode(datum_hex) else {
+                continue;
+            };
+            let Ok(datum) = minicbor::decode::<PlutusData>(&cbor) else {
+                continue;
+            };
+            if let Some((btc_txid, spent_outpoint, treasury_value_sat)) =
+                crate::cardano::tm_chain::parse_confirmed_datum(&datum)
+            {
+                records.push(crate::cardano::tm_chain::ConfirmedTm {
+                    btc_txid,
+                    spent_outpoint,
+                    treasury_value_sat,
+                    cardano_utxo: (u.tx_hash.clone(), u.output_index as u32),
+                });
+            }
+        }
+        Ok(records)
     }
 
     /// Fetch all UTxOs at the wallet base address.
@@ -376,25 +483,36 @@ impl CardanoChain for BlockfrostCardanoChain {
         let csv = self.treasury_config.federation_csv_blocks;
 
         // Bootstrap: before the first TM confirms there is no Confirmed datum to
-        // follow, so fall back to the config outpoint/value.
+        // follow. The treasury is the anchor outpoint from the bridge Config UTxO's
+        // field 11 (initial_btc_treasury_utxo, located by the config NFT) — the same
+        // outpoint the TM validator's Genesis mint redeemer checks. Its value is not
+        // on Cardano, so price it via bitcoind gettxout (DEC-022).
         if confirmed.is_empty() {
-            let cfg_out = self.treasury_config.treasury_outpoint;
-            if cfg_out == bitcoin::OutPoint::null() {
-                return Err(EpochError::Chain(
-                    "no Confirmed TM on-chain and no bootstrap bitcoin.treasury_txid configured"
+            use bitcoin::hashes::Hash;
+            let (anchor, _config_ref) = self.query_config_anchor().await?;
+            let txid_bytes: [u8; 32] = anchor[..32].try_into().unwrap();
+            let txid = bitcoin::Txid::from_byte_array(txid_bytes);
+            let vout = u32::from_le_bytes(anchor[32..].try_into().unwrap());
+            let cfg_out = bitcoin::OutPoint { txid, vout };
+            let rpc = self.btc_rpc.as_ref().ok_or_else(|| {
+                EpochError::Chain(
+                    "genesis treasury resolution needs bitcoin.rpc_url (gettxout on the \
+                     config anchor outpoint)"
                         .into(),
-                ));
-            }
+                )
+            })?;
+            let sat =
+                crate::cardano::btc_rpc::get_txout_value_sat(rpc, &txid.to_string(), vout).await?;
             // An unreadable in-flight movement could be spending this outpoint; be
             // conservative and treat it as not-yet-free.
             let btc_confirmed = !in_flight_spends.contains(&cfg_out) && opaque_unconfirmed == 0;
             eprintln!(
-                "[blockfrost] no Confirmed TM yet — bootstrap treasury from config {cfg_out} \
-                 (btc_confirmed={btc_confirmed})"
+                "[blockfrost] no Confirmed TM yet — treasury = config anchor {cfg_out} \
+                 ({sat} sat, btc_confirmed={btc_confirmed})"
             );
             return Ok(TreasuryUtxo {
                 outpoint: cfg_out,
-                value: self.treasury_config.treasury_value,
+                value: bitcoin::Amount::from_sat(sat),
                 y_51,
                 y_fed: self.treasury_config.y_fed,
                 federation_csv_blocks: csv,
@@ -447,8 +565,16 @@ impl CardanoChain for BlockfrostCardanoChain {
             .ok_or_else(|| EpochError::Chain("treasury tip datum has no outputs".into()))?;
         // A movement already in flight against this tip — or an in-flight movement we
         // could not read — means it is not yet safe to build the next TM; report
-        // btc_confirmed=false so BuildTm waits for confirmation.
-        let btc_confirmed = !in_flight_spends.contains(&outpoint) && opaque_unconfirmed == 0;
+        // btc_confirmed=false so BuildTm waits for confirmation. Additionally, a TM
+        // this process submitted must have become the tip before the next one builds
+        // (DEC-022: restart-safe against a lost Cardano post — the in-flight scan
+        // catches cross-process movements, this catches our own).
+        let own_pending = match *self.last_submitted_txid.lock().unwrap() {
+            None => false,
+            Some(t) => outpoint.txid != t,
+        };
+        let btc_confirmed =
+            !own_pending && !in_flight_spends.contains(&outpoint) && opaque_unconfirmed == 0;
         eprintln!(
             "[blockfrost] treasury tip {}:{} = {} sat ({} confirmed TM(s), in_flight={}, btc_confirmed={})",
             outpoint.txid,
@@ -508,6 +634,13 @@ impl CardanoChain for BlockfrostCardanoChain {
             eprintln!("[submit] bitcoin.submit=false — skipping BTC broadcast");
         }
 
+        // Track our in-flight TM: query_treasury reports btc_confirmed=false until this
+        // txid becomes the Confirmed chain tip, so the epoch machine waits for its own
+        // movement instead of double-spending the tip outpoint.
+        if let Ok(tx) = deserialize::<Transaction>(tx_bytes) {
+            *self.last_submitted_txid.lock().unwrap() = Some(tx.compute_txid());
+        }
+
         // Publish the oracle update to Cardano if enabled.
         if !self.submit_oracle {
             eprintln!("[submit] cardano.submit_oracle=false — skipping Cardano oracle publish");
@@ -561,6 +694,20 @@ impl CardanoChain for BlockfrostCardanoChain {
             cost_models[2].len()
         );
 
+        // The chain-linkage mint reference: the tip Confirmed record (Chain redeemer) or,
+        // before the first TM confirms, the Config UTxO (Genesis redeemer). Only needed when
+        // minting under the real TM validator.
+        let mint_ref: Option<(String, u32, bool)> = if self.tm_script_cbor.is_some() {
+            let (anchor, config_ref) = self.query_config_anchor().await?;
+            let records = self.query_confirmed_records().await?;
+            match crate::cardano::tm_chain::walk_chain(anchor, &records) {
+                Some(tip) => Some((tip.cardano_utxo.0.clone(), tip.cardano_utxo.1, false)),
+                None => Some((config_ref.0, config_ref.1, true)),
+            }
+        } else {
+            None
+        };
+
         let signed_tx_hex = build_oracle_update_tx(
             &self.treasury_address,
             wallet_addr,
@@ -571,7 +718,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             &wallet_utxos,
             key,
             self.tm_script_cbor.as_deref(),
-            self.tm_control_ref.as_ref().map(|(h, i)| (h.as_str(), *i)),
+            mint_ref.as_ref().map(|(h, i, g)| (h.as_str(), *i, *g)),
             Some(cost_models),
         )?;
 

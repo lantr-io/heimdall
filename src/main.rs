@@ -941,25 +941,48 @@ fn main() {
     }
 }
 
-/// Apply the real TM-NFT minting policy to the chain when both `cardano.tm_script_cbor` and
-/// `cardano.tm_control_ref` are configured (else leave it on the always-ok scaffold). Errors on a
-/// half-configured pair or a malformed control ref (`<tx_hash>#<index>`).
+/// Apply the real TM-NFT minting policy and the Config-UTxO locator to the chain. Requires
+/// `cardano.tm_script_cbor`, `cardano.config_address` and `cardano.config_nft_policy_id` to be
+/// configured together (else leave the always-ok scaffold; the Config UTxO anchors the TM chain
+/// the mint redeemer links against). Errors on a half-configured set.
 fn apply_tm_policy(
     chain: BlockfrostCardanoChain,
     cfg: &HeimdallConfig,
 ) -> Result<BlockfrostCardanoChain, String> {
-    match (&cfg.cardano.tm_script_cbor, &cfg.cardano.tm_control_ref) {
-        (Some(cbor), Some(r)) => {
-            let (h, i) = r
-                .split_once('#')
-                .and_then(|(h, i)| i.parse::<u32>().ok().map(|i| (h, i)))
-                .ok_or_else(|| {
-                    format!("cardano.tm_control_ref must be <tx_hash>#<index>, got '{r}'")
-                })?;
-            Ok(chain.with_tm_policy(cbor, h, i))
+    // The Config-UTxO locator is needed by query_treasury (chain walk) even when minting
+    // stays on the scaffold, so apply it whenever configured.
+    let chain = match (
+        &cfg.cardano.config_address,
+        &cfg.cardano.config_nft_policy_id,
+    ) {
+        (Some(addr), Some(policy)) => {
+            let unit = format!(
+                "{policy}{}",
+                cfg.cardano.config_nft_asset_name.as_deref().unwrap_or("")
+            );
+            chain.with_config_utxo(addr, &unit)
         }
-        (None, None) => Ok(chain),
-        _ => Err("set both cardano.tm_script_cbor and cardano.tm_control_ref (or neither)".into()),
+        (None, None) => chain,
+        _ => {
+            return Err(
+                "set both cardano.config_address and cardano.config_nft_policy_id (or neither)"
+                    .into(),
+            );
+        }
+    };
+    match &cfg.cardano.tm_script_cbor {
+        Some(cbor) => {
+            if cfg.cardano.config_address.is_none() {
+                return Err(
+                    "cardano.tm_script_cbor requires cardano.config_address and \
+                     cardano.config_nft_policy_id (the mint redeemer links against the config \
+                     anchor)"
+                        .into(),
+                );
+            }
+            Ok(chain.with_tm_policy(cbor))
+        }
+        None => Ok(chain),
     }
 }
 
@@ -3318,7 +3341,6 @@ fn treasury_asset_name_hex(cfg: &HeimdallConfig) -> String {
 /// Takes the scan by ref so the sweep path scans the validator address ONCE and
 /// reuses it for both the peg-in guard and this tip selection.
 fn select_chain_tip(
-    cfg: &HeimdallConfig,
     expected_spk: &[u8],
     scan: &heimdall::cardano::blockfrost_chain::TmScan,
 ) -> Result<ChainTip, String> {
@@ -3337,29 +3359,16 @@ fn select_chain_tip(
 
     let tip = match select_spendable_tip(&scan.confirmed, expected_spk) {
         Ok(t) => t,
-        // Fresh bridge: no Confirmed TM yet — bootstrap from config, same as the
-        // epoch daemon's query_treasury does, so the auto-mover can post the FIRST TM.
+        // Fresh bridge: no Confirmed TM yet. The local bootstrap config is gone
+        // (DEC-022) — the anchor lives on-chain in the Config UTxO's field 11, which
+        // the epoch daemon resolves automatically; this CLI path takes it explicitly.
         Err(TipSelectError::NoConfirmedTms) => {
-            let (Some(txid), Some(vout), Some(amount)) = (
-                cfg.bitcoin.treasury_txid.as_deref(),
-                cfg.bitcoin.treasury_vout,
-                cfg.bitcoin.treasury_amount_sat,
-            ) else {
-                return Err(
-                    "no Confirmed TM on-chain yet and no bootstrap bitcoin.treasury_txid/\
-                     treasury_vout/treasury_amount_sat configured (or pass --treasury-outpoint)"
-                        .to_string(),
-                );
-            };
-            let outpoint = parse_outpoint(&format!("{txid}:{vout}"))?;
-            let in_flight =
-                scan.in_flight_spends.contains(&outpoint) || scan.opaque_unconfirmed > 0;
-            println!("  treasury (bootstrap from config — no Confirmed TM yet): {outpoint}");
-            return Ok(ChainTip {
-                outpoint,
-                value: bitcoin::Amount::from_sat(amount),
-                in_flight,
-            });
+            return Err(
+                "no Confirmed TM on-chain yet — pass --treasury-outpoint TXID:VOUT and \
+                 --treasury-amount-sat with the bridge's initial treasury anchor (the Config \
+                 UTxO's initial_btc_treasury_utxo, field 11) for the first movement"
+                    .to_string(),
+            );
         }
         Err(e) => return Err(format!("treasury tip selection: {e}")),
     };
@@ -3658,7 +3667,7 @@ fn run_sweep_pegins(
                 "chain-sourced treasury requires cardano.blockfrost_project_id + \
                  cardano.treasury_address (or pass --treasury-outpoint and --treasury-amount-sat)",
             )?;
-            let tip = select_chain_tip(cfg, treasury_spk.as_bytes(), scan)?;
+            let tip = select_chain_tip(treasury_spk.as_bytes(), scan)?;
             if tip.in_flight {
                 let msg = format!(
                     "a treasury movement is already in flight spending tip {} — wait for \

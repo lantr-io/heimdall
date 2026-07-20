@@ -36,6 +36,7 @@ pub mod registry;
 pub mod retry;
 pub mod roster;
 pub mod stake;
+pub mod tm_chain;
 pub mod treasury_bootstrap;
 pub mod treasury_datum;
 pub mod treasury_info;
