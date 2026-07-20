@@ -335,6 +335,14 @@ pub struct SpoIdentity {
     pub port: u16,
 }
 
+/// Attempt-namespace budget per ceremony window (N21): the ceremony joining
+/// grid window `k` uses wire attempts `k·A .. (k+1)·A`, so packages from
+/// different windows can never collide (a late or re-entered node must never
+/// mix a stale round-1 package into a fresh ceremony), and an in-window
+/// reduction chain aborts rather than spilling into the next window's
+/// namespace.
+pub const DKG_ATTEMPTS_PER_WINDOW: u32 = 16;
+
 #[derive(Debug, Clone)]
 pub struct EpochConfig {
     /// Relative per-round DKG poll window, used as the deadline when the chain
@@ -342,6 +350,19 @@ pub struct EpochConfig {
     /// boundary IS known, the schedule-anchored [`Self::dkg_round1_offset`] /
     /// [`Self::dkg_round2_offset`] take over.
     pub dkg_round_timeout: Duration,
+    /// Ceremony-window grid pitch (N21). When the chain schedule anchor is
+    /// known, a node entering DKG first sleeps to the next grid line
+    /// (`epoch_boundary + k·dkg_window`), so every node — however late it
+    /// started, or re-entering after an aborted attempt — runs the ceremony
+    /// on the same schedule and under the same per-window attempt namespace.
+    /// Should comfortably exceed `dkg_round2_offset`.
+    pub dkg_window: Duration,
+    /// Upper bound on the pre-ceremony health gate (N21): how long a node
+    /// waits for every roster peer to answer `/health` before proceeding
+    /// without the missing ones. Bounds the wait only — liveness never
+    /// depends on a peer coming up; an absent peer is then excluded by the
+    /// normal quorum-gated reduction.
+    pub dkg_join_wait: Duration,
     /// Round 1 deadline as an offset from the epoch boundary (WI-014 #6). All
     /// nodes anchor to the same chain-time instant, so they freeze the live
     /// subset L1 together regardless of when each locally started the round.
@@ -378,6 +399,8 @@ impl EpochConfig {
     pub fn demo_default(identity: SpoIdentity) -> Self {
         Self {
             dkg_round_timeout: Duration::from_secs(300),
+            dkg_window: Duration::from_secs(600),
+            dkg_join_wait: Duration::from_secs(300),
             dkg_round1_offset: Duration::from_secs(120),
             dkg_round2_offset: Duration::from_secs(240),
             poll_interval: Duration::from_millis(5000),

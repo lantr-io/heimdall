@@ -43,8 +43,8 @@ use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInSource};
 use crate::epoch::dkg::dkg_phase;
 use crate::epoch::signing::sign_phase;
 use crate::epoch::state::{
-    CascadeLevel, DkgCollected, DkgRound, EpochConfig, EpochError, EpochPhase, EpochResult,
-    GroupKeys, Roster, SignCollected, SigningRound, TreasuryMovement,
+    CascadeLevel, DKG_ATTEMPTS_PER_WINDOW, DkgCollected, DkgRound, EpochConfig, EpochError,
+    EpochPhase, EpochResult, GroupKeys, Roster, SignCollected, SigningRound, TreasuryMovement,
 };
 use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use std::collections::BTreeMap;
@@ -141,7 +141,7 @@ async fn step_phase(
     let next = match phase {
         EpochPhase::Idle => idle_phase(chain).await?,
 
-        EpochPhase::EpochStart { epoch } => epoch_start_phase(chain, config, epoch).await?,
+        EpochPhase::EpochStart { epoch } => epoch_start_phase(chain, peers, config, epoch).await?,
 
         EpochPhase::Dkg {
             round,
@@ -225,6 +225,7 @@ async fn idle_phase(chain: &Arc<dyn CardanoChain>) -> EpochResult<EpochPhase> {
 
 async fn epoch_start_phase(
     chain: &Arc<dyn CardanoChain>,
+    peers: &Arc<dyn PeerNetwork>,
     config: &EpochConfig,
     epoch: u64,
 ) -> EpochResult<EpochPhase> {
@@ -240,13 +241,110 @@ async fn epoch_start_phase(
 
     // Build the stake-aware DKG context for attempt 0. A failed attempt reruns
     // over a reduced candidate set with a bumped attempt inside `dkg_phase`
-    // (DkgContext::reduced_to), so the chain is queried once at the boundary.
-    let ctx = chain.query_dkg_context(epoch, 0).await?;
+    // (DkgContext::reduced_to), so the chain is queried once per ceremony
+    // entry (which also refreshes the roster after an aborted window).
+    let mut ctx = chain.query_dkg_context(epoch, 0).await?;
+
+    // N21 health gate: bring the roster up before the ceremony. A staggered
+    // process start otherwise freezes divergent live subsets — the early
+    // nodes complete a reduced key without the late one, which then loops
+    // forever against their stale round-1 packages. Time-bounded: a peer
+    // that stays down is excluded by the normal quorum-gated reduction.
+    wait_for_roster_health(peers, &ctx, config, me).await;
+
+    // N21 ceremony window grid: with a chain-time anchor, join at the next
+    // grid line so every node — however late it started, or re-entering
+    // after an abort — runs the same ceremony schedule under a per-window
+    // attempt namespace (stale packages from an earlier window can never be
+    // fetched into this one). Without an anchor (mock / no-registry
+    // fallback) the health gate alone aligns entries to within a poll
+    // interval and the relative round deadlines apply as before.
+    if let Some(boundary_ms) = ctx.schedule_anchor_ms {
+        let now_ms = crate::epoch::dkg::wall_now_ms();
+        let (window, window_start_ms) = next_window(boundary_ms, config.dkg_window, now_ms);
+        let wait_ms = window_start_ms.saturating_sub(now_ms);
+        ctx.attempt = window.saturating_mul(DKG_ATTEMPTS_PER_WINDOW);
+        ctx.schedule_anchor_ms = Some(window_start_ms);
+        crate::epoch_log!(
+            me,
+            epoch,
+            "joining ceremony window {window} in {:.1}s (attempt base {})",
+            wait_ms as f64 / 1000.0,
+            ctx.attempt
+        );
+        if wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms as u64)).await;
+        }
+    }
+
     Ok(EpochPhase::Dkg {
         round: DkgRound::Round1,
         ctx,
         collected: DkgCollected::default(),
     })
+}
+
+/// Ceremony-window grid arithmetic (N21): the index and start (Unix ms) of the
+/// next grid line strictly after `now_ms`, on the grid anchored at
+/// `boundary_ms` with pitch `window`. A node starting before the boundary
+/// joins window 0 at the boundary itself.
+fn next_window(boundary_ms: i64, window: std::time::Duration, now_ms: i64) -> (u32, i64) {
+    let w = i64::try_from(window.as_millis()).unwrap_or(i64::MAX).max(1);
+    let elapsed = now_ms.saturating_sub(boundary_ms);
+    let k = if elapsed < 0 { 0 } else { elapsed / w + 1 };
+    (
+        u32::try_from(k).unwrap_or(u32::MAX),
+        boundary_ms.saturating_add(k.saturating_mul(w)),
+    )
+}
+
+/// Poll every roster peer's `/health` until all answer or `dkg_join_wait`
+/// elapses (N21). Never fails: proceeding without a peer is always legal —
+/// the ceremony's quorum gate decides viability, this gate only makes the
+/// happy path start complete.
+async fn wait_for_roster_health(
+    peers: &Arc<dyn PeerNetwork>,
+    ctx: &crate::cardano::dkg_roster::DkgContext,
+    config: &EpochConfig,
+    me: frost::Identifier,
+) {
+    let roster = ctx.to_roster();
+    let deadline = tokio::time::Instant::now() + config.dkg_join_wait;
+    let poll = config
+        .poll_interval
+        .max(std::time::Duration::from_millis(200));
+    loop {
+        let mut down = Vec::new();
+        for info in roster.participants.values() {
+            if info.identifier == me {
+                continue;
+            }
+            if !peers.check_health(info).await {
+                down.push(crate::epoch::log::id_short(info.identifier));
+            }
+        }
+        if down.is_empty() {
+            crate::epoch_log!(me, ctx.epoch, "health gate: full roster reachable");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            crate::epoch_log!(
+                me,
+                ctx.epoch,
+                "health gate: proceeding without unreachable peer(s) {:?} after {:?}",
+                down,
+                config.dkg_join_wait
+            );
+            return;
+        }
+        crate::epoch_log!(
+            me,
+            ctx.epoch,
+            "health gate: waiting for peer(s) {:?}...",
+            down
+        );
+        tokio::time::sleep(poll).await;
+    }
 }
 
 /// Reload a persisted DKG for `epoch` and turn it into a resume-to-PublishKeys
@@ -882,11 +980,12 @@ mod tests {
 
         let chain: Arc<dyn CardanoChain> =
             Arc::new(MockCardanoChain::new(demo_static_fixture(2, 2, 18_700)));
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id1, MockPeerHub::new()));
         let mut config = fast_config(id1);
         config.state_dir = Some(dir.clone());
 
         // With persisted state → resume straight to PublishKeys (no DKG).
-        match epoch_start_phase(&chain, &config, 0).await.unwrap() {
+        match epoch_start_phase(&chain, &peers, &config, 0).await.unwrap() {
             EpochPhase::PublishKeys { group_keys: gk, .. } => {
                 assert_eq!(gk.verifying_key, group_keys.verifying_key);
                 assert_eq!(*gk.key_package.identifier(), id1);
@@ -897,7 +996,7 @@ mod tests {
         // No persisted state → fresh DKG (the mock chain serves the context).
         config.state_dir = None;
         assert!(matches!(
-            epoch_start_phase(&chain, &config, 0).await.unwrap(),
+            epoch_start_phase(&chain, &peers, &config, 0).await.unwrap(),
             EpochPhase::Dkg { .. }
         ));
 
@@ -907,5 +1006,74 @@ mod tests {
     #[tokio::test]
     async fn full_cycle_3_of_3_all_derive_same_treasury() {
         multi_instance_same_treasury(3, 3).await;
+    }
+
+    /// N21 acceptance — the reported staggered-start repro: 3 instances where
+    /// the last starts late (well past the others' old round-1 deadline
+    /// behavior). With the health gate the early nodes wait for the late one,
+    /// and with the window grid all three then join the same ceremony window —
+    /// so the cycle completes with all THREE deriving the identical TM
+    /// (pre-N21: nodes 1+2 completed a reduced 2-of-2 key and node 3 looped
+    /// on their stale attempt-0 packages forever).
+    #[tokio::test]
+    async fn full_cycle_3_of_3_staggered_start_converges() {
+        let fixture = demo_static_fixture(3, 3, 18_800);
+        let hub = MockPeerHub::new();
+        let anchor_ms = crate::epoch::dkg::wall_now_ms();
+
+        let mut handles = Vec::new();
+        for i in 1..=3u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_schedule_anchor_ms(anchor_ms));
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let mut config = fast_config(id);
+            config.dkg_window = Duration::from_millis(1000);
+            config.dkg_join_wait = Duration::from_secs(20);
+            config.dkg_round1_offset = Duration::from_secs(2);
+            config.dkg_round2_offset = Duration::from_secs(4);
+            let hub = hub.clone();
+            handles.push(tokio::spawn(async move {
+                if i == 3 {
+                    // The repro: the last instance comes up late.
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                }
+                hub.set_online(id);
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(h.await.unwrap().expect("epoch cycle completes"));
+        }
+        let txid0 = tms[0].txid;
+        for tm in &tms[1..] {
+            assert_eq!(
+                tm.txid, txid0,
+                "all SPOs (incl. the late starter) must derive the identical TM"
+            );
+        }
+    }
+
+    /// Grid arithmetic: the next line is strictly after `now`, snapped to
+    /// `boundary + k·window`; a pre-boundary start joins window 0 at the
+    /// boundary itself.
+    #[test]
+    fn next_window_snaps_to_the_grid() {
+        let w = Duration::from_secs(60);
+        // pre-boundary → window 0, at the boundary
+        assert_eq!(next_window(1_000_000, w, 995_000), (0, 1_000_000));
+        // at / after the boundary → the strictly-next line
+        assert_eq!(next_window(1_000_000, w, 1_000_000), (1, 1_060_000));
+        assert_eq!(next_window(1_000_000, w, 1_059_999), (1, 1_060_000));
+        assert_eq!(next_window(1_000_000, w, 1_060_000), (2, 1_120_000));
+        // attempt namespaces from consecutive windows never collide
+        let (k1, _) = next_window(1_000_000, w, 1_000_000);
+        let (k2, _) = next_window(1_000_000, w, 1_060_000);
+        assert_ne!(k1 * DKG_ATTEMPTS_PER_WINDOW, k2 * DKG_ATTEMPTS_PER_WINDOW);
     }
 }

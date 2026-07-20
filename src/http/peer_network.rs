@@ -296,8 +296,37 @@ fn push_round2_equivocations(
     }
 }
 
+/// Drop served DKG blobs that can no longer belong to a live ceremony: past
+/// epochs, and same-epoch attempts more than ~2 grid windows behind the one
+/// being published (N21). A stale round-1 package fetched into a later
+/// ceremony poisons it — a late node would see a phantom participant and wait
+/// a full round for shares that never come.
+fn gc_dkg_blobs(
+    dkg: &mut std::collections::BTreeMap<(u64, u64, u64, DkgRoundKey), String>,
+    ns: DkgNamespace,
+) {
+    let keep_from = ns
+        .attempt
+        .saturating_sub(u64::from(2 * crate::epoch::state::DKG_ATTEMPTS_PER_WINDOW));
+    dkg.retain(|k, _| k.0 >= ns.epoch && (k.0 > ns.epoch || k.2 >= keep_from));
+}
+
 #[async_trait]
 impl PeerNetwork for HttpPeerNetwork {
+    async fn check_health(&self, peer: &SpoInfo) -> bool {
+        let url = format!("{}/health", peer.bifrost_url.trim_end_matches('/'));
+        match self
+            .client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
     async fn publish_dkg_round1(
         &self,
         ns: DkgNamespace,
@@ -321,6 +350,7 @@ impl PeerNetwork for HttpPeerNetwork {
             (ns.epoch, ns.threshold, ns.attempt, DkgRoundKey::Round1),
             json,
         );
+        gc_dkg_blobs(&mut s.dkg, ns);
         Ok(())
     }
 
@@ -358,6 +388,7 @@ impl PeerNetwork for HttpPeerNetwork {
             (ns.epoch, ns.threshold, ns.attempt, DkgRoundKey::Round2),
             json,
         );
+        gc_dkg_blobs(&mut s.dkg, ns);
         Ok(())
     }
 

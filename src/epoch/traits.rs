@@ -197,6 +197,17 @@ pub trait CardanoChain: Send + Sync {
 /// poll loop keeps waiting rather than aborting the epoch.
 #[async_trait]
 pub trait PeerNetwork: Send + Sync {
+    /// Whether `peer` is currently reachable (its `/health` endpoint answers).
+    /// Used by the pre-ceremony health gate (N21) so a staggered-start roster
+    /// converges on one DKG instead of freezing divergent live subsets. Purely
+    /// advisory — a `true` here guarantees nothing about later rounds, and the
+    /// gate is time-bounded, so implementations should answer quickly (a
+    /// couple of seconds), never retry internally. Defaults to healthy for
+    /// implementations without a liveness signal.
+    async fn check_health(&self, _peer: &SpoInfo) -> bool {
+        true
+    }
+
     async fn publish_dkg_round1(
         &self,
         ns: DkgNamespace,

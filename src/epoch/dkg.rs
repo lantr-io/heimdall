@@ -59,7 +59,7 @@ pub async fn dkg_phase(
     let me = config.identity.identifier;
     let epoch = ctx.epoch;
     let attempt = ctx.attempt;
-    let epoch_start_ms = ctx.epoch_start_ms;
+    let schedule_anchor_ms = ctx.schedule_anchor_ms;
     // Every payload (and its replay binding) is namespaced by the attempt, so a
     // stale previous-attempt package can never be replayed into a rerun.
     let ns = DkgNamespace::for_attempt(epoch, u64::from(attempt));
@@ -104,7 +104,7 @@ pub async fn dkg_phase(
             let peer_infos = roster.peers_of(me);
             let deadline = round_deadline(
                 clock,
-                epoch_start_ms,
+                schedule_anchor_ms,
                 config.dkg_round1_offset,
                 config.dkg_round_timeout,
             );
@@ -113,7 +113,7 @@ pub async fn dkg_phase(
                 epoch,
                 "  waiting for round1 packages from {} peer(s) until deadline (anchored={})...",
                 peer_infos.len(),
-                epoch_start_ms.is_some()
+                schedule_anchor_ms.is_some()
             );
             poll_dkg_round1(
                 peers,
@@ -229,7 +229,7 @@ pub async fn dkg_phase(
             let peer_infos = roster.peers_of(me);
             let deadline = round_deadline(
                 clock,
-                epoch_start_ms,
+                schedule_anchor_ms,
                 config.dkg_round2_offset,
                 config.dkg_round_timeout,
             );
@@ -239,7 +239,7 @@ pub async fn dkg_phase(
                 "  waiting for round2 shares addressed to me from {} peer(s) until deadline \
                  (anchored={})...",
                 peer_infos.len(),
-                epoch_start_ms.is_some()
+                schedule_anchor_ms.is_some()
             );
             poll_dkg_round2(
                 peers,
@@ -473,6 +473,15 @@ fn rerun_or_abort(
             "{why}; surviving subset fails the threshold / >51%-stake quorum gate"
         ));
     }
+    // N21: a reduction chain may not spill into the next grid window's attempt
+    // namespace — abort instead; the caller re-enters at the next window with a
+    // freshly re-queried (full) roster, which is also how an excluded-but-alive
+    // peer gets back in.
+    if (ctx.attempt + 1).is_multiple_of(crate::epoch::state::DKG_ATTEMPTS_PER_WINDOW) {
+        return abort(format!(
+            "{why}; attempt budget for this ceremony window exhausted"
+        ));
+    }
     match ctx.reduced_to(survivors) {
         Some(reduced) => Ok(EpochPhase::Dkg {
             round: DkgRound::Round1,
@@ -615,23 +624,23 @@ fn check_dkg_output_coherent(
     }
 }
 
-/// The poll deadline for a DKG round (WI-014 #6). When the epoch boundary time
-/// is known (`epoch_start_ms`, from the chain schedule), the deadline is
-/// ABSOLUTE — `boundary + offset` — so every node freezes its live/qualified
-/// subset at the same chain-time instant regardless of when it locally entered
-/// the round; that keeps `L1`/`Q` (and any reduced-set rerun) agreeing across
-/// honest nodes. Without it (mock / no-registry fallback), the fixed relative
+/// The poll deadline for a DKG round (WI-014 #6). When the schedule anchor is
+/// known (`schedule_anchor_ms` — the ceremony window's grid line, or the epoch
+/// boundary on the pre-N21 path), the deadline is ABSOLUTE — `anchor + offset`
+/// — so every node freezes its live/qualified subset at the same chain-time
+/// instant regardless of when it locally entered the round; that keeps
+/// `L1`/`Q` (and any reduced-set rerun) agreeing across honest nodes. Without it (mock / no-registry fallback), the fixed relative
 /// `fallback` window from now is used. The absolute target is converted to a
 /// monotonic [`Instant`] via the local wall clock; over the few-minute DKG
 /// window the two advance together, so a clock skew between nodes only shifts
 /// the freeze by that skew, not unboundedly.
 fn round_deadline(
     clock: &Arc<dyn Clock>,
-    epoch_start_ms: Option<i64>,
+    schedule_anchor_ms: Option<i64>,
     offset: Duration,
     fallback: Duration,
 ) -> Instant {
-    match epoch_start_ms {
+    match schedule_anchor_ms {
         Some(boundary) => {
             let remaining = remaining_to_offset(boundary, offset, wall_now_ms());
             // A *stale* anchor — `boundary + offset` already elapsed — collapses the window to
@@ -661,7 +670,7 @@ fn remaining_to_offset(boundary_ms: i64, offset: Duration, now_ms: i64) -> Durat
 
 /// Current wall-clock time in Unix milliseconds, for schedule anchoring. Before
 /// the Unix epoch (clock badly wrong) → 0.
-fn wall_now_ms() -> i64 {
+pub(crate) fn wall_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))

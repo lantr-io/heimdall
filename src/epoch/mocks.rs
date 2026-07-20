@@ -135,6 +135,10 @@ pub struct MockCardanoChain {
     /// broadcasts the signed BTC tx to the node via `sendrawtransaction`.
     btc_rpc: Option<BtcRpcConfig>,
     dkg_faults: Arc<Mutex<Vec<DkgFaultEvidence>>>,
+    /// Optional wall-clock schedule anchor (Unix ms) stamped onto the DKG
+    /// context, enabling the ceremony window grid (N21) in tests. `None` (the
+    /// default) keeps the mock on relative per-round timeouts.
+    schedule_anchor_ms: Option<i64>,
 }
 
 impl MockCardanoChain {
@@ -146,7 +150,15 @@ impl MockCardanoChain {
             treasury_y_51: Mutex::new(None),
             btc_rpc: None,
             dkg_faults: Arc::new(Mutex::new(Vec::new())),
+            schedule_anchor_ms: None,
         }
+    }
+
+    /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning
+    /// the ceremony window grid on for this mock chain.
+    pub fn with_schedule_anchor_ms(mut self, anchor_ms: i64) -> Self {
+        self.schedule_anchor_ms = Some(anchor_ms);
+        self
     }
 
     /// Configure direct Bitcoin RPC broadcast. When set,
@@ -219,13 +231,13 @@ impl CardanoChain for MockCardanoChain {
         epoch: u64,
         attempt: u32,
     ) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
-        Ok(
-            crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(
-                &self.fixture.roster,
-                epoch,
-                attempt,
-            ),
-        )
+        let mut ctx = crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(
+            &self.fixture.roster,
+            epoch,
+            attempt,
+        );
+        ctx.schedule_anchor_ms = self.schedule_anchor_ms;
+        Ok(ctx)
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {
@@ -312,6 +324,11 @@ pub struct MockPeerHub {
     slots: Mutex<BTreeMap<Identifier, PeerSlot>>,
     dkg_faults: Mutex<BTreeMap<MockFaultKey, Vec<DkgFaultEvidence>>>,
     notify: Notify,
+    /// In-process presence for the health gate (N21). An EMPTY set means
+    /// presence tracking is unused and every peer reports healthy (so tests
+    /// that don't stagger starts are unaffected); once any node registers via
+    /// [`Self::set_online`], only registered nodes are healthy.
+    online: Mutex<std::collections::BTreeSet<Identifier>>,
 }
 
 impl MockPeerHub {
@@ -365,6 +382,17 @@ impl MockPeerHub {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Mark a node as up. Call at spawn (before its epoch loop) in tests that
+    /// exercise staggered starts.
+    pub fn set_online(&self, id: Identifier) {
+        self.online.lock().unwrap().insert(id);
+    }
+
+    fn is_online(&self, id: Identifier) -> bool {
+        let online = self.online.lock().unwrap();
+        online.is_empty() || online.contains(&id)
+    }
 }
 
 /// One SPO's view of the in-process peer hub.
@@ -388,6 +416,10 @@ fn with_slot<R>(hub: &MockPeerHub, id: Identifier, f: impl FnOnce(&mut PeerSlot)
 
 #[async_trait]
 impl PeerNetwork for MockPeerNetwork {
+    async fn check_health(&self, peer: &SpoInfo) -> bool {
+        self.hub.is_online(peer.identifier)
+    }
+
     async fn publish_dkg_round1(
         &self,
         ns: DkgNamespace,

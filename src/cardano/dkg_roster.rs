@@ -141,12 +141,14 @@ pub struct DkgContext {
     pub participants: Vec<DkgParticipant>,
     /// Registered SPOs dropped from the eligible set, with reasons.
     pub excluded: Vec<ExcludedSpo>,
-    /// Epoch boundary wall-clock time (Unix ms) from the chain schedule, when
-    /// known. The ceremony anchors its Round 1/2 deadlines to this so every node
-    /// freezes the live/qualified subsets at the same chain-time instant
-    /// (WI-014 #6). `None` for the mock / no-registry fallback → relative
-    /// per-round timeouts instead.
-    pub epoch_start_ms: Option<i64>,
+    /// Wall-clock anchor (Unix ms) for the ceremony's round schedule. The
+    /// fetch path sets it to the epoch boundary from the chain schedule; the
+    /// epoch machine then re-anchors it to the ceremony window's grid line
+    /// before entering DKG (N21). The ceremony anchors its Round 1/2
+    /// deadlines to this so every node freezes the live/qualified subsets at
+    /// the same chain-time instant (WI-014 #6). `None` for the mock /
+    /// no-registry fallback → relative per-round timeouts instead.
+    pub schedule_anchor_ms: Option<i64>,
 }
 
 /// A registered SPO that survived ban + URL filtering (pre-stake).
@@ -311,9 +313,9 @@ pub fn derive_dkg_context(
         total_stake: total,
         participants,
         excluded,
-        // The schedule-anchored boundary time is supplied by `fetch_dkg_context`
-        // (it already fetches it); the pure derivation leaves it unset.
-        epoch_start_ms: None,
+        // The schedule anchor is supplied by `fetch_dkg_context` (it already
+        // fetches the boundary time); the pure derivation leaves it unset.
+        schedule_anchor_ms: None,
     })
 }
 
@@ -428,8 +430,8 @@ impl DkgContext {
             // survivors (this attempt's absent/faulty peers) are tracked as
             // fault evidence by the ceremony, not re-derived here.
             excluded: self.excluded.clone(),
-            // Same epoch boundary → same anchored schedule for the rerun.
-            epoch_start_ms: self.epoch_start_ms,
+            // Same anchor → same anchored schedule for the rerun.
+            schedule_anchor_ms: self.schedule_anchor_ms,
         })
     }
 
@@ -470,7 +472,7 @@ impl DkgContext {
             excluded: vec![],
             // Mock / no-registry fallback has no chain schedule → relative
             // per-round timeouts.
-            epoch_start_ms: None,
+            schedule_anchor_ms: None,
         }
     }
 }
@@ -623,7 +625,7 @@ pub async fn fetch_dkg_context(
         .map_err(DkgFetchError::Derive)?;
     // Anchor the ceremony's round deadlines to the chain epoch boundary (WI-014
     // #6), so every node freezes L1/Q at the same chain-time instant.
-    ctx.epoch_start_ms = Some(epoch_start_ms);
+    ctx.schedule_anchor_ms = Some(epoch_start_ms);
     Ok(ctx)
 }
 
@@ -726,7 +728,7 @@ mod tests {
             total_stake: total,
             participants,
             excluded: vec![],
-            epoch_start_ms: None,
+            schedule_anchor_ms: None,
         }
     }
 
