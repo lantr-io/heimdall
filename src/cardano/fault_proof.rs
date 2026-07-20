@@ -18,7 +18,9 @@
 //! `blake2b_256("bifrost-fault-equiv-v1" || len(lo) || lo || len(hi) || hi)`.
 
 use pallas_codec::minicbor;
+use pallas_codec::utils::NonEmptySet;
 use pallas_primitives::PlutusData;
+use pallas_primitives::conway::Tx;
 use pallas_wallet::PrivateKey;
 use whisky::*;
 use whisky_pallas::WhiskyPallas;
@@ -418,8 +420,18 @@ pub fn build_fault_proof_mint_tx(
 
     let (fee_utxo, coll_utxo) = select_fee_and_collateral(req.wallet_utxos, lovelace + 1_000_000)?;
     let _fee_tx_id = tx_id_bytes(&fee_utxo.tx_hash)?;
-    let _registration_tx_id = tx_id_bytes(req.registration_ref.0)?;
-    let registration_ref_input_index = 0i64;
+    let registration_ref = (tx_id_bytes(req.registration_ref.0)?, req.registration_ref.1);
+    let mut reference_inputs = vec![registration_ref];
+    if let Some(ref_script) = req.fault_verifier_ref_script {
+        reference_inputs.push((tx_id_bytes(ref_script.tx_hash)?, ref_script.output_index));
+    }
+    reference_inputs.sort();
+    reference_inputs.dedup();
+    let registration_ref_input_index = reference_inputs
+        .iter()
+        .position(|reference_input| *reference_input == registration_ref)
+        .expect("registration reference input is present")
+        as i64;
     let evidence_data = req.evidence.to_plutus_data(registration_ref_input_index)?;
     let redeemer = publish_proof_redeemer(evidence_data);
     let redeemer_hex = hex::encode(minicbor::to_vec(&redeemer).expect("redeemer CBOR encode"));
@@ -522,6 +534,42 @@ pub fn build_fault_proof_mint_tx(
     let unsigned_hex = pallas
         .serialize_tx_body()
         .map_err(|e| FaultProofMintError::Build(format!("whisky tx build: {e:?}")))?;
+
+    let unsigned_hex = {
+        let tx_bytes = hex::decode(&unsigned_hex)
+            .map_err(|e| FaultProofMintError::Build(format!("unsigned hex decode: {e}")))?;
+        let mut tx: Tx = minicbor::decode(&tx_bytes)
+            .map_err(|e| FaultProofMintError::Build(format!("tx decode: {e}")))?;
+        if let Some(refs) = tx.transaction_body.reference_inputs.take() {
+            let mut v = refs.to_vec();
+            v.sort_by_key(|input| (input.transaction_id, input.index));
+            v.dedup();
+            tx.transaction_body.reference_inputs = NonEmptySet::from_vec(v);
+        }
+        let refs: Vec<_> = tx
+            .transaction_body
+            .reference_inputs
+            .as_ref()
+            .map(|inputs| inputs.iter().collect())
+            .unwrap_or_default();
+        let got = refs
+            .get(registration_ref_input_index as usize)
+            .ok_or_else(|| {
+                FaultProofMintError::Build("registration ref input index out of range".into())
+            })?;
+        if got.transaction_id.as_slice() != registration_ref.0
+            || got.index != u64::from(registration_ref.1)
+        {
+            return Err(FaultProofMintError::Build(
+                "registry node not at redeemer ref index -- ref ordering changed".into(),
+            ));
+        }
+        hex::encode(
+            minicbor::to_vec(&tx)
+                .map_err(|e| FaultProofMintError::Build(format!("re-encode: {e}")))?,
+        )
+    };
+
     let signed_tx_hex = sign_built_tx(&unsigned_hex, req.key)?;
 
     Ok(FaultProofMintTx {
@@ -719,7 +767,7 @@ mod tests {
             halo2_proof: &[0xCC; 96],
             halo2_public_inputs: &public_inputs,
         });
-        let ref_tx = "dd".repeat(32);
+        let ref_tx = "00".repeat(32);
 
         let built = build_fault_proof_mint_tx(&FaultProofMintRequest {
             fault_verifier_script: &script,
@@ -746,6 +794,15 @@ mod tests {
             Some(2)
         );
         assert!(tx.transaction_witness_set.plutus_v3_script.is_none());
+
+        let redeemer = mint_redeemer(&tx);
+        let publish_fields = plutus::constr_fields(&redeemer, 0).unwrap();
+        let evidence_fields = plutus::constr_fields(&publish_fields[0], 0).unwrap();
+        assert_eq!(
+            plutus::field_int(evidence_fields, 0).unwrap(),
+            1,
+            "registration reference must be read from the sorted ref-input index"
+        );
     }
 
     #[test]
