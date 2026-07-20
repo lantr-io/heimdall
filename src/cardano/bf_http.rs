@@ -210,24 +210,45 @@ pub async fn fetch_epoch_start_ms(
     project_id: &str,
     epoch: u64,
 ) -> Result<i64, String> {
-    let url = format!("{base_url}/epochs/{epoch}");
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .header("project_id", project_id)
-        .send()
-        .await
-        .map_err(|e| format!("epochs/{epoch} request: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "epochs/{epoch} http {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        ));
-    }
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("epochs/{epoch} json: {e}"))?;
+    // yaci-store serves no per-number /epochs/{n} route (404 "Epoch not
+    // found") — only /epochs/latest. Fall back to it when the direct route
+    // fails, but ONLY accept its start_time when it is for the requested
+    // epoch: an epoch mismatch (turnover race) must stay an error, since a
+    // wrong boundary time silently mis-evaluates ban expiry.
+    let fetch = |path: String| async move {
+        let resp = reqwest::Client::new()
+            .get(format!("{base_url}/{path}"))
+            .header("project_id", project_id)
+            .send()
+            .await
+            .map_err(|e| format!("{path} request: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "{path} http {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            ));
+        }
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("{path} json: {e}"))
+    };
+    let v = match fetch(format!("epochs/{epoch}")).await {
+        Ok(v) => v,
+        Err(direct_err) => {
+            let latest = fetch("epochs/latest".to_string())
+                .await
+                .map_err(|e| format!("{direct_err}; epochs/latest fallback: {e}"))?;
+            match latest.get("epoch").and_then(serde_json::Value::as_u64) {
+                Some(e) if e == epoch => latest,
+                other => {
+                    return Err(format!(
+                        "{direct_err}; epochs/latest is epoch {other:?}, want {epoch}"
+                    ));
+                }
+            }
+        }
+    };
     let secs = v
         .get("start_time")
         .and_then(serde_json::Value::as_i64)
