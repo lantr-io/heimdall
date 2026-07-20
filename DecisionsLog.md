@@ -593,3 +593,45 @@ Existing `heimdall.toml` files with `y_67_seed_hex` / `quorum67_timeout_secs` be
 
 - Design doc: `docs/superpowers/specs/2026-04-22-remove-67-percent-design.md`
 - Driver: `../ft-bifrost-bridge/documentation/technical_documentation.md` (cascade now `51% → federation`).
+
+## DEC-022: Treasury Resolution via the Confirmed TM Chain
+
+Date: 2026-07-20
+Status: Accepted
+
+### Context
+
+The Bitcoin treasury outpoint was configured locally (`[bitcoin] treasury_txid/vout/amount_sat`)
+and the "current" treasury on Cardano was resolved by picking the most recent datum-bearing UTxO
+at the TM address. With the TM Control NFT removed and TM minting made permissionless (gated
+on-chain by chain linkage), a latest-UTxO scan becomes attacker-influenceable: anyone can post
+Unconfirmed records, and a fake tip would deadlock the `btc_confirmed` polling loop.
+
+### Decision
+
+- `query_treasury` reads the bridge Config UTxO's field 11 (`initial_btc_treasury_utxo`, located
+  by the config NFT) and walks the Confirmed TM chain (`cardano::tm_chain`): each Confirmed
+  record is indexed by the outpoint it spent (`swept[0]`); the tip's `(btc_txid, 0)` valued at
+  `fulfilled[0].amount` is the current treasury. Genesis anchor value comes from bitcoind
+  `gettxout`.
+- `btc_confirmed` now means "our last-submitted TM txid has reached the chain tip" (tracked
+  in-process). Attacker-posted Unconfirmed records cannot influence the gate: only Confirmed
+  records (Bitcoin-proven) move the tip.
+- `publish.rs` mints the TM NFT with the `TmMintRedeemer`: `Genesis` (Constr 0, referencing the
+  Config UTxO) before the first TM confirms, `Chain(0)` (Constr 1, referencing the tip Confirmed
+  record; the tx has exactly one reference input so the sorted index is always 0) afterwards.
+- Local treasury config and `tm_control_ref` are removed; `[cardano]` gains `config_address`,
+  `config_nft_policy_id`, `config_nft_asset_name`.
+
+### Consequences
+
+- Single source of truth on-chain; heimdall restart loses only the in-flight-TM marker, which is
+  harmless (a rebuilt TM double-spending our own mempool tx is rejected by Bitcoin; the next
+  poll sees the advanced tip).
+- CLI commands with explicit `--treasury-outpoint` flags keep them for manual use.
+
+### Reference
+
+- Design doc: `../ft-bifrost-bridge/docs/superpowers/specs/2026-07-20-tm-confirmed-chain-design.md`
+- Driver: `../ft-bifrost-bridge/documentation/technical_documentation.md` ("Post signed TM",
+  "The TM chain").
