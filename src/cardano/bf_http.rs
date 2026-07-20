@@ -228,9 +228,9 @@ pub struct EpochWindow {
     /// `TimeTranslationPastHorizon` when the script context is built.
     pub epoch_end_slot: u64,
     /// POSIX time (ms) of `current_slot` (the latest block's wall time). With
-    /// 1-second post-Shelley slots, `posix_ms(slot) = block_time_ms + (slot −
-    /// current_slot) * 1000` — used to derive an ApplyBan validity interval's
-    /// POSIX upper bound (the `start_time` the `spo_bans` validator resolves).
+    /// 1-second post-Shelley slots, `posix_ms(slot) = block_time_ms + (slot -
+    /// current_slot) * 1000`. ApplyBan uses `posix_ms(invalid_hereafter) - 1`
+    /// because Plutus exposes finite upper bounds as exclusive.
     pub block_time_ms: i64,
 }
 

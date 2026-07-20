@@ -16,17 +16,32 @@
 //! inline datum. The old oracle UTxO is NOT spent — old confirmed
 //! UTxOs are kept on-chain for minting proofs.
 
-use std::collections::HashSet;
-use std::sync::Mutex;
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::BufReader,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use blockfrost::{BlockFrostSettings, BlockfrostAPI};
+use halo2_base::halo2_proofs::{
+    SerdeFormat,
+    halo2curves::{
+        bls12_381::{Bls12, Fr as BlsFr},
+        ff::PrimeField,
+    },
+    poly::{commitment::Params, kzg::commitment::ParamsKZG},
+};
 use pallas_codec::minicbor;
 use pallas_primitives::conway::PlutusData;
 use pallas_wallet::PrivateKey;
 
 use crate::bitcoin::taproot::treasury_spend_info;
 use crate::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
+use crate::cardano::fault_proof::FaultProofKind;
 use crate::cardano::publish::{WalletUtxo, build_oracle_update_tx};
 use crate::cardano::treasury_datum::{
     ConfirmedTm, TreasuryConfig, TreasuryDatumError, UnconfirmedTm, parse_confirmed_tm_datum,
@@ -35,6 +50,322 @@ use crate::cardano::treasury_datum::{
 use crate::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 use crate::epoch::state::{EpochError, EpochResult, Roster};
 use crate::epoch::traits::{CardanoChain, EpochBoundaryEvent, PegOutRequestUtxo, TreasuryUtxo};
+
+const FAULT_TOKEN_CONFIRM_POLL_SECS: u64 = 5;
+const FAULT_TOKEN_CONFIRM_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Debug, Clone)]
+pub struct DkgFaultScriptRef {
+    pub tx_hash: String,
+    pub output_index: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DkgFaultBanFlow {
+    blueprint_path: String,
+    registry: crate::cardano::blueprint::ParameterizedScript,
+    round1_fault: crate::cardano::blueprint::ParameterizedScript,
+    round2_fault: crate::cardano::blueprint::ParameterizedScript,
+    equivocation_fault: crate::cardano::blueprint::ParameterizedScript,
+    spo_bans: crate::cardano::blueprint::ParameterizedScript,
+    ban_params: crate::cardano::ban_list::BanPolicyParams,
+    spo_bans_ref: DkgFaultScriptRef,
+    round1_fault_ref: DkgFaultScriptRef,
+    round2_fault_ref: DkgFaultScriptRef,
+    equivocation_fault_ref: DkgFaultScriptRef,
+    srs_path: PathBuf,
+}
+
+impl DkgFaultBanFlow {
+    /// Build the automatic DKG fault-ban configuration. When `ban_bootstrap` is
+    /// unset, the ban list itself is disabled and the automatic flow is absent.
+    /// When it is set, every field needed to publish and apply a ban is required
+    /// so the node fails at startup instead of after detecting a fault.
+    pub fn from_config(cardano: &crate::config::CardanoConfig) -> Result<Option<Self>, String> {
+        let Some(ban_bootstrap) = cardano.ban_bootstrap.as_deref() else {
+            return Ok(None);
+        };
+        let blueprint_path = req_fault_config(&cardano.registry_blueprint, "registry_blueprint")?;
+        let registry_bootstrap =
+            req_fault_config(&cardano.registry_bootstrap, "registry_bootstrap")?;
+        let srs_path = PathBuf::from(req_fault_config(
+            &cardano.fault_proof_srs_path,
+            "fault_proof_srs_path",
+        )?);
+        let spo_bans_ref =
+            parse_script_ref(req_fault_config(&cardano.spo_bans_ref, "spo_bans_ref")?)?;
+        let round1_fault_ref = parse_script_ref(req_fault_config(
+            &cardano.fault_verifier_round1_ref,
+            "fault_verifier_round1_ref",
+        )?)?;
+        let round2_fault_ref = parse_script_ref(req_fault_config(
+            &cardano.fault_verifier_round2_ref,
+            "fault_verifier_round2_ref",
+        )?)?;
+        let equivocation_fault_ref = parse_script_ref(req_fault_config(
+            &cardano.fault_verifier_equivocation_ref,
+            "fault_verifier_equivocation_ref",
+        )?)?;
+
+        let blueprint_json = std::fs::read_to_string(blueprint_path)
+            .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+        let (reg_tx_id, reg_index) = crate::cardano::roster::parse_outref(registry_bootstrap)
+            .map_err(|e| format!("registry bootstrap outref: {e}"))?;
+        let (ban_tx_id, ban_index) = crate::cardano::roster::parse_outref(ban_bootstrap)
+            .map_err(|e| format!("ban bootstrap outref: {e}"))?;
+        let registry = crate::cardano::blueprint::spos_registry_script(
+            &blueprint_json,
+            &reg_tx_id,
+            u64::from(reg_index),
+        )
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+        let round1_fault = crate::cardano::blueprint::fault_verifier_round1_script(
+            &blueprint_json,
+            &registry.hash,
+        )
+        .map_err(|e| format!("parameterize fault_verifier_round1: {e}"))?;
+        let round2_fault = crate::cardano::blueprint::fault_verifier_round2_script(
+            &blueprint_json,
+            &registry.hash,
+        )
+        .map_err(|e| format!("parameterize fault_verifier_round2: {e}"))?;
+        let equivocation_fault = crate::cardano::blueprint::fault_verifier_equivocation_script(
+            &blueprint_json,
+            &registry.hash,
+        )
+        .map_err(|e| format!("parameterize fault_verifier_equivocation: {e}"))?;
+        let ban_params = crate::cardano::ban_list::BanPolicyParams::from_config(cardano)
+            .map_err(|e| e.to_string())?;
+        let own_fault_policies = [
+            round1_fault.hash,
+            round2_fault.hash,
+            equivocation_fault.hash,
+        ];
+        if own_fault_policies
+            .iter()
+            .any(|policy| !ban_params.fault_proof_policies.contains(policy))
+        {
+            return Err(format!(
+                "cardano.fault_proof_policies must include Heimdall's Round 1, Round 2, and \
+                 equivocation fault policies: {}, {}, {}",
+                hex::encode(own_fault_policies[0]),
+                hex::encode(own_fault_policies[1]),
+                hex::encode(own_fault_policies[2])
+            ));
+        }
+        let spo_bans = crate::cardano::blueprint::spo_bans_script(
+            &blueprint_json,
+            &registry.hash,
+            &ban_params.fault_proof_policies,
+            ban_params.base_ban_duration_ms,
+            ban_params.max_faults_before_permanent,
+            ban_params.max_validity_window_ms,
+            &ban_tx_id,
+            u64::from(ban_index),
+        )
+        .map_err(|e| format!("parameterize spo_bans: {e}"))?;
+
+        Ok(Some(Self {
+            blueprint_path: blueprint_path.to_string(),
+            registry,
+            round1_fault,
+            round2_fault,
+            equivocation_fault,
+            spo_bans,
+            ban_params,
+            spo_bans_ref,
+            round1_fault_ref,
+            round2_fault_ref,
+            equivocation_fault_ref,
+            srs_path,
+        }))
+    }
+
+    fn fault_script(
+        &self,
+        kind: FaultProofKind,
+    ) -> (
+        &crate::cardano::blueprint::ParameterizedScript,
+        &DkgFaultScriptRef,
+    ) {
+        match kind {
+            FaultProofKind::Round1InvalidPayload => (&self.round1_fault, &self.round1_fault_ref),
+            FaultProofKind::Round2InvalidPayload => (&self.round2_fault, &self.round2_fault_ref),
+            FaultProofKind::Equivocation => {
+                (&self.equivocation_fault, &self.equivocation_fault_ref)
+            }
+        }
+    }
+}
+
+fn req_fault_config<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {
+    value.as_deref().ok_or_else(|| {
+        format!(
+            "cardano.{name} is required when cardano.ban_bootstrap is set; automatic DKG \
+             fault banning needs the full publish-and-apply path"
+        )
+    })
+}
+
+fn parse_script_ref(raw: &str) -> Result<DkgFaultScriptRef, String> {
+    let (tx_id, output_index) = crate::cardano::roster::parse_outref(raw)
+        .map_err(|e| format!("reference script outref: {e}"))?;
+    Ok(DkgFaultScriptRef {
+        tx_hash: hex::encode(tx_id),
+        output_index,
+    })
+}
+
+fn load_fault_srs(path: &Path, degree: u32) -> Result<ParamsKZG<Bls12>, String> {
+    let file = File::open(path).map_err(|e| format!("open SRS {}: {e}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut srs = ParamsKZG::<Bls12>::read_custom(&mut reader, SerdeFormat::Processed)
+        .map_err(|e| format!("read SRS {}: {e}", path.display()))?;
+    if srs.k() < degree {
+        return Err(format!(
+            "SRS {} has k={} but the fault circuit needs k={degree}",
+            path.display(),
+            srs.k()
+        ));
+    }
+    if srs.k() > degree {
+        srs.downsize(degree);
+    }
+    Ok(srs)
+}
+
+fn bls_scalar_bytes(scalar: BlsFr) -> Vec<u8> {
+    let repr: [u8; 32] = scalar.to_repr();
+    repr.to_vec()
+}
+
+fn public_input_bytes(instances: &[BlsFr]) -> Vec<Vec<u8>> {
+    instances.iter().copied().map(bls_scalar_bytes).collect()
+}
+
+enum PreparedDkgFault {
+    Round1 {
+        accused_pool_id: [u8; 28],
+        evidence_hash: [u8; 32],
+        canonical_round1_bytes: Vec<u8>,
+        payload_signature: [u8; 64],
+        halo2_proof: Vec<u8>,
+        halo2_public_inputs: Vec<Vec<u8>>,
+    },
+    Round2 {
+        accused_pool_id: [u8; 28],
+        evidence_hash: [u8; 32],
+        canonical_round1_bytes: Vec<u8>,
+        round1_signature: [u8; 64],
+        canonical_round2_bytes: Vec<u8>,
+        round2_signature: [u8; 64],
+        round2_entry_index: u32,
+        pad: [u8; 32],
+        opened_share: [u8; 32],
+        halo2_proof: Vec<u8>,
+        halo2_public_inputs: Vec<Vec<u8>>,
+    },
+    Equivocation {
+        accused_pool_id: [u8; 28],
+        evidence_hash: [u8; 32],
+        payload_a: Vec<u8>,
+        signature_a: [u8; 64],
+        payload_b: Vec<u8>,
+        signature_b: [u8; 64],
+    },
+}
+
+impl PreparedDkgFault {
+    fn kind(&self) -> FaultProofKind {
+        match self {
+            Self::Round1 { .. } => FaultProofKind::Round1InvalidPayload,
+            Self::Round2 { .. } => FaultProofKind::Round2InvalidPayload,
+            Self::Equivocation { .. } => FaultProofKind::Equivocation,
+        }
+    }
+
+    fn accused_pool_id(&self) -> [u8; 28] {
+        match self {
+            Self::Round1 {
+                accused_pool_id, ..
+            }
+            | Self::Round2 {
+                accused_pool_id, ..
+            }
+            | Self::Equivocation {
+                accused_pool_id, ..
+            } => *accused_pool_id,
+        }
+    }
+
+    fn evidence_hash(&self) -> [u8; 32] {
+        match self {
+            Self::Round1 { evidence_hash, .. }
+            | Self::Round2 { evidence_hash, .. }
+            | Self::Equivocation { evidence_hash, .. } => *evidence_hash,
+        }
+    }
+}
+
+fn prepare_dkg_fault(
+    flow: &DkgFaultBanFlow,
+    evidence: crate::epoch::traits::DkgFaultEvidence,
+) -> Result<PreparedDkgFault, String> {
+    match evidence {
+        crate::epoch::traits::DkgFaultEvidence::Round1InvalidPayload(ev) => {
+            let srs = load_fault_srs(
+                &flow.srs_path,
+                crate::circuits::fault_evidence::round1_params().degree,
+            )?;
+            let canonical_round1_bytes = ev
+                .canonical_bytes()
+                .map_err(|e| format!("round1 canonical evidence: {e}"))?;
+            let proof = crate::circuits::fault_evidence::prove_round1_pok_fault(&srs, &ev)
+                .map_err(|e| format!("round1 fault proof: {e}"))?;
+            Ok(PreparedDkgFault::Round1 {
+                accused_pool_id: ev.accused_pool_id,
+                evidence_hash: proof.evidence_hash,
+                canonical_round1_bytes,
+                payload_signature: ev.payload_signature,
+                halo2_proof: proof.proof,
+                halo2_public_inputs: public_input_bytes(&proof.public_instances),
+            })
+        }
+        crate::epoch::traits::DkgFaultEvidence::Round2InvalidPayload(ev) => {
+            let srs = load_fault_srs(
+                &flow.srs_path,
+                crate::circuits::fault_evidence::round2_params().degree,
+            )?;
+            let proof = crate::circuits::fault_evidence::prove_round2_share_fault_dyn(&srs, &ev)
+                .map_err(|e| format!("round2 fault proof: {e}"))?;
+            Ok(PreparedDkgFault::Round2 {
+                accused_pool_id: ev.accused_pool_id,
+                evidence_hash: proof.evidence_hash,
+                canonical_round1_bytes: ev.canonical_round1_bytes,
+                round1_signature: ev.round1_signature,
+                canonical_round2_bytes: ev.round2_canonical_bytes,
+                round2_signature: ev.round2_signature,
+                round2_entry_index: ev.round2_entry_index,
+                pad: ev.pad,
+                opened_share: ev.share,
+                halo2_proof: proof.proof,
+                halo2_public_inputs: public_input_bytes(&proof.public_instances),
+            })
+        }
+        crate::epoch::traits::DkgFaultEvidence::Equivocation(ev) => {
+            ev.verify()
+                .map_err(|e| format!("equivocation evidence: {e}"))?;
+            Ok(PreparedDkgFault::Equivocation {
+                accused_pool_id: ev.accused_pool_id,
+                evidence_hash: ev.evidence_hash(),
+                payload_a: ev.payload_a,
+                signature_a: ev.signature_a,
+                payload_b: ev.payload_b,
+                signature_b: ev.signature_b,
+            })
+        }
+    }
+}
 
 pub struct BlockfrostCardanoChain {
     /// Pooled Blockfrost client — used ONLY for `transactions_submit` (the leader's
@@ -97,6 +428,8 @@ pub struct BlockfrostCardanoChain {
     /// The TM-control UTxO `(tx_hash, index)` to reference so the validator can read the authorized
     /// minter. Required alongside `tm_script_cbor`.
     tm_control_ref: Option<(String, u32)>,
+    /// Optional automatic DKG fault proof mint + ApplyBan configuration.
+    fault_ban_flow: Option<DkgFaultBanFlow>,
 }
 
 impl BlockfrostCardanoChain {
@@ -138,6 +471,7 @@ impl BlockfrostCardanoChain {
             oracle_constructor: 0,
             tm_script_cbor: None,
             tm_control_ref: None,
+            fault_ban_flow: None,
         }
     }
 
@@ -152,6 +486,12 @@ impl BlockfrostCardanoChain {
     ) -> Self {
         self.tm_script_cbor = Some(script_cbor.to_string());
         self.tm_control_ref = Some((control_tx_hash.to_string(), control_index));
+        self
+    }
+
+    /// Configure automatic DKG fault proof minting followed by ApplyBan.
+    pub fn with_dkg_fault_ban_flow(mut self, flow: DkgFaultBanFlow) -> Self {
+        self.fault_ban_flow = Some(flow);
         self
     }
 
@@ -254,6 +594,278 @@ impl BlockfrostCardanoChain {
             .filter(|u| u.pure_ada)
             .collect())
     }
+
+    async fn submit_cardano_tx(&self, label: &str, signed_tx_hex: &str) -> EpochResult<String> {
+        let cbor = hex::decode(signed_tx_hex)
+            .map_err(|e| EpochError::Chain(format!("{label} tx hex decode: {e}")))?;
+        eprintln!(
+            "[fault-ban] submitting {label} tx ({} bytes CBOR) via Blockfrost",
+            cbor.len()
+        );
+        let tx_hash = self
+            .api
+            .transactions_submit(cbor)
+            .await
+            .map_err(|e| EpochError::Chain(format!("{label} blockfrost tx submit: {e}")))?;
+        eprintln!("[fault-ban] submitted {label}: tx_hash={tx_hash}");
+        Ok(tx_hash)
+    }
+
+    async fn wait_for_wallet_token_utxo(
+        &self,
+        token_unit: &str,
+    ) -> EpochResult<(
+        crate::cardano::bf_http::BfUtxo,
+        Vec<crate::cardano::bf_http::BfUtxo>,
+    )> {
+        let wallet_addr = self
+            .wallet_base_address
+            .as_deref()
+            .ok_or_else(|| EpochError::Chain("no wallet base address".into()))?;
+        let attempts = FAULT_TOKEN_CONFIRM_TIMEOUT_SECS / FAULT_TOKEN_CONFIRM_POLL_SECS;
+        for attempt in 0..=attempts {
+            let wallet_raw = crate::cardano::bf_http::fetch_address_utxos(
+                &self.bf_base_url,
+                &self.bf_project_id,
+                wallet_addr,
+            )
+            .await
+            .map_err(|e| EpochError::Chain(format!("wallet UTxO query: {e}")))?;
+            if let Some(found) = wallet_raw
+                .iter()
+                .find(|u| u.amount.iter().any(|a| a.unit == token_unit))
+                .cloned()
+            {
+                return Ok((found, wallet_raw));
+            }
+            if attempt < attempts {
+                tokio::time::sleep(Duration::from_secs(FAULT_TOKEN_CONFIRM_POLL_SECS)).await;
+            }
+        }
+        Err(EpochError::Chain(format!(
+            "fault token {token_unit} did not appear at the wallet within \
+             {FAULT_TOKEN_CONFIRM_TIMEOUT_SECS}s"
+        )))
+    }
+
+    async fn publish_dkg_fault_and_apply_ban_live(
+        &self,
+        flow: &DkgFaultBanFlow,
+        evidence: crate::epoch::traits::DkgFaultEvidence,
+    ) -> EpochResult<()> {
+        let key = self.payment_key.as_ref().ok_or_else(|| {
+            EpochError::Chain("cardano.mnemonic required for DKG fault ban flow".into())
+        })?;
+        let wallet_addr = self
+            .wallet_base_address
+            .as_deref()
+            .ok_or_else(|| EpochError::Chain("no wallet base address".into()))?;
+        let network = crate::cardano::tx_common::network_from_address(wallet_addr);
+        let mainnet = matches!(network, pallas_addresses::Network::Mainnet);
+
+        eprintln!(
+            "[fault-ban] preparing DKG fault proof using Bifrost blueprint {}",
+            flow.blueprint_path
+        );
+        let prepared = prepare_dkg_fault(flow, evidence).map_err(EpochError::Chain)?;
+        let accused_pool_id = prepared.accused_pool_id();
+        let evidence_hash = prepared.evidence_hash();
+        let (fault_script, fault_ref) = flow.fault_script(prepared.kind());
+        let public_inputs = match &prepared {
+            PreparedDkgFault::Round1 {
+                halo2_public_inputs,
+                ..
+            }
+            | PreparedDkgFault::Round2 {
+                halo2_public_inputs,
+                ..
+            } => halo2_public_inputs.clone(),
+            PreparedDkgFault::Equivocation { .. } => Vec::new(),
+        };
+
+        let registry_addr = flow.registry.enterprise_address(network);
+        let registry_raw = crate::cardano::bf_http::fetch_address_utxos(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            &registry_addr,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("registry UTxO query: {e}")))?;
+        let reg_unit = format!(
+            "{}{}",
+            flow.registry.hash_hex(),
+            hex::encode(accused_pool_id)
+        );
+        let reg_node = registry_raw
+            .iter()
+            .find(|u| u.amount.iter().any(|a| a.unit == reg_unit))
+            .ok_or_else(|| {
+                EpochError::Chain(format!(
+                    "accused pool {} is not in the on-chain registry",
+                    hex::encode(accused_pool_id)
+                ))
+            })?;
+
+        let cost_models =
+            crate::cardano::bf_http::fetch_cost_models(&self.bf_base_url, &self.bf_project_id)
+                .await
+                .map_err(|e| EpochError::Chain(format!("fetch cost models: {e}")))?;
+        let wallet_utxos = self.query_wallet_utxos().await?;
+        let onchain_evidence = match &prepared {
+            PreparedDkgFault::Round1 {
+                canonical_round1_bytes,
+                payload_signature,
+                halo2_proof,
+                ..
+            } => crate::cardano::fault_proof::FaultProofEvidence::Round1InvalidPayload(
+                crate::cardano::fault_proof::Round1InvalidPayloadEvidence {
+                    accused_pool_id: &accused_pool_id,
+                    canonical_round1_bytes,
+                    payload_signature,
+                    halo2_proof,
+                    halo2_public_inputs: &public_inputs,
+                },
+            ),
+            PreparedDkgFault::Round2 {
+                canonical_round1_bytes,
+                round1_signature,
+                canonical_round2_bytes,
+                round2_signature,
+                round2_entry_index,
+                pad,
+                opened_share,
+                halo2_proof,
+                ..
+            } => crate::cardano::fault_proof::FaultProofEvidence::Round2InvalidPayload(
+                crate::cardano::fault_proof::Round2InvalidPayloadEvidence {
+                    accused_pool_id: &accused_pool_id,
+                    canonical_round1_bytes,
+                    round1_signature,
+                    canonical_round2_bytes,
+                    round2_signature,
+                    round2_entry_index: *round2_entry_index,
+                    pad,
+                    opened_share,
+                    halo2_proof,
+                    halo2_public_inputs: &public_inputs,
+                },
+            ),
+            PreparedDkgFault::Equivocation {
+                payload_a,
+                signature_a,
+                payload_b,
+                signature_b,
+                ..
+            } => crate::cardano::fault_proof::FaultProofEvidence::Equivocation(
+                crate::cardano::fault_proof::EquivocationEvidence {
+                    accused_pool_id: &accused_pool_id,
+                    payload_a,
+                    signature_a,
+                    payload_b,
+                    signature_b,
+                    evidence_hash: &evidence_hash,
+                },
+            ),
+        };
+        let mint = crate::cardano::fault_proof::build_fault_proof_mint_tx(
+            &crate::cardano::fault_proof::FaultProofMintRequest {
+                fault_verifier_script: fault_script,
+                fault_verifier_ref_script: Some(crate::cardano::fault_proof::FaultProofRefScript {
+                    tx_hash: &fault_ref.tx_hash,
+                    output_index: fault_ref.output_index,
+                    script_size: fault_script.cbor.len(),
+                }),
+                evidence: onchain_evidence,
+                registration_ref: (&reg_node.tx_hash, reg_node.output_index),
+                wallet_address: wallet_addr,
+                wallet_utxos: &wallet_utxos,
+                key,
+                cost_models: Some(cost_models.clone()),
+            },
+        )
+        .map_err(|e| EpochError::Chain(format!("build fault-proof mint tx: {e}")))?;
+        eprintln!(
+            "[fault-ban] built FaultProof mint: policy={} token_name={}",
+            mint.policy_id_hex,
+            hex::encode(mint.token_name)
+        );
+        self.submit_cardano_tx("fault-proof mint", &mint.signed_tx_hex)
+            .await?;
+
+        let fault_unit = format!("{}{}", mint.policy_id_hex, hex::encode(mint.token_name));
+        let (fault_bf, wallet_raw_after_mint) =
+            self.wait_for_wallet_token_utxo(&fault_unit).await?;
+        let fault_lovelace = lovelace_of(&fault_bf);
+        let fault_utxo = crate::cardano::apply_ban::FaultProofUtxo {
+            tx_hash: fault_bf.tx_hash,
+            output_index: fault_bf.output_index,
+            lovelace: fault_lovelace,
+        };
+
+        let ban_addr = flow.spo_bans.enterprise_address(network);
+        let ban_raw = crate::cardano::bf_http::fetch_address_utxos(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            &ban_addr,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("ban UTxO query: {e}")))?;
+        let window =
+            crate::cardano::bf_http::fetch_epoch_window(&self.bf_base_url, &self.bf_project_id)
+                .await
+                .map_err(|e| EpochError::Chain(format!("epoch window: {e}")))?;
+        let max_window_slots = (flow.ban_params.max_validity_window_ms / 1000).max(1) as u64;
+        let avail = window.epoch_end_slot.saturating_sub(window.current_slot);
+        let w = max_window_slots.min(avail);
+        let invalid_before = window.current_slot;
+        let invalid_hereafter = window.current_slot + w;
+        let start_time_ms = window.block_time_ms + (w as i64) * 1000 - 1;
+        let wallet_utxos_after_mint: Vec<WalletUtxo> = wallet_raw_after_mint
+            .iter()
+            .map(WalletUtxo::from_bf)
+            .collect();
+        let apply = crate::cardano::apply_ban::build_apply_ban_tx(
+            &crate::cardano::apply_ban::ApplyBanRequest {
+                spo_bans_script: &flow.spo_bans,
+                fault_verifier_script: fault_script,
+                fault_verifier_ref: Some((fault_ref.tx_hash.clone(), fault_ref.output_index)),
+                ban_params: &flow.ban_params,
+                accused_pool_id,
+                evidence_hash,
+                ban_utxos: &ban_raw,
+                fault_utxo: &fault_utxo,
+                registration_ref: (reg_node.tx_hash.clone(), reg_node.output_index),
+                spo_bans_ref: (
+                    flow.spo_bans_ref.tx_hash.clone(),
+                    flow.spo_bans_ref.output_index,
+                ),
+                mainnet,
+                start_time_ms,
+                invalid_before,
+                invalid_hereafter,
+                wallet_address: wallet_addr,
+                wallet_utxos: &wallet_utxos_after_mint,
+                key,
+                cost_models: Some(cost_models),
+            },
+        )
+        .map_err(|e| EpochError::Chain(format!("build apply-ban tx: {e}")))?;
+        eprintln!(
+            "[fault-ban] built ApplyBan: first_ban={} counter={} until={}",
+            apply.first_ban, apply.ban_node.ban_counter, apply.ban_node.ban_until_time
+        );
+        self.submit_cardano_tx("apply-ban", &apply.signed_tx_hex)
+            .await?;
+        Ok(())
+    }
+}
+
+fn lovelace_of(utxo: &crate::cardano::bf_http::BfUtxo) -> u64 {
+    utxo.amount
+        .iter()
+        .find(|a| a.unit == "lovelace")
+        .and_then(|a| a.quantity.parse().ok())
+        .unwrap_or(0)
 }
 
 #[async_trait]
@@ -480,12 +1092,16 @@ impl CardanoChain for BlockfrostCardanoChain {
         &self,
         evidence: crate::epoch::traits::DkgFaultEvidence,
     ) -> EpochResult<()> {
-        Err(EpochError::Chain(format!(
-            "automatic DKG fault publication is not wired for live Cardano yet \
-             (kind={}, accused_pool_id={})",
-            evidence.kind_label(),
-            hex::encode(evidence.accused_pool_id())
-        )))
+        let Some(flow) = self.fault_ban_flow.clone() else {
+            return Err(EpochError::Chain(format!(
+                "automatic DKG fault banning is not configured \
+                 (kind={}, accused_pool_id={})",
+                evidence.kind_label(),
+                hex::encode(evidence.accused_pool_id())
+            )));
+        };
+        self.publish_dkg_fault_and_apply_ban_live(&flow, evidence)
+            .await
     }
 
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>> {

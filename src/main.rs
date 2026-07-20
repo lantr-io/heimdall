@@ -324,6 +324,9 @@ enum Commands {
         /// The fault evidence hash (32-byte hex) that binds the FaultProof token.
         #[arg(long)]
         evidence_hash: String,
+        /// Fault policy kind: round1, round2, or equivocation.
+        #[arg(long)]
+        fault_kind: String,
         /// The spo_bans reference-script UTxO (<tx_hash>:<index>): the script is
         /// used three times in the tx and would not fit embedded.
         #[arg(long)]
@@ -346,27 +349,10 @@ enum Commands {
         /// EquivocationProof branch references registration nodes).
         #[arg(long)]
         registry_bootstrap: String,
-        /// Derive `kind` + `namespace_hash` + `evidence_hash` from a captured
-        /// DKG-evidence JSON file (WI-019) instead of passing opaque hashes.
-        /// When set, --kind/--accused-pool-id/--namespace-hash/--evidence-hash
-        /// are ignored. See `run_fault_proof_mint` for the JSON shape.
+        /// Captured DKG evidence JSON file. Invalid-payload evidence must
+        /// include the Halo2 proof bytes expected by the verifier policy.
         #[arg(long)]
-        evidence_file: Option<String>,
-        /// Fault kind: `invalid-payload` or `equivocation`. Required unless
-        /// --evidence-file is given.
-        #[arg(long)]
-        kind: Option<String>,
-        /// The accused pool id (28-byte hex). Required unless --evidence-file.
-        #[arg(long)]
-        accused_pool_id: Option<String>,
-        /// The protocol namespace hash (32-byte hex) — descriptive datum field.
-        /// Required unless --evidence-file.
-        #[arg(long)]
-        namespace_hash: Option<String>,
-        /// The fault evidence hash (32-byte hex) — binds the FaultProof token.
-        /// Required unless --evidence-file.
-        #[arg(long)]
-        evidence_hash: Option<String>,
+        evidence_file: String,
         /// Actually submit via Blockfrost.
         #[arg(long)]
         submit: bool,
@@ -757,6 +743,7 @@ fn main() {
             registry_bootstrap,
             accused_pool_id,
             evidence_hash,
+            fault_kind,
             spo_bans_ref,
             submit,
         } => {
@@ -766,6 +753,7 @@ fn main() {
                 registry_bootstrap,
                 accused_pool_id,
                 evidence_hash,
+                fault_kind,
                 spo_bans_ref,
                 submit,
             };
@@ -779,10 +767,6 @@ fn main() {
             blueprint,
             registry_bootstrap,
             evidence_file,
-            kind,
-            accused_pool_id,
-            namespace_hash,
-            evidence_hash,
             submit,
         } => {
             let cfg = load_config(config.as_deref());
@@ -790,10 +774,6 @@ fn main() {
                 blueprint,
                 registry_bootstrap,
                 evidence_file,
-                kind,
-                accused_pool_id,
-                namespace_hash,
-                evidence_hash,
                 submit,
             };
             if let Err(e) = run_fault_proof_mint(&cfg, &args) {
@@ -1051,6 +1031,19 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
                     Ok(Some(bans)) => {
                         println!("on-chain ban list:     {}", bans.ban_address);
                         bf_chain = bf_chain.with_ban_source(bans);
+                        match heimdall::cardano::blockfrost_chain::DkgFaultBanFlow::from_config(
+                            &cfg.cardano,
+                        ) {
+                            Ok(Some(flow)) => {
+                                println!("automatic DKG fault banning: enabled");
+                                bf_chain = bf_chain.with_dkg_fault_ban_flow(flow);
+                            }
+                            Ok(None) => unreachable!("ban list is configured"),
+                            Err(e) => {
+                                eprintln!("fatal: DKG fault-ban flow config: {e}");
+                                std::process::exit(1);
+                            }
+                        }
                     }
                     Ok(None) => println!(
                         "note: no ban list configured (cardano.ban_bootstrap) — roster not \
@@ -1919,6 +1912,7 @@ struct ApplyBanArgs {
     registry_bootstrap: String,
     accused_pool_id: String,
     evidence_hash: String,
+    fault_kind: String,
     spo_bans_ref: String,
     submit: bool,
 }
@@ -1927,11 +1921,7 @@ struct ApplyBanArgs {
 struct FaultProofMintArgs {
     blueprint: String,
     registry_bootstrap: String,
-    evidence_file: Option<String>,
-    kind: Option<String>,
-    accused_pool_id: Option<String>,
-    namespace_hash: Option<String>,
-    evidence_hash: Option<String>,
+    evidence_file: String,
     submit: bool,
 }
 
@@ -1967,10 +1957,18 @@ fn parse_hex_n<const N: usize>(arg: &str, what: &str) -> Result<[u8; N], String>
         .ok_or_else(|| format!("{what}: expected {N} bytes of hex"))
 }
 
-/// Unwrap a CLI arg that is required unless `--evidence-file` supplies it.
-fn req_arg<'a>(arg: &'a Option<String>, what: &str) -> Result<&'a str, String> {
-    arg.as_deref()
-        .ok_or_else(|| format!("{what} is required (or pass --evidence-file)"))
+fn parse_fault_verifier_kind(
+    value: &str,
+) -> Result<heimdall::cardano::blueprint::FaultVerifierKind, String> {
+    use heimdall::cardano::blueprint::FaultVerifierKind;
+    match value {
+        "round1" | "invalid-payload-round1" => Ok(FaultVerifierKind::Round1),
+        "round2" | "invalid-payload-round2" => Ok(FaultVerifierKind::Round2),
+        "equivocation" => Ok(FaultVerifierKind::Equivocation),
+        other => Err(format!(
+            "fault kind must be round1, round2, or equivocation; got `{other}`"
+        )),
+    }
 }
 
 fn parse_points(hexes: &[String]) -> Result<Vec<[u8; 33]>, String> {
@@ -1989,9 +1987,12 @@ fn parse_points(hexes: &[String]) -> Result<Vec<[u8; 33]>, String> {
 /// accused did not author.
 ///
 /// One of three shapes selected by `kind`:
-/// - `"invalid-payload-round1"`: `identifier`, `commitments[]`, `sigma_i`, `payload_signature`
-/// - `"invalid-payload-round2"`: `recipient_index`, `sender_commitments[]`, `share`,
-///   `round2_canonical_bytes`, `payload_signature`
+/// - `"invalid-payload-round1"`: `identifier`, `commitments[]`, `sigma_i`,
+///   `payload_signature`, `halo2_proof`
+/// - `"invalid-payload-round2"`: `recipient_index`, `round2_entry_index`,
+///   `sender_commitments[]`, `canonical_round1_bytes`, `round1_signature`,
+///   `share`, `pad`, `round2_canonical_bytes`, `round2_signature`,
+///   `halo2_proof`
 /// - `"equivocation"`: `round` (`"round1"|"round2"`), `payload_a`/`signature_a`,
 ///   `payload_b`/`signature_b` (payloads are the canonical signed bytes)
 ///
@@ -2016,9 +2017,21 @@ struct EvidenceFile {
     #[serde(default)]
     sender_commitments: Option<Vec<String>>,
     #[serde(default)]
+    canonical_round1_bytes: Option<String>,
+    #[serde(default)]
+    round1_signature: Option<String>,
+    #[serde(default)]
+    round2_entry_index: Option<u32>,
+    #[serde(default)]
     share: Option<String>,
     #[serde(default)]
+    pad: Option<String>,
+    #[serde(default)]
     round2_canonical_bytes: Option<String>,
+    #[serde(default)]
+    round2_signature: Option<String>,
+    #[serde(default)]
+    halo2_proof: Option<String>,
     #[serde(default)]
     payload_signature: Option<String>,
     #[serde(default)]
@@ -2033,22 +2046,40 @@ struct EvidenceFile {
     signature_b: Option<String>,
 }
 
-/// The datum fields `build_fault_proof_mint_tx` needs, derived from captured
-/// evidence, plus the on-chain `EquivocationProof` witness when applicable.
+/// The evidence fields `build_fault_proof_mint_tx` needs, derived from captured
+/// evidence.
 #[derive(Debug)]
 struct DerivedFault {
-    kind: heimdall::cardano::fault_proof::FaultKind,
-    accused_pool_id: Vec<u8>,
+    kind: heimdall::cardano::blueprint::FaultVerifierKind,
+    accused_pool_id: [u8; 28],
     namespace_hash: [u8; 32],
     evidence_hash: [u8; 32],
-    /// `Some` iff `kind == Equivocation` — the two signed payloads the
-    /// `fault_verifier` EquivocationProof branch verifies.
+    round1_invalid: Option<DerivedRound1Invalid>,
+    round2_invalid: Option<DerivedRound2Invalid>,
     equivocation: Option<DerivedEquivocation>,
 }
 
 #[derive(Debug)]
+struct DerivedRound1Invalid {
+    canonical_round1_bytes: Vec<u8>,
+    payload_signature: [u8; 64],
+    halo2_proof: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct DerivedRound2Invalid {
+    canonical_round1_bytes: Vec<u8>,
+    round1_signature: [u8; 64],
+    canonical_round2_bytes: Vec<u8>,
+    round2_signature: [u8; 64],
+    round2_entry_index: u32,
+    pad: [u8; 32],
+    opened_share: [u8; 32],
+    halo2_proof: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct DerivedEquivocation {
-    bifrost_id_pk: [u8; 32],
     payload_a: Vec<u8>,
     signature_a: [u8; 64],
     payload_b: Vec<u8>,
@@ -2063,12 +2094,28 @@ fn decode_var(v: &Option<String>, what: &str) -> Result<Vec<u8>, String> {
     hex::decode(req_field(v, what)?.trim()).map_err(|_| format!("{what}: bad hex"))
 }
 
+fn decode_optional_var(v: &Option<String>) -> Result<Vec<u8>, String> {
+    match v {
+        Some(value) => hex::decode(value.trim()).map_err(|_| "halo2_proof: bad hex".to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn round2_signature_field(file: &EvidenceFile) -> Result<[u8; 64], String> {
+    let raw = file
+        .round2_signature
+        .as_ref()
+        .or(file.payload_signature.as_ref())
+        .ok_or("evidence: missing `round2_signature`")?;
+    parse_hex_n::<64>(raw, "round2_signature")
+}
+
 impl EvidenceFile {
     /// Derive `(kind, accused_pool_id, namespace_hash, evidence_hash)` from the
     /// captured evidence. Verifies the accused's payload signature and that the
     /// evidence actually encodes a fault before deriving.
     fn derive(&self) -> Result<DerivedFault, String> {
-        use heimdall::cardano::fault_proof::FaultKind;
+        use heimdall::cardano::blueprint::FaultVerifierKind;
         use heimdall::circuits::fault_evidence as fe;
 
         let accused_pool_id: [u8; 28] =
@@ -2103,10 +2150,16 @@ impl EvidenceFile {
                     return Err("round1 evidence does not encode a fault (PoK verifies)".into());
                 }
                 Ok(DerivedFault {
-                    kind: FaultKind::InvalidPayload,
-                    accused_pool_id: accused_pool_id.to_vec(),
+                    kind: FaultVerifierKind::Round1,
+                    accused_pool_id,
                     namespace_hash: ev.namespace_hash(),
                     evidence_hash: ev.evidence_hash().map_err(to_err)?,
+                    round1_invalid: Some(DerivedRound1Invalid {
+                        canonical_round1_bytes: ev.canonical_bytes().map_err(to_err)?,
+                        payload_signature: ev.payload_signature,
+                        halo2_proof: decode_optional_var(&self.halo2_proof)?,
+                    }),
+                    round2_invalid: None,
                     equivocation: None,
                 })
             }
@@ -2120,30 +2173,50 @@ impl EvidenceFile {
                     recipient_index: self
                         .recipient_index
                         .ok_or("round2 evidence: missing `recipient_index`")?,
+                    round2_entry_index: self
+                        .round2_entry_index
+                        .ok_or("round2 evidence: missing `round2_entry_index`")?,
                     sender_commitments: parse_points(
                         self.sender_commitments
                             .as_deref()
                             .ok_or("round2 evidence: missing `sender_commitments`")?,
                     )?,
+                    canonical_round1_bytes: decode_var(
+                        &self.canonical_round1_bytes,
+                        "canonical_round1_bytes",
+                    )?,
+                    round1_signature: parse_hex_n::<64>(
+                        req_field(&self.round1_signature, "round1_signature")?,
+                        "round1_signature",
+                    )?,
                     share: parse_hex_n::<32>(req_field(&self.share, "share")?, "share")?,
+                    pad: parse_hex_n::<32>(req_field(&self.pad, "pad")?, "pad")?,
                     round2_canonical_bytes: decode_var(
                         &self.round2_canonical_bytes,
                         "round2_canonical_bytes",
                     )?,
-                    payload_signature: parse_hex_n::<64>(
-                        req_field(&self.payload_signature, "payload_signature")?,
-                        "payload_signature",
-                    )?,
+                    round2_signature: round2_signature_field(self)?,
                 };
                 ev.verify_payload_signature().map_err(to_err)?;
                 if !ev.is_fault().map_err(to_err)? {
                     return Err("round2 evidence does not encode a fault (share verifies)".into());
                 }
                 Ok(DerivedFault {
-                    kind: FaultKind::InvalidPayload,
-                    accused_pool_id: accused_pool_id.to_vec(),
+                    kind: FaultVerifierKind::Round2,
+                    accused_pool_id,
                     namespace_hash: ev.namespace_hash(),
                     evidence_hash: fe::round2_evidence_hash_dyn(&ev).map_err(to_err)?,
+                    round1_invalid: None,
+                    round2_invalid: Some(DerivedRound2Invalid {
+                        canonical_round1_bytes: ev.canonical_round1_bytes,
+                        round1_signature: ev.round1_signature,
+                        canonical_round2_bytes: ev.round2_canonical_bytes,
+                        round2_signature: ev.round2_signature,
+                        round2_entry_index: ev.round2_entry_index,
+                        pad: ev.pad,
+                        opened_share: ev.share,
+                        halo2_proof: decode_optional_var(&self.halo2_proof)?,
+                    }),
                     equivocation: None,
                 })
             }
@@ -2177,12 +2250,13 @@ impl EvidenceFile {
                 };
                 ev.verify().map_err(to_err)?;
                 Ok(DerivedFault {
-                    kind: FaultKind::Equivocation,
-                    accused_pool_id: accused_pool_id.to_vec(),
+                    kind: FaultVerifierKind::Equivocation,
+                    accused_pool_id,
                     namespace_hash: ev.namespace_hash(),
                     evidence_hash: ev.evidence_hash(),
+                    round1_invalid: None,
+                    round2_invalid: None,
                     equivocation: Some(DerivedEquivocation {
-                        bifrost_id_pk: ev.bifrost_id_pk,
                         payload_a: ev.payload_a,
                         signature_a: ev.signature_a,
                         payload_b: ev.payload_b,
@@ -2494,7 +2568,8 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let fault = fault_verifier_script(&blueprint_json, &registry.hash)
+    let fault_kind = parse_fault_verifier_kind(&args.fault_kind)?;
+    let fault = fault_verifier_script(&blueprint_json, fault_kind, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
 
     // The ban policy is config-pinned (ban bootstrap + fault-policy set + schedule).
@@ -2597,21 +2672,21 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
         })?;
 
     // Validity interval: [current_slot, current_slot + W), W*1s within both the
-    // ban validator's max_validity_window_ms and the epoch horizon. start_time
-    // is the POSIX-ms upper bound the validator resolves (drives BanNodeData).
-    // NOTE: the exact inclusivity of the resolved upper bound is ledger-defined;
-    // verify start_time against a real node on a devnet before relying on it.
+    // ban validator's max_validity_window_ms and the epoch horizon. Plutus
+    // exposes finite upper bounds as exclusive, so spo_bans resolves the
+    // POSIX-ms upper bound as `slot_to_posix(invalid_hereafter) - 1`.
     let max_window_slots = (params.max_validity_window_ms / 1000).max(1) as u64;
     let avail = window.epoch_end_slot.saturating_sub(window.current_slot);
     let w = max_window_slots.min(avail);
     let invalid_before = window.current_slot;
     let invalid_hereafter = window.current_slot + w;
-    let start_time_ms = window.block_time_ms + (w as i64) * 1000;
+    let start_time_ms = window.block_time_ms + (w as i64) * 1000 - 1;
 
     let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
     let req = ApplyBanRequest {
         spo_bans_script: &spo_bans,
         fault_verifier_script: &fault,
+        fault_verifier_ref: None,
         ban_params: &params,
         accused_pool_id,
         evidence_hash,
@@ -2660,13 +2735,13 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
 
 /// Build (and with `--submit`, broadcast) the `fault_verifier.PublishProof` tx:
 /// mint the FaultProof token `blake2b_256(accused_pool_id || evidence_hash)` and
-/// park it at the wallet with the inline FaultProofDatum (WI-018 pt3b). A later
-/// `apply-ban` consumes + burns it.
+/// park it at the wallet. A later `apply-ban` consumes + burns it.
 fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Result<(), String> {
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{fault_verifier_script, spos_registry_script};
     use heimdall::cardano::fault_proof::{
-        EquivocationWitness, FaultKind, FaultProofDatum, FaultProofMintRequest,
+        EquivocationEvidence as OnchainEquivocationEvidence, FaultProofEvidence,
+        FaultProofMintRequest, Round1InvalidPayloadEvidence, Round2InvalidPayloadEvidence,
         build_fault_proof_mint_tx,
     };
     use heimdall::cardano::publish::WalletUtxo;
@@ -2678,69 +2753,19 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
 
     let blueprint_json = std::fs::read_to_string(&args.blueprint)
         .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
-    // The fault_verifier policy is parameterized by the spos_registry policy id
-    // (its EquivocationProof branch references registration nodes).
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let fault_vscript = fault_verifier_script(&blueprint_json, &registry.hash)
+    let json = std::fs::read_to_string(&args.evidence_file)
+        .map_err(|e| format!("read evidence file {}: {e}", args.evidence_file))?;
+    let ev: EvidenceFile = serde_json::from_str(&json)
+        .map_err(|e| format!("parse evidence file {}: {e}", args.evidence_file))?;
+    let derived = ev.derive()?;
+    println!("derived from evidence ({}):", ev.kind);
+    println!("  evidence_hash:   {}", hex::encode(derived.evidence_hash));
+    println!("  namespace_hash:  {}", hex::encode(derived.namespace_hash));
+    let fault_vscript = fault_verifier_script(&blueprint_json, derived.kind, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
-
-    // Two ways to supply the datum fields: derive them from a captured-evidence
-    // JSON file (WI-019 — real evidence_hash + equivocation witness), or pass
-    // them as opaque hex (InvalidPayload only).
-    let derived: DerivedFault = if let Some(path) = &args.evidence_file {
-        let json =
-            std::fs::read_to_string(path).map_err(|e| format!("read evidence file {path}: {e}"))?;
-        let ev: EvidenceFile =
-            serde_json::from_str(&json).map_err(|e| format!("parse evidence file {path}: {e}"))?;
-        let derived = ev.derive()?;
-        println!("derived from evidence ({}):", ev.kind);
-        println!("  evidence_hash:   {}", hex::encode(derived.evidence_hash));
-        println!("  namespace_hash:  {}", hex::encode(derived.namespace_hash));
-        derived
-    } else {
-        let kind = match args.kind.as_deref() {
-            Some("invalid-payload") => FaultKind::InvalidPayload,
-            Some("equivocation") => {
-                return Err(
-                    "equivocation faults require --evidence-file (the two signed payloads); \
-                     the opaque-hash path only supports invalid-payload"
-                        .into(),
-                );
-            }
-            other => {
-                return Err(format!(
-                    "--kind must be `invalid-payload` (or pass --evidence-file), got {other:?}"
-                ));
-            }
-        };
-        let pool: [u8; 28] = parse_hex_n(
-            req_arg(&args.accused_pool_id, "--accused-pool-id")?,
-            "--accused-pool-id",
-        )?;
-        let ns: [u8; 32] = parse_hex_n(
-            req_arg(&args.namespace_hash, "--namespace-hash")?,
-            "--namespace-hash",
-        )?;
-        let ev: [u8; 32] = parse_hex_n(
-            req_arg(&args.evidence_hash, "--evidence-hash")?,
-            "--evidence-hash",
-        )?;
-        DerivedFault {
-            kind,
-            accused_pool_id: pool.to_vec(),
-            namespace_hash: ns,
-            evidence_hash: ev,
-            equivocation: None,
-        }
-    };
-    let fault = FaultProofDatum {
-        kind: derived.kind,
-        accused_pool_id: derived.accused_pool_id.clone(),
-        namespace_hash: derived.namespace_hash.to_vec(),
-        evidence_hash: derived.evidence_hash.to_vec(),
-    };
 
     let pid = cfg
         .cardano
@@ -2758,52 +2783,90 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
 
-    // For Equivocation, locate the accused's spos_registry node — added as a
-    // read-only reference input so the validator binds bifrost_id_pk to the pool.
-    let registration_ref: Option<(String, u32)> = if derived.equivocation.is_some() {
-        let registry_addr = registry.enterprise_address(network_of(&wallet_addr));
-        let registry_raw = rt
-            .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
-            .map_err(|e| format!("registry UTxO query: {e}"))?;
-        let reg_unit = format!(
-            "{}{}",
-            registry.hash_hex(),
-            hex::encode(&derived.accused_pool_id)
-        );
-        let node = registry_raw
-            .iter()
-            .find(|u| u.amount.iter().any(|a| a.unit == reg_unit))
-            .ok_or_else(|| {
-                format!(
-                    "accused pool {} is not in the on-chain registry — cannot reference it",
-                    hex::encode(&derived.accused_pool_id)
-                )
-            })?;
-        Some((node.tx_hash.clone(), node.output_index))
-    } else {
-        None
+    let registry_addr = registry.enterprise_address(network_of(&wallet_addr));
+    let registry_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
+        .map_err(|e| format!("registry UTxO query: {e}"))?;
+    let reg_unit = format!(
+        "{}{}",
+        registry.hash_hex(),
+        hex::encode(derived.accused_pool_id)
+    );
+    let node = registry_raw
+        .iter()
+        .find(|u| u.amount.iter().any(|a| a.unit == reg_unit))
+        .ok_or_else(|| {
+            format!(
+                "accused pool {} is not in the on-chain registry — cannot reference it",
+                hex::encode(derived.accused_pool_id)
+            )
+        })?;
+    let registration_ref = (node.tx_hash.clone(), node.output_index);
+
+    let public_inputs = vec![
+        derived.evidence_hash.to_vec(),
+        derived.accused_pool_id.to_vec(),
+    ];
+    let evidence = match derived.kind {
+        heimdall::cardano::blueprint::FaultVerifierKind::Round1 => {
+            let Some(round1) = derived.round1_invalid.as_ref() else {
+                return Err("round1 fault evidence missing".into());
+            };
+            if round1.halo2_proof.is_empty() {
+                return Err("round1 invalid-payload evidence requires `halo2_proof`".into());
+            }
+            FaultProofEvidence::Round1InvalidPayload(Round1InvalidPayloadEvidence {
+                accused_pool_id: &derived.accused_pool_id,
+                canonical_round1_bytes: &round1.canonical_round1_bytes,
+                payload_signature: &round1.payload_signature,
+                halo2_proof: &round1.halo2_proof,
+                halo2_public_inputs: &public_inputs,
+            })
+        }
+        heimdall::cardano::blueprint::FaultVerifierKind::Round2 => {
+            let Some(round2) = derived.round2_invalid.as_ref() else {
+                return Err("round2 fault evidence missing".into());
+            };
+            if round2.halo2_proof.is_empty() {
+                return Err("round2 invalid-payload evidence requires `halo2_proof`".into());
+            }
+            FaultProofEvidence::Round2InvalidPayload(Round2InvalidPayloadEvidence {
+                accused_pool_id: &derived.accused_pool_id,
+                canonical_round1_bytes: &round2.canonical_round1_bytes,
+                round1_signature: &round2.round1_signature,
+                canonical_round2_bytes: &round2.canonical_round2_bytes,
+                round2_signature: &round2.round2_signature,
+                round2_entry_index: round2.round2_entry_index,
+                pad: &round2.pad,
+                opened_share: &round2.opened_share,
+                halo2_proof: &round2.halo2_proof,
+                halo2_public_inputs: &public_inputs,
+            })
+        }
+        heimdall::cardano::blueprint::FaultVerifierKind::Equivocation => {
+            let Some(eq) = derived.equivocation.as_ref() else {
+                return Err("equivocation evidence missing".into());
+            };
+            FaultProofEvidence::Equivocation(OnchainEquivocationEvidence {
+                accused_pool_id: &derived.accused_pool_id,
+                payload_a: &eq.payload_a,
+                signature_a: &eq.signature_a,
+                payload_b: &eq.payload_b,
+                signature_b: &eq.signature_b,
+                evidence_hash: &derived.evidence_hash,
+            })
+        }
     };
 
     let req = FaultProofMintRequest {
         fault_verifier_script: &fault_vscript,
-        fault: &fault,
+        fault_verifier_ref_script: None,
+        evidence,
+        registration_ref: (&registration_ref.0, registration_ref.1),
         wallet_address: &wallet_addr,
         wallet_utxos: &wallet_utxos,
         key: &key,
         cost_models: Some(cost_models),
-        equivocation: derived.equivocation.as_ref().map(|e| EquivocationWitness {
-            bifrost_id_pk: &e.bifrost_id_pk,
-            payload_a: &e.payload_a,
-            signature_a: &e.signature_a,
-            payload_b: &e.payload_b,
-            signature_b: &e.signature_b,
-            registration_ref: {
-                let (h, i) = registration_ref
-                    .as_ref()
-                    .expect("equivocation => registration_ref set");
-                (h.as_str(), *i)
-            },
-        }),
     };
     let built =
         build_fault_proof_mint_tx(&req).map_err(|e| format!("build fault-proof mint tx: {e}"))?;
@@ -2817,10 +2880,6 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
     println!(
         "parked at:         {} ({} lovelace) — spend with `apply-ban`",
         built.proof_address, built.lovelace
-    );
-    println!(
-        "nonce input_ref:   {}:{}",
-        built.input_ref.0, built.input_ref.1
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
@@ -4051,7 +4110,7 @@ mod tests {
     use bitcoin::secp256k1::rand::rngs::OsRng;
     use bitcoin::secp256k1::{Keypair, Secp256k1};
     use frost_secp256k1_tr::Identifier;
-    use heimdall::cardano::fault_proof::FaultKind;
+    use heimdall::cardano::blueprint::FaultVerifierKind;
     use heimdall::circuits::fault_evidence as fe;
     use heimdall::frost::participant;
     use heimdall::http::{auth, canonical, frost_bridge};
@@ -4116,10 +4175,12 @@ mod tests {
         let ev = signed_round1(true);
         let parsed: EvidenceFile = serde_json::from_value(round1_json(&ev)).unwrap();
         let d = parsed.derive().unwrap();
-        assert_eq!(d.kind, FaultKind::InvalidPayload);
-        assert_eq!(d.accused_pool_id, ev.accused_pool_id.to_vec());
+        assert_eq!(d.kind, FaultVerifierKind::Round1);
+        assert_eq!(d.accused_pool_id, ev.accused_pool_id);
         assert_eq!(d.evidence_hash, ev.evidence_hash().unwrap());
         assert_eq!(d.namespace_hash, ev.namespace_hash());
+        assert!(d.round1_invalid.is_some());
+        assert!(d.round2_invalid.is_none());
         assert!(d.equivocation.is_none());
     }
 
@@ -4199,13 +4260,12 @@ mod tests {
         });
         let parsed: EvidenceFile = serde_json::from_value(json).unwrap();
         let d = parsed.derive().unwrap();
-        assert_eq!(d.kind, FaultKind::Equivocation);
-        assert_eq!(d.accused_pool_id, ev.accused_pool_id.to_vec());
+        assert_eq!(d.kind, FaultVerifierKind::Equivocation);
+        assert_eq!(d.accused_pool_id, ev.accused_pool_id);
         assert_eq!(d.evidence_hash, ev.evidence_hash());
         assert_eq!(d.namespace_hash, ev.namespace_hash());
         // the equivocation witness is carried through to the mint redeemer
         let w = d.equivocation.expect("equivocation witness");
-        assert_eq!(w.bifrost_id_pk, ev.bifrost_id_pk);
         assert_eq!(w.payload_a, ev.payload_a);
         assert_eq!(w.signature_a, ev.signature_a);
         assert_eq!(w.payload_b, ev.payload_b);

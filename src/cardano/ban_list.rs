@@ -786,19 +786,29 @@ impl BanListSource {
         let registry =
             blueprint::spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
                 .map_err(|e| err("spos_registry", e))?;
-        // Guard the most dangerous misconfig: heimdall's own fault_verifier (the
-        // policy minting the FaultProofs heimdall publishes) MUST be one of the
-        // authorized 3, or those proofs could never be applied — and a wrong set
-        // silently derives the wrong ban address (→ an empty ban list → banned
-        // SPOs slipping into the roster).
-        let fault_verifier =
-            blueprint::validator_hash(&blueprint_json, blueprint::FAULT_VERIFIER_TITLE)
-                .map_err(|e| err("fault_verifier", e))?;
-        if !params.fault_proof_policies.contains(&fault_verifier) {
+        // Guard the most dangerous misconfig: the three fault policies Heimdall
+        // publishes under must be exactly the policies authorized by spo_bans.
+        let own_fault_policies = [
+            blueprint::fault_verifier_round1_script(&blueprint_json, &registry.hash)
+                .map_err(|e| err("fault_verifier_round1", e))?
+                .hash,
+            blueprint::fault_verifier_round2_script(&blueprint_json, &registry.hash)
+                .map_err(|e| err("fault_verifier_round2", e))?
+                .hash,
+            blueprint::fault_verifier_equivocation_script(&blueprint_json, &registry.hash)
+                .map_err(|e| err("fault_verifier_equivocation", e))?
+                .hash,
+        ];
+        if own_fault_policies
+            .iter()
+            .any(|policy| !params.fault_proof_policies.contains(policy))
+        {
             return Err(BanListError::Config(format!(
-                "cardano.fault_proof_policies does not include the blueprint's fault_verifier \
-                 policy {} — heimdall's own FaultProofs could never be applied",
-                hex::encode(fault_verifier)
+                "cardano.fault_proof_policies must include Heimdall's Round 1, Round 2, and \
+                 equivocation fault policies: {}, {}, {}",
+                hex::encode(own_fault_policies[0]),
+                hex::encode(own_fault_policies[1]),
+                hex::encode(own_fault_policies[2])
             )));
         }
         let bans = blueprint::spo_bans_script(

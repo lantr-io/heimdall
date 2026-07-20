@@ -103,8 +103,8 @@ pub fn apply_ban_redeemer(
 
 /// `SpoBansMintRedeemer::MintBanNode` — constructor 1 (constructor 0 is
 /// `Bootstrap`). `withdraw_redeemer_index` points at the ApplyBan withdrawal in
-/// the tx's reward-withdrawal list; `pool_id` is the accused pool (the node's
-/// asset name is `"ban/" || pool_id`).
+/// the sorted `Transaction.redeemers` list, not just the withdrawal sublist;
+/// `pool_id` is the accused pool (the node's asset name is `"ban/" || pool_id`).
 #[must_use]
 pub fn mint_ban_node_redeemer(withdraw_redeemer_index: i64, pool_id: &[u8]) -> PlutusData {
     constr(1, vec![int(withdraw_redeemer_index), bytes(pool_id)])
@@ -184,6 +184,9 @@ pub struct ApplyBanRequest<'a> {
     /// The `fault_verifier` policy that minted the FaultProof (its token is
     /// burned). Must be one of the `ban_params.fault_proof_policies`.
     pub fault_verifier_script: &'a ParameterizedScript,
+    /// Optional deployed reference-script UTxO for the fault verifier burn.
+    /// When absent, the script is included in the transaction witness set.
+    pub fault_verifier_ref: Option<(String, u32)>,
     pub ban_params: &'a BanPolicyParams,
     /// 28-byte accused pool id (= `blake2b_224(cold_vkey)`).
     pub accused_pool_id: [u8; 28],
@@ -202,8 +205,9 @@ pub struct ApplyBanRequest<'a> {
     pub spo_bans_ref: (String, u32),
     pub mainnet: bool,
     /// Ban-start time (POSIX ms) = the resolved upper bound of the validity
-    /// interval the validator derives (`ban_start_time`). Drives the output
-    /// `BanNodeData`; the caller must set it to `slot_to_posix(invalid_hereafter)`.
+    /// interval the validator derives (`ban_start_time`). Finite transaction
+    /// upper bounds are exclusive in the Plutus script context, so the caller
+    /// must set this to `slot_to_posix(invalid_hereafter) - 1`.
     pub start_time_ms: i64,
     /// Validity interval (slots). Must be finite and `<= max_validity_window_ms`
     /// wide once converted to POSIX time (the validator enforces the width).
@@ -375,22 +379,28 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
     let ban_node_asset_name = [BAN_NODE_KEY_PREFIX, &req.accused_pool_id].concat();
     let ban_node_unit = format!("{ban_policy_hex}{}", hex::encode(&ban_node_asset_name));
 
-    // The single ApplyBan withdrawal sits at reward-redeemer index 0.
-    let withdraw_redeemer_index = 0i64;
-
     // Decide first-ban vs reban from the validated list, and produce: the ban
     // element UTxO to SPEND, the OUTPUT element datums + lovelaces, the ban-NFT
     // mints, and the redeemer's output indices.
     let existing = list
         .node(&req.accused_pool_id)
         .map(|(d, l)| (d.clone(), l.map(<[u8]>::to_vec)));
-    let (spend_utxo, outputs_data, ban_mints, ban_node_out, new_ban_node, is_first): (
+    let (
+        spend_utxo,
+        outputs_data,
+        ban_mints,
+        ban_node_out,
+        new_ban_node,
+        is_first,
+        withdraw_redeemer_index,
+    ): (
         &BanUtxo,
         Vec<(Vec<u8>, u64)>, // (inline datum cbor, lovelace) per output, in order
         Vec<MintItem>,
         i64,
         BanNodeData,
         bool,
+        i64,
     ) = match existing {
         // ── reban: spend the existing node, reproduce it with updated data ──
         Some((old, _link)) => {
@@ -424,6 +434,7 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
                 0,      // ban_node_output_index
                 updated,
                 false,
+                2, // sorted redeemers: spo_bans spend, fault burn, ApplyBan reward
             )
         }
         // ── first ban: insert a new node + mint its NFT ──────────────────────
@@ -439,6 +450,10 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
                 .iter()
                 .find(|u| u.asset_name == plan.anchor_asset_name)
                 .ok_or_else(|| ApplyBanError::Build("anchor UTxO not found in snapshot".into()))?;
+            // `stake_validator.validate_withdraw` indexes the sorted
+            // `Transaction.redeemers` list. In this first-ban shape the order
+            // is: spo_bans spend, fault burn, ban-node mint, ApplyBan reward.
+            let withdraw_redeemer_index = 3i64;
             let mint = MintItem::ScriptMint(ScriptMint {
                 mint: MintParameter {
                     policy_id: ban_policy_hex.clone(),
@@ -471,12 +486,33 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
                 1, // ban_node_output_index
                 new,
                 true,
+                withdraw_redeemer_index,
             )
         }
     };
 
     // The fault token burn (BurnProof, -1) under the fault_verifier policy.
     let fault_unit = format!("{fault_policy_hex}{}", hex::encode(token_name));
+    let fault_script_source = req.fault_verifier_ref.as_ref().map_or_else(
+        || {
+            ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
+                script_cbor: req.fault_verifier_script.cbor_hex(),
+                language_version: LanguageVersion::V3,
+            })
+        },
+        |(tx_hash, output_index)| {
+            ScriptSource::InlineScriptSource(InlineScriptSource {
+                ref_tx_in: RefTxIn {
+                    tx_hash: tx_hash.clone(),
+                    tx_index: *output_index,
+                    script_size: Some(req.fault_verifier_script.cbor.len()),
+                },
+                script_hash: fault_policy_hex.clone(),
+                language_version: LanguageVersion::V3,
+                script_size: req.fault_verifier_script.cbor.len(),
+            })
+        },
+    );
     let fault_burn = MintItem::ScriptMint(ScriptMint {
         mint: MintParameter {
             policy_id: fault_policy_hex.clone(),
@@ -490,10 +526,7 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
                 steps: 500_000_000,
             },
         }),
-        script_source: Some(ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
-            script_cbor: req.fault_verifier_script.cbor_hex(),
-            language_version: LanguageVersion::V3,
-        })),
+        script_source: Some(fault_script_source),
     });
     let mut mints = ban_mints;
     mints.push(fault_burn);
@@ -520,15 +553,19 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
     let fault_input_index = idx_of(&fault_ref);
     let ban_input_index = idx_of(&ban_ref);
 
-    // reference inputs: the registry node (data) + the spo_bans ref script.
-    // whisky appends the ref-script input(s); both get sorted by (tx_id,index)
-    // in the body. registration_ref_input_index = the registry node's slot.
+    // Reference inputs: the registry node (data), spo_bans ref script, and
+    // optional fault-verifier ref script. whisky appends ref-script inputs and
+    // the body sorts by (tx_id,index), so include every possible ref input when
+    // computing registration_ref_input_index.
     let reg_ref = (
         tx_id_bytes(&req.registration_ref.0)?,
         req.registration_ref.1,
     );
     let spo_ref = (tx_id_bytes(&req.spo_bans_ref.0)?, req.spo_bans_ref.1);
     let mut ref_sorted = vec![reg_ref, spo_ref];
+    if let Some((tx_hash, output_index)) = &req.fault_verifier_ref {
+        ref_sorted.push((tx_id_bytes(tx_hash)?, *output_index));
+    }
     ref_sorted.sort();
     ref_sorted.dedup();
     let registration_ref_input_index =
@@ -937,6 +974,37 @@ mod tests {
         BanElement::from_plutus_data(&d.0).unwrap()
     }
 
+    fn redeemer_data_by_tag(
+        tx: &Tx,
+        tag: pallas_primitives::conway::RedeemerTag,
+    ) -> Vec<PlutusData> {
+        use pallas_primitives::conway::Redeemers;
+
+        let redeemers = tx.transaction_witness_set.redeemer.as_ref().unwrap();
+        match redeemers {
+            Redeemers::List(rs) => rs
+                .iter()
+                .filter(|r| r.tag == tag)
+                .map(|r| r.data.clone())
+                .collect(),
+            Redeemers::Map(kv) => kv
+                .iter()
+                .filter(|(k, _)| k.tag == tag)
+                .map(|(_, v)| v.data.clone())
+                .collect(),
+        }
+    }
+
+    fn withdraw_redeemer_index_from_spend(data: &PlutusData) -> i64 {
+        let fields = plutus::constr_fields(data, 0).unwrap();
+        plutus::field_int(fields, 0).unwrap()
+    }
+
+    fn withdraw_redeemer_index_from_mint_ban_node(data: &PlutusData) -> Option<i64> {
+        let fields = plutus::constr_fields(data, 1).ok()?;
+        (fields.len() == 2).then(|| plutus::field_int(fields, 0).unwrap())
+    }
+
     fn request<'a>(
         spo_bans: &'a ParameterizedScript,
         fault: &'a ParameterizedScript,
@@ -952,6 +1020,7 @@ mod tests {
         ApplyBanRequest {
             spo_bans_script: spo_bans,
             fault_verifier_script: fault,
+            fault_verifier_ref: None,
             ban_params: params,
             accused_pool_id: pool,
             evidence_hash: evidence,
@@ -1145,6 +1214,16 @@ mod tests {
                 .map_or(0, |w| w.len()),
             1
         );
+        let spend_redeemers =
+            redeemer_data_by_tag(&tx, pallas_primitives::conway::RedeemerTag::Spend);
+        assert_eq!(spend_redeemers.len(), 1);
+        assert_eq!(withdraw_redeemer_index_from_spend(&spend_redeemers[0]), 3);
+        let ban_mint_withdraw_index =
+            redeemer_data_by_tag(&tx, pallas_primitives::conway::RedeemerTag::Mint)
+                .iter()
+                .find_map(withdraw_redeemer_index_from_mint_ban_node)
+                .expect("ban-node mint redeemer");
+        assert_eq!(ban_mint_withdraw_index, 3);
         // Output[0] continued root (link → pool), output[1] new node (counter 1).
         assert_eq!(
             decode_ban_output(&tx, 0).link.as_deref(),
@@ -1164,6 +1243,56 @@ mod tests {
                 .iter()
                 .any(|v| v.vkey.as_slice() == pk)
         );
+    }
+
+    #[test]
+    fn apply_ban_can_reference_fault_verifier_script() {
+        let bans = spo_bans_script();
+        let fault = fault_verifier_script();
+        let params = ban_params();
+        let policy_hex = bans.hash_hex();
+        let pool = [0x55u8; 28];
+        let evidence = [0x66u8; 32];
+        let ban_utxos = vec![ban_bfutxo(
+            &policy_hex,
+            &"11".repeat(32),
+            BAN_ROOT_KEY,
+            &root_elem(None),
+        )];
+        let fault_utxo = FaultProofUtxo {
+            tx_hash: "cc".repeat(32),
+            output_index: 0,
+            lovelace: 2_000_000,
+        };
+        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
+        let addr = wallet_address(&key);
+        let w = wallet();
+        let mut req = request(
+            &bans,
+            &fault,
+            &params,
+            &ban_utxos,
+            &fault_utxo,
+            &w,
+            &key,
+            &addr,
+            pool,
+            evidence,
+        );
+        let fault_ref_tx = "01".repeat(32);
+        req.fault_verifier_ref = Some((fault_ref_tx.clone(), 7));
+        let built = build_apply_ban_tx(&req).expect("build first ban with fault ref");
+        let tx: Tx = minicbor::decode(&hex::decode(&built.signed_tx_hex).unwrap()).unwrap();
+
+        let refs = tx
+            .transaction_body
+            .reference_inputs
+            .as_ref()
+            .expect("reference inputs");
+        assert!(refs.iter().any(|input| {
+            hex::encode(input.transaction_id.as_slice()) == fault_ref_tx && input.index == 7
+        }));
+        assert!(tx.transaction_witness_set.plutus_v3_script.is_none());
     }
 
     #[test]
@@ -1229,6 +1358,10 @@ mod tests {
         assert_eq!(m.len(), 1, "reban should mint only the fault burn: {m:?}");
         assert_eq!(m[0].0, "fa".repeat(28));
         assert_eq!(m[0].2, -1);
+        let spend_redeemers =
+            redeemer_data_by_tag(&tx, pallas_primitives::conway::RedeemerTag::Spend);
+        assert_eq!(spend_redeemers.len(), 1);
+        assert_eq!(withdraw_redeemer_index_from_spend(&spend_redeemers[0]), 2);
         // Output[0] = continued node with the updated data, same asset name.
         assert_eq!(
             decode_ban_output(&tx, 0).data,

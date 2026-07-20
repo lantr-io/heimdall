@@ -188,10 +188,28 @@ fn push_round2_faults_from_payloads(
     sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
     payloads: &[Vec<u8>],
 ) {
+    let round1_signed_payload = net
+        .retained_payloads(ns, DkgRoundKey::Round1, &peer.pool_id)
+        .into_iter()
+        .find_map(|bytes| {
+            let wire = serde_json::from_slice::<Dkg1Wire>(&bytes).ok()?;
+            wire::round1_signed_payload(
+                peer_pool,
+                &peer.bifrost_id_pk,
+                ns.epoch,
+                ns.threshold,
+                ns.attempt,
+                &wire,
+            )
+            .ok()
+        });
     for bytes in payloads {
         let Ok(wire) = serde_json::from_slice::<Dkg2Wire>(bytes) else {
             continue;
         };
+        let round1_signed_payload = round1_signed_payload
+            .as_ref()
+            .map(|(payload, signature)| (payload.as_slice(), signature));
         let Ok(evidence) = wire::round2_fault_evidence(
             &net.secp,
             peer_pool,
@@ -203,6 +221,7 @@ fn push_round2_faults_from_payloads(
             ns.epoch,
             ns.threshold,
             ns.attempt,
+            round1_signed_payload,
             &wire,
         ) else {
             continue;

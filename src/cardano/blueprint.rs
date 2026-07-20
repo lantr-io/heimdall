@@ -39,9 +39,36 @@ pub const TREASURY_INFO_TITLE: &str = "bitcoin/treasury.treasury_info.mint";
 /// one hash; its hash is the ban-list policy id).
 pub const SPO_BANS_TITLE: &str = "bitcoin/spo_bans.spo_bans.mint";
 
-/// Blueprint title of the fault_verifier minting policy (parameterless — its
-/// blueprint `hash` is final; FaultProof tokens are minted under it).
-pub const FAULT_VERIFIER_TITLE: &str = "bitcoin/fault_verifier.fault_verifier.mint";
+/// Blueprint title of the Round 1 invalid-payload fault verifier.
+pub const FAULT_VERIFIER_ROUND1_TITLE: &str =
+    "bitcoin/fault_verifier_round1.fault_verifier_round1.mint";
+
+/// Blueprint title of the Round 2 invalid-payload fault verifier.
+pub const FAULT_VERIFIER_ROUND2_TITLE: &str =
+    "bitcoin/fault_verifier_round2.fault_verifier_round2.mint";
+
+/// Blueprint title of the direct equivocation fault verifier.
+pub const FAULT_VERIFIER_EQUIVOCATION_TITLE: &str =
+    "bitcoin/fault_verifier_equivocation.fault_verifier_equivocation.mint";
+
+/// The three specialized fault verifier policies accepted by `spo_bans`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultVerifierKind {
+    Round1,
+    Round2,
+    Equivocation,
+}
+
+impl FaultVerifierKind {
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Round1 => FAULT_VERIFIER_ROUND1_TITLE,
+            Self::Round2 => FAULT_VERIFIER_ROUND2_TITLE,
+            Self::Equivocation => FAULT_VERIFIER_EQUIVOCATION_TITLE,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum BlueprintError {
@@ -233,19 +260,49 @@ pub fn validator_hash(blueprint_json: &str, title: &str) -> Result<[u8; 28], Blu
         .map_err(|_| BlueprintError::BadBlueprint(format!("{title}: hash is not 28 bytes")))
 }
 
-/// The `fault_verifier` minting policy, parameterized by the `spos_registry`
-/// policy id (`registration_script_hash`). The EquivocationProof branch
-/// references the accused's registration node to bind `bifrost_id_pk →
-/// accused_pool_id`, so the validator is compiled against that registry policy —
-/// and BOTH fault kinds (InvalidPayload + Equivocation) mint under the resulting
-/// (parameterized) policy id. The applied hash is the FaultProof policy id; the
-/// returned cbor is provided as the mint witness.
+/// A specialized fault verifier minting policy, parameterized by the
+/// `spos_registry` policy id (`registration_script_hash`). The validator reads
+/// the accused registration node to bind `bifrost_id_pk -> accused_pool_id`.
 pub fn fault_verifier_script(
+    blueprint_json: &str,
+    kind: FaultVerifierKind,
+    registration_script_hash: &[u8; 28],
+) -> Result<ParameterizedScript, BlueprintError> {
+    let code = validator_compiled_code(blueprint_json, kind.title())?;
+    apply_params(&code, &[bytes(registration_script_hash)])
+}
+
+pub fn fault_verifier_round1_script(
     blueprint_json: &str,
     registration_script_hash: &[u8; 28],
 ) -> Result<ParameterizedScript, BlueprintError> {
-    let code = validator_compiled_code(blueprint_json, FAULT_VERIFIER_TITLE)?;
-    apply_params(&code, &[bytes(registration_script_hash)])
+    fault_verifier_script(
+        blueprint_json,
+        FaultVerifierKind::Round1,
+        registration_script_hash,
+    )
+}
+
+pub fn fault_verifier_round2_script(
+    blueprint_json: &str,
+    registration_script_hash: &[u8; 28],
+) -> Result<ParameterizedScript, BlueprintError> {
+    fault_verifier_script(
+        blueprint_json,
+        FaultVerifierKind::Round2,
+        registration_script_hash,
+    )
+}
+
+pub fn fault_verifier_equivocation_script(
+    blueprint_json: &str,
+    registration_script_hash: &[u8; 28],
+) -> Result<ParameterizedScript, BlueprintError> {
+    fault_verifier_script(
+        blueprint_json,
+        FaultVerifierKind::Equivocation,
+        registration_script_hash,
+    )
 }
 
 /// `spo_bans` parameterized by its full upstream parameter list (7 params, in
@@ -316,10 +373,9 @@ mod tests {
     const TREASURY_INFO_APPLIED_HASH: &str =
         "c62f114c966a2ad65ecb27a871600b5b480b08ea98b5ff65625ac627";
 
-    // `bitcoin/fault_verifier.fault_verifier.mint` compiledCode + blueprint
-    // `hash` (ft-bifrost-bridge onchain/plutus.json). Parameterized by
-    // `registration_script_hash`, so this is the UNAPPLIED program/hash; the
-    // FaultProof policy id is the hash after applying the registry param.
+    // A parameterized fault-verifier compiledCode fixture. The concrete
+    // validator title is supplied by the blueprint, while the apply mechanics
+    // are identical across Round 1, Round 2, and equivocation policies.
     const FAULT_VERIFIER_CODE: &str = include_str!("../../tests/fixtures/fault_verifier_code.txt");
     const FAULT_VERIFIER_HASH: &str = "3b3a74a942ee06b74e56ae07b1b336c33b5257771c686e0f41293cae";
 
@@ -370,23 +426,23 @@ mod tests {
     #[test]
     fn fault_verifier_script_applies_registry_param() {
         let blueprint = format!(
-            r#"{{"validators":[{{"title":"{FAULT_VERIFIER_TITLE}","compiledCode":"{}","hash":"{FAULT_VERIFIER_HASH}"}}]}}"#,
+            r#"{{"validators":[{{"title":"{FAULT_VERIFIER_ROUND1_TITLE}","compiledCode":"{}","hash":"{FAULT_VERIFIER_HASH}"}}]}}"#,
             FAULT_VERIFIER_CODE.trim()
         );
         // Unapplied blueprint hash.
         assert_eq!(
-            hex::encode(validator_hash(&blueprint, FAULT_VERIFIER_TITLE).unwrap()),
+            hex::encode(validator_hash(&blueprint, FAULT_VERIFIER_ROUND1_TITLE).unwrap()),
             FAULT_VERIFIER_HASH
         );
         // Applying the registry param is deterministic and bakes it into the cbor.
         let reg = [0x11u8; 28];
-        let s1 = fault_verifier_script(&blueprint, &reg).unwrap();
-        let s2 = fault_verifier_script(&blueprint, &reg).unwrap();
+        let s1 = fault_verifier_round1_script(&blueprint, &reg).unwrap();
+        let s2 = fault_verifier_script(&blueprint, FaultVerifierKind::Round1, &reg).unwrap();
         assert_eq!(s1.hash, s2.hash);
         assert_ne!(s1.hash_hex(), FAULT_VERIFIER_HASH);
         assert_ne!(s1.cbor, hex::decode(FAULT_VERIFIER_CODE.trim()).unwrap());
         // A different registry → a different FaultProof policy id.
-        let other = fault_verifier_script(&blueprint, &[0x22u8; 28]).unwrap();
+        let other = fault_verifier_round1_script(&blueprint, &[0x22u8; 28]).unwrap();
         assert_ne!(s1.hash, other.hash);
     }
 

@@ -427,6 +427,7 @@ pub fn verify_round2(
         epoch,
         threshold,
         attempt,
+        None,
         wire,
     )?;
     if evidence
@@ -472,6 +473,7 @@ pub fn round2_fault_evidence(
     epoch: u64,
     threshold: u64,
     attempt: u64,
+    round1_signed_payload: Option<(&[u8], &[u8; SIG_LEN])>,
     wire: &Dkg2Wire,
 ) -> Result<Round2ShareFaultEvidence, WireError> {
     let entries = round2_entries(wire)?;
@@ -479,9 +481,10 @@ pub fn round2_fault_evidence(
     let canonical_bytes = canonical::round2(epoch, threshold, attempt, sender_pool_id, &entries);
     auth::verify_payload(secp, sender_bifrost_id_pk, &canonical_bytes, &signature)?;
 
-    let mine = entries
+    let (mine_index, mine) = entries
         .iter()
-        .find(|e| &e.recipient_pool_id == my_pool_id)
+        .enumerate()
+        .find(|(_, e)| &e.recipient_pool_id == my_pool_id)
         .ok_or(WireError::NoShareForUs)?;
     if mine.recipient_identifier != u64::from(my_identifier) {
         return Err(WireError::Field(
@@ -501,10 +504,19 @@ pub fn round2_fault_evidence(
         accused_pool_id: *sender_pool_id,
         bifrost_id_pk: bifrost_pk_array(sender_bifrost_id_pk)?,
         recipient_index: my_identifier,
+        round2_entry_index: u32::try_from(mine_index)
+            .expect("canonical Round 2 entry count fits u32"),
         sender_commitments: sender_commitments.to_vec(),
+        canonical_round1_bytes: round1_signed_payload
+            .map(|(payload, _)| payload.to_vec())
+            .unwrap_or_default(),
+        round1_signature: round1_signed_payload
+            .map(|(_, signature)| *signature)
+            .unwrap_or([0u8; SIG_LEN]),
         share,
+        pad,
         round2_canonical_bytes: canonical_bytes,
-        payload_signature: signature,
+        round2_signature: signature,
     };
     if fault_evidence::round2_evidence_hash_dyn(&ev).map_err(|e| fault_err("evidence_hash", e))?
         != mine.evidence_hash

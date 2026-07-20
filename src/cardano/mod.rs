@@ -21,6 +21,7 @@ pub mod dkg_roster;
 pub mod fault_proof;
 pub mod hash;
 pub mod linked_list;
+pub mod local_eval;
 pub mod mock;
 pub mod mpf;
 pub mod nft_scan;

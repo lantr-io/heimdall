@@ -6,7 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use frost::{Ciphersuite, Identifier};
+use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+use frost::Identifier;
 use frost_secp256k1_tr as frost;
 use halo2_base::halo2_proofs::{
     halo2curves::{
@@ -25,36 +26,63 @@ use halo2_base::halo2_proofs::{
     },
     transcript::{Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer},
 };
-use heimdall::circuits::cardano_transcript::{CardanoBlake2bRead, CardanoBlake2bWrite};
-use k256::{
-    AffinePoint, EncodedPoint, ProjectivePoint, Scalar,
-    elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint},
+use heimdall::cardano::apply_ban::{ApplyBanRequest, FaultProofUtxo, build_apply_ban_tx};
+use heimdall::cardano::ban_list::{
+    BAN_ROOT_KEY, BanElement, BanElementData, BanPolicyParams, fault_token_name,
 };
+use heimdall::cardano::bf_http::{BfAmount, BfUtxo};
+use heimdall::cardano::blueprint::{self, FaultVerifierKind, ParameterizedScript};
+use heimdall::cardano::fault_proof::{
+    EquivocationEvidence as OnchainEquivocationEvidence, FaultProofEvidence, FaultProofMintRequest,
+    FaultProofRefScript, Round1InvalidPayloadEvidence, Round2InvalidPayloadEvidence,
+    build_fault_proof_mint_tx,
+};
+use heimdall::cardano::hash::blake2b_256;
+use heimdall::cardano::local_eval::{DEFAULT_TX_EX_UNIT_LIMITS, ExUnits, evaluate_tx_phase2};
+use heimdall::cardano::publish::WalletUtxo;
+use heimdall::cardano::registry::{ElementData, RegistrationNodeData, RegistryElement};
+use heimdall::cardano::wallet::{derive_payment_key, wallet_address};
+use heimdall::circuits::cardano_transcript::{CardanoBlake2bRead, CardanoBlake2bWrite};
+use heimdall::circuits::fault_evidence;
+use heimdall::http::{auth, canonical, frost_bridge};
+use pallas_codec::minicbor;
+use pallas_primitives::conway::Tx;
 use plutus_halo2_verifier_gen::plutus_gen::{
     AxiomShplonkAikenOutputPaths, generate_axiom_shplonk_aiken_from_vk_and_instances,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use rand_chacha::ChaCha20Rng;
 use serde_json::Value;
+use uplc::tx::SlotConfig;
+use whisky_common::{Asset, Network as WhiskyNetwork, UTxO, UtxoInput, UtxoOutput};
+use whisky_pallas::wrapper::transaction_body::{ScriptRef, ScriptRefKind};
 
 use heimdall::circuits::dkg_fault::{
     AxiomDkgCircuitParams, CircuitStats, DkgRound1PokDigestFaultWitness,
-    DkgRound2ShareFaultWitness, axiom_point_from_compressed, axiom_point_from_projective,
-    axiom_scalar_from_be_bytes, build_round1_digest_fault_keygen_circuit,
-    build_round1_digest_fault_prover_circuit, build_round2_digest_fault_keygen_circuit,
-    build_round2_digest_fault_prover_circuit, is_identity, round1_digest_fault_public_inputs,
-    round1_digest_residual, round1_hdk_challenge, round1_message_digest,
-    round2_digest_fault_public_inputs, round2_message_digest, round2_residual,
+    DkgRound2ShareFaultWitness, axiom_scalar_from_be_bytes, be_bytes_from_fq,
+    build_round1_digest_fault_keygen_circuit, build_round1_digest_fault_prover_circuit,
+    build_round2_digest_fault_keygen_circuit, build_round2_digest_fault_prover_circuit,
+    is_identity, round1_digest_fault_public_inputs, round1_digest_residual, round1_hdk_challenge,
+    round1_message_digest, round2_digest_fault_public_inputs, round2_message_digest,
+    round2_residual,
 };
 use heimdall::frost::participant;
 
 const ROUND2_T: usize = 2;
 const ROUND2_INDEX_BITS: usize = 16;
 const BENCH_POOL_ID: [u8; 28] = [0x51; 28];
+const BENCH_EPOCH: u64 = 7;
+const BENCH_THRESHOLD: u64 = 51;
+const BENCH_ATTEMPT: u64 = 0;
+const BENCH_BASE_BAN_DURATION_MS: i64 = 86_400_000;
+const BENCH_MAX_FAULTS_BEFORE_PERMANENT: i64 = 3;
+const BENCH_MAX_VALIDITY_WINDOW_MS: i64 = 600_000;
 const TARGET_ROOT: &str = "target/dkg_fault_onchain";
-const DEFAULT_MAX_TX_EX_MEM: u64 = 16_500_000;
-const DEFAULT_MAX_TX_EX_CPU: u64 = 10_000_000_000;
 const GENERATE_ONLY_ENV: &str = "DKG_FAULT_ONCHAIN_GENERATE_ONLY";
+const MAX_TX_SIZE_BYTES_ENV: &str = "DKG_FAULT_MAX_TX_SIZE_BYTES";
+const DEFAULT_MAX_TX_SIZE_BYTES: usize = 16_384;
+const TEST_MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const AIKEN_TOML: &str = r#"name = "heimdall/dkg_fault_onchain_benchmark"
 version = "0.0.0"
 compiler = "v1.1.23"
@@ -117,33 +145,43 @@ enum RunMode {
 fn main() {
     let mode = run_mode();
     let limits = tx_ex_unit_limits();
+    let max_tx_size_bytes = max_tx_size_bytes();
     println!(
         "backend: Axiom halo2-axiom, BLS12-381 KZG, SHPLONK, Cardano-friendly Blake2b transcript"
     );
+    println!("standalone_onchain_benchmark: generated Aiken Plutus V3 minting policy");
     println!(
-        "onchain_benchmark: Aiken Plutus V3 minting policy with two pubkey inputs and two pubkey outputs"
+        "full_tx_benchmark: Bifrost fault verifier policy in a signed tx with reference script"
     );
     println!("mode: {mode:?}");
     println!("max_tx_ex_units_mem: {}", limits.mem);
     println!("max_tx_ex_units_cpu: {}", limits.cpu);
+    println!("max_tx_size_bytes: {max_tx_size_bytes}");
+    if mode == RunMode::Benchmark {
+        println!("bifrost_plutus_json_url: {}", bifrost_plutus_json_url());
+    }
 
     let reports = match env::var("DKG_FAULT_ONCHAIN_ROUND").as_deref() {
-        Ok("round1") => vec![run_round1_onchain(
-            AxiomDkgCircuitParams::round1_digest_fault(),
-            mode,
-        )],
-        Ok("round2") => vec![run_round2_onchain(
-            AxiomDkgCircuitParams::round2_digest_fault(),
-            mode,
-        )],
-        Ok("all") | Err(_) => vec![
-            run_round1_onchain(AxiomDkgCircuitParams::round1_digest_fault(), mode),
-            run_round2_onchain(AxiomDkgCircuitParams::round2_digest_fault(), mode),
-        ],
-        Ok(other) => panic!("DKG_FAULT_ONCHAIN_ROUND must be round1, round2, or all; got {other}"),
+        Ok("round1") => run_round1_onchain(AxiomDkgCircuitParams::round1_digest_fault(), mode),
+        Ok("round2") => run_round2_onchain(AxiomDkgCircuitParams::round2_digest_fault(), mode),
+        Ok("equivocation") => run_equivocation_onchain(mode),
+        Ok("all") | Err(_) => {
+            let mut reports =
+                run_round1_onchain(AxiomDkgCircuitParams::round1_digest_fault(), mode);
+            reports.extend(run_round2_onchain(
+                AxiomDkgCircuitParams::round2_digest_fault(),
+                mode,
+            ));
+            reports.extend(run_equivocation_onchain(mode));
+            reports
+        }
+        Ok(other) => {
+            panic!(
+                "DKG_FAULT_ONCHAIN_ROUND must be round1, round2, equivocation, or all; got {other}"
+            )
+        }
     }
     .into_iter()
-    .flatten()
     .collect::<Vec<_>>();
 
     if mode == RunMode::Benchmark {
@@ -162,7 +200,7 @@ fn run_mode() -> RunMode {
     }
 }
 
-fn run_round1_onchain(params: AxiomDkgCircuitParams, mode: RunMode) -> Option<BudgetReport> {
+fn run_round1_onchain(params: AxiomDkgCircuitParams, mode: RunMode) -> Vec<BudgetReport> {
     let cases = round1_fixtures();
     let corrupted = cases
         .iter()
@@ -202,22 +240,29 @@ fn run_round1_onchain(params: AxiomDkgCircuitParams, mode: RunMode) -> Option<Bu
         generate_digest_project("round1", &setup, &pk, &corrupted_artifact, &honest_artifact);
     print_generated_project(&project_dir);
     if mode == RunMode::GenerateOnly {
-        return None;
+        return Vec::new();
     }
 
+    let mut reports = Vec::new();
     let aiken_start = Instant::now();
     let aiken_output = run_aiken_check(&project_dir);
     let aiken_time = aiken_start.elapsed();
     let budget = parse_aiken_budget(&aiken_output, "round1_corrupted_mint_benchmark")
         .expect("round 1 Aiken benchmark ExUnits should be present");
     print_onchain_budget("round1_corrupted_mint_benchmark", budget, aiken_time);
-    Some(BudgetReport {
+    reports.push(BudgetReport {
         name: "round1_corrupted_mint_benchmark",
         budget,
-    })
+    });
+    reports.extend(run_round1_full_tx_benchmark(
+        &corrupted,
+        &corrupted_artifact,
+        tx_ex_unit_limits(),
+    ));
+    reports
 }
 
-fn run_round2_onchain(params: AxiomDkgCircuitParams, mode: RunMode) -> Option<BudgetReport> {
+fn run_round2_onchain(params: AxiomDkgCircuitParams, mode: RunMode) -> Vec<BudgetReport> {
     let cases = round2_fixtures();
     let corrupted = cases
         .iter()
@@ -260,19 +305,690 @@ fn run_round2_onchain(params: AxiomDkgCircuitParams, mode: RunMode) -> Option<Bu
         generate_digest_project("round2", &setup, &pk, &corrupted_artifact, &honest_artifact);
     print_generated_project(&project_dir);
     if mode == RunMode::GenerateOnly {
-        return None;
+        return Vec::new();
     }
 
+    let mut reports = Vec::new();
     let aiken_start = Instant::now();
     let aiken_output = run_aiken_check(&project_dir);
     let aiken_time = aiken_start.elapsed();
     let budget = parse_aiken_budget(&aiken_output, "round2_corrupted_mint_benchmark")
         .expect("round 2 Aiken benchmark ExUnits should be present");
     print_onchain_budget("round2_corrupted_mint_benchmark", budget, aiken_time);
-    Some(BudgetReport {
+    reports.push(BudgetReport {
         name: "round2_corrupted_mint_benchmark",
         budget,
+    });
+    reports.extend(run_round2_full_tx_benchmark(
+        &corrupted,
+        &corrupted_artifact,
+        tx_ex_unit_limits(),
+    ));
+    reports
+}
+
+fn run_equivocation_onchain(mode: RunMode) -> Vec<BudgetReport> {
+    println!();
+    println!("== equivocation-onchain-fault ==");
+    println!("zk_circuit: none");
+    if mode == RunMode::GenerateOnly {
+        return Vec::new();
+    }
+
+    let case = equivocation_fixture();
+    let evidence_hash = case.evidence.evidence_hash();
+    println!("case: {}", case.name);
+    println!("  evidence_hash: {}", hex::encode(evidence_hash));
+    run_equivocation_full_tx_benchmark(&case, tx_ex_unit_limits())
+}
+
+fn run_round1_full_tx_benchmark(
+    case: &Round1Case,
+    artifact: &DigestProofArtifact,
+    limits: ExUnits,
+) -> Vec<BudgetReport> {
+    let scripts = bifrost_fault_scripts(FaultVerifierKind::Round1);
+    let canonical_round1_bytes = case.evidence.canonical_bytes().unwrap();
+    let evidence_hash = case.evidence.evidence_hash().unwrap();
+    assert_eq!(evidence_hash, bls_scalar_bytes(artifact.digest));
+    let public_inputs = public_input_bytes(evidence_hash, case.evidence.accused_pool_id);
+
+    let evidence = FaultProofEvidence::Round1InvalidPayload(Round1InvalidPayloadEvidence {
+        accused_pool_id: &case.evidence.accused_pool_id,
+        canonical_round1_bytes: &canonical_round1_bytes,
+        payload_signature: &case.evidence.payload_signature,
+        halo2_proof: &artifact.proof,
+        halo2_public_inputs: &public_inputs,
+    });
+    run_full_tx_benchmark(
+        "round1_fault_mint_full_tx_phase2",
+        "round1_apply_ban_full_tx_phase2",
+        &scripts,
+        case.evidence.bifrost_id_pk,
+        evidence,
+        limits,
+    )
+}
+
+fn run_round2_full_tx_benchmark(
+    case: &Round2Case,
+    artifact: &DigestProofArtifact,
+    limits: ExUnits,
+) -> Vec<BudgetReport> {
+    let scripts = bifrost_fault_scripts(FaultVerifierKind::Round2);
+    let evidence_hash = case.evidence.evidence_hash::<ROUND2_T>().unwrap();
+    assert_eq!(evidence_hash, bls_scalar_bytes(artifact.digest));
+    let public_inputs = public_input_bytes(evidence_hash, case.evidence.accused_pool_id);
+
+    let evidence = FaultProofEvidence::Round2InvalidPayload(Round2InvalidPayloadEvidence {
+        accused_pool_id: &case.evidence.accused_pool_id,
+        canonical_round1_bytes: &case.evidence.canonical_round1_bytes,
+        round1_signature: &case.evidence.round1_signature,
+        canonical_round2_bytes: &case.evidence.round2_canonical_bytes,
+        round2_signature: &case.evidence.round2_signature,
+        round2_entry_index: case.evidence.round2_entry_index,
+        pad: &case.evidence.pad,
+        opened_share: &case.evidence.share,
+        halo2_proof: &artifact.proof,
+        halo2_public_inputs: &public_inputs,
+    });
+    run_full_tx_benchmark(
+        "round2_fault_mint_full_tx_phase2",
+        "round2_apply_ban_full_tx_phase2",
+        &scripts,
+        case.evidence.bifrost_id_pk,
+        evidence,
+        limits,
+    )
+}
+
+fn run_equivocation_full_tx_benchmark(
+    case: &EquivocationCase,
+    limits: ExUnits,
+) -> Vec<BudgetReport> {
+    let scripts = bifrost_fault_scripts(FaultVerifierKind::Equivocation);
+    let evidence_hash = case.evidence.evidence_hash();
+    let evidence = FaultProofEvidence::Equivocation(OnchainEquivocationEvidence {
+        accused_pool_id: &case.evidence.accused_pool_id,
+        payload_a: &case.evidence.payload_a,
+        signature_a: &case.evidence.signature_a,
+        payload_b: &case.evidence.payload_b,
+        signature_b: &case.evidence.signature_b,
+        evidence_hash: &evidence_hash,
+    });
+    run_full_tx_benchmark(
+        "equivocation_fault_mint_full_tx_phase2",
+        "equivocation_apply_ban_full_tx_phase2",
+        &scripts,
+        case.evidence.bifrost_id_pk,
+        evidence,
+        limits,
+    )
+}
+
+fn run_full_tx_benchmark(
+    mint_name: &'static str,
+    apply_ban_name: &'static str,
+    scripts: &BifrostFaultScripts,
+    accused_bifrost_id_pk: [u8; 32],
+    evidence: FaultProofEvidence<'_>,
+    limits: ExUnits,
+) -> Vec<BudgetReport> {
+    let key = derive_payment_key(TEST_MNEMONIC).unwrap();
+    let wallet_address = wallet_address(&key);
+    let wallet_utxos = bench_wallet_utxos();
+    let accused_pool_id: [u8; 28] = evidence
+        .accused_pool_id()
+        .try_into()
+        .expect("benchmark pool id is 28 bytes");
+    let evidence_hash = evidence.evidence_hash().expect("benchmark evidence hash");
+    let registration_tx_hash = tx_hash_hex(0xC1);
+    let registration_output_index = 0;
+    let registration_utxo = registration_node_utxo(
+        &scripts.registry,
+        &registration_tx_hash,
+        registration_output_index,
+        &accused_pool_id,
+        &accused_bifrost_id_pk,
+    );
+    let fault_ref_tx_hash = tx_hash_hex(0xC2);
+    let fault_ref_output_index = 0;
+    let script_ref_utxo = fault_verifier_script_ref_utxo(
+        &scripts.fault_verifier,
+        &fault_ref_tx_hash,
+        fault_ref_output_index,
+        &wallet_address,
+    );
+    let built = build_fault_proof_mint_tx(&FaultProofMintRequest {
+        fault_verifier_script: &scripts.fault_verifier,
+        fault_verifier_ref_script: Some(FaultProofRefScript {
+            tx_hash: &fault_ref_tx_hash,
+            output_index: fault_ref_output_index,
+            script_size: scripts.fault_verifier.cbor.len(),
+        }),
+        evidence,
+        registration_ref: (&registration_tx_hash, registration_output_index),
+        wallet_address: &wallet_address,
+        wallet_utxos: &wallet_utxos,
+        key: &key,
+        cost_models: None,
     })
+    .expect("full fault-proof mint tx builds");
+    let shape = tx_shape(&built.signed_tx_hex);
+    let tx_size_bytes = built.signed_tx_hex.len() / 2;
+    let max_tx_size_bytes = max_tx_size_bytes();
+    assert!(
+        tx_size_bytes <= max_tx_size_bytes,
+        "{mint_name} tx size exceeds limit: size={tx_size_bytes} max={max_tx_size_bytes}"
+    );
+    let resolved_utxos = resolved_benchmark_utxos(
+        &wallet_utxos,
+        &wallet_address,
+        &[registration_utxo.clone(), script_ref_utxo.clone()],
+    );
+
+    let eval_start = Instant::now();
+    let report = evaluate_tx_phase2(
+        &built.signed_tx_hex,
+        &resolved_utxos,
+        &WhiskyNetwork::Preprod,
+        &SlotConfig::default(),
+        None,
+    )
+    .expect("full fault-proof mint tx phase-2 evaluation succeeds within limits");
+    let eval_time = eval_start.elapsed();
+    assert_eq!(
+        report.actions.len(),
+        1,
+        "fault-proof tx should run one Plutus script"
+    );
+
+    print_full_tx_budget(
+        mint_name,
+        tx_size_bytes,
+        max_tx_size_bytes,
+        &report,
+        shape,
+        &scripts.blueprint_source,
+        eval_time,
+    );
+    assert_within_tx_budget(mint_name, report.total, limits);
+
+    let mint_report = BudgetReport {
+        name: mint_name,
+        budget: report.total,
+    };
+    let apply_ban_report = run_apply_ban_full_tx_benchmark(
+        apply_ban_name,
+        scripts,
+        &key,
+        &wallet_address,
+        &wallet_utxos,
+        &registration_tx_hash,
+        registration_output_index,
+        registration_utxo,
+        fault_ref_tx_hash,
+        fault_ref_output_index,
+        script_ref_utxo,
+        accused_pool_id,
+        evidence_hash,
+        &built,
+        limits,
+    );
+    vec![mint_report, apply_ban_report]
+}
+
+struct BifrostFaultScripts {
+    registry: ParameterizedScript,
+    fault_verifier: ParameterizedScript,
+    spo_bans: ParameterizedScript,
+    ban_params: BanPolicyParams,
+    blueprint_source: String,
+}
+
+fn bifrost_fault_scripts(kind: FaultVerifierKind) -> BifrostFaultScripts {
+    let blueprint_json = fetch_bifrost_plutus_json();
+    let registry = blueprint::spos_registry_script(&blueprint_json, &[0xC0; 32], 0)
+        .expect("parameterize benchmark spos_registry");
+    let round1_fault = blueprint::fault_verifier_script(
+        &blueprint_json,
+        FaultVerifierKind::Round1,
+        &registry.hash,
+    )
+    .expect("parameterize benchmark round 1 fault verifier");
+    let round2_fault = blueprint::fault_verifier_script(
+        &blueprint_json,
+        FaultVerifierKind::Round2,
+        &registry.hash,
+    )
+    .expect("parameterize benchmark round 2 fault verifier");
+    let equivocation_fault = blueprint::fault_verifier_script(
+        &blueprint_json,
+        FaultVerifierKind::Equivocation,
+        &registry.hash,
+    )
+    .expect("parameterize benchmark equivocation fault verifier");
+    let policy_ids = vec![
+        round1_fault.hash,
+        round2_fault.hash,
+        equivocation_fault.hash,
+    ];
+    let ban_params = BanPolicyParams {
+        fault_proof_policies: policy_ids.clone(),
+        base_ban_duration_ms: BENCH_BASE_BAN_DURATION_MS,
+        max_faults_before_permanent: BENCH_MAX_FAULTS_BEFORE_PERMANENT,
+        max_validity_window_ms: BENCH_MAX_VALIDITY_WINDOW_MS,
+    };
+    let spo_bans = blueprint::spo_bans_script(
+        &blueprint_json,
+        &registry.hash,
+        &policy_ids,
+        ban_params.base_ban_duration_ms,
+        ban_params.max_faults_before_permanent,
+        ban_params.max_validity_window_ms,
+        &[0xD0; 32],
+        0,
+    )
+    .expect("parameterize benchmark spo_bans");
+    let fault_verifier = match kind {
+        FaultVerifierKind::Round1 => round1_fault,
+        FaultVerifierKind::Round2 => round2_fault,
+        FaultVerifierKind::Equivocation => equivocation_fault,
+    };
+    BifrostFaultScripts {
+        registry,
+        fault_verifier,
+        spo_bans,
+        ban_params,
+        blueprint_source: bifrost_plutus_json_url().to_string(),
+    }
+}
+
+fn bifrost_plutus_json_url() -> &'static str {
+    "https://raw.githubusercontent.com/FluidTokens/ft-bifrost-bridge/4785169751c297618966fcd085b8d2612df7cb27/onchain/plutus.json"
+}
+
+fn fetch_bifrost_plutus_json() -> String {
+    let url = bifrost_plutus_json_url();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create benchmark HTTP runtime");
+    runtime.block_on(async {
+        let response = reqwest::get(url)
+            .await
+            .unwrap_or_else(|err| panic!("fetch Bifrost plutus.json from {url}: {err}"));
+        let status = response.status();
+        assert!(
+            status.is_success(),
+            "fetch Bifrost plutus.json from {url}: HTTP {status}"
+        );
+        response
+            .text()
+            .await
+            .unwrap_or_else(|err| panic!("read Bifrost plutus.json from {url}: {err}"))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_apply_ban_full_tx_benchmark(
+    name: &'static str,
+    scripts: &BifrostFaultScripts,
+    key: &pallas_wallet::PrivateKey,
+    wallet_address: &str,
+    wallet_utxos: &[WalletUtxo],
+    registration_tx_hash: &str,
+    registration_output_index: u32,
+    registration_utxo: UTxO,
+    fault_ref_tx_hash: String,
+    fault_ref_output_index: u32,
+    fault_ref_utxo: UTxO,
+    accused_pool_id: [u8; 28],
+    evidence_hash: [u8; 32],
+    mint: &heimdall::cardano::fault_proof::FaultProofMintTx,
+    limits: ExUnits,
+) -> BudgetReport {
+    assert_eq!(
+        mint.token_name,
+        fault_token_name(&accused_pool_id, &evidence_hash)
+    );
+    let ban_root_tx_hash = tx_hash_hex(0xC4);
+    let ban_root_output_index = 0;
+    let ban_root_bf = ban_root_bfutxo(&scripts.spo_bans, &ban_root_tx_hash, ban_root_output_index);
+    let ban_root_utxo = ban_element_resolved_utxo(&scripts.spo_bans, &ban_root_bf);
+    let spo_bans_ref_tx_hash = tx_hash_hex(0xC5);
+    let spo_bans_ref_output_index = 0;
+    let spo_bans_ref_utxo = script_ref_utxo(
+        &scripts.spo_bans,
+        &spo_bans_ref_tx_hash,
+        spo_bans_ref_output_index,
+        wallet_address,
+    );
+    let fault_utxo = FaultProofUtxo {
+        tx_hash: tx_hash_hex(0xC3),
+        output_index: 0,
+        lovelace: mint.lovelace,
+    };
+    let fault_resolved_utxo = fault_proof_resolved_utxo(
+        &mint.policy_id_hex,
+        &mint.token_name,
+        &fault_utxo,
+        wallet_address,
+    );
+    let (invalid_before, invalid_hereafter, start_time_ms) = apply_ban_benchmark_window();
+    let built = build_apply_ban_tx(&ApplyBanRequest {
+        spo_bans_script: &scripts.spo_bans,
+        fault_verifier_script: &scripts.fault_verifier,
+        fault_verifier_ref: Some((fault_ref_tx_hash, fault_ref_output_index)),
+        ban_params: &scripts.ban_params,
+        accused_pool_id,
+        evidence_hash,
+        ban_utxos: &[ban_root_bf],
+        fault_utxo: &fault_utxo,
+        registration_ref: (registration_tx_hash.to_string(), registration_output_index),
+        spo_bans_ref: (spo_bans_ref_tx_hash, spo_bans_ref_output_index),
+        mainnet: false,
+        start_time_ms,
+        invalid_before,
+        invalid_hereafter,
+        wallet_address,
+        wallet_utxos,
+        key,
+        cost_models: None,
+    })
+    .expect("full apply-ban tx builds");
+
+    assert!(
+        built.first_ban,
+        "benchmark uses the first-ban transaction shape"
+    );
+    let shape = tx_shape(&built.signed_tx_hex);
+    let tx_size_bytes = built.signed_tx_hex.len() / 2;
+    let max_tx_size_bytes = max_tx_size_bytes();
+    assert!(
+        tx_size_bytes <= max_tx_size_bytes,
+        "{name} tx size exceeds limit: size={tx_size_bytes} max={max_tx_size_bytes}"
+    );
+    let resolved_utxos = resolved_benchmark_utxos(
+        wallet_utxos,
+        wallet_address,
+        &[
+            registration_utxo,
+            fault_ref_utxo,
+            ban_root_utxo,
+            spo_bans_ref_utxo,
+            fault_resolved_utxo,
+        ],
+    );
+    let eval_start = Instant::now();
+    let report = evaluate_tx_phase2(
+        &built.signed_tx_hex,
+        &resolved_utxos,
+        &WhiskyNetwork::Preprod,
+        &SlotConfig::default(),
+        None,
+    )
+    .expect("full apply-ban tx phase-2 evaluation succeeds");
+    let eval_time = eval_start.elapsed();
+    assert_eq!(
+        report.actions.len(),
+        4,
+        "first-ban tx should run four Plutus scripts"
+    );
+
+    print_full_tx_budget(
+        name,
+        tx_size_bytes,
+        max_tx_size_bytes,
+        &report,
+        shape,
+        &scripts.blueprint_source,
+        eval_time,
+    );
+    println!("apply_ban_first_ban: {}", built.first_ban);
+    println!("apply_ban_ban_counter: {}", built.ban_node.ban_counter);
+    println!(
+        "apply_ban_ban_until_time_ms: {}",
+        built.ban_node.ban_until_time
+    );
+    assert_within_tx_budget(name, report.total, limits);
+    BudgetReport {
+        name,
+        budget: report.total,
+    }
+}
+
+fn apply_ban_benchmark_window() -> (u64, u64, i64) {
+    let slot_config = SlotConfig::default();
+    let invalid_before = slot_config.zero_slot;
+    let invalid_hereafter = invalid_before + 1;
+    let start_time_ms =
+        i64::try_from(slot_config.zero_time + u64::from(slot_config.slot_length) - 1)
+            .expect("default slot time fits i64");
+    (invalid_before, invalid_hereafter, start_time_ms)
+}
+
+fn ban_root_bfutxo(spo_bans: &ParameterizedScript, tx_hash: &str, output_index: u32) -> BfUtxo {
+    let root = BanElement {
+        data: BanElementData::Root,
+        link: None,
+    };
+    BfUtxo {
+        tx_hash: tx_hash.to_string(),
+        output_index,
+        amount: vec![
+            BfAmount {
+                unit: "lovelace".to_string(),
+                quantity: "2000000".to_string(),
+            },
+            BfAmount {
+                unit: format!("{}{}", spo_bans.hash_hex(), hex::encode(BAN_ROOT_KEY)),
+                quantity: "1".to_string(),
+            },
+        ],
+        inline_datum: Some(hex::encode(root.to_cbor())),
+        reference_script_hash: None,
+    }
+}
+
+fn ban_element_resolved_utxo(spo_bans: &ParameterizedScript, utxo: &BfUtxo) -> UTxO {
+    UTxO {
+        input: UtxoInput {
+            tx_hash: utxo.tx_hash.clone(),
+            output_index: utxo.output_index,
+        },
+        output: UtxoOutput {
+            address: spo_bans.enterprise_address(pallas_addresses::Network::Testnet),
+            amount: utxo
+                .amount
+                .iter()
+                .map(|asset| Asset::new_from_str(&asset.unit, &asset.quantity))
+                .collect(),
+            data_hash: None,
+            plutus_data: utxo.inline_datum.clone(),
+            script_ref: None,
+            script_hash: Some(spo_bans.hash_hex()),
+        },
+    }
+}
+
+fn fault_proof_resolved_utxo(
+    policy_id_hex: &str,
+    token_name: &[u8; 32],
+    fault_utxo: &FaultProofUtxo,
+    address: &str,
+) -> UTxO {
+    UTxO {
+        input: UtxoInput {
+            tx_hash: fault_utxo.tx_hash.clone(),
+            output_index: fault_utxo.output_index,
+        },
+        output: UtxoOutput {
+            address: address.to_string(),
+            amount: vec![
+                Asset::new_from_str("lovelace", &fault_utxo.lovelace.to_string()),
+                Asset::new_from_str(&format!("{policy_id_hex}{}", hex::encode(token_name)), "1"),
+            ],
+            data_hash: None,
+            plutus_data: None,
+            script_ref: None,
+            script_hash: None,
+        },
+    }
+}
+
+fn fault_verifier_script_ref_utxo(
+    fault_verifier: &ParameterizedScript,
+    tx_hash: &str,
+    output_index: u32,
+    address: &str,
+) -> UTxO {
+    script_ref_utxo(fault_verifier, tx_hash, output_index, address)
+}
+
+fn script_ref_utxo(
+    script: &ParameterizedScript,
+    tx_hash: &str,
+    output_index: u32,
+    address: &str,
+) -> UTxO {
+    let script_ref = ScriptRef::new(ScriptRefKind::PlutusV3Script {
+        plutus_v3_script_hex: script.cbor_hex(),
+    })
+    .expect("script ref")
+    .encode()
+    .expect("script ref CBOR");
+    UTxO {
+        input: UtxoInput {
+            tx_hash: tx_hash.to_string(),
+            output_index,
+        },
+        output: UtxoOutput {
+            address: address.to_string(),
+            amount: vec![Asset::new_from_str("lovelace", "5000000")],
+            data_hash: None,
+            plutus_data: None,
+            script_ref: Some(script_ref),
+            script_hash: None,
+        },
+    }
+}
+
+fn bench_wallet_utxos() -> Vec<WalletUtxo> {
+    vec![
+        WalletUtxo {
+            tx_hash: tx_hash_hex(0xA1),
+            output_index: 0,
+            lovelace: 50_000_000,
+            pure_ada: true,
+        },
+        WalletUtxo {
+            tx_hash: tx_hash_hex(0xA2),
+            output_index: 1,
+            lovelace: 6_000_000,
+            pure_ada: true,
+        },
+    ]
+}
+
+fn resolved_benchmark_utxos(
+    wallet_utxos: &[WalletUtxo],
+    wallet_address: &str,
+    extra_utxos: &[UTxO],
+) -> Vec<UTxO> {
+    let mut resolved = wallet_utxos
+        .iter()
+        .map(|utxo| wallet_resolved_utxo(utxo, wallet_address))
+        .collect::<Vec<_>>();
+    resolved.extend_from_slice(extra_utxos);
+    resolved
+}
+
+fn wallet_resolved_utxo(utxo: &WalletUtxo, address: &str) -> UTxO {
+    UTxO {
+        input: UtxoInput {
+            tx_hash: utxo.tx_hash.clone(),
+            output_index: utxo.output_index,
+        },
+        output: UtxoOutput {
+            address: address.to_string(),
+            amount: vec![Asset::new_from_str("lovelace", &utxo.lovelace.to_string())],
+            data_hash: None,
+            plutus_data: None,
+            script_ref: None,
+            script_hash: None,
+        },
+    }
+}
+
+fn registration_node_utxo(
+    registry: &ParameterizedScript,
+    tx_hash: &str,
+    output_index: u32,
+    pool_id: &[u8],
+    bifrost_id_pk: &[u8; 32],
+) -> UTxO {
+    let datum = RegistryElement {
+        data: ElementData::Node(RegistrationNodeData {
+            bifrost_id_pk: bifrost_id_pk.to_vec(),
+            bifrost_url: b"https://spo.example".to_vec(),
+        }),
+        link: None,
+    };
+    let registry_unit = format!("{}{}", registry.hash_hex(), hex::encode(pool_id));
+    UTxO {
+        input: UtxoInput {
+            tx_hash: tx_hash.to_string(),
+            output_index,
+        },
+        output: UtxoOutput {
+            address: registry.enterprise_address(pallas_addresses::Network::Testnet),
+            amount: vec![
+                Asset::new_from_str("lovelace", "2000000"),
+                Asset::new_from_str(&registry_unit, "1"),
+            ],
+            data_hash: None,
+            plutus_data: Some(hex::encode(datum.to_cbor())),
+            script_ref: None,
+            script_hash: Some(registry.hash_hex()),
+        },
+    }
+}
+
+fn tx_hash_hex(byte: u8) -> String {
+    hex::encode([byte; 32])
+}
+
+fn public_input_bytes(evidence_hash: [u8; 32], pool_id: [u8; 28]) -> Vec<Vec<u8>> {
+    vec![evidence_hash.to_vec(), pool_id.to_vec()]
+}
+
+fn bls_scalar_bytes(scalar: BlsFr) -> [u8; 32] {
+    let repr = scalar.to_repr();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(repr.as_ref());
+    out
+}
+
+fn tx_shape(tx_hex: &str) -> TxShape {
+    let tx_bytes = hex::decode(tx_hex).expect("signed tx hex");
+    let tx: Tx = minicbor::decode(&tx_bytes).expect("signed tx CBOR");
+    TxShape {
+        inputs: tx.transaction_body.inputs.len(),
+        outputs: tx.transaction_body.outputs.len(),
+        collateral_inputs: tx
+            .transaction_body
+            .collateral
+            .as_ref()
+            .map(|inputs| inputs.len())
+            .unwrap_or(0),
+        reference_inputs: tx
+            .transaction_body
+            .reference_inputs
+            .as_ref()
+            .map(|inputs| inputs.len())
+            .unwrap_or(0),
+    }
 }
 
 fn setup(params: AxiomDkgCircuitParams) -> ParamsKZG<Bls12> {
@@ -836,12 +1552,25 @@ fn parse_metric(text: &str, label: &str) -> Option<String> {
 
 fn tx_ex_unit_limits() -> ExUnits {
     ExUnits {
-        mem: env_u64("DKG_FAULT_MAX_TX_EX_MEM").unwrap_or(DEFAULT_MAX_TX_EX_MEM),
-        cpu: env_u64("DKG_FAULT_MAX_TX_EX_CPU").unwrap_or(DEFAULT_MAX_TX_EX_CPU),
+        mem: env_u64("DKG_FAULT_MAX_TX_EX_MEM").unwrap_or(DEFAULT_TX_EX_UNIT_LIMITS.mem),
+        cpu: env_u64("DKG_FAULT_MAX_TX_EX_CPU").unwrap_or(DEFAULT_TX_EX_UNIT_LIMITS.cpu),
     }
 }
 
+fn max_tx_size_bytes() -> usize {
+    env_usize(MAX_TX_SIZE_BYTES_ENV).unwrap_or(DEFAULT_MAX_TX_SIZE_BYTES)
+}
+
 fn env_u64(name: &str) -> Option<u64> {
+    let value = env::var(name).ok()?;
+    Some(
+        value
+            .parse()
+            .unwrap_or_else(|err| panic!("{name} must be an unsigned integer: {err}")),
+    )
+}
+
+fn env_usize(name: &str) -> Option<usize> {
     let value = env::var(name).ok()?;
     Some(
         value
@@ -866,6 +1595,17 @@ fn assert_all_within_tx_budget(reports: &[BudgetReport], limits: ExUnits) {
         violations.is_empty(),
         "on-chain DKG fault benchmarks exceed transaction ExUnit limits:\n{}",
         violations.join("\n")
+    );
+}
+
+fn assert_within_tx_budget(name: &str, budget: ExUnits, limits: ExUnits) {
+    assert!(
+        !budget.exceeds(limits),
+        "{name} exceeds transaction ExUnit limits: mem={} cpu={} limits_mem={} limits_cpu={}",
+        budget.mem,
+        budget.cpu,
+        limits.mem,
+        limits.cpu
     );
 }
 
@@ -928,6 +1668,35 @@ fn print_onchain_budget(name: &str, budget: ExUnits, aiken_time: Duration) {
     println!("aiken_check_time: {}", fmt_duration(aiken_time));
 }
 
+fn print_full_tx_budget(
+    name: &str,
+    tx_size_bytes: usize,
+    max_tx_size_bytes: usize,
+    report: &heimdall::cardano::local_eval::LocalEvalReport,
+    shape: TxShape,
+    blueprint_source: &str,
+    eval_time: Duration,
+) {
+    println!("full_tx_benchmark: {name}");
+    println!("full_tx_bifrost_blueprint: {blueprint_source}");
+    println!("full_tx_size_bytes: {tx_size_bytes}");
+    println!("full_tx_max_size_bytes: {max_tx_size_bytes}");
+    println!("full_tx_inputs: {}", shape.inputs);
+    println!("full_tx_outputs: {}", shape.outputs);
+    println!("full_tx_collateral_inputs: {}", shape.collateral_inputs);
+    println!("full_tx_reference_inputs: {}", shape.reference_inputs);
+    println!("full_tx_plutus_actions: {}", report.actions.len());
+    for action in &report.actions {
+        println!(
+            "full_tx_action: tag={:?} index={} mem={} cpu={}",
+            action.tag, action.index, action.budget.mem, action.budget.steps
+        );
+    }
+    println!("full_tx_mem: {}", report.total.mem);
+    println!("full_tx_cpu: {}", report.total.cpu);
+    println!("full_tx_eval_time: {}", fmt_duration(eval_time));
+}
+
 fn fmt_duration(duration: Duration) -> String {
     format!("{:.3}s", duration.as_secs_f64())
 }
@@ -951,6 +1720,14 @@ struct DigestProofArtifact {
     verify_time: Duration,
 }
 
+#[derive(Clone, Copy)]
+struct TxShape {
+    inputs: usize,
+    outputs: usize,
+    collateral_inputs: usize,
+    reference_inputs: usize,
+}
+
 impl DigestProofArtifact {
     fn with_digest(&self, name: &str, digest: BlsFr) -> Self {
         Self {
@@ -967,12 +1744,6 @@ impl DigestProofArtifact {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ExUnits {
-    mem: u64,
-    cpu: u64,
-}
-
 struct BudgetReport {
     name: &'static str,
     budget: ExUnits,
@@ -981,6 +1752,7 @@ struct BudgetReport {
 #[derive(Clone)]
 struct Round1Case {
     name: String,
+    evidence: fault_evidence::Round1PokFaultEvidence,
     witness: DkgRound1PokDigestFaultWitness,
     expect_residual_matches_transcript: bool,
 }
@@ -988,49 +1760,29 @@ struct Round1Case {
 #[derive(Clone)]
 struct Round2Case {
     name: String,
+    evidence: fault_evidence::Round2ShareFaultEvidence,
     witness: DkgRound2ShareFaultWitness,
     expect_identity_residual: bool,
 }
 
+#[derive(Clone)]
+struct EquivocationCase {
+    name: String,
+    evidence: fault_evidence::EquivocationEvidence,
+}
+
 fn round1_fixtures() -> Vec<Round1Case> {
-    let mut rng = ChaCha20Rng::seed_from_u64(0x524f_554e_4431);
-    let participant_identifier = 1u16;
-    let identifier = Identifier::try_from(participant_identifier).unwrap();
-    let (_secret, package) = participant::dkg_part1(identifier, 3, 2, &mut rng).unwrap();
-
-    let commitments = package.commitment().serialize().unwrap();
-    let phi0_bytes: [u8; 33] = commitments[0].as_slice().try_into().unwrap();
-    let phi0 = axiom_point_from_compressed(&phi0_bytes);
-
-    let proof_bytes = package.proof_of_knowledge().serialize().unwrap();
-    let mut mu_bytes = [0u8; 32];
-    mu_bytes.copy_from_slice(&proof_bytes[32..64]);
-    let mu = axiom_scalar_from_be_bytes(&mu_bytes);
-
-    let mut r_bytes = [0u8; 33];
-    r_bytes[0] = 0x02;
-    r_bytes[1..].copy_from_slice(&proof_bytes[..32]);
-    let honest_r_projective = projective_from_compressed(&r_bytes);
-    let corrupted_r_projective = honest_r_projective + ProjectivePoint::GENERATOR;
-
     [
-        ("round1-honest-pok", honest_r_projective, true),
-        ("round1-corrupted-pok", corrupted_r_projective, false),
+        ("round1-honest-pok", false, true),
+        ("round1-corrupted-pok", true, false),
     ]
     .into_iter()
-    .map(|(name, transcript_r_projective, expect_match)| {
-        let transcript_r_bytes = compressed_from_projective(transcript_r_projective);
-        let challenge = round1_challenge(identifier, &phi0_bytes, &transcript_r_bytes);
-        let witness = DkgRound1PokDigestFaultWitness {
-            accused_pool_id: BENCH_POOL_ID,
-            identifier: u64::from(participant_identifier),
-            mu,
-            challenge,
-            phi0,
-            transcript_r: axiom_point_from_projective(transcript_r_projective),
-        };
+    .map(|(name, corrupt, expect_match)| {
+        let evidence = round1_evidence(corrupt);
+        let witness = evidence.witness().expect("round1 evidence witness");
         Round1Case {
             name: name.to_string(),
+            evidence,
             witness,
             expect_residual_matches_transcript: expect_match,
         }
@@ -1038,17 +1790,69 @@ fn round1_fixtures() -> Vec<Round1Case> {
     .collect()
 }
 
-fn round1_challenge(identifier: Identifier, phi0_bytes: &[u8; 33], r_bytes: &[u8; 33]) -> Fq {
-    let mut challenge_preimage = Vec::new();
-    challenge_preimage.extend_from_slice(&identifier.serialize());
-    challenge_preimage.extend_from_slice(phi0_bytes);
-    challenge_preimage.extend_from_slice(r_bytes);
-    let challenge = frost::Secp256K1Sha256TR::HDKG(&challenge_preimage).unwrap();
-    let challenge_bytes: [u8; 32] = challenge.to_bytes().into();
-    axiom_scalar_from_be_bytes(&challenge_bytes)
+fn round1_evidence(corrupt: bool) -> fault_evidence::Round1PokFaultEvidence {
+    let mut rng = ChaCha20Rng::seed_from_u64(0x524f_554e_4431);
+    let participant_identifier = 1u16;
+    let identifier = Identifier::try_from(participant_identifier).unwrap();
+    let (_secret, package) = participant::dkg_part1(identifier, 3, 2, &mut rng).unwrap();
+
+    let (commitments, mut sigma_i) = frost_bridge::round1_fields(&package).unwrap();
+    if corrupt {
+        let mu: [u8; 32] = sigma_i[32..64].try_into().unwrap();
+        sigma_i[32..64].copy_from_slice(&corrupt_scalar_be(&mu));
+    }
+    let evidence_hash = fault_evidence::round1_evidence_hash_from_fields(
+        &BENCH_POOL_ID,
+        participant_identifier,
+        &commitments,
+        &sigma_i,
+    )
+    .unwrap();
+    let canonical_round1_bytes = canonical::round1(
+        BENCH_EPOCH,
+        BENCH_THRESHOLD,
+        BENCH_ATTEMPT,
+        &BENCH_POOL_ID,
+        &commitments,
+        &sigma_i,
+        &evidence_hash,
+    );
+    let (secp, keypair, bifrost_id_pk) = accused_key(0x31);
+    let payload_signature = auth::sign_payload(&secp, &keypair, &canonical_round1_bytes);
+
+    fault_evidence::Round1PokFaultEvidence {
+        epoch: BENCH_EPOCH,
+        threshold: BENCH_THRESHOLD,
+        attempt: BENCH_ATTEMPT,
+        accused_pool_id: BENCH_POOL_ID,
+        bifrost_id_pk,
+        identifier: participant_identifier,
+        commitments,
+        sigma_i,
+        payload_signature,
+    }
 }
 
 fn round2_fixtures() -> Vec<Round2Case> {
+    [
+        ("round2-honest-share", false, true),
+        ("round2-corrupted-share", true, false),
+    ]
+    .into_iter()
+    .map(|(name, corrupt, expect_identity)| {
+        let evidence = round2_evidence(corrupt);
+        let witness = evidence.witness().expect("round2 evidence witness");
+        Round2Case {
+            name: name.to_string(),
+            evidence,
+            witness,
+            expect_identity_residual: expect_identity,
+        }
+    })
+    .collect()
+}
+
+fn round2_evidence(corrupt: bool) -> fault_evidence::Round2ShareFaultEvidence {
     let mut rng = ChaCha20Rng::seed_from_u64(0x524f_554e_4432);
     let ids: Vec<Identifier> = (1..=3u16)
         .map(|id| Identifier::try_from(id).unwrap())
@@ -1076,54 +1880,147 @@ fn round2_fixtures() -> Vec<Round2Case> {
 
     let sender = ids[0];
     let recipient = ids[1];
-    let participant_index = 2u64;
-    let commitments = round1_packages[&sender]
-        .commitment()
-        .serialize()
-        .unwrap()
-        .into_iter()
-        .map(|bytes| {
-            let bytes: [u8; 33] = bytes.as_slice().try_into().unwrap();
-            axiom_point_from_compressed(&bytes)
-        })
-        .collect::<Vec<_>>();
+    let recipient_index = 2u16;
 
     let share_bytes = round2_packages_per_sender[&sender][&recipient]
         .signing_share()
         .serialize();
-    let share_bytes: [u8; 32] = share_bytes.as_slice().try_into().unwrap();
-    let honest_share = axiom_scalar_from_be_bytes(&share_bytes);
-    let corrupted_share = {
-        let scalar = Scalar::from_repr(share_bytes.into()).unwrap() + Scalar::ONE;
-        let bytes: [u8; 32] = scalar.to_bytes().into();
-        axiom_scalar_from_be_bytes(&bytes)
+    let mut share: [u8; 32] = share_bytes.as_slice().try_into().unwrap();
+    if corrupt {
+        share = corrupt_scalar_be(&share);
+    }
+
+    let (sender_commitments, sender_sigma) =
+        frost_bridge::round1_fields(&round1_packages[&sender]).unwrap();
+    let evidence_hash = fault_evidence::round2_evidence_hash_from_fields_dyn(
+        &BENCH_POOL_ID,
+        recipient_index,
+        &sender_commitments,
+        &share,
+    )
+    .unwrap();
+    let round1_evidence_hash = fault_evidence::round1_evidence_hash_from_fields(
+        &BENCH_POOL_ID,
+        1,
+        &sender_commitments,
+        &sender_sigma,
+    )
+    .unwrap();
+    let canonical_round1_bytes = canonical::round1(
+        BENCH_EPOCH,
+        BENCH_THRESHOLD,
+        BENCH_ATTEMPT,
+        &BENCH_POOL_ID,
+        &sender_commitments,
+        &sender_sigma,
+        &round1_evidence_hash,
+    );
+    let pad = [0xA5; 32];
+    let ciphertext = xor32(&share, &pad);
+    let entry = canonical::ShareEntry {
+        recipient_pool_id: [0x52; 28],
+        recipient_identifier: u64::from(recipient_index),
+        ephemeral_pk: sender_commitments[0],
+        ciphertext,
+        pad_commit: blake2b_256(&pad),
+        evidence_hash,
     };
+    let round2_canonical_bytes = canonical::round2(
+        BENCH_EPOCH,
+        BENCH_THRESHOLD,
+        BENCH_ATTEMPT,
+        &BENCH_POOL_ID,
+        &[entry],
+    );
+    let (secp, keypair, bifrost_id_pk) = accused_key(0x32);
+    let round1_signature = auth::sign_payload(&secp, &keypair, &canonical_round1_bytes);
+    let round2_signature = auth::sign_payload(&secp, &keypair, &round2_canonical_bytes);
 
-    [
-        ("round2-honest-share", honest_share, true),
-        ("round2-corrupted-share", corrupted_share, false),
-    ]
-    .into_iter()
-    .map(|(name, share, expect_identity)| Round2Case {
-        name: name.to_string(),
-        witness: DkgRound2ShareFaultWitness {
-            accused_pool_id: BENCH_POOL_ID,
-            share,
-            participant_index,
-            commitments: commitments.clone(),
-        },
-        expect_identity_residual: expect_identity,
-    })
-    .collect()
+    fault_evidence::Round2ShareFaultEvidence {
+        epoch: BENCH_EPOCH,
+        threshold: BENCH_THRESHOLD,
+        attempt: BENCH_ATTEMPT,
+        accused_pool_id: BENCH_POOL_ID,
+        bifrost_id_pk,
+        recipient_index,
+        round2_entry_index: 0,
+        sender_commitments,
+        canonical_round1_bytes,
+        round1_signature,
+        share,
+        pad,
+        round2_canonical_bytes,
+        round2_signature,
+    }
 }
 
-fn projective_from_compressed(bytes: &[u8; 33]) -> ProjectivePoint {
-    let encoded = EncodedPoint::from_bytes(bytes).unwrap();
-    let affine = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&encoded)).unwrap();
-    ProjectivePoint::from(affine)
+fn equivocation_fixture() -> EquivocationCase {
+    let (secp, keypair, bifrost_id_pk) = accused_key(0x45);
+
+    let commitments_a = [[0x02u8; 33], [0x03u8; 33]];
+    let sigma_a = [0x11u8; 64];
+    let evidence_hash_a = [0x44u8; 32];
+    let payload_a = canonical::round1(
+        BENCH_EPOCH,
+        BENCH_THRESHOLD,
+        BENCH_ATTEMPT,
+        &BENCH_POOL_ID,
+        &commitments_a,
+        &sigma_a,
+        &evidence_hash_a,
+    );
+
+    let commitments_b = [[0x02u8; 33], [0x04u8; 33]];
+    let sigma_b = [0x22u8; 64];
+    let evidence_hash_b = [0x55u8; 32];
+    let payload_b = canonical::round1(
+        BENCH_EPOCH,
+        BENCH_THRESHOLD,
+        BENCH_ATTEMPT,
+        &BENCH_POOL_ID,
+        &commitments_b,
+        &sigma_b,
+        &evidence_hash_b,
+    );
+
+    let signature_a = auth::sign_payload(&secp, &keypair, &payload_a);
+    let signature_b = auth::sign_payload(&secp, &keypair, &payload_b);
+    let evidence = fault_evidence::EquivocationEvidence {
+        phase: fault_evidence::NamespacePhase::Round1,
+        epoch: BENCH_EPOCH,
+        threshold: BENCH_THRESHOLD,
+        attempt: BENCH_ATTEMPT,
+        accused_pool_id: BENCH_POOL_ID,
+        bifrost_id_pk,
+        payload_a,
+        signature_a,
+        payload_b,
+        signature_b,
+    };
+    evidence.verify().expect("equivocation fixture verifies");
+
+    EquivocationCase {
+        name: "equivocation-round1".to_string(),
+        evidence,
+    }
 }
 
-fn compressed_from_projective(point: ProjectivePoint) -> [u8; 33] {
-    let encoded = point.to_affine().to_encoded_point(true);
-    encoded.as_bytes().try_into().unwrap()
+fn corrupt_scalar_be(bytes: &[u8; 32]) -> [u8; 32] {
+    be_bytes_from_fq(axiom_scalar_from_be_bytes(bytes) + Fq::from(1))
+}
+
+fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (out, (left, right)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+        *out = left ^ right;
+    }
+    out
+}
+
+fn accused_key(seed: u8) -> (Secp256k1<bitcoin::secp256k1::All>, Keypair, [u8; 32]) {
+    let secp = Secp256k1::new();
+    let secret = SecretKey::from_slice(&[seed; 32]).expect("deterministic secp secret key");
+    let keypair = Keypair::from_secret_key(&secp, &secret);
+    let bifrost_id_pk = keypair.x_only_public_key().0.serialize();
+    (secp, keypair, bifrost_id_pk)
 }

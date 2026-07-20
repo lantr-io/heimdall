@@ -26,9 +26,10 @@ The implemented DKG fault cases are:
 
 - Round 1 invalid proof-of-knowledge fault.
 - Round 2 invalid share fault.
+- Equivocation over two signed DKG payloads in the same namespace.
 
-The on-chain benchmark generates an Aiken minting policy that verifies the
-Halo2 proof with two public inputs:
+For Round 1 and Round 2, the on-chain benchmark generates an Aiken minting
+policy that verifies the Halo2 proof with two public inputs:
 
 ```text
 [evidence_hash, pool_id]
@@ -43,6 +44,43 @@ It mints exactly one fault token whose name is:
 ```text
 blake2b_256(pool_id || evidence_hash)
 ```
+
+The same benchmark also builds and evaluates signed Bifrost transactions using
+the corresponding Round 1, Round 2, or equivocation verifier policy from the
+Bifrost `plutus.json` artifact pinned by URL in the benchmark: the fault-token
+mint transaction and the first-ban `spo_bans.ApplyBan` transaction that consumes
+and burns the fault token. The equivocation benchmark does not use a Halo2
+proof; the Bifrost policy verifies both signatures, same-namespace payload
+binding, distinct payloads, and the equivocation evidence hash. The transactions
+use reference scripts and check both phase-2 ExUnits and transaction size.
+
+When the on-chain ban list is configured for the epoch loop, Heimdall also
+enables automatic DKG fault banning. The following `[cardano]` fields must be
+set with the same deployed Bifrost scripts and parameters:
+
+```toml
+registry_blueprint = "path/to/bifrost/onchain/plutus.json"
+registry_bootstrap = "<tx_hash>:<index>"
+ban_bootstrap = "<tx_hash>:<index>"
+fault_proof_policies = [
+  "<round1_fault_policy_id>",
+  "<round2_fault_policy_id>",
+  "<equivocation_fault_policy_id>",
+]
+base_ban_duration_ms = 86400000
+max_faults_before_permanent = 3
+max_validity_window_ms = 600000
+spo_bans_ref = "<tx_hash>:<index>"
+fault_verifier_round1_ref = "<tx_hash>:<index>"
+fault_verifier_round2_ref = "<tx_hash>:<index>"
+fault_verifier_equivocation_ref = "<tx_hash>:<index>"
+fault_proof_srs_path = "path/to/bls12_381_kzg_srs.params"
+```
+
+The fault verifier and `spo_bans` reference-script UTxOs are required for the
+automatic mint/apply-ban transaction sequence. The SRS file must be a trusted
+BLS12-381 KZG SRS serialized by Axiom Halo2 with
+`ParamsKZG::write_custom(..., SerdeFormat::Processed)`.
 
 ## Build
 
@@ -78,6 +116,26 @@ Run the on-chain Aiken/Plutus benchmark for Round 2:
 RUSTC_BOOTSTRAP=1 RUSTFLAGS='-D warnings' \
   DKG_FAULT_ONCHAIN_ROUND=round2 \
   cargo bench --bench dkg_fault_onchain
+```
+
+Run the on-chain Bifrost equivocation benchmark:
+
+```sh
+RUSTC_BOOTSTRAP=1 RUSTFLAGS='-D warnings' \
+  DKG_FAULT_ONCHAIN_ROUND=equivocation \
+  cargo bench --bench dkg_fault_onchain
+```
+
+Omit `DKG_FAULT_ONCHAIN_ROUND` or set it to `all` to run all three fault
+policy benchmarks. The full-transaction benchmark downloads the pinned Bifrost
+`plutus.json` artifact from GitHub.
+
+Override the full-transaction limits with:
+
+```sh
+DKG_FAULT_MAX_TX_EX_MEM=16500000
+DKG_FAULT_MAX_TX_EX_CPU=10000000000
+DKG_FAULT_MAX_TX_SIZE_BYTES=16384
 ```
 
 Generate the Aiken projects without running the Aiken benchmark:

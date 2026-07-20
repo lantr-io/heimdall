@@ -254,6 +254,20 @@ pub struct CardanoConfig {
     pub base_ban_duration_ms: Option<i64>,
     pub max_faults_before_permanent: Option<i64>,
     pub max_validity_window_ms: Option<i64>,
+    /// Reference-script UTxO `<tx_hash>:<index>` carrying the `spo_bans`
+    /// validator. Required for automatic DKG fault banning because ApplyBan
+    /// uses the script through withdraw/spend/mint paths.
+    pub spo_bans_ref: Option<String>,
+    /// Reference-script UTxOs `<tx_hash>:<index>` for the three specialized
+    /// fault verifier policies. The Round 1 and Round 2 publish transactions
+    /// do not fit reliably when the verifier script is embedded.
+    pub fault_verifier_round1_ref: Option<String>,
+    pub fault_verifier_round2_ref: Option<String>,
+    pub fault_verifier_equivocation_ref: Option<String>,
+    /// Path to a trusted BLS12-381 KZG SRS file serialized with the Axiom Halo2
+    /// `ParamsKZG::write_custom(..., SerdeFormat::Processed)` format. Required
+    /// for automatic Round 1/Round 2 DKG fault proof generation.
+    pub fault_proof_srs_path: Option<String>,
 }
 
 impl Default for CardanoConfig {
@@ -286,6 +300,11 @@ impl Default for CardanoConfig {
             base_ban_duration_ms: None,
             max_faults_before_permanent: None,
             max_validity_window_ms: None,
+            spo_bans_ref: None,
+            fault_verifier_round1_ref: None,
+            fault_verifier_round2_ref: None,
+            fault_verifier_equivocation_ref: None,
+            fault_proof_srs_path: None,
         }
     }
 }
