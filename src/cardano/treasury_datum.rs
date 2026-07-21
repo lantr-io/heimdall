@@ -4,9 +4,10 @@
 //! most recent Bitcoin treasury movement transaction. Constr(0) means
 //! the BTC tx is unconfirmed on Bitcoin; Constr(1) means confirmed.
 //!
-//! An **Unconfirmed** (Constr 0) datum wraps the full signed BTC tx; the
-//! legacy [`treasury_from_btc_tx_bytes`] / [`parse_treasury_datum`] helpers
-//! deserialize it and take output 0.
+//! An **Unconfirmed** (Constr 0) datum wraps the full signed BTC tx (plus
+//! `creator`/`created` provenance since the GC change; only field 0 is read
+//! here); the legacy [`treasury_from_btc_tx_bytes`] / [`parse_treasury_datum`]
+//! helpers deserialize it and take output 0.
 //!
 //! A **Confirmed** (Constr 1) datum instead carries the recomputed
 //! `btc_txid`, the swept input outpoints, and every output — the shape

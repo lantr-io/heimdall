@@ -7,7 +7,7 @@
 //! signed BTC tx as an inline datum:
 //!
 //! ```text
-//! Constr(0, [BoundedBytes(signed_btc_tx)])
+//! Constr(0, [BoundedBytes(signed_btc_tx), BoundedBytes(creator_pkh), BigInt(created_ms)])
 //! ```
 //!
 //! Constructor 0 = unconfirmed TM tx (confirmed = constructor 1, set
