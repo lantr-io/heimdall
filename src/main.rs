@@ -233,6 +233,26 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Deploy a DKG fault-verifier as a CIP-33 reference script and print its
+    /// policy id (hash) for `fault_proof_policies`. Dry-run (default) prints the
+    /// hash without submitting (round1/round2 need only their hash for the
+    /// equivocation path); `--kind equivocation --submit` deploys the ref.
+    DeployFaultRef {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// Which fault verifier: `round1` | `round2` | `equivocation`.
+        #[arg(long)]
+        kind: String,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
     /// Build (and with --submit, broadcast) the register_spo tx: bind this
     /// pool's cold-key identity to a Bifrost identity (secp256k1 key + URL),
     /// mint the membership token, insert the registration node into the
@@ -685,6 +705,21 @@ fn main() {
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_deploy_registry_ref(&cfg, &blueprint, &registry_bootstrap, submit) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::DeployFaultRef {
+            config,
+            blueprint,
+            registry_bootstrap,
+            kind,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) =
+                run_deploy_fault_ref(&cfg, &blueprint, &registry_bootstrap, &kind, submit)
+            {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1935,6 +1970,90 @@ fn run_deploy_registry_ref(
     let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
     println!("submitted: tx_hash={tx_hash}");
     println!("registry ref UTxO:    {tx_hash}:0  (pass as --registry-ref to register-spo)");
+    Ok(())
+}
+
+/// Deploy a DKG fault verifier as a CIP-33 reference script (M2 of the cheat→ban
+/// scenario), and print its policy id (hash) for `fault_proof_policies`. The
+/// verifier is parameterized by the spos_registry policy hash (derived from the
+/// blueprint + bootstrap outref), exactly as `DkgFaultBanFlow::from_config` does,
+/// so the deployed hash matches what the ban flow recomputes. Dry-run prints only
+/// the hash — enough for round1/round2 on the equivocation path (their ref UTxOs
+/// are never consumed and their SRS is never opened).
+fn run_deploy_fault_ref(
+    cfg: &HeimdallConfig,
+    blueprint_path: &str,
+    registry_bootstrap: &str,
+    kind: &str,
+    submit: bool,
+) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{
+        fault_verifier_equivocation_script, fault_verifier_round1_script,
+        fault_verifier_round2_script, spos_registry_script,
+    };
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let blueprint_json = std::fs::read_to_string(blueprint_path)
+        .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let verifier = match kind {
+        "round1" => fault_verifier_round1_script(&blueprint_json, &registry.hash),
+        "round2" => fault_verifier_round2_script(&blueprint_json, &registry.hash),
+        "equivocation" => fault_verifier_equivocation_script(&blueprint_json, &registry.hash),
+        other => {
+            return Err(format!(
+                "unknown --kind '{other}' (expected: round1 | round2 | equivocation)"
+            ));
+        }
+    }
+    .map_err(|e| format!("parameterize fault_verifier_{kind}: {e}"))?;
+
+    println!("fault_verifier_{kind} policy id: {}", verifier.hash_hex());
+    println!(
+        "  → add to `fault_proof_policies` in [cardano] (order: round1, round2, equivocation)"
+    );
+
+    if !submit {
+        println!("(dry run — hash only, no wallet needed; pass --submit to deploy the ref UTxO)");
+        return Ok(());
+    }
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let built = build_ref_script_deploy_tx(
+        &verifier,
+        &wallet_addr,
+        &wallet_utxos,
+        &key,
+        Some(cost_models),
+    )
+    .map_err(|e| format!("build ref-script deploy tx: {e}"))?;
+    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
+    println!("submitted: tx_hash={tx_hash}");
+    println!(
+        "fault-verifier ref UTxO: {tx_hash}:0  (→ fault_verifier_{kind}_ref in the SPO config)"
+    );
     Ok(())
 }
 
