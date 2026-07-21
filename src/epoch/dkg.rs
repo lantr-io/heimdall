@@ -99,6 +99,33 @@ pub async fn dkg_phase(
             collected.round1_mine = Some(secret);
             collected.round1_peers.insert(me, package);
 
+            // DEMO-ONLY equivocation injection (never set in production): publish a
+            // SECOND, distinct Round-1 package to our own server after peers have
+            // collected the first one, so an honest peer's confirmatory re-fetch (see
+            // `poll_dkg_round1`) retains BOTH and reports us for equivocation. We keep
+            // using the first package's secret for the rest of the ceremony.
+            if config.inject_fault == Some(crate::epoch::state::InjectFault::EquivocateRound1) {
+                let mut equiv_rng = rng.rng(b"dkg1-equivocation");
+                let (_discard, equiv_pkg) = participant::dkg_part1(
+                    me,
+                    roster.max_signers,
+                    roster.min_signers,
+                    &mut equiv_rng,
+                )
+                .map_err(|e| EpochError::Frost(format!("dkg_part1 (equivocation): {e}")))?;
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "  ⚠ INJECT: equivocating round1 — scheduling a SECOND conflicting package"
+                );
+                let peers_equiv = peers.clone();
+                let delay = config.poll_interval.saturating_mul(2);
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = peers_equiv.publish_dkg_round1(ns, me, &equiv_pkg).await;
+                });
+            }
+
             // Poll peers' Round 1 packages until the schedule-anchored deadline.
             // The valid publishers (plus self) form the live subset L1.
             let peer_infos = roster.peers_of(me);
@@ -128,6 +155,9 @@ pub async fn dkg_phase(
             .await?;
 
             let l1: BTreeSet<Identifier> = collected.round1_peers.keys().copied().collect();
+            // Report equivocation by any peer that DID publish a usable package (in L1,
+            // so not covered by the exclusion path below). Catches a "smart" equivocator.
+            report_round1_equivocations(chain, peers, ns, me, &ctx, &l1).await?;
             if l1 == eligible {
                 crate::epoch_log!(
                     me,
@@ -527,6 +557,33 @@ async fn report_round2_faults(
     Ok(())
 }
 
+/// Report equivocation faults for peers that DID publish a usable Round-1 package
+/// (they land in L1, so the exclusion-based [`round1_faults_for_excluded`] never
+/// checks them). The confirmatory re-fetch in [`poll_dkg_round1`] populates the
+/// retained conflicts that back these faults.
+async fn report_round1_equivocations(
+    chain: &Arc<dyn CardanoChain>,
+    peers: &Arc<dyn PeerNetwork>,
+    ns: DkgNamespace,
+    me: Identifier,
+    ctx: &DkgContext,
+    collected: &BTreeSet<Identifier>,
+) -> EpochResult<()> {
+    let roster = ctx.to_roster();
+    for id in collected {
+        if *id == me {
+            continue;
+        }
+        let Some(peer) = roster.participants.get(id) else {
+            continue;
+        };
+        for fault in peers.dkg_round1_fault_evidence(ns, peer).await? {
+            publish_detected_fault(chain, me, ctx.epoch, peer.clone(), fault).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn round1_faults_for_excluded(
     peers: &Arc<dyn PeerNetwork>,
     ns: DkgNamespace,
@@ -715,6 +772,13 @@ async fn poll_dkg_round1(
             break;
         }
         tokio::time::sleep(config.poll_interval).await;
+    }
+    // Anti-equivocation sweep: re-fetch every peer once more (even those already
+    // collected) so a peer that served a DIFFERENT payload after we first fetched it
+    // is caught — `fetch_dkg_round1` calls `retain_evidence`, which records the
+    // conflict that `report_round1_equivocations` then turns into a fault.
+    for peer in peer_infos {
+        let _ = peers.fetch_dkg_round1(ns, peer).await;
     }
     Ok(())
 }
@@ -966,6 +1030,52 @@ mod tests {
         );
         let faults = recorded.lock().unwrap();
         assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].kind_label(), "equivocation");
+        assert_eq!(faults[0].accused_pool_id(), &accused_pool);
+    }
+
+    /// A "smart" equivocator publishes a usable Round-1 package (so it lands in L1
+    /// and is NOT excluded) yet still equivocated. `report_round1_equivocations`
+    /// must catch it — this is the path the `--inject-fault=equivocate-round1`
+    /// demo exercises (the injected node stays in the ceremony but serves a second
+    /// conflicting package that an honest peer's confirmatory re-fetch retains).
+    #[tokio::test]
+    async fn collected_peer_equivocation_is_reported() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let accused = Identifier::try_from(2u16).unwrap();
+        let mut roster = make_roster(3, 2);
+        for (i, participant) in roster.participants.values_mut().enumerate() {
+            participant.pool_id = vec![0xC0 + i as u8; 28];
+        }
+        let accused_pool: [u8; 28] = roster
+            .participants
+            .get(&accused)
+            .unwrap()
+            .pool_id
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let ctx = DkgContext::from_roster_equal_stake(&roster, 0, 0);
+        let ns = DkgNamespace::for_attempt(0, 0);
+        let hub = MockPeerHub::new();
+        hub.push_round1_fault_evidence(ns, accused, dummy_equivocation(0, accused_pool));
+        let mock_chain = Arc::new(MockCardanoChain::demo(2, 3, 0));
+        let recorded = mock_chain.dkg_faults();
+        let chain: Arc<dyn CardanoChain> = mock_chain;
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub));
+
+        // Accused is in the collected set L1 — it DID publish a usable package.
+        let l1: BTreeSet<Identifier> = [me, accused].into_iter().collect();
+        report_round1_equivocations(&chain, &peers, ns, me, &ctx, &l1)
+            .await
+            .expect("reporting equivocations should not error");
+
+        let faults = recorded.lock().unwrap();
+        assert_eq!(
+            faults.len(),
+            1,
+            "the collected equivocator must be reported"
+        );
         assert_eq!(faults[0].kind_label(), "equivocation");
         assert_eq!(faults[0].accused_pool_id(), &accused_pool);
     }

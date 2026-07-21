@@ -420,6 +420,8 @@ impl HeimdallConfig {
                 .state_dir
                 .as_deref()
                 .map(std::path::PathBuf::from),
+            // Demo-only; the harness/CLI sets this after building the config.
+            inject_fault: None,
         }
     }
 }

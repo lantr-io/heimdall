@@ -64,6 +64,11 @@ enum Commands {
         /// reproducible across runs. Demo-only.
         #[arg(long)]
         deterministic: bool,
+        /// DEMO-ONLY: inject a DKG fault so this node misbehaves, to exercise
+        /// the fault-proof / SPO-ban flow live in the scenario harness. Kinds:
+        /// `equivocate-round1`. Never set in production.
+        #[arg(long)]
+        inject_fault: Option<String>,
         /// Blockfrost project ID (e.g. `preprodXXXXXX`). Network is
         /// auto-detected from the key prefix. If set, UTxOs are
         /// queried from Blockfrost instead of a local node.
@@ -516,6 +521,7 @@ fn main() {
             max_signers,
             base_port,
             deterministic,
+            inject_fault,
             blockfrost_project_id,
             cardano_socket,
             cardano_magic,
@@ -585,7 +591,7 @@ fn main() {
             }
 
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_demo(cfg, index, deterministic));
+            rt.block_on(run_demo(cfg, index, deterministic, inject_fault));
         }
         Commands::BootstrapTreasury {
             config,
@@ -966,7 +972,12 @@ fn apply_tm_policy(
     }
 }
 
-async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) {
+async fn run_demo(
+    cfg: HeimdallConfig,
+    index: Option<u16>,
+    deterministic: bool,
+    inject_fault: Option<String>,
+) {
     // The fixture provides a fallback roster (SPO identities + ports)
     // until the on-chain SPO registry is wired.
     let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(&cfg);
@@ -1227,10 +1238,24 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
     );
 
     let peers: Arc<dyn PeerNetwork> = net;
-    let config = cfg.to_epoch_config(SpoIdentity {
+    let mut config = cfg.to_epoch_config(SpoIdentity {
         identifier: id,
         port,
     });
+    // DEMO-ONLY fault injection (--inject-fault); parse-and-die on a bad kind.
+    config.inject_fault = match inject_fault.as_deref() {
+        None => None,
+        Some(s) => match s.parse::<heimdall::epoch::state::InjectFault>() {
+            Ok(k) => Some(k),
+            Err(e) => {
+                eprintln!("[demo] {e}");
+                std::process::exit(2);
+            }
+        },
+    };
+    if let Some(k) = config.inject_fault {
+        eprintln!("[demo] ⚠ FAULT INJECTION ENABLED: {k:?} — this node will misbehave in DKG");
+    }
 
     let t0 = Instant::now();
     // The epoch loop treats chain-read / peer / aborted-DKG failures as

@@ -391,6 +391,32 @@ pub struct EpochConfig {
     /// process restarts for the epoch (WI-014 #5). `None` → in-memory only (the
     /// share is lost on restart and DKG re-runs next boundary).
     pub state_dir: Option<std::path::PathBuf>,
+    /// Demo-only DKG fault injection (never set in production). Makes THIS node
+    /// misbehave so the fault-detection + ban flow can be exercised live.
+    pub inject_fault: Option<InjectFault>,
+}
+
+/// Demo-only fault-injection kinds (see [`EpochConfig::inject_fault`]). Present so
+/// the fault-proof / SPO-ban flow can be exercised live in the scenario harness;
+/// an honest deployment never sets this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectFault {
+    /// Publish two distinct Round-1 DKG packages (equivocation). Honest peers'
+    /// confirmatory re-fetch retains both, and the equivocation fault is reported
+    /// against this node even though it also published a usable package.
+    EquivocateRound1,
+}
+
+impl std::str::FromStr for InjectFault {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "equivocate-round1" | "equivocate_round1" => Ok(InjectFault::EquivocateRound1),
+            other => Err(format!(
+                "unknown --inject-fault kind '{other}' (expected: equivocate-round1)"
+            )),
+        }
+    }
 }
 
 impl EpochConfig {
@@ -416,6 +442,7 @@ impl EpochConfig {
             pegin_poll_interval: Duration::from_millis(1000),
             pegin_refund_timeout_blocks: 4320,
             state_dir: None,
+            inject_fault: None,
         }
     }
 }
