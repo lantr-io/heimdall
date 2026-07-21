@@ -127,14 +127,17 @@ pub fn build_oracle_update_tx(
     // `Network::Custom` so the script-integrity hash matches the ledger's even when whisky's
     // hardcoded per-network cost models are stale. `None` → whisky's built-in Preprod models.
     cost_models: Option<Vec<Vec<i64>>>,
-    // Latest chain `(slot, posix_secs)`: seeds the datum's `created` (block time, ms) and the
-    // tx's `invalid_hereafter` (slot + 30 min). The TM mint policy requires a finite validity
-    // upper bound within 1h of `created`, so the GC grace period cannot be backdated.
+    // Latest chain `(slot, posix_secs)`: derives the tx's `invalid_hereafter` (slot + 30 min)
+    // and the datum's `created`. The TM mint policy requires `created` to EQUAL the validity
+    // upper bound's POSIX ms, making it a guaranteed upper bound on the real posting time (the
+    // GC grace period can start late but never early). Block time == slot time and recent
+    // preprod/mainnet slots are 1 s, so slot latest+1800 begins at (latest_time + 1800) s
+    // exactly.
     latest_slot_time: (u64, i64),
 ) -> EpochResult<String> {
     let pkh = pub_key_hash_hex(key);
     let (latest_slot, latest_time_secs) = latest_slot_time;
-    let created_ms = latest_time_secs * 1000;
+    let created_ms = (latest_time_secs + 1800) * 1000;
     let creator_pkh =
         hex::decode(&pkh).map_err(|e| EpochError::Chain(format!("wallet pkh decode: {e}")))?;
     let datum_hex = encode_datum_hex(signed_btc_tx, constructor, &creator_pkh, created_ms);
@@ -261,8 +264,8 @@ pub fn build_oracle_update_tx(
         metadata: vec![],
         validity_range: ValidityRange {
             invalid_before: None,
-            // Finite upper bound, required by the TM mint policy's created-anchoring check
-            // (30 min << the 1h on-chain slack; preprod/mainnet slots are 1s).
+            // Finite upper bound, required by the TM mint policy's created-anchoring check:
+            // `created` in the datum equals this slot's begin time in ms (see created_ms above).
             invalid_hereafter: Some(latest_slot + 1800),
         },
         total_collateral: None,
