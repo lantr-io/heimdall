@@ -586,7 +586,7 @@ impl BlockfrostCardanoChain {
 
     /// Read the Config UTxO's field 11 (initial_btc_treasury_utxo). Returns the 36-byte
     /// anchor outpoint and the config UTxO's Cardano outpoint (the Genesis mint reference).
-    async fn query_config_anchor(&self) -> EpochResult<([u8; 36], (String, u32))> {
+    async fn query_config_anchor(&self) -> EpochResult<([u8; 36], (String, u32), u64)> {
         let (addr, unit) = match (&self.config_address, &self.config_nft_unit) {
             (Some(a), Some(u)) => (a, u),
             _ => {
@@ -631,7 +631,21 @@ impl BlockfrostCardanoChain {
                 v.len()
             ))
         })?;
-        Ok((anchor, (utxo.tx_hash.clone(), utxo.output_index as u32)))
+        // N7: leader_reward is Config field 15 (present once the operational-parameter tunables are
+        // appended; absent on a bare upstream config → 0). Carried into the posted TM datum; its
+        // on-chain pin against this field lands with N9.
+        let leader_reward = if fields.len() > 15 {
+            crate::cardano::plutus::field_int(fields, 15)
+                .map_err(|e| EpochError::Chain(format!("config field 15 (leader_reward): {e}")))?
+                .max(0) as u64
+        } else {
+            0
+        };
+        Ok((
+            anchor,
+            (utxo.tx_hash.clone(), utxo.output_index as u32),
+            leader_reward,
+        ))
     }
 
     /// All Confirmed TM records at the treasury address carrying the TM NFT, parsed for
@@ -1101,7 +1115,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         // on Cardano, so price it via bitcoind gettxout (DEC-022).
         if confirmed.is_empty() {
             use bitcoin::hashes::Hash;
-            let (anchor, _config_ref) = self.query_config_anchor().await?;
+            let (anchor, _config_ref, _leader_reward) = self.query_config_anchor().await?;
             let txid_bytes: [u8; 32] = anchor[..32].try_into().unwrap();
             let txid = bitcoin::Txid::from_byte_array(txid_bytes);
             let vout = u32::from_le_bytes(anchor[32..].try_into().unwrap());
@@ -1325,16 +1339,20 @@ impl CardanoChain for BlockfrostCardanoChain {
         // The chain-linkage mint reference: the tip Confirmed record (Chain redeemer) or,
         // before the first TM confirms, the Config UTxO (Genesis redeemer). Only needed when
         // minting under the real TM validator.
-        let mint_ref: Option<(String, u32, bool)> = if self.tm_script_cbor.is_some() {
-            let (anchor, config_ref) = self.query_config_anchor().await?;
-            let records = self.query_confirmed_records().await?;
-            match crate::cardano::tm_chain::walk_chain(anchor, &records) {
-                Some(tip) => Some((tip.cardano_utxo.0.clone(), tip.cardano_utxo.1, false)),
-                None => Some((config_ref.0, config_ref.1, true)),
-            }
-        } else {
-            None
-        };
+        // Also capture the N7 `leader_reward` (Config field 15) here — the real path already reads
+        // the Config UTxO for the anchor; the scaffold path has no Config, so 0.
+        let (mint_ref, leader_reward): (Option<(String, u32, bool)>, u64) =
+            if self.tm_script_cbor.is_some() {
+                let (anchor, config_ref, cfg_leader_reward) = self.query_config_anchor().await?;
+                let records = self.query_confirmed_records().await?;
+                let r = match crate::cardano::tm_chain::walk_chain(anchor, &records) {
+                    Some(tip) => Some((tip.cardano_utxo.0.clone(), tip.cardano_utxo.1, false)),
+                    None => Some((config_ref.0, config_ref.1, true)),
+                };
+                (r, cfg_leader_reward)
+            } else {
+                (None, 0)
+            };
 
         // Latest chain slot + time: seeds the datum's `created` and the finite
         // `invalid_hereafter` the TM mint policy requires (created-anchoring check).
@@ -1344,6 +1362,13 @@ impl CardanoChain for BlockfrostCardanoChain {
         )
         .await
         .map_err(|e| EpochError::Chain(format!("fetch latest block slot/time: {e}")))?;
+
+        // N7: the Cardano epoch this TM belongs to — carried in the posted datum (not yet enforced
+        // on-chain; the leader_reward pin + payout land with N9).
+        let epoch =
+            crate::cardano::bf_http::fetch_current_epoch(&self.bf_base_url, &self.bf_project_id)
+                .await
+                .map_err(|e| EpochError::Chain(format!("fetch current epoch: {e}")))?;
 
         let signed_tx_hex = build_oracle_update_tx(
             &self.treasury_address,
@@ -1358,6 +1383,8 @@ impl CardanoChain for BlockfrostCardanoChain {
             mint_ref.as_ref().map(|(h, i, g)| (h.as_str(), *i, *g)),
             Some(cost_models),
             latest_slot_time,
+            epoch,
+            leader_reward,
         )?;
 
         let cardano_tx_cbor = hex::decode(&signed_tx_hex)

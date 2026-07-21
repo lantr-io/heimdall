@@ -76,20 +76,32 @@ impl WalletUtxo {
 }
 
 /// Encode the treasury oracle datum:
-/// `Constr(constructor, [BoundedBytes(btc_tx), BoundedBytes(creator_pkh), BigInt(created_ms)])`.
+/// `Constr(constructor, [BoundedBytes(btc_tx), BoundedBytes(creator_pkh), BigInt(created_ms),
+/// BigInt(epoch), BigInt(leader_reward)])`.
 ///
 /// Constructor 0 = unconfirmed TM tx; 1 = confirmed (set by Binocular after a
 /// Bitcoin proof). `creator` is the poster's payment key hash (it may GC the
 /// Confirmed record after the on-chain grace period); `created` is POSIX ms,
-/// anchored by the TM mint policy to the tx's validity upper bound. Canonical
-/// encoding via `cardano::plutus::constr`.
-fn encode_datum_hex(btc_tx: &[u8], constructor: u8, creator_pkh: &[u8], created_ms: i64) -> String {
+/// anchored by the TM mint policy to the tx's validity upper bound. `epoch` /
+/// `leader_reward` are the N7 fields (Cardano epoch; a copy of the Config
+/// `leader_reward` tunable) — carried through Confirm, not yet enforced on-chain
+/// (pin + payout land with N9). Canonical encoding via `cardano::plutus::constr`.
+fn encode_datum_hex(
+    btc_tx: &[u8],
+    constructor: u8,
+    creator_pkh: &[u8],
+    created_ms: i64,
+    epoch: i64,
+    leader_reward: i64,
+) -> String {
     let datum = crate::cardano::plutus::constr(
         u64::from(constructor),
         vec![
             crate::cardano::plutus::bytes(btc_tx),
             crate::cardano::plutus::bytes(creator_pkh),
             crate::cardano::plutus::int(created_ms),
+            crate::cardano::plutus::int(epoch),
+            crate::cardano::plutus::int(leader_reward),
         ],
     );
     let cbor = minicbor::to_vec(&datum).expect("datum CBOR encode");
@@ -134,13 +146,25 @@ pub fn build_oracle_update_tx(
     // preprod/mainnet slots are 1 s, so slot latest+1800 begins at (latest_time + 1800) s
     // exactly.
     latest_slot_time: (u64, i64),
+    // N7 datum fields carried through to the Confirmed record: `epoch` (the Cardano epoch this TM
+    // belongs to) and `leader_reward` (a copy of the Config `leader_reward` tunable at post). Not
+    // yet enforced on-chain — the pin + payout land with N9.
+    epoch: u64,
+    leader_reward: u64,
 ) -> EpochResult<String> {
     let pkh = pub_key_hash_hex(key);
     let (latest_slot, latest_time_secs) = latest_slot_time;
     let created_ms = (latest_time_secs + 1800) * 1000;
     let creator_pkh =
         hex::decode(&pkh).map_err(|e| EpochError::Chain(format!("wallet pkh decode: {e}")))?;
-    let datum_hex = encode_datum_hex(signed_btc_tx, constructor, &creator_pkh, created_ms);
+    let datum_hex = encode_datum_hex(
+        signed_btc_tx,
+        constructor,
+        &creator_pkh,
+        created_ms,
+        epoch as i64,
+        leader_reward as i64,
+    );
     let asset_unit = format!("{treasury_policy_id}{treasury_asset_name_hex}");
 
     // Pick the richest wallet UTxO as the fee-paying input.
@@ -312,16 +336,17 @@ mod tests {
     use pallas_primitives::conway::PlutusData;
 
     #[test]
-    fn encode_datum_is_constr_0_with_creator_and_created() {
+    fn encode_datum_is_constr_0_with_creator_created_epoch_leader_reward() {
         let btc_tx = vec![0x02, 0x00, 0x00, 0x00];
         let creator = vec![0x7a; 28];
-        let hex_str = encode_datum_hex(&btc_tx, 0, &creator, 1_700_000_000_000);
+        let hex_str = encode_datum_hex(&btc_tx, 0, &creator, 1_700_000_000_000, 42, 2_000_000);
         let cbor = hex::decode(&hex_str).unwrap();
         let decoded: PlutusData = pallas_codec::minicbor::decode(&cbor).expect("decode");
         match decoded {
             PlutusData::Constr(c) => {
                 assert_eq!(c.tag, 121, "should be constructor 0 (unconfirmed)");
-                assert_eq!(c.fields.len(), 3);
+                // N7: [signed_btc_tx, creator, created, epoch, leader_reward]
+                assert_eq!(c.fields.len(), 5);
                 match &c.fields[0] {
                     PlutusData::BoundedBytes(b) => {
                         let v: Vec<u8> = b.clone().into();
@@ -336,7 +361,12 @@ mod tests {
                     }
                     _ => panic!("expected BoundedBytes creator"),
                 }
-                assert!(matches!(&c.fields[2], PlutusData::BigInt(_)));
+                assert!(matches!(&c.fields[2], PlutusData::BigInt(_)), "created");
+                assert!(matches!(&c.fields[3], PlutusData::BigInt(_)), "epoch");
+                assert!(
+                    matches!(&c.fields[4], PlutusData::BigInt(_)),
+                    "leader_reward"
+                );
             }
             _ => panic!("expected Constr"),
         }
