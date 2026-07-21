@@ -253,6 +253,34 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Deploy the `spo_bans` validator as a CIP-33 reference script and print its
+    /// policy id (the ban-list policy). `spo_bans` is parameterized by the registry
+    /// hash + the 3 fault-verifier policy hashes (derived here from the blueprint) +
+    /// the ban-schedule params + the ban-list bootstrap outref, so the printed hash
+    /// matches what `DkgFaultBanFlow::from_config` recomputes.
+    DeploySpoBansRef {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// The ban-list one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        ban_bootstrap: String,
+        /// Ban-schedule params (must equal the SPO config's).
+        #[arg(long)]
+        base_ban_duration_ms: i64,
+        #[arg(long)]
+        max_faults_before_permanent: i64,
+        #[arg(long)]
+        max_validity_window_ms: i64,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
     /// Build (and with --submit, broadcast) the register_spo tx: bind this
     /// pool's cold-key identity to a Bifrost identity (secp256k1 key + URL),
     /// mint the membership token, insert the registration node into the
@@ -720,6 +748,31 @@ fn main() {
             if let Err(e) =
                 run_deploy_fault_ref(&cfg, &blueprint, &registry_bootstrap, &kind, submit)
             {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::DeploySpoBansRef {
+            config,
+            blueprint,
+            registry_bootstrap,
+            ban_bootstrap,
+            base_ban_duration_ms,
+            max_faults_before_permanent,
+            max_validity_window_ms,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_deploy_spo_bans_ref(
+                &cfg,
+                &blueprint,
+                &registry_bootstrap,
+                &ban_bootstrap,
+                base_ban_duration_ms,
+                max_faults_before_permanent,
+                max_validity_window_ms,
+                submit,
+            ) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -2054,6 +2107,104 @@ fn run_deploy_fault_ref(
     println!(
         "fault-verifier ref UTxO: {tx_hash}:0  (→ fault_verifier_{kind}_ref in the SPO config)"
     );
+    Ok(())
+}
+
+/// Deploy `spo_bans` as a CIP-33 reference script (M2). Parameterizes it exactly
+/// as `DkgFaultBanFlow::from_config`: registry hash + the 3 fault-verifier policy
+/// hashes (round1, round2, equivocation — order matters) + ban-schedule params +
+/// the ban-list bootstrap outref. Prints the ban-list policy id; --submit deploys.
+#[allow(clippy::too_many_arguments)]
+fn run_deploy_spo_bans_ref(
+    cfg: &HeimdallConfig,
+    blueprint_path: &str,
+    registry_bootstrap: &str,
+    ban_bootstrap: &str,
+    base_ban_duration_ms: i64,
+    max_faults_before_permanent: i64,
+    max_validity_window_ms: i64,
+    submit: bool,
+) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{
+        fault_verifier_equivocation_script, fault_verifier_round1_script,
+        fault_verifier_round2_script, spo_bans_script, spos_registry_script,
+    };
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let blueprint_json = std::fs::read_to_string(blueprint_path)
+        .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let r1 = fault_verifier_round1_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_round1: {e}"))?;
+    let r2 = fault_verifier_round2_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_round2: {e}"))?;
+    let eq = fault_verifier_equivocation_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_equivocation: {e}"))?;
+    let policies = [r1.hash, r2.hash, eq.hash];
+    let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
+    let spo_bans = spo_bans_script(
+        &blueprint_json,
+        &registry.hash,
+        &policies,
+        base_ban_duration_ms,
+        max_faults_before_permanent,
+        max_validity_window_ms,
+        &ban_tx_id,
+        u64::from(ban_index),
+    )
+    .map_err(|e| format!("parameterize spo_bans: {e}"))?;
+
+    println!(
+        "spo_bans policy id (ban-list policy): {}",
+        spo_bans.hash_hex()
+    );
+    println!("fault_proof_policies (round1, round2, equivocation):");
+    println!("  {}", r1.hash_hex());
+    println!("  {}", r2.hash_hex());
+    println!("  {}", eq.hash_hex());
+
+    if !submit {
+        println!(
+            "(dry run — hashes only, no wallet needed; pass --submit to deploy the spo_bans ref UTxO)"
+        );
+        return Ok(());
+    }
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let built = build_ref_script_deploy_tx(
+        &spo_bans,
+        &wallet_addr,
+        &wallet_utxos,
+        &key,
+        Some(cost_models),
+    )
+    .map_err(|e| format!("build ref-script deploy tx: {e}"))?;
+
+    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
+    println!("submitted: tx_hash={tx_hash}");
+    println!("spo_bans ref UTxO: {tx_hash}:0  (→ spo_bans_ref in the SPO config)");
     Ok(())
 }
 
