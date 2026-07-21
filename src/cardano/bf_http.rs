@@ -152,8 +152,8 @@ pub async fn fetch_latest_block_time(base_url: &str, project_id: &str) -> Result
 }
 
 /// The latest block's `(slot, posix_time_secs)` from `/blocks/latest`. The slot anchors
-/// tx validity bounds (`invalid_hereafter`); the time seeds the TM datum's `created` field
-/// (the TM mint policy requires `created` within 1h of the tx's validity upper bound).
+/// tx validity bounds (`invalid_hereafter`); the time derives the TM datum's `created` field
+/// (the TM mint policy requires `created` to EQUAL the validity upper bound's POSIX ms).
 pub async fn fetch_latest_block_slot_time(
     base_url: &str,
     project_id: &str,
