@@ -75,15 +75,22 @@ impl WalletUtxo {
     }
 }
 
-/// Encode the treasury oracle datum: `Constr(constructor, [BoundedBytes(btc_tx)])`.
+/// Encode the treasury oracle datum:
+/// `Constr(constructor, [BoundedBytes(btc_tx), BoundedBytes(creator_pkh), BigInt(created_ms)])`.
 ///
 /// Constructor 0 = unconfirmed TM tx; 1 = confirmed (set by Binocular after a
-/// Bitcoin proof). Canonical encoding via `cardano::plutus::constr` (see that
-/// module for the tag / canonical-encoding rules).
-fn encode_datum_hex(btc_tx: &[u8], constructor: u8) -> String {
+/// Bitcoin proof). `creator` is the poster's payment key hash (it may GC the
+/// Confirmed record after the on-chain grace period); `created` is POSIX ms,
+/// anchored by the TM mint policy to the tx's validity upper bound. Canonical
+/// encoding via `cardano::plutus::constr`.
+fn encode_datum_hex(btc_tx: &[u8], constructor: u8, creator_pkh: &[u8], created_ms: i64) -> String {
     let datum = crate::cardano::plutus::constr(
         u64::from(constructor),
-        vec![crate::cardano::plutus::bytes(btc_tx)],
+        vec![
+            crate::cardano::plutus::bytes(btc_tx),
+            crate::cardano::plutus::bytes(creator_pkh),
+            crate::cardano::plutus::int(created_ms),
+        ],
     );
     let cbor = minicbor::to_vec(&datum).expect("datum CBOR encode");
     hex::encode(cbor)
@@ -120,9 +127,20 @@ pub fn build_oracle_update_tx(
     // `Network::Custom` so the script-integrity hash matches the ledger's even when whisky's
     // hardcoded per-network cost models are stale. `None` → whisky's built-in Preprod models.
     cost_models: Option<Vec<Vec<i64>>>,
+    // Latest chain `(slot, posix_secs)`: derives the tx's `invalid_hereafter` (slot + 30 min)
+    // and the datum's `created`. The TM mint policy requires `created` to EQUAL the validity
+    // upper bound's POSIX ms, making it a guaranteed upper bound on the real posting time (the
+    // GC grace period can start late but never early). Block time == slot time and recent
+    // preprod/mainnet slots are 1 s, so slot latest+1800 begins at (latest_time + 1800) s
+    // exactly.
+    latest_slot_time: (u64, i64),
 ) -> EpochResult<String> {
     let pkh = pub_key_hash_hex(key);
-    let datum_hex = encode_datum_hex(signed_btc_tx, constructor);
+    let (latest_slot, latest_time_secs) = latest_slot_time;
+    let created_ms = (latest_time_secs + 1800) * 1000;
+    let creator_pkh =
+        hex::decode(&pkh).map_err(|e| EpochError::Chain(format!("wallet pkh decode: {e}")))?;
+    let datum_hex = encode_datum_hex(signed_btc_tx, constructor, &creator_pkh, created_ms);
     let asset_unit = format!("{treasury_policy_id}{treasury_asset_name_hex}");
 
     // Pick the richest wallet UTxO as the fee-paying input.
@@ -246,7 +264,9 @@ pub fn build_oracle_update_tx(
         metadata: vec![],
         validity_range: ValidityRange {
             invalid_before: None,
-            invalid_hereafter: None,
+            // Finite upper bound, required by the TM mint policy's created-anchoring check:
+            // `created` in the datum equals this slot's begin time in ms (see created_ms above).
+            invalid_hereafter: Some(latest_slot + 1800),
         },
         total_collateral: None,
         collateral_return_address: None,
@@ -292,15 +312,16 @@ mod tests {
     use pallas_primitives::conway::PlutusData;
 
     #[test]
-    fn encode_datum_is_constr_0() {
+    fn encode_datum_is_constr_0_with_creator_and_created() {
         let btc_tx = vec![0x02, 0x00, 0x00, 0x00];
-        let hex_str = encode_datum_hex(&btc_tx, 0);
+        let creator = vec![0x7a; 28];
+        let hex_str = encode_datum_hex(&btc_tx, 0, &creator, 1_700_000_000_000);
         let cbor = hex::decode(&hex_str).unwrap();
         let decoded: PlutusData = pallas_codec::minicbor::decode(&cbor).expect("decode");
         match decoded {
             PlutusData::Constr(c) => {
                 assert_eq!(c.tag, 121, "should be constructor 0 (unconfirmed)");
-                assert_eq!(c.fields.len(), 1);
+                assert_eq!(c.fields.len(), 3);
                 match &c.fields[0] {
                     PlutusData::BoundedBytes(b) => {
                         let v: Vec<u8> = b.clone().into();
@@ -308,6 +329,14 @@ mod tests {
                     }
                     _ => panic!("expected BoundedBytes"),
                 }
+                match &c.fields[1] {
+                    PlutusData::BoundedBytes(b) => {
+                        let v: Vec<u8> = b.clone().into();
+                        assert_eq!(v, creator);
+                    }
+                    _ => panic!("expected BoundedBytes creator"),
+                }
+                assert!(matches!(&c.fields[2], PlutusData::BigInt(_)));
             }
             _ => panic!("expected Constr"),
         }

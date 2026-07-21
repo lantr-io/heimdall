@@ -60,7 +60,8 @@ pub fn walk_chain(anchor: [u8; 36], records: &[ConfirmedTm]) -> Option<&Confirme
 }
 
 /// Parse a `Confirmed` TM datum: Constr tag 122 with fields
-/// `[BoundedBytes btcTxid, Array<BoundedBytes> swept, Array<Constr(scriptPubKey, amount)>]`.
+/// `[BoundedBytes btcTxid, Array<BoundedBytes> swept, Array<Constr(scriptPubKey, amount)>,
+/// BoundedBytes creator, BigInt created]` (creator/created ignored here).
 /// Returns `(btc_txid, spent_outpoint = swept[0], treasury_value_sat = fulfilled[0].amount)`,
 /// or `None` for anything else (Unconfirmed records, garbage datums).
 #[must_use]
@@ -68,7 +69,9 @@ pub fn parse_confirmed_datum(data: &PlutusData) -> Option<([u8; 32], [u8; 36], u
     let PlutusData::Constr(c) = data else {
         return None;
     };
-    if c.tag != 122 || c.fields.len() != 3 {
+    // 5 fields since creator/created provenance was added (btcTxid, swept, fulfilled,
+    // creator, created); accept >= 3 so pre-provenance fixtures/records still parse.
+    if c.tag != 122 || c.fields.len() < 3 {
         return None;
     }
     let fields: Vec<&PlutusData> = c.fields.iter().collect();
@@ -173,6 +176,28 @@ mod tests {
                     plutus::constr(0, vec![plutus::bytes(&[0x51; 34]), plutus::int(7000)]),
                     plutus::constr(0, vec![plutus::bytes(&[0x00; 22]), plutus::int(1000)]),
                 ]),
+            ],
+        );
+        let (txid, spent, sats) = parse_confirmed_datum(&datum).unwrap();
+        assert_eq!(txid, [0xcc; 32]);
+        assert_eq!(spent, [0xaa; 36]);
+        assert_eq!(sats, 7000);
+    }
+
+    #[test]
+    fn parse_confirmed_datum_accepts_provenance_fields() {
+        // Confirmed(btcTxid, swept, fulfilled, creator, created) - the 5-field shape.
+        let datum = plutus::constr(
+            1,
+            vec![
+                plutus::bytes(&[0xcc; 32]),
+                plutus::array(vec![plutus::bytes(&[0xaa; 36])]),
+                plutus::array(vec![plutus::constr(
+                    0,
+                    vec![plutus::bytes(&[0x51; 34]), plutus::int(7000)],
+                )]),
+                plutus::bytes(&[0x7a; 28]),
+                plutus::int(1_700_000_000_000),
             ],
         );
         let (txid, spent, sats) = parse_confirmed_datum(&datum).unwrap();
