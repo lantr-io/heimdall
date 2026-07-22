@@ -272,6 +272,32 @@ async fn epoch_start_phase(
             wait_ms as f64 / 1000.0,
             ctx.attempt
         );
+        // INSTRUMENTATION (2026-07-22): the derived context, printed so the SAME
+        // line from every node can be diffed. A payload's poseidon_commit binds
+        // (epoch, threshold=51, attempt, identifier); `t` and the candidate set
+        // determine the commitment-vector length and the index assignment but
+        // appear NOWHERE in the namespace — so if two nodes disagree here they
+        // reject each other's honest payloads with no way to notice. This line
+        // makes that disagreement visible directly instead of by inference.
+        crate::epoch_log!(
+            me,
+            epoch,
+            "ceremony ctx: t={} n={} attempt={} window={} anchor_ms={:?} candidates=[{}]",
+            ctx.threshold,
+            ctx.participants.len(),
+            ctx.attempt,
+            window,
+            ctx.schedule_anchor_ms,
+            ctx.participants
+                .iter()
+                .map(|p| format!(
+                    "{}@{}",
+                    hex::encode(&p.pool_id[..4.min(p.pool_id.len())]),
+                    p.index
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         if wait_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(wait_ms as u64)).await;
         }

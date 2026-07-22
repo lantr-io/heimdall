@@ -260,12 +260,26 @@ pub fn round1_fault_evidence(
         sigma_i,
         payload_signature: signature,
     };
-    if poseidon_commit
-        != ev
-            .evidence_hash()
-            .map_err(|e| fault_err("poseidon_commit", e))?
-    {
-        return Err(WireError::Field("poseidon_commit mismatch".into()));
+    let computed = ev
+        .evidence_hash()
+        .map_err(|e| fault_err("poseidon_commit", e))?;
+    if poseidon_commit != computed {
+        // INSTRUMENTATION (2026-07-22): a bare "mismatch" is undiagnosable. The
+        // receiver reconstructs the sender's commitment from ITS OWN
+        // (epoch, threshold, attempt, identifier) — see the caller in
+        // peer_network.rs — so a mismatch means one of those four disagrees, or
+        // the commitment vector does. Print every reconstruction input plus the
+        // vector length, which is the sender's `t` — the one quantity NOT in the
+        // namespace — so one wedged run names the differing field instead of
+        // costing another round of inference.
+        return Err(WireError::Field(format!(
+            "poseidon_commit mismatch: reconstructed from epoch={epoch} threshold={threshold} \
+             attempt={attempt} identifier={peer_identifier} commitments={} (= sender's t); \
+             computed={} wire={}",
+            ev.commitments.len(),
+            hex::encode(computed),
+            hex::encode(poseidon_commit),
+        )));
     }
     let canonical_bytes = ev
         .canonical_bytes()
