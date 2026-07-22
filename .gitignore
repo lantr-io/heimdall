@@ -8,6 +8,11 @@ docs/local/
 # Generated peg-in demo output.
 /data/
 heimdall-preprod.toml
+# ...and any hand-made backup of one. These carry the same Blockfrost
+# token and mnemonic as the file they copy, but the patterns above do not
+# match a suffixed name (heimdall-preprod.toml.bak-predemo), so two of them
+# sat untracked-but-committable until 2026-07-22.
+heimdall-*.toml.*
 heimdall-devnet.toml
 project/target/
 heimdall-bip322.toml
