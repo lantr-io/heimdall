@@ -20,6 +20,7 @@ pub mod btc_rpc;
 pub mod dkg_roster;
 pub mod fault_proof;
 pub mod hash;
+pub mod init_scripts;
 pub mod linked_list;
 pub mod local_eval;
 pub mod mock;

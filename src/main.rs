@@ -281,6 +281,43 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Register the stake credential of every withdraw-using script heimdall
+    /// deploys, so their withdraw-zero paths are admissible. Conway rejects a
+    /// withdrawal whose reward account is unregistered
+    /// (`WithdrawalsNotInRewardsCERTS`), and certificates validate against the
+    /// PRE-transaction ledger state, so this cannot be folded into the
+    /// withdrawing tx. Today the set is `spo_bans` alone — `peg_in`/`peg_out`
+    /// are registered by binocular's `deploy-bridge` / `register-bridge-creds`,
+    /// and re-registering an existing credential is a ledger error. Idempotent:
+    /// already-registered credentials are skipped. Run after
+    /// `bootstrap-ban-list`, before any withdraw path.
+    InitScripts {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// The ban-list one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        ban_bootstrap: String,
+        /// Ban-schedule params (must equal the SPO config's).
+        #[arg(long)]
+        base_ban_duration_ms: i64,
+        #[arg(long)]
+        max_faults_before_permanent: i64,
+        #[arg(long)]
+        max_validity_window_ms: i64,
+        /// Override the protocol stake-key deposit (lovelace) instead of
+        /// reading it from /epochs/latest/parameters.
+        #[arg(long)]
+        key_deposit: Option<u64>,
+        /// Actually submit via Blockfrost (default: report state only).
+        #[arg(long)]
+        submit: bool,
+    },
     /// Build (and with --submit, broadcast) the register_spo tx: bind this
     /// pool's cold-key identity to a Bifrost identity (secp256k1 key + URL),
     /// mint the membership token, insert the registration node into the
@@ -771,6 +808,33 @@ fn main() {
                 base_ban_duration_ms,
                 max_faults_before_permanent,
                 max_validity_window_ms,
+                submit,
+            ) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::InitScripts {
+            config,
+            blueprint,
+            registry_bootstrap,
+            ban_bootstrap,
+            base_ban_duration_ms,
+            max_faults_before_permanent,
+            max_validity_window_ms,
+            key_deposit,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_init_scripts(
+                &cfg,
+                &blueprint,
+                &registry_bootstrap,
+                &ban_bootstrap,
+                base_ban_duration_ms,
+                max_faults_before_permanent,
+                max_validity_window_ms,
+                key_deposit,
                 submit,
             ) {
                 eprintln!("Error: {e}");
@@ -2206,6 +2270,164 @@ fn run_deploy_spo_bans_ref(
     println!("submitted: tx_hash={tx_hash}");
     println!("spo_bans ref UTxO: {tx_hash}:0  (→ spo_bans_ref in the SPO config)");
     Ok(())
+}
+
+/// Register the stake credentials of heimdall's withdraw-using scripts.
+///
+/// The table is deliberately a table: today it holds `spo_bans` alone, and a
+/// future heimdall-deployed withdraw script is one more row rather than another
+/// command. `peg_in`/`peg_out` are *not* here — binocular's `deploy-bridge`
+/// registers them in its bootstrap tx, and re-registering is a ledger error.
+#[allow(clippy::too_many_arguments)]
+fn run_init_scripts(
+    cfg: &HeimdallConfig,
+    blueprint_path: &str,
+    registry_bootstrap: &str,
+    ban_bootstrap: &str,
+    base_ban_duration_ms: i64,
+    max_faults_before_permanent: i64,
+    max_validity_window_ms: i64,
+    key_deposit_override: Option<u64>,
+    submit: bool,
+) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{
+        fault_verifier_equivocation_script, fault_verifier_round1_script,
+        fault_verifier_round2_script, spo_bans_script, spos_registry_script,
+    };
+    use heimdall::cardano::init_scripts::{
+        WithdrawScript, build_init_scripts_tx, is_already_registered_error,
+    };
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::tx_common::is_testnet_address;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    // Derive spo_bans exactly as deploy-spo-bans-ref and
+    // DkgFaultBanFlow::from_config do — recomputing the fault-verifier policy
+    // ids from the blueprint rather than reading cfg.fault_proof_policies, so
+    // the credential we register cannot drift from the one ApplyBan withdraws.
+    let blueprint_json = std::fs::read_to_string(blueprint_path)
+        .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let r1 = fault_verifier_round1_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_round1: {e}"))?;
+    let r2 = fault_verifier_round2_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_round2: {e}"))?;
+    let eq = fault_verifier_equivocation_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_equivocation: {e}"))?;
+    let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
+    let spo_bans = spo_bans_script(
+        &blueprint_json,
+        &registry.hash,
+        &[r1.hash, r2.hash, eq.hash],
+        base_ban_duration_ms,
+        max_faults_before_permanent,
+        max_validity_window_ms,
+        &ban_tx_id,
+        u64::from(ban_index),
+    )
+    .map_err(|e| format!("parameterize spo_bans: {e}"))?;
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let mainnet = !is_testnet_address(&wallet_addr);
+
+    let scripts = vec![WithdrawScript {
+        name: "spo_bans",
+        hash_hex: spo_bans.hash_hex(),
+        reward_address: spo_bans.reward_address(mainnet),
+    }];
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    // Filter per credential, not per transaction: one already-registered script
+    // must not block the rest, or a partially-applied init could never converge.
+    println!("withdraw-using scripts deployed by heimdall:");
+    let mut pending: Vec<WithdrawScript> = Vec::new();
+    for s in scripts {
+        let state = rt
+            .block_on(bf_http::fetch_account_registered(
+                &base_url,
+                pid,
+                &s.reward_address,
+            ))
+            .map_err(|e| format!("registration state of {}: {e}", s.name))?;
+        let label = match state {
+            Some(true) => "registered",
+            Some(false) => "NOT registered",
+            None => "unknown — backend does not serve /accounts; will attempt",
+        };
+        println!("  {:<10} hash={}", s.name, s.hash_hex);
+        println!("             reward={}  [{label}]", s.reward_address);
+        if state != Some(true) {
+            pending.push(s);
+        }
+    }
+
+    if pending.is_empty() {
+        println!("all credentials already registered — nothing to do");
+        return Ok(());
+    }
+    if !submit {
+        println!(
+            "(dry run — {} credential(s) to register; pass --submit)",
+            pending.len()
+        );
+        return Ok(());
+    }
+
+    let key_deposit = match key_deposit_override {
+        Some(d) => d,
+        None => rt
+            .block_on(bf_http::fetch_key_deposit(&base_url, pid))
+            .map_err(|e| format!("fetch key_deposit: {e}"))?,
+    };
+    let raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let built = build_init_scripts_tx(
+        &pending,
+        key_deposit,
+        &wallet_addr,
+        &wallet_utxos,
+        &key,
+        Some(cost_models),
+    )
+    .map_err(|e| format!("build init-scripts tx: {e}"))?;
+    println!(
+        "registering {} credential(s), locking {} lovelace of deposits ({key_deposit} each)",
+        pending.len(),
+        built.deposit_total
+    );
+
+    match submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt) {
+        Ok(tx_hash) => {
+            println!("submitted init-scripts: tx_hash={tx_hash}");
+            Ok(())
+        }
+        // Idempotency backstop for backends whose /accounts route we cannot
+        // trust: a phase-1 "already registered" rejection is the state we
+        // wanted, at no cost.
+        Err(e) if is_already_registered_error(&e) => {
+            println!("credentials already registered on chain (submission rejected: {e})");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// register-spo CLI inputs, bundled (clap hands us a dozen options).

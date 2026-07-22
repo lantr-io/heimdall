@@ -329,6 +329,74 @@ pub async fn fetch_epoch_window(base_url: &str, project_id: &str) -> Result<Epoc
     })
 }
 
+/// Fetch the protocol's stake-key deposit (lovelace) from
+/// `/epochs/latest/parameters`.
+///
+/// A stake registration locks this per certificate, refundable only by
+/// deregistration, so `init-scripts` must know it to balance the transaction.
+/// Blockfrost serves the amount as a string; yaci-store as a number — accept
+/// both.
+pub async fn fetch_key_deposit(base_url: &str, project_id: &str) -> Result<u64, String> {
+    let url = format!("{base_url}/epochs/latest/parameters");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("parameters request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "parameters http {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parameters json: {e}"))?;
+    let d = v
+        .get("key_deposit")
+        .ok_or_else(|| "parameters: no key_deposit".to_string())?;
+    d.as_u64()
+        .or_else(|| d.as_str().and_then(|s| s.parse().ok()))
+        .ok_or_else(|| format!("parameters: key_deposit not a number: {d}"))
+}
+
+/// Whether a reward account is currently registered, via `/accounts/{addr}`.
+///
+/// `Ok(Some(true|false))` is a definite answer; **`Ok(None)` means unknown** —
+/// the backend does not serve this route (yaci-store implements only part of
+/// the Blockfrost surface, as the `/epochs/{n}` and `/pools/{id}` workarounds
+/// elsewhere in this module attest). A 404 is reported as `Some(false)`, since
+/// that is how Blockfrost says "never registered"; callers must treat the
+/// unknown case optimistically and let the ledger arbitrate, because
+/// re-registering is rejected in phase 1 at no cost.
+pub async fn fetch_account_registered(
+    base_url: &str,
+    project_id: &str,
+    stake_address: &str,
+) -> Result<Option<bool>, String> {
+    let url = format!("{base_url}/accounts/{stake_address}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("account request: {e}"))?;
+    if resp.status().as_u16() == 404 {
+        return Ok(Some(false));
+    }
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("account json: {e}"))?;
+    Ok(v.get("active").and_then(serde_json::Value::as_bool))
+}
+
 /// Fetch the network's live Plutus cost models (ordered int arrays) from
 /// `/epochs/latest/parameters`, returned as `[PlutusV1, PlutusV2, PlutusV3]`.
 ///
