@@ -44,6 +44,12 @@ use crate::frost::participant;
 use crate::http::frost_bridge;
 use crate::http::wire::DkgNamespace;
 
+/// How many times [`poll_dkg_round1`] re-fetches every peer after Round-1
+/// collection finishes, spaced one poll interval apart, to catch a peer that
+/// serves a second, conflicting payload. Covers a grace window of
+/// `(PASSES - 1) * poll_interval` past the moment the last package arrived.
+const EQUIVOCATION_SWEEP_PASSES: usize = 3;
+
 /// Drive one DKG sub-round for `ctx` and produce the next phase: the next
 /// sub-round, a reduced-set rerun at Round 1, or (at Part 3) `PublishKeys`.
 pub async fn dkg_phase(
@@ -119,7 +125,11 @@ pub async fn dkg_phase(
                     "  ⚠ INJECT: equivocating round1 — scheduling a SECOND conflicting package"
                 );
                 let peers_equiv = peers.clone();
-                let delay = config.poll_interval.saturating_mul(2);
+                // One and a half poll cycles: long enough that every live peer has
+                // already fetched package A (so they RETAIN A and see B as a conflict,
+                // rather than B being the only payload they ever saw), short enough to
+                // land inside the honest nodes' anti-equivocation sweep window.
+                let delay = config.poll_interval.saturating_mul(3) / 2;
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
                     let _ = peers_equiv.publish_dkg_round1(ns, me, &equiv_pkg).await;
@@ -773,12 +783,25 @@ async fn poll_dkg_round1(
         }
         tokio::time::sleep(config.poll_interval).await;
     }
-    // Anti-equivocation sweep: re-fetch every peer once more (even those already
-    // collected) so a peer that served a DIFFERENT payload after we first fetched it
-    // is caught — `fetch_dkg_round1` calls `retain_evidence`, which records the
+    // Anti-equivocation sweep: re-fetch every peer (even those already collected)
+    // so a peer that served a DIFFERENT payload after we first fetched it is
+    // caught — `fetch_dkg_round1` calls `retain_evidence`, which records the
     // conflict that `report_round1_equivocations` then turns into a fault.
-    for peer in peer_infos {
-        let _ = peers.fetch_dkg_round1(ns, peer).await;
+    //
+    // Swept REPEATEDLY over a short grace window rather than once: an equivocator
+    // chooses when to serve its second payload, so a single pass only catches the
+    // one interleaving where the conflict happens to already be in place. Collection
+    // can finish in well under a poll interval (every package arrives on the first
+    // tick), which is exactly when a one-shot sweep runs too early to see anything.
+    // The grace is bounded and, on the anchored path, absorbed by the Round-2
+    // offset the nodes are waiting for anyway.
+    for pass in 0..EQUIVOCATION_SWEEP_PASSES {
+        if pass > 0 {
+            tokio::time::sleep(config.poll_interval).await;
+        }
+        for peer in peer_infos {
+            let _ = peers.fetch_dkg_round1(ns, peer).await;
+        }
     }
     Ok(())
 }
