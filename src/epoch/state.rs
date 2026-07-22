@@ -184,18 +184,29 @@ pub enum SigningRound {
     Round2,
 }
 
-/// Signing cascade level (only `Quorum51` exercised in v0.2 first cycle).
+/// The active SPO threshold path for a signing session.
 ///
-/// TODO: implement the `Federation` fallback path. When `Quorum51` fails
-/// to collect a threshold of signatures within
-/// `EpochConfig::quorum51_timeout`, `sign_phase` should transition to
-/// `Federation` (script-path spend using the federation fallback leaf
-/// after `federation_csv_blocks`). Today the cascade is a type-level
-/// placeholder; `sign_phase` never demotes.
+/// One variant on purpose, and it is not a stub. The spec keeps `mode` in the
+/// signing namespace with a single value today "so that adding a future
+/// threshold mode does not change any byte layout" (§Signing namespaces), so
+/// the type stays even though it cannot vary.
+///
+/// **There is deliberately no `Federation` variant.** An earlier comment here
+/// said `sign_phase` should demote to a federation script-path spend on
+/// `quorum51_timeout`; that describes work the SPO program must never do. Per
+/// §Threshold failover, "federation mode does not use the SPO HTTP endpoints…
+/// it is an on-chain and Bitcoin-level emergency fallback", and per §Signing
+/// namespaces it "has no signing namespace at all: it uses no SPO endpoints and
+/// no FROST rounds". The federation signs out of band with `Y_federation` via
+/// the CSV leaf, and the signed TM is posted permissionlessly like any other —
+/// heimdall observes the result as an ordinary TM and plays no part in
+/// producing it.
+///
+/// Nor is there an inter-mode timer to add: "the overall bound for the cascade
+/// is therefore implicit… with no extra inter-mode timer" (§Threshold failover).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CascadeLevel {
     Quorum51,
-    Federation,
 }
 
 /// In-progress signing state. Per-input maps because each TM input
@@ -374,7 +385,6 @@ pub struct EpochConfig {
     pub dkg_round2_offset: Duration,
     pub poll_interval: Duration,
     pub quorum51_timeout: Duration,
-    pub federation_timeout: Duration,
     pub leader_timeout: Duration,
     pub identity: SpoIdentity,
     /// Cardano policy ID (script hash) identifying peg-in request UTxOs.
@@ -434,7 +444,6 @@ impl EpochConfig {
             dkg_round2_offset: Duration::from_secs(240),
             poll_interval: Duration::from_millis(5000),
             quorum51_timeout: Duration::from_secs(300),
-            federation_timeout: Duration::from_secs(300),
             leader_timeout: Duration::from_secs(10000),
             identity,
             pegin_policy_id: [0u8; 28],

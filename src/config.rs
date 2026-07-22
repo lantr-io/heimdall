@@ -77,7 +77,6 @@ pub struct ProtocolConfig {
     pub dkg_round2_offset_secs: u64,
     pub poll_interval_ms: u64,
     pub quorum51_timeout_secs: u64,
-    pub federation_timeout_secs: u64,
     pub leader_timeout_secs: u64,
     pub pegin_collection_window_secs: u64,
     pub pegin_poll_interval_ms: u64,
@@ -96,7 +95,6 @@ impl Default for ProtocolConfig {
             dkg_round2_offset_secs: 240,
             poll_interval_ms: 5000,
             quorum51_timeout_secs: 300,
-            federation_timeout_secs: 300,
             leader_timeout_secs: 10000,
             pegin_collection_window_secs: 5,
             pegin_poll_interval_ms: 1000,
@@ -406,7 +404,6 @@ impl HeimdallConfig {
             dkg_round2_offset: Duration::from_secs(self.protocol.dkg_round2_offset_secs),
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
             quorum51_timeout: Duration::from_secs(self.protocol.quorum51_timeout_secs),
-            federation_timeout: Duration::from_secs(self.protocol.federation_timeout_secs),
             leader_timeout: Duration::from_secs(self.protocol.leader_timeout_secs),
             identity,
             pegin_policy_id,
@@ -558,7 +555,6 @@ fee_rate_sat_per_vb = 5
         assert_eq!(epoch.dkg_round_timeout, demo.dkg_round_timeout);
         assert_eq!(epoch.poll_interval, demo.poll_interval);
         assert_eq!(epoch.quorum51_timeout, demo.quorum51_timeout);
-        assert_eq!(epoch.federation_timeout, demo.federation_timeout);
         assert_eq!(epoch.leader_timeout, demo.leader_timeout);
         assert_eq!(epoch.pegin_policy_id, demo.pegin_policy_id);
         assert_eq!(epoch.pegin_collection_window, demo.pegin_collection_window);
