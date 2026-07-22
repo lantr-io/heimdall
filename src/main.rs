@@ -2290,7 +2290,7 @@ fn run_init_scripts(
     key_deposit_override: Option<u64>,
     submit: bool,
 ) -> Result<(), String> {
-    use heimdall::cardano::bf_http;
+    use heimdall::cardano::bf_http::{self, RegistrationState};
     use heimdall::cardano::blueprint::{
         fault_verifier_equivocation_script, fault_verifier_round1_script,
         fault_verifier_round2_script, spo_bans_script, spos_registry_script,
@@ -2362,13 +2362,18 @@ fn run_init_scripts(
             ))
             .map_err(|e| format!("registration state of {}: {e}", s.name))?;
         let label = match state {
-            Some(true) => "registered",
-            Some(false) => "NOT registered",
-            None => "unknown — backend does not serve /accounts; will attempt",
+            RegistrationState::Registered => "registered".to_string(),
+            RegistrationState::NotRegistered => "NOT registered".to_string(),
+            // A 404 here is ambiguous — never-registered and route-not-served
+            // are indistinguishable — so say so rather than guessing, and let
+            // the submission arbitrate.
+            RegistrationState::Unknown { http_status } => {
+                format!("unknown (http {http_status}) — will attempt")
+            }
         };
         println!("  {:<10} hash={}", s.name, s.hash_hex);
         println!("             reward={}  [{label}]", s.reward_address);
-        if state != Some(true) {
+        if state != RegistrationState::Registered {
             pending.push(s);
         }
     }
@@ -2394,7 +2399,30 @@ fn run_init_scripts(
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    // Never let coin selection consume either one-shot bootstrap outref. Both
+    // parameterize script hashes — the registry's, and (through the ban list)
+    // the very `spo_bans` credential this command registers. Ordering puts this
+    // command after both bootstraps, so normally they are already spent; but the
+    // ordering is documentation, not an interlock, and spending the ban outref
+    // early would register a credential for a `spo_bans` that can now never be
+    // bootstrapped at that hash — silently. `run_bootstrap_registry` guards the
+    // registry outref for the same reason.
+    let reg_outref = (hex::encode(reg_tx_id), reg_index);
+    let ban_outref = (hex::encode(ban_tx_id), ban_index);
+    let wallet_utxos: Vec<WalletUtxo> = raw
+        .iter()
+        .map(WalletUtxo::from_bf)
+        .filter(|u| {
+            let this = (u.tx_hash.clone(), u.output_index);
+            this != reg_outref && this != ban_outref
+        })
+        .collect();
+    if wallet_utxos.is_empty() {
+        return Err(format!(
+            "wallet has no spendable UTxOs besides the bootstrap one-shot outrefs — \
+             fund it first (address: {wallet_addr})"
+        ));
+    }
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;

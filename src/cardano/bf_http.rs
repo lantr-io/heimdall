@@ -335,7 +335,13 @@ pub async fn fetch_epoch_window(base_url: &str, project_id: &str) -> Result<Epoc
 /// A stake registration locks this per certificate, refundable only by
 /// deregistration, so `init-scripts` must know it to balance the transaction.
 /// Blockfrost serves the amount as a string; yaci-store as a number — accept
-/// both.
+/// both, and accept the camelCase key too, in the spirit of this module's other
+/// yaci-store accommodations.
+///
+/// Falls back to the protocol-standard 2 ADA when the field is absent entirely,
+/// rather than failing the run: a wrong deposit unbalances the tx and the node
+/// rejects it loudly, whereas a hard error here blocks a devnet whose parameters
+/// endpoint is merely incomplete. `--key-deposit` overrides.
 pub async fn fetch_key_deposit(base_url: &str, project_id: &str) -> Result<u64, String> {
     let url = format!("{base_url}/epochs/latest/parameters");
     let resp = reqwest::Client::new()
@@ -355,28 +361,54 @@ pub async fn fetch_key_deposit(base_url: &str, project_id: &str) -> Result<u64, 
         .json()
         .await
         .map_err(|e| format!("parameters json: {e}"))?;
-    let d = v
-        .get("key_deposit")
-        .ok_or_else(|| "parameters: no key_deposit".to_string())?;
+    let Some(d) = v.get("key_deposit").or_else(|| v.get("keyDeposit")) else {
+        eprintln!(
+            "warning: /epochs/latest/parameters carries no key_deposit — \
+             assuming the protocol-standard {DEFAULT_KEY_DEPOSIT} lovelace \
+             (override with --key-deposit)"
+        );
+        return Ok(DEFAULT_KEY_DEPOSIT);
+    };
     d.as_u64()
         .or_else(|| d.as_str().and_then(|s| s.parse().ok()))
         .ok_or_else(|| format!("parameters: key_deposit not a number: {d}"))
 }
 
-/// Whether a reward account is currently registered, via `/accounts/{addr}`.
+/// The protocol-standard stake-key deposit, used only when the parameters
+/// endpoint omits the field.
+pub const DEFAULT_KEY_DEPOSIT: u64 = 2_000_000;
+
+/// Registration state of a reward account, as far as the backend can tell us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationState {
+    Registered,
+    NotRegistered,
+    /// No usable answer. Carries the HTTP status so the operator can see *why*
+    /// rather than guessing between an unimplemented route and an outage.
+    Unknown {
+        http_status: u16,
+    },
+}
+
+/// Registration state of a reward account, via `/accounts/{addr}`.
 ///
-/// `Ok(Some(true|false))` is a definite answer; **`Ok(None)` means unknown** —
-/// the backend does not serve this route (yaci-store implements only part of
-/// the Blockfrost surface, as the `/epochs/{n}` and `/pools/{id}` workarounds
-/// elsewhere in this module attest). A 404 is reported as `Some(false)`, since
-/// that is how Blockfrost says "never registered"; callers must treat the
-/// unknown case optimistically and let the ledger arbitrate, because
-/// re-registering is rejected in phase 1 at no cost.
+/// Only a 200 carrying `active` is treated as an answer. **A 404 is
+/// deliberately `Unknown`, not `NotRegistered`**: Blockfrost 404s an account it
+/// has never seen, but a backend that does not implement the route 404s
+/// identically (yaci-store serves only part of the Blockfrost surface — see the
+/// `/epochs/{n}` and named-map `cost_models` workarounds elsewhere in this
+/// module). Reporting "not registered" off an unimplemented route would state a
+/// falsehood about the chain, so the ambiguity is surfaced instead.
+///
+/// This costs nothing in practice: callers treat `Unknown` optimistically and
+/// let the ledger arbitrate, since re-registering is rejected in phase 1 at no
+/// cost, and the positive case — which is what post-registration assertions
+/// check — stays exact.
 pub async fn fetch_account_registered(
     base_url: &str,
     project_id: &str,
     stake_address: &str,
-) -> Result<Option<bool>, String> {
+) -> Result<RegistrationState, String> {
     let url = format!("{base_url}/accounts/{stake_address}");
     let resp = reqwest::Client::new()
         .get(&url)
@@ -384,17 +416,24 @@ pub async fn fetch_account_registered(
         .send()
         .await
         .map_err(|e| format!("account request: {e}"))?;
-    if resp.status().as_u16() == 404 {
-        return Ok(Some(false));
-    }
+    let status = resp.status().as_u16();
     if !resp.status().is_success() {
-        return Ok(None);
+        return Ok(RegistrationState::Unknown {
+            http_status: status,
+        });
     }
     let v: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| format!("account json: {e}"))?;
-    Ok(v.get("active").and_then(serde_json::Value::as_bool))
+    match v.get("active").and_then(serde_json::Value::as_bool) {
+        Some(true) => Ok(RegistrationState::Registered),
+        Some(false) => Ok(RegistrationState::NotRegistered),
+        // 200 without `active` — a backend serving a different schema.
+        None => Ok(RegistrationState::Unknown {
+            http_status: status,
+        }),
+    }
 }
 
 /// Fetch the network's live Plutus cost models (ordered int arrays) from

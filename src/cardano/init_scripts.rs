@@ -80,7 +80,14 @@ pub fn build_init_scripts_tx(
     // No scripts execute here, so a fee input is all this tx needs — no
     // collateral. The input must additionally cover the deposits, which leave
     // the transaction for the deposit pot rather than returning as change.
-    let fee_utxo = select_fee(wallet_utxos, deposit_total + 1_000_000)?;
+    //
+    // The 2 ADA headroom above the deposits is two separate ~1 ADA floors, not
+    // slack: the fee itself, and the min-UTxO the *change* output must still
+    // clear once the deposits are gone. Sizing this at 1 ADA lets a wallet whose
+    // only pure-ADA UTxO is `deposit_total + 1 ADA` build a tx whose change
+    // (~0.83 ADA) is below min-UTxO, which the node rejects with
+    // OutputTooSmallUTxO after the build reports success.
+    let fee_utxo = select_fee(wallet_utxos, deposit_total + 2_000_000)?;
 
     // whisky's change balancer DROPS the deposit for legacy StakeRegistration
     // certificates: the `Certificate::StakeRegistration` arm of core_pallas.rs
@@ -178,18 +185,27 @@ pub fn build_init_scripts_tx(
 
 /// True when a submission error says the credential is already registered.
 ///
-/// Idempotency backstop for backends whose `/accounts` route we cannot trust
-/// (yaci-store does not implement every Blockfrost route). Re-registering is
-/// rejected in **phase 1**, so an optimistic attempt costs nothing — and this
-/// turns that rejection into the success it semantically is.
+/// This is the **primary** idempotency guarantee, not a nicety: `/accounts` 404s
+/// identically for "never registered" and "route not implemented", so on a
+/// backend that does not serve it (yaci-store) the pre-flight query returns
+/// `Unknown` and this is the only thing standing between a re-run and a hard
+/// failure. Re-registering is rejected in **phase 1**, costing nothing, so the
+/// optimistic attempt is safe — this turns that rejection into the success it
+/// semantically is.
+///
+/// The two era spellings differ, and matching only the older one silently
+/// disables the backstop on every Conway network:
+///
+/// - Conway:     `StakeKeyRegisteredDELEG`
+/// - pre-Conway: `StakeKeyAlreadyRegisteredDELEG`
+///
+/// `StakeKeyNotRegisteredDELEG` — the *inverse* failure — must not match, which
+/// is why this tests both spellings rather than a shared `RegisteredDELEG`
+/// substring that would also catch the negative form.
 #[must_use]
 pub fn is_already_registered_error(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
-    // Conway: StakeKeyAlreadyRegisteredDELEG. Older eras spell it
-    // StakeKeyAlreadyRegisteredDELEG / StakeKeyNonZeroAccountBalanceDELEG; the
-    // substring below covers the registered-already family without pinning the
-    // era suffix.
-    e.contains("alreadyregistered")
+    e.contains("stakekeyregistereddeleg") || e.contains("stakekeyalreadyregistereddeleg")
 }
 
 #[cfg(test)]
@@ -348,6 +364,47 @@ mod tests {
         );
     }
 
+    /// The submission error arrives as a JSON-wrapped Haskell constructor
+    /// string. This is the real shape, taken verbatim from the devnet log that
+    /// found this whole gap (`data/logs/scenario2-equivocate/spo3.log`), with
+    /// the certs failure swapped for the delegation one — so the matcher is
+    /// pinned against what a node actually emits, not against a remembered
+    /// constructor name.
+    fn submit_error(inner: &str) -> String {
+        format!(
+            r#"submit failed: Message: {{"contents":{{"contents":{{"contents":{{"era":"ShelleyBasedEraConway","error":["{inner}"],"kind":"ShelleyTxValidationError"}},"tag":"TxValidationErrorInCardanoMode"}},"tag":"TxCmdTxSubmitValidationError"}},"tag":"TxSubmitFail"}}"#
+        )
+    }
+
+    /// Conway and pre-Conway spell this differently, and matching only the
+    /// older one silently disables the idempotency backstop on every Conway
+    /// network — which is every network we run.
+    #[test]
+    fn already_registered_matches_both_era_spellings() {
+        assert!(is_already_registered_error(&submit_error(
+            r#"ConwayCertsFailure (ConwayDelegFailure (StakeKeyRegisteredDELEG (ScriptHashObj (ScriptHash \"9dbace5d750dc078fb80ea888c2eaadadd6871c1600e385dd3678767\"))))"#
+        )));
+        assert!(is_already_registered_error(&submit_error(
+            r#"StakeKeyAlreadyRegisteredDELEG (ScriptHashObj (ScriptHash \"9dbace5d\"))"#
+        )));
+    }
+
+    /// The inverse failure must NOT count as success — it shares the
+    /// `RegisteredDELEG` tail, which is why the matcher tests whole spellings
+    /// rather than that substring.
+    #[test]
+    fn already_registered_rejects_the_inverse_and_unrelated_failures() {
+        assert!(!is_already_registered_error(&submit_error(
+            r#"ConwayCertsFailure (ConwayDelegFailure (StakeKeyNotRegisteredDELEG (ScriptHashObj (ScriptHash \"9dbace5d\"))))"#
+        )));
+        // The verbatim blocker this command exists to remove: it must not be
+        // mistaken for "already done".
+        assert!(!is_already_registered_error(&submit_error(
+            r#"ConwayCertsFailure (WithdrawalsNotInRewardsCERTS (fromList [(RewardAccount {raNetwork = Testnet, raCredential = ScriptHashObj (ScriptHash \"9dbace5d750dc078fb80ea888c2eaadadd6871c1600e385dd3678767\")},Coin 0)]))"#
+        )));
+        assert!(!is_already_registered_error("ValueNotConservedUTxO"));
+    }
+
     #[test]
     fn rejects_a_fee_utxo_too_small_for_the_deposits() {
         let key = normal_key_from_seed([7u8; 32]);
@@ -356,7 +413,7 @@ mod tests {
             hash_hex: hex::encode([0x9du8; 28]),
             reward_address: reward_addr(0x9d),
         }];
-        // select_fee's floor (deposit + 1 ADA) rejects before the subtraction.
+        // select_fee's floor rejects before the subtraction.
         let err = build_init_scripts_tx(
             &scripts,
             2_000_000,
@@ -366,6 +423,20 @@ mod tests {
             None,
         )
         .expect_err("must not build");
+        assert!(err.contains("cannot cover"), "unexpected error: {err}");
+
+        // deposit + 1 ADA used to build: change came out ~0.83 ADA, under
+        // min-UTxO, and the node rejected with OutputTooSmallUTxO only after
+        // the build reported success. The floor must catch it here instead.
+        let err = build_init_scripts_tx(
+            &scripts,
+            2_000_000,
+            &wallet_addr(&key),
+            &[utxo(3_000_000)],
+            &key,
+            None,
+        )
+        .expect_err("deposit + 1 ADA leaves change below min-UTxO");
         assert!(err.contains("cannot cover"), "unexpected error: {err}");
     }
 }
