@@ -1410,18 +1410,19 @@ async fn run_demo(
     }
 
     let t0 = Instant::now();
-    // The epoch loop treats chain-read / peer / aborted-DKG failures as
-    // retriable (it backs off and re-enters the boundary internally), so a
-    // returned Err is a genuinely fatal condition (a logic/crypto bug or
-    // malformed tx). Exit cleanly with a message instead of panicking — the
-    // node never dies on a transient failure (WI-014 error-handling feedback).
+    // The epoch loop backs off and re-enters `Idle` on EVERY error, so it does
+    // not return Err at all today — this arm is unreachable by construction and
+    // kept only because the signature is still `EpochResult`. It must NOT go
+    // back to parking on Ctrl-C: that is exactly what froze an honest node on a
+    // stale roster (2026-07-22), because re-deriving the roster is something
+    // only the loop does. If a future change reintroduces an error exit, say so
+    // plainly and let the supervisor restart us.
     let tm = match run_epoch_loop(chain, pegin_source, peers, clock, rng, &config).await {
         Ok(tm) => tm,
         Err(e) => {
-            eprintln!("[demo] epoch loop terminated with a fatal error: {e}");
-            eprintln!("[demo] server still running on {bind_addr}:{port}; press Ctrl-C to exit.");
-            tokio::signal::ctrl_c().await.ok();
-            return;
+            eprintln!("[demo] epoch loop returned unexpectedly: {e}");
+            eprintln!("[demo] this should not happen — the loop is meant to retry indefinitely.");
+            std::process::exit(1);
         }
     };
     println!("Cycle complete ({:.2?})", t0.elapsed());

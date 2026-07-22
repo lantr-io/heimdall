@@ -181,7 +181,22 @@ pub async fn dkg_phase(
             // stale view (observed 2026-07-22, spo2).
             let expected_commitments = usize::from(ctx.threshold);
             collected.round1_peers.retain(|id, pkg| {
-                let got = pkg.commitment().serialize().map_or(0, |c| c.len());
+                // Distinguish the two ways this can fail. Collapsing an
+                // unserializable commitment into "0 points" would report it as a
+                // cross-view peer, which is a different (and blameless)
+                // condition — the whole point of this filter is an honest reason.
+                let got = match pkg.commitment().serialize() {
+                    Ok(c) => c.len(),
+                    Err(e) => {
+                        crate::epoch_log!(
+                            me,
+                            ctx.epoch,
+                            "  dropping round1 from {}: commitment will not serialize ({e})",
+                            id_short(*id)
+                        );
+                        return false;
+                    }
+                };
                 let keep = got == expected_commitments;
                 if !keep {
                     crate::epoch_log!(
