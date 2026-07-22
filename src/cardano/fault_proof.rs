@@ -405,6 +405,35 @@ fn sign_built_tx(unsigned_hex: &str, key: &PrivateKey) -> Result<String, FaultPr
     common_sign_built_tx(unsigned_hex, key).map_err(FaultProofMintError::Build)
 }
 
+/// Declared execution budget for the FaultProof mint, per fault kind.
+///
+/// Conway caps a whole transaction at `maxTxExUnits` = 14,000,000 memory /
+/// 10,000,000,000 steps. A single flat 16,000,000-memory budget therefore
+/// exceeded the ceiling and every fault-proof mint was rejected outright with
+/// `ExUnitsTooBigUTxO` — before phase 2 ran at all, so no script ever got the
+/// chance to succeed or fail on its own terms. Script-level evaluation tests
+/// cannot catch this: the cap is a transaction-level rule.
+///
+/// Budgeting per kind rather than giving everything the maximum keeps the fee
+/// honest — declared ExUnits are what the fee is charged on, so an oversized
+/// declaration is real overpayment on a live network.
+fn fault_mint_ex_units(kind: FaultProofKind) -> Budget {
+    match kind {
+        // ZK-free: the policy re-hashes the two retained payloads and checks
+        // they differ under one namespace. Cheap, with headroom to spare.
+        FaultProofKind::Equivocation => Budget {
+            mem: 8_000_000,
+            steps: 5_000_000_000,
+        },
+        // Halo2/KZG proof verification on-chain — give these as much as Conway
+        // permits, less a margin for the rest of the transaction.
+        FaultProofKind::Round1InvalidPayload | FaultProofKind::Round2InvalidPayload => Budget {
+            mem: 13_500_000,
+            steps: 9_000_000_000,
+        },
+    }
+}
+
 pub fn build_fault_proof_mint_tx(
     req: &FaultProofMintRequest,
 ) -> Result<FaultProofMintTx, FaultProofMintError> {
@@ -509,10 +538,7 @@ pub fn build_fault_proof_mint_tx(
             },
             redeemer: Some(Redeemer {
                 data: redeemer_hex,
-                ex_units: Budget {
-                    mem: 16_000_000,
-                    steps: 9_000_000_000,
-                },
+                ex_units: fault_mint_ex_units(req.evidence.kind()),
             }),
             script_source: Some(script_source),
         })],
