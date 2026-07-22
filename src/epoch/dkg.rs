@@ -164,6 +164,37 @@ pub async fn dkg_phase(
             )
             .await?;
 
+            // Drop packages built for a DIFFERENT candidate set before they can
+            // reach FROST. A round-1 package carries exactly `t` commitment
+            // points, so a length other than ours means the sender derived a
+            // different member list — after a ban, say, which changes both `t`
+            // and the index assignment. Such a peer is ABSENT for our purposes,
+            // never faulty: its package is honest and correctly signed, just for
+            // another ceremony. (The fault path agrees by construction —
+            // building fault evidence requires reconstructing the sender's
+            // poseidon_commit, which is exactly what fails across views, so a
+            // cross-view peer can never be punished.)
+            //
+            // Without this, the mismatched vector reaches `dkg_part2`, which
+            // returns "Incorrect number of commitments" — an error that used to
+            // terminate the epoch loop, permanently freezing an honest node on a
+            // stale view (observed 2026-07-22, spo2).
+            let expected_commitments = usize::from(ctx.threshold);
+            collected.round1_peers.retain(|id, pkg| {
+                let got = pkg.commitment().serialize().map_or(0, |c| c.len());
+                let keep = got == expected_commitments;
+                if !keep {
+                    crate::epoch_log!(
+                        me,
+                        ctx.epoch,
+                        "  dropping round1 from {}: {got} commitments, we expect {expected_commitments} \
+                         (peer is on a different candidate set — treating as absent, not faulty)",
+                        id_short(*id)
+                    );
+                }
+                keep
+            });
+
             let l1: BTreeSet<Identifier> = collected.round1_peers.keys().copied().collect();
             // Report equivocation by any peer that DID publish a usable package (in L1,
             // so not covered by the exclusion path below). Catches a "smart" equivocator.

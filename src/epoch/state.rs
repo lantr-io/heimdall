@@ -520,26 +520,14 @@ impl std::fmt::Display for EpochError {
 
 impl std::error::Error for EpochError {}
 
-impl EpochError {
-    /// Whether the epoch loop should treat this as a transient, retriable
-    /// condition — back off and re-enter from the boundary — rather than a
-    /// fatal one that ends the process.
-    ///
-    /// Retriable: chain reads (`Chain`), peer transport (`Peer`), a signing
-    /// poll timeout (`PollTimeout`), and a fully-aborted DKG attempt
-    /// (`DkgAborted`) — all "try again next boundary" conditions, never node
-    /// death (WI-010 / WI-014 error-handling feedback). Fatal: `Frost`,
-    /// `TmBuild`, `SignatureVerify`, `Transition` — deterministic given their
-    /// inputs (a logic/crypto bug or malformed data), so a blind retry would
-    /// just loop on the same failure.
-    #[must_use]
-    pub fn is_retriable(&self) -> bool {
-        matches!(
-            self,
-            Self::Chain(_) | Self::Peer(_) | Self::PollTimeout { .. } | Self::DkgAborted { .. }
-        )
-    }
-}
+// NOTE: `EpochError::is_retriable` used to split these into "back off" vs
+// "kill the loop". It was removed on 2026-07-22: the epoch loop now backs off
+// and re-enters `Idle` on EVERY error, because the fatal half of that split was
+// a liveness bug. A peer on a different candidate set produced a FROST error,
+// which the allowlist called fatal, which permanently terminated an honest
+// node's loop — leaving it frozen on a stale roster with no way back, since
+// re-deriving the roster is exactly what the loop does. Conditions that truly
+// cannot be retried belong to startup validation, before the loop runs.
 
 pub type EpochResult<T> = Result<T, EpochError>;
 
@@ -606,29 +594,6 @@ mod tests {
         assert!(r.own_participant(&vec![0xFF; 32]).is_none());
         // An empty key (legacy fixture) never matches a real entry.
         assert!(r.own_participant(&[]).is_none());
-    }
-
-    #[test]
-    fn error_retriability_classification() {
-        // Transient → retriable (back off, re-enter the boundary).
-        assert!(EpochError::Chain("blockfrost 502".into()).is_retriable());
-        assert!(EpochError::Peer("connection reset".into()).is_retriable());
-        assert!(EpochError::PollTimeout { got: 1, need: 3 }.is_retriable());
-        assert!(
-            EpochError::DkgAborted {
-                epoch: 7,
-                attempt: 2,
-                qualified: 1,
-                eligible: 3,
-                reason: "round1 incomplete".into(),
-            }
-            .is_retriable()
-        );
-        // Deterministic given inputs → fatal (a blind retry just loops).
-        assert!(!EpochError::Frost("dkg_part3".into()).is_retriable());
-        assert!(!EpochError::TmBuild("insufficient funds".into()).is_retriable());
-        assert!(!EpochError::Transition("missing round1 secret".into()).is_retriable());
-        assert!(!EpochError::SignatureVerify(0, "bad sig".into()).is_retriable());
     }
 
     #[test]

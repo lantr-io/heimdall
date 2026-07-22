@@ -102,25 +102,39 @@ pub async fn run_epoch_loop(
                 backoff = RETRY_BACKOFF_MIN; // progress → reset
             }
             Ok(Step::Done(tm)) => return Ok(tm),
-            // Retriable (chain read, peer transport, signing timeout, fully
-            // aborted DKG attempt): back off and re-enter from the boundary,
-            // NEVER kill the node. A failed DKG attempt already reruns over a
-            // reduced set inside `dkg_phase`; reaching here means even that
-            // aborted, so wait for the next boundary and rebuild the context.
-            Err(e) if e.is_retriable() => {
+            // EVERY in-loop error backs off and re-enters Idle. The loop never
+            // terminates.
+            //
+            // It used to exit on anything outside a small retriable allowlist,
+            // and that allowlist was the bug: a peer on a different candidate
+            // set sent a package FROST rejected, heimdall classified the FROST
+            // error as fatal, and an honest node's epoch loop died for good —
+            // frozen on a stale roster while its HTTP server kept answering. It
+            // could not recover, because recovering means re-deriving the roster
+            // from chain and only this loop does that. One ban could take out an
+            // honest node; enough of them walk the roster below quorum.
+            //
+            // The spec is explicit that a failed ceremony is not terminal: "no
+            // Update-Y is posted... the old roster simply carries over... the
+            // next epoch boundary takes fresh snapshots and retries the DKG. No
+            // halt, no special state." Re-entering Idle re-derives from chain,
+            // which is what makes a stale node self-heal.
+            //
+            // Genuinely unrecoverable conditions (missing keys, unparseable
+            // config, an identity absent from the registry) are STARTUP
+            // validation and must fail before the loop is entered — not here,
+            // where the only correct answer is to keep trying.
+            Err(e) => {
                 crate::epoch_log!(
                     me,
                     current_epoch(&EpochPhase::Idle),
-                    "retriable error: {e}; backing off {:?} then re-entering Idle",
+                    "error: {e}; backing off {:?} then re-entering Idle",
                     backoff
                 );
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
                 phase = EpochPhase::Idle;
             }
-            // Fatal (logic/crypto bug, malformed tx): surface it. The caller
-            // logs and exits cleanly rather than panicking.
-            Err(e) => return Err(e),
         }
     }
 }
