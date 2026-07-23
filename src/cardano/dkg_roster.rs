@@ -149,6 +149,57 @@ pub struct DkgContext {
     /// the same chain-time instant (WI-014 #6). `None` for the mock /
     /// no-registry fallback → relative per-round timeouts instead.
     pub schedule_anchor_ms: Option<i64>,
+    /// Chain posix-time (ms) of the latest block when this context was read from
+    /// the chain — the freshness stamp for [`ChainView`]. Carried forward
+    /// unchanged by `reduced_to` (a rerun uses the same read). `0` on the
+    /// mock/fixture path, which has no chain.
+    pub read_time_ms: i64,
+}
+
+/// A node's view of the on-chain candidate set. Published UNSIGNED alongside
+/// each DKG payload so a peer can tell a genuine cross-view disagreement (both
+/// honest, different chain reads near a ban) from a corrupt payload, and
+/// schedule a settling re-read instead of blindly retrying. It is a hint, never
+/// authoritative: the chain stays the only source of truth, and a lying peer
+/// only gets its own payload dropped.
+///
+/// NOT part of `canonical_bytes` and NOT compared in the equivocation check —
+/// two payloads with identical signed content but different `ChainView` are the
+/// same payload, not an equivocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainView {
+    /// `blake2b_256` of the eligible `pool_id`s in ceremony (bifrost-key) order.
+    /// Two nodes on the same candidate set have the same digest; a ban that one
+    /// has seen and the other hasn't flips it.
+    pub digest: [u8; 32],
+    /// Eligible participant count — a cheap, human-legible discriminator.
+    pub n: u16,
+    /// Chain posix-time (ms) of the latest block this view was read from — a
+    /// **freshness** marker, deliberately finer than the epoch. On a digest
+    /// disagreement, the node with the OLDER `read_time_ms` is behind (it read
+    /// the chain before the disagreeing event, e.g. a ban, settled into its
+    /// view) and is the one that should re-read. This is what makes the
+    /// reconcile directional instead of a blind wait, and it distinguishes
+    /// states WITHIN one epoch — exactly where the ban-settlement disagreement
+    /// lives. Chain-derived (a block time), never a local clock, so it is
+    /// comparable across nodes.
+    pub read_time_ms: i64,
+}
+
+impl DkgContext {
+    /// This node's chain-view for the current context.
+    #[must_use]
+    pub fn chain_view(&self) -> ChainView {
+        let mut buf = Vec::with_capacity(self.participants.len() * 28);
+        for p in &self.participants {
+            buf.extend_from_slice(&p.pool_id);
+        }
+        ChainView {
+            digest: crate::cardano::hash::blake2b_256(&buf),
+            n: u16::try_from(self.participants.len()).unwrap_or(u16::MAX),
+            read_time_ms: self.read_time_ms,
+        }
+    }
 }
 
 /// A registered SPO that survived ban + URL filtering (pre-stake).
@@ -316,6 +367,7 @@ pub fn derive_dkg_context(
         // The schedule anchor is supplied by `fetch_dkg_context` (it already
         // fetches the boundary time); the pure derivation leaves it unset.
         schedule_anchor_ms: None,
+        read_time_ms: 0,
     })
 }
 
@@ -432,6 +484,7 @@ impl DkgContext {
             excluded: self.excluded.clone(),
             // Same anchor → same anchored schedule for the rerun.
             schedule_anchor_ms: self.schedule_anchor_ms,
+            read_time_ms: self.read_time_ms,
         })
     }
 
@@ -473,6 +526,7 @@ impl DkgContext {
             // Mock / no-registry fallback has no chain schedule → relative
             // per-round timeouts.
             schedule_anchor_ms: None,
+            read_time_ms: 0,
         }
     }
 }
@@ -643,6 +697,15 @@ pub async fn fetch_dkg_context(
     // Anchor the ceremony's round deadlines to the chain epoch boundary (WI-014
     // #6), so every node freezes L1/Q at the same chain-time instant.
     ctx.schedule_anchor_ms = Some(epoch_start_ms);
+    // Freshness stamp for the published ChainView: the chain time this view was
+    // read at. A node that read the chain later saw more of it, so on a
+    // candidate-set disagreement the OLDER read_time_ms marks the stale node.
+    // Best-effort — a failed tip read leaves it 0 (treated as "oldest"), which
+    // is safe: it only ever makes THIS node the one that re-reads.
+    ctx.read_time_ms = bf_http::fetch_latest_block_time(base_url, project_id)
+        .await
+        .map(|secs| secs * 1000)
+        .unwrap_or(0);
     Ok(ctx)
 }
 
@@ -746,6 +809,7 @@ mod tests {
             participants,
             excluded: vec![],
             schedule_anchor_ms: None,
+            read_time_ms: 0,
         }
     }
 
