@@ -125,14 +125,37 @@ pub async fn run_epoch_loop(
             // validation and must fail before the loop is entered — not here,
             // where the only correct answer is to keep trying.
             Err(e) => {
-                crate::epoch_log!(
-                    me,
-                    current_epoch(&EpochPhase::Idle),
-                    "error: {e}; backing off {:?} then re-entering Idle",
-                    backoff
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                // Post-ban recovery (chain-view reconcile): if this failure came
+                // with a detected chain-view disagreement on which we are the
+                // STALE side (older blockchain read-time), a blind fast retry
+                // would just re-read the same unsettled tip and churn — the real
+                // chain returns the current epoch immediately, so the back-off IS
+                // the re-read cadence. Wait a settling interval so the next
+                // re-read lands AFTER the disagreeing event settles into our
+                // view; the fresher-read nodes don't wait. Otherwise the ordinary
+                // capped exponential.
+                let wait = if peers.is_view_stale().await {
+                    crate::epoch_log!(
+                        me,
+                        current_epoch(&EpochPhase::Idle),
+                        "error: {e}; STALE chain-view — settling back-off {:?} before re-read \
+                         (reconcile), then re-entering Idle",
+                        config.dkg_reconcile_backoff
+                    );
+                    backoff = RETRY_BACKOFF_MIN; // the settling wait replaces the ramp
+                    config.dkg_reconcile_backoff
+                } else {
+                    crate::epoch_log!(
+                        me,
+                        current_epoch(&EpochPhase::Idle),
+                        "error: {e}; backing off {:?} then re-entering Idle",
+                        backoff
+                    );
+                    let w = backoff;
+                    backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                    w
+                };
+                tokio::time::sleep(wait).await;
                 phase = EpochPhase::Idle;
             }
         }

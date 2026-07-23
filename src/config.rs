@@ -75,6 +75,12 @@ pub struct ProtocolConfig {
     /// (WI-014 #6). Tunable for preprod; the spec budget is ~minutes.
     pub dkg_round1_offset_secs: u64,
     pub dkg_round2_offset_secs: u64,
+    /// Settling back-off (seconds) taken instead of the blind exponential when a
+    /// DKG fails while THIS node is the stale side of a chain-view disagreement,
+    /// so the next chain re-read lands after the disagreeing event settles
+    /// (post-ban recovery — see heimdall `EpochConfig::dkg_reconcile_backoff`).
+    /// Devnet-tight by default; mainnet wants it near the settlement depth.
+    pub dkg_reconcile_backoff_secs: u64,
     pub poll_interval_ms: u64,
     pub quorum51_timeout_secs: u64,
     pub leader_timeout_secs: u64,
@@ -93,6 +99,7 @@ impl Default for ProtocolConfig {
             dkg_join_wait_secs: 300,
             dkg_round1_offset_secs: 120,
             dkg_round2_offset_secs: 240,
+            dkg_reconcile_backoff_secs: 30,
             poll_interval_ms: 5000,
             quorum51_timeout_secs: 300,
             leader_timeout_secs: 10000,
@@ -402,6 +409,7 @@ impl HeimdallConfig {
             dkg_join_wait: Duration::from_secs(self.protocol.dkg_join_wait_secs),
             dkg_round1_offset: Duration::from_secs(self.protocol.dkg_round1_offset_secs),
             dkg_round2_offset: Duration::from_secs(self.protocol.dkg_round2_offset_secs),
+            dkg_reconcile_backoff: Duration::from_secs(self.protocol.dkg_reconcile_backoff_secs),
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
             quorum51_timeout: Duration::from_secs(self.protocol.quorum51_timeout_secs),
             leader_timeout: Duration::from_secs(self.protocol.leader_timeout_secs),

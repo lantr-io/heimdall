@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bitcoin::secp256k1::rand::rngs::OsRng;
@@ -22,9 +23,38 @@ use super::canonical::POOL_ID_LEN;
 use super::client::identifier_to_pool_id;
 use super::payloads::{Sign1Payload, Sign2Payload};
 use super::server::{AppState, DkgRoundKey, SharedState};
-use super::wire::{self, Dkg1Wire, Dkg2Wire, DkgNamespace, Round2Recipient};
+use super::wire::{self, ChainViewWire, Dkg1Wire, Dkg2Wire, DkgNamespace, Round2Recipient};
+use crate::cardano::dkg_roster::ChainView;
 use crate::epoch::state::{EpochError, EpochResult, SpoInfo};
 use crate::epoch::traits::{DkgFaultEvidence, PeerNetwork};
+
+/// Wall-clock bound past which a persistent chain-view disagreement with one
+/// peer is flagged (the reconcile design's "impossible-case" tripwire). Under
+/// honest-majority + chain liveness two honest nodes reading one canonical
+/// chain always reconcile once the disagreeing event settles, so this must stay
+/// silent. Set clear of even the pre-reconcile churn (which recovered in ~1–2
+/// bench epochs ≈ 360 s) so only genuine permanent divergence trips it, never a
+/// merely-slow-but-converging recovery — the recovery-*time* win is measured
+/// separately, by when the reduced DKG completes.
+const DIVERGENCE_ALARM: Duration = Duration::from_secs(300);
+
+/// This node's chain-view plus the reconcile / divergence bookkeeping the fetch
+/// path maintains against it. Behind a plain mutex: every access is a short
+/// critical section with no `.await` held across the lock.
+#[derive(Debug, Default)]
+struct ViewState {
+    /// This node's view for the current ceremony, set at each ceremony entry.
+    own: Option<ChainView>,
+    /// Set when a fetched peer's view differed AND its blockchain read-time was
+    /// NEWER (this node is the stale side). Read by the epoch loop to pick a
+    /// settling backoff; reset at the next `set_chain_view`.
+    stale: bool,
+    /// Per-peer `pool_id` → the instant a still-unresolved view disagreement was
+    /// first observed: the divergence tripwire's clock. Cleared when the peer's
+    /// view matches ours again; NOT reset by `set_chain_view`, since one
+    /// disagreement can span several attempts.
+    divergence_since: BTreeMap<Vec<u8>, Instant>,
+}
 
 /// Key under which a fetched peer payload's raw bytes are retained for
 /// equivocation evidence: a re-fetch returning *different* bytes for the
@@ -60,6 +90,7 @@ pub struct HttpPeerNetwork {
     keypair: Keypair,
     my_pool_id: [u8; POOL_ID_LEN],
     evidence: Arc<Mutex<BTreeMap<EvidenceKey, RetainedDkgPayloads>>>,
+    views: Arc<Mutex<ViewState>>,
 }
 
 impl HttpPeerNetwork {
@@ -75,6 +106,85 @@ impl HttpPeerNetwork {
             keypair,
             my_pool_id,
             evidence: Arc::new(Mutex::new(BTreeMap::new())),
+            views: Arc::new(Mutex::new(ViewState::default())),
+        }
+    }
+
+    /// Compare a fetched peer's chain-view against our own (the reconcile
+    /// design's detect step). Called on every Round-1 fetch, independent of
+    /// whether the payload itself verifies — a cross-view peer's package is
+    /// dropped downstream by the commitment-count filter, but the *view* is what
+    /// tells us WHY, and who should re-read.
+    ///
+    /// Records three things: (a) a one-line diagnosis at the start of each
+    /// disagreement episode, replacing the opaque `poseidon_commit mismatch` as
+    /// the first thing a log shows; (b) `stale = true` iff our blockchain
+    /// read-time is older than the peer's, so the epoch loop settles+re-reads
+    /// rather than blind-retrying; (c) the per-peer divergence timer that trips
+    /// [`DIVERGENCE_ALARM`] if a pair never reconciles. A view is only ever a
+    /// hint here — nothing adopts the peer's value; the chain stays the truth.
+    fn compare_view(&self, peer_pool_id: &[u8], peer_view: Option<&ChainViewWire>) {
+        let mut v = self.views.lock().expect("views mutex");
+        let Some(own) = v.own else {
+            return; // no own view yet (mock / pre-entry) → nothing to compare
+        };
+        let peer = match peer_view.map(ChainViewWire::to_view) {
+            Some(Ok(p)) => p,
+            // Peer published no view (mock / older payload) or a malformed one:
+            // can't compare → treat as "not disagreeing" and clear any timer.
+            _ => {
+                v.divergence_since.remove(peer_pool_id);
+                return;
+            }
+        };
+        if peer.digest == own.digest {
+            if v.divergence_since.remove(peer_pool_id).is_some() {
+                eprintln!(
+                    "[chain-view] peer {} reconciled to our view (n={})",
+                    hex::encode(peer_pool_id),
+                    own.n
+                );
+            }
+            return;
+        }
+
+        // Genuine cross-view disagreement.
+        let older = own.read_time_ms < peer.read_time_ms;
+        if !v.divergence_since.contains_key(peer_pool_id) {
+            eprintln!(
+                "[chain-view] disagreement with peer {}: mine=(n={} digest={} read_time_ms={}) \
+                 theirs=(n={} digest={} read_time_ms={}) — we are the {} side",
+                hex::encode(peer_pool_id),
+                own.n,
+                hex::encode(&own.digest[..4]),
+                own.read_time_ms,
+                peer.n,
+                hex::encode(&peer.digest[..4]),
+                peer.read_time_ms,
+                if older {
+                    "STALE (will re-read after settling)"
+                } else {
+                    "fresher (the peer re-reads)"
+                },
+            );
+            v.divergence_since
+                .insert(peer_pool_id.to_vec(), Instant::now());
+        } else if let Some(since) = v.divergence_since.get(peer_pool_id) {
+            let elapsed = since.elapsed();
+            if elapsed >= DIVERGENCE_ALARM {
+                eprintln!(
+                    "DIVERGENCE: peer {} differs for >{}s — two honest nodes on one chain must \
+                     reconcile once the event settles; this tripwire should never fire",
+                    hex::encode(peer_pool_id),
+                    elapsed.as_secs(),
+                );
+            }
+        }
+        // Directional: only the stale side re-reads. Set every disagreeing poll
+        // (not just the first), because `set_chain_view` clears it each attempt
+        // and the epoch loop wants the latest attempt's verdict.
+        if older {
+            v.stale = true;
         }
     }
 
@@ -327,12 +437,25 @@ impl PeerNetwork for HttpPeerNetwork {
         }
     }
 
+    async fn set_chain_view(&self, view: ChainView) {
+        let mut v = self.views.lock().expect("views mutex");
+        v.own = Some(view);
+        v.stale = false; // fresh ceremony entry → clear the per-attempt verdict
+    }
+
+    async fn is_view_stale(&self) -> bool {
+        self.views.lock().expect("views mutex").stale
+    }
+
     async fn publish_dkg_round1(
         &self,
         ns: DkgNamespace,
         identifier: frost_secp256k1_tr::Identifier,
         package: &round1::Package,
     ) -> EpochResult<()> {
+        // Attach our own chain-view (UNSIGNED) so peers can detect a genuine
+        // cross-view disagreement — `None` before the first `set_chain_view`.
+        let own_view = self.views.lock().expect("views mutex").own;
         let wire = wire::build_round1(
             &self.secp,
             &self.keypair,
@@ -342,6 +465,7 @@ impl PeerNetwork for HttpPeerNetwork {
             &self.my_pool_id,
             identifier_to_pool_id(identifier),
             package,
+            own_view.as_ref(),
         )
         .map_err(peer_err)?;
         let json = serde_json::to_string(&wire).map_err(peer_err)?;
@@ -431,6 +555,11 @@ impl PeerNetwork for HttpPeerNetwork {
             &peer.pool_id,
         );
         let wire: Dkg1Wire = serde_json::from_slice(&bytes).map_err(peer_err)?;
+        // Detect a genuine cross-view disagreement BEFORE verification: a
+        // cross-view peer's package fails the downstream commitment-count filter
+        // as "absent, not faulty", but its published view is what names the
+        // disagreement and decides who re-reads.
+        self.compare_view(&peer.pool_id, wire.view.as_ref());
         let peer_pool = pool_id_arr(&peer.pool_id)?;
         match wire::verify_round1(
             &self.secp,
@@ -698,6 +827,71 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a different epoch must not resolve"
+        );
+    }
+
+    /// The reconcile design's directional property: on a chain-view
+    /// disagreement, ONLY the node whose blockchain read-time is older flags
+    /// itself stale (it read before the event settled), so only it re-reads —
+    /// the fresher-read node does not. Verified through the real fetch path.
+    #[tokio::test]
+    async fn only_the_older_read_node_flags_itself_stale() {
+        let secp = Secp256k1::new();
+        let (kp1, pool1, pk1) = identity(&secp, 1);
+        let (kp2, pool2, pk2) = identity(&secp, 2);
+        let net1 = HttpPeerNetwork::new(Secp256k1::new(), kp1, pool1);
+        let net2 = HttpPeerNetwork::new(Secp256k1::new(), kp2, pool2);
+        let url1 = serve(&net1).await;
+        let url2 = serve(&net2).await;
+        let ns = DkgNamespace::new(7);
+
+        // net1 read the chain EARLIER (older read_time) and still sees 4 members;
+        // net2 read later and already sees the 3-member post-ban set. Distinct
+        // candidate-set digests ⇒ a genuine cross-view disagreement.
+        net1.set_chain_view(ChainView {
+            digest: [0xA1; 32],
+            n: 4,
+            read_time_ms: 100,
+        })
+        .await;
+        net2.set_chain_view(ChainView {
+            digest: [0xB2; 32],
+            n: 3,
+            read_time_ms: 200,
+        })
+        .await;
+
+        // Each publishes its Round-1 payload (carrying its own view), then fetches
+        // the other's.
+        let (_s1, pkg1) = dkg::part1(id(1), 3, 2, OsRng).unwrap();
+        let (_s2, pkg2) = dkg::part1(id(2), 3, 2, OsRng).unwrap();
+        net1.publish_dkg_round1(ns, id(1), &pkg1).await.unwrap();
+        net2.publish_dkg_round1(ns, id(2), &pkg2).await.unwrap();
+
+        let peer1 = peer_info(1, &pool1, &url1, &pk1);
+        let peer2 = peer_info(2, &pool2, &url2, &pk2);
+        let _ = fetch_r1_retrying(&net1, ns, &peer2).await; // net1 sees net2's fresher view
+        let _ = fetch_r1_retrying(&net2, ns, &peer1).await; // net2 sees net1's staler view
+
+        assert!(
+            net1.is_view_stale().await,
+            "the older-read node must flag itself as the stale side"
+        );
+        assert!(
+            !net2.is_view_stale().await,
+            "the fresher-read node must NOT re-read — it already saw the settled view"
+        );
+
+        // A fresh ceremony entry clears the per-attempt verdict.
+        net1.set_chain_view(ChainView {
+            digest: [0xB2; 32],
+            n: 3,
+            read_time_ms: 300,
+        })
+        .await;
+        assert!(
+            !net1.is_view_stale().await,
+            "set_chain_view resets the stale flag for the new attempt"
         );
     }
 

@@ -17,6 +17,7 @@ use super::canonical::{
     self, EVIDENCE_HASH_LEN, PAD_COMMIT_LEN, POINT_LEN, POOL_ID_LEN, SHARE_LEN, SIG_LEN, ShareEntry,
 };
 use super::frost_bridge::{self, BridgeError};
+use crate::cardano::dkg_roster::ChainView;
 use crate::cardano::hash::blake2b_256;
 use crate::circuits::fault_evidence;
 use crate::circuits::fault_evidence::{
@@ -125,6 +126,48 @@ impl DkgNamespace {
 // Round 1
 // ---------------------------------------------------------------------------
 
+/// A publisher's [`ChainView`] in hex/JSON form, carried UNSIGNED on each
+/// Round-1 payload ([`Dkg1Wire::view`]).
+///
+/// It is NOT part of `canonical_bytes` and NOT compared in the equivocation
+/// check: two Round-1 payloads differing ONLY here reconstruct to identical
+/// canonical bytes, so they are the SAME signed payload, never an equivocation
+/// (pinned by the `view_only_difference_is_not_equivocation` test). A peer
+/// reads it to tell a genuine cross-view disagreement (both honest, different
+/// chain reads near a ban) from a corrupt payload, and to schedule a settling
+/// re-read — a hint that only ever makes a node re-read the chain, never adopt
+/// a peer's value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainViewWire {
+    /// `blake2b_256` of the eligible `pool_id`s in ceremony order, hex (32 bytes).
+    pub view_digest: String,
+    /// Eligible participant count.
+    pub view_n: u16,
+    /// Chain block-time (Unix ms) this view was read at — the freshness marker.
+    /// Older ⇒ read the chain earlier ⇒ the stale side of a disagreement.
+    pub view_read_time_ms: i64,
+}
+
+impl ChainViewWire {
+    #[must_use]
+    pub fn from_view(v: &ChainView) -> Self {
+        Self {
+            view_digest: hex::encode(v.digest),
+            view_n: v.n,
+            view_read_time_ms: v.read_time_ms,
+        }
+    }
+
+    /// Parse back into a [`ChainView`] for the compare-on-fetch path.
+    pub fn to_view(&self) -> Result<ChainView, WireError> {
+        Ok(ChainView {
+            digest: hex_n::<32>(&self.view_digest, "view_digest")?,
+            n: self.view_n,
+            read_time_ms: self.view_read_time_ms,
+        })
+    }
+}
+
 /// Round 1 payload: commitment vector + proof of knowledge, authenticated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Dkg1Wire {
@@ -136,9 +179,20 @@ pub struct Dkg1Wire {
     pub poseidon_commit: String,
     /// BIP-340 signature over `SHA256(canonical_bytes)`, hex (64 bytes).
     pub signature: String,
+    /// This publisher's UNSIGNED chain-view (candidate-set digest + count +
+    /// chain read-time). Outside `canonical_bytes` and the equivocation check
+    /// by construction — see [`ChainViewWire`]. `None` on the mock /
+    /// no-registry path (no chain view was set), so old payloads without the
+    /// field still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<ChainViewWire>,
 }
 
-/// Build and sign this SPO's Round 1 payload from its frost package.
+/// Build and sign this SPO's Round 1 payload from its frost package. `view` is
+/// this node's chain-view for the ceremony, attached UNSIGNED (it never enters
+/// the canonical bytes the signature covers); `None` on the mock / no-registry
+/// path.
+#[allow(clippy::too_many_arguments)]
 pub fn build_round1(
     secp: &Secp256k1<All>,
     keypair: &Keypair,
@@ -148,6 +202,7 @@ pub fn build_round1(
     my_pool_id: &[u8; POOL_ID_LEN],
     my_identifier: u16,
     package: &round1::Package,
+    view: Option<&ChainView>,
 ) -> Result<Dkg1Wire, WireError> {
     let (commitment, sigma_i) = frost_bridge::round1_fields(package)?;
     let poseidon_commit = fault_evidence::round1_evidence_hash_from_fields(
@@ -172,6 +227,7 @@ pub fn build_round1(
         sigma_i: hex::encode(sigma_i),
         poseidon_commit: hex::encode(poseidon_commit),
         signature: hex::encode(signature),
+        view: view.map(ChainViewWire::from_view),
     })
 }
 
@@ -679,7 +735,18 @@ mod tests {
         let pool = [3u8; POOL_ID_LEN];
         let (_s, pkg) = dkg::part1(id(1), 3, 2, OsRng).unwrap();
 
-        let wire = build_round1(&secp, &kp, 9, canonical::THRESHOLD_51, 0, &pool, 1, &pkg).unwrap();
+        let wire = build_round1(
+            &secp,
+            &kp,
+            9,
+            canonical::THRESHOLD_51,
+            0,
+            &pool,
+            1,
+            &pkg,
+            None,
+        )
+        .unwrap();
         assert_eq!(wire.commitment.len(), 2);
         assert_eq!(
             hex::decode(&wire.poseidon_commit).unwrap().len(),
@@ -706,7 +773,18 @@ mod tests {
         let (_sk, kp, xonly) = keypair(&secp);
         let pool = [3u8; POOL_ID_LEN];
         let (_s, pkg) = dkg::part1(id(1), 3, 2, OsRng).unwrap();
-        let wire = build_round1(&secp, &kp, 9, canonical::THRESHOLD_51, 0, &pool, 1, &pkg).unwrap();
+        let wire = build_round1(
+            &secp,
+            &kp,
+            9,
+            canonical::THRESHOLD_51,
+            0,
+            &pool,
+            1,
+            &pkg,
+            None,
+        )
+        .unwrap();
 
         // Wrong epoch -> different canonical bytes -> signature must fail.
         let err = verify_round1(
@@ -720,6 +798,72 @@ mod tests {
             &wire,
         );
         assert!(matches!(err, Err(WireError::Auth(_))));
+    }
+
+    /// The consensus-adjacent safety property: the unsigned `ChainView` is
+    /// invisible to the equivocation detector. Two Round-1 payloads with
+    /// identical SIGNED content but a different `view` (as when the same node
+    /// re-read the chain) reconstruct to byte-identical canonical bytes, so
+    /// building equivocation evidence from them is refused — otherwise a benign
+    /// cross-view difference would mint a FALSE fault proof against an honest
+    /// node, far worse than the churn the view exists to cut.
+    #[test]
+    fn view_only_difference_is_not_equivocation() {
+        let secp = Secp256k1::new();
+        let (_sk, kp, xonly) = keypair(&secp);
+        let pool = [7u8; POOL_ID_LEN];
+        let (_s, pkg) = dkg::part1(id(1), 3, 2, OsRng).unwrap();
+
+        let view_a = ChainView {
+            digest: [0xAA; 32],
+            n: 4,
+            read_time_ms: 1_000,
+        };
+        let wire_a = build_round1(
+            &secp,
+            &kp,
+            9,
+            canonical::THRESHOLD_51,
+            0,
+            &pool,
+            1,
+            &pkg,
+            Some(&view_a),
+        )
+        .unwrap();
+        // Same signed content, a DIFFERENT (fresher) view: only `view` changes.
+        let mut wire_b = wire_a.clone();
+        wire_b.view = Some(ChainViewWire {
+            view_digest: hex::encode([0xBB; 32]),
+            view_n: 3,
+            view_read_time_ms: 2_000,
+        });
+        assert_ne!(wire_a, wire_b, "the wires differ (in the unsigned view)");
+
+        // The signed canonical bytes ignore the view, so they are identical...
+        let (payload_a, _) =
+            round1_signed_payload(&pool, &xonly, 9, canonical::THRESHOLD_51, 0, &wire_a).unwrap();
+        let (payload_b, _) =
+            round1_signed_payload(&pool, &xonly, 9, canonical::THRESHOLD_51, 0, &wire_b).unwrap();
+        assert_eq!(
+            payload_a, payload_b,
+            "canonical bytes must be blind to the unsigned ChainView"
+        );
+
+        // ...so equivocation evidence over the two is refused (NotEquivocation).
+        let err = round1_equivocation_evidence(
+            &pool,
+            &xonly,
+            9,
+            canonical::THRESHOLD_51,
+            0,
+            &wire_a,
+            &wire_b,
+        );
+        assert!(
+            matches!(err, Err(WireError::Field(_))),
+            "a view-only difference must never be treated as an equivocation, got {err:?}"
+        );
     }
 
     #[test]

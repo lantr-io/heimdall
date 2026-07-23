@@ -395,6 +395,16 @@ pub struct EpochConfig {
     pub dkg_round1_offset: Duration,
     /// Round 2 deadline as an offset from the epoch boundary (> round 1).
     pub dkg_round2_offset: Duration,
+    /// Settling back-off used INSTEAD of the blind exponential when a failed DKG
+    /// was accompanied by a detected chain-view disagreement on which THIS node
+    /// was the stale side (older blockchain read-time). Because the real chain's
+    /// `await_epoch_boundary` returns the current epoch immediately, the retry
+    /// back-off IS the chain re-read cadence — so waiting a settling interval
+    /// here makes the re-read land AFTER the disagreeing event (e.g. a ban)
+    /// settles into this node's view, converging in one step instead of churning
+    /// at 2/4/8 s against the still-unsettled tip. Bounded and self-terminating:
+    /// once views reconcile there is no disagreement to re-arm it.
+    pub dkg_reconcile_backoff: Duration,
     pub poll_interval: Duration,
     pub quorum51_timeout: Duration,
     pub leader_timeout: Duration,
@@ -454,6 +464,7 @@ impl EpochConfig {
             dkg_join_wait: Duration::from_secs(300),
             dkg_round1_offset: Duration::from_secs(120),
             dkg_round2_offset: Duration::from_secs(240),
+            dkg_reconcile_backoff: Duration::from_secs(30),
             poll_interval: Duration::from_millis(5000),
             quorum51_timeout: Duration::from_secs(300),
             leader_timeout: Duration::from_secs(10000),

@@ -208,6 +208,26 @@ pub trait PeerNetwork: Send + Sync {
         true
     }
 
+    /// Record this node's chain-view for the ceremony it is entering.
+    /// [`Self::publish_dkg_round1`] attaches it (UNSIGNED) to each Round-1
+    /// payload and [`Self::fetch_dkg_round1`] compares it against peers' — so a
+    /// node can tell a genuine cross-view disagreement (both honest, different
+    /// chain reads near a ban) from a corrupt payload. Called once per ceremony
+    /// entry (each attempt), before publishing. Default no-op: a transport with
+    /// no wire view (the mock) ignores it and [`Self::is_view_stale`] stays
+    /// `false`.
+    async fn set_chain_view(&self, _view: crate::cardano::dkg_roster::ChainView) {}
+
+    /// Whether, during the ceremony since the last [`Self::set_chain_view`], this
+    /// node observed a peer whose chain-view differed AND whose blockchain
+    /// read-time was NEWER — i.e. THIS node is the STALE side and should re-read
+    /// after the disagreeing event (e.g. a ban) settles. The epoch loop reads
+    /// this after a failed DKG to back off a settling interval instead of the
+    /// blind exponential, making the reconcile directional. Default `false`.
+    async fn is_view_stale(&self) -> bool {
+        false
+    }
+
     async fn publish_dkg_round1(
         &self,
         ns: DkgNamespace,

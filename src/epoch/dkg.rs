@@ -100,6 +100,15 @@ pub async fn dkg_phase(
                 roster.min_signers
             );
 
+            // Publish THIS node's chain-view for the ceremony (candidate-set
+            // digest + count + the chain read-time it was resolved at). The
+            // transport attaches it UNSIGNED to every Round-1 payload and
+            // compares peers' against it: a differing view near a ban is a
+            // genuine cross-view disagreement, not a corrupt payload, and the
+            // staler node re-reads after a settling delay. Also clears the
+            // per-attempt stale verdict the epoch loop reads on abort.
+            peers.set_chain_view(ctx.chain_view()).await;
+
             let mut dkg_rng = rng.rng(b"dkg1");
             let (secret, package) =
                 participant::dkg_part1(me, roster.max_signers, roster.min_signers, &mut dkg_rng)
