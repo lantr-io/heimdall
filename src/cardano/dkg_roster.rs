@@ -600,6 +600,23 @@ pub async fn fetch_dkg_context(
         .await
         .map_err(DkgFetchError::Ban)?;
     let eligible = eligible_pool_ids(&snapshot, &active_bans);
+    // TRACE (2026-07-23): the chain view this node derived, so the SAME line from
+    // every node can be diffed to see WHEN each first saw the ban. The ban list is
+    // read at the current tip (fetch_active_bans → fetch_ban_list), so a ban
+    // landing near a boundary is seen by some nodes an epoch before others — the
+    // suspected root of the transitional recovery churn.
+    {
+        let short = |v: &[u8]| hex::encode(&v[..4.min(v.len())]);
+        let bans_short: Vec<String> = active_bans.iter().map(|b| short(b)).collect();
+        let elig_short: Vec<String> = eligible.iter().map(|e| short(e)).collect();
+        eprintln!(
+            "[chain-view] epoch={epoch} attempt={attempt} epoch_start_ms={epoch_start_ms} \
+             registered={} active_bans=[{}] eligible=[{}]",
+            snapshot.spos.len(),
+            bans_short.join(","),
+            elig_short.join(",")
+        );
+    }
     let stakes = fetch_eligible_stakes(
         base_url,
         project_id,
