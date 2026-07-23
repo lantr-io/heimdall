@@ -174,9 +174,10 @@ enum Commands {
         amount_sat: u64,
         /// The treasury's current internal key (32-byte x-only hex = its FROST
         /// group key Y_51), needed to rebuild the treasury Taproot tree + the
-        /// leaf control block.
+        /// leaf control block. Omit for the bootstrap treasury, where Y_51 =
+        /// y_fed (as `bootstrap-treasury` prints it).
         #[arg(long)]
-        y51: String,
+        y51: Option<String>,
         /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
         #[arg(long)]
         broadcast: bool,
@@ -736,7 +737,9 @@ fn main() {
             broadcast,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) = run_federation_spend(&cfg, &outpoint, amount_sat, &y51, broadcast) {
+            if let Err(e) =
+                run_federation_spend(&cfg, &outpoint, amount_sat, y51.as_deref(), broadcast)
+            {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1690,7 +1693,7 @@ fn run_federation_spend(
     cfg: &HeimdallConfig,
     outpoint: &str,
     amount_sat: u64,
-    y51_hex: &str,
+    y51_hex: Option<&str>,
     broadcast: bool,
 ) -> Result<(), String> {
     use bitcoin::key::{Secp256k1, UntweakedPublicKey};
@@ -1703,13 +1706,21 @@ fn run_federation_spend(
     let outpoint = parse_outpoint(outpoint)?;
     let (y_fed_sk, y_fed) = y_fed_keypair(&secp, cfg)?;
     let csv = csv_blocks_u16(cfg)?;
-    let y51_bytes = hex::decode(y51_hex.trim()).map_err(|e| format!("--y51 hex: {e}"))?;
-    let y51 = UntweakedPublicKey::from_slice(&y51_bytes)
-        .map_err(|e| format!("--y51 is not a 32-byte x-only key: {e}"))?;
+    // Omitted => the bootstrap treasury, whose internal key is y_fed itself.
+    let y51 = match y51_hex {
+        Some(h) => {
+            let b = hex::decode(h.trim()).map_err(|e| format!("--y51 hex: {e}"))?;
+            UntweakedPublicKey::from_slice(&b)
+                .map_err(|e| format!("--y51 is not a 32-byte x-only key: {e}"))?
+        }
+        None => y_fed,
+    };
 
     // Real treasury tree: Y_51 internal (key-path = 51%), y_fed CSV leaf (federation).
     let spend_info = treasury_spend_info(&secp, y51, y_fed, csv);
     let treasury_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
+    let treasury_addr =
+        bitcoin::Address::p2tr_tweaked(spend_info.output_key(), cfg.bitcoin.parsed_network());
 
     // Treasury-only, no peg-ins/peg-outs => single output[0] = treasury.
     let unsigned = build_tm(
@@ -1730,6 +1741,7 @@ fn run_federation_spend(
     let raw = bitcoin::consensus::encode::serialize(&signed);
 
     println!("federation-spend txid : {}", signed.compute_txid());
+    println!("  treasury address     : {treasury_addr}  (fund this / the input's scriptPubKey)");
     println!(
         "  script-path via y_fed CSV leaf (csv={csv}); output[0] = {} sat (treasury)",
         signed.output[0].value.to_sat()
