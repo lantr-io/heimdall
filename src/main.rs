@@ -157,6 +157,30 @@ enum Commands {
         #[arg(long)]
         broadcast: bool,
     },
+    /// FEDERATION emergency spend of the treasury (scenario 3, N23): a Taproot
+    /// SCRIPT-PATH spend via the `y_fed` CSV leaf — the fallback for when the FROST
+    /// group is dark. The treasury UTxO must already be `federation_csv_blocks`
+    /// deep on Bitcoin. Change returns to the same treasury address (federation
+    /// self-send); the on-chain key rotation to y_federation is separate (N10b).
+    /// Prints the signed tx, broadcasts only with --broadcast.
+    FederationSpend {
+        #[arg(long)]
+        config: Option<String>,
+        /// Treasury outpoint to spend, as <txid>:<vout>.
+        #[arg(long)]
+        outpoint: String,
+        /// Treasury input amount in satoshis.
+        #[arg(long)]
+        amount_sat: u64,
+        /// The treasury's current internal key (32-byte x-only hex = its FROST
+        /// group key Y_51), needed to rebuild the treasury Taproot tree + the
+        /// leaf control block.
+        #[arg(long)]
+        y51: String,
+        /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
+        #[arg(long)]
+        broadcast: bool,
+    },
     /// Print the Cardano wallet base address + payment key hash (the TM-NFT mint
     /// authority) derived from the configured mnemonic / $HEIMDALL_MNEMONIC.
     WalletAddress {
@@ -700,6 +724,19 @@ fn main() {
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_treasury_self_send(&cfg, &outpoint, amount_sat, broadcast) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::FederationSpend {
+            config,
+            outpoint,
+            amount_sat,
+            y51,
+            broadcast,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_federation_spend(&cfg, &outpoint, amount_sat, &y51, broadcast) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1631,6 +1668,82 @@ fn run_treasury_self_send(
 
     if !broadcast {
         println!("(not broadcast — pass --broadcast to send)");
+        return Ok(());
+    }
+    let rpc = btc_rpc_config(cfg)?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(broadcast_btc_tx(&rpc, &raw))
+        .map_err(|e| format!("broadcast: {e}"))?;
+    println!("broadcast OK");
+    Ok(())
+}
+
+/// Build (and with --broadcast, send) the FEDERATION emergency spend of the
+/// treasury (scenario 3, N23): a Taproot SCRIPT-PATH spend via the `y_fed` CSV
+/// leaf, the fallback for when the FROST group is dark. The treasury UTxO must
+/// already be `federation_csv_blocks` deep on Bitcoin. Change returns to the
+/// same treasury address (federation self-send); the on-chain rotation to
+/// y_federation is a separate step (N10b). `y51_hex` is the treasury's current
+/// internal key (its FROST group key) — needed only to rebuild the treasury tree
+/// / leaf control block; `y_fed` + csv come from the config.
+fn run_federation_spend(
+    cfg: &HeimdallConfig,
+    outpoint: &str,
+    amount_sat: u64,
+    y51_hex: &str,
+    broadcast: bool,
+) -> Result<(), String> {
+    use bitcoin::key::{Secp256k1, UntweakedPublicKey};
+    use bitcoin::{Amount, ScriptBuf};
+    use heimdall::bitcoin::taproot::treasury_spend_info;
+    use heimdall::bitcoin::tm_builder::{TreasuryInput, build_tm, sign_tm_federation_leaf};
+    use heimdall::cardano::btc_rpc::broadcast_btc_tx;
+
+    let secp = Secp256k1::new();
+    let outpoint = parse_outpoint(outpoint)?;
+    let (y_fed_sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    let csv = csv_blocks_u16(cfg)?;
+    let y51_bytes = hex::decode(y51_hex.trim()).map_err(|e| format!("--y51 hex: {e}"))?;
+    let y51 = UntweakedPublicKey::from_slice(&y51_bytes)
+        .map_err(|e| format!("--y51 is not a 32-byte x-only key: {e}"))?;
+
+    // Real treasury tree: Y_51 internal (key-path = 51%), y_fed CSV leaf (federation).
+    let spend_info = treasury_spend_info(&secp, y51, y_fed, csv);
+    let treasury_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
+
+    // Treasury-only, no peg-ins/peg-outs => single output[0] = treasury.
+    let unsigned = build_tm(
+        TreasuryInput {
+            outpoint,
+            value: Amount::from_sat(amount_sat),
+            spend_info,
+        },
+        vec![],
+        vec![],
+        treasury_spk,
+        &fee_params_from_cfg(cfg),
+    )
+    .map_err(|e| format!("build federation spend: {e}"))?;
+
+    let signed = sign_tm_federation_leaf(&secp, &unsigned, &y_fed_sk, csv)
+        .map_err(|e| format!("sign federation spend: {e}"))?;
+    let raw = bitcoin::consensus::encode::serialize(&signed);
+
+    println!("federation-spend txid : {}", signed.compute_txid());
+    println!(
+        "  script-path via y_fed CSV leaf (csv={csv}); output[0] = {} sat (treasury)",
+        signed.output[0].value.to_sat()
+    );
+    println!(
+        "  witness items: {} (expect 3: sig, leaf, control block)",
+        signed.input[0].witness.len()
+    );
+    println!("  raw tx : {}", hex::encode(&raw));
+
+    if !broadcast {
+        println!(
+            "(not broadcast — pass --broadcast; the treasury UTxO must be >= {csv} blocks deep)"
+        );
         return Ok(());
     }
     let rpc = btc_rpc_config(cfg)?;
