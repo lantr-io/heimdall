@@ -161,11 +161,19 @@ pub fn build_treasury_bootstrap_tx(
     let script_address = treasury_script.enterprise_address(network);
     let policy_id_hex = treasury_script.hash_hex();
 
-    // The one-shot + fee input: the richest wallet UTxO.
+    // The one-shot + fee input: the richest PURE-ADA wallet UTxO. Pure-ADA is
+    // required — this builder emits a single change output that forwards only
+    // ADA, so a token-bearing one-shot would silently drop its native tokens
+    // and the tx fails ledger value-conservation (ValueNotConservedUTxO, hit on
+    // a preprod wallet carrying leftover test tokens). Matches the pure-ADA
+    // selection in `tx_common::select_fee` / `register_pool::select_inputs`.
     let fee_utxo = wallet_utxos
         .iter()
+        .filter(|u| u.pure_ada)
         .max_by_key(|u| u.lovelace)
-        .ok_or_else(|| EpochError::Chain("no wallet UTxOs for the one-shot input".into()))?;
+        .ok_or_else(|| {
+            EpochError::Chain("no pure-ADA wallet UTxO for the one-shot input".into())
+        })?;
     let tx_id: [u8; 32] = hex::decode(&fee_utxo.tx_hash)
         .ok()
         .and_then(|v| v.try_into().ok())
