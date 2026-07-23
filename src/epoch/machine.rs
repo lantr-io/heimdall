@@ -258,24 +258,29 @@ async fn epoch_start_phase(
     // the NEW one, so every honest node rejected every other with an opaque
     // `poseidon_commit mismatch`. `own_participant` looks this node up by its
     // stable bifrost key, so it always returns the correct current index.
-    let me = match ctx.own_participant(&config.identity.bifrost_id_pk) {
-        Some(p) => p.identifier,
-        // No configured key: the `--index` fixture/demo has no bifrost key and
-        // trusts the statically configured identifier.
-        None if config.identity.bifrost_id_pk.is_empty() => config.identity.identifier,
-        // We hold a key but are not in this epoch's eligible set — banned,
-        // deregistered, or URL-excluded. Sit the epoch out: this is retriable,
-        // so the loop backs off and re-enters Idle, and a temporary ban that
-        // later expires lets us rejoin automatically at a future boundary.
-        None => {
-            return Err(EpochError::DkgAborted {
-                epoch,
-                attempt: 0,
-                qualified: 0,
-                eligible: ctx.participants.len(),
-                reason: "this node is not in the eligible set (banned / deregistered / excluded)"
-                    .into(),
-            });
+    let me = if config.identity.bifrost_id_pk.is_empty() {
+        // Fixture / --index demo: no on-chain key. Must NOT look up an empty key
+        // in the roster — `own_participant(&[])` would spuriously match the first
+        // participant that also has an empty key. Trust the configured index.
+        config.identity.identifier
+    } else {
+        match ctx.own_participant(&config.identity.bifrost_id_pk) {
+            Some(p) => p.identifier,
+            // We hold a key but are not in this epoch's eligible set — banned,
+            // deregistered, or URL-excluded. Sit the epoch out: this is
+            // retriable, so the loop backs off and re-enters Idle, and a
+            // temporary ban that later expires lets us rejoin automatically.
+            None => {
+                return Err(EpochError::DkgAborted {
+                    epoch,
+                    attempt: 0,
+                    qualified: 0,
+                    eligible: ctx.participants.len(),
+                    reason:
+                        "this node is not in the eligible set (banned / deregistered / excluded)"
+                            .into(),
+                });
+            }
         }
     };
 

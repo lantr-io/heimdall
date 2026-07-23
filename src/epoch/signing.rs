@@ -48,7 +48,12 @@ pub async fn sign_phase(
     round: SigningRound,
     mut collected: SignCollected,
 ) -> EpochResult<EpochPhase> {
-    let me = config.identity.identifier;
+    // The identifier the DKG actually produced for us — authoritative for
+    // signing, and consistent with the other post-DKG phases (PublishKeys,
+    // BuildTm, Submit) which also key off the group key package. Using the
+    // frozen `config.identity.identifier` here would drift from it after a
+    // roster change, exactly as it did in `dkg_phase`.
+    let me = *group_keys.key_package.identifier();
     let num_inputs = tm.num_inputs();
 
     match round {

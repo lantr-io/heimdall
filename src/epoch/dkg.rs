@@ -62,7 +62,24 @@ pub async fn dkg_phase(
     ctx: DkgContext,
     mut collected: DkgCollected,
 ) -> EpochResult<EpochPhase> {
-    let me = config.identity.identifier;
+    // Our index in THIS ceremony's context, NOT the frozen startup value. The
+    // FROST index is positional and shifts when the set changes (a ban renumbers
+    // survivors). `epoch_start_phase` already re-derives it to build `ctx`, but
+    // `dkg_phase` runs the actual round-1 publish, so it must use the SAME index
+    // — reading `config.identity.identifier` here made the DKG publish under the
+    // stale index while the context was built under the correct one, and peers
+    // rejected the payloads. `own_participant` looks us up by our stable bifrost
+    // key; the fixture path (no key) falls back to the configured index.
+    let me = if config.identity.bifrost_id_pk.is_empty() {
+        // Fixture / --index demo: no on-chain key. An empty key must NOT be
+        // looked up in the roster — `own_participant(&[])` would spuriously
+        // match the first participant that also has an empty key. Trust the
+        // configured index instead.
+        config.identity.identifier
+    } else {
+        ctx.own_participant(&config.identity.bifrost_id_pk)
+            .map_or(config.identity.identifier, |p| p.identifier)
+    };
     let epoch = ctx.epoch;
     let attempt = ctx.attempt;
     let schedule_anchor_ms = ctx.schedule_anchor_ms;
