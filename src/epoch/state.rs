@@ -342,7 +342,19 @@ impl EpochPhase {
 
 #[derive(Debug, Clone)]
 pub struct SpoIdentity {
+    /// This node's index in the roster, resolved ONCE at startup. It is a
+    /// STARTING value only: the FROST index is positional (rank in the sorted
+    /// eligible set), so it changes whenever the set does — e.g. a ban removes
+    /// an earlier member and everyone after it shifts up. The epoch loop
+    /// therefore re-derives the live index each epoch from the current context
+    /// (see `epoch_start_phase`); this field is used only as the fixture/demo
+    /// fallback when no `bifrost_id_pk` is configured.
     pub identifier: Identifier,
+    /// This node's stable identity — its x-only bifrost key. Unlike `identifier`
+    /// this never changes, so the loop looks itself up by this in each epoch's
+    /// context to recompute its current index. Empty in the `--index` fixture
+    /// demo, which has no key and trusts the configured `identifier`.
+    pub bifrost_id_pk: Vec<u8>,
     pub port: u16,
 }
 

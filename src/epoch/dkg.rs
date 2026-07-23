@@ -979,6 +979,7 @@ mod tests {
             let clock = clock.clone();
             let mut config = EpochConfig::demo_default(SpoIdentity {
                 identifier: id,
+                bifrost_id_pk: Vec::new(),
                 port: 0,
             });
             // Tight timing so the absent-peer reruns don't make the test slow.
@@ -1076,6 +1077,7 @@ mod tests {
         let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
         let mut config = EpochConfig::demo_default(SpoIdentity {
             identifier: me,
+            bifrost_id_pk: Vec::new(),
             port: 0,
         });
         config.dkg_round_timeout = Duration::from_millis(20);

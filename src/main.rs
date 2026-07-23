@@ -1290,6 +1290,10 @@ async fn run_demo(
     // fixture's deterministic keypairs.
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let configured_keypair = cfg.load_bifrost_keypair(&secp).ok();
+    // Whether this node has a real on-chain identity key. Drives whether the
+    // epoch loop re-derives its index from the live roster (registry path) or
+    // trusts the static configured index (fixture/`--index` demo).
+    let has_configured_key = configured_keypair.is_some();
 
     // WI-014: query the roster at the REAL current epoch (was hardcoded 0).
     let epoch = chain
@@ -1390,8 +1394,17 @@ async fn run_demo(
     );
 
     let peers: Arc<dyn PeerNetwork> = net;
+    // On the registry path, carry this node's stable bifrost key so the loop can
+    // re-derive its live index each epoch (see `epoch_start_phase`). Empty on the
+    // fixture path, which has no on-chain roster and keeps the configured index.
+    let own_bifrost_id_pk = if has_configured_key {
+        keypair.x_only_public_key().0.serialize().to_vec()
+    } else {
+        Vec::new()
+    };
     let mut config = cfg.to_epoch_config(SpoIdentity {
         identifier: id,
+        bifrost_id_pk: own_bifrost_id_pk,
         port,
     });
     // DEMO-ONLY fault injection (--inject-fault); parse-and-die on a bad kind.

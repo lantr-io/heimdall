@@ -547,6 +547,7 @@ fee_rate_sat_per_vb = 5
         let id = frost_secp256k1_tr::Identifier::try_from(1u16).unwrap();
         let identity = SpoIdentity {
             identifier: id,
+            bifrost_id_pk: Vec::new(),
             port: 18500,
         };
         let epoch = cfg.to_epoch_config(identity.clone());

@@ -402,6 +402,7 @@ mod tests {
             let clock = clock.clone();
             let config = EpochConfig::demo_default(SpoIdentity {
                 identifier: id,
+                bifrost_id_pk: Vec::new(),
                 port: 0,
             });
             let roster = roster.clone();
@@ -483,6 +484,7 @@ mod tests {
             let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
             let config = EpochConfig::demo_default(SpoIdentity {
                 identifier: id,
+                bifrost_id_pk: Vec::new(),
                 port: 0,
             });
             let roster = roster.clone();

@@ -243,21 +243,50 @@ async fn epoch_start_phase(
     config: &EpochConfig,
     epoch: u64,
 ) -> EpochResult<EpochPhase> {
-    let me = config.identity.identifier;
-
-    // Restart recovery (WI-014 #5): if this epoch's DKG already ran and was
-    // persisted, reload the share and skip straight to PublishKeys — the
-    // ceremony is multi-round and expensive, and a mid-epoch crash must not
-    // re-run it (or lose the share).
-    if let Some(resumed) = try_resume_dkg(config, me, epoch)? {
-        return Ok(resumed);
-    }
-
     // Build the stake-aware DKG context for attempt 0. A failed attempt reruns
     // over a reduced candidate set with a bumped attempt inside `dkg_phase`
     // (DkgContext::reduced_to), so the chain is queried once per ceremony
     // entry (which also refreshes the roster after an aborted window).
     let mut ctx = chain.query_dkg_context(epoch, 0).await?;
+
+    // Re-derive THIS node's index from the CURRENT context, every epoch. The
+    // FROST index is positional — rank in the sorted eligible set — so it
+    // shifts whenever the set changes: a ban removes an earlier member and
+    // everyone after it moves up by one. Reading the frozen startup value here
+    // is what wedged the cluster post-ban (2026-07-22): each node kept building
+    // round-1 payloads under its OLD index while peers reconstructed them under
+    // the NEW one, so every honest node rejected every other with an opaque
+    // `poseidon_commit mismatch`. `own_participant` looks this node up by its
+    // stable bifrost key, so it always returns the correct current index.
+    let me = match ctx.own_participant(&config.identity.bifrost_id_pk) {
+        Some(p) => p.identifier,
+        // No configured key: the `--index` fixture/demo has no bifrost key and
+        // trusts the statically configured identifier.
+        None if config.identity.bifrost_id_pk.is_empty() => config.identity.identifier,
+        // We hold a key but are not in this epoch's eligible set — banned,
+        // deregistered, or URL-excluded. Sit the epoch out: this is retriable,
+        // so the loop backs off and re-enters Idle, and a temporary ban that
+        // later expires lets us rejoin automatically at a future boundary.
+        None => {
+            return Err(EpochError::DkgAborted {
+                epoch,
+                attempt: 0,
+                qualified: 0,
+                eligible: ctx.participants.len(),
+                reason: "this node is not in the eligible set (banned / deregistered / excluded)"
+                    .into(),
+            });
+        }
+    };
+
+    // Restart recovery (WI-014 #5): if this epoch's DKG already ran and was
+    // persisted, reload the share and skip straight to PublishKeys — the
+    // ceremony is multi-round and expensive, and a mid-epoch crash must not
+    // re-run it (or lose the share). Keyed by the re-derived `me`, so a resume
+    // matches only the share written under this epoch's actual index.
+    if let Some(resumed) = try_resume_dkg(config, me, epoch)? {
+        return Ok(resumed);
+    }
 
     // N21 health gate: bring the roster up before the ceremony. A staggered
     // process start otherwise freezes divergent live subsets — the early
@@ -894,6 +923,7 @@ mod tests {
     fn fast_config(id: Identifier) -> EpochConfig {
         let mut config = EpochConfig::demo_default(SpoIdentity {
             identifier: id,
+            bifrost_id_pk: Vec::new(),
             port: 0,
         });
         config.dkg_round_timeout = Duration::from_millis(500);
