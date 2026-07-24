@@ -397,6 +397,43 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Update-Y: rotate `current_spos_frost_key` in the treasury_info state UTxO
+    /// to the incoming roster's Y_51' (the DKG key handoff — §Update-Y). The
+    /// OUTGOING key signs (BIP340) a domain-tagged message committing to the
+    /// spent outpoint, epoch and new key; submission is permissionless. Prints
+    /// the signed tx, submits only with --submit. In Phase 1 the outgoing key is
+    /// Y_federation, so the y_fed seed signs by default.
+    UpdateY {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
+        /// that parameterizes the registry policy (and through it treasury_info).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
+        #[arg(long)]
+        treasury_nft_name: String,
+        /// The incoming roster's x-only Y_51' (32-byte hex) — the new key.
+        #[arg(long)]
+        new_key: String,
+        /// Epoch number bound into the signed message (8-byte BE).
+        #[arg(long)]
+        epoch: u64,
+        /// Sign with this 32-byte hex secret key (the OUTGOING key). Omit to sign
+        /// with the config y_fed seed (Phase 1), or use --signature (air-gapped).
+        #[arg(long)]
+        signer_skey: Option<String>,
+        /// Air-gapped: 64-byte BIP340 signature (hex) over the update-y message.
+        /// Run without it first to print the exact 32-byte message to sign.
+        #[arg(long)]
+        signature: Option<String>,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
     /// Bootstrap the spo_bans ban list: spend the one-shot outref that
     /// parameterizes the ban policy and mint the "ban-root" anchor NFT to the
     /// ban script address (WI-015). Prints the signed tx, submits only with
@@ -912,6 +949,33 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_register_spo(&cfg, &args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::UpdateY {
+            config,
+            blueprint,
+            registry_bootstrap,
+            treasury_nft_name,
+            new_key,
+            epoch,
+            signer_skey,
+            signature,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            let args = UpdateYArgs {
+                blueprint,
+                registry_bootstrap,
+                treasury_nft_name,
+                new_key,
+                epoch,
+                signer_skey,
+                signature,
+                submit,
+            };
+            if let Err(e) = run_update_y(&cfg, &args) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -3246,6 +3310,150 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         "membership token:  {}.{}",
         registry.hash_hex(),
         hex::encode(built.pool_id)
+    );
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex)
+}
+
+struct UpdateYArgs {
+    blueprint: String,
+    registry_bootstrap: String,
+    treasury_nft_name: String,
+    new_key: String,
+    epoch: u64,
+    signer_skey: Option<String>,
+    signature: Option<String>,
+    submit: bool,
+}
+
+/// Build (and with `--submit`, broadcast) the Update-Y key-rotation tx: spend the
+/// treasury_info state UTxO with the `UpdateY` redeemer, rotating
+/// `current_spos_frost_key` to `--new-key`. The OUTGOING key signs the
+/// domain-tagged message (Phase 1: the y_fed seed; else `--signer-skey`, or an
+/// air-gapped `--signature`). Submission is permissionless.
+fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> {
+    use bitcoin::key::Secp256k1;
+    use bitcoin::secp256k1::{Keypair, Message};
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::treasury_info::update_y_sig_msg;
+    use heimdall::cardano::treasury_spend::find_treasury_state;
+    use heimdall::cardano::update_y::{UpdateYRequest, build_update_y_tx};
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = std::fs::read_to_string(&args.blueprint)
+        .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+
+    let new_key = parse_hex_n::<32>(&args.new_key, "--new-key")?;
+    let epoch_i64 =
+        i64::try_from(args.epoch).map_err(|_| "epoch too large for Plutus Int".to_string())?;
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    let network = network_of(&wallet_addr);
+    let treasury_addr = treasury.enterprise_address(network);
+    let wallet_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let treasury_utxos = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &treasury_addr))
+        .map_err(|e| format!("treasury UTxO query: {e}"))?;
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+    let window = rt
+        .block_on(bf_http::fetch_epoch_window(&base_url, pid))
+        .map_err(|e| format!("epoch window: {e}"))?;
+
+    let state = find_treasury_state(
+        &treasury_utxos,
+        &treasury.hash_hex(),
+        &args.treasury_nft_name,
+    )
+    .map_err(|e| format!("locate treasury state: {e}"))?;
+
+    let spent_txid: [u8; 32] = hex::decode(&state.tx_hash)
+        .map_err(|e| format!("state txid hex: {e}"))?
+        .try_into()
+        .map_err(|_| "state txid must be 32 bytes".to_string())?;
+    let sig_msg = update_y_sig_msg(&spent_txid, state.output_index, args.epoch, &new_key);
+
+    println!("treasury policy:   {}", treasury.hash_hex());
+    println!(
+        "state UTxO:        {}:{}",
+        state.tx_hash, state.output_index
+    );
+    println!(
+        "current key:       {}",
+        hex::encode(&state.datum.current_spos_frost_key)
+    );
+    println!("new key:           {}", hex::encode(new_key));
+    println!("epoch:             {}", args.epoch);
+    println!("sign message:      {}", hex::encode(sig_msg));
+
+    // Resolve the 64-byte BIP340 signature under the OUTGOING key.
+    let secp = Secp256k1::new();
+    let signature: [u8; 64] = if let Some(sig_hex) = args.signature.as_deref() {
+        parse_hex_n::<64>(sig_hex, "--signature")?
+    } else {
+        let sk = match args.signer_skey.as_deref() {
+            Some(hex_sk) => {
+                bitcoin::secp256k1::SecretKey::from_slice(&parse_key32(hex_sk, "--signer-skey")?)
+                    .map_err(|e| format!("--signer-skey: {e}"))?
+            }
+            // Phase 1 default: the outgoing key is Y_federation.
+            None => y_fed_keypair(&secp, cfg)?.0,
+        };
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let signer_xonly = kp.x_only_public_key().0.serialize();
+        if signer_xonly.as_slice() != state.datum.current_spos_frost_key.as_slice() {
+            return Err(format!(
+                "signer key {} does not match the treasury's current_spos_frost_key {} — the \
+                 OUTGOING key must sign Update-Y (Phase 1: y_fed; else pass --signer-skey, or \
+                 BIP340-sign the printed message and pass --signature)",
+                hex::encode(signer_xonly),
+                hex::encode(&state.datum.current_spos_frost_key)
+            ));
+        }
+        secp.sign_schnorr_no_aux_rand(&Message::from_digest(sig_msg), &kp)
+            .serialize()
+    };
+
+    let req = UpdateYRequest {
+        treasury_script: &treasury,
+        state: &state,
+        new_spos_frost_key: &new_key,
+        epoch: epoch_i64,
+        signature: &signature,
+        wallet_address: &wallet_addr,
+        wallet_utxos: &wallet_utxos,
+        key: &key,
+        invalid_before: Some(window.current_slot),
+        invalid_hereafter: Some(window.epoch_end_slot),
+        cost_models: Some(cost_models),
+    };
+    let built = build_update_y_tx(&req).map_err(|e| format!("build update-y tx: {e}"))?;
+    println!(
+        "rotated key ->:    {}",
+        hex::encode(&built.new_datum.current_spos_frost_key)
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
