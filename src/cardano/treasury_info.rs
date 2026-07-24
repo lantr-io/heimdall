@@ -141,21 +141,51 @@ impl TreasuryInfoDatum {
     }
 }
 
-/// Encode the `TreasurySpendRedeemer` for registration:
-/// `Constr(0, [config_ref_input_index, new_root, new_address, new_utxo_id, new_frost_key])`.
-/// `new` is the post-registration datum (only `bifrost_identity_root` differs).
+/// Encode the `TreasurySpendRedeemer::RegistryUpdate { new_bifrost_identity_root }`
+/// (constructor 0) — the Register/Deregister path. `treasury.ak` preserves every
+/// other datum field itself (record-update spread off the spent datum), so only
+/// the new MPF root travels in the redeemer.
 #[must_use]
-pub fn treasury_spend_redeemer(config_ref_input_index: i64, new: &TreasuryInfoDatum) -> PlutusData {
+pub fn registry_update_redeemer(new: &TreasuryInfoDatum) -> PlutusData {
+    constr(0, vec![bytes(&new.bifrost_identity_root)])
+}
+
+/// Encode the `TreasurySpendRedeemer::UpdateY { new_spos_frost_key, epoch, signature }`
+/// (constructor 1) — the DKG key-rotation path.
+#[must_use]
+pub fn update_y_redeemer(new_spos_frost_key: &[u8], epoch: i64, signature: &[u8]) -> PlutusData {
     constr(
-        0,
-        vec![
-            int(config_ref_input_index),
-            bytes(&new.bifrost_identity_root),
-            bytes(&new.current_treasury_address),
-            bytes(&new.current_treasury_utxo_id),
-            bytes(&new.current_spos_frost_key),
-        ],
+        1,
+        vec![bytes(new_spos_frost_key), int(epoch), bytes(signature)],
     )
+}
+
+/// The domain-separated message the OUTGOING roster signs (BIP340) to authorize
+/// an Update-Y rotation. MUST match `treasury.ak`'s `update_y_sig_msg`
+/// byte-for-byte:
+///
+/// ```text
+/// sha2_256("bifrost-update-y" ++ spent_txid(32B) ++ spent_vout(4B LE)
+///          ++ epoch(8B BE) ++ new_spos_frost_key(32B))
+/// ```
+///
+/// `spent_txid` is the 32-byte Cardano tx id of the treasury state UTxO being
+/// spent; `spent_vout` its output index.
+#[must_use]
+pub fn update_y_sig_msg(
+    spent_txid: &[u8; 32],
+    spent_vout: u32,
+    epoch: u64,
+    new_spos_frost_key: &[u8],
+) -> [u8; 32] {
+    use bitcoin::hashes::{Hash as _, sha256};
+    let mut pre = Vec::with_capacity(16 + 32 + 4 + 8 + new_spos_frost_key.len());
+    pre.extend_from_slice(b"bifrost-update-y");
+    pre.extend_from_slice(spent_txid);
+    pre.extend_from_slice(&spent_vout.to_le_bytes());
+    pre.extend_from_slice(&epoch.to_be_bytes());
+    pre.extend_from_slice(new_spos_frost_key);
+    sha256::Hash::hash(&pre).to_byte_array()
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +410,48 @@ mod tests {
         // The spend redeemer also encodes.
         let current = sample_datum(trie.root_hash());
         let (new_datum, _) = apply_registration(&current, &trie, b"absent-key", b"pool").unwrap();
-        let redeemer = treasury_spend_redeemer(0, &new_datum);
+        let redeemer = registry_update_redeemer(&new_datum);
         let _cbor = minicbor::to_vec(redeemer).unwrap();
+    }
+
+    // RegistryUpdate is Constr(0, [new_root]) — a single field now that
+    // treasury.ak preserves every other datum field itself.
+    #[test]
+    fn registry_update_redeemer_is_single_field_constr0() {
+        let d = sample_datum([3u8; 32]);
+        let PlutusData::Constr(c) = registry_update_redeemer(&d) else {
+            panic!("expected Constr");
+        };
+        assert_eq!(c.tag, 121); // Constr 0
+        let fields: Vec<_> = c.fields.to_vec();
+        assert_eq!(fields.len(), 1);
+        assert!(matches!(&fields[0], PlutusData::BoundedBytes(b) if **b == [3u8; 32]));
+    }
+
+    // UpdateY is Constr(1, [new_key, epoch, signature]).
+    #[test]
+    fn update_y_redeemer_is_constr1_three_fields() {
+        let PlutusData::Constr(c) = update_y_redeemer(&[0xAB; 32], 7, &[0xCD; 64]) else {
+            panic!("expected Constr");
+        };
+        assert_eq!(c.tag, 122); // Constr 1
+        let fields: Vec<_> = c.fields.to_vec();
+        assert_eq!(fields.len(), 3);
+        assert!(matches!(&fields[0], PlutusData::BoundedBytes(b) if **b == [0xAB; 32]));
+        assert!(matches!(&fields[1], PlutusData::BigInt(_)));
+        assert!(matches!(&fields[2], PlutusData::BoundedBytes(b) if **b == [0xCD; 64]));
+    }
+
+    // The signed message MUST match treasury.ak byte-for-byte. This vector is the
+    // one the Aiken `spend_update_y_happy` test verifies a real BIP340 signature
+    // against (txid = 0x22*32, vout = 0, epoch = 7, new_key = 0xAB*32), so this
+    // single assertion locks the two implementations together.
+    #[test]
+    fn update_y_sig_msg_matches_onchain_vector() {
+        let msg = update_y_sig_msg(&[0x22u8; 32], 0, 7, &[0xABu8; 32]);
+        assert_eq!(
+            hex::encode(msg),
+            "e347507502df93a1056a7c889b943d24ff614d78bdb54e3f6275c6b2ea268492"
+        );
     }
 }

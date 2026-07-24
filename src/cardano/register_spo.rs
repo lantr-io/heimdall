@@ -61,7 +61,9 @@ use crate::cardano::publish::WalletUtxo;
 use crate::cardano::registry::{
     REGISTRATION_ROOT_KEY, RegistrationNodeData, RegistryElement, RegistryError, RegistryList,
 };
-use crate::cardano::treasury_info::{TreasuryInfoError, apply_registration, proof_to_plutus_data};
+use crate::cardano::treasury_info::{
+    TreasuryInfoError, apply_registration, proof_to_plutus_data, registry_update_redeemer,
+};
 use crate::cardano::treasury_spend::{TreasurySpendError, find_treasury_state, treasury_spend_leg};
 use crate::cardano::tx_common::{
     BootstrapError, OneShotBootstrapParams, build_oneshot_bootstrap_tx, element_lovelace,
@@ -461,8 +463,13 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
     let network = network_from_address(req.wallet_address);
     let registry_address = req.registry_script.enterprise_address(network);
 
-    let (treasury_in, treasury_out) =
-        treasury_spend_leg(&state, req.treasury_script, &new_treasury_datum, 0, network);
+    let (treasury_in, treasury_out) = treasury_spend_leg(
+        &state,
+        req.treasury_script,
+        &new_treasury_datum,
+        registry_update_redeemer(&new_treasury_datum),
+        network,
+    );
 
     // New node output: min-ADA + the freshly minted membership NFT.
     let new_node_datum_cbor = plan.new_node.to_cbor();
