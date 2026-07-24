@@ -229,6 +229,11 @@ pub struct CardanoConfig {
     /// `treasury_policy_id` must be the validator's script hash and `treasury_asset_name` empty.
     /// When unset, the always-ok scaffold policy is used.
     pub tm_script_cbor: Option<String>,
+    /// Validity window (seconds) for posted TM txs (`invalid_hereafter`/`created` = latest +
+    /// window). `None` → 1800 (preprod/mainnet). MUST be small (e.g. 90) on a short-epoch
+    /// devnet, whose era-forecast horizon is only ~tens-to-hundreds of slots ahead — a large
+    /// window lands past it (TimeTranslationPastHorizon at submit).
+    pub tm_validity_window_secs: Option<u64>,
     /// Bech32 address of the bridge Config UTxO (the config script address, from
     /// `binocular deploy-bridge`). The Config UTxO's field 11 (initial_btc_treasury_utxo)
     /// anchors the Treasury Movement chain; the first TM mint references it.
@@ -307,6 +312,7 @@ impl Default for CardanoConfig {
             submit_oracle: true,
             oracle_constructor: 0,
             tm_script_cbor: None,
+            tm_validity_window_secs: None,
             config_address: None,
             config_nft_policy_id: None,
             config_nft_asset_name: None,

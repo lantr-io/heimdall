@@ -5141,6 +5141,7 @@ fn run_sweep_pegins(
             cfg.cardano.submit_oracle,
             cfg.cardano.oracle_constructor,
         );
+        chain = chain.with_validity_window(cfg.cardano.tm_validity_window_secs.unwrap_or(1800));
         let chain = apply_tm_policy(chain, cfg)?;
         rt.block_on(chain.submit_signed_tm(&raw))
             .map_err(|e| format!("submit_signed_tm: {e}"))?;

@@ -146,6 +146,11 @@ pub fn build_oracle_update_tx(
     // preprod/mainnet slots are 1 s, so slot latest+1800 begins at (latest_time + 1800) s
     // exactly.
     latest_slot_time: (u64, i64),
+    // Validity window (seconds): the tx's `invalid_hereafter` and the datum's `created` are both
+    // `latest + validity_window_secs`. 1800 (30 min) on preprod/mainnet; MUST be small on a
+    // short-epoch devnet, whose era-forecast horizon is only ~tens-to-hundreds of slots ahead —
+    // a large window lands past it (TimeTranslationPastHorizon at submit).
+    validity_window_secs: u64,
     // N7 datum fields carried through to the Confirmed record: `epoch` (the Cardano epoch this TM
     // belongs to) and `leader_reward` (a copy of the Config `leader_reward` tunable at post). Not
     // yet enforced on-chain — the pin + payout land with N9.
@@ -154,7 +159,7 @@ pub fn build_oracle_update_tx(
 ) -> EpochResult<String> {
     let pkh = pub_key_hash_hex(key);
     let (latest_slot, latest_time_secs) = latest_slot_time;
-    let created_ms = (latest_time_secs + 1800) * 1000;
+    let created_ms = (latest_time_secs + validity_window_secs as i64) * 1000;
     let creator_pkh =
         hex::decode(&pkh).map_err(|e| EpochError::Chain(format!("wallet pkh decode: {e}")))?;
     let datum_hex = encode_datum_hex(
@@ -290,7 +295,7 @@ pub fn build_oracle_update_tx(
             invalid_before: None,
             // Finite upper bound, required by the TM mint policy's created-anchoring check:
             // `created` in the datum equals this slot's begin time in ms (see created_ms above).
-            invalid_hereafter: Some(latest_slot + 1800),
+            invalid_hereafter: Some(latest_slot + validity_window_secs),
         },
         total_collateral: None,
         collateral_return_address: None,

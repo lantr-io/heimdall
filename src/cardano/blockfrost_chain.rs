@@ -32,7 +32,7 @@ use std::{
 use async_trait::async_trait;
 use bitcoin::Transaction;
 use bitcoin::consensus::deserialize;
-use blockfrost::{BlockFrostSettings, BlockfrostAPI, Pagination};
+use blockfrost::{BlockFrostSettings, BlockfrostAPI};
 use halo2_base::halo2_proofs::{
     SerdeFormat,
     halo2curves::{
@@ -431,6 +431,10 @@ pub struct BlockfrostCardanoChain {
     /// this policy (and `treasury_policy_id` must be its hash, `treasury_asset_name_hex` empty); else
     /// the always-ok scaffold is used.
     tm_script_cbor: Option<String>,
+    /// Validity window (seconds) for posted TM txs (`invalid_hereafter`/`created` =
+    /// latest + window). 1800 for preprod/mainnet; small on a short-epoch devnet whose
+    /// era-forecast horizon is only ~tens-to-hundreds of slots ahead.
+    validity_window_secs: u64,
     /// Bech32 address of the bridge Config UTxO and the config NFT unit
     /// (policy_id ++ asset_name hex) that authenticates it. The Config UTxO's field 11
     /// (initial_btc_treasury_utxo) anchors the TM chain. Required for treasury resolution.
@@ -482,6 +486,7 @@ impl BlockfrostCardanoChain {
             submit_oracle: true,
             oracle_constructor: 0,
             tm_script_cbor: None,
+            validity_window_secs: 1800,
             config_address: None,
             config_nft_unit: None,
             last_submitted_txid: Mutex::new(None),
@@ -493,6 +498,13 @@ impl BlockfrostCardanoChain {
     /// `binocular tm-script`). Without this the always-ok scaffold policy is used.
     pub fn with_tm_policy(mut self, script_cbor: &str) -> Self {
         self.tm_script_cbor = Some(script_cbor.to_string());
+        self
+    }
+
+    /// Override the TM-tx validity window (seconds). Use a small value on short-epoch
+    /// devnets to stay within the era-forecast horizon.
+    pub fn with_validity_window(mut self, secs: u64) -> Self {
+        self.validity_window_secs = secs;
         self
     }
 
@@ -597,11 +609,15 @@ impl BlockfrostCardanoChain {
                 ));
             }
         };
-        let utxos = self
-            .api
-            .addresses_utxos(addr, Pagination::all())
-            .await
-            .map_err(|e| EpochError::Chain(format!("blockfrost config query: {e}")))?;
+        // Lenient raw-HTTP parse (tolerates yaci-devkit, which omits `tx_index`) — the SDK's
+        // addresses_utxos requires it and errors on that backend (as query_wallet_utxos already does).
+        let utxos = crate::cardano::bf_http::fetch_address_utxos(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            addr,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("blockfrost config query: {e}")))?;
         let utxo = utxos
             .iter()
             .find(|u| u.inline_datum.is_some() && u.amount.iter().any(|a| &a.unit == unit))
@@ -653,11 +669,13 @@ impl BlockfrostCardanoChain {
     async fn query_confirmed_records(
         &self,
     ) -> EpochResult<Vec<crate::cardano::tm_chain::ConfirmedTm>> {
-        let utxos = self
-            .api
-            .addresses_utxos(&self.treasury_address, Pagination::all())
-            .await
-            .map_err(|e| EpochError::Chain(format!("blockfrost treasury query: {e}")))?;
+        let utxos = crate::cardano::bf_http::fetch_address_utxos(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            &self.treasury_address,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("blockfrost treasury query: {e}")))?;
         let nft_unit = format!(
             "{}{}",
             self.treasury_policy_id, self.treasury_asset_name_hex
@@ -1383,6 +1401,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             mint_ref.as_ref().map(|(h, i, g)| (h.as_str(), *i, *g)),
             Some(cost_models),
             latest_slot_time,
+            self.validity_window_secs,
             epoch,
             leader_reward,
         )?;
