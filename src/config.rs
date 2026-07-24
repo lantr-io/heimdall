@@ -327,6 +327,36 @@ impl Default for CardanoConfig {
     }
 }
 
+impl CardanoConfig {
+    /// The TM NFT policy id (28 bytes) = the binocular `TreasuryMovementValidator`
+    /// script hash. It is the **2nd parameter** of the `treasury_info` validator
+    /// (N10b: `treasury.ak::FederationReset` authenticates the referenced Confirmed
+    /// TM by this policy), so every command that parameterizes `treasury_info` must
+    /// supply the SAME value or it derives a different script hash/address.
+    ///
+    /// Prefers the explicit `treasury_policy_id` (the TM NFT policy is exactly that —
+    /// see publish.rs); falls back to deriving it from the configured TM validator
+    /// CBOR (`tm_script_cbor`, what `binocular tm-script` prints), so either config
+    /// style works.
+    pub fn tm_nft_policy(&self) -> Result<[u8; 28], String> {
+        if let Some(hex_str) = self.treasury_policy_id.as_deref() {
+            return hex::decode(hex_str)
+                .map_err(|e| format!("cardano.treasury_policy_id hex: {e}"))?
+                .try_into()
+                .map_err(|_| "cardano.treasury_policy_id must be 28 bytes".to_string());
+        }
+        if let Some(cbor) = self.tm_script_cbor.as_deref() {
+            return crate::cardano::blueprint::tm_nft_policy_from_script_cbor(cbor)
+                .map_err(|e| e.to_string());
+        }
+        Err(
+            "set cardano.treasury_policy_id (or cardano.tm_script_cbor) — the TM NFT policy \
+             is treasury_info's 2nd param"
+                .to_string(),
+        )
+    }
+}
+
 // ── [http] ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]

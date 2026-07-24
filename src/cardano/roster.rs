@@ -430,6 +430,7 @@ impl RegistryRosterSource {
         blueprint_path: &str,
         registry_bootstrap: &str,
         treasury_info_asset_name_hex: &str,
+        tm_nft_policy: &[u8; 28],
         mainnet: bool,
     ) -> Result<Self, RosterError> {
         let blueprint_json = std::fs::read_to_string(blueprint_path)
@@ -441,8 +442,9 @@ impl RegistryRosterSource {
         };
         let registry = blueprint::spos_registry_script(&blueprint_json, &tx_id, u64::from(index))
             .map_err(|e| err("spos_registry", e))?;
-        let treasury = blueprint::treasury_info_script(&blueprint_json, &registry.hash)
-            .map_err(|e| err("treasury_info", e))?;
+        let treasury =
+            blueprint::treasury_info_script(&blueprint_json, &registry.hash, tm_nft_policy)
+                .map_err(|e| err("treasury_info", e))?;
         let network = if mainnet {
             pallas_addresses::Network::Mainnet
         } else {
@@ -485,7 +487,10 @@ impl RegistryRosterSource {
             .blockfrost_project_id
             .as_deref()
             .is_some_and(|p| p.starts_with("mainnet"));
-        Self::from_blueprint(blueprint_path, bootstrap, asset_name_hex, mainnet).map(Some)
+        // N10b: treasury_info is now 2-param — the TM-NFT policy (binocular TM
+        // validator hash), required alongside the registry fields for a real roster.
+        let tm_nft = cardano.tm_nft_policy().map_err(RosterError::Config)?;
+        Self::from_blueprint(blueprint_path, bootstrap, asset_name_hex, &tm_nft, mainnet).map(Some)
     }
 
     /// Fetch + verify the snapshot, retrying transient failures.
@@ -581,6 +586,7 @@ mod tests {
             current_spos_frost_key: vec![0xAB; 32],
             y_federation: vec![0xCD; 32],
             federation_csv_blocks: 144,
+            last_reset_tm_txid: vec![],
         };
         let unit = format!("{TREASURY_POLICY}{TREASURY_NFT_NAME}");
         bf_utxo(&"77".repeat(32), 0, &unit, datum.to_cbor())

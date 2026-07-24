@@ -6,12 +6,15 @@
 //!
 //! ```text
 //! Constr(0, [ bifrost_identity_root, current_spos_frost_key,
-//!             y_federation,          federation_csv_blocks ])
-//! //          ^ByteArray x3          ^Int
+//!             y_federation,          federation_csv_blocks,
+//!             last_reset_tm_txid ])
+//! //          ^ByteArray x3          ^Int                   ^ByteArray
 //! ```
 //!
 //! matching the Aiken `bifrost/types/treasury.ak` `TreasuryDatum` (N10b: the two
-//! vestigial pointer fields were retired and the federation fields added).
+//! vestigial pointer fields were retired and the federation fields added; field
+//! #4 `last_reset_tm_txid` is the FederationReset anti-replay anchor — empty at
+//! bootstrap, set to the consumed federation-sweep TM's `btc_txid` by each reset).
 //!
 //! `register_spo` (R1c) spends this UTxO to insert `bifrost_id_pk → pool_id`
 //! into the `bifrost_identity_root` Merkle-Patricia-Forestry trie. This module
@@ -40,6 +43,10 @@ pub struct TreasuryInfoDatum {
     pub current_spos_frost_key: Vec<u8>,
     pub y_federation: Vec<u8>,
     pub federation_csv_blocks: i64,
+    /// #4 — `btc_txid` of the federation-sweep TM that last authorized a
+    /// FederationReset (anti-replay anchor). Empty (`vec![]`) at bootstrap and
+    /// until the first reset; every non-reset branch preserves it verbatim.
+    pub last_reset_tm_txid: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -102,7 +109,8 @@ impl From<plutus::PlutusError> for TreasuryInfoError {
 // ---------------------------------------------------------------------------
 
 impl TreasuryInfoDatum {
-    /// Encode as `Constr(0, [root, frost_key, y_federation, federation_csv_blocks])`.
+    /// Encode as `Constr(0, [root, frost_key, y_federation, federation_csv_blocks,
+    /// last_reset_tm_txid])`.
     #[must_use]
     pub fn to_plutus_data(&self) -> PlutusData {
         constr(
@@ -112,6 +120,7 @@ impl TreasuryInfoDatum {
                 bytes(&self.current_spos_frost_key),
                 bytes(&self.y_federation),
                 int(self.federation_csv_blocks),
+                bytes(&self.last_reset_tm_txid),
             ],
         )
     }
@@ -124,9 +133,9 @@ impl TreasuryInfoDatum {
 
     pub fn from_plutus_data(data: &PlutusData) -> Result<Self, TreasuryInfoError> {
         let fields = plutus::constr_fields(data, 0)?;
-        if fields.len() != 4 {
+        if fields.len() != 5 {
             return Err(TreasuryInfoError::FieldCount {
-                expected: 4,
+                expected: 5,
                 got: fields.len(),
             });
         }
@@ -140,6 +149,7 @@ impl TreasuryInfoDatum {
             current_spos_frost_key: plutus::field_bytes(fields, 1)?,
             y_federation: plutus::field_bytes(fields, 2)?,
             federation_csv_blocks: plutus::field_int(fields, 3)?,
+            last_reset_tm_txid: plutus::field_bytes(fields, 4)?,
         })
     }
 }
@@ -163,6 +173,25 @@ pub fn update_y_redeemer(new_spos_frost_key: &[u8], epoch: i64, signature: &[u8]
     )
 }
 
+/// Encode the `TreasurySpendRedeemer::FederationReset { tm_ref_input_index, epoch,
+/// signature }` (constructor 2) — the emergency dead-roster recovery path. The
+/// Confirmed TM referenced at `tm_ref_input_index` (index into the tx's reference
+/// inputs, ledger-sorted) supplies both the `spent_via_federation_leaf` evidence and
+/// the `btc_txid` that `treasury.ak` writes into `last_reset_tm_txid`;
+/// `current_spos_frost_key` is rotated to `y_federation` and every other field is
+/// preserved by the validator itself (record-update spread).
+#[must_use]
+pub fn federation_reset_redeemer(
+    tm_ref_input_index: i64,
+    epoch: i64,
+    signature: &[u8],
+) -> PlutusData {
+    constr(
+        2,
+        vec![int(tm_ref_input_index), int(epoch), bytes(signature)],
+    )
+}
+
 /// The domain-separated message the OUTGOING roster signs (BIP340) to authorize
 /// an Update-Y rotation. MUST match `treasury.ak`'s `update_y_sig_msg`
 /// byte-for-byte:
@@ -181,13 +210,61 @@ pub fn update_y_sig_msg(
     epoch: u64,
     new_spos_frost_key: &[u8],
 ) -> [u8; 32] {
+    rotation_sig_msg(
+        b"bifrost-update-y",
+        spent_txid,
+        spent_vout,
+        epoch,
+        new_spos_frost_key,
+    )
+}
+
+/// The domain-separated message the FEDERATION signs (BIP340 under `y_federation`)
+/// to authorize a FederationReset. MUST match `treasury.ak`'s `rotation_sig_msg`
+/// with tag `"bifrost-update-y-reset"` and `new_key = y_federation`, byte-for-byte:
+///
+/// ```text
+/// sha2_256("bifrost-update-y-reset" ++ spent_txid(32B) ++ spent_vout(4B LE)
+///          ++ epoch(8B BE) ++ y_federation(32B))
+/// ```
+///
+/// The signer is the federation (it holds `y_federation`'s secret), signing over the
+/// SPENT treasury-state outpoint so the reset cannot be replayed against a different
+/// state UTxO.
+#[must_use]
+pub fn federation_reset_sig_msg(
+    spent_txid: &[u8; 32],
+    spent_vout: u32,
+    epoch: u64,
+    y_federation: &[u8],
+) -> [u8; 32] {
+    rotation_sig_msg(
+        b"bifrost-update-y-reset",
+        spent_txid,
+        spent_vout,
+        epoch,
+        y_federation,
+    )
+}
+
+/// Shared preimage + hash for the treasury key-rotation signatures — the heimdall
+/// mirror of `treasury.ak`'s `rotation_sig_msg`: `sha2_256(tag ++ spent_txid(32B)
+/// ++ spent_vout(4B LE) ++ epoch(8B BE) ++ key(32B))`. The Update-Y and
+/// FederationReset variants differ only in `tag` and the trailing `key`.
+fn rotation_sig_msg(
+    tag: &[u8],
+    spent_txid: &[u8; 32],
+    spent_vout: u32,
+    epoch: u64,
+    key: &[u8],
+) -> [u8; 32] {
     use bitcoin::hashes::{Hash as _, sha256};
-    let mut pre = Vec::with_capacity(16 + 32 + 4 + 8 + new_spos_frost_key.len());
-    pre.extend_from_slice(b"bifrost-update-y");
+    let mut pre = Vec::with_capacity(tag.len() + 32 + 4 + 8 + key.len());
+    pre.extend_from_slice(tag);
     pre.extend_from_slice(spent_txid);
     pre.extend_from_slice(&spent_vout.to_le_bytes());
     pre.extend_from_slice(&epoch.to_be_bytes());
-    pre.extend_from_slice(new_spos_frost_key);
+    pre.extend_from_slice(key);
     sha256::Hash::hash(&pre).to_byte_array()
 }
 
@@ -290,6 +367,7 @@ mod tests {
             current_spos_frost_key: vec![0xABu8; 32],
             y_federation: vec![0xCDu8; 32],
             federation_csv_blocks: 144,
+            last_reset_tm_txid: vec![],
         }
     }
 
@@ -328,10 +406,25 @@ mod tests {
             TreasuryInfoDatum::from_plutus_data(&wrong),
             Err(TreasuryInfoError::WrongConstructor(1))
         ));
-        // root not 32 bytes
+        // too few fields (4, not the N10b 5) → FieldCount before any field decode
+        let four = constr(0, vec![bytes(&[0u8; 32]), bytes(b""), bytes(b""), int(144)]);
+        assert!(matches!(
+            TreasuryInfoDatum::from_plutus_data(&four),
+            Err(TreasuryInfoError::FieldCount {
+                expected: 5,
+                got: 4
+            })
+        ));
+        // root not 32 bytes (5-field datum so the field-count check passes first)
         let short = constr(
             0,
-            vec![bytes(&[0u8; 8]), bytes(b""), bytes(b""), bytes(b"")],
+            vec![
+                bytes(&[0u8; 8]),
+                bytes(b""),
+                bytes(b""),
+                int(144),
+                bytes(b""),
+            ],
         );
         assert!(matches!(
             TreasuryInfoDatum::from_plutus_data(&short),
@@ -457,5 +550,35 @@ mod tests {
             hex::encode(msg),
             "e347507502df93a1056a7c889b943d24ff614d78bdb54e3f6275c6b2ea268492"
         );
+    }
+
+    // Reset sibling of the above. The Aiken `spend_federation_reset_happy` test verifies a real
+    // BIP340 signature (t_reset_sig, secret 3) against exactly this message: txid = 0x22*32,
+    // vout = 0, epoch = 9, y_federation = t_yfed (x-only of secret 3). Locking the hash locks the
+    // heimdall builder's message to the on-chain one — a mismatch would make every FederationReset
+    // signature the federation produces fail `verify_schnorr_signature`.
+    #[test]
+    fn federation_reset_sig_msg_matches_onchain_vector() {
+        let t_yfed =
+            hex::decode("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9")
+                .unwrap();
+        let msg = federation_reset_sig_msg(&[0x22u8; 32], 0, 9, &t_yfed);
+        assert_eq!(
+            hex::encode(msg),
+            "68a1d8173d424c952b4e33b6a3dcada7cae9f7fa96f10464fde7cf14e510c925"
+        );
+    }
+
+    #[test]
+    fn federation_reset_redeemer_encodes_constr2() {
+        let PlutusData::Constr(c) = federation_reset_redeemer(0, 9, &[0xCD; 64]) else {
+            panic!("expected Constr");
+        };
+        assert_eq!(c.tag, 121 + 2); // Constr 2
+        let fields: Vec<_> = c.fields.to_vec();
+        assert_eq!(fields.len(), 3);
+        assert!(matches!(&fields[0], PlutusData::BigInt(_))); // tm_ref_input_index
+        assert!(matches!(&fields[1], PlutusData::BigInt(_))); // epoch
+        assert!(matches!(&fields[2], PlutusData::BoundedBytes(b) if **b == [0xCD; 64]));
     }
 }

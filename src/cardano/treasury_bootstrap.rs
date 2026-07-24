@@ -91,6 +91,8 @@ pub fn bootstrap_datum(
         current_spos_frost_key,
         y_federation,
         federation_csv_blocks,
+        // No reset at bootstrap; empty until the first FederationReset consumes a sweep.
+        last_reset_tm_txid: vec![],
     }
 }
 

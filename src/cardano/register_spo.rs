@@ -1134,6 +1134,7 @@ mod tests {
             current_spos_frost_key: vec![0xAB; 32],
             y_federation: vec![0xCD; 32],
             federation_csv_blocks: 144,
+            last_reset_tm_txid: vec![],
         };
         let nft_name = "ee".repeat(32);
         let treasury_utxos = vec![BfUtxo {
@@ -1493,6 +1494,7 @@ mod tests {
             current_spos_frost_key: vec![3],
             y_federation: vec![4],
             federation_csv_blocks: 144,
+            last_reset_tm_txid: vec![],
         };
         let treasury_utxos = vec![BfUtxo {
             tx_hash: "dd".repeat(32),

@@ -229,13 +229,33 @@ pub fn spos_registry_script(
     )
 }
 
-/// `treasury_info` parameterized by the registry policy id.
+/// `treasury_info` parameterized by (registry policy id, TM-NFT policy id). N10b
+/// added the 2nd param: `treasury.ak::FederationReset` authenticates the referenced
+/// Confirmed TM by the TM NFT (`tm_nft_policy_id` = the binocular
+/// TreasuryMovementValidator script hash — derive it with [`script_hash_v3`] over
+/// `cardano.tm_script_cbor`). Every caller MUST pass the same value or they compute
+/// a different treasury_info hash (→ a different address, → the state UTxO is
+/// unfindable).
 pub fn treasury_info_script(
     blueprint_json: &str,
     registry_policy_id: &[u8; 28],
+    tm_nft_policy_id: &[u8; 28],
 ) -> Result<ParameterizedScript, BlueprintError> {
     let code = validator_compiled_code(blueprint_json, TREASURY_INFO_TITLE)?;
-    apply_params(&code, &[bytes(registry_policy_id)])
+    apply_params(&code, &[bytes(registry_policy_id), bytes(tm_nft_policy_id)])
+}
+
+/// The TM-NFT policy id = the binocular `TreasuryMovementValidator` script hash,
+/// derived from its fully-applied CBOR (`cardano.tm_script_cbor`, the same bytes
+/// `binocular tm-script` prints). This is the 2nd parameter every
+/// [`treasury_info_script`] call needs (N10b), so all callers agree on the
+/// treasury_info address.
+pub fn tm_nft_policy_from_script_cbor(
+    tm_script_cbor_hex: &str,
+) -> Result<[u8; 28], BlueprintError> {
+    let cbor = hex::decode(tm_script_cbor_hex.trim())
+        .map_err(|e| BlueprintError::BadHex(e.to_string()))?;
+    Ok(script_hash_v3(&cbor))
 }
 
 /// The blueprint's own `hash` field of the validator titled `title` — final
@@ -538,11 +558,20 @@ mod tests {
             .expect("set BIFROST_PLUTUS_JSON to the upstream plutus.json");
         let blueprint = std::fs::read_to_string(path).unwrap();
         let registry = spos_registry_script(&blueprint, &[0xaa; 32], 1).unwrap();
+        // N10b: spos_registry references TreasuryDatum, whose shape changed (federation
+        // fields + last_reset_tm_txid), so its compiled code — and this hash — moved.
         assert_eq!(
             registry.hash_hex(),
-            "796609d4a6a9f0bda089817e69e56e555356b2eca684f747c91baa16"
+            "37df878dca019a2806def25f6befb7b0bfba6de84e192bbf68ad60ba"
         );
-        let treasury = treasury_info_script(&blueprint, &registry.hash).unwrap();
-        assert_eq!(treasury.hash_hex(), TREASURY_INFO_APPLIED_HASH);
+        // N10b: treasury_info is 2-param (registry, tm_nft). A fixed synthetic
+        // tm_nft (0x11*28) makes the applied hash reproducible; because the blueprint
+        // is aiken's own output and apply_params matches `aiken blueprint apply`
+        // byte-for-byte, the pinned hash is aiken's 2-param application.
+        let treasury = treasury_info_script(&blueprint, &registry.hash, &[0x11u8; 28]).unwrap();
+        assert_eq!(
+            treasury.hash_hex(),
+            "e196f69aff75052cf69a9a9a68e9c58345ca4252f1321b1695a89133"
+        );
     }
 }

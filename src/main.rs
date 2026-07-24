@@ -1887,7 +1887,8 @@ fn run_bootstrap_treasury_info(
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
+    let tm_nft = cfg.cardano.tm_nft_policy()?;
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
         .map_err(|e| format!("parameterize treasury_info: {e}"))?;
     println!("registry policy id:   {}", registry.hash_hex());
     println!("treasury_info policy: {}", treasury.hash_hex());
@@ -3072,7 +3073,8 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
+    let tm_nft = cfg.cardano.tm_nft_policy()?;
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
         .map_err(|e| format!("parameterize treasury_info: {e}"))?;
 
     // ── identities: local secret keys, or the air-gapped halves ──
@@ -3350,7 +3352,8 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
+    let tm_nft = cfg.cardano.tm_nft_policy()?;
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
         .map_err(|e| format!("parameterize treasury_info: {e}"))?;
 
     let new_key = parse_hex_n::<32>(&args.new_key, "--new-key")?;
@@ -3824,10 +3827,12 @@ fn run_show_roster(
         .as_deref()
         .ok_or("cardano.blockfrost_project_id required")?;
 
+    let tm_nft = cfg.cardano.tm_nft_policy()?;
     let source = RegistryRosterSource::from_blueprint(
         &blueprint,
         &bootstrap,
         &nft_name,
+        &tm_nft,
         pid.starts_with("mainnet"),
     )
     .map_err(|e| e.to_string())?;

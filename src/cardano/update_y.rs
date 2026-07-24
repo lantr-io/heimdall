@@ -204,6 +204,7 @@ mod tests {
             current_spos_frost_key: vec![0xABu8; 32],
             y_federation: vec![0xCDu8; 32],
             federation_csv_blocks: 144,
+            last_reset_tm_txid: vec![],
         }
     }
 
