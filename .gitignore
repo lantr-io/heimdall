@@ -14,6 +14,12 @@ heimdall-preprod.toml
 # sat untracked-but-committable until 2026-07-22.
 heimdall-*.toml.*
 heimdall-devnet.toml
+# Broad catch-all: EVERY `heimdall-<something>.toml` carries a Blockfrost token +
+# mnemonic and must stay untracked. The specific names above kept missing new
+# configs (heimdall-n10b-*.toml, heimdall-preprod-s2.toml, heimdall-s2-spo*.toml
+# all sat committable). No tracked file uses the `heimdall-` prefix — the checked-in
+# ones are `heimdall.toml` / `heimdall.testnet4.toml` (dot, not hyphen) — so this is safe.
+heimdall-*.toml
 project/target/
 heimdall-bip322.toml
 # run-dkz screencast demo artifacts (2026-06-30): per-SPO configs, bifrost secret-key
