@@ -436,6 +436,42 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Emergency dead-roster recovery (N10b): rotate `current_spos_frost_key` back
+    /// to `y_federation`, gated on a Confirmed federation-sweep TM
+    /// (spent_via_federation_leaf) and a BIP340 signature under y_federation.
+    /// Submission is permissionless; the y_fed seed signs by default.
+    FederationReset {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
+        /// that parameterizes the registry policy (and through it treasury_info).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
+        #[arg(long)]
+        treasury_nft_name: String,
+        /// Epoch number bound into the signed message (8-byte BE).
+        #[arg(long)]
+        epoch: u64,
+        /// Optional explicit Confirmed federation-sweep TM (<tx_hash>:<index>) to
+        /// reference; omit to auto-discover a flagged, fresh one at the TM address.
+        #[arg(long)]
+        tm_ref: Option<String>,
+        /// Sign with this 32-byte hex secret key (the FEDERATION key). Omit to sign
+        /// with the config y_fed seed (Phase 1), or use --signature (air-gapped).
+        #[arg(long)]
+        signer_skey: Option<String>,
+        /// Air-gapped: 64-byte BIP340 signature (hex) over the reset message.
+        /// Run without it first to print the exact 32-byte message to sign.
+        #[arg(long)]
+        signature: Option<String>,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
     /// Bootstrap the spo_bans ban list: spend the one-shot outref that
     /// parameterizes the ban policy and mint the "ban-root" anchor NFT to the
     /// ban script address (WI-015). Prints the signed tx, submits only with
@@ -978,6 +1014,33 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_update_y(&cfg, &args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::FederationReset {
+            config,
+            blueprint,
+            registry_bootstrap,
+            treasury_nft_name,
+            epoch,
+            tm_ref,
+            signer_skey,
+            signature,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            let args = FederationResetArgs {
+                blueprint,
+                registry_bootstrap,
+                treasury_nft_name,
+                epoch,
+                tm_ref,
+                signer_skey,
+                signature,
+                submit,
+            };
+            if let Err(e) = run_federation_reset(&cfg, &args) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -3327,6 +3390,19 @@ struct UpdateYArgs {
     submit: bool,
 }
 
+struct FederationResetArgs {
+    blueprint: String,
+    registry_bootstrap: String,
+    treasury_nft_name: String,
+    epoch: u64,
+    /// Optional explicit Confirmed federation-sweep TM to reference (TXID:VOUT);
+    /// omit to auto-discover a flagged, fresh Confirmed TM at the TM address.
+    tm_ref: Option<String>,
+    signer_skey: Option<String>,
+    signature: Option<String>,
+    submit: bool,
+}
+
 /// Build (and with `--submit`, broadcast) the Update-Y key-rotation tx: spend the
 /// treasury_info state UTxO with the `UpdateY` redeemer, rotating
 /// `current_spos_frost_key` to `--new-key`. The OUTGOING key signs the
@@ -3455,6 +3531,219 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     println!(
         "rotated key ->:    {}",
         hex::encode(&built.new_datum.current_spos_frost_key)
+    );
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex)
+}
+
+/// Build (and with `--submit`, broadcast) the emergency FederationReset tx: spend
+/// the treasury_info state UTxO with the `FederationReset` redeemer, referencing a
+/// Confirmed federation-sweep TM (dead-roster evidence), rotating
+/// `current_spos_frost_key` to `y_federation` and advancing `last_reset_tm_txid`.
+/// The FEDERATION signs (Phase 1: the y_fed seed; else `--signer-skey`, or an
+/// air-gapped `--signature`). Submission is permissionless.
+fn run_federation_reset(cfg: &HeimdallConfig, args: &FederationResetArgs) -> Result<(), String> {
+    use bitcoin::key::Secp256k1;
+    use bitcoin::secp256k1::{Keypair, Message};
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
+    use heimdall::cardano::federation_reset::{
+        ConfirmedTmRef, FederationResetRequest, build_federation_reset_tx,
+    };
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::treasury_datum::confirmed_tm_reset_evidence_from_hex;
+    use heimdall::cardano::treasury_info::federation_reset_sig_msg;
+    use heimdall::cardano::treasury_spend::find_treasury_state;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+    use pallas_addresses::{Address, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = std::fs::read_to_string(&args.blueprint)
+        .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let tm_nft = cfg.cardano.tm_nft_policy()?;
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
+        .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+
+    let epoch_i64 =
+        i64::try_from(args.epoch).map_err(|_| "epoch too large for Plutus Int".to_string())?;
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    let network = network_of(&wallet_addr);
+    let treasury_addr = treasury.enterprise_address(network);
+    // The TM validator address = enterprise script address of the TM NFT policy
+    // (binocular's TreasuryMovementValidator hash).
+    let tm_addr = Address::Shelley(ShelleyAddress::new(
+        network,
+        ShelleyPaymentPart::script_hash(tm_nft.into()),
+        ShelleyDelegationPart::Null,
+    ))
+    .to_bech32()
+    .map_err(|e| format!("TM address: {e}"))?;
+
+    let wallet_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let treasury_utxos = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &treasury_addr))
+        .map_err(|e| format!("treasury UTxO query: {e}"))?;
+    let tm_utxos = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &tm_addr))
+        .map_err(|e| format!("TM UTxO query: {e}"))?;
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+    let window = rt
+        .block_on(bf_http::fetch_epoch_window(&base_url, pid))
+        .map_err(|e| format!("epoch window: {e}"))?;
+
+    let state = find_treasury_state(
+        &treasury_utxos,
+        &treasury.hash_hex(),
+        &args.treasury_nft_name,
+    )
+    .map_err(|e| format!("locate treasury state: {e}"))?;
+
+    // Locate the Confirmed federation-sweep TM to reference: a UTxO at the TM
+    // address carrying the TM NFT (policy `tm_nft`, empty asset name → unit is the
+    // policy hex), whose Confirmed datum has spent_via_federation_leaf == true and
+    // btc_txid != the state's last_reset_tm_txid (freshness).
+    let tm_nft_unit = hex::encode(tm_nft);
+    let explicit = args
+        .tm_ref
+        .as_deref()
+        .map(parse_cardano_outref)
+        .transpose()?;
+    let mut chosen: Option<ConfirmedTmRef> = None;
+    for u in &tm_utxos {
+        if !u.amount.iter().any(|a| a.unit == tm_nft_unit) {
+            continue;
+        }
+        if let Some((want_txid, want_vout)) = explicit {
+            if !(u.tx_hash == hex::encode(want_txid) && u.output_index == want_vout) {
+                continue;
+            }
+        }
+        let Some(datum_hex) = u.inline_datum.as_deref() else {
+            continue;
+        };
+        let Some((btc_txid, flag)) = confirmed_tm_reset_evidence_from_hex(datum_hex) else {
+            continue; // not a Confirmed TM
+        };
+        let fresh = btc_txid.to_vec() != state.datum.last_reset_tm_txid;
+        if flag && fresh {
+            chosen = Some(ConfirmedTmRef {
+                tx_hash: u.tx_hash.clone(),
+                output_index: u.output_index,
+                btc_txid: btc_txid.to_vec(),
+            });
+            break;
+        }
+        if explicit.is_some() {
+            return Err(format!(
+                "TM {}:{} is not a usable sweep: spent_via_federation_leaf={flag}, fresh={fresh}",
+                u.tx_hash, u.output_index
+            ));
+        }
+    }
+    let tm_ref = chosen.ok_or_else(|| {
+        "no Confirmed TM at the TM address is a fresh federation-leaf sweep \
+         (spent_via_federation_leaf=true and btc_txid != last_reset_tm_txid) — post + confirm \
+         the federation-sweep TM first"
+            .to_string()
+    })?;
+
+    let spent_txid: [u8; 32] = hex::decode(&state.tx_hash)
+        .map_err(|e| format!("state txid hex: {e}"))?
+        .try_into()
+        .map_err(|_| "state txid must be 32 bytes".to_string())?;
+    let y_federation = state.datum.y_federation.clone();
+    let sig_msg =
+        federation_reset_sig_msg(&spent_txid, state.output_index, args.epoch, &y_federation);
+
+    println!("treasury policy:   {}", treasury.hash_hex());
+    println!(
+        "state UTxO:        {}:{}",
+        state.tx_hash, state.output_index
+    );
+    println!(
+        "current key:       {}",
+        hex::encode(&state.datum.current_spos_frost_key)
+    );
+    println!("y_federation:      {}", hex::encode(&y_federation));
+    println!(
+        "reference TM:      {}:{}  (btc_txid {})",
+        tm_ref.tx_hash,
+        tm_ref.output_index,
+        hex::encode(&tm_ref.btc_txid)
+    );
+    println!("epoch:             {}", args.epoch);
+    println!("sign message:      {}", hex::encode(sig_msg));
+
+    // Resolve the 64-byte BIP340 signature under y_federation (the FEDERATION signs).
+    let secp = Secp256k1::new();
+    let signature: [u8; 64] = if let Some(sig_hex) = args.signature.as_deref() {
+        parse_hex_n::<64>(sig_hex, "--signature")?
+    } else {
+        let sk = match args.signer_skey.as_deref() {
+            Some(hex_sk) => {
+                bitcoin::secp256k1::SecretKey::from_slice(&parse_key32(hex_sk, "--signer-skey")?)
+                    .map_err(|e| format!("--signer-skey: {e}"))?
+            }
+            // Phase 1 default: y_federation is the config y_fed seed.
+            None => y_fed_keypair(&secp, cfg)?.0,
+        };
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let signer_xonly = kp.x_only_public_key().0.serialize();
+        if signer_xonly.as_slice() != y_federation.as_slice() {
+            return Err(format!(
+                "signer key {} does not match the treasury's y_federation {} — the FEDERATION \
+                 key must sign the reset (Phase 1: y_fed seed; else pass --signer-skey, or \
+                 BIP340-sign the printed message and pass --signature)",
+                hex::encode(signer_xonly),
+                hex::encode(&y_federation)
+            ));
+        }
+        secp.sign_schnorr_no_aux_rand(&Message::from_digest(sig_msg), &kp)
+            .serialize()
+    };
+
+    let req = FederationResetRequest {
+        treasury_script: &treasury,
+        state: &state,
+        tm_ref: &tm_ref,
+        epoch: epoch_i64,
+        signature: &signature,
+        wallet_address: &wallet_addr,
+        wallet_utxos: &wallet_utxos,
+        key: &key,
+        invalid_before: Some(window.current_slot),
+        invalid_hereafter: Some(window.epoch_end_slot),
+        cost_models: Some(cost_models),
+    };
+    let built =
+        build_federation_reset_tx(&req).map_err(|e| format!("build federation-reset tx: {e}"))?;
+    println!(
+        "reset key ->:      {}",
+        hex::encode(&built.new_datum.current_spos_frost_key)
+    );
+    println!(
+        "last_reset ->:     {}",
+        hex::encode(&built.new_datum.last_reset_tm_txid)
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 

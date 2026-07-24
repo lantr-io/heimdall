@@ -19,6 +19,7 @@ pub mod blueprint;
 pub mod btc_rpc;
 pub mod dkg_roster;
 pub mod fault_proof;
+pub mod federation_reset;
 pub mod hash;
 pub mod init_scripts;
 pub mod linked_list;

@@ -412,6 +412,39 @@ pub fn parse_confirmed_tm_datum(data: &PlutusData) -> Result<ConfirmedTm, Treasu
     })
 }
 
+/// Read the N10b `spent_via_federation_leaf` flag from a **Confirmed** (Constr 1)
+/// TM datum — the dead-roster evidence `treasury.ak::FederationReset` gates on.
+/// It sits at Constr index 3 (`btc_txid, swept, fulfilled, spent_via_federation_leaf,
+/// ..`); a Plutus `Bool` is `Constr(0|1, [])` (tag 121 = false, 122 = true).
+///
+/// Returns `None` if `data` is not a Confirmed TM or predates the flag (a
+/// pre-N10b record with < 4 fields) — callers treat `None` as "not federation-swept".
+pub fn confirmed_tm_spent_via_federation_leaf(data: &PlutusData) -> Option<bool> {
+    let PlutusData::Constr(c) = data else {
+        return None;
+    };
+    if c.tag != 122 {
+        return None; // not a Confirmed (Constr 1) TM
+    }
+    match c.fields.iter().nth(3) {
+        Some(PlutusData::Constr(b)) if b.tag == 121 => Some(false),
+        Some(PlutusData::Constr(b)) if b.tag == 122 => Some(true),
+        _ => None,
+    }
+}
+
+/// Decode a Confirmed-TM inline-datum (CBOR hex) into the FederationReset evidence
+/// it carries: `(btc_txid, spent_via_federation_leaf)`. `None` unless the hex
+/// decodes as a Confirmed (Constr 1) TM. Convenience for the `federation-reset`
+/// CLI's Confirmed-TM discovery (keeps CBOR decoding out of the call site).
+pub fn confirmed_tm_reset_evidence_from_hex(datum_hex: &str) -> Option<([u8; 32], bool)> {
+    let cbor = hex::decode(datum_hex).ok()?;
+    let pd: PlutusData = pallas_codec::minicbor::decode(&cbor).ok()?;
+    let confirmed = parse_confirmed_tm_datum(&pd).ok()?;
+    let flag = confirmed_tm_spent_via_federation_leaf(&pd).unwrap_or(false);
+    Some((confirmed.btc_txid, flag))
+}
+
 /// A parsed Unconfirmed (Constr 0) TM datum — the signed BTC tx's identity, its
 /// inputs (what it spends), and its outputs. Used to diagnose WHY the treasury is
 /// blocked: which in-flight movement spends the current tip and what its BTC leg
