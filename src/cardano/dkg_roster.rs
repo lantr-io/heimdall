@@ -731,9 +731,9 @@ mod tests {
                 asset_name_hex: "ab".into(),
                 datum: TreasuryInfoDatum {
                     bifrost_identity_root: [0u8; 32],
-                    current_treasury_address: vec![],
-                    current_treasury_utxo_id: vec![],
                     current_spos_frost_key: vec![],
+                    y_federation: vec![],
+                    federation_csv_blocks: 144,
                 },
             },
         }

@@ -201,9 +201,9 @@ mod tests {
     fn sample_datum() -> TreasuryInfoDatum {
         TreasuryInfoDatum {
             bifrost_identity_root: mpf::NULL_HASH,
-            current_treasury_address: b"\x51\x20treasury-spk".to_vec(),
-            current_treasury_utxo_id: vec![0x11; 36],
             current_spos_frost_key: vec![0xABu8; 32],
+            y_federation: vec![0xCDu8; 32],
+            federation_csv_blocks: 144,
         }
     }
 
@@ -288,9 +288,10 @@ mod tests {
             built.new_datum.bifrost_identity_root,
             old.bifrost_identity_root
         );
+        assert_eq!(built.new_datum.y_federation, old.y_federation);
         assert_eq!(
-            built.new_datum.current_treasury_address,
-            old.current_treasury_address
+            built.new_datum.federation_csv_blocks,
+            old.federation_csv_blocks
         );
 
         let tx: Tx = minicbor::decode(&hex::decode(&built.signed_tx_hex).unwrap()).unwrap();

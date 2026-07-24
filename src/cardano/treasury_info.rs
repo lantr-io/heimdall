@@ -5,11 +5,13 @@
 //! `treasury_info` UTxO carries:
 //!
 //! ```text
-//! Constr(0, [ bifrost_identity_root, current_treasury_address,
-//!             current_treasury_utxo_id, current_spos_frost_key ])   // all ByteArray
+//! Constr(0, [ bifrost_identity_root, current_spos_frost_key,
+//!             y_federation,          federation_csv_blocks ])
+//! //          ^ByteArray x3          ^Int
 //! ```
 //!
-//! matching the Aiken `bifrost/types/treasury.ak` `TreasuryDatum`.
+//! matching the Aiken `bifrost/types/treasury.ak` `TreasuryDatum` (N10b: the two
+//! vestigial pointer fields were retired and the federation fields added).
 //!
 //! `register_spo` (R1c) spends this UTxO to insert `bifrost_id_pk → pool_id`
 //! into the `bifrost_identity_root` Merkle-Patricia-Forestry trie. This module
@@ -29,14 +31,15 @@ use pallas_primitives::PlutusData;
 use crate::cardano::mpf;
 use crate::cardano::plutus::{self, array, bytes, constr, int};
 
-/// The `treasury_info` state datum (`TreasuryDatum`). All fields are on-chain
-/// `ByteArray`s; `bifrost_identity_root` is the 32-byte MPF root.
+/// The `treasury_info` state datum (`TreasuryDatum`). `bifrost_identity_root` is
+/// the 32-byte MPF root; `current_spos_frost_key` / `y_federation` are x-only
+/// keys; `federation_csv_blocks` is the CSV timeout (an on-chain `Int`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreasuryInfoDatum {
     pub bifrost_identity_root: mpf::Hash,
-    pub current_treasury_address: Vec<u8>,
-    pub current_treasury_utxo_id: Vec<u8>,
     pub current_spos_frost_key: Vec<u8>,
+    pub y_federation: Vec<u8>,
+    pub federation_csv_blocks: i64,
 }
 
 #[derive(Debug)]
@@ -78,10 +81,10 @@ impl From<plutus::PlutusError> for TreasuryInfoError {
         match e {
             plutus::PlutusError::NotConstr => Self::NotConstr,
             plutus::PlutusError::WrongConstructor { got, .. } => Self::WrongConstructor(got),
-            // The shared `field_bytes` distinguishes missing vs wrong-type; this
-            // module's `from_plutus_data` checks field count first, so both map
-            // to NotBytes (preserving the prior behaviour). NotInt is
-            // unreachable for this datum shape (no Int fields).
+            // Field-count is checked first, so MissingField is unreachable here.
+            // NotInt is reachable now (federation_csv_blocks is field #3, an Int);
+            // it and the byte-field errors collapse to NotBytes(i) — the index
+            // still points at the offending field, which is what callers log.
             plutus::PlutusError::MissingField(i)
             | plutus::PlutusError::NotBytes(i)
             | plutus::PlutusError::NotInt(i)
@@ -99,16 +102,16 @@ impl From<plutus::PlutusError> for TreasuryInfoError {
 // ---------------------------------------------------------------------------
 
 impl TreasuryInfoDatum {
-    /// Encode as `Constr(0, [root, address, utxo_id, frost_key])`.
+    /// Encode as `Constr(0, [root, frost_key, y_federation, federation_csv_blocks])`.
     #[must_use]
     pub fn to_plutus_data(&self) -> PlutusData {
         constr(
             0,
             vec![
                 bytes(&self.bifrost_identity_root),
-                bytes(&self.current_treasury_address),
-                bytes(&self.current_treasury_utxo_id),
                 bytes(&self.current_spos_frost_key),
+                bytes(&self.y_federation),
+                int(self.federation_csv_blocks),
             ],
         )
     }
@@ -134,9 +137,9 @@ impl TreasuryInfoDatum {
             .map_err(|_| TreasuryInfoError::BadRootLen(root_bytes.len()))?;
         Ok(TreasuryInfoDatum {
             bifrost_identity_root,
-            current_treasury_address: plutus::field_bytes(fields, 1)?,
-            current_treasury_utxo_id: plutus::field_bytes(fields, 2)?,
-            current_spos_frost_key: plutus::field_bytes(fields, 3)?,
+            current_spos_frost_key: plutus::field_bytes(fields, 1)?,
+            y_federation: plutus::field_bytes(fields, 2)?,
+            federation_csv_blocks: plutus::field_int(fields, 3)?,
         })
     }
 }
@@ -256,11 +259,11 @@ pub fn apply_registration(
         .map_err(TreasuryInfoError::Mpf)?;
     let new_root =
         mpf::including(bifrost_id_pk, pool_id, &absence_proof).map_err(TreasuryInfoError::Mpf)?;
+    // Only the identity root changes; the frost key and federation fields are
+    // preserved (mirrors treasury.ak's RegistryUpdate / spos-registry.ak).
     let new_datum = TreasuryInfoDatum {
         bifrost_identity_root: new_root,
-        current_treasury_address: current.current_treasury_address.clone(),
-        current_treasury_utxo_id: current.current_treasury_utxo_id.clone(),
-        current_spos_frost_key: current.current_spos_frost_key.clone(),
+        ..current.clone()
     };
     Ok((new_datum, absence_proof))
 }
@@ -284,9 +287,9 @@ mod tests {
     fn sample_datum(root: mpf::Hash) -> TreasuryInfoDatum {
         TreasuryInfoDatum {
             bifrost_identity_root: root,
-            current_treasury_address: b"\x51\x20treasury-spk".to_vec(),
-            current_treasury_utxo_id: b"btc-outpoint".to_vec(),
             current_spos_frost_key: vec![0xABu8; 32],
+            y_federation: vec![0xCDu8; 32],
+            federation_csv_blocks: 144,
         }
     }
 
@@ -363,12 +366,13 @@ mod tests {
             current.bifrost_identity_root
         );
         assert_eq!(
-            new_datum.current_treasury_address,
-            current.current_treasury_address
-        );
-        assert_eq!(
             new_datum.current_spos_frost_key,
             current.current_spos_frost_key
+        );
+        assert_eq!(new_datum.y_federation, current.y_federation);
+        assert_eq!(
+            new_datum.federation_csv_blocks,
+            current.federation_csv_blocks
         );
     }
 

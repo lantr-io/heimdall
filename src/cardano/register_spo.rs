@@ -1131,9 +1131,9 @@ mod tests {
         let trie = mpf::Trie::from_pairs(identity_pairs.iter().map(|(k, v)| (k, v))).unwrap();
         let treasury_datum = TreasuryInfoDatum {
             bifrost_identity_root: trie.root_hash(),
-            current_treasury_address: b"\x51\x20treasury-spk".to_vec(),
-            current_treasury_utxo_id: vec![0x11; 36],
             current_spos_frost_key: vec![0xAB; 32],
+            y_federation: vec![0xCD; 32],
+            federation_csv_blocks: 144,
         };
         let nft_name = "ee".repeat(32);
         let treasury_utxos = vec![BfUtxo {
@@ -1490,9 +1490,9 @@ mod tests {
         )];
         let bad_datum = TreasuryInfoDatum {
             bifrost_identity_root: [9u8; 32],
-            current_treasury_address: vec![1],
-            current_treasury_utxo_id: vec![2],
             current_spos_frost_key: vec![3],
+            y_federation: vec![4],
+            federation_csv_blocks: 144,
         };
         let treasury_utxos = vec![BfUtxo {
             tx_hash: "dd".repeat(32),

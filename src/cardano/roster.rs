@@ -578,9 +578,9 @@ mod tests {
     fn treasury_utxo(root: mpf::Hash) -> BfUtxo {
         let datum = TreasuryInfoDatum {
             bifrost_identity_root: root,
-            current_treasury_address: b"\x51\x20treasury".to_vec(),
-            current_treasury_utxo_id: b"outpoint".to_vec(),
             current_spos_frost_key: vec![0xAB; 32],
+            y_federation: vec![0xCD; 32],
+            federation_csv_blocks: 144,
         };
         let unit = format!("{TREASURY_POLICY}{TREASURY_NFT_NAME}");
         bf_utxo(&"77".repeat(32), 0, &unit, datum.to_cbor())

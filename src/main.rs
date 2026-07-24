@@ -208,16 +208,18 @@ enum Commands {
         /// until then.
         #[arg(long)]
         registry_bootstrap: String,
-        /// Bootstrap BTC treasury P2TR scriptPubKey, hex (5120 || x-only key).
-        #[arg(long)]
-        btc_treasury_spk: String,
-        /// Bootstrap BTC treasury outpoint, as <btc_txid>:<vout>. Stored in the
-        /// datum in Bitcoin consensus form (txid little-endian || u32-LE vout).
-        #[arg(long)]
-        btc_outpoint: String,
-        /// 32-byte FROST group key (y_fed, x-only), hex.
+        /// 32-byte x-only key seeded into current_spos_frost_key. In Phase 1 this
+        /// is Y_federation (the federation is the key-path signer until the first
+        /// DKG), so it normally equals --y-federation.
         #[arg(long)]
         frost_key: String,
+        /// 32-byte x-only federation fallback key (y_federation), hex — the
+        /// script-leaf key of both Taproot trees.
+        #[arg(long)]
+        y_federation: String,
+        /// The timeout_federation CSV value baked into the federation leaves.
+        #[arg(long)]
+        federation_csv_blocks: i64,
         /// Actually submit via Blockfrost (default: build + print only).
         #[arg(long)]
         submit: bool,
@@ -808,9 +810,9 @@ fn main() {
             config,
             blueprint,
             registry_bootstrap,
-            btc_treasury_spk,
-            btc_outpoint,
             frost_key,
+            y_federation,
+            federation_csv_blocks,
             submit,
         } => {
             let cfg = load_config(config.as_deref());
@@ -818,9 +820,9 @@ fn main() {
                 &cfg,
                 &blueprint,
                 &registry_bootstrap,
-                &btc_treasury_spk,
-                &btc_outpoint,
                 &frost_key,
+                &y_federation,
+                federation_csv_blocks,
                 submit,
             ) {
                 eprintln!("Error: {e}");
@@ -1865,9 +1867,9 @@ fn run_bootstrap_treasury_info(
     cfg: &HeimdallConfig,
     blueprint_path: &str,
     registry_bootstrap: &str,
-    btc_treasury_spk: &str,
-    btc_outpoint: &str,
     frost_key: &str,
+    y_federation: &str,
+    federation_csv_blocks: i64,
     submit: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
@@ -1890,20 +1892,16 @@ fn run_bootstrap_treasury_info(
     println!("registry policy id:   {}", registry.hash_hex());
     println!("treasury_info policy: {}", treasury.hash_hex());
 
-    let spk = hex::decode(btc_treasury_spk).map_err(|e| format!("--btc-treasury-spk: {e}"))?;
-    if spk.len() != 34 || spk[..2] != [0x51, 0x20] {
-        return Err(format!(
-            "--btc-treasury-spk must be a P2TR scriptPubKey (34 bytes, 5120 || x-only key), \
-             got {} bytes",
-            spk.len()
-        ));
-    }
-    let outpoint = parse_outpoint(btc_outpoint)?;
-    let utxo_id = bitcoin::consensus::encode::serialize(&outpoint);
     let frost = hex::decode(frost_key).map_err(|e| format!("--frost-key: {e}"))?;
     bitcoin::XOnlyPublicKey::from_slice(&frost)
         .map_err(|e| format!("--frost-key is not a valid x-only secp256k1 point: {e}"))?;
-    let datum = bootstrap_datum(spk, utxo_id, frost);
+    let y_fed = hex::decode(y_federation).map_err(|e| format!("--y-federation: {e}"))?;
+    bitcoin::XOnlyPublicKey::from_slice(&y_fed)
+        .map_err(|e| format!("--y-federation is not a valid x-only secp256k1 point: {e}"))?;
+    if federation_csv_blocks <= 0 {
+        return Err("--federation-csv-blocks must be positive".into());
+    }
+    let datum = bootstrap_datum(frost, y_fed, federation_csv_blocks);
 
     let pid = cfg
         .cardano

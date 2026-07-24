@@ -250,9 +250,9 @@ mod tests {
     fn sample_datum(root: mpf::Hash) -> TreasuryInfoDatum {
         TreasuryInfoDatum {
             bifrost_identity_root: root,
-            current_treasury_address: b"\x51\x20treasury-spk".to_vec(),
-            current_treasury_utxo_id: vec![0x11; 36],
             current_spos_frost_key: vec![0xAB; 32],
+            y_federation: vec![0xCD; 32],
+            federation_csv_blocks: 144,
         }
     }
 
@@ -466,11 +466,9 @@ mod tests {
             mpf::including(b"new-spo-pk", b"new-pool", &proof).unwrap()
         );
         // Everything else is preserved by registration.
-        assert_eq!(
-            continued.current_treasury_address,
-            old.current_treasury_address
-        );
         assert_eq!(continued.current_spos_frost_key, old.current_spos_frost_key);
+        assert_eq!(continued.y_federation, old.y_federation);
+        assert_eq!(continued.federation_csv_blocks, old.federation_csv_blocks);
     }
 
     // Compose the leg into a full whisky tx (with a stand-in mint for the
