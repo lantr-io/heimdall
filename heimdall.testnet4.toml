@@ -25,7 +25,7 @@ y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 # verified the tx looks right.
 submit = false
 
-# Treasury UTXO fields intentionally omitted — the regtest values in
-# heimdall.toml are wrong for testnet4. Required for the SPO daemon
-# (not for the depositor binary); fill in with real testnet4 values
-# when you wire up the daemon side.
+# No local treasury UTXO fields: the anchor outpoint lives on-chain in
+# the bridge Config UTxO (field 11) and the current treasury is resolved
+# by walking the Confirmed Treasury Movement chain — set the [cardano]
+# config_address / config_nft_* fields for the SPO daemon.

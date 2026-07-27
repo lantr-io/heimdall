@@ -244,11 +244,30 @@ Token name = `blake2b_256(pool_id ‖ evidence_hash)`; pool binding by recompute
 `ban_until_time = start_time_ms + base_ban_duration_ms·2^(n−1)`; dedup by the ban
 node's `evidence_hashes` list with a `permanent` cap at
 `max_faults_before_permanent`; multi-policy (separate round1/round2/equivocation
-verifiers in `fault_proof_policy_ids`). heimdall matches it — WI-016/017/018
-delivered; WI-019 derives the real `evidence_hash`. The one open FluidTokens
-question is the §5a InvalidPayload ZK-verify binding.
+verifiers in `fault_proof_policy_ids`). heimdall derives the DKG invalid-payload
+`evidence_hash` as public input 0 of the Halo2 proof and exposes the accused
+`pool_id` as public input 1. The circuit includes the same pool id in the
+Poseidon preimage, so the generated verifier can be called with:
 
-### 5a. InvalidPayload fault verifier — binding scheme RESOLVED 2026-07-15 (spec); implementation open
+```text
+[evidence_hash, pool_id]
+```
+
+and the token name remains:
+
+```text
+blake2b_256(pool_id || evidence_hash)
+```
+
+### 5a. InvalidPayload fault verifier wiring
+
+The Bifrost invalid-payload publish branches fail closed until the generated
+Halo2 verifiers are wired. The expected verifier boundary is the two-input
+shape above. The verifier policy must check the public-input count and order,
+convert `accused_pool_id` to the same little-endian BLS scalar as Heimdall, and
+mint exactly `blake2b_256(accused_pool_id || evidence_hash)`.
+
+### 5b. InvalidPayload binding scheme — RESOLVED 2026-07-15 (spec); implementation open
 
 *Resolution (spec-gaps review, `1e26700` on `docs/spec-gaps-fill`) — "Option B, self-committing
 payloads":* every fault-provable payload (DKG R1/R2, sign R2) appends `poseidon_commit =
@@ -256,33 +275,71 @@ Poseidon(structured_fields)` as the final 32 bytes of its canonical layout; the 
 recomputes `sha2_256(full bytes)`, verifies the accused's signature, slices the trailer, and
 requires the ZK public input to equal it — collision resistance welds proof to signature, framing
 needs a second preimage. Mismatched commitments are malformed transport (fetch-time rule → treated
-as never published). Round-2 binding: HKDF replaced by the Poseidon KDF
-(`k = Poseidon("bifrost-dkg-share" ‖ ss.x ‖ recipient_pool_id)`), circuit statement = two secp
-scalar mults + Poseidon + XOR + commitment check. WI-022 becomes implementation: add the trailer
-to the WI-013 transport + fetch validation, switch the KDF, point the circuits' public input at
-the commitment, and implement the real verifier policies (upstream mock replacement). Note the
-"FluidTokens design call" framing is retired — per the spec's new §Scope and normativity, the
-spec decides and code diverging from it is a CR. Original analysis below for history.
-
-The `fault_verifier` `PublishProof` (InvalidPayload) branch is still a permissive
-mock — it checks only structural shape (token name, 28/32-byte lengths,
-datum-on-output), **no ZK verify** — so anyone can mint a forged InvalidPayload
-FaultProof against any pool, and ApplyBan trusts it.
-
-**The open question (FluidTokens design call):** a real ZK verify needs the proof
-bound to the payload the accused *signed*. The `dkg_fault` circuit's public input
-is `Poseidon(structured_fields)`, but the accused signs
-`message_hash = SHA256(canonical_bytes)`; nothing ties them, so a generated
-verifier is forgeable (fabricate fields → valid proof → ban an honest pool).
-Closing it needs either (a) computing `SHA256(canonical_bytes)` **in-circuit** and
-exposing `message_hash` as the public input (costly SHA256-in-ZK over a
-variable-length preimage), or (b) an alternative binding scheme. Round 2
-additionally needs the encrypted↔decrypted share binding. Once chosen, the
-per-kind ZK verifier policies can be wired (the heimdall circuits already prove
-the fault predicate). Until then the InvalidPayload ban path is functionally
-testable but NOT trust-minimized — flag in any preprod/mainnet readiness review.
-Tracked as WI-022.
+as never published). Round-2 binding: HKDF is replaced by the Poseidon KDF
+(`k = Poseidon("bifrost-dkg-share" ‖ ss.x ‖ recipient_pool_id)`), and the circuit statement is two
+secp scalar multiplications, Poseidon, XOR, and a commitment check. WI-022 remains the
+implementation work: add the trailer to the WI-013 transport and fetch validation, switch the
+KDF, point the circuits' public input at the commitment, and implement the real verifier policies.
+The "FluidTokens design call" framing is retired — the spec decides and code diverging from it is
+a CR.
 
 (Equivocation is **not** an open FluidTokens question: the verifier is *our* code
 — FluidTokens PR #20, open — implementing their spec §9.2, and its remaining
 soundness hardening is *our* WI-020. Tracked there, not here.)
+
+## 6. On-chain proof that a registrant is a real SPO — OPEN (proposal to FluidTokens)
+
+`spos_registry.ak` registration (technical_documentation.md §6) verifies only that
+`pool_id == blake2b_224(cold_vkey)` plus two signatures — Ed25519 cold-key and
+BIP-340 bifrost-key — over `"bifrost-spo" ‖ pool_id ‖ bifrost_id_pk ‖ bifrost_url`.
+The spec's stated requirement that "registration is accepted only if the SPO has a
+delegated stake bigger than a minimum threshold" (technical_documentation.md, SPO
+overview) is **not** enforced on-chain: a Plutus validator cannot read the stake
+distribution or the pool registry. heimdall enforces it off-chain — the
+`register-spo` CLI min-stake gate (R2, `src/cardano/stake.rs`) refuses to submit
+below threshold, and Round-0 roster derivation (`src/cardano/dkg_roster.rs`)
+re-queries `active_stake` and stake-weights the FROST threshold.
+
+**What the cold-key signature already guarantees (the real safety): authenticity.**
+Because `pool_id = blake2b_224(cold_vkey)` and you must sign with that cold key, no
+one can register under another pool's `pool_id` (no identity / stake-weight theft);
+combined with one-token-per-`pool_id` and the `bifrost_id_pk` MPF absence proof, the
+registry is a set of authentic, distinct identities. Round 0 looks up stake *by
+pool_id*, so the cold-key binding is exactly what makes that lookup sound. A
+fabricated fresh-key `pool_id` is self-consistent but carries zero stake ⇒ zero
+weight; it cannot influence signing. The residual risk is *liveness* (junk entries
+bloat the candidate set; an unresolvable stake currently makes Round-0 derivation
+fatal), not *safety*.
+
+**The gap.** §6 cannot tell a real ledger-registered pool from a fresh key. The
+"registration ⇒ stake ≥ threshold" property lives entirely off-chain.
+
+**Proposal to FluidTokens (Idea #2 — optional stronger registration path).** Add a
+non-normative §6a to technical_documentation.md (draft prepared 2026-06-18):
+require the registration tx to additionally carry a `RegisterStakePool` certificate
+whose stake-pool key hash equals `pool_id`. Plutus V3 exposes the tx certificate
+set (`TxCertPoolRegister`; aiken `Certificate.RegisterStakePool { stake_pool, vrf }`,
+where `stake_pool` is the cold-key hash = `pool_id`). The ledger independently
+validates that cert (cold-key-signed, well-formed), so its presence proves on-chain
+that `pool_id` is a real Cardano stake pool registered/re-registered in this very
+tx — not a fabricated identifier. Upgrades "controls *a* cold key" to "controls the
+cold key of a ledger-accepted stake pool."
+
+**Deliberate limitations / why it's a decision, not a slam-dunk:**
+- Binds *pool registration*, not *delegated stake*. The stake amount stays
+  unobservable on-chain, so the min-stake threshold and stake-weighted FROST
+  threshold remain off-chain / Round-0. Closes the fabricated-pool hole, not the
+  stake-weight one.
+- A `RegisterStakePool` cert is a pool **re-registration** (re-submits VRF, pledge,
+  cost, margin, reward account, relays, metadata; refreshes the pool deposit).
+  Operators do this only at a parameter-update boundary, so it must be framed as an
+  *optional* stronger path — accepted in addition to / in lieu of the off-chain
+  stake attestation — not mandatory for every SPO.
+- Rejected alternative: a reward-account withdrawal (`TxInfo` withdrawals) signals
+  on-chain stake activity, but the reward account is keyed by the pool's *stake*
+  credential and its binding to `pool_id` lives in the pool registration cert
+  (unreadable as standalone ledger state), so it cannot be bound to `pool_id`
+  on-chain.
+
+**Status:** proposal only; needs FluidTokens agreement before any `spos_registry.ak`
+change. Not yet ticketed.

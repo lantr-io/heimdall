@@ -2,8 +2,11 @@
 //!
 //! The circuits prove only the secp256k1 computations that are too expensive
 //! for Plutus. The original builders expose the computed residual point as
-//! public instances. The digest builders bind the private DKG message to a
-//! Poseidon public input and prove the fault predicate inside the circuit.
+//! public instances. The digest-fault builders expose two public instances:
+//! `evidence_hash = Poseidon(pool_id, message_fields)` and the accused
+//! `pool_id` encoded as a BLS scalar. The same pool id cell is included in the
+//! Poseidon preimage, so the proof is bound to the token-name pool id that
+//! Bifrost passes to the generated verifier.
 
 use halo2_base::{
     AssignedValue, Context,
@@ -53,6 +56,7 @@ const SECP_SCALAR_CHUNK_BYTES: usize = 24;
 const BYTE_BITS: usize = 8;
 const SHA256_BLOCK_BYTES: usize = 64;
 const SHA256_WORD_BITS: usize = 32;
+pub const DKG_POOL_ID_BYTES: usize = 28;
 
 type AssignedBit = AssignedValue<BlsFr>;
 type AssignedByte = Vec<AssignedBit>;
@@ -137,6 +141,7 @@ pub struct DkgRound1PokFaultWitness {
 
 #[derive(Clone, Copy, Debug)]
 pub struct DkgRound1PokDigestFaultWitness {
+    pub accused_pool_id: [u8; DKG_POOL_ID_BYTES],
     pub identifier: u64,
     pub mu: Fq,
     pub challenge: Fq,
@@ -146,6 +151,7 @@ pub struct DkgRound1PokDigestFaultWitness {
 
 #[derive(Clone, Debug)]
 pub struct DkgRound2ShareFaultWitness {
+    pub accused_pool_id: [u8; DKG_POOL_ID_BYTES],
     pub share: Fq,
     pub participant_index: u64,
     pub commitments: Vec<Secp256k1Affine>,
@@ -312,12 +318,23 @@ pub fn round1_message_digest(
     poseidon_digest(&round1_message_elements(params, witness))
 }
 
+pub fn round1_digest_fault_public_inputs(
+    params: AxiomDkgCircuitParams,
+    witness: &DkgRound1PokDigestFaultWitness,
+) -> Vec<BlsFr> {
+    vec![
+        round1_message_digest(params, witness),
+        pool_id_public_input(&witness.accused_pool_id),
+    ]
+}
+
 pub fn round1_message_elements(
     params: AxiomDkgCircuitParams,
     witness: &DkgRound1PokDigestFaultWitness,
 ) -> Vec<BlsFr> {
-    let mut elements = Vec::with_capacity(6 + params.num_limbs * 5);
+    let mut elements = Vec::with_capacity(7 + params.num_limbs * 5);
     elements.extend_from_slice(&round1_message_header(params));
+    elements.push(pool_id_public_input(&witness.accused_pool_id));
     elements.push(BlsFr::from(witness.identifier));
     elements.extend_from_slice(&fq_public_limbs(witness.mu, params));
     elements.extend_from_slice(&point_public_limbs(witness.phi0, params));
@@ -332,6 +349,16 @@ pub fn round2_message_digest<const T: usize, const INDEX_BITS: usize>(
     poseidon_digest(&round2_message_elements::<T, INDEX_BITS>(params, witness))
 }
 
+pub fn round2_digest_fault_public_inputs<const T: usize, const INDEX_BITS: usize>(
+    params: AxiomDkgCircuitParams,
+    witness: &DkgRound2ShareFaultWitness,
+) -> Vec<BlsFr> {
+    vec![
+        round2_message_digest::<T, INDEX_BITS>(params, witness),
+        pool_id_public_input(&witness.accused_pool_id),
+    ]
+}
+
 pub fn round2_message_elements<const T: usize, const INDEX_BITS: usize>(
     params: AxiomDkgCircuitParams,
     witness: &DkgRound2ShareFaultWitness,
@@ -341,8 +368,9 @@ pub fn round2_message_elements<const T: usize, const INDEX_BITS: usize>(
     assert_eq!(witness.commitments.len(), T);
     assert!(witness.participant_index < (1u64 << INDEX_BITS));
 
-    let mut elements = Vec::with_capacity(7 + params.num_limbs * (1 + 2 * T));
+    let mut elements = Vec::with_capacity(8 + params.num_limbs * (1 + 2 * T));
     elements.extend_from_slice(&round2_message_header::<T, INDEX_BITS>(params));
+    elements.push(pool_id_public_input(&witness.accused_pool_id));
     elements.extend_from_slice(&fq_public_limbs(witness.share, params));
     elements.push(BlsFr::from(witness.participant_index));
     for commitment in &witness.commitments {
@@ -402,6 +430,12 @@ pub fn be_bytes_from_fp(value: Fp) -> [u8; 32] {
     let mut repr = value.to_repr();
     repr.reverse();
     repr
+}
+
+pub fn pool_id_public_input(pool_id: &[u8; DKG_POOL_ID_BYTES]) -> BlsFr {
+    let mut repr = [0u8; 32];
+    repr[..DKG_POOL_ID_BYTES].copy_from_slice(pool_id);
+    Option::<BlsFr>::from(BlsFr::from_repr(repr)).expect("28-byte pool id fits in BLS scalar")
 }
 
 fn keygen_builder(params: AxiomDkgCircuitParams) -> RangeCircuitBuilder<BlsFr> {
@@ -475,6 +509,7 @@ fn synthesize_round1_digest_fault(
     let fq_chip = FqChip::<BlsFr>::new(range, params.limb_bits, params.num_limbs);
     let ecc_chip = EccChip::<BlsFr, FpChip<BlsFr>>::new(&fp_chip);
 
+    let pool_id = ctx.load_witness(pool_id_public_input(&witness.accused_pool_id));
     let identifier = ctx.load_witness(BlsFr::from(witness.identifier));
     let mu = fq_chip.load_private(ctx, witness.mu);
     let challenge = fq_chip.load_private(ctx, witness.challenge);
@@ -513,12 +548,13 @@ fn synthesize_round1_digest_fault(
     let residual = secp_sub_complete(ecc_chip.field_chip(), ctx, mu_g, c_phi0);
     assert_points_not_equal(ecc_chip.field_chip(), ctx, &residual, &transcript_r);
 
-    let mut digest_inputs = Vec::with_capacity(6 + params.num_limbs * 5);
+    let mut digest_inputs = Vec::with_capacity(7 + params.num_limbs * 5);
     digest_inputs.extend(
         round1_message_header(params)
             .into_iter()
             .map(|value| ctx.load_constant(value)),
     );
+    digest_inputs.push(pool_id);
     digest_inputs.push(identifier);
     digest_inputs.extend_from_slice(mu.limbs());
     digest_inputs.extend_from_slice(phi0.x.limbs());
@@ -527,7 +563,7 @@ fn synthesize_round1_digest_fault(
     digest_inputs.extend_from_slice(transcript_r.y.limbs());
 
     let digest = poseidon_digest_assigned(ctx, range, &digest_inputs);
-    vec![digest]
+    vec![digest, pool_id]
 }
 
 fn synthesize_round2<const T: usize, const INDEX_BITS: usize>(
@@ -611,6 +647,7 @@ fn synthesize_round2_digest_fault<const T: usize, const INDEX_BITS: usize>(
     let fq_chip = FqChip::<BlsFr>::new(range, params.limb_bits, params.num_limbs);
     let ecc_chip = EccChip::<BlsFr, FpChip<BlsFr>>::new(&fp_chip);
 
+    let pool_id = ctx.load_witness(pool_id_public_input(&witness.accused_pool_id));
     let share = fq_chip.load_private(ctx, witness.share);
     let index = ctx.load_witness(BlsFr::from(witness.participant_index));
     let _index_bits = range.gate.num_to_bits(ctx, index, INDEX_BITS);
@@ -651,12 +688,13 @@ fn synthesize_round2_digest_fault<const T: usize, const INDEX_BITS: usize>(
     let residual = secp_sub_complete(ecc_chip.field_chip(), ctx, horner, share_g);
     assert_non_identity(ecc_chip.field_chip(), ctx, &residual);
 
-    let mut digest_inputs = Vec::with_capacity(7 + params.num_limbs * (1 + 2 * T));
+    let mut digest_inputs = Vec::with_capacity(8 + params.num_limbs * (1 + 2 * T));
     digest_inputs.extend(
         round2_message_header::<T, INDEX_BITS>(params)
             .into_iter()
             .map(|value| ctx.load_constant(value)),
     );
+    digest_inputs.push(pool_id);
     digest_inputs.extend_from_slice(share.limbs());
     digest_inputs.push(index);
     for commitment in &commitments {
@@ -665,7 +703,7 @@ fn synthesize_round2_digest_fault<const T: usize, const INDEX_BITS: usize>(
     }
 
     let digest = poseidon_digest_assigned(ctx, range, &digest_inputs);
-    vec![digest]
+    vec![digest, pool_id]
 }
 
 fn small_linear_combination<const INDEX_BITS: usize, FC>(

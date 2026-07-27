@@ -1,0 +1,4 @@
+[env]
+# poseidon-primitives (via halo2-base/halo2-ecc) needs nightly feature gates;
+# build it on stable via the bootstrap escape hatch (see README "Build").
+RUSTC_BOOTSTRAP = "1"

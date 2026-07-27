@@ -19,7 +19,11 @@ use heimdall::http::peer_network::HttpPeerNetwork;
 use heimdall::http::server::router;
 
 #[derive(Parser)]
-#[command(name = "heimdall", about = "Bifrost Bridge SPO program")]
+#[command(
+    name = "heimdall",
+    about = "Bifrost Bridge SPO program",
+    version = env!("HEIMDALL_VERSION")
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -60,6 +64,11 @@ enum Commands {
         /// reproducible across runs. Demo-only.
         #[arg(long)]
         deterministic: bool,
+        /// DEMO-ONLY: inject a DKG fault so this node misbehaves, to exercise
+        /// the fault-proof / SPO-ban flow live in the scenario harness. Kinds:
+        /// `equivocate-round1`. Never set in production.
+        #[arg(long)]
+        inject_fault: Option<String>,
         /// Blockfrost project ID (e.g. `preprodXXXXXX`). Network is
         /// auto-detected from the key prefix. If set, UTxOs are
         /// queried from Blockfrost instead of a local node.
@@ -148,6 +157,31 @@ enum Commands {
         #[arg(long)]
         broadcast: bool,
     },
+    /// FEDERATION emergency spend of the treasury (scenario 3, N23): a Taproot
+    /// SCRIPT-PATH spend via the `y_fed` CSV leaf — the fallback for when the FROST
+    /// group is dark. The treasury UTxO must already be `federation_csv_blocks`
+    /// deep on Bitcoin. Change returns to the same treasury address (federation
+    /// self-send); the on-chain key rotation to y_federation is separate (N10b).
+    /// Prints the signed tx, broadcasts only with --broadcast.
+    FederationSpend {
+        #[arg(long)]
+        config: Option<String>,
+        /// Treasury outpoint to spend, as <txid>:<vout>.
+        #[arg(long)]
+        outpoint: String,
+        /// Treasury input amount in satoshis.
+        #[arg(long)]
+        amount_sat: u64,
+        /// The treasury's current internal key (32-byte x-only hex = its FROST
+        /// group key Y_51), needed to rebuild the treasury Taproot tree + the
+        /// leaf control block. Omit for the bootstrap treasury, where Y_51 =
+        /// y_fed (as `bootstrap-treasury` prints it).
+        #[arg(long)]
+        y51: Option<String>,
+        /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
+        #[arg(long)]
+        broadcast: bool,
+    },
     /// Print the Cardano wallet base address + payment key hash (the TM-NFT mint
     /// authority) derived from the configured mnemonic / $HEIMDALL_MNEMONIC.
     WalletAddress {
@@ -174,16 +208,18 @@ enum Commands {
         /// until then.
         #[arg(long)]
         registry_bootstrap: String,
-        /// Bootstrap BTC treasury P2TR scriptPubKey, hex (5120 || x-only key).
-        #[arg(long)]
-        btc_treasury_spk: String,
-        /// Bootstrap BTC treasury outpoint, as <btc_txid>:<vout>. Stored in the
-        /// datum in Bitcoin consensus form (txid little-endian || u32-LE vout).
-        #[arg(long)]
-        btc_outpoint: String,
-        /// 32-byte FROST group key (y_fed, x-only), hex.
+        /// 32-byte x-only key seeded into current_spos_frost_key. In Phase 1 this
+        /// is Y_federation (the federation is the key-path signer until the first
+        /// DKG), so it normally equals --y-federation.
         #[arg(long)]
         frost_key: String,
+        /// 32-byte x-only federation fallback key (y_federation), hex — the
+        /// script-leaf key of both Taproot trees.
+        #[arg(long)]
+        y_federation: String,
+        /// The timeout_federation CSV value baked into the federation leaves.
+        #[arg(long)]
+        federation_csv_blocks: i64,
         /// Actually submit via Blockfrost (default: build + print only).
         #[arg(long)]
         submit: bool,
@@ -221,6 +257,91 @@ enum Commands {
         #[arg(long)]
         registry_bootstrap: String,
         /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
+    /// Deploy a DKG fault-verifier as a CIP-33 reference script and print its
+    /// policy id (hash) for `fault_proof_policies`. Dry-run (default) prints the
+    /// hash without submitting (round1/round2 need only their hash for the
+    /// equivocation path); `--kind equivocation --submit` deploys the ref.
+    DeployFaultRef {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// Which fault verifier: `round1` | `round2` | `equivocation`.
+        #[arg(long)]
+        kind: String,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
+    /// Deploy the `spo_bans` validator as a CIP-33 reference script and print its
+    /// policy id (the ban-list policy). `spo_bans` is parameterized by the registry
+    /// hash + the 3 fault-verifier policy hashes (derived here from the blueprint) +
+    /// the ban-schedule params + the ban-list bootstrap outref, so the printed hash
+    /// matches what `DkgFaultBanFlow::from_config` recomputes.
+    DeploySpoBansRef {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// The ban-list one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        ban_bootstrap: String,
+        /// Ban-schedule params (must equal the SPO config's).
+        #[arg(long)]
+        base_ban_duration_ms: i64,
+        #[arg(long)]
+        max_faults_before_permanent: i64,
+        #[arg(long)]
+        max_validity_window_ms: i64,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
+    /// Register the stake credential of every withdraw-using script heimdall
+    /// deploys, so their withdraw-zero paths are admissible. Conway rejects a
+    /// withdrawal whose reward account is unregistered
+    /// (`WithdrawalsNotInRewardsCERTS`), and certificates validate against the
+    /// PRE-transaction ledger state, so this cannot be folded into the
+    /// withdrawing tx. Today the set is `spo_bans` alone — `peg_in`/`peg_out`
+    /// are registered by binocular's `deploy-bridge` / `register-bridge-creds`,
+    /// and re-registering an existing credential is a ledger error. Idempotent:
+    /// already-registered credentials are skipped. Run after
+    /// `bootstrap-ban-list`, before any withdraw path.
+    InitScripts {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// The ban-list one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        ban_bootstrap: String,
+        /// Ban-schedule params (must equal the SPO config's).
+        #[arg(long)]
+        base_ban_duration_ms: i64,
+        #[arg(long)]
+        max_faults_before_permanent: i64,
+        #[arg(long)]
+        max_validity_window_ms: i64,
+        /// Override the protocol stake-key deposit (lovelace) instead of
+        /// reading it from /epochs/latest/parameters.
+        #[arg(long)]
+        key_deposit: Option<u64>,
+        /// Actually submit via Blockfrost (default: report state only).
         #[arg(long)]
         submit: bool,
     },
@@ -278,6 +399,79 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Update-Y: rotate `current_spos_frost_key` in the treasury_info state UTxO
+    /// to the incoming roster's Y_51' (the DKG key handoff — §Update-Y). The
+    /// OUTGOING key signs (BIP340) a domain-tagged message committing to the
+    /// spent outpoint, epoch and new key; submission is permissionless. Prints
+    /// the signed tx, submits only with --submit. In Phase 1 the outgoing key is
+    /// Y_federation, so the y_fed seed signs by default.
+    UpdateY {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
+        /// that parameterizes the registry policy (and through it treasury_info).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
+        #[arg(long)]
+        treasury_nft_name: String,
+        /// The incoming roster's x-only Y_51' (32-byte hex) — the new key.
+        #[arg(long)]
+        new_key: String,
+        /// Epoch number bound into the signed message (8-byte BE).
+        #[arg(long)]
+        epoch: u64,
+        /// Sign with this 32-byte hex secret key (the OUTGOING key). Omit to sign
+        /// with the config y_fed seed (Phase 1), or use --signature (air-gapped).
+        #[arg(long)]
+        signer_skey: Option<String>,
+        /// Air-gapped: 64-byte BIP340 signature (hex) over the update-y message.
+        /// Run without it first to print the exact 32-byte message to sign.
+        #[arg(long)]
+        signature: Option<String>,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
+    /// Emergency dead-roster recovery (N10b): rotate `current_spos_frost_key` back
+    /// to `y_federation`, gated on a Confirmed federation-sweep TM
+    /// (spent_via_federation_leaf) and a BIP340 signature under y_federation.
+    /// Submission is permissionless; the y_fed seed signs by default.
+    FederationReset {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
+        /// that parameterizes the registry policy (and through it treasury_info).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
+        #[arg(long)]
+        treasury_nft_name: String,
+        /// Epoch number bound into the signed message (8-byte BE).
+        #[arg(long)]
+        epoch: u64,
+        /// Optional explicit Confirmed federation-sweep TM (<tx_hash>:<index>) to
+        /// reference; omit to auto-discover a flagged, fresh one at the TM address.
+        #[arg(long)]
+        tm_ref: Option<String>,
+        /// Sign with this 32-byte hex secret key (the FEDERATION key). Omit to sign
+        /// with the config y_fed seed (Phase 1), or use --signature (air-gapped).
+        #[arg(long)]
+        signer_skey: Option<String>,
+        /// Air-gapped: 64-byte BIP340 signature (hex) over the reset message.
+        /// Run without it first to print the exact 32-byte message to sign.
+        #[arg(long)]
+        signature: Option<String>,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
     /// Bootstrap the spo_bans ban list: spend the one-shot outref that
     /// parameterizes the ban policy and mint the "ban-root" anchor NFT to the
     /// ban script address (WI-015). Prints the signed tx, submits only with
@@ -320,6 +514,9 @@ enum Commands {
         /// The fault evidence hash (32-byte hex) that binds the FaultProof token.
         #[arg(long)]
         evidence_hash: String,
+        /// Fault policy kind: round1, round2, or equivocation.
+        #[arg(long)]
+        fault_kind: String,
         /// The spo_bans reference-script UTxO (<tx_hash>:<index>): the script is
         /// used three times in the tx and would not fit embedded.
         #[arg(long)]
@@ -342,27 +539,10 @@ enum Commands {
         /// EquivocationProof branch references registration nodes).
         #[arg(long)]
         registry_bootstrap: String,
-        /// Derive `kind` + `namespace_hash` + `evidence_hash` from a captured
-        /// DKG-evidence JSON file (WI-019) instead of passing opaque hashes.
-        /// When set, --kind/--accused-pool-id/--namespace-hash/--evidence-hash
-        /// are ignored. See `run_fault_proof_mint` for the JSON shape.
+        /// Captured DKG evidence JSON file. Invalid-payload evidence must
+        /// include the Halo2 proof bytes expected by the verifier policy.
         #[arg(long)]
-        evidence_file: Option<String>,
-        /// Fault kind: `invalid-payload` or `equivocation`. Required unless
-        /// --evidence-file is given.
-        #[arg(long)]
-        kind: Option<String>,
-        /// The accused pool id (28-byte hex). Required unless --evidence-file.
-        #[arg(long)]
-        accused_pool_id: Option<String>,
-        /// The protocol namespace hash (32-byte hex) — descriptive datum field.
-        /// Required unless --evidence-file.
-        #[arg(long)]
-        namespace_hash: Option<String>,
-        /// The fault evidence hash (32-byte hex) — binds the FaultProof token.
-        /// Required unless --evidence-file.
-        #[arg(long)]
-        evidence_hash: Option<String>,
+        evidence_file: String,
         /// Actually submit via Blockfrost.
         #[arg(long)]
         submit: bool,
@@ -401,27 +581,30 @@ enum Commands {
         #[arg(long)]
         cardano_magic: u64,
         /// Bech32 address of the peg-in script holding the PegInRequest UTxOs.
+        /// Falls back to `cardano.pegin_script_address` if omitted.
         #[arg(long)]
-        pegin_script_address: String,
+        pegin_script_address: Option<String>,
         /// Peg-in policy ID as 56 hex chars (28 bytes).
+        /// Falls back to `cardano.pegin_policy_id` if omitted.
         #[arg(long)]
-        pegin_policy_id: String,
-        /// Current treasury outpoint to sweep, as <txid>:<vout>.
+        pegin_policy_id: Option<String>,
+        /// Current treasury outpoint to sweep, as <txid>:<vout>. Omit (together with
+        /// --treasury-amount-sat) to chain-source the treasury from the Cardano tip
+        /// Confirmed-TM (WI-028); pass both to override.
+        #[arg(long, requires = "treasury_amount_sat")]
+        treasury_outpoint: Option<String>,
+        /// Treasury input amount in satoshis. Omit to chain-source from Cardano.
+        #[arg(long, requires = "treasury_outpoint")]
+        treasury_amount_sat: Option<u64>,
+        /// Bech32 address of the `peg_out.ak` script holding PegOut UTxOs (the TM pays every
+        /// pending peg-out there; destination + amount come from each on-chain PegOut UTxO).
+        /// Falls back to `cardano.pegout_script_address` if omitted.
         #[arg(long)]
-        treasury_outpoint: String,
-        /// Treasury input amount in satoshis.
-        #[arg(long)]
-        treasury_amount_sat: u64,
-        /// Bech32 address of the `peg_out.ak` script holding PegOut UTxOs. A Treasury Movement
-        /// collects EVERY pending peg-out here (technical_documentation §"Treasury Movement
-        /// (Bitcoin)": "pay every pending peg-out") alongside every confirmed peg-in. Destination +
-        /// amount come from each on-chain PegOut UTxO, never from the CLI.
-        #[arg(long)]
-        pegout_script_address: String,
+        pegout_script_address: Option<String>,
         /// The bridged-token (fBTC) unit `<policy_hex><asset_name_hex>` used to read each PegOut
-        /// UTxO's locked amount from its value.
+        /// UTxO's locked amount. Falls back to `cardano.bridged_token_unit` if omitted.
         #[arg(long)]
-        bridged_token_unit: String,
+        bridged_token_unit: Option<String>,
         /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
         #[arg(long)]
         broadcast: bool,
@@ -431,6 +614,66 @@ enum Commands {
         /// these bytes; Bitcoin broadcast is skipped regardless of `bitcoin.submit`.
         #[arg(long)]
         existing_tm_hex: Option<String>,
+        /// Peg-in BTC outpoint(s) `<txid>:<vout>` to DROP from the sweep even though their
+        /// PegInRequest still sits at the peg-in address. Use for deposits already swept into
+        /// the current treasury whose PIR was never consumed by a mint — re-including them would
+        /// double-spend an outpoint that no longer exists. Repeatable.
+        #[arg(long = "exclude-pegin")]
+        exclude_pegin: Vec<String>,
+    },
+    /// Read-only: chain-source the current Bitcoin treasury from Cardano state
+    /// (WI-028). Scans the TM validator address (`cardano.treasury_address`),
+    /// chain-follows the Confirmed TMs to the unspent tip, and prints its
+    /// outpoint / value / scriptPubKey, whether it matches the demo Y_51 treasury
+    /// keys, and whether a movement is already in flight against it. Posts
+    /// nothing — the same read the auto-mover and `sweep-pegins` use to source
+    /// the treasury.
+    ShowTreasury {
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Background auto-mover (WI-028): every `--interval-secs`, chain-source the
+    /// current treasury from Cardano (no config edits), collect pending peg-ins +
+    /// peg-outs, and — if the treasury is free and there is work — build, FROST-sign
+    /// and post the next Treasury Movement. Skips ticks when nothing is pending or a
+    /// movement is already in flight (waits for binocular `confirm-tmtx` to advance
+    /// the tip). Runs on the CURRENT contracts with no leader election, so run ONE
+    /// instance per bridge. Use `--once` for a single tick and omit `--broadcast`
+    /// for a dry run (build + print, no post).
+    RunMover {
+        #[arg(long)]
+        config: Option<String>,
+        /// N2C socket — unused on the Blockfrost path the mover uses; defaulted so a
+        /// config-driven mover needs only `--config`.
+        #[arg(long, default_value = "/dev/null")]
+        cardano_socket: String,
+        #[arg(long, default_value_t = 1)]
+        cardano_magic: u64,
+        /// Falls back to `cardano.pegin_script_address` if omitted.
+        #[arg(long)]
+        pegin_script_address: Option<String>,
+        /// Falls back to `cardano.pegin_policy_id` if omitted.
+        #[arg(long)]
+        pegin_policy_id: Option<String>,
+        /// Falls back to `cardano.pegout_script_address` if omitted.
+        #[arg(long)]
+        pegout_script_address: Option<String>,
+        /// Falls back to `cardano.bridged_token_unit` if omitted.
+        #[arg(long)]
+        bridged_token_unit: Option<String>,
+        /// Seconds between ticks.
+        #[arg(long, default_value_t = 60)]
+        interval_secs: u64,
+        /// Run a single tick and exit (for testing).
+        #[arg(long)]
+        once: bool,
+        /// Post the built TM (Cardano + optional Bitcoin per config). Omit for a dry run.
+        #[arg(long)]
+        broadcast: bool,
+        /// Peg-in BTC outpoint(s) `<txid>:<vout>` to DROP from every sweep (see
+        /// `sweep-pegins --exclude-pegin`). Repeatable.
+        #[arg(long = "exclude-pegin")]
+        exclude_pegin: Vec<String>,
     },
 }
 
@@ -444,6 +687,15 @@ fn load_config(path: Option<&str>) -> HeimdallConfig {
     }
 }
 
+/// Resolve a per-bridge value from the CLI flag (override) else the config, exiting
+/// with a message that names both the `--flag` and the `cardano.<key>` it can come from.
+fn resolve_arg(cli: Option<String>, cfg_val: Option<&String>, flag: &str, cfg_key: &str) -> String {
+    cli.or_else(|| cfg_val.cloned()).unwrap_or_else(|| {
+        eprintln!("Error: pass --{flag} or set cardano.{cfg_key} in the config");
+        std::process::exit(1);
+    })
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -454,6 +706,7 @@ fn main() {
             max_signers,
             base_port,
             deterministic,
+            inject_fault,
             blockfrost_project_id,
             cardano_socket,
             cardano_magic,
@@ -523,7 +776,7 @@ fn main() {
             }
 
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_demo(cfg, index, deterministic));
+            rt.block_on(run_demo(cfg, index, deterministic, inject_fault));
         }
         Commands::BootstrapTreasury {
             config,
@@ -547,6 +800,21 @@ fn main() {
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_treasury_self_send(&cfg, &outpoint, amount_sat, broadcast) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::FederationSpend {
+            config,
+            outpoint,
+            amount_sat,
+            y51,
+            broadcast,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) =
+                run_federation_spend(&cfg, &outpoint, amount_sat, y51.as_deref(), broadcast)
+            {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -578,9 +846,9 @@ fn main() {
             config,
             blueprint,
             registry_bootstrap,
-            btc_treasury_spk,
-            btc_outpoint,
             frost_key,
+            y_federation,
+            federation_csv_blocks,
             submit,
         } => {
             let cfg = load_config(config.as_deref());
@@ -588,9 +856,9 @@ fn main() {
                 &cfg,
                 &blueprint,
                 &registry_bootstrap,
-                &btc_treasury_spk,
-                &btc_outpoint,
                 &frost_key,
+                &y_federation,
+                federation_csv_blocks,
                 submit,
             ) {
                 eprintln!("Error: {e}");
@@ -617,6 +885,73 @@ fn main() {
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_deploy_registry_ref(&cfg, &blueprint, &registry_bootstrap, submit) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::DeployFaultRef {
+            config,
+            blueprint,
+            registry_bootstrap,
+            kind,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) =
+                run_deploy_fault_ref(&cfg, &blueprint, &registry_bootstrap, &kind, submit)
+            {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::DeploySpoBansRef {
+            config,
+            blueprint,
+            registry_bootstrap,
+            ban_bootstrap,
+            base_ban_duration_ms,
+            max_faults_before_permanent,
+            max_validity_window_ms,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_deploy_spo_bans_ref(
+                &cfg,
+                &blueprint,
+                &registry_bootstrap,
+                &ban_bootstrap,
+                base_ban_duration_ms,
+                max_faults_before_permanent,
+                max_validity_window_ms,
+                submit,
+            ) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::InitScripts {
+            config,
+            blueprint,
+            registry_bootstrap,
+            ban_bootstrap,
+            base_ban_duration_ms,
+            max_faults_before_permanent,
+            max_validity_window_ms,
+            key_deposit,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_init_scripts(
+                &cfg,
+                &blueprint,
+                &registry_bootstrap,
+                &ban_bootstrap,
+                base_ban_duration_ms,
+                max_faults_before_permanent,
+                max_validity_window_ms,
+                key_deposit,
+                submit,
+            ) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -656,6 +991,60 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::UpdateY {
+            config,
+            blueprint,
+            registry_bootstrap,
+            treasury_nft_name,
+            new_key,
+            epoch,
+            signer_skey,
+            signature,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            let args = UpdateYArgs {
+                blueprint,
+                registry_bootstrap,
+                treasury_nft_name,
+                new_key,
+                epoch,
+                signer_skey,
+                signature,
+                submit,
+            };
+            if let Err(e) = run_update_y(&cfg, &args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::FederationReset {
+            config,
+            blueprint,
+            registry_bootstrap,
+            treasury_nft_name,
+            epoch,
+            tm_ref,
+            signer_skey,
+            signature,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            let args = FederationResetArgs {
+                blueprint,
+                registry_bootstrap,
+                treasury_nft_name,
+                epoch,
+                tm_ref,
+                signer_skey,
+                signature,
+                submit,
+            };
+            if let Err(e) = run_federation_reset(&cfg, &args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::BootstrapBanList {
             config,
             blueprint,
@@ -681,6 +1070,7 @@ fn main() {
             registry_bootstrap,
             accused_pool_id,
             evidence_hash,
+            fault_kind,
             spo_bans_ref,
             submit,
         } => {
@@ -690,6 +1080,7 @@ fn main() {
                 registry_bootstrap,
                 accused_pool_id,
                 evidence_hash,
+                fault_kind,
                 spo_bans_ref,
                 submit,
             };
@@ -703,10 +1094,6 @@ fn main() {
             blueprint,
             registry_bootstrap,
             evidence_file,
-            kind,
-            accused_pool_id,
-            namespace_hash,
-            evidence_hash,
             submit,
         } => {
             let cfg = load_config(config.as_deref());
@@ -714,10 +1101,6 @@ fn main() {
                 blueprint,
                 registry_bootstrap,
                 evidence_file,
-                kind,
-                accused_pool_id,
-                namespace_hash,
-                evidence_hash,
                 submit,
             };
             if let Err(e) = run_fault_proof_mint(&cfg, &args) {
@@ -750,21 +1133,114 @@ fn main() {
             bridged_token_unit,
             broadcast,
             existing_tm_hex,
+            exclude_pegin,
         } => {
             let cfg = load_config(config.as_deref());
+            // CLI flags override; otherwise fall back to the [cardano] config.
+            let c = &cfg.cardano;
+            let pegin_script_address = resolve_arg(
+                pegin_script_address,
+                c.pegin_script_address.as_ref(),
+                "pegin-script-address",
+                "pegin_script_address",
+            );
+            let pegin_policy_id = resolve_arg(
+                pegin_policy_id,
+                c.pegin_policy_id.as_ref(),
+                "pegin-policy-id",
+                "pegin_policy_id",
+            );
+            let pegout_script_address = resolve_arg(
+                pegout_script_address,
+                c.pegout_script_address.as_ref(),
+                "pegout-script-address",
+                "pegout_script_address",
+            );
+            let bridged_token_unit = resolve_arg(
+                bridged_token_unit,
+                c.bridged_token_unit.as_ref(),
+                "bridged-token-unit",
+                "bridged_token_unit",
+            );
             if let Err(e) = run_sweep_pegins(
                 &cfg,
                 &cardano_socket,
                 cardano_magic,
                 &pegin_script_address,
                 &pegin_policy_id,
-                &treasury_outpoint,
+                treasury_outpoint.as_deref(),
                 treasury_amount_sat,
                 &pegout_script_address,
                 &bridged_token_unit,
                 broadcast,
                 existing_tm_hex.as_deref(),
+                &exclude_pegin,
+                false, // auto_mode
             ) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::RunMover {
+            config,
+            cardano_socket,
+            cardano_magic,
+            pegin_script_address,
+            pegin_policy_id,
+            pegout_script_address,
+            bridged_token_unit,
+            interval_secs,
+            once,
+            broadcast,
+            exclude_pegin,
+        } => {
+            let cfg = load_config(config.as_deref());
+            // CLI flags override; otherwise fall back to the [cardano] config.
+            let c = &cfg.cardano;
+            let pegin_script_address = resolve_arg(
+                pegin_script_address,
+                c.pegin_script_address.as_ref(),
+                "pegin-script-address",
+                "pegin_script_address",
+            );
+            let pegin_policy_id = resolve_arg(
+                pegin_policy_id,
+                c.pegin_policy_id.as_ref(),
+                "pegin-policy-id",
+                "pegin_policy_id",
+            );
+            let pegout_script_address = resolve_arg(
+                pegout_script_address,
+                c.pegout_script_address.as_ref(),
+                "pegout-script-address",
+                "pegout_script_address",
+            );
+            let bridged_token_unit = resolve_arg(
+                bridged_token_unit,
+                c.bridged_token_unit.as_ref(),
+                "bridged-token-unit",
+                "bridged_token_unit",
+            );
+            if let Err(e) = run_mover(
+                &cfg,
+                &cardano_socket,
+                cardano_magic,
+                &pegin_script_address,
+                &pegin_policy_id,
+                &pegout_script_address,
+                &bridged_token_unit,
+                interval_secs,
+                once,
+                broadcast,
+                &exclude_pegin,
+            ) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::ShowTreasury { config } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_show_treasury(&cfg) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -772,29 +1248,57 @@ fn main() {
     }
 }
 
-/// Apply the real TM-NFT minting policy to the chain when both `cardano.tm_script_cbor` and
-/// `cardano.tm_control_ref` are configured (else leave it on the always-ok scaffold). Errors on a
-/// half-configured pair or a malformed control ref (`<tx_hash>#<index>`).
+/// Apply the real TM-NFT minting policy and the Config-UTxO locator to the chain. Requires
+/// `cardano.tm_script_cbor`, `cardano.config_address` and `cardano.config_nft_policy_id` to be
+/// configured together (else leave the always-ok scaffold; the Config UTxO anchors the TM chain
+/// the mint redeemer links against). Errors on a half-configured set.
 fn apply_tm_policy(
     chain: BlockfrostCardanoChain,
     cfg: &HeimdallConfig,
 ) -> Result<BlockfrostCardanoChain, String> {
-    match (&cfg.cardano.tm_script_cbor, &cfg.cardano.tm_control_ref) {
-        (Some(cbor), Some(r)) => {
-            let (h, i) = r
-                .split_once('#')
-                .and_then(|(h, i)| i.parse::<u32>().ok().map(|i| (h, i)))
-                .ok_or_else(|| {
-                    format!("cardano.tm_control_ref must be <tx_hash>#<index>, got '{r}'")
-                })?;
-            Ok(chain.with_tm_policy(cbor, h, i))
+    // The Config-UTxO locator is needed by query_treasury (chain walk) even when minting
+    // stays on the scaffold, so apply it whenever configured.
+    let chain = match (
+        &cfg.cardano.config_address,
+        &cfg.cardano.config_nft_policy_id,
+    ) {
+        (Some(addr), Some(policy)) => {
+            let unit = format!(
+                "{policy}{}",
+                cfg.cardano.config_nft_asset_name.as_deref().unwrap_or("")
+            );
+            chain.with_config_utxo(addr, &unit)
         }
-        (None, None) => Ok(chain),
-        _ => Err("set both cardano.tm_script_cbor and cardano.tm_control_ref (or neither)".into()),
+        (None, None) => chain,
+        _ => {
+            return Err(
+                "set both cardano.config_address and cardano.config_nft_policy_id (or neither)"
+                    .into(),
+            );
+        }
+    };
+    match &cfg.cardano.tm_script_cbor {
+        Some(cbor) => {
+            if cfg.cardano.config_address.is_none() {
+                return Err(
+                    "cardano.tm_script_cbor requires cardano.config_address and \
+                     cardano.config_nft_policy_id (the mint redeemer links against the config \
+                     anchor)"
+                        .into(),
+                );
+            }
+            Ok(chain.with_tm_policy(cbor))
+        }
+        None => Ok(chain),
     }
 }
 
-async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) {
+async fn run_demo(
+    cfg: HeimdallConfig,
+    index: Option<u16>,
+    deterministic: bool,
+    inject_fault: Option<String>,
+) {
     // The fixture provides a fallback roster (SPO identities + ports)
     // until the on-chain SPO registry is wired.
     let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(&cfg);
@@ -822,6 +1326,8 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
             federation_csv_blocks: fixture.federation_csv_blocks,
             fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
             per_pegout_fee: fixture.per_pegout_fee,
+            treasury_outpoint: fixture.treasury_outpoint,
+            treasury_value: fixture.treasury_value,
         };
         let mut bf_chain = BlockfrostCardanoChain::new(
             project_id,
@@ -856,6 +1362,14 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
             cfg.cardano.oracle_constructor,
         );
 
+        // Per-pool stake source for the DKG threshold (default Blockfrost;
+        // "yaci_store" for a local yaci-devkit devnet).
+        let stake_source =
+            heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
+                .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
+        bf_chain = bf_chain.with_stake_source(stake_source);
+        bf_chain = bf_chain.with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked);
+
         // On-chain SPO registry roster (WI-010): configured via
         // cardano.{registry_blueprint, registry_bootstrap, treasury_info_asset_name}.
         // Without it query_roster serves the fixture roster.
@@ -872,6 +1386,19 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
                     Ok(Some(bans)) => {
                         println!("on-chain ban list:     {}", bans.ban_address);
                         bf_chain = bf_chain.with_ban_source(bans);
+                        match heimdall::cardano::blockfrost_chain::DkgFaultBanFlow::from_config(
+                            &cfg.cardano,
+                        ) {
+                            Ok(Some(flow)) => {
+                                println!("automatic DKG fault banning: enabled");
+                                bf_chain = bf_chain.with_dkg_fault_ban_flow(flow);
+                            }
+                            Ok(None) => unreachable!("ban list is configured"),
+                            Err(e) => {
+                                eprintln!("fatal: DKG fault-ban flow config: {e}");
+                                std::process::exit(1);
+                            }
+                        }
                     }
                     Ok(None) => println!(
                         "note: no ban list configured (cardano.ban_bootstrap) — roster not \
@@ -925,14 +1452,17 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
         Arc::new(OsRngSource)
     };
 
-    // Identity (WI-014): this node's bifrost key locates its own roster entry
-    // (own_participant). The positional --index is a legacy fallback only for
-    // the config/mock fixture, whose SpoInfos carry no bifrost_id_pk.
+    // Identity (WI-014/WI-023): with an on-chain registry, this node's bifrost
+    // key (from [bifrost].skey_path) locates its own roster entry
+    // (own_participant). For the no-registry local demo there is no configured
+    // key — the per-node identity AND its secret come from `--index` via the
+    // fixture's deterministic keypairs.
     let secp = bitcoin::secp256k1::Secp256k1::new();
-    let keypair = cfg
-        .load_bifrost_keypair(&secp)
-        .unwrap_or_else(|e| panic!("bifrost identity key required for the HTTP transport: {e}"));
-    let bifrost_id_pk = keypair.x_only_public_key().0.serialize();
+    let configured_keypair = cfg.load_bifrost_keypair(&secp).ok();
+    // Whether this node has a real on-chain identity key. Drives whether the
+    // epoch loop re-derives its index from the live roster (registry path) or
+    // trusts the static configured index (fixture/`--index` demo).
+    let has_configured_key = configured_keypair.is_some();
 
     // WI-014: query the roster at the REAL current epoch (was hardcoded 0).
     let epoch = chain
@@ -944,30 +1474,63 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
         .await
         .expect("query initial roster");
 
-    let (id, me) = match roster.own_participant(&bifrost_id_pk) {
-        Some((id, info)) => (id, info),
+    let (id, me, keypair) = match configured_keypair {
+        // A [bifrost].skey_path was configured: locate ourselves by that key.
+        Some(kp) => {
+            let bifrost_id_pk = kp.x_only_public_key().0.serialize();
+            match roster.own_participant(&bifrost_id_pk) {
+                Some((id, info)) => (id, info.clone(), kp),
+                None => {
+                    // Not in the roster by bifrost key. Against a real registry
+                    // roster this is fatal (not registered / banned / URL-excluded).
+                    // Fall back to --index ONLY for the legacy fixture demo.
+                    let ix = index.unwrap_or_else(|| {
+                        panic!(
+                            "this node's bifrost_id_pk ({}) is not in the eligible roster for \
+                             epoch {epoch} (not registered / banned / URL-excluded) and no \
+                             --index fallback was given — refusing to run DKG under an unknown \
+                             identity",
+                            hex::encode(bifrost_id_pk)
+                        )
+                    });
+                    let id = Identifier::try_from(ix).unwrap();
+                    let info = roster
+                        .participants
+                        .get(&id)
+                        .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
+                        .clone();
+                    eprintln!(
+                        "[demo] WARNING: bifrost_id_pk not found in roster; falling back to \
+                         --index {ix} (fixture/legacy demo only)"
+                    );
+                    (id, info, kp)
+                }
+            }
+        }
+        // No configured key (WI-023 no-registry demo): both identity and secret
+        // come from --index via the fixture's deterministic keypairs, so 3
+        // processes sharing one config differ only by `--index`.
         None => {
-            // Not in the roster by bifrost key. Against a real registry roster
-            // this is fatal (not registered / banned / bifrost_url excluded). Fall
-            // back to --index ONLY for the fixture demo (empty bifrost_id_pks).
             let ix = index.unwrap_or_else(|| {
                 panic!(
-                    "this node's bifrost_id_pk ({}) is not in the eligible roster for epoch \
-                     {epoch} (not registered / banned / URL-excluded) and no --index fallback \
-                     was given — refusing to run DKG under an unknown identity",
-                    hex::encode(bifrost_id_pk)
+                    "no bifrost identity key — set [bifrost].skey_path (on-chain registry \
+                     deployments) or pass --index N for the local no-registry fixture demo"
                 )
             });
             let id = Identifier::try_from(ix).unwrap();
             let info = roster
                 .participants
                 .get(&id)
-                .unwrap_or_else(|| panic!("--index {ix} is not in the roster"));
-            eprintln!(
-                "[demo] WARNING: bifrost_id_pk not found in roster; falling back to --index {ix} \
-                 (fixture/legacy demo only)"
-            );
-            (id, info)
+                .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
+                .clone();
+            let kp = *fixture.bifrost_keypairs.get(&id).unwrap_or_else(|| {
+                panic!(
+                    "--index {ix}: no fixture bifrost keypair — the no-registry demo derives \
+                     each node's key from the fixture; set [bifrost].skey_path for a registry \
+                     deployment"
+                )
+            });
+            (id, info, kp)
         }
     };
     let port = port_from_url(&me.bifrost_url).unwrap_or_else(|e| panic!("{e}"));
@@ -1000,24 +1563,48 @@ async fn run_demo(cfg: HeimdallConfig, index: Option<u16>, deterministic: bool) 
     );
 
     let peers: Arc<dyn PeerNetwork> = net;
-    let config = cfg.to_epoch_config(SpoIdentity {
+    // On the registry path, carry this node's stable bifrost key so the loop can
+    // re-derive its live index each epoch (see `epoch_start_phase`). Empty on the
+    // fixture path, which has no on-chain roster and keeps the configured index.
+    let own_bifrost_id_pk = if has_configured_key {
+        keypair.x_only_public_key().0.serialize().to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut config = cfg.to_epoch_config(SpoIdentity {
         identifier: id,
+        bifrost_id_pk: own_bifrost_id_pk,
         port,
     });
+    // DEMO-ONLY fault injection (--inject-fault); parse-and-die on a bad kind.
+    config.inject_fault = match inject_fault.as_deref() {
+        None => None,
+        Some(s) => match s.parse::<heimdall::epoch::state::InjectFault>() {
+            Ok(k) => Some(k),
+            Err(e) => {
+                eprintln!("[demo] {e}");
+                std::process::exit(2);
+            }
+        },
+    };
+    if let Some(k) = config.inject_fault {
+        eprintln!("[demo] ⚠ FAULT INJECTION ENABLED: {k:?} — this node will misbehave in DKG");
+    }
 
     let t0 = Instant::now();
-    // The epoch loop treats chain-read / peer / aborted-DKG failures as
-    // retriable (it backs off and re-enters the boundary internally), so a
-    // returned Err is a genuinely fatal condition (a logic/crypto bug or
-    // malformed tx). Exit cleanly with a message instead of panicking — the
-    // node never dies on a transient failure (WI-014 error-handling feedback).
+    // The epoch loop backs off and re-enters `Idle` on EVERY error, so it does
+    // not return Err at all today — this arm is unreachable by construction and
+    // kept only because the signature is still `EpochResult`. It must NOT go
+    // back to parking on Ctrl-C: that is exactly what froze an honest node on a
+    // stale roster (2026-07-22), because re-deriving the roster is something
+    // only the loop does. If a future change reintroduces an error exit, say so
+    // plainly and let the supervisor restart us.
     let tm = match run_epoch_loop(chain, pegin_source, peers, clock, rng, &config).await {
         Ok(tm) => tm,
         Err(e) => {
-            eprintln!("[demo] epoch loop terminated with a fatal error: {e}");
-            eprintln!("[demo] server still running on {bind_addr}:{port}; press Ctrl-C to exit.");
-            tokio::signal::ctrl_c().await.ok();
-            return;
+            eprintln!("[demo] epoch loop returned unexpectedly: {e}");
+            eprintln!("[demo] this should not happen — the loop is meant to retry indefinitely.");
+            std::process::exit(1);
         }
     };
     println!("Cycle complete ({:.2?})", t0.elapsed());
@@ -1223,6 +1810,91 @@ fn run_treasury_self_send(
     Ok(())
 }
 
+/// Build (and with --broadcast, send) the FEDERATION emergency spend of the
+/// treasury (scenario 3, N23): a Taproot SCRIPT-PATH spend via the `y_fed` CSV
+/// leaf, the fallback for when the FROST group is dark. The treasury UTxO must
+/// already be `federation_csv_blocks` deep on Bitcoin. Change returns to the
+/// same treasury address (federation self-send); the on-chain rotation to
+/// y_federation is a separate step (N10b). `y51_hex` is the treasury's current
+/// internal key (its FROST group key) — needed only to rebuild the treasury tree
+/// / leaf control block; `y_fed` + csv come from the config.
+fn run_federation_spend(
+    cfg: &HeimdallConfig,
+    outpoint: &str,
+    amount_sat: u64,
+    y51_hex: Option<&str>,
+    broadcast: bool,
+) -> Result<(), String> {
+    use bitcoin::key::{Secp256k1, UntweakedPublicKey};
+    use bitcoin::{Amount, ScriptBuf};
+    use heimdall::bitcoin::taproot::treasury_spend_info;
+    use heimdall::bitcoin::tm_builder::{TreasuryInput, build_tm, sign_tm_federation_leaf};
+    use heimdall::cardano::btc_rpc::broadcast_btc_tx;
+
+    let secp = Secp256k1::new();
+    let outpoint = parse_outpoint(outpoint)?;
+    let (y_fed_sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    let csv = csv_blocks_u16(cfg)?;
+    // Omitted => the bootstrap treasury, whose internal key is y_fed itself.
+    let y51 = match y51_hex {
+        Some(h) => {
+            let b = hex::decode(h.trim()).map_err(|e| format!("--y51 hex: {e}"))?;
+            UntweakedPublicKey::from_slice(&b)
+                .map_err(|e| format!("--y51 is not a 32-byte x-only key: {e}"))?
+        }
+        None => y_fed,
+    };
+
+    // Real treasury tree: Y_51 internal (key-path = 51%), y_fed CSV leaf (federation).
+    let spend_info = treasury_spend_info(&secp, y51, y_fed, csv);
+    let treasury_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
+    let treasury_addr =
+        bitcoin::Address::p2tr_tweaked(spend_info.output_key(), cfg.bitcoin.parsed_network());
+
+    // Treasury-only, no peg-ins/peg-outs => single output[0] = treasury.
+    let unsigned = build_tm(
+        TreasuryInput {
+            outpoint,
+            value: Amount::from_sat(amount_sat),
+            spend_info,
+        },
+        vec![],
+        vec![],
+        treasury_spk,
+        &fee_params_from_cfg(cfg),
+    )
+    .map_err(|e| format!("build federation spend: {e}"))?;
+
+    let signed = sign_tm_federation_leaf(&secp, &unsigned, &y_fed_sk, csv)
+        .map_err(|e| format!("sign federation spend: {e}"))?;
+    let raw = bitcoin::consensus::encode::serialize(&signed);
+
+    println!("federation-spend txid : {}", signed.compute_txid());
+    println!("  treasury address     : {treasury_addr}  (fund this / the input's scriptPubKey)");
+    println!(
+        "  script-path via y_fed CSV leaf (csv={csv}); output[0] = {} sat (treasury)",
+        signed.output[0].value.to_sat()
+    );
+    println!(
+        "  witness items: {} (expect 3: sig, leaf, control block)",
+        signed.input[0].witness.len()
+    );
+    println!("  raw tx : {}", hex::encode(&raw));
+
+    if !broadcast {
+        println!(
+            "(not broadcast — pass --broadcast; the treasury UTxO must be >= {csv} blocks deep)"
+        );
+        return Ok(());
+    }
+    let rpc = btc_rpc_config(cfg)?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(broadcast_btc_tx(&rpc, &raw))
+        .map_err(|e| format!("broadcast: {e}"))?;
+    println!("broadcast OK");
+    Ok(())
+}
+
 /// The Cardano wallet mnemonic: `cardano.mnemonic` from config, else
 /// `$HEIMDALL_MNEMONIC`.
 fn resolve_mnemonic(cfg: &HeimdallConfig) -> Result<String, String> {
@@ -1258,9 +1930,9 @@ fn run_bootstrap_treasury_info(
     cfg: &HeimdallConfig,
     blueprint_path: &str,
     registry_bootstrap: &str,
-    btc_treasury_spk: &str,
-    btc_outpoint: &str,
     frost_key: &str,
+    y_federation: &str,
+    federation_csv_blocks: i64,
     submit: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
@@ -1278,25 +1950,22 @@ fn run_bootstrap_treasury_info(
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
+    let tm_nft = cfg.cardano.tm_nft_policy()?;
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
         .map_err(|e| format!("parameterize treasury_info: {e}"))?;
     println!("registry policy id:   {}", registry.hash_hex());
     println!("treasury_info policy: {}", treasury.hash_hex());
 
-    let spk = hex::decode(btc_treasury_spk).map_err(|e| format!("--btc-treasury-spk: {e}"))?;
-    if spk.len() != 34 || spk[..2] != [0x51, 0x20] {
-        return Err(format!(
-            "--btc-treasury-spk must be a P2TR scriptPubKey (34 bytes, 5120 || x-only key), \
-             got {} bytes",
-            spk.len()
-        ));
-    }
-    let outpoint = parse_outpoint(btc_outpoint)?;
-    let utxo_id = bitcoin::consensus::encode::serialize(&outpoint);
     let frost = hex::decode(frost_key).map_err(|e| format!("--frost-key: {e}"))?;
     bitcoin::XOnlyPublicKey::from_slice(&frost)
         .map_err(|e| format!("--frost-key is not a valid x-only secp256k1 point: {e}"))?;
-    let datum = bootstrap_datum(spk, utxo_id, frost);
+    let y_fed = hex::decode(y_federation).map_err(|e| format!("--y-federation: {e}"))?;
+    bitcoin::XOnlyPublicKey::from_slice(&y_fed)
+        .map_err(|e| format!("--y-federation is not a valid x-only secp256k1 point: {e}"))?;
+    if federation_csv_blocks <= 0 {
+        return Err("--federation-csv-blocks must be positive".into());
+    }
+    let datum = bootstrap_datum(frost, y_fed, federation_csv_blocks);
 
     let pid = cfg
         .cardano
@@ -1686,6 +2355,374 @@ fn run_deploy_registry_ref(
     Ok(())
 }
 
+/// Deploy a DKG fault verifier as a CIP-33 reference script (M2 of the cheat→ban
+/// scenario), and print its policy id (hash) for `fault_proof_policies`. The
+/// verifier is parameterized by the spos_registry policy hash (derived from the
+/// blueprint + bootstrap outref), exactly as `DkgFaultBanFlow::from_config` does,
+/// so the deployed hash matches what the ban flow recomputes. Dry-run prints only
+/// the hash — enough for round1/round2 on the equivocation path (their ref UTxOs
+/// are never consumed and their SRS is never opened).
+fn run_deploy_fault_ref(
+    cfg: &HeimdallConfig,
+    blueprint_path: &str,
+    registry_bootstrap: &str,
+    kind: &str,
+    submit: bool,
+) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{
+        fault_verifier_equivocation_script, fault_verifier_round1_script,
+        fault_verifier_round2_script, spos_registry_script,
+    };
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let blueprint_json = std::fs::read_to_string(blueprint_path)
+        .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let verifier = match kind {
+        "round1" => fault_verifier_round1_script(&blueprint_json, &registry.hash),
+        "round2" => fault_verifier_round2_script(&blueprint_json, &registry.hash),
+        "equivocation" => fault_verifier_equivocation_script(&blueprint_json, &registry.hash),
+        other => {
+            return Err(format!(
+                "unknown --kind '{other}' (expected: round1 | round2 | equivocation)"
+            ));
+        }
+    }
+    .map_err(|e| format!("parameterize fault_verifier_{kind}: {e}"))?;
+
+    println!("fault_verifier_{kind} policy id: {}", verifier.hash_hex());
+    println!(
+        "  → add to `fault_proof_policies` in [cardano] (order: round1, round2, equivocation)"
+    );
+
+    if !submit {
+        println!("(dry run — hash only, no wallet needed; pass --submit to deploy the ref UTxO)");
+        return Ok(());
+    }
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let built = build_ref_script_deploy_tx(
+        &verifier,
+        &wallet_addr,
+        &wallet_utxos,
+        &key,
+        Some(cost_models),
+    )
+    .map_err(|e| format!("build ref-script deploy tx: {e}"))?;
+    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
+    println!("submitted: tx_hash={tx_hash}");
+    println!(
+        "fault-verifier ref UTxO: {tx_hash}:0  (→ fault_verifier_{kind}_ref in the SPO config)"
+    );
+    Ok(())
+}
+
+/// Deploy `spo_bans` as a CIP-33 reference script (M2). Parameterizes it exactly
+/// as `DkgFaultBanFlow::from_config`: registry hash + the 3 fault-verifier policy
+/// hashes (round1, round2, equivocation — order matters) + ban-schedule params +
+/// the ban-list bootstrap outref. Prints the ban-list policy id; --submit deploys.
+#[allow(clippy::too_many_arguments)]
+fn run_deploy_spo_bans_ref(
+    cfg: &HeimdallConfig,
+    blueprint_path: &str,
+    registry_bootstrap: &str,
+    ban_bootstrap: &str,
+    base_ban_duration_ms: i64,
+    max_faults_before_permanent: i64,
+    max_validity_window_ms: i64,
+    submit: bool,
+) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{
+        fault_verifier_equivocation_script, fault_verifier_round1_script,
+        fault_verifier_round2_script, spo_bans_script, spos_registry_script,
+    };
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let blueprint_json = std::fs::read_to_string(blueprint_path)
+        .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let r1 = fault_verifier_round1_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_round1: {e}"))?;
+    let r2 = fault_verifier_round2_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_round2: {e}"))?;
+    let eq = fault_verifier_equivocation_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_equivocation: {e}"))?;
+    let policies = [r1.hash, r2.hash, eq.hash];
+    let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
+    let spo_bans = spo_bans_script(
+        &blueprint_json,
+        &registry.hash,
+        &policies,
+        base_ban_duration_ms,
+        max_faults_before_permanent,
+        max_validity_window_ms,
+        &ban_tx_id,
+        u64::from(ban_index),
+    )
+    .map_err(|e| format!("parameterize spo_bans: {e}"))?;
+
+    println!(
+        "spo_bans policy id (ban-list policy): {}",
+        spo_bans.hash_hex()
+    );
+    println!("fault_proof_policies (round1, round2, equivocation):");
+    println!("  {}", r1.hash_hex());
+    println!("  {}", r2.hash_hex());
+    println!("  {}", eq.hash_hex());
+
+    if !submit {
+        println!(
+            "(dry run — hashes only, no wallet needed; pass --submit to deploy the spo_bans ref UTxO)"
+        );
+        return Ok(());
+    }
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let built = build_ref_script_deploy_tx(
+        &spo_bans,
+        &wallet_addr,
+        &wallet_utxos,
+        &key,
+        Some(cost_models),
+    )
+    .map_err(|e| format!("build ref-script deploy tx: {e}"))?;
+
+    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
+    println!("submitted: tx_hash={tx_hash}");
+    println!("spo_bans ref UTxO: {tx_hash}:0  (→ spo_bans_ref in the SPO config)");
+    Ok(())
+}
+
+/// Register the stake credentials of heimdall's withdraw-using scripts.
+///
+/// The table is deliberately a table: today it holds `spo_bans` alone, and a
+/// future heimdall-deployed withdraw script is one more row rather than another
+/// command. `peg_in`/`peg_out` are *not* here — binocular's `deploy-bridge`
+/// registers them in its bootstrap tx, and re-registering is a ledger error.
+#[allow(clippy::too_many_arguments)]
+fn run_init_scripts(
+    cfg: &HeimdallConfig,
+    blueprint_path: &str,
+    registry_bootstrap: &str,
+    ban_bootstrap: &str,
+    base_ban_duration_ms: i64,
+    max_faults_before_permanent: i64,
+    max_validity_window_ms: i64,
+    key_deposit_override: Option<u64>,
+    submit: bool,
+) -> Result<(), String> {
+    use heimdall::cardano::bf_http::{self, RegistrationState};
+    use heimdall::cardano::blueprint::{
+        fault_verifier_equivocation_script, fault_verifier_round1_script,
+        fault_verifier_round2_script, spo_bans_script, spos_registry_script,
+    };
+    use heimdall::cardano::init_scripts::{
+        WithdrawScript, build_init_scripts_tx, is_already_registered_error,
+    };
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::tx_common::is_testnet_address;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    // Derive spo_bans exactly as deploy-spo-bans-ref and
+    // DkgFaultBanFlow::from_config do — recomputing the fault-verifier policy
+    // ids from the blueprint rather than reading cfg.fault_proof_policies, so
+    // the credential we register cannot drift from the one ApplyBan withdraws.
+    let blueprint_json = std::fs::read_to_string(blueprint_path)
+        .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let r1 = fault_verifier_round1_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_round1: {e}"))?;
+    let r2 = fault_verifier_round2_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_round2: {e}"))?;
+    let eq = fault_verifier_equivocation_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("fault_verifier_equivocation: {e}"))?;
+    let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
+    let spo_bans = spo_bans_script(
+        &blueprint_json,
+        &registry.hash,
+        &[r1.hash, r2.hash, eq.hash],
+        base_ban_duration_ms,
+        max_faults_before_permanent,
+        max_validity_window_ms,
+        &ban_tx_id,
+        u64::from(ban_index),
+    )
+    .map_err(|e| format!("parameterize spo_bans: {e}"))?;
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let mainnet = !is_testnet_address(&wallet_addr);
+
+    let scripts = vec![WithdrawScript {
+        name: "spo_bans",
+        hash_hex: spo_bans.hash_hex(),
+        reward_address: spo_bans.reward_address(mainnet),
+    }];
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    // Filter per credential, not per transaction: one already-registered script
+    // must not block the rest, or a partially-applied init could never converge.
+    println!("withdraw-using scripts deployed by heimdall:");
+    let mut pending: Vec<WithdrawScript> = Vec::new();
+    for s in scripts {
+        let state = rt
+            .block_on(bf_http::fetch_account_registered(
+                &base_url,
+                pid,
+                &s.reward_address,
+            ))
+            .map_err(|e| format!("registration state of {}: {e}", s.name))?;
+        let label = match state {
+            RegistrationState::Registered => "registered".to_string(),
+            RegistrationState::NotRegistered => "NOT registered".to_string(),
+            // A 404 here is ambiguous — never-registered and route-not-served
+            // are indistinguishable — so say so rather than guessing, and let
+            // the submission arbitrate.
+            RegistrationState::Unknown { http_status } => {
+                format!("unknown (http {http_status}) — will attempt")
+            }
+        };
+        println!("  {:<10} hash={}", s.name, s.hash_hex);
+        println!("             reward={}  [{label}]", s.reward_address);
+        if state != RegistrationState::Registered {
+            pending.push(s);
+        }
+    }
+
+    if pending.is_empty() {
+        println!("all credentials already registered — nothing to do");
+        return Ok(());
+    }
+    if !submit {
+        println!(
+            "(dry run — {} credential(s) to register; pass --submit)",
+            pending.len()
+        );
+        return Ok(());
+    }
+
+    let key_deposit = match key_deposit_override {
+        Some(d) => d,
+        None => rt
+            .block_on(bf_http::fetch_key_deposit(&base_url, pid))
+            .map_err(|e| format!("fetch key_deposit: {e}"))?,
+    };
+    let raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    // Never let coin selection consume either one-shot bootstrap outref. Both
+    // parameterize script hashes — the registry's, and (through the ban list)
+    // the very `spo_bans` credential this command registers. Ordering puts this
+    // command after both bootstraps, so normally they are already spent; but the
+    // ordering is documentation, not an interlock, and spending the ban outref
+    // early would register a credential for a `spo_bans` that can now never be
+    // bootstrapped at that hash — silently. `run_bootstrap_registry` guards the
+    // registry outref for the same reason.
+    let reg_outref = (hex::encode(reg_tx_id), reg_index);
+    let ban_outref = (hex::encode(ban_tx_id), ban_index);
+    let wallet_utxos: Vec<WalletUtxo> = raw
+        .iter()
+        .map(WalletUtxo::from_bf)
+        .filter(|u| {
+            let this = (u.tx_hash.clone(), u.output_index);
+            this != reg_outref && this != ban_outref
+        })
+        .collect();
+    if wallet_utxos.is_empty() {
+        return Err(format!(
+            "wallet has no spendable UTxOs besides the bootstrap one-shot outrefs — \
+             fund it first (address: {wallet_addr})"
+        ));
+    }
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let built = build_init_scripts_tx(
+        &pending,
+        key_deposit,
+        &wallet_addr,
+        &wallet_utxos,
+        &key,
+        Some(cost_models),
+    )
+    .map_err(|e| format!("build init-scripts tx: {e}"))?;
+    println!(
+        "registering {} credential(s), locking {} lovelace of deposits ({key_deposit} each)",
+        pending.len(),
+        built.deposit_total
+    );
+
+    match submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt) {
+        Ok(tx_hash) => {
+            println!("submitted init-scripts: tx_hash={tx_hash}");
+            Ok(())
+        }
+        // Idempotency backstop for backends whose /accounts route we cannot
+        // trust: a phase-1 "already registered" rejection is the state we
+        // wanted, at no cost.
+        Err(e) if is_already_registered_error(&e) => {
+            println!("credentials already registered on chain (submission rejected: {e})");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// register-spo CLI inputs, bundled (clap hands us a dozen options).
 struct RegisterSpoArgs {
     blueprint: String,
@@ -1708,6 +2745,7 @@ struct ApplyBanArgs {
     registry_bootstrap: String,
     accused_pool_id: String,
     evidence_hash: String,
+    fault_kind: String,
     spo_bans_ref: String,
     submit: bool,
 }
@@ -1716,11 +2754,7 @@ struct ApplyBanArgs {
 struct FaultProofMintArgs {
     blueprint: String,
     registry_bootstrap: String,
-    evidence_file: Option<String>,
-    kind: Option<String>,
-    accused_pool_id: Option<String>,
-    namespace_hash: Option<String>,
-    evidence_hash: Option<String>,
+    evidence_file: String,
     submit: bool,
 }
 
@@ -1756,10 +2790,18 @@ fn parse_hex_n<const N: usize>(arg: &str, what: &str) -> Result<[u8; N], String>
         .ok_or_else(|| format!("{what}: expected {N} bytes of hex"))
 }
 
-/// Unwrap a CLI arg that is required unless `--evidence-file` supplies it.
-fn req_arg<'a>(arg: &'a Option<String>, what: &str) -> Result<&'a str, String> {
-    arg.as_deref()
-        .ok_or_else(|| format!("{what} is required (or pass --evidence-file)"))
+fn parse_fault_verifier_kind(
+    value: &str,
+) -> Result<heimdall::cardano::blueprint::FaultVerifierKind, String> {
+    use heimdall::cardano::blueprint::FaultVerifierKind;
+    match value {
+        "round1" | "invalid-payload-round1" => Ok(FaultVerifierKind::Round1),
+        "round2" | "invalid-payload-round2" => Ok(FaultVerifierKind::Round2),
+        "equivocation" => Ok(FaultVerifierKind::Equivocation),
+        other => Err(format!(
+            "fault kind must be round1, round2, or equivocation; got `{other}`"
+        )),
+    }
 }
 
 fn parse_points(hexes: &[String]) -> Result<Vec<[u8; 33]>, String> {
@@ -1778,9 +2820,12 @@ fn parse_points(hexes: &[String]) -> Result<Vec<[u8; 33]>, String> {
 /// accused did not author.
 ///
 /// One of three shapes selected by `kind`:
-/// - `"invalid-payload-round1"`: `identifier`, `commitments[]`, `sigma_i`, `payload_signature`
-/// - `"invalid-payload-round2"`: `recipient_index`, `sender_commitments[]`, `share`,
-///   `round2_canonical_bytes`, `payload_signature`
+/// - `"invalid-payload-round1"`: `identifier`, `commitments[]`, `sigma_i`,
+///   `payload_signature`, `halo2_proof`
+/// - `"invalid-payload-round2"`: `recipient_index`, `round2_entry_index`,
+///   `sender_commitments[]`, `canonical_round1_bytes`, `round1_signature`,
+///   `share`, `pad`, `round2_canonical_bytes`, `round2_signature`,
+///   `halo2_proof`
 /// - `"equivocation"`: `round` (`"round1"|"round2"`), `payload_a`/`signature_a`,
 ///   `payload_b`/`signature_b` (payloads are the canonical signed bytes)
 ///
@@ -1805,9 +2850,21 @@ struct EvidenceFile {
     #[serde(default)]
     sender_commitments: Option<Vec<String>>,
     #[serde(default)]
+    canonical_round1_bytes: Option<String>,
+    #[serde(default)]
+    round1_signature: Option<String>,
+    #[serde(default)]
+    round2_entry_index: Option<u32>,
+    #[serde(default)]
     share: Option<String>,
     #[serde(default)]
+    pad: Option<String>,
+    #[serde(default)]
     round2_canonical_bytes: Option<String>,
+    #[serde(default)]
+    round2_signature: Option<String>,
+    #[serde(default)]
+    halo2_proof: Option<String>,
     #[serde(default)]
     payload_signature: Option<String>,
     #[serde(default)]
@@ -1822,22 +2879,40 @@ struct EvidenceFile {
     signature_b: Option<String>,
 }
 
-/// The datum fields `build_fault_proof_mint_tx` needs, derived from captured
-/// evidence, plus the on-chain `EquivocationProof` witness when applicable.
+/// The evidence fields `build_fault_proof_mint_tx` needs, derived from captured
+/// evidence.
 #[derive(Debug)]
 struct DerivedFault {
-    kind: heimdall::cardano::fault_proof::FaultKind,
-    accused_pool_id: Vec<u8>,
+    kind: heimdall::cardano::blueprint::FaultVerifierKind,
+    accused_pool_id: [u8; 28],
     namespace_hash: [u8; 32],
     evidence_hash: [u8; 32],
-    /// `Some` iff `kind == Equivocation` — the two signed payloads the
-    /// `fault_verifier` EquivocationProof branch verifies.
+    round1_invalid: Option<DerivedRound1Invalid>,
+    round2_invalid: Option<DerivedRound2Invalid>,
     equivocation: Option<DerivedEquivocation>,
 }
 
 #[derive(Debug)]
+struct DerivedRound1Invalid {
+    canonical_round1_bytes: Vec<u8>,
+    payload_signature: [u8; 64],
+    halo2_proof: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct DerivedRound2Invalid {
+    canonical_round1_bytes: Vec<u8>,
+    round1_signature: [u8; 64],
+    canonical_round2_bytes: Vec<u8>,
+    round2_signature: [u8; 64],
+    round2_entry_index: u32,
+    pad: [u8; 32],
+    opened_share: [u8; 32],
+    halo2_proof: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct DerivedEquivocation {
-    bifrost_id_pk: [u8; 32],
     payload_a: Vec<u8>,
     signature_a: [u8; 64],
     payload_b: Vec<u8>,
@@ -1852,12 +2927,28 @@ fn decode_var(v: &Option<String>, what: &str) -> Result<Vec<u8>, String> {
     hex::decode(req_field(v, what)?.trim()).map_err(|_| format!("{what}: bad hex"))
 }
 
+fn decode_optional_var(v: &Option<String>) -> Result<Vec<u8>, String> {
+    match v {
+        Some(value) => hex::decode(value.trim()).map_err(|_| "halo2_proof: bad hex".to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn round2_signature_field(file: &EvidenceFile) -> Result<[u8; 64], String> {
+    let raw = file
+        .round2_signature
+        .as_ref()
+        .or(file.payload_signature.as_ref())
+        .ok_or("evidence: missing `round2_signature`")?;
+    parse_hex_n::<64>(raw, "round2_signature")
+}
+
 impl EvidenceFile {
     /// Derive `(kind, accused_pool_id, namespace_hash, evidence_hash)` from the
     /// captured evidence. Verifies the accused's payload signature and that the
     /// evidence actually encodes a fault before deriving.
     fn derive(&self) -> Result<DerivedFault, String> {
-        use heimdall::cardano::fault_proof::FaultKind;
+        use heimdall::cardano::blueprint::FaultVerifierKind;
         use heimdall::circuits::fault_evidence as fe;
 
         let accused_pool_id: [u8; 28] =
@@ -1892,10 +2983,16 @@ impl EvidenceFile {
                     return Err("round1 evidence does not encode a fault (PoK verifies)".into());
                 }
                 Ok(DerivedFault {
-                    kind: FaultKind::InvalidPayload,
-                    accused_pool_id: accused_pool_id.to_vec(),
+                    kind: FaultVerifierKind::Round1,
+                    accused_pool_id,
                     namespace_hash: ev.namespace_hash(),
                     evidence_hash: ev.evidence_hash().map_err(to_err)?,
+                    round1_invalid: Some(DerivedRound1Invalid {
+                        canonical_round1_bytes: ev.canonical_bytes().map_err(to_err)?,
+                        payload_signature: ev.payload_signature,
+                        halo2_proof: decode_optional_var(&self.halo2_proof)?,
+                    }),
+                    round2_invalid: None,
                     equivocation: None,
                 })
             }
@@ -1909,30 +3006,50 @@ impl EvidenceFile {
                     recipient_index: self
                         .recipient_index
                         .ok_or("round2 evidence: missing `recipient_index`")?,
+                    round2_entry_index: self
+                        .round2_entry_index
+                        .ok_or("round2 evidence: missing `round2_entry_index`")?,
                     sender_commitments: parse_points(
                         self.sender_commitments
                             .as_deref()
                             .ok_or("round2 evidence: missing `sender_commitments`")?,
                     )?,
+                    canonical_round1_bytes: decode_var(
+                        &self.canonical_round1_bytes,
+                        "canonical_round1_bytes",
+                    )?,
+                    round1_signature: parse_hex_n::<64>(
+                        req_field(&self.round1_signature, "round1_signature")?,
+                        "round1_signature",
+                    )?,
                     share: parse_hex_n::<32>(req_field(&self.share, "share")?, "share")?,
+                    pad: parse_hex_n::<32>(req_field(&self.pad, "pad")?, "pad")?,
                     round2_canonical_bytes: decode_var(
                         &self.round2_canonical_bytes,
                         "round2_canonical_bytes",
                     )?,
-                    payload_signature: parse_hex_n::<64>(
-                        req_field(&self.payload_signature, "payload_signature")?,
-                        "payload_signature",
-                    )?,
+                    round2_signature: round2_signature_field(self)?,
                 };
                 ev.verify_payload_signature().map_err(to_err)?;
                 if !ev.is_fault().map_err(to_err)? {
                     return Err("round2 evidence does not encode a fault (share verifies)".into());
                 }
                 Ok(DerivedFault {
-                    kind: FaultKind::InvalidPayload,
-                    accused_pool_id: accused_pool_id.to_vec(),
+                    kind: FaultVerifierKind::Round2,
+                    accused_pool_id,
                     namespace_hash: ev.namespace_hash(),
                     evidence_hash: fe::round2_evidence_hash_dyn(&ev).map_err(to_err)?,
+                    round1_invalid: None,
+                    round2_invalid: Some(DerivedRound2Invalid {
+                        canonical_round1_bytes: ev.canonical_round1_bytes,
+                        round1_signature: ev.round1_signature,
+                        canonical_round2_bytes: ev.round2_canonical_bytes,
+                        round2_signature: ev.round2_signature,
+                        round2_entry_index: ev.round2_entry_index,
+                        pad: ev.pad,
+                        opened_share: ev.share,
+                        halo2_proof: decode_optional_var(&self.halo2_proof)?,
+                    }),
                     equivocation: None,
                 })
             }
@@ -1966,12 +3083,13 @@ impl EvidenceFile {
                 };
                 ev.verify().map_err(to_err)?;
                 Ok(DerivedFault {
-                    kind: FaultKind::Equivocation,
-                    accused_pool_id: accused_pool_id.to_vec(),
+                    kind: FaultVerifierKind::Equivocation,
+                    accused_pool_id,
                     namespace_hash: ev.namespace_hash(),
                     evidence_hash: ev.evidence_hash(),
+                    round1_invalid: None,
+                    round2_invalid: None,
                     equivocation: Some(DerivedEquivocation {
-                        bifrost_id_pk: ev.bifrost_id_pk,
                         payload_a: ev.payload_a,
                         signature_a: ev.signature_a,
                         payload_b: ev.payload_b,
@@ -2005,7 +3123,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         registration_message, verify_registration,
     };
     use heimdall::cardano::registry::REGISTRATION_ROOT_KEY;
-    use heimdall::cardano::stake::{check_min_stake, fetch_pool_stake};
+    use heimdall::cardano::stake::{StakeSource, check_min_stake, fetch_pool_stake_src};
     use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
     use pallas_crypto::key::ed25519;
 
@@ -2018,7 +3136,8 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
+    let tm_nft = cfg.cardano.tm_nft_policy()?;
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
         .map_err(|e| format!("parameterize treasury_info: {e}"))?;
 
     // ── identities: local secret keys, or the air-gapped halves ──
@@ -2131,10 +3250,24 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
     // ── R2 min-stake gate: gates submission; a dry run only warns ──
+    let stake_source = StakeSource::from_config(cfg.cardano.stake_source.as_deref())?;
     match cfg.cardano.min_stake_lovelace {
         Some(threshold) => {
+            // yaci-store reads stake per-epoch; Blockfrost ignores the epoch.
+            let epoch = match stake_source {
+                StakeSource::YaciStore => rt
+                    .block_on(bf_http::fetch_current_epoch(&base_url, pid))
+                    .map_err(|e| format!("min-stake gate (epoch): {e}"))?,
+                StakeSource::Blockfrost => 0,
+            };
             let stake = rt
-                .block_on(fetch_pool_stake(&base_url, pid, &pool_id_bech32(&pool_id)))
+                .block_on(fetch_pool_stake_src(
+                    stake_source,
+                    &base_url,
+                    pid,
+                    epoch,
+                    &pool_id_bech32(&pool_id),
+                ))
                 .map_err(|e| format!("min-stake gate: {e}"))?;
             let chk = check_min_stake(&stake, threshold);
             println!(
@@ -2246,6 +3379,377 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex)
 }
 
+struct UpdateYArgs {
+    blueprint: String,
+    registry_bootstrap: String,
+    treasury_nft_name: String,
+    new_key: String,
+    epoch: u64,
+    signer_skey: Option<String>,
+    signature: Option<String>,
+    submit: bool,
+}
+
+struct FederationResetArgs {
+    blueprint: String,
+    registry_bootstrap: String,
+    treasury_nft_name: String,
+    epoch: u64,
+    /// Optional explicit Confirmed federation-sweep TM to reference (TXID:VOUT);
+    /// omit to auto-discover a flagged, fresh Confirmed TM at the TM address.
+    tm_ref: Option<String>,
+    signer_skey: Option<String>,
+    signature: Option<String>,
+    submit: bool,
+}
+
+/// Build (and with `--submit`, broadcast) the Update-Y key-rotation tx: spend the
+/// treasury_info state UTxO with the `UpdateY` redeemer, rotating
+/// `current_spos_frost_key` to `--new-key`. The OUTGOING key signs the
+/// domain-tagged message (Phase 1: the y_fed seed; else `--signer-skey`, or an
+/// air-gapped `--signature`). Submission is permissionless.
+fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> {
+    use bitcoin::key::Secp256k1;
+    use bitcoin::secp256k1::{Keypair, Message};
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::treasury_info::update_y_sig_msg;
+    use heimdall::cardano::treasury_spend::find_treasury_state;
+    use heimdall::cardano::update_y::{UpdateYRequest, build_update_y_tx};
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = std::fs::read_to_string(&args.blueprint)
+        .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let tm_nft = cfg.cardano.tm_nft_policy()?;
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
+        .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+
+    let new_key = parse_hex_n::<32>(&args.new_key, "--new-key")?;
+    let epoch_i64 =
+        i64::try_from(args.epoch).map_err(|_| "epoch too large for Plutus Int".to_string())?;
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    let network = network_of(&wallet_addr);
+    let treasury_addr = treasury.enterprise_address(network);
+    let wallet_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let treasury_utxos = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &treasury_addr))
+        .map_err(|e| format!("treasury UTxO query: {e}"))?;
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+    let window = rt
+        .block_on(bf_http::fetch_epoch_window(&base_url, pid))
+        .map_err(|e| format!("epoch window: {e}"))?;
+
+    let state = find_treasury_state(
+        &treasury_utxos,
+        &treasury.hash_hex(),
+        &args.treasury_nft_name,
+    )
+    .map_err(|e| format!("locate treasury state: {e}"))?;
+
+    let spent_txid: [u8; 32] = hex::decode(&state.tx_hash)
+        .map_err(|e| format!("state txid hex: {e}"))?
+        .try_into()
+        .map_err(|_| "state txid must be 32 bytes".to_string())?;
+    let sig_msg = update_y_sig_msg(&spent_txid, state.output_index, args.epoch, &new_key);
+
+    println!("treasury policy:   {}", treasury.hash_hex());
+    println!(
+        "state UTxO:        {}:{}",
+        state.tx_hash, state.output_index
+    );
+    println!(
+        "current key:       {}",
+        hex::encode(&state.datum.current_spos_frost_key)
+    );
+    println!("new key:           {}", hex::encode(new_key));
+    println!("epoch:             {}", args.epoch);
+    println!("sign message:      {}", hex::encode(sig_msg));
+
+    // Resolve the 64-byte BIP340 signature under the OUTGOING key.
+    let secp = Secp256k1::new();
+    let signature: [u8; 64] = if let Some(sig_hex) = args.signature.as_deref() {
+        parse_hex_n::<64>(sig_hex, "--signature")?
+    } else {
+        let sk = match args.signer_skey.as_deref() {
+            Some(hex_sk) => {
+                bitcoin::secp256k1::SecretKey::from_slice(&parse_key32(hex_sk, "--signer-skey")?)
+                    .map_err(|e| format!("--signer-skey: {e}"))?
+            }
+            // Phase 1 default: the outgoing key is Y_federation.
+            None => y_fed_keypair(&secp, cfg)?.0,
+        };
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let signer_xonly = kp.x_only_public_key().0.serialize();
+        if signer_xonly.as_slice() != state.datum.current_spos_frost_key.as_slice() {
+            return Err(format!(
+                "signer key {} does not match the treasury's current_spos_frost_key {} — the \
+                 OUTGOING key must sign Update-Y (Phase 1: y_fed; else pass --signer-skey, or \
+                 BIP340-sign the printed message and pass --signature)",
+                hex::encode(signer_xonly),
+                hex::encode(&state.datum.current_spos_frost_key)
+            ));
+        }
+        secp.sign_schnorr_no_aux_rand(&Message::from_digest(sig_msg), &kp)
+            .serialize()
+    };
+
+    let req = UpdateYRequest {
+        treasury_script: &treasury,
+        state: &state,
+        new_spos_frost_key: &new_key,
+        epoch: epoch_i64,
+        signature: &signature,
+        wallet_address: &wallet_addr,
+        wallet_utxos: &wallet_utxos,
+        key: &key,
+        invalid_before: Some(window.current_slot),
+        invalid_hereafter: Some(window.epoch_end_slot),
+        cost_models: Some(cost_models),
+    };
+    let built = build_update_y_tx(&req).map_err(|e| format!("build update-y tx: {e}"))?;
+    println!(
+        "rotated key ->:    {}",
+        hex::encode(&built.new_datum.current_spos_frost_key)
+    );
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex)
+}
+
+/// Build (and with `--submit`, broadcast) the emergency FederationReset tx: spend
+/// the treasury_info state UTxO with the `FederationReset` redeemer, referencing a
+/// Confirmed federation-sweep TM (dead-roster evidence), rotating
+/// `current_spos_frost_key` to `y_federation` and advancing `last_reset_tm_txid`.
+/// The FEDERATION signs (Phase 1: the y_fed seed; else `--signer-skey`, or an
+/// air-gapped `--signature`). Submission is permissionless.
+fn run_federation_reset(cfg: &HeimdallConfig, args: &FederationResetArgs) -> Result<(), String> {
+    use bitcoin::key::Secp256k1;
+    use bitcoin::secp256k1::{Keypair, Message};
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
+    use heimdall::cardano::federation_reset::{
+        ConfirmedTmRef, FederationResetRequest, build_federation_reset_tx,
+    };
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::treasury_datum::confirmed_tm_reset_evidence_from_hex;
+    use heimdall::cardano::treasury_info::federation_reset_sig_msg;
+    use heimdall::cardano::treasury_spend::find_treasury_state;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+    use pallas_addresses::{Address, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = std::fs::read_to_string(&args.blueprint)
+        .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let tm_nft = cfg.cardano.tm_nft_policy()?;
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
+        .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+
+    let epoch_i64 =
+        i64::try_from(args.epoch).map_err(|_| "epoch too large for Plutus Int".to_string())?;
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    let network = network_of(&wallet_addr);
+    let treasury_addr = treasury.enterprise_address(network);
+    // The TM validator address = enterprise script address of the TM NFT policy
+    // (binocular's TreasuryMovementValidator hash).
+    let tm_addr = Address::Shelley(ShelleyAddress::new(
+        network,
+        ShelleyPaymentPart::script_hash(tm_nft.into()),
+        ShelleyDelegationPart::Null,
+    ))
+    .to_bech32()
+    .map_err(|e| format!("TM address: {e}"))?;
+
+    let wallet_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let treasury_utxos = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &treasury_addr))
+        .map_err(|e| format!("treasury UTxO query: {e}"))?;
+    let tm_utxos = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &tm_addr))
+        .map_err(|e| format!("TM UTxO query: {e}"))?;
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+    let window = rt
+        .block_on(bf_http::fetch_epoch_window(&base_url, pid))
+        .map_err(|e| format!("epoch window: {e}"))?;
+
+    let state = find_treasury_state(
+        &treasury_utxos,
+        &treasury.hash_hex(),
+        &args.treasury_nft_name,
+    )
+    .map_err(|e| format!("locate treasury state: {e}"))?;
+
+    // Locate the Confirmed federation-sweep TM to reference: a UTxO at the TM
+    // address carrying the TM NFT (policy `tm_nft`, empty asset name → unit is the
+    // policy hex), whose Confirmed datum has spent_via_federation_leaf == true and
+    // btc_txid != the state's last_reset_tm_txid (freshness).
+    let tm_nft_unit = hex::encode(tm_nft);
+    let explicit = args
+        .tm_ref
+        .as_deref()
+        .map(parse_cardano_outref)
+        .transpose()?;
+    let mut chosen: Option<ConfirmedTmRef> = None;
+    for u in &tm_utxos {
+        if !u.amount.iter().any(|a| a.unit == tm_nft_unit) {
+            continue;
+        }
+        if let Some((want_txid, want_vout)) = explicit {
+            if !(u.tx_hash == hex::encode(want_txid) && u.output_index == want_vout) {
+                continue;
+            }
+        }
+        let Some(datum_hex) = u.inline_datum.as_deref() else {
+            continue;
+        };
+        let Some((btc_txid, flag)) = confirmed_tm_reset_evidence_from_hex(datum_hex) else {
+            continue; // not a Confirmed TM
+        };
+        let fresh = btc_txid.to_vec() != state.datum.last_reset_tm_txid;
+        if flag && fresh {
+            chosen = Some(ConfirmedTmRef {
+                tx_hash: u.tx_hash.clone(),
+                output_index: u.output_index,
+                btc_txid: btc_txid.to_vec(),
+            });
+            break;
+        }
+        if explicit.is_some() {
+            return Err(format!(
+                "TM {}:{} is not a usable sweep: spent_via_federation_leaf={flag}, fresh={fresh}",
+                u.tx_hash, u.output_index
+            ));
+        }
+    }
+    let tm_ref = chosen.ok_or_else(|| {
+        "no Confirmed TM at the TM address is a fresh federation-leaf sweep \
+         (spent_via_federation_leaf=true and btc_txid != last_reset_tm_txid) — post + confirm \
+         the federation-sweep TM first"
+            .to_string()
+    })?;
+
+    let spent_txid: [u8; 32] = hex::decode(&state.tx_hash)
+        .map_err(|e| format!("state txid hex: {e}"))?
+        .try_into()
+        .map_err(|_| "state txid must be 32 bytes".to_string())?;
+    let y_federation = state.datum.y_federation.clone();
+    let sig_msg =
+        federation_reset_sig_msg(&spent_txid, state.output_index, args.epoch, &y_federation);
+
+    println!("treasury policy:   {}", treasury.hash_hex());
+    println!(
+        "state UTxO:        {}:{}",
+        state.tx_hash, state.output_index
+    );
+    println!(
+        "current key:       {}",
+        hex::encode(&state.datum.current_spos_frost_key)
+    );
+    println!("y_federation:      {}", hex::encode(&y_federation));
+    println!(
+        "reference TM:      {}:{}  (btc_txid {})",
+        tm_ref.tx_hash,
+        tm_ref.output_index,
+        hex::encode(&tm_ref.btc_txid)
+    );
+    println!("epoch:             {}", args.epoch);
+    println!("sign message:      {}", hex::encode(sig_msg));
+
+    // Resolve the 64-byte BIP340 signature under y_federation (the FEDERATION signs).
+    let secp = Secp256k1::new();
+    let signature: [u8; 64] = if let Some(sig_hex) = args.signature.as_deref() {
+        parse_hex_n::<64>(sig_hex, "--signature")?
+    } else {
+        let sk = match args.signer_skey.as_deref() {
+            Some(hex_sk) => {
+                bitcoin::secp256k1::SecretKey::from_slice(&parse_key32(hex_sk, "--signer-skey")?)
+                    .map_err(|e| format!("--signer-skey: {e}"))?
+            }
+            // Phase 1 default: y_federation is the config y_fed seed.
+            None => y_fed_keypair(&secp, cfg)?.0,
+        };
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let signer_xonly = kp.x_only_public_key().0.serialize();
+        if signer_xonly.as_slice() != y_federation.as_slice() {
+            return Err(format!(
+                "signer key {} does not match the treasury's y_federation {} — the FEDERATION \
+                 key must sign the reset (Phase 1: y_fed seed; else pass --signer-skey, or \
+                 BIP340-sign the printed message and pass --signature)",
+                hex::encode(signer_xonly),
+                hex::encode(&y_federation)
+            ));
+        }
+        secp.sign_schnorr_no_aux_rand(&Message::from_digest(sig_msg), &kp)
+            .serialize()
+    };
+
+    let req = FederationResetRequest {
+        treasury_script: &treasury,
+        state: &state,
+        tm_ref: &tm_ref,
+        epoch: epoch_i64,
+        signature: &signature,
+        wallet_address: &wallet_addr,
+        wallet_utxos: &wallet_utxos,
+        key: &key,
+        invalid_before: Some(window.current_slot),
+        invalid_hereafter: Some(window.epoch_end_slot),
+        cost_models: Some(cost_models),
+    };
+    let built =
+        build_federation_reset_tx(&req).map_err(|e| format!("build federation-reset tx: {e}"))?;
+    println!(
+        "reset key ->:      {}",
+        hex::encode(&built.new_datum.current_spos_frost_key)
+    );
+    println!(
+        "last_reset ->:     {}",
+        hex::encode(&built.new_datum.last_reset_tm_txid)
+    );
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex)
+}
+
 /// Build (and with `--submit`, broadcast) the `spo_bans.ApplyBan` tx: consume a
 /// published FaultProof and write the ban-list node (WI-018 pt4b). The
 /// fault-policy set + ban-schedule params come from `[cardano]` config (they
@@ -2269,7 +3773,8 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let fault = fault_verifier_script(&blueprint_json, &registry.hash)
+    let fault_kind = parse_fault_verifier_kind(&args.fault_kind)?;
+    let fault = fault_verifier_script(&blueprint_json, fault_kind, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
 
     // The ban policy is config-pinned (ban bootstrap + fault-policy set + schedule).
@@ -2372,21 +3877,21 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
         })?;
 
     // Validity interval: [current_slot, current_slot + W), W*1s within both the
-    // ban validator's max_validity_window_ms and the epoch horizon. start_time
-    // is the POSIX-ms upper bound the validator resolves (drives BanNodeData).
-    // NOTE: the exact inclusivity of the resolved upper bound is ledger-defined;
-    // verify start_time against a real node on a devnet before relying on it.
+    // ban validator's max_validity_window_ms and the epoch horizon. Plutus
+    // exposes finite upper bounds as exclusive, so spo_bans resolves the
+    // POSIX-ms upper bound as `slot_to_posix(invalid_hereafter) - 1`.
     let max_window_slots = (params.max_validity_window_ms / 1000).max(1) as u64;
     let avail = window.epoch_end_slot.saturating_sub(window.current_slot);
     let w = max_window_slots.min(avail);
     let invalid_before = window.current_slot;
     let invalid_hereafter = window.current_slot + w;
-    let start_time_ms = window.block_time_ms + (w as i64) * 1000;
+    let start_time_ms = window.block_time_ms + (w as i64) * 1000 - 1;
 
     let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
     let req = ApplyBanRequest {
         spo_bans_script: &spo_bans,
         fault_verifier_script: &fault,
+        fault_verifier_ref: None,
         ban_params: &params,
         accused_pool_id,
         evidence_hash,
@@ -2435,13 +3940,13 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
 
 /// Build (and with `--submit`, broadcast) the `fault_verifier.PublishProof` tx:
 /// mint the FaultProof token `blake2b_256(accused_pool_id || evidence_hash)` and
-/// park it at the wallet with the inline FaultProofDatum (WI-018 pt3b). A later
-/// `apply-ban` consumes + burns it.
+/// park it at the wallet. A later `apply-ban` consumes + burns it.
 fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Result<(), String> {
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{fault_verifier_script, spos_registry_script};
     use heimdall::cardano::fault_proof::{
-        EquivocationWitness, FaultKind, FaultProofDatum, FaultProofMintRequest,
+        EquivocationEvidence as OnchainEquivocationEvidence, FaultProofEvidence,
+        FaultProofMintRequest, Round1InvalidPayloadEvidence, Round2InvalidPayloadEvidence,
         build_fault_proof_mint_tx,
     };
     use heimdall::cardano::publish::WalletUtxo;
@@ -2453,69 +3958,19 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
 
     let blueprint_json = std::fs::read_to_string(&args.blueprint)
         .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
-    // The fault_verifier policy is parameterized by the spos_registry policy id
-    // (its EquivocationProof branch references registration nodes).
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let fault_vscript = fault_verifier_script(&blueprint_json, &registry.hash)
+    let json = std::fs::read_to_string(&args.evidence_file)
+        .map_err(|e| format!("read evidence file {}: {e}", args.evidence_file))?;
+    let ev: EvidenceFile = serde_json::from_str(&json)
+        .map_err(|e| format!("parse evidence file {}: {e}", args.evidence_file))?;
+    let derived = ev.derive()?;
+    println!("derived from evidence ({}):", ev.kind);
+    println!("  evidence_hash:   {}", hex::encode(derived.evidence_hash));
+    println!("  namespace_hash:  {}", hex::encode(derived.namespace_hash));
+    let fault_vscript = fault_verifier_script(&blueprint_json, derived.kind, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
-
-    // Two ways to supply the datum fields: derive them from a captured-evidence
-    // JSON file (WI-019 — real evidence_hash + equivocation witness), or pass
-    // them as opaque hex (InvalidPayload only).
-    let derived: DerivedFault = if let Some(path) = &args.evidence_file {
-        let json =
-            std::fs::read_to_string(path).map_err(|e| format!("read evidence file {path}: {e}"))?;
-        let ev: EvidenceFile =
-            serde_json::from_str(&json).map_err(|e| format!("parse evidence file {path}: {e}"))?;
-        let derived = ev.derive()?;
-        println!("derived from evidence ({}):", ev.kind);
-        println!("  evidence_hash:   {}", hex::encode(derived.evidence_hash));
-        println!("  namespace_hash:  {}", hex::encode(derived.namespace_hash));
-        derived
-    } else {
-        let kind = match args.kind.as_deref() {
-            Some("invalid-payload") => FaultKind::InvalidPayload,
-            Some("equivocation") => {
-                return Err(
-                    "equivocation faults require --evidence-file (the two signed payloads); \
-                     the opaque-hash path only supports invalid-payload"
-                        .into(),
-                );
-            }
-            other => {
-                return Err(format!(
-                    "--kind must be `invalid-payload` (or pass --evidence-file), got {other:?}"
-                ));
-            }
-        };
-        let pool: [u8; 28] = parse_hex_n(
-            req_arg(&args.accused_pool_id, "--accused-pool-id")?,
-            "--accused-pool-id",
-        )?;
-        let ns: [u8; 32] = parse_hex_n(
-            req_arg(&args.namespace_hash, "--namespace-hash")?,
-            "--namespace-hash",
-        )?;
-        let ev: [u8; 32] = parse_hex_n(
-            req_arg(&args.evidence_hash, "--evidence-hash")?,
-            "--evidence-hash",
-        )?;
-        DerivedFault {
-            kind,
-            accused_pool_id: pool.to_vec(),
-            namespace_hash: ns,
-            evidence_hash: ev,
-            equivocation: None,
-        }
-    };
-    let fault = FaultProofDatum {
-        kind: derived.kind,
-        accused_pool_id: derived.accused_pool_id.clone(),
-        namespace_hash: derived.namespace_hash.to_vec(),
-        evidence_hash: derived.evidence_hash.to_vec(),
-    };
 
     let pid = cfg
         .cardano
@@ -2533,52 +3988,90 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
 
-    // For Equivocation, locate the accused's spos_registry node — added as a
-    // read-only reference input so the validator binds bifrost_id_pk to the pool.
-    let registration_ref: Option<(String, u32)> = if derived.equivocation.is_some() {
-        let registry_addr = registry.enterprise_address(network_of(&wallet_addr));
-        let registry_raw = rt
-            .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
-            .map_err(|e| format!("registry UTxO query: {e}"))?;
-        let reg_unit = format!(
-            "{}{}",
-            registry.hash_hex(),
-            hex::encode(&derived.accused_pool_id)
-        );
-        let node = registry_raw
-            .iter()
-            .find(|u| u.amount.iter().any(|a| a.unit == reg_unit))
-            .ok_or_else(|| {
-                format!(
-                    "accused pool {} is not in the on-chain registry — cannot reference it",
-                    hex::encode(&derived.accused_pool_id)
-                )
-            })?;
-        Some((node.tx_hash.clone(), node.output_index))
-    } else {
-        None
+    let registry_addr = registry.enterprise_address(network_of(&wallet_addr));
+    let registry_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
+        .map_err(|e| format!("registry UTxO query: {e}"))?;
+    let reg_unit = format!(
+        "{}{}",
+        registry.hash_hex(),
+        hex::encode(derived.accused_pool_id)
+    );
+    let node = registry_raw
+        .iter()
+        .find(|u| u.amount.iter().any(|a| a.unit == reg_unit))
+        .ok_or_else(|| {
+            format!(
+                "accused pool {} is not in the on-chain registry — cannot reference it",
+                hex::encode(derived.accused_pool_id)
+            )
+        })?;
+    let registration_ref = (node.tx_hash.clone(), node.output_index);
+
+    let public_inputs = vec![
+        derived.evidence_hash.to_vec(),
+        derived.accused_pool_id.to_vec(),
+    ];
+    let evidence = match derived.kind {
+        heimdall::cardano::blueprint::FaultVerifierKind::Round1 => {
+            let Some(round1) = derived.round1_invalid.as_ref() else {
+                return Err("round1 fault evidence missing".into());
+            };
+            if round1.halo2_proof.is_empty() {
+                return Err("round1 invalid-payload evidence requires `halo2_proof`".into());
+            }
+            FaultProofEvidence::Round1InvalidPayload(Round1InvalidPayloadEvidence {
+                accused_pool_id: &derived.accused_pool_id,
+                canonical_round1_bytes: &round1.canonical_round1_bytes,
+                payload_signature: &round1.payload_signature,
+                halo2_proof: &round1.halo2_proof,
+                halo2_public_inputs: &public_inputs,
+            })
+        }
+        heimdall::cardano::blueprint::FaultVerifierKind::Round2 => {
+            let Some(round2) = derived.round2_invalid.as_ref() else {
+                return Err("round2 fault evidence missing".into());
+            };
+            if round2.halo2_proof.is_empty() {
+                return Err("round2 invalid-payload evidence requires `halo2_proof`".into());
+            }
+            FaultProofEvidence::Round2InvalidPayload(Round2InvalidPayloadEvidence {
+                accused_pool_id: &derived.accused_pool_id,
+                canonical_round1_bytes: &round2.canonical_round1_bytes,
+                round1_signature: &round2.round1_signature,
+                canonical_round2_bytes: &round2.canonical_round2_bytes,
+                round2_signature: &round2.round2_signature,
+                round2_entry_index: round2.round2_entry_index,
+                pad: &round2.pad,
+                opened_share: &round2.opened_share,
+                halo2_proof: &round2.halo2_proof,
+                halo2_public_inputs: &public_inputs,
+            })
+        }
+        heimdall::cardano::blueprint::FaultVerifierKind::Equivocation => {
+            let Some(eq) = derived.equivocation.as_ref() else {
+                return Err("equivocation evidence missing".into());
+            };
+            FaultProofEvidence::Equivocation(OnchainEquivocationEvidence {
+                accused_pool_id: &derived.accused_pool_id,
+                payload_a: &eq.payload_a,
+                signature_a: &eq.signature_a,
+                payload_b: &eq.payload_b,
+                signature_b: &eq.signature_b,
+                evidence_hash: &derived.evidence_hash,
+            })
+        }
     };
 
     let req = FaultProofMintRequest {
         fault_verifier_script: &fault_vscript,
-        fault: &fault,
+        fault_verifier_ref_script: None,
+        evidence,
+        registration_ref: (&registration_ref.0, registration_ref.1),
         wallet_address: &wallet_addr,
         wallet_utxos: &wallet_utxos,
         key: &key,
         cost_models: Some(cost_models),
-        equivocation: derived.equivocation.as_ref().map(|e| EquivocationWitness {
-            bifrost_id_pk: &e.bifrost_id_pk,
-            payload_a: &e.payload_a,
-            signature_a: &e.signature_a,
-            payload_b: &e.payload_b,
-            signature_b: &e.signature_b,
-            registration_ref: {
-                let (h, i) = registration_ref
-                    .as_ref()
-                    .expect("equivocation => registration_ref set");
-                (h.as_str(), *i)
-            },
-        }),
     };
     let built =
         build_fault_proof_mint_tx(&req).map_err(|e| format!("build fault-proof mint tx: {e}"))?;
@@ -2592,10 +4085,6 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
     println!(
         "parked at:         {} ({} lovelace) — spend with `apply-ban`",
         built.proof_address, built.lovelace
-    );
-    println!(
-        "nonce input_ref:   {}:{}",
-        built.input_ref.0, built.input_ref.1
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
@@ -2627,10 +4116,12 @@ fn run_show_roster(
         .as_deref()
         .ok_or("cardano.blockfrost_project_id required")?;
 
+    let tm_nft = cfg.cardano.tm_nft_policy()?;
     let source = RegistryRosterSource::from_blueprint(
         &blueprint,
         &bootstrap,
         &nft_name,
+        &tm_nft,
         pid.starts_with("mainnet"),
     )
     .map_err(|e| e.to_string())?;
@@ -2735,34 +4226,61 @@ fn run_show_roster(
         derive_dkg_context, eligible_pool_ids, fetch_eligible_stakes,
     };
     let eligible = eligible_pool_ids(&snapshot, &active_bans);
-    match rt.block_on(fetch_eligible_stakes(&base_url, pid, &eligible)) {
-        Ok(stakes) => match derive_dkg_context(&snapshot, &active_bans, &stakes, epoch, 0) {
-            Ok(ctx) => {
-                println!(
-                    "DKG roster (epoch {epoch}; threshold {} of {}, total stake {}):",
-                    ctx.threshold,
-                    ctx.participants.len(),
-                    ctx.total_stake
-                );
-                for p in &ctx.participants {
-                    println!(
-                        "  #{:<3} pk {}  stake={} {}",
-                        p.index,
-                        hex::encode(&p.bifrost_id_pk),
-                        p.active_stake,
-                        p.bifrost_url
-                    );
-                }
-                for ex in &ctx.excluded {
-                    println!(
-                        "  excluded pool {}: {}",
-                        hex::encode(&ex.pool_id),
-                        ex.reason
-                    );
+    let stake_source =
+        heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
+            .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
+    let exclude_unstaked = cfg.cardano.demo_exclude_unstaked;
+    match rt.block_on(fetch_eligible_stakes(
+        &base_url,
+        pid,
+        &eligible,
+        stake_source,
+        epoch,
+        exclude_unstaked,
+    )) {
+        Ok(stakes) => {
+            // DEMO-ONLY: drop pools whose stake was skipped (mirrors the demo
+            // path) so the threshold below reflects only resolvable-stake pools.
+            let mut bans = active_bans.clone();
+            if exclude_unstaked {
+                for pid2 in &eligible {
+                    if !stakes.contains_key(pid2) {
+                        bans.insert(pid2.clone());
+                    }
                 }
             }
-            Err(e) => println!("DKG roster:        cannot derive ({e})"),
-        },
+            match derive_dkg_context(&snapshot, &bans, &stakes, epoch, 0) {
+                Ok(ctx) => {
+                    println!(
+                        "DKG roster (epoch {epoch}; threshold {} of {}, total stake {}):",
+                        ctx.threshold,
+                        ctx.participants.len(),
+                        ctx.total_stake
+                    );
+                    for p in &ctx.participants {
+                        println!(
+                            "  #{:<3} pk {}  stake={} {}",
+                            p.index,
+                            hex::encode(&p.bifrost_id_pk),
+                            p.active_stake,
+                            p.bifrost_url
+                        );
+                    }
+                    for ex in &ctx.excluded {
+                        // `demo_exclude_unstaked` excludes no-stake pools by adding them to the
+                        // ban set, so `ex.reason` would read "banned" — relabel those accurately
+                        // (they were NOT banned/slashed, just have no resolvable Cardano stake).
+                        let reason = if exclude_unstaked && !active_bans.contains(&ex.pool_id) {
+                            "no active stake (excluded via demo_exclude_unstaked)".to_string()
+                        } else {
+                            ex.reason.to_string()
+                        };
+                        println!("  excluded pool {}: {}", hex::encode(&ex.pool_id), reason);
+                    }
+                }
+                Err(e) => println!("DKG roster:        cannot derive ({e})"),
+            }
+        }
         // A stake query failure is fatal for a real ceremony (the threshold
         // can't be computed), but tolerated in this read-only diagnostic so
         // the registry + ban sections above still print — synthetic preprod
@@ -2775,6 +4293,340 @@ fn run_show_roster(
     Ok(())
 }
 
+/// Background auto-mover loop (WI-028): periodically chain-source the treasury and
+/// post the next Treasury Movement when there is work AND the treasury is free.
+/// Reuses `run_sweep_pegins` in `auto_mode` (busy / idle → skip, not error) so a
+/// transient failure never kills the loop; pacing is implicit — a just-posted
+/// movement shows up as in-flight on the next tick and is skipped until binocular
+/// `confirm-tmtx` advances the tip. No leader election (WI-027): run ONE instance.
+#[allow(clippy::too_many_arguments)]
+fn run_mover(
+    cfg: &HeimdallConfig,
+    cardano_socket: &str,
+    cardano_magic: u64,
+    pegin_script_address: &str,
+    pegin_policy_id: &str,
+    pegout_script_address: &str,
+    bridged_token_unit: &str,
+    interval_secs: u64,
+    once: bool,
+    broadcast: bool,
+    exclude_pegin: &[String],
+) -> Result<(), String> {
+    use std::time::Duration;
+
+    let mut tick: u64 = 0;
+    loop {
+        tick += 1;
+        println!(
+            "\n═══ auto-mover tick #{tick} (interval {interval_secs}s, broadcast={broadcast}) ═══"
+        );
+        let result = run_sweep_pegins(
+            cfg,
+            cardano_socket,
+            cardano_magic,
+            pegin_script_address,
+            pegin_policy_id,
+            None, // chain-source the treasury (WI-028)
+            None,
+            pegout_script_address,
+            bridged_token_unit,
+            broadcast,
+            None, // no existing-tm override
+            exclude_pegin,
+            true, // auto_mode → busy/idle skips instead of erroring
+        );
+        // In --once mode (documented "for testing") propagate the tick result so the
+        // process exit code reflects success/failure. In the continuous loop a tick
+        // error is logged and the loop keeps going.
+        if once {
+            return result;
+        }
+        if let Err(e) = result {
+            eprintln!("[mover] tick #{tick} error (continuing): {e}");
+        }
+        std::thread::sleep(Duration::from_secs(interval_secs));
+    }
+}
+
+/// Read-only `show-treasury`: chain-source the current treasury from Cardano and
+/// print it. The safe way to test WI-028 against a live network — posts nothing.
+fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
+    use bitcoin::ScriptBuf;
+    use bitcoin::key::Secp256k1;
+    use heimdall::bitcoin::taproot::treasury_spend_info;
+    use heimdall::cardano::blockfrost_chain::scan_tm_utxos;
+    use heimdall::cardano::treasury_datum::unspent_tips;
+    use heimdall::frost::dkg::run_demo_dkg;
+
+    let address = cfg
+        .cardano
+        .treasury_address
+        .as_deref()
+        .ok_or("cardano.treasury_address not set")?;
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id not set")?;
+    let base_url = heimdall::cardano::bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let policy = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
+    let asset_unit = format!("{policy}{}", treasury_asset_name_hex(cfg));
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let scan = rt.block_on(scan_tm_utxos(
+        &base_url,
+        pid,
+        address,
+        &asset_unit,
+        cfg.bitcoin.inflight_deadline_secs,
+    ))?;
+
+    println!("TM validator address: {address}");
+    println!("marker unit:          {asset_unit}");
+    println!("confirmed TMs:        {}", scan.confirmed.len());
+    println!("in-flight spends:     {}", scan.in_flight_spends.len());
+    println!("parse failures:       {}", scan.parse_failures);
+    println!("opaque unconfirmed:   {}", scan.opaque_unconfirmed);
+    if scan.parse_failures > 0 {
+        println!(
+            "  ⚠ {} marker-token TM datum(s) failed to parse — chain-source would REFUSE \
+             (mis-root risk)",
+            scan.parse_failures
+        );
+    }
+
+    // Our expected treasury keys: demo Y_51 (deterministic DKG) + federation seed + csv.
+    let secp = Secp256k1::new();
+    let (_sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    let dkg = run_demo_dkg(
+        b"heimdall-demo-seed-v1-0123456789",
+        cfg.demo.min_signers,
+        cfg.demo.max_signers,
+    );
+    let vk = dkg
+        .public_key_package
+        .verifying_key()
+        .serialize()
+        .map_err(|e| format!("group verifying key serialize: {e}"))?;
+    let y_51 = bitcoin::key::UntweakedPublicKey::from_slice(&vk[1..33])
+        .map_err(|e| format!("group key x-only: {e}"))?;
+    let csv = csv_blocks_u16(cfg)?;
+    let expected_spk =
+        ScriptBuf::new_p2tr_tweaked(treasury_spend_info(&secp, y_51, y_fed, csv).output_key());
+    println!("our Y_51:             {}", hex::encode(&vk[1..33]));
+    println!(
+        "expected treasury spk: {}",
+        hex::encode(expected_spk.as_bytes())
+    );
+
+    let tips = unspent_tips(&scan.confirmed);
+    println!("\nunspent tips: {}", tips.len());
+    let mut current = None;
+    for t in &tips {
+        let op = t.treasury_outpoint();
+        let val = t.treasury_value().map(|v| v.to_sat()).unwrap_or(0);
+        let spk = t.treasury_spk().map(hex::encode).unwrap_or_default();
+        let is_ours = t.treasury_spk() == Some(expected_spk.as_bytes());
+        let in_flight = scan.in_flight_spends.contains(&op);
+        println!(
+            "  {op}  {val} sat  spk={spk}{}{}",
+            if is_ours {
+                "  ← MATCHES our keys (current treasury)"
+            } else {
+                ""
+            },
+            if in_flight {
+                "  [movement IN FLIGHT]"
+            } else {
+                ""
+            },
+        );
+        if is_ours {
+            current = Some((op, val, in_flight));
+        }
+    }
+
+    match current {
+        Some((op, val, in_flight)) => {
+            println!("\nCURRENT TREASURY: {op} — {val} sat");
+            if in_flight {
+                println!(
+                    "  a movement is already in flight against it — NOT free to move \
+                     (wait for confirm-tmtx)"
+                );
+            } else {
+                println!(
+                    "  free to move — the auto-mover / sweep-pegins would build the next TM off this"
+                );
+            }
+        }
+        None if tips.is_empty() => {
+            println!("\nno unspent tip — bootstrap (config) treasury would be used")
+        }
+        None => println!(
+            "\nno unspent tip matches our keys ({} tip(s)) — check keys/config",
+            tips.len()
+        ),
+    }
+
+    // Diagnose "why can't the mover advance": list the in-flight (Unconfirmed)
+    // movements and flag the one(s) that spend the current tip — those block the
+    // mover, and if any can never confirm (a spent/missing BTC input) it deadlocks.
+    let tip_op = current.map(|(op, _, _)| op);
+    if !scan.unconfirmed.is_empty() || scan.opaque_unconfirmed > 0 {
+        println!(
+            "\nin-flight (Unconfirmed) movements: {}",
+            scan.unconfirmed.len()
+        );
+        for u in &scan.unconfirmed {
+            // Dead = spends an input a Confirmed TM already swept (oracle-verified
+            // spent) → can never confirm → auto-ignored, no longer blocks the tip.
+            let dead = u.inputs.iter().any(|i| scan.consumed.contains(i));
+            let spends_tip = tip_op.is_some_and(|t| u.inputs.contains(&t));
+            let tag = if dead {
+                "   ← DEAD (spends an already-swept input; can never confirm — auto-ignored)"
+            } else if spends_tip {
+                "   ← SPENDS THE CURRENT TIP (blocks the mover)"
+            } else {
+                ""
+            };
+            println!(
+                "  btc {} — {} input(s), {} output(s){}",
+                u.btc_txid,
+                u.inputs.len(),
+                u.outputs.len(),
+                tag,
+            );
+            for inp in &u.inputs {
+                let mut mark = String::new();
+                if tip_op == Some(*inp) {
+                    mark.push_str("   (= current treasury tip)");
+                }
+                if scan.consumed.contains(inp) {
+                    mark.push_str("   (ALREADY SWEPT — spent per a Confirmed TM)");
+                }
+                println!("      in  {}:{}{}", inp.txid, inp.vout, mark);
+            }
+            for (val, spk) in &u.outputs {
+                println!(
+                    "      out {} sat  {}",
+                    val.to_sat(),
+                    hex::encode(spk.as_bytes())
+                );
+            }
+        }
+        if scan.opaque_unconfirmed > 0 {
+            println!(
+                "  + {} unreadable Unconfirmed TM(s) (BTC tx did not deserialize) — treated as \
+                 blocking (fail-closed)",
+                scan.opaque_unconfirmed
+            );
+        }
+        if let Some(t) = tip_op {
+            let viable_blockers = scan
+                .unconfirmed
+                .iter()
+                .filter(|u| {
+                    u.inputs.contains(&t) && !u.inputs.iter().any(|i| scan.consumed.contains(i))
+                })
+                .count();
+            let dead_blockers = scan
+                .unconfirmed
+                .iter()
+                .filter(|u| {
+                    u.inputs.contains(&t) && u.inputs.iter().any(|i| scan.consumed.contains(i))
+                })
+                .count();
+            if viable_blockers > 0 || scan.opaque_unconfirmed > 0 {
+                println!(
+                    "\nBLOCKED: {viable_blockers} live in-flight movement(s) spend the current tip \
+                     {t} — the mover waits for one to confirm."
+                );
+            } else if dead_blockers > 0 {
+                println!(
+                    "\nNOT BLOCKED: the {dead_blockers} in-flight movement(s) on the tip are DEAD \
+                     (they spend an already-swept input) — auto-ignored, so the mover treats the tip \
+                     as free and will build a fresh TM."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The chain-sourced treasury tip: outpoint + value, and whether a movement is
+/// already in flight against it (an Unconfirmed TM already spends it).
+struct ChainTip {
+    outpoint: bitcoin::OutPoint,
+    value: bitcoin::Amount,
+    in_flight: bool,
+}
+
+/// The treasury marker-token asset name (hex). Shared by every treasury-sourcing
+/// path so they scan the SAME token unit; the real TM validator uses an empty
+/// asset name, the always-ok scaffold uses "TMTx".
+fn treasury_asset_name_hex(cfg: &HeimdallConfig) -> String {
+    cfg.cardano
+        .treasury_asset_name
+        .clone()
+        .unwrap_or_else(|| hex::encode("TMTx"))
+}
+
+/// Chain-source the current Bitcoin treasury UTxO from a pre-fetched TM-UTxO
+/// scan (WI-028): chain-follow the Confirmed datums to the tip whose scriptPubKey
+/// matches `expected_spk`, and return its outpoint + value. `in_flight` is set
+/// when a VIABLE Unconfirmed TM already spends the tip (or an unreadable one) —
+/// the caller decides whether to wait (auto-mover) or error (one-shot sweep), so
+/// we never build a second TM off an unconfirmed treasury. Before the first TM
+/// confirms, falls back to the bootstrap `bitcoin.treasury_txid/vout/amount`.
+///
+/// Takes the scan by ref so the sweep path scans the validator address ONCE and
+/// reuses it for both the peg-in guard and this tip selection.
+fn select_chain_tip(
+    expected_spk: &[u8],
+    scan: &heimdall::cardano::blockfrost_chain::TmScan,
+) -> Result<ChainTip, String> {
+    use heimdall::cardano::treasury_datum::{TipSelectError, select_spendable_tip};
+
+    // A marker-token datum we could not read is a real TM we dropped; chain-follow
+    // on an incomplete set can promote an already-spent parent to a false tip.
+    if scan.parse_failures > 0 {
+        return Err(format!(
+            "{} marker-token TM datum(s) failed to parse — refusing to chain-source the \
+             treasury (would risk re-spending an already-moved UTxO); pass --treasury-outpoint \
+             to override",
+            scan.parse_failures
+        ));
+    }
+
+    let tip = match select_spendable_tip(&scan.confirmed, expected_spk) {
+        Ok(t) => t,
+        // Fresh bridge: no Confirmed TM yet. The local bootstrap config is gone
+        // (DEC-022) — the anchor lives on-chain in the Config UTxO's field 11, which
+        // the epoch daemon resolves automatically; this CLI path takes it explicitly.
+        Err(TipSelectError::NoConfirmedTms) => {
+            return Err(
+                "no Confirmed TM on-chain yet — pass --treasury-outpoint TXID:VOUT and \
+                 --treasury-amount-sat with the bridge's initial treasury anchor (the Config \
+                 UTxO's initial_btc_treasury_utxo, field 11) for the first movement"
+                    .to_string(),
+            );
+        }
+        Err(e) => return Err(format!("treasury tip selection: {e}")),
+    };
+    let outpoint = tip.treasury_outpoint();
+    let in_flight = scan.in_flight_spends.contains(&outpoint) || scan.opaque_unconfirmed > 0;
+    let value = tip
+        .treasury_value()
+        .ok_or("treasury tip datum has no outputs")?;
+    Ok(ChainTip {
+        outpoint,
+        value,
+        in_flight,
+    })
+}
+
 /// Scan binocular's on-chain `PegInRequest` UTxOs over N2C, then build, sign and
 /// (optionally) broadcast the Treasury Movement sweeping the current treasury +
 /// all discovered deposits into a new treasury `output[0]`.
@@ -2783,8 +4635,8 @@ fn run_show_roster(
 /// validated by `parse_pegin_request`, which reconstructs the peg-in P2TR from
 /// `(y_fed, depositor_xonly, refund_timeout)` and requires a matching output —
 /// so a successful parse is itself proof the spend-info matches the on-chain
-/// scriptPubKey. The treasury input is passed by arg (its Cardano oracle UTxO is
-/// not required for the pure-Bitcoin sweep).
+/// scriptPubKey. The treasury input is chain-sourced from the Cardano tip
+/// Confirmed-TM (WI-028) unless overridden by `--treasury-outpoint`.
 #[allow(clippy::too_many_arguments)]
 fn run_sweep_pegins(
     cfg: &HeimdallConfig,
@@ -2792,18 +4644,24 @@ fn run_sweep_pegins(
     cardano_magic: u64,
     pegin_script_address: &str,
     pegin_policy_id: &str,
-    treasury_outpoint: &str,
-    treasury_amount_sat: u64,
+    treasury_outpoint: Option<&str>,
+    treasury_amount_sat: Option<u64>,
     pegout_script_address: &str,
     bridged_token_unit: &str,
     broadcast: bool,
     existing_tm_hex: Option<&str>,
+    exclude_pegin: &[String],
+    // Auto-mover mode (WI-028 background loop): a treasury movement already in
+    // flight, or nothing pending to sweep, is a no-op skip (returns Ok) rather
+    // than an error — so the loop just waits for the next tick. One-shot
+    // `sweep-pegins` passes false (busy/idle stays an explicit outcome).
+    auto_mode: bool,
 ) -> Result<(), String> {
     use bitcoin::key::Secp256k1;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
     use heimdall::bitcoin::taproot::treasury_spend_info;
     use heimdall::bitcoin::tm_builder::{
-        PegInInput, PegOutRequest, TreasuryInput, build_tm, sign_tm_single_key,
+        PegInInput, PegOutRequest, TreasuryInput, build_tm, sign_tm_frost,
     };
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
@@ -2812,9 +4670,27 @@ fn run_sweep_pegins(
     use heimdall::cardano::pegin_datum::parse_pegin_request;
     use heimdall::cardano::pegin_source::CardanoPegInSource;
     use heimdall::cardano::pegout_datum::fetch_pegout_requests;
+    use heimdall::frost::dkg::run_demo_dkg;
 
     let secp = Secp256k1::new();
-    let (sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    let (_sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    // Peg-in internal key + treasury key-path = the FROST group key Y_51, NOT the fe-seed y_fed
+    // (commit 6af7c67 wrongly switched these to y_fed for the demo). Reproduce the deterministic
+    // demo DKG to recover Y_51 + every signing share, then FROST-sign the TM. y_fed survives only
+    // as the treasury federation fallback leaf.
+    let dkg = run_demo_dkg(
+        b"heimdall-demo-seed-v1-0123456789",
+        cfg.demo.min_signers,
+        cfg.demo.max_signers,
+    );
+    let vk = dkg
+        .public_key_package
+        .verifying_key()
+        .serialize()
+        .map_err(|e| format!("group verifying key serialize: {e}"))?;
+    let y_51 = bitcoin::key::UntweakedPublicKey::from_slice(&vk[1..33])
+        .map_err(|e| format!("group key x-only: {e}"))?;
+    println!("  FROST group key Y_51: {}", hex::encode(&vk[1..33]));
     let csv = csv_blocks_u16(cfg)?;
     let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
 
@@ -2853,13 +4729,101 @@ fn run_sweep_pegins(
         reqs.len()
     );
 
+    // Operator-supplied drop list: BTC outpoints whose PIR lingers on Cardano but whose deposit
+    // is already inside the current treasury (swept by an earlier TM, never minted). Re-including
+    // them would spend a UTxO that no longer exists, so drop them before building.
+    let excluded: std::collections::HashSet<bitcoin::OutPoint> = exclude_pegin
+        .iter()
+        .map(|s| parse_outpoint(s))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("--exclude-pegin: {e}"))?;
+
+    // Scan the TM validator UTxOs ONCE (Cardano) — reused for the peg-in guard here
+    // AND the chain-sourced treasury tip below, so a mover tick scans only once.
+    let tm_scan: Option<heimdall::cardano::blockfrost_chain::TmScan> =
+        match cfg.cardano.blockfrost_project_id.as_deref() {
+            Some(pid) => {
+                let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+                let address = cfg.cardano.treasury_address.clone().unwrap_or_default();
+                let asset_unit = format!(
+                    "{}{}",
+                    cfg.cardano.treasury_policy_id.clone().unwrap_or_default(),
+                    treasury_asset_name_hex(cfg)
+                );
+                if address.is_empty() {
+                    None
+                } else {
+                    match rt.block_on(heimdall::cardano::blockfrost_chain::scan_tm_utxos(
+                        &base_url,
+                        pid,
+                        &address,
+                        &asset_unit,
+                        cfg.bitcoin.inflight_deadline_secs,
+                    )) {
+                        Ok(scan) => Some(scan),
+                        Err(e) => {
+                            eprintln!("[sweep] could not scan TM UTxOs: {e}");
+                            None
+                        }
+                    }
+                }
+            }
+            None => None,
+        };
+
+    // Auto-skip peg-ins Cardano already shows as handled — WITHOUT querying Bitcoin.
+    // A peg-in whose deposit is in a Confirmed TM's swept inputs (oracle-verified
+    // spent) or committed to a viable in-flight TM would build an invalid/duplicate
+    // TM. Because `pegin-complete` (fBTC mint) is the depositor's choice and may
+    // never happen, the on-chain PIR can linger forever after its deposit is swept;
+    // we detect that from the Confirmed/Unconfirmed TM datums, not the open PIR.
+    let auto_consumed: std::collections::HashSet<bitcoin::OutPoint> = tm_scan
+        .as_ref()
+        .map(|s| {
+            let mut c = s.consumed.clone();
+            c.extend(s.in_flight_spends.iter().copied());
+            c
+        })
+        .unwrap_or_default();
+
     // Each parse reconstructs and matches the peg-in P2TR, so the returned
     // `spend_info` is itself proof the spend info matches the on-chain
     // scriptPubKey — reuse it directly rather than re-deriving.
     let mut pegin_inputs = Vec::with_capacity(reqs.len());
     for req in &reqs {
-        let parsed = parse_pegin_request(req, y_fed, refund_timeout)
-            .map_err(|e| format!("parse_pegin_request: {e}"))?;
+        // Skip PIRs that don't reconstruct under Y_51 (other bridges' deposits, or encodings we
+        // don't yet support) rather than aborting the whole sweep — a TM sweeps the valid peg-ins
+        // and drops the rest. Mirrors the daemon's collect_pegins drop behaviour.
+        let parsed = match parse_pegin_request(req, y_51, refund_timeout) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("  dropped peg-in {:?}: {e}", req.cardano_utxo);
+                continue;
+            }
+        };
+        let outpoint = OutPoint {
+            txid: parsed.btc_txid,
+            vout: parsed.btc_vout,
+        };
+        if excluded.contains(&outpoint) {
+            println!(
+                "  excluded peg-in {}:{} — {} sat (--exclude-pegin: already in treasury)",
+                parsed.btc_txid,
+                parsed.btc_vout,
+                parsed.value.to_sat(),
+            );
+            continue;
+        }
+        if auto_consumed.contains(&outpoint) {
+            println!(
+                "  auto-skip peg-in {}:{} — {} sat (already swept into a Confirmed TM or committed \
+                 to a live in-flight TM per Cardano; its PIR just isn't minted yet)",
+                parsed.btc_txid,
+                parsed.btc_vout,
+                parsed.value.to_sat(),
+            );
+            continue;
+        }
         println!(
             "  peg-in {}:{} — {} sat (depositor {})",
             parsed.btc_txid,
@@ -2868,10 +4832,7 @@ fn run_sweep_pegins(
             hex::encode(parsed.depositor_xonly_pubkey.serialize()),
         );
         pegin_inputs.push(PegInInput {
-            outpoint: OutPoint {
-                txid: parsed.btc_txid,
-                vout: parsed.btc_vout,
-            },
+            outpoint,
             value: parsed.value,
             spend_info: parsed.spend_info,
         });
@@ -2919,9 +4880,57 @@ fn run_sweep_pegins(
         });
     }
 
-    let treasury_outpoint = parse_outpoint(treasury_outpoint)?;
-    let treasury_spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv);
+    // Auto-mover: with nothing pending, don't post a treasury→treasury self-move
+    // (it would just burn fee) — skip this tick.
+    if auto_mode && pegin_inputs.is_empty() && pegout_requests.is_empty() {
+        println!("[mover] nothing to sweep (0 peg-ins, 0 peg-outs) — skipping tick");
+        return Ok(());
+    }
+
+    let treasury_spend_info = treasury_spend_info(&secp, y_51, y_fed, csv);
     let treasury_spk = ScriptBuf::new_p2tr_tweaked(treasury_spend_info.output_key());
+
+    // Treasury input: an explicit --treasury-outpoint/--treasury-amount-sat pair
+    // overrides; otherwise chain-source it from the Cardano tip Confirmed-TM
+    // (WI-028) so no manual config edit is needed after each movement.
+    let (treasury_outpoint, treasury_amount_sat) = match (treasury_outpoint, treasury_amount_sat) {
+        (Some(o), Some(a)) => {
+            println!("  treasury (CLI override): {o} — {a} sat");
+            (parse_outpoint(o)?, a)
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(
+                "pass BOTH --treasury-outpoint and --treasury-amount-sat, or NEITHER \
+                        (to chain-source the treasury from the Cardano tip Confirmed-TM)"
+                    .to_string(),
+            );
+        }
+        (None, None) => {
+            let scan = tm_scan.as_ref().ok_or(
+                "chain-sourced treasury requires cardano.blockfrost_project_id + \
+                 cardano.treasury_address (or pass --treasury-outpoint and --treasury-amount-sat)",
+            )?;
+            let tip = select_chain_tip(treasury_spk.as_bytes(), scan)?;
+            if tip.in_flight {
+                let msg = format!(
+                    "a treasury movement is already in flight spending tip {} — wait for \
+                     confirm-tmtx before sweeping again",
+                    tip.outpoint
+                );
+                if auto_mode {
+                    println!("[mover] {msg} (skipping tick)");
+                    return Ok(());
+                }
+                return Err(format!("{msg} (or override with --treasury-outpoint)"));
+            }
+            println!(
+                "  treasury (Cardano tip Confirmed-TM): {} — {} sat",
+                tip.outpoint,
+                tip.value.to_sat()
+            );
+            (tip.outpoint, tip.value.to_sat())
+        }
+    };
 
     // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..] = one
     // payment per peg-out (sorted by scriptPubKey inside build_tm).
@@ -2961,8 +4970,8 @@ fn run_sweep_pegins(
         ));
     }
 
-    let signed =
-        sign_tm_single_key(&secp, &unsigned, &sk).map_err(|e| format!("sign sweep: {e}"))?;
+    let signed = sign_tm_frost(&unsigned, &dkg.key_packages, &dkg.public_key_package)
+        .map_err(|e| format!("FROST sign sweep: {e}"))?;
     let local_raw = bitcoin::consensus::encode::serialize(&signed);
     // If an existing-on-Bitcoin TM is provided, the effective tx posted to Cardano is THAT one,
     // not the locally-built one. Deserialize it so every subsequent print (txid, inputs, outputs)
@@ -3095,6 +5104,8 @@ fn run_sweep_pegins(
             federation_csv_blocks: fixture.federation_csv_blocks,
             fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
             per_pegout_fee: fixture.per_pegout_fee,
+            treasury_outpoint: fixture.treasury_outpoint,
+            treasury_value: fixture.treasury_value,
         };
         let mut chain = BlockfrostCardanoChain::new(
             project_id,
@@ -3130,6 +5141,7 @@ fn run_sweep_pegins(
             cfg.cardano.submit_oracle,
             cfg.cardano.oracle_constructor,
         );
+        chain = chain.with_validity_window(cfg.cardano.tm_validity_window_secs.unwrap_or(1800));
         let chain = apply_tm_policy(chain, cfg)?;
         rt.block_on(chain.submit_signed_tm(&raw))
             .map_err(|e| format!("submit_signed_tm: {e}"))?;
@@ -3292,7 +5304,7 @@ mod tests {
     use bitcoin::secp256k1::rand::rngs::OsRng;
     use bitcoin::secp256k1::{Keypair, Secp256k1};
     use frost_secp256k1_tr::Identifier;
-    use heimdall::cardano::fault_proof::FaultKind;
+    use heimdall::cardano::blueprint::FaultVerifierKind;
     use heimdall::circuits::fault_evidence as fe;
     use heimdall::frost::participant;
     use heimdall::http::{auth, canonical, frost_bridge};
@@ -3317,7 +5329,10 @@ mod tests {
             sigma_i[32..64].copy_from_slice(&corrupt_scalar(&mu));
         }
         let pool = [0x11u8; 28];
-        let canonical_bytes = canonical::round1(7, 51, 0, &pool, &commitments, &sigma_i);
+        let evidence_hash =
+            fe::round1_evidence_hash_from_fields(&pool, 1, &commitments, &sigma_i).unwrap();
+        let canonical_bytes =
+            canonical::round1(7, 51, 0, &pool, &commitments, &sigma_i, &evidence_hash);
         let secp = Secp256k1::new();
         let (sk, _pk) = secp.generate_keypair(&mut OsRng);
         let kp = Keypair::from_secret_key(&secp, &sk);
@@ -3354,10 +5369,12 @@ mod tests {
         let ev = signed_round1(true);
         let parsed: EvidenceFile = serde_json::from_value(round1_json(&ev)).unwrap();
         let d = parsed.derive().unwrap();
-        assert_eq!(d.kind, FaultKind::InvalidPayload);
-        assert_eq!(d.accused_pool_id, ev.accused_pool_id.to_vec());
+        assert_eq!(d.kind, FaultVerifierKind::Round1);
+        assert_eq!(d.accused_pool_id, ev.accused_pool_id);
         assert_eq!(d.evidence_hash, ev.evidence_hash().unwrap());
         assert_eq!(d.namespace_hash, ev.namespace_hash());
+        assert!(d.round1_invalid.is_some());
+        assert!(d.round2_invalid.is_none());
         assert!(d.equivocation.is_none());
     }
 
@@ -3399,7 +5416,9 @@ mod tests {
                 participant::dkg_part1(Identifier::try_from(1u16).unwrap(), 3, 2, &mut rng)
                     .unwrap();
             let (commitments, sigma_i) = frost_bridge::round1_fields(&pkg).unwrap();
-            let bytes = canonical::round1(3, 51, 1, &pool, &commitments, &sigma_i);
+            let evidence_hash =
+                fe::round1_evidence_hash_from_fields(&pool, 1, &commitments, &sigma_i).unwrap();
+            let bytes = canonical::round1(3, 51, 1, &pool, &commitments, &sigma_i, &evidence_hash);
             let sig = auth::sign_payload(&secp, &kp, &bytes);
             (bytes, sig)
         };
@@ -3435,13 +5454,12 @@ mod tests {
         });
         let parsed: EvidenceFile = serde_json::from_value(json).unwrap();
         let d = parsed.derive().unwrap();
-        assert_eq!(d.kind, FaultKind::Equivocation);
-        assert_eq!(d.accused_pool_id, ev.accused_pool_id.to_vec());
+        assert_eq!(d.kind, FaultVerifierKind::Equivocation);
+        assert_eq!(d.accused_pool_id, ev.accused_pool_id);
         assert_eq!(d.evidence_hash, ev.evidence_hash());
         assert_eq!(d.namespace_hash, ev.namespace_hash());
         // the equivocation witness is carried through to the mint redeemer
         let w = d.equivocation.expect("equivocation witness");
-        assert_eq!(w.bifrost_id_pk, ev.bifrost_id_pk);
         assert_eq!(w.payload_a, ev.payload_a);
         assert_eq!(w.signature_a, ev.signature_a);
         assert_eq!(w.payload_b, ev.payload_b);

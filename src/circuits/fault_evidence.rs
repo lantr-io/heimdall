@@ -10,10 +10,11 @@
 //!    malformed PoK, or a sender's commitments + a decrypted bad share, or
 //!    two conflicting signed payloads) are the inputs here.
 //! 2. **The Axiom/Halo2 fault PROVER** (`circuits::dkg_fault`) — round1
-//!    PoK-fault and round2 share-fault circuits whose single public input is
-//!    `Poseidon(message)` (a `BlsFr`). The circuit *attests* that the
-//!    committed payload is genuinely faulty (`μ·G − c·φ₀ ≠ R`, resp.
-//!    `f_i(l)·G ≠ Σ_j l^j φ_{i,j}`).
+//!    PoK-fault and round2 share-fault circuits whose public inputs are
+//!    `[evidence_hash, pool_id]`, where
+//!    `evidence_hash = Poseidon(pool_id, message_fields)`. The circuit
+//!    *attests* that the committed payload is genuinely faulty
+//!    (`μ·G − c·φ₀ ≠ R`, resp. `f_i(l)·G ≠ Σ_j l^j φ_{i,j}`).
 //! 3. **The WI-016 mint tx** (`cardano::fault_proof::build_fault_proof_mint_tx`)
 //!    — mints the `FaultProof` token named `blake2b_256(pool_id ‖ evidence_hash)`.
 //!
@@ -23,10 +24,10 @@
 //! payload. The protocol uses the **sign-the-hash** scheme: every DKG payload
 //! carries a BIP-340 signature by the accused's `bifrost_id_pk` over
 //! `message_hash = SHA256(canonical_bytes)`. A direct-fault submission therefore
-//! carries (§9.2): `message_hash` (32B) + the accused signature (64B) + the
-//! Halo2 proof + its public inputs; the verifier policy checks
-//! `verifySchnorrSecp256k1Signature(bifrost_id_pk, message_hash, signature)` AND
-//! the proof.
+//! carries (§9.2): the signed canonical payload bytes + the accused signature
+//! (64B) + the Halo2 proof + its public inputs; the verifier policy checks
+//! `verifySchnorrSecp256k1Signature(bifrost_id_pk, SHA256(canonical_bytes),
+//! signature)` AND the proof.
 //!
 //! So every invalid-payload evidence type here carries the accused's
 //! `bifrost_id_pk`, the `(epoch, threshold, attempt, pool_id)` namespace, and
@@ -40,18 +41,16 @@
 //! ## The bridge — `evidence_hash`
 //!
 //! - `InvalidPayload`: `evidence_hash = digest.to_repr()` — the 32-byte little-
-//!   endian serialization of the circuit's public input. The on-chain
-//!   `fault_token_name` preimage uses exactly these bytes (see the
-//!   `dkg_fault_onchain` bench, which signs/binds `digest.to_repr()`), so when
-//!   the upstream ZK verify lands it can recompute the token name from the
-//!   verified public input and they must match. NOTE: connecting that Poseidon
-//!   public input to the SHA256 `message_hash` the accused signed is still an
-//!   upstream circuit concern (the circuit does not compute SHA256) — see
-//!   `technical_questions.md` §5a.
-//! - `Equivocation`: no ZK. `evidence_hash = blake2b_256(min(a,b) ‖ max(a,b))`
-//!   over the two conflicting signed payload byte strings. Sorting makes it
-//!   order-independent. This preimage is heimdall's choice, not yet pinned by
-//!   the (permissive) contract.
+//!   endian serialization of public input 0. Public input 1 is the 28-byte
+//!   accused `pool_id` interpreted as a little-endian BLS scalar. The signed
+//!   DKG payload carries this `evidence_hash`, so the generated verifier must
+//!   pass exactly `[evidence_hash, pool_id]`, and the on-chain token name is
+//!   `blake2b_256(pool_id || evidence_hash)`.
+//! - `Equivocation`: no ZK.
+//!   `evidence_hash = blake2b_256("bifrost-fault-equiv-v1" ‖ len(lo) ‖ lo ‖ len(hi) ‖ hi)`
+//!   over the two conflicting signed payload byte strings, where `lo <= hi`.
+//!   Sorting makes it order-independent, and length prefixes keep the preimage
+//!   unambiguous.
 //!
 //! ## Cost
 //!
@@ -90,15 +89,15 @@ use k256::{
 use rand::{SeedableRng, rngs::StdRng};
 use sha2::{Digest, Sha256};
 
-use crate::cardano::fault_proof::{FaultKind, FaultProofDatum};
 use crate::cardano::hash::blake2b_256;
 use crate::circuits::cardano_transcript::{CardanoBlake2bRead, CardanoBlake2bWrite};
 use crate::circuits::dkg_fault::{
-    AxiomDkgCircuitParams, DkgRound1PokDigestFaultWitness, DkgRound2ShareFaultWitness,
-    axiom_point_from_compressed, build_round1_digest_fault_keygen_circuit,
-    build_round1_digest_fault_prover_circuit, build_round2_digest_fault_keygen_circuit,
-    build_round2_digest_fault_prover_circuit, is_identity, round1_digest_residual,
-    round1_hdk_challenge, round1_message_digest, round2_message_digest, round2_residual,
+    AxiomDkgCircuitParams, DKG_POOL_ID_BYTES, DkgRound1PokDigestFaultWitness,
+    DkgRound2ShareFaultWitness, axiom_point_from_compressed,
+    build_round1_digest_fault_keygen_circuit, build_round1_digest_fault_prover_circuit,
+    build_round2_digest_fault_keygen_circuit, build_round2_digest_fault_prover_circuit,
+    is_identity, round1_digest_fault_public_inputs, round1_digest_residual, round1_hdk_challenge,
+    round1_message_digest, round2_digest_fault_public_inputs, round2_residual,
 };
 use crate::http::{auth, canonical};
 
@@ -107,7 +106,8 @@ use crate::http::{auth, canonical};
 pub const DKG_INDEX_BITS: usize = 16;
 
 /// 28-byte `blake2b_224(cold_vkey)` pool id.
-const POOL_ID_LEN: usize = 28;
+const POOL_ID_LEN: usize = DKG_POOL_ID_BYTES;
+const EQUIVOCATION_DOMAIN: &[u8] = b"bifrost-fault-equiv-v1";
 
 /// Anything that can go wrong turning captured bytes into a fault proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,8 +209,9 @@ fn verify_sig(
 ///
 /// The remaining fields are the **authentication envelope**: the accused signed
 /// `SHA256(canonical_bytes)` — where `canonical_bytes` is rebuilt from the
-/// namespace + `commitments` + `sigma_i` — with `bifrost_id_pk`. So the same
-/// bytes the circuit proves invalid are the bytes the accused authenticated.
+/// namespace + `commitments` + `sigma_i` + `evidence_hash` — with
+/// `bifrost_id_pk`. So the same evidence hash the circuit opens is the one the
+/// accused authenticated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Round1PokFaultEvidence {
     pub epoch: u64,
@@ -234,9 +235,8 @@ pub struct Round1PokFaultEvidence {
 ///
 /// `round2_canonical_bytes` are the full Round 2 payload (the encrypted-share
 /// vector) the sender BIP-340-signed; `message_hash = SHA256(round2_canonical_bytes)`.
-/// Binding the *decrypted* `share` to a ciphertext inside those bytes is an
-/// upstream circuit concern (the `dkg_fault` circuit takes the plaintext share,
-/// not the ECDH decryption) — see `technical_questions.md` §5a.
+/// The selected share entry carries this circuit's `evidence_hash`; the
+/// on-chain policy checks that the opened ciphertext/pad matches the entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Round2ShareFaultEvidence {
     pub epoch: u64,
@@ -247,12 +247,20 @@ pub struct Round2ShareFaultEvidence {
     /// The accused SENDER's x-only bifrost identity key.
     pub bifrost_id_pk: [u8; 32],
     pub recipient_index: u16,
+    /// Index of this recipient's entry in the signed canonical Round 2 payload.
+    pub round2_entry_index: u32,
     pub sender_commitments: Vec<[u8; 33]>,
+    /// The exact Round 1 canonical bytes that introduced `sender_commitments`.
+    pub canonical_round1_bytes: Vec<u8>,
+    /// Accused's BIP-340 signature over `SHA256(canonical_round1_bytes)`.
+    pub round1_signature: [u8; 64],
     pub share: [u8; 32],
+    /// One-time pad opening the selected Round 2 ciphertext.
+    pub pad: [u8; 32],
     /// The exact Round 2 canonical bytes the sender signed.
     pub round2_canonical_bytes: Vec<u8>,
     /// Accused's BIP-340 signature over `SHA256(round2_canonical_bytes)`.
-    pub payload_signature: [u8; 64],
+    pub round2_signature: [u8; 64],
 }
 
 /// Two conflicting, same-namespace, BIP-340-signed payloads from one accused.
@@ -315,25 +323,87 @@ pub fn round2_params() -> AxiomDkgCircuitParams {
     AxiomDkgCircuitParams::round2_digest_fault()
 }
 
+pub fn round1_evidence_hash_from_fields(
+    accused_pool_id: &[u8; POOL_ID_LEN],
+    identifier: u16,
+    commitments: &[[u8; 33]],
+    sigma_i: &[u8; 64],
+) -> Result<[u8; 32], FaultEvidenceError> {
+    let phi0 = checked_point(
+        commitments
+            .first()
+            .ok_or(FaultEvidenceError::NoCommitments)?,
+    )?;
+    let mu_bytes: [u8; 32] = sigma_i[32..64].try_into().expect("64-byte sigma");
+    let mu = checked_scalar(&mu_bytes)?;
+    let mut r_compressed = [0u8; 33];
+    r_compressed[0] = 0x02;
+    r_compressed[1..].copy_from_slice(&sigma_i[0..32]);
+    let transcript_r = checked_point(&r_compressed)?;
+    let witness = DkgRound1PokDigestFaultWitness {
+        accused_pool_id: *accused_pool_id,
+        identifier: u64::from(identifier),
+        mu,
+        challenge: Fq::ZERO,
+        phi0,
+        transcript_r,
+    };
+    Ok(digest_bytes(round1_message_digest(
+        round1_params(),
+        &witness,
+    )))
+}
+
+pub fn round2_evidence_hash_from_fields_dyn(
+    accused_pool_id: &[u8; POOL_ID_LEN],
+    recipient_index: u16,
+    sender_commitments: &[[u8; 33]],
+    share: &[u8; 32],
+) -> Result<[u8; 32], FaultEvidenceError> {
+    let evidence = Round2ShareFaultEvidence {
+        epoch: 0,
+        threshold: 0,
+        attempt: 0,
+        accused_pool_id: *accused_pool_id,
+        bifrost_id_pk: [0u8; 32],
+        recipient_index,
+        round2_entry_index: 0,
+        sender_commitments: sender_commitments.to_vec(),
+        share: *share,
+        canonical_round1_bytes: Vec::new(),
+        round1_signature: [0u8; 64],
+        pad: [0u8; 32],
+        round2_canonical_bytes: Vec::new(),
+        round2_signature: [0u8; 64],
+    };
+    round2_evidence_hash_dyn(&evidence)
+}
+
 impl Round1PokFaultEvidence {
-    /// The exact bytes the accused signed: `TAG_R1 ‖ namespace ‖ φ… ‖ σ_i`.
-    #[must_use]
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        canonical::round1(
+    /// The exact bytes the accused signed:
+    /// `TAG_R1 ‖ namespace ‖ φ… ‖ σ_i ‖ evidence_hash`.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, FaultEvidenceError> {
+        let evidence_hash = self.evidence_hash()?;
+        Ok(canonical::round1(
             self.epoch,
             self.threshold,
             self.attempt,
             &self.accused_pool_id,
             &self.commitments,
             &self.sigma_i,
-        )
+            &evidence_hash,
+        ))
     }
 
     /// `message_hash = SHA256(canonical_bytes)` — the §9.2 submission field the
     /// fault verifier checks the accused signature against.
     #[must_use]
     pub fn message_hash(&self) -> [u8; 32] {
-        sha256(&self.canonical_bytes())
+        sha256(
+            &self
+                .canonical_bytes()
+                .expect("validated round1 evidence has canonical bytes"),
+        )
     }
 
     /// Confirm the accused actually authored this payload (BIP-340 over
@@ -341,7 +411,7 @@ impl Round1PokFaultEvidence {
     pub fn verify_payload_signature(&self) -> Result<(), FaultEvidenceError> {
         verify_sig(
             &self.bifrost_id_pk,
-            &self.canonical_bytes(),
+            &self.canonical_bytes()?,
             &self.payload_signature,
         )
     }
@@ -374,6 +444,7 @@ impl Round1PokFaultEvidence {
         r_compressed[1..].copy_from_slice(&self.sigma_i[0..32]);
         let transcript_r = checked_point(&r_compressed)?;
         let probe = DkgRound1PokDigestFaultWitness {
+            accused_pool_id: self.accused_pool_id,
             identifier: u64::from(self.identifier),
             mu,
             challenge: Fq::ZERO,
@@ -390,11 +461,16 @@ impl Round1PokFaultEvidence {
         Ok(round1_digest_residual(&w) != w.transcript_r)
     }
 
-    /// The 32-byte `evidence_hash` = the circuit public input `Poseidon(msg)`.
-    /// Cheap: no proof, no SRS.
-    pub fn evidence_hash(&self) -> Result<[u8; 32], FaultEvidenceError> {
+    /// The circuit public inputs: `[evidence_hash, pool_id]`.
+    pub fn public_inputs(&self) -> Result<Vec<BlsFr>, FaultEvidenceError> {
         let w = self.witness()?;
-        Ok(digest_bytes(round1_message_digest(round1_params(), &w)))
+        Ok(round1_digest_fault_public_inputs(round1_params(), &w))
+    }
+
+    /// The 32-byte `evidence_hash` = the first circuit public input,
+    /// `Poseidon(pool_id, msg)`. Cheap: no proof, no SRS.
+    pub fn evidence_hash(&self) -> Result<[u8; 32], FaultEvidenceError> {
+        Ok(digest_bytes(self.public_inputs()?[0]))
     }
 }
 
@@ -409,8 +485,13 @@ impl Round2ShareFaultEvidence {
     pub fn verify_payload_signature(&self) -> Result<(), FaultEvidenceError> {
         verify_sig(
             &self.bifrost_id_pk,
+            &self.canonical_round1_bytes,
+            &self.round1_signature,
+        )?;
+        verify_sig(
+            &self.bifrost_id_pk,
             &self.round2_canonical_bytes,
-            &self.payload_signature,
+            &self.round2_signature,
         )
     }
 
@@ -437,6 +518,7 @@ impl Round2ShareFaultEvidence {
             .map(checked_point)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DkgRound2ShareFaultWitness {
+            accused_pool_id: self.accused_pool_id,
             share,
             participant_index: u64::from(self.recipient_index),
             commitments,
@@ -450,9 +532,9 @@ impl Round2ShareFaultEvidence {
         Ok(!is_identity(&round2_residual(&w)))
     }
 
-    /// The 32-byte `evidence_hash` for the configured threshold `T`.
-    /// `T` must equal `sender_commitments.len()`.
-    pub fn evidence_hash<const T: usize>(&self) -> Result<[u8; 32], FaultEvidenceError> {
+    /// The circuit public inputs for the configured threshold `T`:
+    /// `[evidence_hash, pool_id]`. `T` must equal `sender_commitments.len()`.
+    pub fn public_inputs<const T: usize>(&self) -> Result<Vec<BlsFr>, FaultEvidenceError> {
         if self.sender_commitments.len() != T {
             return Err(FaultEvidenceError::ThresholdMismatch {
                 expected: T,
@@ -460,10 +542,16 @@ impl Round2ShareFaultEvidence {
             });
         }
         let w = self.witness()?;
-        Ok(digest_bytes(round2_message_digest::<T, DKG_INDEX_BITS>(
+        Ok(round2_digest_fault_public_inputs::<T, DKG_INDEX_BITS>(
             round2_params(),
             &w,
-        )))
+        ))
+    }
+
+    /// The 32-byte `evidence_hash` for the configured threshold `T` = the first
+    /// circuit public input. `T` must equal `sender_commitments.len()`.
+    pub fn evidence_hash<const T: usize>(&self) -> Result<[u8; 32], FaultEvidenceError> {
+        Ok(digest_bytes(self.public_inputs::<T>()?[0]))
     }
 }
 
@@ -527,7 +615,8 @@ impl EquivocationEvidence {
         Ok(())
     }
 
-    /// `evidence_hash = blake2b_256(min(a,b) ‖ max(a,b))` — order-independent.
+    /// `evidence_hash = blake2b_256(domain ‖ len(lo) ‖ lo ‖ len(hi) ‖ hi)` —
+    /// order-independent and byte-compatible with `fault_verifier_equivocation`.
     #[must_use]
     pub fn evidence_hash(&self) -> [u8; 32] {
         let (lo, hi) = if self.payload_a <= self.payload_b {
@@ -535,8 +624,11 @@ impl EquivocationEvidence {
         } else {
             (&self.payload_b, &self.payload_a)
         };
-        let mut buf = Vec::with_capacity(lo.len() + hi.len());
+        let mut buf = Vec::with_capacity(EQUIVOCATION_DOMAIN.len() + 16 + lo.len() + hi.len());
+        buf.extend_from_slice(EQUIVOCATION_DOMAIN);
+        buf.extend_from_slice(&(lo.len() as u64).to_be_bytes());
         buf.extend_from_slice(lo);
+        buf.extend_from_slice(&(hi.len() as u64).to_be_bytes());
         buf.extend_from_slice(hi);
         blake2b_256(&buf)
     }
@@ -574,34 +666,17 @@ pub fn namespace_hash(phase: NamespacePhase, epoch: u64, threshold: u64, attempt
     blake2b_256(&buf)
 }
 
-/// Convenience: assemble the on-chain `FaultProofDatum` from a derived
-/// `evidence_hash`. `accused_pool_id` is the 28-byte `blake2b_224(cold_vkey)`.
-#[must_use]
-pub fn fault_proof_datum(
-    kind: FaultKind,
-    accused_pool_id: Vec<u8>,
-    namespace_hash: [u8; 32],
-    evidence_hash: [u8; 32],
-) -> FaultProofDatum {
-    FaultProofDatum {
-        kind,
-        accused_pool_id,
-        namespace_hash: namespace_hash.to_vec(),
-        evidence_hash: evidence_hash.to_vec(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Real ZK proof generation
 // ---------------------------------------------------------------------------
 
 /// A generated DKG fault proof. Carries everything a §9.2 direct-fault
-/// submission needs: the `evidence_hash` (== the public input, binds the token
-/// name), the `message_hash` the accused signed, that signature, and the
-/// accused key — plus the proof and raw public instances.
+/// submission needs: the accused `pool_id`, the `evidence_hash` (public input
+/// 0), the `message_hash` the accused signed, that signature, and the accused
+/// key — plus the proof and raw public instances.
 #[derive(Debug, Clone)]
 pub struct DkgFaultProof {
-    pub kind: FaultKind,
+    pub accused_pool_id: [u8; POOL_ID_LEN],
     pub evidence_hash: [u8; 32],
     pub message_hash: [u8; 32],
     pub payload_signature: [u8; 64],
@@ -702,7 +777,7 @@ pub fn prove_round1_pok_fault(
     let proof = gen_proof(srs, &pk, prover_builder, &public_instances);
     verify(srs, &pk, &proof, &public_instances)?;
     Ok(DkgFaultProof {
-        kind: FaultKind::InvalidPayload,
+        accused_pool_id: evidence.accused_pool_id,
         evidence_hash: digest_bytes(public_instances[0]),
         message_hash: evidence.message_hash(),
         payload_signature: evidence.payload_signature,
@@ -744,14 +819,32 @@ pub fn prove_round2_share_fault<const T: usize>(
     let proof = gen_proof(srs, &pk, prover_builder, &public_instances);
     verify(srs, &pk, &proof, &public_instances)?;
     Ok(DkgFaultProof {
-        kind: FaultKind::InvalidPayload,
+        accused_pool_id: evidence.accused_pool_id,
         evidence_hash: digest_bytes(public_instances[0]),
         message_hash: evidence.message_hash(),
-        payload_signature: evidence.payload_signature,
+        payload_signature: evidence.round2_signature,
         bifrost_id_pk: evidence.bifrost_id_pk,
         public_instances,
         proof,
     })
+}
+
+/// Generate a Round 2 share-fault proof when the DKG threshold is only known at
+/// runtime. Supports DKG min_signers 2..=16, matching
+/// [`round2_evidence_hash_dyn`].
+pub fn prove_round2_share_fault_dyn(
+    srs: &ParamsKZG<Bls12>,
+    evidence: &Round2ShareFaultEvidence,
+) -> Result<DkgFaultProof, FaultEvidenceError> {
+    macro_rules! dispatch {
+        ($($t:literal),* $(,)?) => {
+            match evidence.sender_commitments.len() {
+                $( $t => prove_round2_share_fault::<$t>(srs, evidence), )*
+                other => Err(FaultEvidenceError::UnsupportedThreshold(other)),
+            }
+        };
+    }
+    dispatch!(2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
 }
 
 #[cfg(test)]
@@ -760,11 +853,17 @@ mod tests {
     use crate::cardano::ban_list::fault_token_name;
     use crate::cardano::blueprint::{self, ParameterizedScript};
     use crate::cardano::fault_proof::{
-        EquivocationWitness, FaultProofMintRequest, build_fault_proof_mint_tx,
+        EquivocationEvidence as OnchainEquivocationEvidence, FaultProofEvidence,
+        FaultProofMintRequest, Round1InvalidPayloadEvidence, Round2InvalidPayloadEvidence,
+        build_fault_proof_mint_tx,
     };
+    use crate::cardano::hash::blake2b_256;
     use crate::cardano::publish::WalletUtxo;
     use crate::cardano::wallet::{derive_payment_key, wallet_address};
-    use crate::circuits::dkg_fault::{axiom_scalar_from_be_bytes, be_bytes_from_fq};
+    use crate::circuits::dkg_fault::{
+        axiom_scalar_from_be_bytes, be_bytes_from_fq, pool_id_public_input, round1_message_digest,
+        round2_message_digest,
+    };
     use crate::frost::participant;
     use crate::http::frost_bridge;
     use bitcoin::secp256k1::rand::rngs::OsRng;
@@ -810,7 +909,17 @@ mod tests {
             let mu: [u8; 32] = sigma_i[32..64].try_into().unwrap();
             sigma_i[32..64].copy_from_slice(&corrupt_scalar_be(&mu));
         }
-        let canonical = canonical::round1(EPOCH, THRESHOLD, ATTEMPT, &POOL, &commitments, &sigma_i);
+        let evidence_hash =
+            round1_evidence_hash_from_fields(&POOL, identifier, &commitments, &sigma_i).unwrap();
+        let canonical = canonical::round1(
+            EPOCH,
+            THRESHOLD,
+            ATTEMPT,
+            &POOL,
+            &commitments,
+            &sigma_i,
+            &evidence_hash,
+        );
         let (secp, kp, bifrost_id_pk) = accused_key();
         let payload_signature = auth::sign_payload(&secp, &kp, &canonical);
         Round1PokFaultEvidence {
@@ -856,16 +965,35 @@ mod tests {
         let (_s2, round2) =
             participant::dkg_part2(secrets.remove(&sender).unwrap(), &others).unwrap();
         let share = frost_bridge::round2_share_bytes(&round2[&recipient]).unwrap();
-        let (sender_commitments, _sigma) = frost_bridge::round1_fields(&packages[&sender]).unwrap();
+        let (sender_commitments, sender_sigma) =
+            frost_bridge::round1_fields(&packages[&sender]).unwrap();
         let bad_share = corrupt_scalar_be(&share);
+        let evidence_hash =
+            round2_evidence_hash_from_fields_dyn(&POOL, 2, &sender_commitments, &bad_share)
+                .unwrap();
+        let (secp, kp, bifrost_id_pk) = accused_key();
+        let round1_evidence_hash =
+            round1_evidence_hash_from_fields(&POOL, 1, &sender_commitments, &sender_sigma).unwrap();
+        let canonical_round1_bytes = canonical::round1(
+            EPOCH,
+            THRESHOLD,
+            ATTEMPT,
+            &POOL,
+            &sender_commitments,
+            &sender_sigma,
+            &round1_evidence_hash,
+        );
+        let round1_signature = auth::sign_payload(&secp, &kp, &canonical_round1_bytes);
         let entry = canonical::ShareEntry {
             recipient_pool_id: [0x22; POOL_ID_LEN],
+            recipient_identifier: 2,
             ephemeral_pk: sender_commitments[0],
             ciphertext: bad_share,
+            pad_commit: blake2b_256(&[0u8; 32]),
+            evidence_hash,
         };
         let round2_canonical_bytes = canonical::round2(EPOCH, THRESHOLD, ATTEMPT, &POOL, &[entry]);
-        let (secp, kp, bifrost_id_pk) = accused_key();
-        let payload_signature = auth::sign_payload(&secp, &kp, &round2_canonical_bytes);
+        let round2_signature = auth::sign_payload(&secp, &kp, &round2_canonical_bytes);
         Round2ShareFaultEvidence {
             epoch: EPOCH,
             threshold: THRESHOLD,
@@ -873,10 +1001,14 @@ mod tests {
             accused_pool_id: POOL,
             bifrost_id_pk,
             recipient_index: 2,
+            round2_entry_index: 0,
             sender_commitments,
+            canonical_round1_bytes,
+            round1_signature,
             share: bad_share,
+            pad: [0u8; 32],
             round2_canonical_bytes,
-            payload_signature,
+            round2_signature,
         }
     }
 
@@ -890,7 +1022,17 @@ mod tests {
                 participant::dkg_part1(Identifier::try_from(1u16).unwrap(), 3, 2, &mut rng)
                     .unwrap();
             let (commitments, sigma_i) = frost_bridge::round1_fields(&pkg).unwrap();
-            let bytes = canonical::round1(EPOCH, THRESHOLD, ATTEMPT, &POOL, &commitments, &sigma_i);
+            let evidence_hash =
+                round1_evidence_hash_from_fields(&POOL, 1, &commitments, &sigma_i).unwrap();
+            let bytes = canonical::round1(
+                EPOCH,
+                THRESHOLD,
+                ATTEMPT,
+                &POOL,
+                &commitments,
+                &sigma_i,
+                &evidence_hash,
+            );
             let sig = auth::sign_payload(&secp, &kp, &bytes);
             (bytes, sig)
         };
@@ -935,24 +1077,28 @@ mod tests {
         ]
     }
 
+    fn public_inputs(evidence_hash: [u8; 32], pool_id: [u8; POOL_ID_LEN]) -> Vec<Vec<u8>> {
+        vec![evidence_hash.to_vec(), pool_id.to_vec()]
+    }
+
     /// The pipeline's core claim: a derived `evidence_hash` threads into the
-    /// minted FaultProof token name exactly as `blake2b_256(pool_id ‖ hash)`.
-    fn assert_mints_with(evidence_hash: [u8; 32], kind: FaultKind) {
-        let accused_pool_id = POOL.to_vec();
-        let ns = namespace_hash(NamespacePhase::Round1, EPOCH, THRESHOLD, ATTEMPT);
-        let datum = fault_proof_datum(kind, accused_pool_id.clone(), ns, evidence_hash);
+    /// minted FaultProof token name exactly as `blake2b_256(pool_id || hash)`.
+    fn assert_mints_with(evidence_hash: [u8; 32], evidence: FaultProofEvidence<'_>) {
+        let accused_pool_id = evidence.accused_pool_id().to_vec();
         let script = fault_verifier_script();
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
         let addr = wallet_address(&key);
         let utxos = wallet_utxos();
+        let reg_tx = "cc".repeat(32);
         let built = build_fault_proof_mint_tx(&FaultProofMintRequest {
             fault_verifier_script: &script,
-            fault: &datum,
+            fault_verifier_ref_script: None,
+            evidence,
+            registration_ref: (&reg_tx, 0),
             wallet_address: &addr,
             wallet_utxos: &utxos,
             key: &key,
             cost_models: None,
-            equivocation: None,
         })
         .expect("mint tx builds from derived evidence_hash");
         assert_eq!(
@@ -967,40 +1113,17 @@ mod tests {
     /// two signed payloads from the evidence.
     fn assert_equivocation_mints(ev: &EquivocationEvidence) {
         let evidence_hash = ev.evidence_hash();
-        let accused_pool_id = ev.accused_pool_id.to_vec();
-        let datum = fault_proof_datum(
-            FaultKind::Equivocation,
-            accused_pool_id.clone(),
-            ev.namespace_hash(),
+        assert_mints_with(
             evidence_hash,
-        );
-        let script = fault_verifier_script();
-        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address(&key);
-        let utxos = wallet_utxos();
-        let reg_tx = "cc".repeat(32);
-        let built = build_fault_proof_mint_tx(&FaultProofMintRequest {
-            fault_verifier_script: &script,
-            fault: &datum,
-            wallet_address: &addr,
-            wallet_utxos: &utxos,
-            key: &key,
-            cost_models: None,
-            equivocation: Some(EquivocationWitness {
-                bifrost_id_pk: &ev.bifrost_id_pk,
+            FaultProofEvidence::Equivocation(OnchainEquivocationEvidence {
+                accused_pool_id: &ev.accused_pool_id,
                 payload_a: &ev.payload_a,
                 signature_a: &ev.signature_a,
                 payload_b: &ev.payload_b,
                 signature_b: &ev.signature_b,
-                registration_ref: (&reg_tx, 0),
+                evidence_hash: &evidence_hash,
             }),
-        })
-        .expect("equivocation mint tx builds");
-        assert_eq!(
-            built.token_name,
-            fault_token_name(&accused_pool_id, &evidence_hash)
         );
-        assert!(!built.signed_tx_hex.is_empty());
     }
 
     #[test]
@@ -1010,6 +1133,10 @@ mod tests {
         let w = ev.witness().unwrap();
         let expect = digest_bytes(round1_message_digest(round1_params(), &w));
         assert_eq!(ev.evidence_hash().unwrap(), expect);
+        let public_inputs = ev.public_inputs().unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(digest_bytes(public_inputs[0]), expect);
+        assert_eq!(public_inputs[1], pool_id_public_input(&POOL));
     }
 
     #[test]
@@ -1023,7 +1150,7 @@ mod tests {
     #[test]
     fn round1_message_hash_is_sha256_of_canonical() {
         let ev = round1_fault_evidence();
-        assert_eq!(ev.message_hash(), sha256(&ev.canonical_bytes()));
+        assert_eq!(ev.message_hash(), sha256(&ev.canonical_bytes().unwrap()));
     }
 
     #[test]
@@ -1085,6 +1212,10 @@ mod tests {
             &w,
         ));
         assert_eq!(ev.evidence_hash::<FIXTURE_T>().unwrap(), expect);
+        let public_inputs = ev.public_inputs::<FIXTURE_T>().unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(digest_bytes(public_inputs[0]), expect);
+        assert_eq!(public_inputs[1], pool_id_public_input(&POOL));
     }
 
     #[test]
@@ -1125,8 +1256,17 @@ mod tests {
         let (_s, pkg) =
             participant::dkg_part1(Identifier::try_from(1u16).unwrap(), 3, 2, &mut rng).unwrap();
         let (commitments, sigma_i) = frost_bridge::round1_fields(&pkg).unwrap();
-        let other_ns =
-            canonical::round1(EPOCH, THRESHOLD, ATTEMPT + 1, &POOL, &commitments, &sigma_i);
+        let evidence_hash =
+            round1_evidence_hash_from_fields(&POOL, 1, &commitments, &sigma_i).unwrap();
+        let other_ns = canonical::round1(
+            EPOCH,
+            THRESHOLD,
+            ATTEMPT + 1,
+            &POOL,
+            &commitments,
+            &sigma_i,
+            &evidence_hash,
+        );
         ev.bifrost_id_pk = pk;
         ev.signature_a = auth::sign_payload(&secp, &kp, &ev.payload_a); // keep a valid
         ev.signature_b = auth::sign_payload(&secp, &kp, &other_ns);
@@ -1148,6 +1288,34 @@ mod tests {
     }
 
     #[test]
+    fn equivocation_hash_matches_bifrost_policy_vector() {
+        let payload_a = hex::decode(
+            "626966726f73742d646b672d723100000000000000010000000000000033000000000000000001010101010101010101010101010101010101010101010101010101021111111111111111111111111111111111111111111111111111111111111111121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121313131313131313131313131313131313131313131313131313131313131313",
+        )
+        .unwrap();
+        let payload_b = hex::decode(
+            "626966726f73742d646b672d723100000000000000010000000000000033000000000000000001010101010101010101010101010101010101010101010101010101022222222222222222222222222222222222222222222222222222222222222222232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232424242424242424242424242424242424242424242424242424242424242424",
+        )
+        .unwrap();
+        let expected =
+            hex::decode("d80be6e612c4afe7842f224d0aedfcaa9d827c9c8e890467e6fbe8955fe8462c")
+                .unwrap();
+        let ev = EquivocationEvidence {
+            phase: NamespacePhase::Round1,
+            epoch: 1,
+            threshold: 51,
+            attempt: 0,
+            accused_pool_id: [0x01; POOL_ID_LEN],
+            bifrost_id_pk: [0u8; 32],
+            payload_a,
+            signature_a: [0u8; 64],
+            payload_b,
+            signature_b: [0u8; 64],
+        };
+        assert_eq!(ev.evidence_hash().as_slice(), expected.as_slice());
+    }
+
+    #[test]
     fn bad_point_in_evidence_errors_not_panics() {
         let mut ev = round1_fault_evidence();
         ev.commitments = vec![[0xFFu8; 33]]; // not a valid SEC1 point
@@ -1159,15 +1327,40 @@ mod tests {
     #[test]
     fn round1_invalid_payload_evidence_hash_mints_fault_proof() {
         let ev = round1_fault_evidence();
-        assert_mints_with(ev.evidence_hash().unwrap(), FaultKind::InvalidPayload);
+        let evidence_hash = ev.evidence_hash().unwrap();
+        let canonical = ev.canonical_bytes().unwrap();
+        let public_inputs = public_inputs(evidence_hash, ev.accused_pool_id);
+        assert_mints_with(
+            evidence_hash,
+            FaultProofEvidence::Round1InvalidPayload(Round1InvalidPayloadEvidence {
+                accused_pool_id: &ev.accused_pool_id,
+                canonical_round1_bytes: &canonical,
+                payload_signature: &ev.payload_signature,
+                halo2_proof: &[0xCC; 96],
+                halo2_public_inputs: &public_inputs,
+            }),
+        );
     }
 
     #[test]
     fn round2_invalid_payload_evidence_hash_mints_fault_proof() {
         let ev = round2_fault_evidence();
+        let evidence_hash = ev.evidence_hash::<FIXTURE_T>().unwrap();
+        let public_inputs = public_inputs(evidence_hash, ev.accused_pool_id);
         assert_mints_with(
-            ev.evidence_hash::<FIXTURE_T>().unwrap(),
-            FaultKind::InvalidPayload,
+            evidence_hash,
+            FaultProofEvidence::Round2InvalidPayload(Round2InvalidPayloadEvidence {
+                accused_pool_id: &ev.accused_pool_id,
+                canonical_round1_bytes: &ev.canonical_round1_bytes,
+                round1_signature: &ev.round1_signature,
+                canonical_round2_bytes: &ev.round2_canonical_bytes,
+                round2_signature: &ev.round2_signature,
+                round2_entry_index: ev.round2_entry_index,
+                pad: &ev.pad,
+                opened_share: &ev.share,
+                halo2_proof: &[0xCC; 96],
+                halo2_public_inputs: &public_inputs,
+            }),
         );
     }
 
@@ -1185,10 +1378,22 @@ mod tests {
         let srs = insecure_test_srs(round1_params());
         let proof = prove_round1_pok_fault(&srs, &ev).expect("round1 fault proof");
         assert!(!proof.proof.is_empty());
+        assert_eq!(proof.accused_pool_id, ev.accused_pool_id);
         assert_eq!(proof.evidence_hash, ev.evidence_hash().unwrap());
         assert_eq!(proof.message_hash, ev.message_hash());
         assert_eq!(proof.bifrost_id_pk, ev.bifrost_id_pk);
-        assert_mints_with(proof.evidence_hash, FaultKind::InvalidPayload);
+        let canonical = ev.canonical_bytes().unwrap();
+        let public_inputs = public_inputs(proof.evidence_hash, proof.accused_pool_id);
+        assert_mints_with(
+            proof.evidence_hash,
+            FaultProofEvidence::Round1InvalidPayload(Round1InvalidPayloadEvidence {
+                accused_pool_id: &proof.accused_pool_id,
+                canonical_round1_bytes: &canonical,
+                payload_signature: &proof.payload_signature,
+                halo2_proof: &proof.proof,
+                halo2_public_inputs: &public_inputs,
+            }),
+        );
     }
 
     #[test]
@@ -1198,11 +1403,27 @@ mod tests {
         let srs = insecure_test_srs(round2_params());
         let proof = prove_round2_share_fault::<FIXTURE_T>(&srs, &ev).expect("round2 fault proof");
         assert!(!proof.proof.is_empty());
+        assert_eq!(proof.accused_pool_id, ev.accused_pool_id);
         assert_eq!(
             proof.evidence_hash,
             ev.evidence_hash::<FIXTURE_T>().unwrap()
         );
         assert_eq!(proof.message_hash, ev.message_hash());
-        assert_mints_with(proof.evidence_hash, FaultKind::InvalidPayload);
+        let public_inputs = public_inputs(proof.evidence_hash, proof.accused_pool_id);
+        assert_mints_with(
+            proof.evidence_hash,
+            FaultProofEvidence::Round2InvalidPayload(Round2InvalidPayloadEvidence {
+                accused_pool_id: &proof.accused_pool_id,
+                canonical_round1_bytes: &ev.canonical_round1_bytes,
+                round1_signature: &ev.round1_signature,
+                canonical_round2_bytes: &ev.round2_canonical_bytes,
+                round2_signature: &proof.payload_signature,
+                round2_entry_index: ev.round2_entry_index,
+                pad: &ev.pad,
+                opened_share: &ev.share,
+                halo2_proof: &proof.proof,
+                halo2_public_inputs: &public_inputs,
+            }),
+        );
     }
 }

@@ -48,7 +48,12 @@ pub async fn sign_phase(
     round: SigningRound,
     mut collected: SignCollected,
 ) -> EpochResult<EpochPhase> {
-    let me = config.identity.identifier;
+    // The identifier the DKG actually produced for us — authoritative for
+    // signing, and consistent with the other post-DKG phases (PublishKeys,
+    // BuildTm, Submit) which also key off the group key package. Using the
+    // frozen `config.identity.identifier` here would drift from it after a
+    // roster change, exactly as it did in `dkg_phase`.
+    let me = *group_keys.key_package.identifier();
     let num_inputs = tm.num_inputs();
 
     match round {
@@ -312,7 +317,9 @@ mod tests {
         FeeParams, PegInInput, PegOutRequest, TreasuryInput, build_tm, compute_sighashes,
     };
     use crate::epoch::dkg::dkg_phase;
-    use crate::epoch::mocks::{MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock};
+    use crate::epoch::mocks::{
+        MockCardanoChain, MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock,
+    };
     use crate::epoch::state::{
         DkgCollected, DkgRound, EpochConfig, SignCollected, SpoIdentity, SpoInfo,
     };
@@ -349,6 +356,11 @@ mod tests {
         roster: Roster,
     ) -> GroupKeys {
         let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let chain: Arc<dyn crate::epoch::traits::CardanoChain> = Arc::new(MockCardanoChain::demo(
+            roster.min_signers,
+            roster.max_signers,
+            0,
+        ));
         let ctx = crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(&roster, 0, 0);
         let mut phase = EpochPhase::Dkg {
             round: DkgRound::Round1,
@@ -361,7 +373,7 @@ mod tests {
                     round,
                     ctx,
                     collected,
-                } => dkg_phase(&peers, &clock, &rng, &config, round, ctx, collected)
+                } => dkg_phase(&chain, &peers, &clock, &rng, &config, round, ctx, collected)
                     .await
                     .unwrap(),
                 EpochPhase::PublishKeys { group_keys, .. } => return group_keys,
@@ -395,6 +407,7 @@ mod tests {
             let clock = clock.clone();
             let config = EpochConfig::demo_default(SpoIdentity {
                 identifier: id,
+                bifrost_id_pk: Vec::new(),
                 port: 0,
             });
             let roster = roster.clone();
@@ -476,6 +489,7 @@ mod tests {
             let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
             let config = EpochConfig::demo_default(SpoIdentity {
                 identifier: id,
+                bifrost_id_pk: Vec::new(),
                 port: 0,
             });
             let roster = roster.clone();

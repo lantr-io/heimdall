@@ -12,12 +12,17 @@
 //!
 //! Constructor 0 = unconfirmed TM tx (confirmed = constructor 1, set
 //! by Binocular after Bitcoin inclusion proof). The new UTxO also
-//! carries 1 freshly-minted treasury marker token (using the Plutus V3
-//! always-succeeds minting policy `ALWAYS_OK_PLUTUS_CBOR_HEX`).
+//! carries 1 freshly-minted TM NFT: under the real
+//! TreasuryMovementValidator policy the mint is permissionless but
+//! gated by chain linkage — the redeemer names the Config UTxO
+//! (Genesis) or the predecessor Confirmed record (Chain) as a
+//! reference input and the validator checks the embedded BTC tx
+//! spends that treasury outpoint. The always-ok scaffold policy
+//! (`ALWAYS_OK_PLUTUS_CBOR_HEX`) remains the no-script fallback.
 //!
 //! The old oracle UTxO is NOT spent — old confirmed UTxOs are needed
-//! for minting fBTC proofs. The most recent UTxO at the treasury
-//! address (with a datum) is always used as the current oracle.
+//! for minting fBTC proofs. The current treasury is resolved by
+//! walking the Confirmed TM chain (see `cardano::tm_chain`).
 
 use pallas_codec::minicbor;
 use pallas_codec::utils::{Bytes, NonEmptySet};
@@ -70,15 +75,34 @@ impl WalletUtxo {
     }
 }
 
-/// Encode the treasury oracle datum: `Constr(constructor, [BoundedBytes(btc_tx)])`.
+/// Encode the treasury oracle datum:
+/// `Constr(constructor, [BoundedBytes(btc_tx), BoundedBytes(creator_pkh), BigInt(created_ms),
+/// BigInt(epoch), BigInt(leader_reward)])`.
 ///
 /// Constructor 0 = unconfirmed TM tx; 1 = confirmed (set by Binocular after a
-/// Bitcoin proof). Canonical encoding via `cardano::plutus::constr` (see that
-/// module for the tag / canonical-encoding rules).
-fn encode_datum_hex(btc_tx: &[u8], constructor: u8) -> String {
+/// Bitcoin proof). `creator` is the poster's payment key hash (it may GC the
+/// Confirmed record after the on-chain grace period); `created` is POSIX ms,
+/// anchored by the TM mint policy to the tx's validity upper bound. `epoch` /
+/// `leader_reward` are the N7 fields (Cardano epoch; a copy of the Config
+/// `leader_reward` tunable) — carried through Confirm, not yet enforced on-chain
+/// (pin + payout land with N9). Canonical encoding via `cardano::plutus::constr`.
+fn encode_datum_hex(
+    btc_tx: &[u8],
+    constructor: u8,
+    creator_pkh: &[u8],
+    created_ms: i64,
+    epoch: i64,
+    leader_reward: i64,
+) -> String {
     let datum = crate::cardano::plutus::constr(
         u64::from(constructor),
-        vec![crate::cardano::plutus::bytes(btc_tx)],
+        vec![
+            crate::cardano::plutus::bytes(btc_tx),
+            crate::cardano::plutus::bytes(creator_pkh),
+            crate::cardano::plutus::int(created_ms),
+            crate::cardano::plutus::int(epoch),
+            crate::cardano::plutus::int(leader_reward),
+        ],
     );
     let cbor = minicbor::to_vec(&datum).expect("datum CBOR encode");
     hex::encode(cbor)
@@ -102,19 +126,50 @@ pub fn build_oracle_update_tx(
     wallet_utxos: &[WalletUtxo],
     key: &PrivateKey,
     // When `Some`, mint the TM NFT under the real TreasuryMovementValidator policy (CBOR from
-    // `binocular tm-script`) and reference the TM-control UTxO `(tx_hash, index)` so the validator
-    // can read the authorized minter. `treasury_policy_id` must then be the validator's script hash
+    // `binocular tm-script`). `treasury_policy_id` must then be the validator's script hash
     // and `treasury_asset_name_hex` empty (the validator counts the empty-name token). When `None`,
     // falls back to the always-ok scaffold policy (legacy).
     tm_script_cbor: Option<&str>,
-    control_ref: Option<(&str, u32)>,
+    // The chain-linkage mint reference `(tx_hash, index, is_genesis)`: the Config UTxO
+    // (Genesis redeemer, before the first TM confirms) or the tip Confirmed TM record
+    // (Chain redeemer). Required alongside `tm_script_cbor`. The tx has exactly ONE
+    // reference input, so the Chain redeemer's reference-input index is always 0.
+    mint_ref: Option<(&str, u32, bool)>,
     // When `Some`, the network's live Plutus cost models `[V1, V2, V3]` (from Blockfrost). Used via
     // `Network::Custom` so the script-integrity hash matches the ledger's even when whisky's
     // hardcoded per-network cost models are stale. `None` → whisky's built-in Preprod models.
     cost_models: Option<Vec<Vec<i64>>>,
+    // Latest chain `(slot, posix_secs)`: derives the tx's `invalid_hereafter` (slot + 30 min)
+    // and the datum's `created`. The TM mint policy requires `created` to EQUAL the validity
+    // upper bound's POSIX ms, making it a guaranteed upper bound on the real posting time (the
+    // GC grace period can start late but never early). Block time == slot time and recent
+    // preprod/mainnet slots are 1 s, so slot latest+1800 begins at (latest_time + 1800) s
+    // exactly.
+    latest_slot_time: (u64, i64),
+    // Validity window (seconds): the tx's `invalid_hereafter` and the datum's `created` are both
+    // `latest + validity_window_secs`. 1800 (30 min) on preprod/mainnet; MUST be small on a
+    // short-epoch devnet, whose era-forecast horizon is only ~tens-to-hundreds of slots ahead —
+    // a large window lands past it (TimeTranslationPastHorizon at submit).
+    validity_window_secs: u64,
+    // N7 datum fields carried through to the Confirmed record: `epoch` (the Cardano epoch this TM
+    // belongs to) and `leader_reward` (a copy of the Config `leader_reward` tunable at post). Not
+    // yet enforced on-chain — the pin + payout land with N9.
+    epoch: u64,
+    leader_reward: u64,
 ) -> EpochResult<String> {
     let pkh = pub_key_hash_hex(key);
-    let datum_hex = encode_datum_hex(signed_btc_tx, constructor);
+    let (latest_slot, latest_time_secs) = latest_slot_time;
+    let created_ms = (latest_time_secs + validity_window_secs as i64) * 1000;
+    let creator_pkh =
+        hex::decode(&pkh).map_err(|e| EpochError::Chain(format!("wallet pkh decode: {e}")))?;
+    let datum_hex = encode_datum_hex(
+        signed_btc_tx,
+        constructor,
+        &creator_pkh,
+        created_ms,
+        epoch as i64,
+        leader_reward as i64,
+    );
     let asset_unit = format!("{treasury_policy_id}{treasury_asset_name_hex}");
 
     // Pick the richest wallet UTxO as the fee-paying input.
@@ -174,10 +229,11 @@ pub fn build_oracle_update_tx(
         change_address: wallet_address.to_string(),
         signing_key: vec![],
         network: Some(whisky_network(&cost_models)),
-        // Reference the TM-control UTxO so the validator's mint branch can read the authorized
-        // minter from its datum (authenticated by the control NFT it carries).
-        reference_inputs: control_ref
-            .map(|(h, i)| {
+        // Reference the chain-linkage anchor so the validator's mint branch can verify the
+        // embedded BTC tx spends the current treasury outpoint: the Config UTxO (Genesis)
+        // or the predecessor Confirmed TM record (Chain).
+        reference_inputs: mint_ref
+            .map(|(h, i, _)| {
                 vec![RefTxIn {
                     tx_hash: h.to_string(),
                     tx_index: i,
@@ -193,10 +249,31 @@ pub fn build_oracle_update_tx(
                 amount: 1,
             },
             redeemer: Some(Redeemer {
-                data: UNIT_REDEEMER_HEX.to_string(),
-                // Generous budget for the real TreasuryMovementValidator mint branch (reads the
-                // control reference datum, checks the signature + NFT qty). The always-ok scaffold
-                // needed ~14k mem; the validator needs much more. Well within Conway tx limits.
+                // Real validator: TmMintRedeemer — Genesis(configRefInputIdx) = Constr(0, [0]),
+                // Chain(prevTmRefInputIdx) = Constr(1, [0]). Both carry the 0-based
+                // reference-input index of their anchor; the tx has exactly ONE reference
+                // input, so the sorted index is always 0. Scaffold: unit.
+                data: match (tm_script_cbor, mint_ref) {
+                    (Some(_), Some((_, _, true))) => hex::encode(
+                        minicbor::to_vec(&crate::cardano::plutus::constr(
+                            0,
+                            vec![crate::cardano::plutus::int(0)],
+                        ))
+                        .expect("redeemer CBOR encode"),
+                    ),
+                    (Some(_), Some((_, _, false))) => hex::encode(
+                        minicbor::to_vec(&crate::cardano::plutus::constr(
+                            1,
+                            vec![crate::cardano::plutus::int(0)],
+                        ))
+                        .expect("redeemer CBOR encode"),
+                    ),
+                    _ => UNIT_REDEEMER_HEX.to_string(),
+                },
+                // Generous budget for the real TreasuryMovementValidator mint branch (parses the
+                // embedded BTC tx's first input, reads the reference datum, checks the NFT
+                // binding). The always-ok scaffold needed ~14k mem; the validator needs much
+                // more. Well within Conway tx limits.
                 ex_units: Budget {
                     mem: 2_000_000,
                     steps: 900_000_000,
@@ -216,7 +293,9 @@ pub fn build_oracle_update_tx(
         metadata: vec![],
         validity_range: ValidityRange {
             invalid_before: None,
-            invalid_hereafter: None,
+            // Finite upper bound, required by the TM mint policy's created-anchoring check:
+            // `created` in the datum equals this slot's begin time in ms (see created_ms above).
+            invalid_hereafter: Some(latest_slot + validity_window_secs),
         },
         total_collateral: None,
         collateral_return_address: None,
@@ -262,15 +341,17 @@ mod tests {
     use pallas_primitives::conway::PlutusData;
 
     #[test]
-    fn encode_datum_is_constr_0() {
+    fn encode_datum_is_constr_0_with_creator_created_epoch_leader_reward() {
         let btc_tx = vec![0x02, 0x00, 0x00, 0x00];
-        let hex_str = encode_datum_hex(&btc_tx, 0);
+        let creator = vec![0x7a; 28];
+        let hex_str = encode_datum_hex(&btc_tx, 0, &creator, 1_700_000_000_000, 42, 2_000_000);
         let cbor = hex::decode(&hex_str).unwrap();
         let decoded: PlutusData = pallas_codec::minicbor::decode(&cbor).expect("decode");
         match decoded {
             PlutusData::Constr(c) => {
                 assert_eq!(c.tag, 121, "should be constructor 0 (unconfirmed)");
-                assert_eq!(c.fields.len(), 1);
+                // N7: [signed_btc_tx, creator, created, epoch, leader_reward]
+                assert_eq!(c.fields.len(), 5);
                 match &c.fields[0] {
                     PlutusData::BoundedBytes(b) => {
                         let v: Vec<u8> = b.clone().into();
@@ -278,6 +359,19 @@ mod tests {
                     }
                     _ => panic!("expected BoundedBytes"),
                 }
+                match &c.fields[1] {
+                    PlutusData::BoundedBytes(b) => {
+                        let v: Vec<u8> = b.clone().into();
+                        assert_eq!(v, creator);
+                    }
+                    _ => panic!("expected BoundedBytes creator"),
+                }
+                assert!(matches!(&c.fields[2], PlutusData::BigInt(_)), "created");
+                assert!(matches!(&c.fields[3], PlutusData::BigInt(_)), "epoch");
+                assert!(
+                    matches!(&c.fields[4], PlutusData::BigInt(_)),
+                    "leader_reward"
+                );
             }
             _ => panic!("expected Constr"),
         }

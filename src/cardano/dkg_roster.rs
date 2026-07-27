@@ -45,7 +45,7 @@ use crate::cardano::roster::{
     FROST_MIN_PARTICIPANTS, RegistryRosterSource, RegistrySnapshot, RosterError,
     validate_bifrost_url,
 };
-use crate::cardano::stake::fetch_pool_stake;
+use crate::cardano::stake::{StakeSource, fetch_pool_stake_src};
 use crate::epoch::state::{Roster, SpoInfo};
 
 /// Security threshold as a percentage of total eligible stake: any `t`
@@ -141,12 +141,65 @@ pub struct DkgContext {
     pub participants: Vec<DkgParticipant>,
     /// Registered SPOs dropped from the eligible set, with reasons.
     pub excluded: Vec<ExcludedSpo>,
-    /// Epoch boundary wall-clock time (Unix ms) from the chain schedule, when
-    /// known. The ceremony anchors its Round 1/2 deadlines to this so every node
-    /// freezes the live/qualified subsets at the same chain-time instant
-    /// (WI-014 #6). `None` for the mock / no-registry fallback → relative
-    /// per-round timeouts instead.
-    pub epoch_start_ms: Option<i64>,
+    /// Wall-clock anchor (Unix ms) for the ceremony's round schedule. The
+    /// fetch path sets it to the epoch boundary from the chain schedule; the
+    /// epoch machine then re-anchors it to the ceremony window's grid line
+    /// before entering DKG (N21). The ceremony anchors its Round 1/2
+    /// deadlines to this so every node freezes the live/qualified subsets at
+    /// the same chain-time instant (WI-014 #6). `None` for the mock /
+    /// no-registry fallback → relative per-round timeouts instead.
+    pub schedule_anchor_ms: Option<i64>,
+    /// Chain posix-time (ms) of the latest block when this context was read from
+    /// the chain — the freshness stamp for [`ChainView`]. Carried forward
+    /// unchanged by `reduced_to` (a rerun uses the same read). `0` on the
+    /// mock/fixture path, which has no chain.
+    pub read_time_ms: i64,
+}
+
+/// A node's view of the on-chain candidate set. Published UNSIGNED alongside
+/// each DKG payload so a peer can tell a genuine cross-view disagreement (both
+/// honest, different chain reads near a ban) from a corrupt payload, and
+/// schedule a settling re-read instead of blindly retrying. It is a hint, never
+/// authoritative: the chain stays the only source of truth, and a lying peer
+/// only gets its own payload dropped.
+///
+/// NOT part of `canonical_bytes` and NOT compared in the equivocation check —
+/// two payloads with identical signed content but different `ChainView` are the
+/// same payload, not an equivocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainView {
+    /// `blake2b_256` of the eligible `pool_id`s in ceremony (bifrost-key) order.
+    /// Two nodes on the same candidate set have the same digest; a ban that one
+    /// has seen and the other hasn't flips it.
+    pub digest: [u8; 32],
+    /// Eligible participant count — a cheap, human-legible discriminator.
+    pub n: u16,
+    /// Chain posix-time (ms) of the latest block this view was read from — a
+    /// **freshness** marker, deliberately finer than the epoch. On a digest
+    /// disagreement, the node with the OLDER `read_time_ms` is behind (it read
+    /// the chain before the disagreeing event, e.g. a ban, settled into its
+    /// view) and is the one that should re-read. This is what makes the
+    /// reconcile directional instead of a blind wait, and it distinguishes
+    /// states WITHIN one epoch — exactly where the ban-settlement disagreement
+    /// lives. Chain-derived (a block time), never a local clock, so it is
+    /// comparable across nodes.
+    pub read_time_ms: i64,
+}
+
+impl DkgContext {
+    /// This node's chain-view for the current context.
+    #[must_use]
+    pub fn chain_view(&self) -> ChainView {
+        let mut buf = Vec::with_capacity(self.participants.len() * 28);
+        for p in &self.participants {
+            buf.extend_from_slice(&p.pool_id);
+        }
+        ChainView {
+            digest: crate::cardano::hash::blake2b_256(&buf),
+            n: u16::try_from(self.participants.len()).unwrap_or(u16::MAX),
+            read_time_ms: self.read_time_ms,
+        }
+    }
 }
 
 /// A registered SPO that survived ban + URL filtering (pre-stake).
@@ -311,9 +364,10 @@ pub fn derive_dkg_context(
         total_stake: total,
         participants,
         excluded,
-        // The schedule-anchored boundary time is supplied by `fetch_dkg_context`
-        // (it already fetches it); the pure derivation leaves it unset.
-        epoch_start_ms: None,
+        // The schedule anchor is supplied by `fetch_dkg_context` (it already
+        // fetches the boundary time); the pure derivation leaves it unset.
+        schedule_anchor_ms: None,
+        read_time_ms: 0,
     })
 }
 
@@ -428,8 +482,9 @@ impl DkgContext {
             // survivors (this attempt's absent/faulty peers) are tracked as
             // fault evidence by the ceremony, not re-derived here.
             excluded: self.excluded.clone(),
-            // Same epoch boundary → same anchored schedule for the rerun.
-            epoch_start_ms: self.epoch_start_ms,
+            // Same anchor → same anchored schedule for the rerun.
+            schedule_anchor_ms: self.schedule_anchor_ms,
+            read_time_ms: self.read_time_ms,
         })
     }
 
@@ -470,7 +525,8 @@ impl DkgContext {
             excluded: vec![],
             // Mock / no-registry fallback has no chain schedule → relative
             // per-round timeouts.
-            epoch_start_ms: None,
+            schedule_anchor_ms: None,
+            read_time_ms: 0,
         }
     }
 }
@@ -531,6 +587,12 @@ pub async fn fetch_eligible_stakes(
     base_url: &str,
     project_id: &str,
     pool_ids: &[Vec<u8>],
+    source: StakeSource,
+    epoch: u64,
+    // DEMO-ONLY: when true, a pool whose stake can't be resolved is skipped
+    // (omitted from the map) instead of failing the whole fetch. The caller
+    // then excludes those pools from the roster. Default false in production.
+    exclude_unstaked: bool,
 ) -> Result<BTreeMap<Vec<u8>, u64>, String> {
     let mut stakes = BTreeMap::new();
     for pool_id in pool_ids {
@@ -538,8 +600,19 @@ pub async fn fetch_eligible_stakes(
             .as_slice()
             .try_into()
             .map_err(|_| format!("pool_id is not 28 bytes: {}", hex::encode(pool_id)))?;
-        let stake = fetch_pool_stake(base_url, project_id, &pool_id_bech32(&arr)).await?;
-        stakes.insert(pool_id.clone(), stake.active_stake);
+        match fetch_pool_stake_src(source, base_url, project_id, epoch, &pool_id_bech32(&arr)).await
+        {
+            Ok(stake) => {
+                stakes.insert(pool_id.clone(), stake.active_stake);
+            }
+            Err(e) if exclude_unstaked => {
+                eprintln!(
+                    "[demo] excluding pool {} from roster: stake unresolved ({e})",
+                    pool_id_bech32(&arr)
+                );
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(stakes)
 }
@@ -553,8 +626,12 @@ pub async fn fetch_dkg_context(
     bans: Option<&BanListSource>,
     base_url: &str,
     project_id: &str,
+    stake_source: StakeSource,
     epoch: u64,
     attempt: u32,
+    // DEMO-ONLY: exclude eligible pools whose stake can't be resolved instead of
+    // failing the whole roster (`MissingStake`). Default false in production.
+    exclude_unstaked: bool,
 ) -> Result<DkgContext, DkgFetchError> {
     // The registry snapshot and the epoch-boundary time are independent — fetch
     // them concurrently. Ban activity is checked at that boundary time
@@ -577,14 +654,58 @@ pub async fn fetch_dkg_context(
         .await
         .map_err(DkgFetchError::Ban)?;
     let eligible = eligible_pool_ids(&snapshot, &active_bans);
-    let stakes = fetch_eligible_stakes(base_url, project_id, &eligible)
-        .await
-        .map_err(DkgFetchError::Stake)?;
-    let mut ctx = derive_dkg_context(&snapshot, &active_bans, &stakes, epoch, attempt)
+    // TRACE (2026-07-23): the chain view this node derived, so the SAME line from
+    // every node can be diffed to see WHEN each first saw the ban. The ban list is
+    // read at the current tip (fetch_active_bans → fetch_ban_list), so a ban
+    // landing near a boundary is seen by some nodes an epoch before others — the
+    // suspected root of the transitional recovery churn.
+    {
+        let short = |v: &[u8]| hex::encode(&v[..4.min(v.len())]);
+        let bans_short: Vec<String> = active_bans.iter().map(|b| short(b)).collect();
+        let elig_short: Vec<String> = eligible.iter().map(|e| short(e)).collect();
+        eprintln!(
+            "[chain-view] epoch={epoch} attempt={attempt} epoch_start_ms={epoch_start_ms} \
+             registered={} active_bans=[{}] eligible=[{}]",
+            snapshot.spos.len(),
+            bans_short.join(","),
+            elig_short.join(",")
+        );
+    }
+    let stakes = fetch_eligible_stakes(
+        base_url,
+        project_id,
+        &eligible,
+        stake_source,
+        epoch,
+        exclude_unstaked,
+    )
+    .await
+    .map_err(DkgFetchError::Stake)?;
+    // DEMO-ONLY: pools whose stake was skipped above are dropped from the roster
+    // by adding them to the exclusion (ban) set, so the derivation sees only
+    // resolvable-stake pools rather than erroring on `MissingStake`.
+    let mut bans = active_bans;
+    if exclude_unstaked {
+        for pid in &eligible {
+            if !stakes.contains_key(pid) {
+                bans.insert(pid.clone());
+            }
+        }
+    }
+    let mut ctx = derive_dkg_context(&snapshot, &bans, &stakes, epoch, attempt)
         .map_err(DkgFetchError::Derive)?;
     // Anchor the ceremony's round deadlines to the chain epoch boundary (WI-014
     // #6), so every node freezes L1/Q at the same chain-time instant.
-    ctx.epoch_start_ms = Some(epoch_start_ms);
+    ctx.schedule_anchor_ms = Some(epoch_start_ms);
+    // Freshness stamp for the published ChainView: the chain time this view was
+    // read at. A node that read the chain later saw more of it, so on a
+    // candidate-set disagreement the OLDER read_time_ms marks the stale node.
+    // Best-effort — a failed tip read leaves it 0 (treated as "oldest"), which
+    // is safe: it only ever makes THIS node the one that re-reads.
+    ctx.read_time_ms = bf_http::fetch_latest_block_time(base_url, project_id)
+        .await
+        .map(|secs| secs * 1000)
+        .unwrap_or(0);
     Ok(ctx)
 }
 
@@ -610,9 +731,10 @@ mod tests {
                 asset_name_hex: "ab".into(),
                 datum: TreasuryInfoDatum {
                     bifrost_identity_root: [0u8; 32],
-                    current_treasury_address: vec![],
-                    current_treasury_utxo_id: vec![],
                     current_spos_frost_key: vec![],
+                    y_federation: vec![],
+                    federation_csv_blocks: 144,
+                    last_reset_tm_txid: vec![],
                 },
             },
         }
@@ -687,7 +809,8 @@ mod tests {
             total_stake: total,
             participants,
             excluded: vec![],
-            epoch_start_ms: None,
+            schedule_anchor_ms: None,
+            read_time_ms: 0,
         }
     }
 

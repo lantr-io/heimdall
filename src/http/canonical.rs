@@ -12,8 +12,11 @@
 //! ```text
 //! r1: "bifrost-dkg-r1" || epoch(8 BE) || threshold(8 BE) || attempt(8 BE)
 //!       || pool_id(28) || φ_0(33) || … || φ_{t-1}(33) || σ_i(64)
+//!       || evidence_hash(32)
 //! r2: "bifrost-dkg-r2" || epoch(8 BE) || threshold(8 BE) || attempt(8 BE)
-//!       || pool_id(28) || [recipient(28) || ephemeral_pk(33) || ciphertext(32)] × m
+//!       || pool_id(28)
+//!       || [recipient(28) || recipient_id(8 BE) || ephemeral_pk(33)
+//!           || ciphertext(32) || pad_commit(32) || evidence_hash(32)] × m
 //! ```
 //!
 //! Round 2 share entries are ordered by `recipient_pool_id`
@@ -27,6 +30,10 @@ pub const POINT_LEN: usize = 33;
 pub const SIG_LEN: usize = 64;
 /// Encrypted share — a 32-byte secp256k1 scalar XOR the HKDF key.
 pub const SHARE_LEN: usize = 32;
+/// Circuit public input 0 and token-name evidence component.
+pub const EVIDENCE_HASH_LEN: usize = 32;
+/// Blake2b-256 commitment to the one-time pad that opens a Round 2 ciphertext.
+pub const PAD_COMMIT_LEN: usize = 32;
 
 /// The fixed DKG threshold *label* in URLs and canonical bytes — the
 /// ">51% stake" DKG, one per epoch. This is NOT the computed
@@ -60,9 +67,15 @@ pub fn round1(
     pool_id: &[u8; POOL_ID_LEN],
     commitment: &[[u8; POINT_LEN]],
     sigma_i: &[u8; SIG_LEN],
+    evidence_hash: &[u8; EVIDENCE_HASH_LEN],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        TAG_R1.len() + 24 + POOL_ID_LEN + commitment.len() * POINT_LEN + SIG_LEN,
+        TAG_R1.len()
+            + 24
+            + POOL_ID_LEN
+            + commitment.len() * POINT_LEN
+            + SIG_LEN
+            + EVIDENCE_HASH_LEN,
     );
     out.extend_from_slice(TAG_R1);
     push_header(&mut out, epoch, threshold, attempt, pool_id);
@@ -70,6 +83,7 @@ pub fn round1(
         out.extend_from_slice(phi);
     }
     out.extend_from_slice(sigma_i);
+    out.extend_from_slice(evidence_hash);
     out
 }
 
@@ -77,8 +91,11 @@ pub fn round1(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareEntry {
     pub recipient_pool_id: [u8; POOL_ID_LEN],
+    pub recipient_identifier: u64,
     pub ephemeral_pk: [u8; POINT_LEN],
     pub ciphertext: [u8; SHARE_LEN],
+    pub pad_commit: [u8; PAD_COMMIT_LEN],
+    pub evidence_hash: [u8; EVIDENCE_HASH_LEN],
 }
 
 /// Round 2 canonical bytes. `shares` may be in any order — this sorts a
@@ -93,14 +110,17 @@ pub fn round2(
 ) -> Vec<u8> {
     let mut sorted: Vec<&ShareEntry> = shares.iter().collect();
     sorted.sort_by_key(|e| e.recipient_pool_id);
-    let entry_len = POOL_ID_LEN + POINT_LEN + SHARE_LEN;
+    let entry_len = POOL_ID_LEN + 8 + POINT_LEN + SHARE_LEN + PAD_COMMIT_LEN + EVIDENCE_HASH_LEN;
     let mut out = Vec::with_capacity(TAG_R2.len() + 24 + POOL_ID_LEN + sorted.len() * entry_len);
     out.extend_from_slice(TAG_R2);
     push_header(&mut out, epoch, threshold, attempt, pool_id);
     for s in sorted {
         out.extend_from_slice(&s.recipient_pool_id);
+        out.extend_from_slice(&s.recipient_identifier.to_be_bytes());
         out.extend_from_slice(&s.ephemeral_pk);
         out.extend_from_slice(&s.ciphertext);
+        out.extend_from_slice(&s.pad_commit);
+        out.extend_from_slice(&s.evidence_hash);
     }
     out
 }
@@ -121,10 +141,22 @@ mod tests {
         let t = 3;
         let commitment = vec![[7u8; POINT_LEN]; t];
         let sigma = [9u8; SIG_LEN];
-        let bytes = round1(42, THRESHOLD_51, 0, &pid(1), &commitment, &sigma);
+        let evidence_hash = [8u8; EVIDENCE_HASH_LEN];
+        let bytes = round1(
+            42,
+            THRESHOLD_51,
+            0,
+            &pid(1),
+            &commitment,
+            &sigma,
+            &evidence_hash,
+        );
 
         assert_eq!(&bytes[..TAG_LEN], TAG_R1);
-        assert_eq!(bytes.len(), HEADER_LEN + t * POINT_LEN + SIG_LEN);
+        assert_eq!(
+            bytes.len(),
+            HEADER_LEN + t * POINT_LEN + SIG_LEN + EVIDENCE_HASH_LEN
+        );
         // epoch big-endian right after the tag
         assert_eq!(&bytes[TAG_LEN..TAG_LEN + 8], &42u64.to_be_bytes());
         // threshold == 51
@@ -132,8 +164,11 @@ mod tests {
             &bytes[TAG_LEN + 8..TAG_LEN + 16],
             &THRESHOLD_51.to_be_bytes()
         );
-        // σ_i is the final 64 bytes
-        assert_eq!(&bytes[bytes.len() - SIG_LEN..], &sigma);
+        assert_eq!(
+            &bytes[bytes.len() - SIG_LEN - EVIDENCE_HASH_LEN..bytes.len() - EVIDENCE_HASH_LEN],
+            &sigma
+        );
+        assert_eq!(&bytes[bytes.len() - EVIDENCE_HASH_LEN..], &evidence_hash);
     }
 
     #[test]
@@ -141,22 +176,32 @@ mod tests {
         let shares = vec![
             ShareEntry {
                 recipient_pool_id: pid(3),
+                recipient_identifier: 3,
                 ephemeral_pk: [1; POINT_LEN],
                 ciphertext: [1; SHARE_LEN],
+                pad_commit: [4; PAD_COMMIT_LEN],
+                evidence_hash: [5; EVIDENCE_HASH_LEN],
             },
             ShareEntry {
                 recipient_pool_id: pid(1),
+                recipient_identifier: 1,
                 ephemeral_pk: [2; POINT_LEN],
                 ciphertext: [2; SHARE_LEN],
+                pad_commit: [6; PAD_COMMIT_LEN],
+                evidence_hash: [7; EVIDENCE_HASH_LEN],
             },
             ShareEntry {
                 recipient_pool_id: pid(2),
+                recipient_identifier: 2,
                 ephemeral_pk: [3; POINT_LEN],
                 ciphertext: [3; SHARE_LEN],
+                pad_commit: [8; PAD_COMMIT_LEN],
+                evidence_hash: [9; EVIDENCE_HASH_LEN],
             },
         ];
         let bytes = round2(7, THRESHOLD_51, 1, &pid(9), &shares);
-        let entry_len = POOL_ID_LEN + POINT_LEN + SHARE_LEN;
+        let entry_len =
+            POOL_ID_LEN + 8 + POINT_LEN + SHARE_LEN + PAD_COMMIT_LEN + EVIDENCE_HASH_LEN;
 
         assert_eq!(&bytes[..TAG_LEN], TAG_R2);
         assert_eq!(bytes.len(), HEADER_LEN + shares.len() * entry_len);
@@ -171,13 +216,19 @@ mod tests {
     fn round2_independent_of_input_order() {
         let a = ShareEntry {
             recipient_pool_id: pid(1),
+            recipient_identifier: 1,
             ephemeral_pk: [2; POINT_LEN],
             ciphertext: [2; SHARE_LEN],
+            pad_commit: [3; PAD_COMMIT_LEN],
+            evidence_hash: [4; EVIDENCE_HASH_LEN],
         };
         let b = ShareEntry {
             recipient_pool_id: pid(2),
+            recipient_identifier: 2,
             ephemeral_pk: [3; POINT_LEN],
             ciphertext: [3; SHARE_LEN],
+            pad_commit: [4; PAD_COMMIT_LEN],
+            evidence_hash: [5; EVIDENCE_HASH_LEN],
         };
         let forward = round2(1, THRESHOLD_51, 0, &pid(0), &[a.clone(), b.clone()]);
         let reversed = round2(1, THRESHOLD_51, 0, &pid(0), &[b, a]);

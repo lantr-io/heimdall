@@ -121,6 +121,10 @@ pub enum TmBuildError {
         prevouts: usize,
         spend_infos: usize,
     },
+    /// The federation CSV leaf could not be spent script-path — its control
+    /// block is absent from the treasury `TaprootSpendInfo` (the leaf handed in
+    /// does not belong to this tree).
+    FederationLeafSpend(String),
 }
 
 impl fmt::Display for TmBuildError {
@@ -144,6 +148,7 @@ impl fmt::Display for TmBuildError {
                 "malformed UnsignedTm: {inputs} inputs but {prevouts} prevouts \
                  and {spend_infos} spend infos (all must match)"
             ),
+            Self::FederationLeafSpend(m) => write!(f, "federation leaf spend: {m}"),
         }
     }
 }
@@ -478,10 +483,183 @@ pub fn sign_tm_single_key(
     Ok(tx)
 }
 
+/// Sign the treasury input (index 0) via the **federation CSV leaf** — the
+/// emergency script-path fallback for when the FROST group is dark (scenario 3,
+/// N23). Unlike the key-path signers this reveals the leaf + its control block
+/// and signs the **raw** `y_fed` key (the leaf's `OP_CHECKSIG` checks `y_fed`
+/// un-tweaked), and it sets the treasury input's `nSequence` to `csv_blocks` so
+/// `OP_CSV`'s relative timelock is enabled and satisfied — the treasury UTxO must
+/// already be `csv_blocks` deep on Bitcoin. Only input 0 is federation-spent.
+///
+/// `y_fed_secret` must correspond to the treasury tree's federation-leaf key (the
+/// same key passed to [`crate::bitcoin::taproot::treasury_spend_info`]); a
+/// mismatch (or wrong `csv_blocks`) means the leaf is not in the tree and yields
+/// [`TmBuildError::FederationLeafSpend`]. Changing `nSequence` changes the txid,
+/// so this is a standalone federation tx, not a FROST-coordinated one.
+pub fn sign_tm_federation_leaf(
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    unsigned: &UnsignedTm,
+    y_fed_secret: &bitcoin::secp256k1::SecretKey,
+    csv_blocks: u16,
+) -> Result<Transaction, TmBuildError> {
+    use bitcoin::secp256k1::{Keypair, Message};
+    use bitcoin::taproot::{LeafVersion, TapLeafHash};
+
+    let n = unsigned.tx.input.len();
+    if unsigned.prevouts.len() != n || unsigned.input_spend_info.len() != n {
+        return Err(TmBuildError::MalformedUnsignedTm {
+            inputs: n,
+            prevouts: unsigned.prevouts.len(),
+            spend_infos: unsigned.input_spend_info.len(),
+        });
+    }
+
+    let keypair = Keypair::from_secret_key(secp, y_fed_secret);
+    let y_fed_xonly = keypair.x_only_public_key().0;
+    // The exact leaf `treasury_spend_info` built: <csv> OP_CSV OP_DROP <y_fed> OP_CHECKSIG.
+    let leaf = crate::bitcoin::taproot::build_csv_checksig_script(csv_blocks, y_fed_xonly);
+    let leaf_hash = TapLeafHash::from_script(&leaf, LeafVersion::TapScript);
+    let control_block = unsigned.input_spend_info[0]
+        .control_block(&(leaf.clone(), LeafVersion::TapScript))
+        .ok_or_else(|| {
+            TmBuildError::FederationLeafSpend(
+                "control block for the federation leaf not found in the treasury tree — \
+                 y_fed / csv_blocks do not match how the treasury was locked"
+                    .into(),
+            )
+        })?;
+
+    // nSequence commits into the sighash AND must satisfy OP_CSV, so set it
+    // before hashing. `from_height` => relative-by-block-height, disable bit clear.
+    let mut tx = unsigned.tx.clone();
+    tx.input[0].sequence = Sequence::from_height(csv_blocks);
+
+    let sighash = {
+        let mut cache = SighashCache::new(&tx);
+        cache
+            .taproot_script_spend_signature_hash(
+                0,
+                &Prevouts::All(&unsigned.prevouts),
+                leaf_hash,
+                TapSighashType::Default,
+            )
+            .map_err(|e| TmBuildError::FederationLeafSpend(format!("sighash: {e}")))?
+    };
+
+    let sig =
+        secp.sign_schnorr_no_aux_rand(&Message::from_digest(sighash.to_byte_array()), &keypair);
+    let tap_sig = bitcoin::taproot::Signature {
+        signature: sig,
+        sighash_type: TapSighashType::Default,
+    };
+
+    // Script-path witness: [Schnorr signature, revealed leaf script, control block].
+    let mut witness = Witness::new();
+    witness.push(tap_sig.to_vec());
+    witness.push(leaf.as_bytes());
+    witness.push(control_block.serialize());
+    tx.input[0].witness = witness;
+
+    Ok(tx)
+}
+
+/// FROST analogue of [`sign_tm_single_key`]: sign every key-path TM input with a
+/// set of FROST signing shares, applying each input's BIP-341 taptweak. Use this
+/// when the inputs are keyed to the FROST group key `Y_51` (treasury key-path +
+/// `Y_51`-internal peg-ins) rather than a single federation key — a single
+/// `secret` cannot produce a valid `Y_51` signature.
+///
+/// All `key_packages` sign in this process (the demo cohort, reproduced via
+/// [`crate::frost::dkg::run_demo_dkg`]); a real multi-SPO deployment drives the
+/// identical per-input commit → tweaked-sign → aggregate rounds across the
+/// network instead (`epoch::signing::sign_phase`). Returns the witnessed tx.
+pub fn sign_tm_frost(
+    unsigned: &UnsignedTm,
+    key_packages: &std::collections::BTreeMap<
+        frost_secp256k1_tr::Identifier,
+        frost_secp256k1_tr::keys::KeyPackage,
+    >,
+    public_key_package: &frost_secp256k1_tr::keys::PublicKeyPackage,
+) -> Result<Transaction, String> {
+    use crate::frost::participant;
+    use bitcoin::hashes::{HashEngine, sha256};
+    use frost_secp256k1_tr as frost;
+    use rand_core::SeedableRng;
+    use std::collections::BTreeMap;
+
+    let n = unsigned.tx.input.len();
+    if unsigned.prevouts.len() != n || unsigned.input_spend_info.len() != n {
+        return Err(format!(
+            "malformed UnsignedTm: {n} inputs but {} prevouts / {} spend-infos",
+            unsigned.prevouts.len(),
+            unsigned.input_spend_info.len()
+        ));
+    }
+    let sighashes = compute_sighashes(unsigned);
+    let mut tx = unsigned.tx.clone();
+
+    for (i, ((txin, spend_info), sighash)) in tx
+        .input
+        .iter_mut()
+        .zip(unsigned.input_spend_info.iter())
+        .zip(sighashes.iter())
+        .enumerate()
+    {
+        // The BIP-341 key-path tweak = this input's script-tree merkle root.
+        let merkle_root: Option<[u8; 32]> = spend_info.merkle_root().map(|h| h.to_byte_array());
+        let mr: Option<&[u8]> = merkle_root.as_ref().map(|b| b.as_slice());
+
+        // Round 1: per-signer nonce + commitment. Deterministic-but-unique nonce
+        // per (input, signer) — safe because each signs exactly one message.
+        let mut nonces = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for (j, (id, kp)) in key_packages.iter().enumerate() {
+            let mut eng = sha256::Hash::engine();
+            eng.input(b"heimdall-sweep-nonce-v1");
+            eng.input(&(i as u32).to_le_bytes());
+            eng.input(&(j as u32).to_le_bytes());
+            let mut rng =
+                rand_chacha::ChaCha20Rng::from_seed(sha256::Hash::from_engine(eng).to_byte_array());
+            let (sn, sc) = participant::sign_round1(kp, &mut rng);
+            nonces.insert(*id, sn);
+            commitments.insert(*id, sc);
+        }
+
+        let signing_package = frost::SigningPackage::new(commitments, sighash);
+
+        // Round 2: tweaked signature share per signer, then aggregate.
+        let mut shares = BTreeMap::new();
+        for (id, kp) in key_packages.iter() {
+            let share = participant::sign_round2_with_tweak(&signing_package, &nonces[id], kp, mr)
+                .map_err(|e| format!("input {i} sign_round2: {e}"))?;
+            shares.insert(*id, share);
+        }
+        let sig = participant::sign_aggregate_with_tweak(
+            &signing_package,
+            &shares,
+            public_key_package,
+            mr,
+        )
+        .map_err(|e| format!("input {i} aggregate: {e}"))?;
+
+        let sig_bytes = sig
+            .serialize()
+            .map_err(|e| format!("input {i} sig serialize: {e}"))?;
+        let schnorr = bitcoin::secp256k1::schnorr::Signature::from_slice(&sig_bytes)
+            .map_err(|e| format!("input {i} schnorr from_slice: {e}"))?;
+        let tap_sig = bitcoin::taproot::Signature {
+            signature: schnorr,
+            sighash_type: TapSighashType::Default,
+        };
+        txin.witness = Witness::p2tr_key_spend(&tap_sig);
+    }
+    Ok(tx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitcoin::taproot::treasury_spend_info;
+    use crate::bitcoin::taproot::{pegin_spend_info, treasury_spend_info};
     use bitcoin::secp256k1::{Keypair, Secp256k1};
 
     fn xonly_from_seed(seed: [u8; 32]) -> bitcoin::key::UntweakedPublicKey {
@@ -592,6 +770,72 @@ mod tests {
             let outkey = tm.input_spend_info[i].output_key().to_x_only_public_key();
             secp.verify_schnorr(&sig, &msg, &outkey)
                 .unwrap_or_else(|e| panic!("input {i} sig invalid under output key: {e}"));
+        }
+    }
+
+    // --- FROST signer (Y_51-keyed inputs) ---
+
+    #[test]
+    fn test_frost_signer_verifies_under_output_key() {
+        use crate::frost::dkg::run_demo_dkg;
+
+        let secp = Secp256k1::new();
+        // Reproduce the demo DKG; the TM inputs are keyed to the group key Y_51,
+        // which a single federation key cannot sign for.
+        let dkg = run_demo_dkg(b"heimdall-demo-seed-v1-0123456789", 2, 3);
+        let vk = dkg.public_key_package.verifying_key().serialize().unwrap();
+        let y_51 = bitcoin::key::UntweakedPublicKey::from_slice(&vk[1..33]).unwrap();
+        // Sanity: this is the live deployment's Y_51.
+        assert_eq!(
+            hex::encode(&vk[1..33]),
+            "b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854"
+        );
+
+        let y_fed = xonly_from_seed([3u8; 32]);
+        let depositor = xonly_from_seed([7u8; 32]);
+        let treasury_si = treasury_spend_info(&secp, y_51, y_fed, 144);
+        let pegin_si = pegin_spend_info(&secp, y_51, depositor, 720);
+
+        let tm = build_tm(
+            TreasuryInput {
+                outpoint: OutPoint {
+                    txid: make_txid(0xAA),
+                    vout: 0,
+                },
+                value: Amount::from_sat(1_000_000),
+                spend_info: treasury_si,
+            },
+            vec![PegInInput {
+                outpoint: OutPoint {
+                    txid: make_txid(0xBB),
+                    vout: 0,
+                },
+                value: Amount::from_sat(5_714),
+                spend_info: pegin_si,
+            }],
+            vec![],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+
+        let signed = sign_tm_frost(&tm, &dkg.key_packages, &dkg.public_key_package).unwrap();
+        let sighashes = compute_sighashes(&tm);
+
+        assert_eq!(signed.input.len(), 2);
+        for (i, txin) in signed.input.iter().enumerate() {
+            let items = txin.witness.to_vec();
+            assert_eq!(items.len(), 1, "input {i}: key-path witness is one element");
+            assert_eq!(
+                items[0].len(),
+                64,
+                "input {i}: Default-sighash sig is 64 bytes"
+            );
+            let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(&items[0]).unwrap();
+            let msg = bitcoin::secp256k1::Message::from_digest(sighashes[i]);
+            let outkey = tm.input_spend_info[i].output_key().to_x_only_public_key();
+            secp.verify_schnorr(&sig, &msg, &outkey)
+                .unwrap_or_else(|e| panic!("input {i} FROST sig invalid under output key: {e}"));
         }
     }
 
@@ -1084,5 +1328,66 @@ mod tests {
             signed_tx.input.len(),
             signed_tx.output.len()
         );
+    }
+
+    // --- Federation CSV-leaf (script-path) signer (N23) ---
+
+    /// The federation fallback: sign the treasury via its CSV leaf and prove the
+    /// signature validates against `y_fed` under the tapscript sighash, the
+    /// witness is the 3-item script-path shape, and `nSequence` enables OP_CSV.
+    #[test]
+    fn test_federation_leaf_spend_signs_and_verifies() {
+        use crate::bitcoin::taproot::build_csv_checksig_script;
+        use bitcoin::secp256k1::{Message, Secp256k1};
+        use bitcoin::taproot::{LeafVersion, TapLeafHash};
+
+        let secp = Secp256k1::new();
+        // treasury locked under (Y_51 = seed[1], y_fed = seed[3], csv = 144)
+        let tm = build_tm(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+
+        let y_fed_sk = sk_from_seed([3u8; 32]);
+        let signed = sign_tm_federation_leaf(&secp, &tm, &y_fed_sk, 144).unwrap();
+
+        // 3-item script-path witness + a relative-timelock nSequence (not the
+        // OP_CSV-disabling TM_SEQUENCE).
+        assert_eq!(signed.input[0].witness.len(), 3);
+        assert_eq!(signed.input[0].sequence, Sequence::from_height(144));
+        assert_ne!(signed.input[0].sequence, TM_SEQUENCE);
+
+        // The revealed leaf is exactly the treasury federation leaf.
+        let y_fed = xonly_from_seed([3u8; 32]);
+        let leaf = build_csv_checksig_script(144, y_fed);
+        assert_eq!(signed.input[0].witness.nth(1).unwrap(), leaf.as_bytes());
+
+        // The Schnorr signature validates against y_fed under the tapscript sighash.
+        let sig_bytes = signed.input[0].witness.nth(0).unwrap();
+        let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(sig_bytes).unwrap();
+        let leaf_hash = TapLeafHash::from_script(&leaf, LeafVersion::TapScript);
+        let sighash = {
+            let mut cache = SighashCache::new(&signed);
+            cache
+                .taproot_script_spend_signature_hash(
+                    0,
+                    &Prevouts::All(&tm.prevouts),
+                    leaf_hash,
+                    TapSighashType::Default,
+                )
+                .unwrap()
+        };
+        secp.verify_schnorr(&sig, &Message::from_digest(sighash.to_byte_array()), &y_fed)
+            .expect("federation leaf signature must verify against y_fed");
+
+        // A key/csv that is not the tree's leaf has no control block → error.
+        assert!(matches!(
+            sign_tm_federation_leaf(&secp, &tm, &sk_from_seed([9u8; 32]), 144),
+            Err(TmBuildError::FederationLeafSpend(_))
+        ));
     }
 }

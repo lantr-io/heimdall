@@ -28,9 +28,7 @@ use whisky::*;
 
 use crate::cardano::bf_http::BfUtxo;
 use crate::cardano::blueprint::ParameterizedScript;
-use crate::cardano::treasury_info::{
-    TreasuryInfoDatum, TreasuryInfoError, treasury_spend_redeemer,
-};
+use crate::cardano::treasury_info::{TreasuryInfoDatum, TreasuryInfoError};
 
 #[derive(Debug)]
 pub enum TreasurySpendError {
@@ -159,21 +157,22 @@ pub fn find_treasury_state(
 }
 
 /// The whisky pieces of the treasury leg: the script input spending the state
-/// UTxO (with `TreasurySpendRedeemer{config_ref_input_index, new_*}`) and the
-/// continuing output (same address, same value, `new_datum` inline).
+/// UTxO (with the caller-supplied `TreasurySpendRedeemer` — `RegistryUpdate` for
+/// register_spo, `UpdateY` for key rotation) and the continuing output (same
+/// address, same value, `new_datum` inline).
 ///
-/// `config_ref_input_index` is carried in the redeemer because the type
-/// declares it; the deployed validator never reads it.
+/// `redeemer_pd` is the encoded `TreasurySpendRedeemer` (see
+/// [`crate::cardano::treasury_info::registry_update_redeemer`] /
+/// [`crate::cardano::treasury_info::update_y_redeemer`]).
 ///
-/// The composing tx must also mint under the registry policy and account for
-/// the treasury input's position when building the registry `Register`
-/// redeemer — both are the caller's responsibility.
+/// The RegistryUpdate path additionally requires the composing tx to mint under
+/// the registry policy (the caller's responsibility); the UpdateY path does not.
 #[must_use]
 pub fn treasury_spend_leg(
     state: &TreasuryStateUtxo,
     treasury_script: &ParameterizedScript,
     new_datum: &TreasuryInfoDatum,
-    config_ref_input_index: i64,
+    redeemer_pd: PlutusData,
     network: pallas_addresses::Network,
 ) -> (TxIn, Output) {
     let script_address = treasury_script.enterprise_address(network);
@@ -185,7 +184,6 @@ pub fn treasury_spend_leg(
         Asset::new_from_str(&asset_unit, "1"),
     ];
 
-    let redeemer_pd = treasury_spend_redeemer(config_ref_input_index, new_datum);
     let redeemer_hex = hex::encode(minicbor::to_vec(&redeemer_pd).expect("redeemer CBOR encode"));
 
     let tx_in = TxIn::ScriptTxIn(ScriptTxIn {
@@ -252,9 +250,10 @@ mod tests {
     fn sample_datum(root: mpf::Hash) -> TreasuryInfoDatum {
         TreasuryInfoDatum {
             bifrost_identity_root: root,
-            current_treasury_address: b"\x51\x20treasury-spk".to_vec(),
-            current_treasury_utxo_id: vec![0x11; 36],
             current_spos_frost_key: vec![0xAB; 32],
+            y_federation: vec![0xCD; 32],
+            federation_csv_blocks: 144,
+            last_reset_tm_txid: vec![],
         }
     }
 
@@ -390,7 +389,7 @@ mod tests {
             &state,
             &script,
             &new_datum,
-            0,
+            crate::cardano::treasury_info::registry_update_redeemer(&new_datum),
             pallas_addresses::Network::Testnet,
         );
 
@@ -414,17 +413,16 @@ mod tests {
         };
         assert_eq!(datum_hex, &hex::encode(new_datum.to_cbor()));
 
-        // Redeemer: Constr 0, [config_ref_input_index, new_root, new_address,
-        // new_utxo_id, new_frost_key].
+        // Redeemer: RegistryUpdate = Constr 0, [new_bifrost_identity_root].
         let r = &stx.script_tx_in.redeemer.as_ref().unwrap().data;
         let pd: PlutusData = minicbor::decode(&hex::decode(r).unwrap()).unwrap();
         let PlutusData::Constr(c) = pd else {
             panic!("expected Constr redeemer");
         };
         assert_eq!(c.tag, 121);
-        assert_eq!(c.fields.len(), 5);
+        assert_eq!(c.fields.len(), 1);
         assert!(
-            matches!(&c.fields[1], PlutusData::BoundedBytes(b) if **b == new_datum.bifrost_identity_root)
+            matches!(&c.fields[0], PlutusData::BoundedBytes(b) if **b == new_datum.bifrost_identity_root)
         );
     }
 
@@ -453,7 +451,7 @@ mod tests {
             &state,
             &script,
             &new_datum,
-            0,
+            crate::cardano::treasury_info::registry_update_redeemer(&new_datum),
             pallas_addresses::Network::Testnet,
         );
 
@@ -469,11 +467,9 @@ mod tests {
             mpf::including(b"new-spo-pk", b"new-pool", &proof).unwrap()
         );
         // Everything else is preserved by registration.
-        assert_eq!(
-            continued.current_treasury_address,
-            old.current_treasury_address
-        );
         assert_eq!(continued.current_spos_frost_key, old.current_spos_frost_key);
+        assert_eq!(continued.y_federation, old.y_federation);
+        assert_eq!(continued.federation_csv_blocks, old.federation_csv_blocks);
     }
 
     // Compose the leg into a full whisky tx (with a stand-in mint for the
@@ -500,7 +496,7 @@ mod tests {
             &state,
             &script,
             &new_datum,
-            0,
+            crate::cardano::treasury_info::registry_update_redeemer(&new_datum),
             pallas_addresses::Network::Testnet,
         );
 

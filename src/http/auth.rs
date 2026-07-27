@@ -139,21 +139,51 @@ fn xor32(a: &[u8; SHARE_LEN], b: &[u8; SHARE_LEN]) -> [u8; SHARE_LEN] {
 }
 
 /// Encrypt one share `f_i(l)` for recipient `l`, given a freshly
-/// generated ephemeral secret. Returns `(ephemeral_pk, ciphertext)` —
-/// the 33-byte compressed `E_i` and the 32-byte XOR ciphertext.
+/// generated ephemeral secret. Returns `(ephemeral_pk, ciphertext, pad)` —
+/// the 33-byte compressed `E_i`, the 32-byte XOR ciphertext, and the 32-byte
+/// one-time pad. The pad is not published, but its hash is part of the signed
+/// Round 2 payload so it can be revealed in a fault proof.
+pub fn encrypt_share_with_pad(
+    secp: &Secp256k1<All>,
+    ephemeral_sk: &SecretKey,
+    recipient_bifrost_id_pk: &[u8],
+    share: &[u8; SHARE_LEN],
+) -> Result<([u8; POINT_LEN], [u8; SHARE_LEN], [u8; SHARE_LEN]), AuthError> {
+    let recipient_point = XOnlyPublicKey::from_slice(recipient_bifrost_id_pk)
+        .map_err(|e| AuthError::BadKey(e.to_string()))?
+        .public_key(Parity::Even);
+    let ss = ecdh_x(secp, ephemeral_sk, &recipient_point)?;
+    let pad = share_key(&ss);
+    let ciphertext = xor32(share, &pad);
+    let ephemeral_pk = PublicKey::from_secret_key(secp, ephemeral_sk).serialize();
+    Ok((ephemeral_pk, ciphertext, pad))
+}
+
+/// Encrypt one share and return only the public wire fields.
 pub fn encrypt_share(
     secp: &Secp256k1<All>,
     ephemeral_sk: &SecretKey,
     recipient_bifrost_id_pk: &[u8],
     share: &[u8; SHARE_LEN],
 ) -> Result<([u8; POINT_LEN], [u8; SHARE_LEN]), AuthError> {
-    let recipient_point = XOnlyPublicKey::from_slice(recipient_bifrost_id_pk)
-        .map_err(|e| AuthError::BadKey(e.to_string()))?
-        .public_key(Parity::Even);
-    let ss = ecdh_x(secp, ephemeral_sk, &recipient_point)?;
-    let ciphertext = xor32(share, &share_key(&ss));
-    let ephemeral_pk = PublicKey::from_secret_key(secp, ephemeral_sk).serialize();
+    let (ephemeral_pk, ciphertext, _pad) =
+        encrypt_share_with_pad(secp, ephemeral_sk, recipient_bifrost_id_pk, share)?;
     Ok((ephemeral_pk, ciphertext))
+}
+
+/// Decrypt a share addressed to us, using our bifrost identity secret
+/// and the sender's ephemeral public key. Returns `(share, pad)` so callers can
+/// verify the signed `pad_commit`.
+pub fn decrypt_share_with_pad(
+    secp: &Secp256k1<All>,
+    my_bifrost_sk: &SecretKey,
+    ephemeral_pk: &[u8; POINT_LEN],
+    ciphertext: &[u8; SHARE_LEN],
+) -> Result<([u8; SHARE_LEN], [u8; SHARE_LEN]), AuthError> {
+    let e = PublicKey::from_slice(ephemeral_pk).map_err(|e| AuthError::BadKey(e.to_string()))?;
+    let ss = ecdh_x(secp, my_bifrost_sk, &e)?;
+    let pad = share_key(&ss);
+    Ok((xor32(ciphertext, &pad), pad))
 }
 
 /// Decrypt a share addressed to us, using our bifrost identity secret
@@ -164,9 +194,8 @@ pub fn decrypt_share(
     ephemeral_pk: &[u8; POINT_LEN],
     ciphertext: &[u8; SHARE_LEN],
 ) -> Result<[u8; SHARE_LEN], AuthError> {
-    let e = PublicKey::from_slice(ephemeral_pk).map_err(|e| AuthError::BadKey(e.to_string()))?;
-    let ss = ecdh_x(secp, my_bifrost_sk, &e)?;
-    Ok(xor32(ciphertext, &share_key(&ss)))
+    let (share, _pad) = decrypt_share_with_pad(secp, my_bifrost_sk, ephemeral_pk, ciphertext)?;
+    Ok(share)
 }
 
 #[cfg(test)]

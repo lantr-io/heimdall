@@ -61,7 +61,9 @@ use crate::cardano::publish::WalletUtxo;
 use crate::cardano::registry::{
     REGISTRATION_ROOT_KEY, RegistrationNodeData, RegistryElement, RegistryError, RegistryList,
 };
-use crate::cardano::treasury_info::{TreasuryInfoError, apply_registration, proof_to_plutus_data};
+use crate::cardano::treasury_info::{
+    TreasuryInfoError, apply_registration, proof_to_plutus_data, registry_update_redeemer,
+};
 use crate::cardano::treasury_spend::{TreasurySpendError, find_treasury_state, treasury_spend_leg};
 use crate::cardano::tx_common::{
     BootstrapError, OneShotBootstrapParams, build_oneshot_bootstrap_tx, element_lovelace,
@@ -461,8 +463,13 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
     let network = network_from_address(req.wallet_address);
     let registry_address = req.registry_script.enterprise_address(network);
 
-    let (treasury_in, treasury_out) =
-        treasury_spend_leg(&state, req.treasury_script, &new_treasury_datum, 0, network);
+    let (treasury_in, treasury_out) = treasury_spend_leg(
+        &state,
+        req.treasury_script,
+        &new_treasury_datum,
+        registry_update_redeemer(&new_treasury_datum),
+        network,
+    );
 
     // New node output: min-ADA + the freshly minted membership NFT.
     let new_node_datum_cbor = plan.new_node.to_cbor();
@@ -1124,9 +1131,10 @@ mod tests {
         let trie = mpf::Trie::from_pairs(identity_pairs.iter().map(|(k, v)| (k, v))).unwrap();
         let treasury_datum = TreasuryInfoDatum {
             bifrost_identity_root: trie.root_hash(),
-            current_treasury_address: b"\x51\x20treasury-spk".to_vec(),
-            current_treasury_utxo_id: vec![0x11; 36],
             current_spos_frost_key: vec![0xAB; 32],
+            y_federation: vec![0xCD; 32],
+            federation_csv_blocks: 144,
+            last_reset_tm_txid: vec![],
         };
         let nft_name = "ee".repeat(32);
         let treasury_utxos = vec![BfUtxo {
@@ -1483,9 +1491,10 @@ mod tests {
         )];
         let bad_datum = TreasuryInfoDatum {
             bifrost_identity_root: [9u8; 32],
-            current_treasury_address: vec![1],
-            current_treasury_utxo_id: vec![2],
             current_spos_frost_key: vec![3],
+            y_federation: vec![4],
+            federation_csv_blocks: 144,
+            last_reset_tm_txid: vec![],
         };
         let treasury_utxos = vec![BfUtxo {
             tx_hash: "dd".repeat(32),

@@ -5,11 +5,16 @@
 //! `treasury_info` UTxO carries:
 //!
 //! ```text
-//! Constr(0, [ bifrost_identity_root, current_treasury_address,
-//!             current_treasury_utxo_id, current_spos_frost_key ])   // all ByteArray
+//! Constr(0, [ bifrost_identity_root, current_spos_frost_key,
+//!             y_federation,          federation_csv_blocks,
+//!             last_reset_tm_txid ])
+//! //          ^ByteArray x3          ^Int                   ^ByteArray
 //! ```
 //!
-//! matching the Aiken `bifrost/types/treasury.ak` `TreasuryDatum`.
+//! matching the Aiken `bifrost/types/treasury.ak` `TreasuryDatum` (N10b: the two
+//! vestigial pointer fields were retired and the federation fields added; field
+//! #4 `last_reset_tm_txid` is the FederationReset anti-replay anchor — empty at
+//! bootstrap, set to the consumed federation-sweep TM's `btc_txid` by each reset).
 //!
 //! `register_spo` (R1c) spends this UTxO to insert `bifrost_id_pk → pool_id`
 //! into the `bifrost_identity_root` Merkle-Patricia-Forestry trie. This module
@@ -29,14 +34,19 @@ use pallas_primitives::PlutusData;
 use crate::cardano::mpf;
 use crate::cardano::plutus::{self, array, bytes, constr, int};
 
-/// The `treasury_info` state datum (`TreasuryDatum`). All fields are on-chain
-/// `ByteArray`s; `bifrost_identity_root` is the 32-byte MPF root.
+/// The `treasury_info` state datum (`TreasuryDatum`). `bifrost_identity_root` is
+/// the 32-byte MPF root; `current_spos_frost_key` / `y_federation` are x-only
+/// keys; `federation_csv_blocks` is the CSV timeout (an on-chain `Int`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreasuryInfoDatum {
     pub bifrost_identity_root: mpf::Hash,
-    pub current_treasury_address: Vec<u8>,
-    pub current_treasury_utxo_id: Vec<u8>,
     pub current_spos_frost_key: Vec<u8>,
+    pub y_federation: Vec<u8>,
+    pub federation_csv_blocks: i64,
+    /// #4 — `btc_txid` of the federation-sweep TM that last authorized a
+    /// FederationReset (anti-replay anchor). Empty (`vec![]`) at bootstrap and
+    /// until the first reset; every non-reset branch preserves it verbatim.
+    pub last_reset_tm_txid: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -78,10 +88,10 @@ impl From<plutus::PlutusError> for TreasuryInfoError {
         match e {
             plutus::PlutusError::NotConstr => Self::NotConstr,
             plutus::PlutusError::WrongConstructor { got, .. } => Self::WrongConstructor(got),
-            // The shared `field_bytes` distinguishes missing vs wrong-type; this
-            // module's `from_plutus_data` checks field count first, so both map
-            // to NotBytes (preserving the prior behaviour). NotInt is
-            // unreachable for this datum shape (no Int fields).
+            // Field-count is checked first, so MissingField is unreachable here.
+            // NotInt is reachable now (federation_csv_blocks is field #3, an Int);
+            // it and the byte-field errors collapse to NotBytes(i) — the index
+            // still points at the offending field, which is what callers log.
             plutus::PlutusError::MissingField(i)
             | plutus::PlutusError::NotBytes(i)
             | plutus::PlutusError::NotInt(i)
@@ -99,16 +109,18 @@ impl From<plutus::PlutusError> for TreasuryInfoError {
 // ---------------------------------------------------------------------------
 
 impl TreasuryInfoDatum {
-    /// Encode as `Constr(0, [root, address, utxo_id, frost_key])`.
+    /// Encode as `Constr(0, [root, frost_key, y_federation, federation_csv_blocks,
+    /// last_reset_tm_txid])`.
     #[must_use]
     pub fn to_plutus_data(&self) -> PlutusData {
         constr(
             0,
             vec![
                 bytes(&self.bifrost_identity_root),
-                bytes(&self.current_treasury_address),
-                bytes(&self.current_treasury_utxo_id),
                 bytes(&self.current_spos_frost_key),
+                bytes(&self.y_federation),
+                int(self.federation_csv_blocks),
+                bytes(&self.last_reset_tm_txid),
             ],
         )
     }
@@ -121,9 +133,9 @@ impl TreasuryInfoDatum {
 
     pub fn from_plutus_data(data: &PlutusData) -> Result<Self, TreasuryInfoError> {
         let fields = plutus::constr_fields(data, 0)?;
-        if fields.len() != 4 {
+        if fields.len() != 5 {
             return Err(TreasuryInfoError::FieldCount {
-                expected: 4,
+                expected: 5,
                 got: fields.len(),
             });
         }
@@ -134,28 +146,126 @@ impl TreasuryInfoDatum {
             .map_err(|_| TreasuryInfoError::BadRootLen(root_bytes.len()))?;
         Ok(TreasuryInfoDatum {
             bifrost_identity_root,
-            current_treasury_address: plutus::field_bytes(fields, 1)?,
-            current_treasury_utxo_id: plutus::field_bytes(fields, 2)?,
-            current_spos_frost_key: plutus::field_bytes(fields, 3)?,
+            current_spos_frost_key: plutus::field_bytes(fields, 1)?,
+            y_federation: plutus::field_bytes(fields, 2)?,
+            federation_csv_blocks: plutus::field_int(fields, 3)?,
+            last_reset_tm_txid: plutus::field_bytes(fields, 4)?,
         })
     }
 }
 
-/// Encode the `TreasurySpendRedeemer` for registration:
-/// `Constr(0, [config_ref_input_index, new_root, new_address, new_utxo_id, new_frost_key])`.
-/// `new` is the post-registration datum (only `bifrost_identity_root` differs).
+/// Encode the `TreasurySpendRedeemer::RegistryUpdate { new_bifrost_identity_root }`
+/// (constructor 0) — the Register/Deregister path. `treasury.ak` preserves every
+/// other datum field itself (record-update spread off the spent datum), so only
+/// the new MPF root travels in the redeemer.
 #[must_use]
-pub fn treasury_spend_redeemer(config_ref_input_index: i64, new: &TreasuryInfoDatum) -> PlutusData {
+pub fn registry_update_redeemer(new: &TreasuryInfoDatum) -> PlutusData {
+    constr(0, vec![bytes(&new.bifrost_identity_root)])
+}
+
+/// Encode the `TreasurySpendRedeemer::UpdateY { new_spos_frost_key, epoch, signature }`
+/// (constructor 1) — the DKG key-rotation path.
+#[must_use]
+pub fn update_y_redeemer(new_spos_frost_key: &[u8], epoch: i64, signature: &[u8]) -> PlutusData {
     constr(
-        0,
-        vec![
-            int(config_ref_input_index),
-            bytes(&new.bifrost_identity_root),
-            bytes(&new.current_treasury_address),
-            bytes(&new.current_treasury_utxo_id),
-            bytes(&new.current_spos_frost_key),
-        ],
+        1,
+        vec![bytes(new_spos_frost_key), int(epoch), bytes(signature)],
     )
+}
+
+/// Encode the `TreasurySpendRedeemer::FederationReset { tm_ref_input_index, epoch,
+/// signature }` (constructor 2) — the emergency dead-roster recovery path. The
+/// Confirmed TM referenced at `tm_ref_input_index` (index into the tx's reference
+/// inputs, ledger-sorted) supplies both the `spent_via_federation_leaf` evidence and
+/// the `btc_txid` that `treasury.ak` writes into `last_reset_tm_txid`;
+/// `current_spos_frost_key` is rotated to `y_federation` and every other field is
+/// preserved by the validator itself (record-update spread).
+#[must_use]
+pub fn federation_reset_redeemer(
+    tm_ref_input_index: i64,
+    epoch: i64,
+    signature: &[u8],
+) -> PlutusData {
+    constr(
+        2,
+        vec![int(tm_ref_input_index), int(epoch), bytes(signature)],
+    )
+}
+
+/// The domain-separated message the OUTGOING roster signs (BIP340) to authorize
+/// an Update-Y rotation. MUST match `treasury.ak`'s `update_y_sig_msg`
+/// byte-for-byte:
+///
+/// ```text
+/// sha2_256("bifrost-update-y" ++ spent_txid(32B) ++ spent_vout(4B LE)
+///          ++ epoch(8B BE) ++ new_spos_frost_key(32B))
+/// ```
+///
+/// `spent_txid` is the 32-byte Cardano tx id of the treasury state UTxO being
+/// spent; `spent_vout` its output index.
+#[must_use]
+pub fn update_y_sig_msg(
+    spent_txid: &[u8; 32],
+    spent_vout: u32,
+    epoch: u64,
+    new_spos_frost_key: &[u8],
+) -> [u8; 32] {
+    rotation_sig_msg(
+        b"bifrost-update-y",
+        spent_txid,
+        spent_vout,
+        epoch,
+        new_spos_frost_key,
+    )
+}
+
+/// The domain-separated message the FEDERATION signs (BIP340 under `y_federation`)
+/// to authorize a FederationReset. MUST match `treasury.ak`'s `rotation_sig_msg`
+/// with tag `"bifrost-update-y-reset"` and `new_key = y_federation`, byte-for-byte:
+///
+/// ```text
+/// sha2_256("bifrost-update-y-reset" ++ spent_txid(32B) ++ spent_vout(4B LE)
+///          ++ epoch(8B BE) ++ y_federation(32B))
+/// ```
+///
+/// The signer is the federation (it holds `y_federation`'s secret), signing over the
+/// SPENT treasury-state outpoint so the reset cannot be replayed against a different
+/// state UTxO.
+#[must_use]
+pub fn federation_reset_sig_msg(
+    spent_txid: &[u8; 32],
+    spent_vout: u32,
+    epoch: u64,
+    y_federation: &[u8],
+) -> [u8; 32] {
+    rotation_sig_msg(
+        b"bifrost-update-y-reset",
+        spent_txid,
+        spent_vout,
+        epoch,
+        y_federation,
+    )
+}
+
+/// Shared preimage + hash for the treasury key-rotation signatures — the heimdall
+/// mirror of `treasury.ak`'s `rotation_sig_msg`: `sha2_256(tag ++ spent_txid(32B)
+/// ++ spent_vout(4B LE) ++ epoch(8B BE) ++ key(32B))`. The Update-Y and
+/// FederationReset variants differ only in `tag` and the trailing `key`.
+fn rotation_sig_msg(
+    tag: &[u8],
+    spent_txid: &[u8; 32],
+    spent_vout: u32,
+    epoch: u64,
+    key: &[u8],
+) -> [u8; 32] {
+    use bitcoin::hashes::{Hash as _, sha256};
+    let mut pre = Vec::with_capacity(tag.len() + 32 + 4 + 8 + key.len());
+    pre.extend_from_slice(tag);
+    pre.extend_from_slice(spent_txid);
+    pre.extend_from_slice(&spent_vout.to_le_bytes());
+    pre.extend_from_slice(&epoch.to_be_bytes());
+    pre.extend_from_slice(key);
+    sha256::Hash::hash(&pre).to_byte_array()
 }
 
 // ---------------------------------------------------------------------------
@@ -226,11 +336,11 @@ pub fn apply_registration(
         .map_err(TreasuryInfoError::Mpf)?;
     let new_root =
         mpf::including(bifrost_id_pk, pool_id, &absence_proof).map_err(TreasuryInfoError::Mpf)?;
+    // Only the identity root changes; the frost key and federation fields are
+    // preserved (mirrors treasury.ak's RegistryUpdate / spos-registry.ak).
     let new_datum = TreasuryInfoDatum {
         bifrost_identity_root: new_root,
-        current_treasury_address: current.current_treasury_address.clone(),
-        current_treasury_utxo_id: current.current_treasury_utxo_id.clone(),
-        current_spos_frost_key: current.current_spos_frost_key.clone(),
+        ..current.clone()
     };
     Ok((new_datum, absence_proof))
 }
@@ -254,9 +364,10 @@ mod tests {
     fn sample_datum(root: mpf::Hash) -> TreasuryInfoDatum {
         TreasuryInfoDatum {
             bifrost_identity_root: root,
-            current_treasury_address: b"\x51\x20treasury-spk".to_vec(),
-            current_treasury_utxo_id: b"btc-outpoint".to_vec(),
             current_spos_frost_key: vec![0xABu8; 32],
+            y_federation: vec![0xCDu8; 32],
+            federation_csv_blocks: 144,
+            last_reset_tm_txid: vec![],
         }
     }
 
@@ -295,10 +406,25 @@ mod tests {
             TreasuryInfoDatum::from_plutus_data(&wrong),
             Err(TreasuryInfoError::WrongConstructor(1))
         ));
-        // root not 32 bytes
+        // too few fields (4, not the N10b 5) → FieldCount before any field decode
+        let four = constr(0, vec![bytes(&[0u8; 32]), bytes(b""), bytes(b""), int(144)]);
+        assert!(matches!(
+            TreasuryInfoDatum::from_plutus_data(&four),
+            Err(TreasuryInfoError::FieldCount {
+                expected: 5,
+                got: 4
+            })
+        ));
+        // root not 32 bytes (5-field datum so the field-count check passes first)
         let short = constr(
             0,
-            vec![bytes(&[0u8; 8]), bytes(b""), bytes(b""), bytes(b"")],
+            vec![
+                bytes(&[0u8; 8]),
+                bytes(b""),
+                bytes(b""),
+                int(144),
+                bytes(b""),
+            ],
         );
         assert!(matches!(
             TreasuryInfoDatum::from_plutus_data(&short),
@@ -333,12 +459,13 @@ mod tests {
             current.bifrost_identity_root
         );
         assert_eq!(
-            new_datum.current_treasury_address,
-            current.current_treasury_address
-        );
-        assert_eq!(
             new_datum.current_spos_frost_key,
             current.current_spos_frost_key
+        );
+        assert_eq!(new_datum.y_federation, current.y_federation);
+        assert_eq!(
+            new_datum.federation_csv_blocks,
+            current.federation_csv_blocks
         );
     }
 
@@ -380,7 +507,78 @@ mod tests {
         // The spend redeemer also encodes.
         let current = sample_datum(trie.root_hash());
         let (new_datum, _) = apply_registration(&current, &trie, b"absent-key", b"pool").unwrap();
-        let redeemer = treasury_spend_redeemer(0, &new_datum);
+        let redeemer = registry_update_redeemer(&new_datum);
         let _cbor = minicbor::to_vec(redeemer).unwrap();
+    }
+
+    // RegistryUpdate is Constr(0, [new_root]) — a single field now that
+    // treasury.ak preserves every other datum field itself.
+    #[test]
+    fn registry_update_redeemer_is_single_field_constr0() {
+        let d = sample_datum([3u8; 32]);
+        let PlutusData::Constr(c) = registry_update_redeemer(&d) else {
+            panic!("expected Constr");
+        };
+        assert_eq!(c.tag, 121); // Constr 0
+        let fields: Vec<_> = c.fields.to_vec();
+        assert_eq!(fields.len(), 1);
+        assert!(matches!(&fields[0], PlutusData::BoundedBytes(b) if **b == [3u8; 32]));
+    }
+
+    // UpdateY is Constr(1, [new_key, epoch, signature]).
+    #[test]
+    fn update_y_redeemer_is_constr1_three_fields() {
+        let PlutusData::Constr(c) = update_y_redeemer(&[0xAB; 32], 7, &[0xCD; 64]) else {
+            panic!("expected Constr");
+        };
+        assert_eq!(c.tag, 122); // Constr 1
+        let fields: Vec<_> = c.fields.to_vec();
+        assert_eq!(fields.len(), 3);
+        assert!(matches!(&fields[0], PlutusData::BoundedBytes(b) if **b == [0xAB; 32]));
+        assert!(matches!(&fields[1], PlutusData::BigInt(_)));
+        assert!(matches!(&fields[2], PlutusData::BoundedBytes(b) if **b == [0xCD; 64]));
+    }
+
+    // The signed message MUST match treasury.ak byte-for-byte. This vector is the
+    // one the Aiken `spend_update_y_happy` test verifies a real BIP340 signature
+    // against (txid = 0x22*32, vout = 0, epoch = 7, new_key = 0xAB*32), so this
+    // single assertion locks the two implementations together.
+    #[test]
+    fn update_y_sig_msg_matches_onchain_vector() {
+        let msg = update_y_sig_msg(&[0x22u8; 32], 0, 7, &[0xABu8; 32]);
+        assert_eq!(
+            hex::encode(msg),
+            "e347507502df93a1056a7c889b943d24ff614d78bdb54e3f6275c6b2ea268492"
+        );
+    }
+
+    // Reset sibling of the above. The Aiken `spend_federation_reset_happy` test verifies a real
+    // BIP340 signature (t_reset_sig, secret 3) against exactly this message: txid = 0x22*32,
+    // vout = 0, epoch = 9, y_federation = t_yfed (x-only of secret 3). Locking the hash locks the
+    // heimdall builder's message to the on-chain one — a mismatch would make every FederationReset
+    // signature the federation produces fail `verify_schnorr_signature`.
+    #[test]
+    fn federation_reset_sig_msg_matches_onchain_vector() {
+        let t_yfed =
+            hex::decode("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9")
+                .unwrap();
+        let msg = federation_reset_sig_msg(&[0x22u8; 32], 0, 9, &t_yfed);
+        assert_eq!(
+            hex::encode(msg),
+            "68a1d8173d424c952b4e33b6a3dcada7cae9f7fa96f10464fde7cf14e510c925"
+        );
+    }
+
+    #[test]
+    fn federation_reset_redeemer_encodes_constr2() {
+        let PlutusData::Constr(c) = federation_reset_redeemer(0, 9, &[0xCD; 64]) else {
+            panic!("expected Constr");
+        };
+        assert_eq!(c.tag, 121 + 2); // Constr 2
+        let fields: Vec<_> = c.fields.to_vec();
+        assert_eq!(fields.len(), 3);
+        assert!(matches!(&fields[0], PlutusData::BigInt(_))); // tm_ref_input_index
+        assert!(matches!(&fields[1], PlutusData::BigInt(_))); // epoch
+        assert!(matches!(&fields[2], PlutusData::BoundedBytes(b) if **b == [0xCD; 64]));
     }
 }

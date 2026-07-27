@@ -279,6 +279,13 @@ Script builders (internal):
 
 ### 6.2 Treasury Movement Transaction
 
+The treasury input is resolved on-chain (DEC-022): the bridge Config UTxO's field 11
+(`initial_btc_treasury_utxo`) anchors the Confirmed TM chain, and `query_treasury` walks the
+Confirmed records at the TM address (each spends its predecessor's output 0) to the tip. Before
+the first TM confirms, the treasury IS the anchor outpoint (value via bitcoind `gettxout`);
+afterwards it is the tip's `(btc_txid, 0)` valued at the tip record's `fulfilled[0].amount`.
+There is no local treasury configuration.
+
 Deterministic construction from shared Cardano state:
 
 ```

@@ -132,6 +132,75 @@ pub async fn fetch_current_epoch(base_url: &str, project_id: &str) -> Result<u64
         .ok_or_else(|| "epochs/latest: missing/non-numeric `epoch`".to_string())
 }
 
+/// Chain "now" — the latest block's POSIX time (seconds), from `/blocks/latest`.
+/// Used as the reference clock for the in-flight staleness deadline (chain time,
+/// never a local node clock).
+pub async fn fetch_latest_block_time(base_url: &str, project_id: &str) -> Result<i64, String> {
+    let url = format!("{base_url}/blocks/latest");
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("blocks/latest request: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("blocks/latest json: {e}"))?;
+    v.get("time")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "blocks/latest: missing/non-numeric `time`".to_string())
+}
+
+/// The latest block's `(slot, posix_time_secs)` from `/blocks/latest`. The slot anchors
+/// tx validity bounds (`invalid_hereafter`); the time seeds the TM datum's `created` field
+/// (the TM mint policy requires `created` within 1h of the tx's validity upper bound).
+pub async fn fetch_latest_block_slot_time(
+    base_url: &str,
+    project_id: &str,
+) -> Result<(u64, i64), String> {
+    let url = format!("{base_url}/blocks/latest");
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("blocks/latest request: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("blocks/latest json: {e}"))?;
+    let slot = v
+        .get("slot")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "blocks/latest: missing/non-numeric `slot`".to_string())?;
+    let time = v
+        .get("time")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "blocks/latest: missing/non-numeric `time`".to_string())?;
+    Ok((slot, time))
+}
+
+/// The POSIX block-time (seconds) of the Cardano tx `tx_hash`, from `/txs/{hash}`.
+/// The age of an Unconfirmed TM UTxO = chain-now − this.
+pub async fn fetch_tx_block_time(
+    base_url: &str,
+    project_id: &str,
+    tx_hash: &str,
+) -> Result<i64, String> {
+    let url = format!("{base_url}/txs/{tx_hash}");
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("txs/{tx_hash} request: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("txs/{tx_hash} json: {e}"))?;
+    v.get("block_time")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("txs/{tx_hash}: missing/non-numeric `block_time`"))
+}
+
 /// POSIX start time (ms) of `epoch`, from `/epochs/{epoch}`. This is the
 /// epoch-boundary time the eligible-roster ban check compares against — using a
 /// chain-derived boundary (not a node clock) so every SPO derives the same
@@ -141,24 +210,45 @@ pub async fn fetch_epoch_start_ms(
     project_id: &str,
     epoch: u64,
 ) -> Result<i64, String> {
-    let url = format!("{base_url}/epochs/{epoch}");
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .header("project_id", project_id)
-        .send()
-        .await
-        .map_err(|e| format!("epochs/{epoch} request: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "epochs/{epoch} http {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        ));
-    }
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("epochs/{epoch} json: {e}"))?;
+    // yaci-store serves no per-number /epochs/{n} route (404 "Epoch not
+    // found") — only /epochs/latest. Fall back to it when the direct route
+    // fails, but ONLY accept its start_time when it is for the requested
+    // epoch: an epoch mismatch (turnover race) must stay an error, since a
+    // wrong boundary time silently mis-evaluates ban expiry.
+    let fetch = |path: String| async move {
+        let resp = reqwest::Client::new()
+            .get(format!("{base_url}/{path}"))
+            .header("project_id", project_id)
+            .send()
+            .await
+            .map_err(|e| format!("{path} request: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "{path} http {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            ));
+        }
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("{path} json: {e}"))
+    };
+    let v = match fetch(format!("epochs/{epoch}")).await {
+        Ok(v) => v,
+        Err(direct_err) => {
+            let latest = fetch("epochs/latest".to_string())
+                .await
+                .map_err(|e| format!("{direct_err}; epochs/latest fallback: {e}"))?;
+            match latest.get("epoch").and_then(serde_json::Value::as_u64) {
+                Some(e) if e == epoch => latest,
+                other => {
+                    return Err(format!(
+                        "{direct_err}; epochs/latest is epoch {other:?}, want {epoch}"
+                    ));
+                }
+            }
+        }
+    };
     let secs = v
         .get("start_time")
         .and_then(serde_json::Value::as_i64)
@@ -187,9 +277,9 @@ pub struct EpochWindow {
     /// `TimeTranslationPastHorizon` when the script context is built.
     pub epoch_end_slot: u64,
     /// POSIX time (ms) of `current_slot` (the latest block's wall time). With
-    /// 1-second post-Shelley slots, `posix_ms(slot) = block_time_ms + (slot −
-    /// current_slot) * 1000` — used to derive an ApplyBan validity interval's
-    /// POSIX upper bound (the `start_time` the `spo_bans` validator resolves).
+    /// 1-second post-Shelley slots, `posix_ms(slot) = block_time_ms + (slot -
+    /// current_slot) * 1000`. ApplyBan uses `posix_ms(invalid_hereafter) - 1`
+    /// because Plutus exposes finite upper bounds as exclusive.
     pub block_time_ms: i64,
 }
 
@@ -239,6 +329,113 @@ pub async fn fetch_epoch_window(base_url: &str, project_id: &str) -> Result<Epoc
     })
 }
 
+/// Fetch the protocol's stake-key deposit (lovelace) from
+/// `/epochs/latest/parameters`.
+///
+/// A stake registration locks this per certificate, refundable only by
+/// deregistration, so `init-scripts` must know it to balance the transaction.
+/// Blockfrost serves the amount as a string; yaci-store as a number — accept
+/// both, and accept the camelCase key too, in the spirit of this module's other
+/// yaci-store accommodations.
+///
+/// Falls back to the protocol-standard 2 ADA when the field is absent entirely,
+/// rather than failing the run: a wrong deposit unbalances the tx and the node
+/// rejects it loudly, whereas a hard error here blocks a devnet whose parameters
+/// endpoint is merely incomplete. `--key-deposit` overrides.
+pub async fn fetch_key_deposit(base_url: &str, project_id: &str) -> Result<u64, String> {
+    let url = format!("{base_url}/epochs/latest/parameters");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("parameters request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "parameters http {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parameters json: {e}"))?;
+    let Some(d) = v.get("key_deposit").or_else(|| v.get("keyDeposit")) else {
+        eprintln!(
+            "warning: /epochs/latest/parameters carries no key_deposit — \
+             assuming the protocol-standard {DEFAULT_KEY_DEPOSIT} lovelace \
+             (override with --key-deposit)"
+        );
+        return Ok(DEFAULT_KEY_DEPOSIT);
+    };
+    d.as_u64()
+        .or_else(|| d.as_str().and_then(|s| s.parse().ok()))
+        .ok_or_else(|| format!("parameters: key_deposit not a number: {d}"))
+}
+
+/// The protocol-standard stake-key deposit, used only when the parameters
+/// endpoint omits the field.
+pub const DEFAULT_KEY_DEPOSIT: u64 = 2_000_000;
+
+/// Registration state of a reward account, as far as the backend can tell us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationState {
+    Registered,
+    NotRegistered,
+    /// No usable answer. Carries the HTTP status so the operator can see *why*
+    /// rather than guessing between an unimplemented route and an outage.
+    Unknown {
+        http_status: u16,
+    },
+}
+
+/// Registration state of a reward account, via `/accounts/{addr}`.
+///
+/// Only a 200 carrying `active` is treated as an answer. **A 404 is
+/// deliberately `Unknown`, not `NotRegistered`**: Blockfrost 404s an account it
+/// has never seen, but a backend that does not implement the route 404s
+/// identically (yaci-store serves only part of the Blockfrost surface — see the
+/// `/epochs/{n}` and named-map `cost_models` workarounds elsewhere in this
+/// module). Reporting "not registered" off an unimplemented route would state a
+/// falsehood about the chain, so the ambiguity is surfaced instead.
+///
+/// This costs nothing in practice: callers treat `Unknown` optimistically and
+/// let the ledger arbitrate, since re-registering is rejected in phase 1 at no
+/// cost, and the positive case — which is what post-registration assertions
+/// check — stays exact.
+pub async fn fetch_account_registered(
+    base_url: &str,
+    project_id: &str,
+    stake_address: &str,
+) -> Result<RegistrationState, String> {
+    let url = format!("{base_url}/accounts/{stake_address}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("account request: {e}"))?;
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        return Ok(RegistrationState::Unknown {
+            http_status: status,
+        });
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("account json: {e}"))?;
+    match v.get("active").and_then(serde_json::Value::as_bool) {
+        Some(true) => Ok(RegistrationState::Registered),
+        Some(false) => Ok(RegistrationState::NotRegistered),
+        // 200 without `active` — a backend serving a different schema.
+        None => Ok(RegistrationState::Unknown {
+            http_status: status,
+        }),
+    }
+}
+
 /// Fetch the network's live Plutus cost models (ordered int arrays) from
 /// `/epochs/latest/parameters`, returned as `[PlutusV1, PlutusV2, PlutusV3]`.
 ///
@@ -272,17 +469,37 @@ pub async fn fetch_cost_models(base_url: &str, project_id: &str) -> Result<Vec<V
         .ok_or_else(|| "parameters: no cost_models_raw/cost_models".to_string())?;
     let mut out = Vec::with_capacity(3);
     for lang in ["PlutusV1", "PlutusV2", "PlutusV3"] {
-        let arr = raw
+        let entry = raw
             .get(lang)
-            .and_then(|x| x.as_array())
-            .ok_or_else(|| format!("parameters: cost_models[{lang}] not an array"))?;
-        let nums: Vec<i64> = arr
-            .iter()
-            .map(|n| {
-                n.as_i64()
-                    .ok_or_else(|| format!("cost_models[{lang}]: non-int entry"))
-            })
-            .collect::<Result<_, _>>()?;
+            .ok_or_else(|| format!("parameters: no cost_models[{lang}]"))?;
+        let nums: Vec<i64> = if let Some(arr) = entry.as_array() {
+            arr.iter()
+                .map(|n| {
+                    n.as_i64()
+                        .ok_or_else(|| format!("cost_models[{lang}]: non-int entry"))
+                })
+                .collect::<Result<_, _>>()?
+        } else if let Some(map) = entry.as_object() {
+            // yaci-store serves ONLY the named-map form (no cost_models_raw).
+            // The ledger's canonical array order for cost models is the
+            // alphabetical order of the parameter names, so a key-sorted
+            // flatten reproduces it — and any deviation is self-checking: a
+            // wrong order breaks the script integrity hash and the chain
+            // rejects the tx.
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            entries
+                .into_iter()
+                .map(|(k, n)| {
+                    n.as_i64()
+                        .ok_or_else(|| format!("cost_models[{lang}].{k}: non-int entry"))
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            return Err(format!(
+                "parameters: cost_models[{lang}] is neither an array nor a map"
+            ));
+        };
         out.push(nums);
     }
     Ok(out)

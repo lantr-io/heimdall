@@ -31,8 +31,8 @@ use tokio::sync::Notify;
 use crate::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
 use crate::epoch::state::{EpochError, EpochResult, Roster, SpoInfo};
 use crate::epoch::traits::{
-    CardanoChain, Clock, CycleRng, EpochBoundaryEvent, PeerNetwork, PegOutRequestUtxo, RngSource,
-    TreasuryUtxo,
+    CardanoChain, Clock, CycleRng, DkgFaultEvidence, EpochBoundaryEvent, PeerNetwork,
+    PegOutRequestUtxo, RngSource, TreasuryUtxo,
 };
 use crate::http::payloads::{Sign1Payload, Sign2Payload};
 use crate::http::wire::DkgNamespace;
@@ -134,6 +134,11 @@ pub struct MockCardanoChain {
     /// Optional Bitcoin RPC config. When set, `submit_signed_tm` also
     /// broadcasts the signed BTC tx to the node via `sendrawtransaction`.
     btc_rpc: Option<BtcRpcConfig>,
+    dkg_faults: Arc<Mutex<Vec<DkgFaultEvidence>>>,
+    /// Optional wall-clock schedule anchor (Unix ms) stamped onto the DKG
+    /// context, enabling the ceremony window grid (N21) in tests. `None` (the
+    /// default) keeps the mock on relative per-round timeouts.
+    schedule_anchor_ms: Option<i64>,
 }
 
 impl MockCardanoChain {
@@ -144,7 +149,16 @@ impl MockCardanoChain {
             submitted_txs: Arc::new(Mutex::new(Vec::new())),
             treasury_y_51: Mutex::new(None),
             btc_rpc: None,
+            dkg_faults: Arc::new(Mutex::new(Vec::new())),
+            schedule_anchor_ms: None,
         }
+    }
+
+    /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning
+    /// the ceremony window grid on for this mock chain.
+    pub fn with_schedule_anchor_ms(mut self, anchor_ms: i64) -> Self {
+        self.schedule_anchor_ms = Some(anchor_ms);
+        self
     }
 
     /// Configure direct Bitcoin RPC broadcast. When set,
@@ -178,6 +192,10 @@ impl MockCardanoChain {
 
     pub fn submitted_txs(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
         self.submitted_txs.clone()
+    }
+
+    pub fn dkg_faults(&self) -> Arc<Mutex<Vec<DkgFaultEvidence>>> {
+        self.dkg_faults.clone()
     }
 }
 
@@ -213,13 +231,13 @@ impl CardanoChain for MockCardanoChain {
         epoch: u64,
         attempt: u32,
     ) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
-        Ok(
-            crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(
-                &self.fixture.roster,
-                epoch,
-                attempt,
-            ),
-        )
+        let mut ctx = crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(
+            &self.fixture.roster,
+            epoch,
+            attempt,
+        );
+        ctx.schedule_anchor_ms = self.schedule_anchor_ms;
+        Ok(ctx)
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {
@@ -241,6 +259,11 @@ impl CardanoChain for MockCardanoChain {
 
     async fn publish_group_key(&self, y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()> {
         *self.treasury_y_51.lock().unwrap() = Some(y_51);
+        Ok(())
+    }
+
+    async fn publish_dkg_fault_and_apply_ban(&self, evidence: DkgFaultEvidence) -> EpochResult<()> {
+        self.dkg_faults.lock().unwrap().push(evidence);
         Ok(())
     }
 
@@ -293,16 +316,82 @@ struct PeerSlot {
     sign2: BTreeMap<u32, Sign2Payload>,
 }
 
+type MockFaultKey = (u64, u64, u64, u8, Identifier);
+
 /// Shared blackboard that all in-process `MockPeerNetwork`s read/write.
 #[derive(Debug, Default)]
 pub struct MockPeerHub {
     slots: Mutex<BTreeMap<Identifier, PeerSlot>>,
+    dkg_faults: Mutex<BTreeMap<MockFaultKey, Vec<DkgFaultEvidence>>>,
     notify: Notify,
+    /// In-process presence for the health gate (N21). An EMPTY set means
+    /// presence tracking is unused and every peer reports healthy (so tests
+    /// that don't stagger starts are unaffected); once any node registers via
+    /// [`Self::set_online`], only registered nodes are healthy.
+    online: Mutex<std::collections::BTreeSet<Identifier>>,
 }
 
 impl MockPeerHub {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub fn push_round1_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        accused: Identifier,
+        evidence: DkgFaultEvidence,
+    ) {
+        self.push_fault_evidence(ns, 1, accused, evidence);
+    }
+
+    pub fn push_round2_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        accused: Identifier,
+        evidence: DkgFaultEvidence,
+    ) {
+        self.push_fault_evidence(ns, 2, accused, evidence);
+    }
+
+    fn push_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        round: u8,
+        accused: Identifier,
+        evidence: DkgFaultEvidence,
+    ) {
+        self.dkg_faults
+            .lock()
+            .unwrap()
+            .entry((ns.epoch, ns.threshold, ns.attempt, round, accused))
+            .or_default()
+            .push(evidence);
+    }
+
+    fn fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        round: u8,
+        accused: Identifier,
+    ) -> Vec<DkgFaultEvidence> {
+        self.dkg_faults
+            .lock()
+            .unwrap()
+            .get(&(ns.epoch, ns.threshold, ns.attempt, round, accused))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Mark a node as up. Call at spawn (before its epoch loop) in tests that
+    /// exercise staggered starts.
+    pub fn set_online(&self, id: Identifier) {
+        self.online.lock().unwrap().insert(id);
+    }
+
+    fn is_online(&self, id: Identifier) -> bool {
+        let online = self.online.lock().unwrap();
+        online.is_empty() || online.contains(&id)
     }
 }
 
@@ -327,9 +416,14 @@ fn with_slot<R>(hub: &MockPeerHub, id: Identifier, f: impl FnOnce(&mut PeerSlot)
 
 #[async_trait]
 impl PeerNetwork for MockPeerNetwork {
+    async fn check_health(&self, peer: &SpoInfo) -> bool {
+        self.hub.is_online(peer.identifier)
+    }
+
     async fn publish_dkg_round1(
         &self,
         ns: DkgNamespace,
+        _identifier: Identifier,
         package: &round1::Package,
     ) -> EpochResult<()> {
         let pkg = package.clone();
@@ -341,6 +435,8 @@ impl PeerNetwork for MockPeerNetwork {
     async fn publish_dkg_round2(
         &self,
         ns: DkgNamespace,
+        _sender_identifier: Identifier,
+        _sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
         recipients: &[(SpoInfo, round2::Package)],
     ) -> EpochResult<()> {
         with_slot(&self.hub, self.me, |s| {
@@ -387,6 +483,8 @@ impl PeerNetwork for MockPeerNetwork {
         &self,
         ns: DkgNamespace,
         peer: &SpoInfo,
+        _recipient_identifier: Identifier,
+        _sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
     ) -> EpochResult<Option<round2::Package>> {
         // Return the share `peer` addressed to us (self.me) in this namespace.
         Ok(with_slot(&self.hub, peer.identifier, |s| {
@@ -395,6 +493,24 @@ impl PeerNetwork for MockPeerNetwork {
                 .filter(|(slot_ns, _)| *slot_ns == ns)
                 .map(|(_, pkg)| pkg.clone())
         }))
+    }
+
+    async fn dkg_round1_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+    ) -> EpochResult<Vec<DkgFaultEvidence>> {
+        Ok(self.hub.fault_evidence(ns, 1, peer.identifier))
+    }
+
+    async fn dkg_round2_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+        _recipient_identifier: Identifier,
+        _sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
+    ) -> EpochResult<Vec<DkgFaultEvidence>> {
+        Ok(self.hub.fault_evidence(ns, 2, peer.identifier))
     }
 
     async fn fetch_sign_round1(
@@ -452,7 +568,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let (_, pkg) = participant::dkg_part1(id1, 3, 2, &mut rng).unwrap();
         let ns = DkgNamespace::new(0);
-        net1.publish_dkg_round1(ns, &pkg).await.unwrap();
+        net1.publish_dkg_round1(ns, id1, &pkg).await.unwrap();
 
         let info1 = SpoInfo {
             identifier: id1,

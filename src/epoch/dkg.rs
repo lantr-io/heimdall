@@ -20,12 +20,11 @@
 //! The happy path (everyone contributes → `Q == C`, no reduction) needs no
 //! rerun and is what the multi-instance acceptance test exercises.
 //!
-//! TODO (WI-019): the transport drops invalid peer payloads (bad PoK / bad
-//! decrypted share) as `Ok(None)` and retains the raw bytes as fault evidence.
-//! This layer sees such peers only as "absent" (missing from `L1`/`Q`). Wiring
-//! the retained evidence through to a FaultProof is WI-019; here a faulty peer
-//! and an offline peer are handled identically (excluded, candidate set
-//! reduced).
+//! The transport drops invalid peer payloads (bad PoK / bad decrypted share) as
+//! `Ok(None)` and retains signed evidence. When a deadline leaves peers outside
+//! `L1`/`Q`, the orchestration layer asks the transport for provable evidence
+//! and hands any such evidence to the chain ban flow. Plain absence is not
+//! punishable; absent peers are only excluded from a reduced rerun.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -40,13 +39,21 @@ use crate::epoch::state::SpoInfo;
 use crate::epoch::state::{
     DkgCollected, DkgRound, EpochConfig, EpochError, EpochPhase, EpochResult, GroupKeys,
 };
-use crate::epoch::traits::{Clock, PeerNetwork, RngSource};
+use crate::epoch::traits::{CardanoChain, Clock, DkgFaultEvidence, PeerNetwork, RngSource};
 use crate::frost::participant;
+use crate::http::frost_bridge;
 use crate::http::wire::DkgNamespace;
+
+/// How many times [`poll_dkg_round1`] re-fetches every peer after Round-1
+/// collection finishes, spaced one poll interval apart, to catch a peer that
+/// serves a second, conflicting payload. Covers a grace window of
+/// `(PASSES - 1) * poll_interval` past the moment the last package arrived.
+const EQUIVOCATION_SWEEP_PASSES: usize = 3;
 
 /// Drive one DKG sub-round for `ctx` and produce the next phase: the next
 /// sub-round, a reduced-set rerun at Round 1, or (at Part 3) `PublishKeys`.
 pub async fn dkg_phase(
+    chain: &Arc<dyn CardanoChain>,
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
     rng: &Arc<dyn RngSource>,
@@ -55,10 +62,27 @@ pub async fn dkg_phase(
     ctx: DkgContext,
     mut collected: DkgCollected,
 ) -> EpochResult<EpochPhase> {
-    let me = config.identity.identifier;
+    // Our index in THIS ceremony's context, NOT the frozen startup value. The
+    // FROST index is positional and shifts when the set changes (a ban renumbers
+    // survivors). `epoch_start_phase` already re-derives it to build `ctx`, but
+    // `dkg_phase` runs the actual round-1 publish, so it must use the SAME index
+    // — reading `config.identity.identifier` here made the DKG publish under the
+    // stale index while the context was built under the correct one, and peers
+    // rejected the payloads. `own_participant` looks us up by our stable bifrost
+    // key; the fixture path (no key) falls back to the configured index.
+    let me = if config.identity.bifrost_id_pk.is_empty() {
+        // Fixture / --index demo: no on-chain key. An empty key must NOT be
+        // looked up in the roster — `own_participant(&[])` would spuriously
+        // match the first participant that also has an empty key. Trust the
+        // configured index instead.
+        config.identity.identifier
+    } else {
+        ctx.own_participant(&config.identity.bifrost_id_pk)
+            .map_or(config.identity.identifier, |p| p.identifier)
+    };
     let epoch = ctx.epoch;
     let attempt = ctx.attempt;
-    let epoch_start_ms = ctx.epoch_start_ms;
+    let schedule_anchor_ms = ctx.schedule_anchor_ms;
     // Every payload (and its replay binding) is namespaced by the attempt, so a
     // stale previous-attempt package can never be replayed into a rerun.
     let ns = DkgNamespace::for_attempt(epoch, u64::from(attempt));
@@ -76,6 +100,15 @@ pub async fn dkg_phase(
                 roster.min_signers
             );
 
+            // Publish THIS node's chain-view for the ceremony (candidate-set
+            // digest + count + the chain read-time it was resolved at). The
+            // transport attaches it UNSIGNED to every Round-1 payload and
+            // compares peers' against it: a differing view near a ban is a
+            // genuine cross-view disagreement, not a corrupt payload, and the
+            // staler node re-reads after a settling delay. Also clears the
+            // per-attempt stale verdict the epoch loop reads on abort.
+            peers.set_chain_view(ctx.chain_view()).await;
+
             let mut dkg_rng = rng.rng(b"dkg1");
             let (secret, package) =
                 participant::dkg_part1(me, roster.max_signers, roster.min_signers, &mut dkg_rng)
@@ -92,18 +125,49 @@ pub async fn dkg_phase(
                 short_hex(&pkg_bytes, 16)
             );
 
-            peers.publish_dkg_round1(ns, &package).await?;
+            peers.publish_dkg_round1(ns, me, &package).await?;
             crate::epoch_log!(me, epoch, "  -> round1 package published to local server");
 
             collected.round1_mine = Some(secret);
             collected.round1_peers.insert(me, package);
+
+            // DEMO-ONLY equivocation injection (never set in production): publish a
+            // SECOND, distinct Round-1 package to our own server after peers have
+            // collected the first one, so an honest peer's confirmatory re-fetch (see
+            // `poll_dkg_round1`) retains BOTH and reports us for equivocation. We keep
+            // using the first package's secret for the rest of the ceremony.
+            if config.inject_fault == Some(crate::epoch::state::InjectFault::EquivocateRound1) {
+                let mut equiv_rng = rng.rng(b"dkg1-equivocation");
+                let (_discard, equiv_pkg) = participant::dkg_part1(
+                    me,
+                    roster.max_signers,
+                    roster.min_signers,
+                    &mut equiv_rng,
+                )
+                .map_err(|e| EpochError::Frost(format!("dkg_part1 (equivocation): {e}")))?;
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "  ⚠ INJECT: equivocating round1 — scheduling a SECOND conflicting package"
+                );
+                let peers_equiv = peers.clone();
+                // One and a half poll cycles: long enough that every live peer has
+                // already fetched package A (so they RETAIN A and see B as a conflict,
+                // rather than B being the only payload they ever saw), short enough to
+                // land inside the honest nodes' anti-equivocation sweep window.
+                let delay = config.poll_interval.saturating_mul(3) / 2;
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = peers_equiv.publish_dkg_round1(ns, me, &equiv_pkg).await;
+                });
+            }
 
             // Poll peers' Round 1 packages until the schedule-anchored deadline.
             // The valid publishers (plus self) form the live subset L1.
             let peer_infos = roster.peers_of(me);
             let deadline = round_deadline(
                 clock,
-                epoch_start_ms,
+                schedule_anchor_ms,
                 config.dkg_round1_offset,
                 config.dkg_round_timeout,
             );
@@ -112,7 +176,7 @@ pub async fn dkg_phase(
                 epoch,
                 "  waiting for round1 packages from {} peer(s) until deadline (anchored={})...",
                 peer_infos.len(),
-                epoch_start_ms.is_some()
+                schedule_anchor_ms.is_some()
             );
             poll_dkg_round1(
                 peers,
@@ -126,7 +190,56 @@ pub async fn dkg_phase(
             )
             .await?;
 
+            // Drop packages built for a DIFFERENT candidate set before they can
+            // reach FROST. A round-1 package carries exactly `t` commitment
+            // points, so a length other than ours means the sender derived a
+            // different member list — after a ban, say, which changes both `t`
+            // and the index assignment. Such a peer is ABSENT for our purposes,
+            // never faulty: its package is honest and correctly signed, just for
+            // another ceremony. (The fault path agrees by construction —
+            // building fault evidence requires reconstructing the sender's
+            // poseidon_commit, which is exactly what fails across views, so a
+            // cross-view peer can never be punished.)
+            //
+            // Without this, the mismatched vector reaches `dkg_part2`, which
+            // returns "Incorrect number of commitments" — an error that used to
+            // terminate the epoch loop, permanently freezing an honest node on a
+            // stale view (observed 2026-07-22, spo2).
+            let expected_commitments = usize::from(ctx.threshold);
+            collected.round1_peers.retain(|id, pkg| {
+                // Distinguish the two ways this can fail. Collapsing an
+                // unserializable commitment into "0 points" would report it as a
+                // cross-view peer, which is a different (and blameless)
+                // condition — the whole point of this filter is an honest reason.
+                let got = match pkg.commitment().serialize() {
+                    Ok(c) => c.len(),
+                    Err(e) => {
+                        crate::epoch_log!(
+                            me,
+                            ctx.epoch,
+                            "  dropping round1 from {}: commitment will not serialize ({e})",
+                            id_short(*id)
+                        );
+                        return false;
+                    }
+                };
+                let keep = got == expected_commitments;
+                if !keep {
+                    crate::epoch_log!(
+                        me,
+                        ctx.epoch,
+                        "  dropping round1 from {}: {got} commitments, we expect {expected_commitments} \
+                         (peer is on a different candidate set — treating as absent, not faulty)",
+                        id_short(*id)
+                    );
+                }
+                keep
+            });
+
             let l1: BTreeSet<Identifier> = collected.round1_peers.keys().copied().collect();
+            // Report equivocation by any peer that DID publish a usable package (in L1,
+            // so not covered by the exclusion path below). Catches a "smart" equivocator.
+            report_round1_equivocations(chain, peers, ns, me, &ctx, &l1).await?;
             if l1 == eligible {
                 crate::epoch_log!(
                     me,
@@ -149,6 +262,7 @@ pub async fn dkg_phase(
                     eligible.len(),
                     absent
                 );
+                report_round1_faults(chain, peers, ns, me, &ctx, &l1).await?;
                 rerun_or_abort(me, &ctx, DkgRound::Round1, &l1, "round1 incomplete")
             }
         }
@@ -211,7 +325,15 @@ pub async fn dkg_phase(
                         })
                 })
                 .collect::<Result<_, _>>()?;
-            peers.publish_dkg_round2(ns, &recipients).await?;
+            let my_round1 = collected
+                .round1_peers
+                .get(&me)
+                .ok_or_else(|| EpochError::Transition("missing own round1 package".into()))?;
+            let (my_commitments, _sigma_i) = frost_bridge::round1_fields(my_round1)
+                .map_err(|e| EpochError::Frost(format!("round1 fields: {e}")))?;
+            peers
+                .publish_dkg_round2(ns, me, &my_commitments, &recipients)
+                .await?;
             crate::epoch_log!(me, epoch, "  -> round2 packages published");
 
             collected.round2_mine = Some(round2_secret);
@@ -219,7 +341,7 @@ pub async fn dkg_phase(
             let peer_infos = roster.peers_of(me);
             let deadline = round_deadline(
                 clock,
-                epoch_start_ms,
+                schedule_anchor_ms,
                 config.dkg_round2_offset,
                 config.dkg_round_timeout,
             );
@@ -229,7 +351,7 @@ pub async fn dkg_phase(
                 "  waiting for round2 shares addressed to me from {} peer(s) until deadline \
                  (anchored={})...",
                 peer_infos.len(),
-                epoch_start_ms.is_some()
+                schedule_anchor_ms.is_some()
             );
             poll_dkg_round2(
                 peers,
@@ -239,6 +361,7 @@ pub async fn dkg_phase(
                 me,
                 &peer_infos,
                 deadline,
+                &collected.round1_peers,
                 &mut collected.round2_peers,
             )
             .await?;
@@ -269,6 +392,8 @@ pub async fn dkg_phase(
                     eligible.len(),
                     absent
                 );
+                report_round2_faults(chain, peers, ns, me, &ctx, &q, &collected.round1_peers)
+                    .await?;
                 rerun_or_abort(me, &ctx, DkgRound::Round2, &q, "round2 incomplete")
             }
         }
@@ -378,14 +503,11 @@ pub async fn dkg_phase(
     }
 }
 
-/// Orchestration-layer fault evidence for one incomplete DKG round: the
+/// Orchestration-layer exclusion evidence for one incomplete DKG round: the
 /// eligible participants that did NOT deliver a verifiable payload by the
-/// deadline (WI-014 #8). At this layer "absent" and "sent an unverifiable
-/// payload" are indistinguishable — the transport already dropped bad payloads
-/// to `Ok(None)` and separately retained their raw bytes for equivocation
-/// proofs, keyed by `(epoch, round, pool_id)`. This records WHICH participants
-/// to look those up for; turning it into a Plonk fault proof + on-chain ban is
-/// WI-019 (explicitly out of scope here).
+/// deadline. This records which participants to ask the transport about.
+/// Absence alone is not punishable; only retained signed invalid-payload or
+/// equivocation evidence is sent to the chain ban flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DkgExclusionEvidence {
     pub epoch: u64,
@@ -432,7 +554,6 @@ impl DkgExclusionEvidence {
 /// After a round finished incomplete, decide between a reduced-set rerun and a
 /// fatal abort. Reruns iff the `survivors` clear the quorum gate AND there are
 /// still enough of them to run FROST DKG; otherwise the epoch's DKG is dead.
-/// Captures structured [`DkgExclusionEvidence`] for the excluded peers (WI-019).
 fn rerun_or_abort(
     me: Identifier,
     ctx: &DkgContext,
@@ -444,8 +565,7 @@ fn rerun_or_abort(
     crate::epoch_log!(
         me,
         ctx.epoch,
-        "  DKG fault evidence (attempt {}, {:?}): excluded [{}] — retained raw bytes available \
-         from the transport for WI-019 fault proofs",
+        "  DKG exclusions (attempt {}, {:?}): excluded [{}]",
         ctx.attempt,
         round,
         evidence.summary()
@@ -465,6 +585,15 @@ fn rerun_or_abort(
             "{why}; surviving subset fails the threshold / >51%-stake quorum gate"
         ));
     }
+    // N21: a reduction chain may not spill into the next grid window's attempt
+    // namespace — abort instead; the caller re-enters at the next window with a
+    // freshly re-queried (full) roster, which is also how an excluded-but-alive
+    // peer gets back in.
+    if (ctx.attempt + 1).is_multiple_of(crate::epoch::state::DKG_ATTEMPTS_PER_WINDOW) {
+        return abort(format!(
+            "{why}; attempt budget for this ceremony window exhausted"
+        ));
+    }
     match ctx.reduced_to(survivors) {
         Some(reduced) => Ok(EpochPhase::Dkg {
             round: DkgRound::Round1,
@@ -475,6 +604,132 @@ fn rerun_or_abort(
         // defensive guard (e.g. zero survivor stake) rather than a reachable arm.
         None => abort(format!("{why}; too few survivors to rerun FROST DKG")),
     }
+}
+
+async fn report_round1_faults(
+    chain: &Arc<dyn CardanoChain>,
+    peers: &Arc<dyn PeerNetwork>,
+    ns: DkgNamespace,
+    me: Identifier,
+    ctx: &DkgContext,
+    survivors: &BTreeSet<Identifier>,
+) -> EpochResult<()> {
+    let evidence = DkgExclusionEvidence::from_round(ctx, DkgRound::Round1, survivors);
+    for (peer, fault) in round1_faults_for_excluded(peers, ns, ctx, &evidence).await? {
+        publish_detected_fault(chain, me, ctx.epoch, peer, fault).await?;
+    }
+    Ok(())
+}
+
+async fn report_round2_faults(
+    chain: &Arc<dyn CardanoChain>,
+    peers: &Arc<dyn PeerNetwork>,
+    ns: DkgNamespace,
+    me: Identifier,
+    ctx: &DkgContext,
+    survivors: &BTreeSet<Identifier>,
+    round1_packages: &BTreeMap<Identifier, frost::keys::dkg::round1::Package>,
+) -> EpochResult<()> {
+    let evidence = DkgExclusionEvidence::from_round(ctx, DkgRound::Round2, survivors);
+    for (peer, fault) in
+        round2_faults_for_excluded(peers, ns, me, ctx, &evidence, round1_packages).await?
+    {
+        publish_detected_fault(chain, me, ctx.epoch, peer, fault).await?;
+    }
+    Ok(())
+}
+
+/// Report equivocation faults for peers that DID publish a usable Round-1 package
+/// (they land in L1, so the exclusion-based [`round1_faults_for_excluded`] never
+/// checks them). The confirmatory re-fetch in [`poll_dkg_round1`] populates the
+/// retained conflicts that back these faults.
+async fn report_round1_equivocations(
+    chain: &Arc<dyn CardanoChain>,
+    peers: &Arc<dyn PeerNetwork>,
+    ns: DkgNamespace,
+    me: Identifier,
+    ctx: &DkgContext,
+    collected: &BTreeSet<Identifier>,
+) -> EpochResult<()> {
+    let roster = ctx.to_roster();
+    for id in collected {
+        if *id == me {
+            continue;
+        }
+        let Some(peer) = roster.participants.get(id) else {
+            continue;
+        };
+        for fault in peers.dkg_round1_fault_evidence(ns, peer).await? {
+            publish_detected_fault(chain, me, ctx.epoch, peer.clone(), fault).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn round1_faults_for_excluded(
+    peers: &Arc<dyn PeerNetwork>,
+    ns: DkgNamespace,
+    ctx: &DkgContext,
+    evidence: &DkgExclusionEvidence,
+) -> EpochResult<Vec<(SpoInfo, DkgFaultEvidence)>> {
+    let roster = ctx.to_roster();
+    let mut out = Vec::new();
+    for (id, _) in &evidence.excluded {
+        let Some(peer) = roster.participants.get(id) else {
+            continue;
+        };
+        for fault in peers.dkg_round1_fault_evidence(ns, peer).await? {
+            out.push((peer.clone(), fault));
+        }
+    }
+    Ok(out)
+}
+
+async fn round2_faults_for_excluded(
+    peers: &Arc<dyn PeerNetwork>,
+    ns: DkgNamespace,
+    me: Identifier,
+    ctx: &DkgContext,
+    evidence: &DkgExclusionEvidence,
+    round1_packages: &BTreeMap<Identifier, frost::keys::dkg::round1::Package>,
+) -> EpochResult<Vec<(SpoInfo, DkgFaultEvidence)>> {
+    let roster = ctx.to_roster();
+    let mut out = Vec::new();
+    for (id, _) in &evidence.excluded {
+        let Some(peer) = roster.participants.get(id) else {
+            continue;
+        };
+        let Some(sender_round1) = round1_packages.get(id) else {
+            continue;
+        };
+        let (sender_commitments, _sigma_i) = frost_bridge::round1_fields(sender_round1)
+            .map_err(|e| EpochError::Frost(format!("round1 fields: {e}")))?;
+        for fault in peers
+            .dkg_round2_fault_evidence(ns, peer, me, &sender_commitments)
+            .await?
+        {
+            out.push((peer.clone(), fault));
+        }
+    }
+    Ok(out)
+}
+
+async fn publish_detected_fault(
+    chain: &Arc<dyn CardanoChain>,
+    me: Identifier,
+    epoch: u64,
+    peer: SpoInfo,
+    fault: DkgFaultEvidence,
+) -> EpochResult<()> {
+    crate::epoch_log!(
+        me,
+        epoch,
+        "  -> publishing DKG fault: kind={} accused={} spo={}",
+        fault.kind_label(),
+        hex::encode(fault.accused_pool_id()),
+        id_short(peer.identifier)
+    );
+    chain.publish_dkg_fault_and_apply_ban(fault).await
 }
 
 /// Assert dkg_part3's two outputs are internally coherent: the [`KeyPackage`]
@@ -508,24 +763,36 @@ fn check_dkg_output_coherent(
     }
 }
 
-/// The poll deadline for a DKG round (WI-014 #6). When the epoch boundary time
-/// is known (`epoch_start_ms`, from the chain schedule), the deadline is
-/// ABSOLUTE — `boundary + offset` — so every node freezes its live/qualified
-/// subset at the same chain-time instant regardless of when it locally entered
-/// the round; that keeps `L1`/`Q` (and any reduced-set rerun) agreeing across
-/// honest nodes. Without it (mock / no-registry fallback), the fixed relative
+/// The poll deadline for a DKG round (WI-014 #6). When the schedule anchor is
+/// known (`schedule_anchor_ms` — the ceremony window's grid line, or the epoch
+/// boundary on the pre-N21 path), the deadline is ABSOLUTE — `anchor + offset`
+/// — so every node freezes its live/qualified subset at the same chain-time
+/// instant regardless of when it locally entered the round; that keeps
+/// `L1`/`Q` (and any reduced-set rerun) agreeing across honest nodes. Without it (mock / no-registry fallback), the fixed relative
 /// `fallback` window from now is used. The absolute target is converted to a
 /// monotonic [`Instant`] via the local wall clock; over the few-minute DKG
 /// window the two advance together, so a clock skew between nodes only shifts
 /// the freeze by that skew, not unboundedly.
 fn round_deadline(
     clock: &Arc<dyn Clock>,
-    epoch_start_ms: Option<i64>,
+    schedule_anchor_ms: Option<i64>,
     offset: Duration,
     fallback: Duration,
 ) -> Instant {
-    match epoch_start_ms {
-        Some(boundary) => clock.now() + remaining_to_offset(boundary, offset, wall_now_ms()),
+    match schedule_anchor_ms {
+        Some(boundary) => {
+            let remaining = remaining_to_offset(boundary, offset, wall_now_ms());
+            // A *stale* anchor — `boundary + offset` already elapsed — collapses the window to
+            // zero, leaving a node no time to poll for peers' packages (every retry then fails
+            // identically). This happens whenever the ceremony runs well after the epoch boundary
+            // (e.g. a mid-epoch demo). Fall back to the relative window so the round still has time
+            // to converge. At a real epoch-boundary DKG `remaining > 0`, so anchoring is preserved.
+            if remaining.is_zero() {
+                clock.deadline(fallback)
+            } else {
+                clock.now() + remaining
+            }
+        }
         None => clock.deadline(fallback),
     }
 }
@@ -542,7 +809,7 @@ fn remaining_to_offset(boundary_ms: i64, offset: Duration, now_ms: i64) -> Durat
 
 /// Current wall-clock time in Unix milliseconds, for schedule anchoring. Before
 /// the Unix epoch (clock badly wrong) → 0.
-fn wall_now_ms() -> i64 {
+pub(crate) fn wall_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
@@ -588,6 +855,26 @@ async fn poll_dkg_round1(
         }
         tokio::time::sleep(config.poll_interval).await;
     }
+    // Anti-equivocation sweep: re-fetch every peer (even those already collected)
+    // so a peer that served a DIFFERENT payload after we first fetched it is
+    // caught — `fetch_dkg_round1` calls `retain_evidence`, which records the
+    // conflict that `report_round1_equivocations` then turns into a fault.
+    //
+    // Swept REPEATEDLY over a short grace window rather than once: an equivocator
+    // chooses when to serve its second payload, so a single pass only catches the
+    // one interleaving where the conflict happens to already be in place. Collection
+    // can finish in well under a poll interval (every package arrives on the first
+    // tick), which is exactly when a one-shot sweep runs too early to see anything.
+    // The grace is bounded and, on the anchored path, absorbed by the Round-2
+    // offset the nodes are waiting for anyway.
+    for pass in 0..EQUIVOCATION_SWEEP_PASSES {
+        if pass > 0 {
+            tokio::time::sleep(config.poll_interval).await;
+        }
+        for peer in peer_infos {
+            let _ = peers.fetch_dkg_round1(ns, peer).await;
+        }
+    }
     Ok(())
 }
 
@@ -603,6 +890,7 @@ async fn poll_dkg_round2(
     me: Identifier,
     peer_infos: &[&SpoInfo],
     deadline: Instant,
+    round1_packages: &BTreeMap<Identifier, frost::keys::dkg::round1::Package>,
     out: &mut BTreeMap<Identifier, frost::keys::dkg::round2::Package>,
 ) -> EpochResult<()> {
     let need = peer_infos.len();
@@ -611,7 +899,15 @@ async fn poll_dkg_round2(
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            if let Some(pkg) = peers.fetch_dkg_round2(ns, peer).await? {
+            let Some(sender_round1) = round1_packages.get(&peer.identifier) else {
+                continue;
+            };
+            let (sender_commitments, _sigma_i) = frost_bridge::round1_fields(sender_round1)
+                .map_err(|e| EpochError::Frost(format!("round1 fields: {e}")))?;
+            if let Some(pkg) = peers
+                .fetch_dkg_round2(ns, peer, me, &sender_commitments)
+                .await?
+            {
                 crate::epoch_log!(
                     me,
                     ns.epoch,
@@ -634,8 +930,12 @@ async fn poll_dkg_round2(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::epoch::mocks::{MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock};
+    use crate::circuits::fault_evidence::{EquivocationEvidence, NamespacePhase};
+    use crate::epoch::mocks::{
+        MockCardanoChain, MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock,
+    };
     use crate::epoch::state::{EpochConfig, Roster, SpoIdentity, SpoInfo};
+    use crate::http::canonical::THRESHOLD_51;
     use std::time::Duration;
 
     fn make_roster(n: u16, threshold: u16) -> Roster {
@@ -661,6 +961,7 @@ mod tests {
     }
 
     async fn drive_dkg(
+        chain: Arc<dyn CardanoChain>,
         peers: Arc<dyn PeerNetwork>,
         clock: Arc<dyn Clock>,
         config: EpochConfig,
@@ -679,7 +980,9 @@ mod tests {
                     round,
                     ctx,
                     collected,
-                } => dkg_phase(&peers, &clock, &rng, &config, round, ctx, collected).await?,
+                } => {
+                    dkg_phase(&chain, &peers, &clock, &rng, &config, round, ctx, collected).await?
+                }
                 EpochPhase::PublishKeys { group_keys, .. } => return Ok(group_keys),
                 other => panic!("unexpected phase: {}", other.name()),
             };
@@ -693,10 +996,16 @@ mod tests {
         let mut handles = Vec::new();
         for &i in ids {
             let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::demo(
+                roster.min_signers,
+                roster.max_signers,
+                0,
+            ));
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock = clock.clone();
             let mut config = EpochConfig::demo_default(SpoIdentity {
                 identifier: id,
+                bifrost_id_pk: Vec::new(),
                 port: 0,
             });
             // Tight timing so the absent-peer reruns don't make the test slow.
@@ -704,7 +1013,7 @@ mod tests {
             config.poll_interval = Duration::from_millis(10);
             let roster = roster.clone();
             handles.push(tokio::spawn(async move {
-                drive_dkg(peers, clock, config, roster).await
+                drive_dkg(chain, peers, clock, config, roster).await
             }));
         }
         let mut out = Vec::new();
@@ -722,6 +1031,21 @@ mod tests {
         for gk in &keys[1..] {
             assert_eq!(*gk, keys[0], "all SPOs must derive the same Y_51");
         }
+    }
+
+    fn dummy_equivocation(epoch: u64, accused_pool_id: [u8; 28]) -> DkgFaultEvidence {
+        DkgFaultEvidence::Equivocation(EquivocationEvidence {
+            epoch,
+            threshold: THRESHOLD_51,
+            attempt: 0,
+            phase: NamespacePhase::Round1,
+            accused_pool_id,
+            bifrost_id_pk: [0x42; 32],
+            payload_a: b"payload-a".to_vec(),
+            signature_a: [0xA1; 64],
+            payload_b: b"payload-b".to_vec(),
+            signature_b: [0xB2; 64],
+        })
     }
 
     #[tokio::test]
@@ -746,6 +1070,111 @@ mod tests {
     async fn dkg_absent_peer_reduces_and_reruns() {
         let results = run_ceremony(make_roster(3, 2), &[1, 2]).await; // SPO 3 never spawns
         assert_same_group_key(&results);
+    }
+
+    #[tokio::test]
+    async fn incomplete_round_reports_retained_fault_evidence() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let accused = Identifier::try_from(2u16).unwrap();
+        let mut roster = make_roster(3, 2);
+        for (i, participant) in roster.participants.values_mut().enumerate() {
+            participant.pool_id = vec![0xC0 + i as u8; 28];
+        }
+        let accused_pool: [u8; 28] = roster
+            .participants
+            .get(&accused)
+            .unwrap()
+            .pool_id
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let ctx = DkgContext::from_roster_equal_stake(&roster, 0, 0);
+        let hub = MockPeerHub::new();
+        hub.push_round1_fault_evidence(
+            DkgNamespace::for_attempt(0, 0),
+            accused,
+            dummy_equivocation(0, accused_pool),
+        );
+        let mock_chain = Arc::new(MockCardanoChain::demo(2, 3, 0));
+        let recorded = mock_chain.dkg_faults();
+        let chain: Arc<dyn CardanoChain> = mock_chain;
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let mut config = EpochConfig::demo_default(SpoIdentity {
+            identifier: me,
+            bifrost_id_pk: Vec::new(),
+            port: 0,
+        });
+        config.dkg_round_timeout = Duration::from_millis(20);
+        config.poll_interval = Duration::from_millis(5);
+
+        let result = dkg_phase(
+            &chain,
+            &peers,
+            &clock,
+            &rng,
+            &config,
+            DkgRound::Round1,
+            ctx,
+            DkgCollected::default(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EpochError::DkgAborted { .. })),
+            "the one-survivor ceremony should still abort after reporting evidence"
+        );
+        let faults = recorded.lock().unwrap();
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].kind_label(), "equivocation");
+        assert_eq!(faults[0].accused_pool_id(), &accused_pool);
+    }
+
+    /// A "smart" equivocator publishes a usable Round-1 package (so it lands in L1
+    /// and is NOT excluded) yet still equivocated. `report_round1_equivocations`
+    /// must catch it — this is the path the `--inject-fault=equivocate-round1`
+    /// demo exercises (the injected node stays in the ceremony but serves a second
+    /// conflicting package that an honest peer's confirmatory re-fetch retains).
+    #[tokio::test]
+    async fn collected_peer_equivocation_is_reported() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let accused = Identifier::try_from(2u16).unwrap();
+        let mut roster = make_roster(3, 2);
+        for (i, participant) in roster.participants.values_mut().enumerate() {
+            participant.pool_id = vec![0xC0 + i as u8; 28];
+        }
+        let accused_pool: [u8; 28] = roster
+            .participants
+            .get(&accused)
+            .unwrap()
+            .pool_id
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let ctx = DkgContext::from_roster_equal_stake(&roster, 0, 0);
+        let ns = DkgNamespace::for_attempt(0, 0);
+        let hub = MockPeerHub::new();
+        hub.push_round1_fault_evidence(ns, accused, dummy_equivocation(0, accused_pool));
+        let mock_chain = Arc::new(MockCardanoChain::demo(2, 3, 0));
+        let recorded = mock_chain.dkg_faults();
+        let chain: Arc<dyn CardanoChain> = mock_chain;
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub));
+
+        // Accused is in the collected set L1 — it DID publish a usable package.
+        let l1: BTreeSet<Identifier> = [me, accused].into_iter().collect();
+        report_round1_equivocations(&chain, &peers, ns, me, &ctx, &l1)
+            .await
+            .expect("reporting equivocations should not error");
+
+        let faults = recorded.lock().unwrap();
+        assert_eq!(
+            faults.len(),
+            1,
+            "the collected equivocator must be reported"
+        );
+        assert_eq!(faults[0].kind_label(), "equivocation");
+        assert_eq!(faults[0].accused_pool_id(), &accused_pool);
     }
 
     /// The finalize coherence check accepts a real part3 output (group keys
@@ -812,9 +1241,9 @@ mod tests {
         );
     }
 
-    /// Fault evidence records exactly the eligible participants missing from the
-    /// survivor set, tagged with epoch/attempt/round — the structured hook
-    /// WI-019 correlates with the transport's retained raw bytes.
+    /// Exclusion evidence records exactly the eligible participants missing from
+    /// the survivor set, tagged with epoch/attempt/round, so DKG can ask the
+    /// peer transport whether any of them produced provable fault evidence.
     #[test]
     fn exclusion_evidence_records_the_missing_participants() {
         let roster = make_roster(3, 2);

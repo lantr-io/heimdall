@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: System deps (openssl for native-tls)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked
+
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System deps (openssl for native-tls)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: cargo build (debug)
+        run: cargo build --locked --all-targets
+      - name: cargo test
+        run: cargo test --locked
+
+  notify:
+    name: discord
+    needs: [lint, test]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+    steps:
+      - name: Report build status
+        if: env.DISCORD_WEBHOOK != ''
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ env.DISCORD_WEBHOOK }}
+          status: ${{ (needs.lint.result == 'success' && needs.test.result == 'success') && 'success' || 'failure' }}
+          title: "[${{ github.event.repository.name }}] ${{ (needs.lint.result == 'success' && needs.test.result == 'success') && '✅' || '❌' }} CI - ${{ github.actor }} on ${{ github.ref_name }}"
+          description: "[${{ github.event.head_commit.message }}](${{ github.event.head_commit.url }})"
+          url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          username: "GitHub Actions"
+          avatar_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png"
+          nodetail: true
+          notimestamp: true

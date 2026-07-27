@@ -14,8 +14,11 @@ use bitcoin::{ScriptBuf, script};
 // Script builders
 // ---------------------------------------------------------------------------
 
-/// `<timeout> OP_CSV OP_DROP <pubkey> OP_CHECKSIG`
-fn build_csv_checksig_script(timeout: u16, pubkey: UntweakedPublicKey) -> ScriptBuf {
+/// `<timeout> OP_CSV OP_DROP <pubkey> OP_CHECKSIG` — the CSV-timelock+checksig
+/// leaf shared by the treasury federation tree and the peg-in refund tree.
+/// Public so the script-path (federation-leaf) spender can rebuild the exact
+/// leaf it must reveal + sign against (see `tm_builder::sign_tm_federation_leaf`).
+pub fn build_csv_checksig_script(timeout: u16, pubkey: UntweakedPublicKey) -> ScriptBuf {
     script::Builder::new()
         .push_int(timeout as i64)
         .push_opcode(OP_CSV)

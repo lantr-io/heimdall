@@ -43,8 +43,8 @@ use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInSource};
 use crate::epoch::dkg::dkg_phase;
 use crate::epoch::signing::sign_phase;
 use crate::epoch::state::{
-    CascadeLevel, DkgCollected, DkgRound, EpochConfig, EpochError, EpochPhase, EpochResult,
-    GroupKeys, Roster, SignCollected, SigningRound, TreasuryMovement,
+    CascadeLevel, DKG_ATTEMPTS_PER_WINDOW, DkgCollected, DkgRound, EpochConfig, EpochError,
+    EpochPhase, EpochResult, GroupKeys, Roster, SignCollected, SigningRound, TreasuryMovement,
 };
 use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use std::collections::BTreeMap;
@@ -102,25 +102,62 @@ pub async fn run_epoch_loop(
                 backoff = RETRY_BACKOFF_MIN; // progress → reset
             }
             Ok(Step::Done(tm)) => return Ok(tm),
-            // Retriable (chain read, peer transport, signing timeout, fully
-            // aborted DKG attempt): back off and re-enter from the boundary,
-            // NEVER kill the node. A failed DKG attempt already reruns over a
-            // reduced set inside `dkg_phase`; reaching here means even that
-            // aborted, so wait for the next boundary and rebuild the context.
-            Err(e) if e.is_retriable() => {
-                crate::epoch_log!(
-                    me,
-                    current_epoch(&EpochPhase::Idle),
-                    "retriable error: {e}; backing off {:?} then re-entering Idle",
-                    backoff
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+            // EVERY in-loop error backs off and re-enters Idle. The loop never
+            // terminates.
+            //
+            // It used to exit on anything outside a small retriable allowlist,
+            // and that allowlist was the bug: a peer on a different candidate
+            // set sent a package FROST rejected, heimdall classified the FROST
+            // error as fatal, and an honest node's epoch loop died for good —
+            // frozen on a stale roster while its HTTP server kept answering. It
+            // could not recover, because recovering means re-deriving the roster
+            // from chain and only this loop does that. One ban could take out an
+            // honest node; enough of them walk the roster below quorum.
+            //
+            // The spec is explicit that a failed ceremony is not terminal: "no
+            // Update-Y is posted... the old roster simply carries over... the
+            // next epoch boundary takes fresh snapshots and retries the DKG. No
+            // halt, no special state." Re-entering Idle re-derives from chain,
+            // which is what makes a stale node self-heal.
+            //
+            // Genuinely unrecoverable conditions (missing keys, unparseable
+            // config, an identity absent from the registry) are STARTUP
+            // validation and must fail before the loop is entered — not here,
+            // where the only correct answer is to keep trying.
+            Err(e) => {
+                // Post-ban recovery (chain-view reconcile): if this failure came
+                // with a detected chain-view disagreement on which we are the
+                // STALE side (older blockchain read-time), a blind fast retry
+                // would just re-read the same unsettled tip and churn — the real
+                // chain returns the current epoch immediately, so the back-off IS
+                // the re-read cadence. Wait a settling interval so the next
+                // re-read lands AFTER the disagreeing event settles into our
+                // view; the fresher-read nodes don't wait. Otherwise the ordinary
+                // capped exponential.
+                let wait = if peers.is_view_stale().await {
+                    crate::epoch_log!(
+                        me,
+                        current_epoch(&EpochPhase::Idle),
+                        "error: {e}; STALE chain-view — settling back-off {:?} before re-read \
+                         (reconcile), then re-entering Idle",
+                        config.dkg_reconcile_backoff
+                    );
+                    backoff = RETRY_BACKOFF_MIN; // the settling wait replaces the ramp
+                    config.dkg_reconcile_backoff
+                } else {
+                    crate::epoch_log!(
+                        me,
+                        current_epoch(&EpochPhase::Idle),
+                        "error: {e}; backing off {:?} then re-entering Idle",
+                        backoff
+                    );
+                    let w = backoff;
+                    backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                    w
+                };
+                tokio::time::sleep(wait).await;
                 phase = EpochPhase::Idle;
             }
-            // Fatal (logic/crypto bug, malformed tx): surface it. The caller
-            // logs and exits cleanly rather than panicking.
-            Err(e) => return Err(e),
         }
     }
 }
@@ -141,13 +178,13 @@ async fn step_phase(
     let next = match phase {
         EpochPhase::Idle => idle_phase(chain).await?,
 
-        EpochPhase::EpochStart { epoch } => epoch_start_phase(chain, config, epoch).await?,
+        EpochPhase::EpochStart { epoch } => epoch_start_phase(chain, peers, config, epoch).await?,
 
         EpochPhase::Dkg {
             round,
             ctx,
             collected,
-        } => dkg_phase(peers, clock, rng, config, round, ctx, collected).await?,
+        } => dkg_phase(chain, peers, clock, rng, config, round, ctx, collected).await?,
 
         EpochPhase::PublishKeys {
             epoch,
@@ -225,28 +262,186 @@ async fn idle_phase(chain: &Arc<dyn CardanoChain>) -> EpochResult<EpochPhase> {
 
 async fn epoch_start_phase(
     chain: &Arc<dyn CardanoChain>,
+    peers: &Arc<dyn PeerNetwork>,
     config: &EpochConfig,
     epoch: u64,
 ) -> EpochResult<EpochPhase> {
-    let me = config.identity.identifier;
+    // Build the stake-aware DKG context for attempt 0. A failed attempt reruns
+    // over a reduced candidate set with a bumped attempt inside `dkg_phase`
+    // (DkgContext::reduced_to), so the chain is queried once per ceremony
+    // entry (which also refreshes the roster after an aborted window).
+    let mut ctx = chain.query_dkg_context(epoch, 0).await?;
+
+    // Re-derive THIS node's index from the CURRENT context, every epoch. The
+    // FROST index is positional — rank in the sorted eligible set — so it
+    // shifts whenever the set changes: a ban removes an earlier member and
+    // everyone after it moves up by one. Reading the frozen startup value here
+    // is what wedged the cluster post-ban (2026-07-22): each node kept building
+    // round-1 payloads under its OLD index while peers reconstructed them under
+    // the NEW one, so every honest node rejected every other with an opaque
+    // `poseidon_commit mismatch`. `own_participant` looks this node up by its
+    // stable bifrost key, so it always returns the correct current index.
+    let me = if config.identity.bifrost_id_pk.is_empty() {
+        // Fixture / --index demo: no on-chain key. Must NOT look up an empty key
+        // in the roster — `own_participant(&[])` would spuriously match the first
+        // participant that also has an empty key. Trust the configured index.
+        config.identity.identifier
+    } else {
+        match ctx.own_participant(&config.identity.bifrost_id_pk) {
+            Some(p) => p.identifier,
+            // We hold a key but are not in this epoch's eligible set — banned,
+            // deregistered, or URL-excluded. Sit the epoch out: this is
+            // retriable, so the loop backs off and re-enters Idle, and a
+            // temporary ban that later expires lets us rejoin automatically.
+            None => {
+                return Err(EpochError::DkgAborted {
+                    epoch,
+                    attempt: 0,
+                    qualified: 0,
+                    eligible: ctx.participants.len(),
+                    reason:
+                        "this node is not in the eligible set (banned / deregistered / excluded)"
+                            .into(),
+                });
+            }
+        }
+    };
 
     // Restart recovery (WI-014 #5): if this epoch's DKG already ran and was
     // persisted, reload the share and skip straight to PublishKeys — the
     // ceremony is multi-round and expensive, and a mid-epoch crash must not
-    // re-run it (or lose the share).
+    // re-run it (or lose the share). Keyed by the re-derived `me`, so a resume
+    // matches only the share written under this epoch's actual index.
     if let Some(resumed) = try_resume_dkg(config, me, epoch)? {
         return Ok(resumed);
     }
 
-    // Build the stake-aware DKG context for attempt 0. A failed attempt reruns
-    // over a reduced candidate set with a bumped attempt inside `dkg_phase`
-    // (DkgContext::reduced_to), so the chain is queried once at the boundary.
-    let ctx = chain.query_dkg_context(epoch, 0).await?;
+    // N21 health gate: bring the roster up before the ceremony. A staggered
+    // process start otherwise freezes divergent live subsets — the early
+    // nodes complete a reduced key without the late one, which then loops
+    // forever against their stale round-1 packages. Time-bounded: a peer
+    // that stays down is excluded by the normal quorum-gated reduction.
+    wait_for_roster_health(peers, &ctx, config, me).await;
+
+    // N21 ceremony window grid: with a chain-time anchor, join at the next
+    // grid line so every node — however late it started, or re-entering
+    // after an abort — runs the same ceremony schedule under a per-window
+    // attempt namespace (stale packages from an earlier window can never be
+    // fetched into this one). Without an anchor (mock / no-registry
+    // fallback) the health gate alone aligns entries to within a poll
+    // interval and the relative round deadlines apply as before.
+    if let Some(boundary_ms) = ctx.schedule_anchor_ms {
+        let now_ms = crate::epoch::dkg::wall_now_ms();
+        let (window, window_start_ms) = next_window(boundary_ms, config.dkg_window, now_ms);
+        let wait_ms = window_start_ms.saturating_sub(now_ms);
+        ctx.attempt = window.saturating_mul(DKG_ATTEMPTS_PER_WINDOW);
+        ctx.schedule_anchor_ms = Some(window_start_ms);
+        crate::epoch_log!(
+            me,
+            epoch,
+            "joining ceremony window {window} in {:.1}s (attempt base {})",
+            wait_ms as f64 / 1000.0,
+            ctx.attempt
+        );
+        // INSTRUMENTATION (2026-07-22): the derived context, printed so the SAME
+        // line from every node can be diffed. A payload's poseidon_commit binds
+        // (epoch, threshold=51, attempt, identifier); `t` and the candidate set
+        // determine the commitment-vector length and the index assignment but
+        // appear NOWHERE in the namespace — so if two nodes disagree here they
+        // reject each other's honest payloads with no way to notice. This line
+        // makes that disagreement visible directly instead of by inference.
+        crate::epoch_log!(
+            me,
+            epoch,
+            "ceremony ctx: t={} n={} attempt={} window={} anchor_ms={:?} candidates=[{}]",
+            ctx.threshold,
+            ctx.participants.len(),
+            ctx.attempt,
+            window,
+            ctx.schedule_anchor_ms,
+            ctx.participants
+                .iter()
+                .map(|p| format!(
+                    "{}@{}",
+                    hex::encode(&p.pool_id[..4.min(p.pool_id.len())]),
+                    p.index
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        if wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms as u64)).await;
+        }
+    }
+
     Ok(EpochPhase::Dkg {
         round: DkgRound::Round1,
         ctx,
         collected: DkgCollected::default(),
     })
+}
+
+/// Ceremony-window grid arithmetic (N21): the index and start (Unix ms) of the
+/// next grid line strictly after `now_ms`, on the grid anchored at
+/// `boundary_ms` with pitch `window`. A node starting before the boundary
+/// joins window 0 at the boundary itself.
+fn next_window(boundary_ms: i64, window: std::time::Duration, now_ms: i64) -> (u32, i64) {
+    let w = i64::try_from(window.as_millis()).unwrap_or(i64::MAX).max(1);
+    let elapsed = now_ms.saturating_sub(boundary_ms);
+    let k = if elapsed < 0 { 0 } else { elapsed / w + 1 };
+    (
+        u32::try_from(k).unwrap_or(u32::MAX),
+        boundary_ms.saturating_add(k.saturating_mul(w)),
+    )
+}
+
+/// Poll every roster peer's `/health` until all answer or `dkg_join_wait`
+/// elapses (N21). Never fails: proceeding without a peer is always legal —
+/// the ceremony's quorum gate decides viability, this gate only makes the
+/// happy path start complete.
+async fn wait_for_roster_health(
+    peers: &Arc<dyn PeerNetwork>,
+    ctx: &crate::cardano::dkg_roster::DkgContext,
+    config: &EpochConfig,
+    me: frost::Identifier,
+) {
+    let roster = ctx.to_roster();
+    let deadline = tokio::time::Instant::now() + config.dkg_join_wait;
+    let poll = config
+        .poll_interval
+        .max(std::time::Duration::from_millis(200));
+    loop {
+        let mut down = Vec::new();
+        for info in roster.participants.values() {
+            if info.identifier == me {
+                continue;
+            }
+            if !peers.check_health(info).await {
+                down.push(crate::epoch::log::id_short(info.identifier));
+            }
+        }
+        if down.is_empty() {
+            crate::epoch_log!(me, ctx.epoch, "health gate: full roster reachable");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            crate::epoch_log!(
+                me,
+                ctx.epoch,
+                "health gate: proceeding without unreachable peer(s) {:?} after {:?}",
+                down,
+                config.dkg_join_wait
+            );
+            return;
+        }
+        crate::epoch_log!(
+            me,
+            ctx.epoch,
+            "health gate: waiting for peer(s) {:?}...",
+            down
+        );
+        tokio::time::sleep(poll).await;
+    }
 }
 
 /// Reload a persisted DKG for `epoch` and turn it into a resume-to-PublishKeys
@@ -325,22 +520,36 @@ async fn publish_keys_phase(
     // makes the handoff destination visible the moment DKG completes. Y_51 is
     // identical across all SPOs (checked in `dkg_phase`), so every SPO derives
     // this same address.
-    let treasury = chain.query_treasury().await?;
-    let secp = Secp256k1::new();
-    let new_spend = treasury_spend_info(
-        &secp,
-        y_51,
-        treasury.y_fed,
-        treasury.federation_csv_blocks as u16,
-    );
-    let new_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(new_spend.output_key());
-    crate::epoch_log!(
-        me,
-        epoch,
-        "  -> new treasury: output_key={} scriptPubKey={}",
-        hex::encode(new_spend.output_key().to_x_only_public_key().serialize()),
-        hex::encode(new_spk.as_bytes())
-    );
+    //
+    // This runs BEFORE `publish_group_key` sets the group key, so `query_treasury`
+    // may not yet be able to match the current on-chain tip to our keys. That is a
+    // hard error there (never sign an unmatched tip), but here it is only an
+    // address preview — so treat a failure as non-fatal and continue to the actual
+    // handoff, where `build_tm_phase` re-queries with the published key.
+    match chain.query_treasury().await {
+        Ok(treasury) => {
+            let secp = Secp256k1::new();
+            let new_spend = treasury_spend_info(
+                &secp,
+                y_51,
+                treasury.y_fed,
+                treasury.federation_csv_blocks as u16,
+            );
+            let new_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(new_spend.output_key());
+            crate::epoch_log!(
+                me,
+                epoch,
+                "  -> new treasury: output_key={} scriptPubKey={}",
+                hex::encode(new_spend.output_key().to_x_only_public_key().serialize()),
+                hex::encode(new_spk.as_bytes())
+            );
+        }
+        Err(e) => crate::epoch_log!(
+            me,
+            epoch,
+            "  (new treasury address preview unavailable pre-handoff: {e})"
+        ),
+    }
 
     chain.publish_group_key(y_51).await?;
 
@@ -371,8 +580,8 @@ async fn collect_pegins_phase(
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
 
-    // Pull the current treasury (Y_51) from the on-chain treasury oracle.
-    // The peg-in Taproot Q is derived per-depositor inside
+    // Pull current Y_fed from the on-chain treasury oracle. The
+    // peg-in Taproot Q is derived per-depositor inside
     // `parse_pegin_request` using the OP_RETURN beacon xonly pubkey.
     let treasury = chain.query_treasury().await?;
     let refund_timeout = config.pegin_refund_timeout_blocks;
@@ -396,6 +605,8 @@ async fn collect_pegins_phase(
             if accepted.contains_key(&req.cardano_utxo) {
                 continue;
             }
+            // Peg-in internal key is Y_51 (the FROST group key), not Y_fed —
+            // see parse_pegin_request / commit 6af7c67.
             match parse_pegin_request(&req, treasury.y_51, refund_timeout) {
                 Ok(parsed) => {
                     accepted.insert(req.cardano_utxo.clone(), parsed);
@@ -631,6 +842,20 @@ async fn submit_phase(
 
     let tx_bytes = bitcoin::consensus::encode::serialize(&signed_tx);
 
+    // Every participant assembles the *identical* witnessed tx (same FROST
+    // group signature, deterministic build), so logging the raw hex on every
+    // node makes the "all SPOs saw the same signed transaction" moment visible
+    // across all terminals — the point at which the epoch's signing round is
+    // complete. The leader additionally submits it below.
+    crate::epoch_log!(
+        me,
+        epoch,
+        "Submit: signed treasury movement — txid={} ({} bytes)\n    raw tx: {}",
+        tm.txid,
+        tx_bytes.len(),
+        hex::encode(&tx_bytes)
+    );
+
     // Only the designated leader broadcasts. Everyone else assembles
     // the witnessed tx, holds it, and waits — they'd take over on a
     // future leader-timeout cascade.
@@ -726,6 +951,7 @@ mod tests {
     fn fast_config(id: Identifier) -> EpochConfig {
         let mut config = EpochConfig::demo_default(SpoIdentity {
             identifier: id,
+            bifrost_id_pk: Vec::new(),
             port: 0,
         });
         config.dkg_round_timeout = Duration::from_millis(500);
@@ -852,11 +1078,12 @@ mod tests {
 
         let chain: Arc<dyn CardanoChain> =
             Arc::new(MockCardanoChain::new(demo_static_fixture(2, 2, 18_700)));
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id1, MockPeerHub::new()));
         let mut config = fast_config(id1);
         config.state_dir = Some(dir.clone());
 
         // With persisted state → resume straight to PublishKeys (no DKG).
-        match epoch_start_phase(&chain, &config, 0).await.unwrap() {
+        match epoch_start_phase(&chain, &peers, &config, 0).await.unwrap() {
             EpochPhase::PublishKeys { group_keys: gk, .. } => {
                 assert_eq!(gk.verifying_key, group_keys.verifying_key);
                 assert_eq!(*gk.key_package.identifier(), id1);
@@ -867,7 +1094,7 @@ mod tests {
         // No persisted state → fresh DKG (the mock chain serves the context).
         config.state_dir = None;
         assert!(matches!(
-            epoch_start_phase(&chain, &config, 0).await.unwrap(),
+            epoch_start_phase(&chain, &peers, &config, 0).await.unwrap(),
             EpochPhase::Dkg { .. }
         ));
 
@@ -877,5 +1104,79 @@ mod tests {
     #[tokio::test]
     async fn full_cycle_3_of_3_all_derive_same_treasury() {
         multi_instance_same_treasury(3, 3).await;
+    }
+
+    /// N21 acceptance — the reported staggered-start repro: 3 instances where
+    /// the last starts late (well past the others' old round-1 deadline
+    /// behavior). With the health gate the early nodes wait for the late one,
+    /// and with the window grid all three then join the same ceremony window —
+    /// so the cycle completes with all THREE deriving the identical TM
+    /// (pre-N21: nodes 1+2 completed a reduced 2-of-2 key and node 3 looped
+    /// on their stale attempt-0 packages forever).
+    #[tokio::test]
+    async fn full_cycle_3_of_3_staggered_start_converges() {
+        let fixture = demo_static_fixture(3, 3, 18_800);
+        let hub = MockPeerHub::new();
+        let anchor_ms = crate::epoch::dkg::wall_now_ms();
+
+        let mut handles = Vec::new();
+        for i in 1..=3u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_schedule_anchor_ms(anchor_ms));
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let mut config = fast_config(id);
+            // Must satisfy the self-healing inequality (see `dkg_window` docs):
+            // dkg_round1_offset (2s) + retry backoff (2s) < window, so if the
+            // rare entry race splits the cohorts one line apart, an aborting
+            // node reaches the very next line and the cohorts merge instead of
+            // cycling phase-locked (which would hang this test).
+            config.dkg_window = Duration::from_secs(5);
+            config.dkg_join_wait = Duration::from_secs(20);
+            config.dkg_round1_offset = Duration::from_secs(2);
+            config.dkg_round2_offset = Duration::from_secs(4);
+            let hub = hub.clone();
+            handles.push(tokio::spawn(async move {
+                if i == 3 {
+                    // The repro: the last instance comes up late.
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                }
+                hub.set_online(id);
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(h.await.unwrap().expect("epoch cycle completes"));
+        }
+        let txid0 = tms[0].txid;
+        for tm in &tms[1..] {
+            assert_eq!(
+                tm.txid, txid0,
+                "all SPOs (incl. the late starter) must derive the identical TM"
+            );
+        }
+    }
+
+    /// Grid arithmetic: the next line is strictly after `now`, snapped to
+    /// `boundary + k·window`; a pre-boundary start joins window 0 at the
+    /// boundary itself.
+    #[test]
+    fn next_window_snaps_to_the_grid() {
+        let w = Duration::from_secs(60);
+        // pre-boundary → window 0, at the boundary
+        assert_eq!(next_window(1_000_000, w, 995_000), (0, 1_000_000));
+        // at / after the boundary → the strictly-next line
+        assert_eq!(next_window(1_000_000, w, 1_000_000), (1, 1_060_000));
+        assert_eq!(next_window(1_000_000, w, 1_059_999), (1, 1_060_000));
+        assert_eq!(next_window(1_000_000, w, 1_060_000), (2, 1_120_000));
+        // attempt namespaces from consecutive windows never collide
+        let (k1, _) = next_window(1_000_000, w, 1_000_000);
+        let (k2, _) = next_window(1_000_000, w, 1_060_000);
+        assert_ne!(k1 * DKG_ATTEMPTS_PER_WINDOW, k2 * DKG_ATTEMPTS_PER_WINDOW);
     }
 }

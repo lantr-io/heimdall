@@ -31,16 +31,11 @@ pub struct SpoInfo {
     #[serde(default)]
     pub pool_id: Vec<u8>,
     pub bifrost_url: String,
-    /// Reserved for BIP-340 payload authentication. Not enforced in v0.2.
+    /// BIP-340 identity key used to authenticate peer payloads.
     ///
-    /// TODO: every DKG/sign payload delivered over the HTTP peer
-    /// protocol should be signed under this key (BIP-340 Schnorr over
-    /// secp256k1) and verified on receipt. Today publish/fetch accept
-    /// unauthenticated JSON — a MITM or a dishonest peer can inject
-    /// arbitrary commitments.
-    /// FIXME: also need replay protection — payloads should bind to
-    /// `(epoch, round, input_index)` under the signature so an old
-    /// payload can't be replayed into a new session.
+    /// DKG HTTP payloads are signed under this key and bind their replay
+    /// namespace in the canonical bytes. Signing payloads still need the same
+    /// end-to-end treatment before signing-share fault proofs are implemented.
     #[serde(default)]
     pub bifrost_id_pk: Vec<u8>,
 }
@@ -189,18 +184,29 @@ pub enum SigningRound {
     Round2,
 }
 
-/// Signing cascade level (only `Quorum51` exercised in v0.2 first cycle).
+/// The active SPO threshold path for a signing session.
 ///
-/// TODO: implement the `Federation` fallback path. When `Quorum51` fails
-/// to collect a threshold of signatures within
-/// `EpochConfig::quorum51_timeout`, `sign_phase` should transition to
-/// `Federation` (script-path spend using the federation fallback leaf
-/// after `federation_csv_blocks`). Today the cascade is a type-level
-/// placeholder; `sign_phase` never demotes.
+/// One variant on purpose, and it is not a stub. The spec keeps `mode` in the
+/// signing namespace with a single value today "so that adding a future
+/// threshold mode does not change any byte layout" (§Signing namespaces), so
+/// the type stays even though it cannot vary.
+///
+/// **There is deliberately no `Federation` variant.** An earlier comment here
+/// said `sign_phase` should demote to a federation script-path spend on
+/// `quorum51_timeout`; that describes work the SPO program must never do. Per
+/// §Threshold failover, "federation mode does not use the SPO HTTP endpoints…
+/// it is an on-chain and Bitcoin-level emergency fallback", and per §Signing
+/// namespaces it "has no signing namespace at all: it uses no SPO endpoints and
+/// no FROST rounds". The federation signs out of band with `Y_federation` via
+/// the CSV leaf, and the signed TM is posted permissionlessly like any other —
+/// heimdall observes the result as an ordinary TM and plays no part in
+/// producing it.
+///
+/// Nor is there an inter-mode timer to add: "the overall bound for the cascade
+/// is therefore implicit… with no extra inter-mode timer" (§Threshold failover).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CascadeLevel {
     Quorum51,
-    Federation,
 }
 
 /// In-progress signing state. Per-input maps because each TM input
@@ -336,9 +342,29 @@ impl EpochPhase {
 
 #[derive(Debug, Clone)]
 pub struct SpoIdentity {
+    /// This node's index in the roster, resolved ONCE at startup. It is a
+    /// STARTING value only: the FROST index is positional (rank in the sorted
+    /// eligible set), so it changes whenever the set does — e.g. a ban removes
+    /// an earlier member and everyone after it shifts up. The epoch loop
+    /// therefore re-derives the live index each epoch from the current context
+    /// (see `epoch_start_phase`); this field is used only as the fixture/demo
+    /// fallback when no `bifrost_id_pk` is configured.
     pub identifier: Identifier,
+    /// This node's stable identity — its x-only bifrost key. Unlike `identifier`
+    /// this never changes, so the loop looks itself up by this in each epoch's
+    /// context to recompute its current index. Empty in the `--index` fixture
+    /// demo, which has no key and trusts the configured `identifier`.
+    pub bifrost_id_pk: Vec<u8>,
     pub port: u16,
 }
+
+/// Attempt-namespace budget per ceremony window (N21): the ceremony joining
+/// grid window `k` uses wire attempts `k·A .. (k+1)·A`, so packages from
+/// different windows can never collide (a late or re-entered node must never
+/// mix a stale round-1 package into a fresh ceremony), and an in-window
+/// reduction chain aborts rather than spilling into the next window's
+/// namespace.
+pub const DKG_ATTEMPTS_PER_WINDOW: u32 = 16;
 
 #[derive(Debug, Clone)]
 pub struct EpochConfig {
@@ -347,15 +373,40 @@ pub struct EpochConfig {
     /// boundary IS known, the schedule-anchored [`Self::dkg_round1_offset`] /
     /// [`Self::dkg_round2_offset`] take over.
     pub dkg_round_timeout: Duration,
+    /// Ceremony-window grid pitch (N21). When the chain schedule anchor is
+    /// known, a node entering DKG first sleeps to the next grid line
+    /// (`epoch_boundary + k·dkg_window`), so every node — however late it
+    /// started, or re-entering after an aborted attempt — runs the ceremony
+    /// on the same schedule and under the same per-window attempt namespace.
+    /// MUST exceed `dkg_round2_offset` by more than the retry backoff (~2 s):
+    /// a node that aborts a window has to reach the very next grid line, or
+    /// two cohorts that entered one line apart can cycle phase-locked and
+    /// never merge.
+    pub dkg_window: Duration,
+    /// Upper bound on the pre-ceremony health gate (N21): how long a node
+    /// waits for every roster peer to answer `/health` before proceeding
+    /// without the missing ones. Bounds the wait only — liveness never
+    /// depends on a peer coming up; an absent peer is then excluded by the
+    /// normal quorum-gated reduction.
+    pub dkg_join_wait: Duration,
     /// Round 1 deadline as an offset from the epoch boundary (WI-014 #6). All
     /// nodes anchor to the same chain-time instant, so they freeze the live
     /// subset L1 together regardless of when each locally started the round.
     pub dkg_round1_offset: Duration,
     /// Round 2 deadline as an offset from the epoch boundary (> round 1).
     pub dkg_round2_offset: Duration,
+    /// Settling back-off used INSTEAD of the blind exponential when a failed DKG
+    /// was accompanied by a detected chain-view disagreement on which THIS node
+    /// was the stale side (older blockchain read-time). Because the real chain's
+    /// `await_epoch_boundary` returns the current epoch immediately, the retry
+    /// back-off IS the chain re-read cadence — so waiting a settling interval
+    /// here makes the re-read land AFTER the disagreeing event (e.g. a ban)
+    /// settles into this node's view, converging in one step instead of churning
+    /// at 2/4/8 s against the still-unsettled tip. Bounded and self-terminating:
+    /// once views reconcile there is no disagreement to re-arm it.
+    pub dkg_reconcile_backoff: Duration,
     pub poll_interval: Duration,
     pub quorum51_timeout: Duration,
-    pub federation_timeout: Duration,
     pub leader_timeout: Duration,
     pub identity: SpoIdentity,
     /// Cardano policy ID (script hash) identifying peg-in request UTxOs.
@@ -372,6 +423,32 @@ pub struct EpochConfig {
     /// process restarts for the epoch (WI-014 #5). `None` → in-memory only (the
     /// share is lost on restart and DKG re-runs next boundary).
     pub state_dir: Option<std::path::PathBuf>,
+    /// Demo-only DKG fault injection (never set in production). Makes THIS node
+    /// misbehave so the fault-detection + ban flow can be exercised live.
+    pub inject_fault: Option<InjectFault>,
+}
+
+/// Demo-only fault-injection kinds (see [`EpochConfig::inject_fault`]). Present so
+/// the fault-proof / SPO-ban flow can be exercised live in the scenario harness;
+/// an honest deployment never sets this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectFault {
+    /// Publish two distinct Round-1 DKG packages (equivocation). Honest peers'
+    /// confirmatory re-fetch retains both, and the equivocation fault is reported
+    /// against this node even though it also published a usable package.
+    EquivocateRound1,
+}
+
+impl std::str::FromStr for InjectFault {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "equivocate-round1" | "equivocate_round1" => Ok(InjectFault::EquivocateRound1),
+            other => Err(format!(
+                "unknown --inject-fault kind '{other}' (expected: equivocate-round1)"
+            )),
+        }
+    }
 }
 
 impl EpochConfig {
@@ -383,11 +460,13 @@ impl EpochConfig {
     pub fn demo_default(identity: SpoIdentity) -> Self {
         Self {
             dkg_round_timeout: Duration::from_secs(300),
+            dkg_window: Duration::from_secs(600),
+            dkg_join_wait: Duration::from_secs(300),
             dkg_round1_offset: Duration::from_secs(120),
             dkg_round2_offset: Duration::from_secs(240),
+            dkg_reconcile_backoff: Duration::from_secs(30),
             poll_interval: Duration::from_millis(5000),
             quorum51_timeout: Duration::from_secs(300),
-            federation_timeout: Duration::from_secs(300),
             leader_timeout: Duration::from_secs(10000),
             identity,
             pegin_policy_id: [0u8; 28],
@@ -395,6 +474,7 @@ impl EpochConfig {
             pegin_poll_interval: Duration::from_millis(1000),
             pegin_refund_timeout_blocks: 4320,
             state_dir: None,
+            inject_fault: None,
         }
     }
 }
@@ -463,26 +543,14 @@ impl std::fmt::Display for EpochError {
 
 impl std::error::Error for EpochError {}
 
-impl EpochError {
-    /// Whether the epoch loop should treat this as a transient, retriable
-    /// condition — back off and re-enter from the boundary — rather than a
-    /// fatal one that ends the process.
-    ///
-    /// Retriable: chain reads (`Chain`), peer transport (`Peer`), a signing
-    /// poll timeout (`PollTimeout`), and a fully-aborted DKG attempt
-    /// (`DkgAborted`) — all "try again next boundary" conditions, never node
-    /// death (WI-010 / WI-014 error-handling feedback). Fatal: `Frost`,
-    /// `TmBuild`, `SignatureVerify`, `Transition` — deterministic given their
-    /// inputs (a logic/crypto bug or malformed data), so a blind retry would
-    /// just loop on the same failure.
-    #[must_use]
-    pub fn is_retriable(&self) -> bool {
-        matches!(
-            self,
-            Self::Chain(_) | Self::Peer(_) | Self::PollTimeout { .. } | Self::DkgAborted { .. }
-        )
-    }
-}
+// NOTE: `EpochError::is_retriable` used to split these into "back off" vs
+// "kill the loop". It was removed on 2026-07-22: the epoch loop now backs off
+// and re-enters `Idle` on EVERY error, because the fatal half of that split was
+// a liveness bug. A peer on a different candidate set produced a FROST error,
+// which the allowlist called fatal, which permanently terminated an honest
+// node's loop — leaving it frozen on a stale roster with no way back, since
+// re-deriving the roster is exactly what the loop does. Conditions that truly
+// cannot be retried belong to startup validation, before the loop runs.
 
 pub type EpochResult<T> = Result<T, EpochError>;
 
@@ -549,29 +617,6 @@ mod tests {
         assert!(r.own_participant(&vec![0xFF; 32]).is_none());
         // An empty key (legacy fixture) never matches a real entry.
         assert!(r.own_participant(&[]).is_none());
-    }
-
-    #[test]
-    fn error_retriability_classification() {
-        // Transient → retriable (back off, re-enter the boundary).
-        assert!(EpochError::Chain("blockfrost 502".into()).is_retriable());
-        assert!(EpochError::Peer("connection reset".into()).is_retriable());
-        assert!(EpochError::PollTimeout { got: 1, need: 3 }.is_retriable());
-        assert!(
-            EpochError::DkgAborted {
-                epoch: 7,
-                attempt: 2,
-                qualified: 1,
-                eligible: 3,
-                reason: "round1 incomplete".into(),
-            }
-            .is_retriable()
-        );
-        // Deterministic given inputs → fatal (a blind retry just loops).
-        assert!(!EpochError::Frost("dkg_part3".into()).is_retriable());
-        assert!(!EpochError::TmBuild("insufficient funds".into()).is_retriable());
-        assert!(!EpochError::Transition("missing round1 secret".into()).is_retriable());
-        assert!(!EpochError::SignatureVerify(0, "bad sig".into()).is_retriable());
     }
 
     #[test]

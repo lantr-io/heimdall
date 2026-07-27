@@ -61,13 +61,28 @@ impl Default for BifrostConfig {
 #[serde(default)]
 pub struct ProtocolConfig {
     pub dkg_round_timeout_secs: u64,
+    /// Ceremony-window grid pitch (N21): a node entering DKG sleeps to the
+    /// next `epoch_boundary + k·dkg_window` line so staggered starts and
+    /// abort-retries all join the same ceremony schedule. MUST exceed
+    /// `dkg_round2_offset_secs` by more than the ~2 s retry backoff — a node
+    /// aborting a window must reach the very next grid line, or cohorts one
+    /// line apart can cycle phase-locked and never merge.
+    pub dkg_window_secs: u64,
+    /// Pre-ceremony health gate (N21): how long to wait for the whole DKG
+    /// roster to answer `/health` before starting without the missing peers.
+    pub dkg_join_wait_secs: u64,
     /// DKG Round 1/2 deadlines as offsets (seconds) from the epoch boundary
     /// (WI-014 #6). Tunable for preprod; the spec budget is ~minutes.
     pub dkg_round1_offset_secs: u64,
     pub dkg_round2_offset_secs: u64,
+    /// Settling back-off (seconds) taken instead of the blind exponential when a
+    /// DKG fails while THIS node is the stale side of a chain-view disagreement,
+    /// so the next chain re-read lands after the disagreeing event settles
+    /// (post-ban recovery — see heimdall `EpochConfig::dkg_reconcile_backoff`).
+    /// Devnet-tight by default; mainnet wants it near the settlement depth.
+    pub dkg_reconcile_backoff_secs: u64,
     pub poll_interval_ms: u64,
     pub quorum51_timeout_secs: u64,
-    pub federation_timeout_secs: u64,
     pub leader_timeout_secs: u64,
     pub pegin_collection_window_secs: u64,
     pub pegin_poll_interval_ms: u64,
@@ -80,11 +95,13 @@ impl Default for ProtocolConfig {
     fn default() -> Self {
         Self {
             dkg_round_timeout_secs: 300,
+            dkg_window_secs: 600,
+            dkg_join_wait_secs: 300,
             dkg_round1_offset_secs: 120,
             dkg_round2_offset_secs: 240,
+            dkg_reconcile_backoff_secs: 30,
             poll_interval_ms: 5000,
             quorum51_timeout_secs: 300,
-            federation_timeout_secs: 300,
             leader_timeout_secs: 10000,
             pegin_collection_window_secs: 5,
             pegin_poll_interval_ms: 1000,
@@ -112,14 +129,18 @@ pub struct BitcoinConfig {
     /// Whether to broadcast the signed BTC tx to the Bitcoin node via
     /// `sendrawtransaction`. Requires `rpc_url`. Default: true (when rpc_url set).
     pub submit: bool,
-    /// Override the demo mock treasury UTXO with a real on-chain UTXO.
-    pub treasury_txid: Option<String>,
-    pub treasury_vout: Option<u32>,
-    pub treasury_amount_sat: Option<u64>,
     /// Depositor refund timelock (BTC blocks) in the peg-in Taproot's
     /// refund leaf. Spec default 4320 (~30 days); override for
     /// testnet4/preprod which use shorter timeouts.
     pub pegin_refund_timeout_blocks: u16,
+    /// Opt-in staleness deadline (seconds). An Unconfirmed TM still on-chain this
+    /// long after its Cardano block (chain time − block time) is treated as DEAD —
+    /// it never confirmed, so it stops blocking the tip and reserving its peg-ins.
+    /// Catches never-confirmable movements heimdall can't otherwise see (a peg-in
+    /// refunded/spent outside a Confirmed TM). `None` = disabled (block forever).
+    /// MUST exceed the worst-case confirmation time (oracle maturation window +
+    /// margin) so a live movement always confirms before the deadline.
+    pub inflight_deadline_secs: Option<u64>,
 }
 
 impl Default for BitcoinConfig {
@@ -134,10 +155,8 @@ impl Default for BitcoinConfig {
             rpc_user: None,
             rpc_pass: None,
             submit: true,
-            treasury_txid: None,
-            treasury_vout: None,
-            treasury_amount_sat: None,
             pegin_refund_timeout_blocks: 4320,
+            inflight_deadline_secs: None,
         }
     }
 }
@@ -167,6 +186,13 @@ pub struct CardanoConfig {
     pub network_magic: Option<u64>,
     pub pegin_script_address: Option<String>,
     pub pegin_policy_id: Option<String>,
+    /// Bech32 address of the `peg_out.ak` script holding PegOut UTxOs. Read by
+    /// `sweep-pegins` / `run-mover` when `--pegout-script-address` is not passed.
+    pub pegout_script_address: Option<String>,
+    /// The bridged-token (fBTC) unit `<policy_hex><asset_name_hex>` used to read each
+    /// PegOut UTxO's locked amount. Read by `sweep-pegins` / `run-mover` when
+    /// `--bridged-token-unit` is not passed.
+    pub bridged_token_unit: Option<String>,
     pub treasury_address: Option<String>,
     pub treasury_policy_id: Option<String>,
     pub treasury_asset_name: Option<String>,
@@ -178,6 +204,19 @@ pub struct CardanoConfig {
     /// here. `None` → no gate configured (the caller must error rather than
     /// admit unconditionally).
     pub min_stake_lovelace: Option<u64>,
+    /// Where the DKG roster threshold + R2 gate read per-pool active stake.
+    /// `None`/`"blockfrost"` (default) → Blockfrost `/pools/{id}.active_stake`
+    /// (preprod/mainnet). `"yaci_store"` → a local yaci-devkit devnet, which
+    /// has no `/pools/{id}`; stake is read from
+    /// `/epochs/{epoch}/pools/{id}/stake`. See `cardano::stake::StakeSource`.
+    pub stake_source: Option<String>,
+    /// DEMO-ONLY. When true, an eligible registered SPO whose Cardano stake
+    /// cannot be resolved (404 / retired / not a real stake pool) is *excluded*
+    /// from the DKG roster instead of making the whole stake-weighted derivation
+    /// fatal (`MissingStake`). Lets a screencast run the registry-driven DKG over
+    /// the real-stake pools while a legacy synthetic SPO sits in the registry.
+    /// Default false — production must never silently drop a registered member.
+    pub demo_exclude_unstaked: bool,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
     pub submit_oracle: bool,
@@ -185,14 +224,25 @@ pub struct CardanoConfig {
     /// 0 = unconfirmed TM tx (Binocular will update to 1 on Bitcoin confirmation).
     /// Default: 0.
     pub oracle_constructor: u8,
-    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). When set (with
-    /// `tm_control_ref`), the TM NFT is minted under the real validator policy — then
+    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). When set (with the
+    /// `config_*` fields below), the TM NFT is minted under the real validator policy — then
     /// `treasury_policy_id` must be the validator's script hash and `treasury_asset_name` empty.
     /// When unset, the always-ok scaffold policy is used.
     pub tm_script_cbor: Option<String>,
-    /// The TM-control UTxO outpoint `<tx_hash>#<index>` to reference (carries the authorized-minter
-    /// datum). Required alongside `tm_script_cbor`.
-    pub tm_control_ref: Option<String>,
+    /// Validity window (seconds) for posted TM txs (`invalid_hereafter`/`created` = latest +
+    /// window). `None` → 1800 (preprod/mainnet). MUST be small (e.g. 90) on a short-epoch
+    /// devnet, whose era-forecast horizon is only ~tens-to-hundreds of slots ahead — a large
+    /// window lands past it (TimeTranslationPastHorizon at submit).
+    pub tm_validity_window_secs: Option<u64>,
+    /// Bech32 address of the bridge Config UTxO (the config script address, from
+    /// `binocular deploy-bridge`). The Config UTxO's field 11 (initial_btc_treasury_utxo)
+    /// anchors the Treasury Movement chain; the first TM mint references it.
+    pub config_address: Option<String>,
+    /// Config NFT policy id (56 hex chars) locating the Config UTxO. Required alongside
+    /// `tm_script_cbor` and `config_address`.
+    pub config_nft_policy_id: Option<String>,
+    /// Config NFT asset name (hex). Required alongside `config_nft_policy_id`.
+    pub config_nft_asset_name: Option<String>,
     /// Path to the bifrost Aiken blueprint (plutus.json) holding the compiled
     /// spos_registry + treasury_info validators. Together with
     /// `registry_bootstrap` and `treasury_info_asset_name` this switches
@@ -225,6 +275,20 @@ pub struct CardanoConfig {
     pub base_ban_duration_ms: Option<i64>,
     pub max_faults_before_permanent: Option<i64>,
     pub max_validity_window_ms: Option<i64>,
+    /// Reference-script UTxO `<tx_hash>:<index>` carrying the `spo_bans`
+    /// validator. Required for automatic DKG fault banning because ApplyBan
+    /// uses the script through withdraw/spend/mint paths.
+    pub spo_bans_ref: Option<String>,
+    /// Reference-script UTxOs `<tx_hash>:<index>` for the three specialized
+    /// fault verifier policies. The Round 1 and Round 2 publish transactions
+    /// do not fit reliably when the verifier script is embedded.
+    pub fault_verifier_round1_ref: Option<String>,
+    pub fault_verifier_round2_ref: Option<String>,
+    pub fault_verifier_equivocation_ref: Option<String>,
+    /// Path to a trusted BLS12-381 KZG SRS file serialized with the Axiom Halo2
+    /// `ParamsKZG::write_custom(..., SerdeFormat::Processed)` format. Required
+    /// for automatic Round 1/Round 2 DKG fault proof generation.
+    pub fault_proof_srs_path: Option<String>,
 }
 
 impl Default for CardanoConfig {
@@ -236,15 +300,22 @@ impl Default for CardanoConfig {
             network_magic: None,
             pegin_script_address: None,
             pegin_policy_id: None,
+            pegout_script_address: None,
+            bridged_token_unit: None,
             treasury_address: None,
             treasury_policy_id: None,
             treasury_asset_name: None,
             mnemonic: None,
             min_stake_lovelace: None,
+            stake_source: None,
+            demo_exclude_unstaked: false,
             submit_oracle: true,
             oracle_constructor: 0,
             tm_script_cbor: None,
-            tm_control_ref: None,
+            tm_validity_window_secs: None,
+            config_address: None,
+            config_nft_policy_id: None,
+            config_nft_asset_name: None,
             registry_blueprint: None,
             registry_bootstrap: None,
             treasury_info_asset_name: None,
@@ -253,7 +324,42 @@ impl Default for CardanoConfig {
             base_ban_duration_ms: None,
             max_faults_before_permanent: None,
             max_validity_window_ms: None,
+            spo_bans_ref: None,
+            fault_verifier_round1_ref: None,
+            fault_verifier_round2_ref: None,
+            fault_verifier_equivocation_ref: None,
+            fault_proof_srs_path: None,
         }
+    }
+}
+
+impl CardanoConfig {
+    /// The TM NFT policy id (28 bytes) = the binocular `TreasuryMovementValidator`
+    /// script hash. It is the **2nd parameter** of the `treasury_info` validator
+    /// (N10b: `treasury.ak::FederationReset` authenticates the referenced Confirmed
+    /// TM by this policy), so every command that parameterizes `treasury_info` must
+    /// supply the SAME value or it derives a different script hash/address.
+    ///
+    /// Prefers the explicit `treasury_policy_id` (the TM NFT policy is exactly that —
+    /// see publish.rs); falls back to deriving it from the configured TM validator
+    /// CBOR (`tm_script_cbor`, what `binocular tm-script` prints), so either config
+    /// style works.
+    pub fn tm_nft_policy(&self) -> Result<[u8; 28], String> {
+        if let Some(hex_str) = self.treasury_policy_id.as_deref() {
+            return hex::decode(hex_str)
+                .map_err(|e| format!("cardano.treasury_policy_id hex: {e}"))?
+                .try_into()
+                .map_err(|_| "cardano.treasury_policy_id must be 28 bytes".to_string());
+        }
+        if let Some(cbor) = self.tm_script_cbor.as_deref() {
+            return crate::cardano::blueprint::tm_nft_policy_from_script_cbor(cbor)
+                .map_err(|e| e.to_string());
+        }
+        Err(
+            "set cardano.treasury_policy_id (or cardano.tm_script_cbor) — the TM NFT policy \
+             is treasury_info's 2nd param"
+                .to_string(),
+        )
     }
 }
 
@@ -335,11 +441,13 @@ impl HeimdallConfig {
 
         EpochConfig {
             dkg_round_timeout: Duration::from_secs(self.protocol.dkg_round_timeout_secs),
+            dkg_window: Duration::from_secs(self.protocol.dkg_window_secs),
+            dkg_join_wait: Duration::from_secs(self.protocol.dkg_join_wait_secs),
             dkg_round1_offset: Duration::from_secs(self.protocol.dkg_round1_offset_secs),
             dkg_round2_offset: Duration::from_secs(self.protocol.dkg_round2_offset_secs),
+            dkg_reconcile_backoff: Duration::from_secs(self.protocol.dkg_reconcile_backoff_secs),
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
             quorum51_timeout: Duration::from_secs(self.protocol.quorum51_timeout_secs),
-            federation_timeout: Duration::from_secs(self.protocol.federation_timeout_secs),
             leader_timeout: Duration::from_secs(self.protocol.leader_timeout_secs),
             identity,
             pegin_policy_id,
@@ -353,6 +461,8 @@ impl HeimdallConfig {
                 .state_dir
                 .as_deref()
                 .map(std::path::PathBuf::from),
+            // Demo-only; the harness/CLI sets this after building the config.
+            inject_fault: None,
         }
     }
 }
@@ -481,6 +591,7 @@ fee_rate_sat_per_vb = 5
         let id = frost_secp256k1_tr::Identifier::try_from(1u16).unwrap();
         let identity = SpoIdentity {
             identifier: id,
+            bifrost_id_pk: Vec::new(),
             port: 18500,
         };
         let epoch = cfg.to_epoch_config(identity.clone());
@@ -489,7 +600,6 @@ fee_rate_sat_per_vb = 5
         assert_eq!(epoch.dkg_round_timeout, demo.dkg_round_timeout);
         assert_eq!(epoch.poll_interval, demo.poll_interval);
         assert_eq!(epoch.quorum51_timeout, demo.quorum51_timeout);
-        assert_eq!(epoch.federation_timeout, demo.federation_timeout);
         assert_eq!(epoch.leader_timeout, demo.leader_timeout);
         assert_eq!(epoch.pegin_policy_id, demo.pegin_policy_id);
         assert_eq!(epoch.pegin_collection_window, demo.pegin_collection_window);

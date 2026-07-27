@@ -13,9 +13,14 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use frost_secp256k1_tr::Identifier;
 use frost_secp256k1_tr::keys::dkg::{round1, round2};
 
+use crate::circuits::fault_evidence::{
+    EquivocationEvidence, Round1PokFaultEvidence, Round2ShareFaultEvidence,
+};
 use crate::epoch::state::{EpochResult, Roster, SpoInfo};
+use crate::http::canonical::POINT_LEN;
 use crate::http::payloads::{Sign1Payload, Sign2Payload};
 use crate::http::wire::DkgNamespace;
 
@@ -60,9 +65,45 @@ pub struct TreasuryUtxo {
     pub federation_csv_blocks: u32,
     pub fee_rate_sat_per_vb: u64,
     pub per_pegout_fee: bitcoin::Amount,
-    /// Whether the Bitcoin transaction in the oracle datum has been
-    /// confirmed on Bitcoin. A new treasury movement can only begin once the previous one is confirmed.
+    /// Whether it is safe to begin the NEXT treasury movement off this UTxO.
+    /// A new movement can only begin once the previous one is confirmed, so the
+    /// Blockfrost impl (WI-028) sets this false when an Unconfirmed TM (or an
+    /// in-flight TM it could not read) is already spending this tip; the mock
+    /// reports a simple always-confirmed treasury.
     pub btc_confirmed: bool,
+}
+
+/// Provable DKG misbehavior captured by the peer transport.
+///
+/// Missing peers are not faults by themselves. These variants are only returned
+/// when the transport can show either a signed invalid payload or two conflicting
+/// signed payloads from the same `(epoch, threshold, attempt, round, pool_id)`
+/// namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DkgFaultEvidence {
+    Round1InvalidPayload(Round1PokFaultEvidence),
+    Round2InvalidPayload(Round2ShareFaultEvidence),
+    Equivocation(EquivocationEvidence),
+}
+
+impl DkgFaultEvidence {
+    #[must_use]
+    pub fn accused_pool_id(&self) -> &[u8; 28] {
+        match self {
+            Self::Round1InvalidPayload(ev) => &ev.accused_pool_id,
+            Self::Round2InvalidPayload(ev) => &ev.accused_pool_id,
+            Self::Equivocation(ev) => &ev.accused_pool_id,
+        }
+    }
+
+    #[must_use]
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Round1InvalidPayload(_) => "round1-invalid-payload",
+            Self::Round2InvalidPayload(_) => "round2-invalid-payload",
+            Self::Equivocation(_) => "equivocation",
+        }
+    }
 }
 
 #[async_trait]
@@ -115,6 +156,15 @@ pub trait CardanoChain: Send + Sync {
     /// treasury oracle.
     async fn publish_group_key(&self, y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()>;
 
+    /// Publish a DKG fault proof and apply the corresponding SPO ban.
+    ///
+    /// Implementations must only return `Ok(())` after the fault has been
+    /// submitted to the configured ban flow or recorded by an explicit test
+    /// double. DKG calls this only for provable evidence supplied by
+    /// [`PeerNetwork`]; absent peers are reduced out of the candidate set but
+    /// are not banned.
+    async fn publish_dkg_fault_and_apply_ban(&self, evidence: DkgFaultEvidence) -> EpochResult<()>;
+
     /// Submit a Bitcoin tx (in v0.2 the mock just records it).
     ///
     /// TODO: misleading name — this lives on `CardanoChain` but it
@@ -147,9 +197,41 @@ pub trait CardanoChain: Send + Sync {
 /// poll loop keeps waiting rather than aborting the epoch.
 #[async_trait]
 pub trait PeerNetwork: Send + Sync {
+    /// Whether `peer` is currently reachable (its `/health` endpoint answers).
+    /// Used by the pre-ceremony health gate (N21) so a staggered-start roster
+    /// converges on one DKG instead of freezing divergent live subsets. Purely
+    /// advisory — a `true` here guarantees nothing about later rounds, and the
+    /// gate is time-bounded, so implementations should answer quickly (a
+    /// couple of seconds), never retry internally. Defaults to healthy for
+    /// implementations without a liveness signal.
+    async fn check_health(&self, _peer: &SpoInfo) -> bool {
+        true
+    }
+
+    /// Record this node's chain-view for the ceremony it is entering.
+    /// [`Self::publish_dkg_round1`] attaches it (UNSIGNED) to each Round-1
+    /// payload and [`Self::fetch_dkg_round1`] compares it against peers' — so a
+    /// node can tell a genuine cross-view disagreement (both honest, different
+    /// chain reads near a ban) from a corrupt payload. Called once per ceremony
+    /// entry (each attempt), before publishing. Default no-op: a transport with
+    /// no wire view (the mock) ignores it and [`Self::is_view_stale`] stays
+    /// `false`.
+    async fn set_chain_view(&self, _view: crate::cardano::dkg_roster::ChainView) {}
+
+    /// Whether, during the ceremony since the last [`Self::set_chain_view`], this
+    /// node observed a peer whose chain-view differed AND whose blockchain
+    /// read-time was NEWER — i.e. THIS node is the STALE side and should re-read
+    /// after the disagreeing event (e.g. a ban) settles. The epoch loop reads
+    /// this after a failed DKG to back off a settling interval instead of the
+    /// blind exponential, making the reconcile directional. Default `false`.
+    async fn is_view_stale(&self) -> bool {
+        false
+    }
+
     async fn publish_dkg_round1(
         &self,
         ns: DkgNamespace,
+        identifier: Identifier,
         package: &round1::Package,
     ) -> EpochResult<()>;
     /// Publish Round 2: one encrypted share per recipient. Each entry pairs
@@ -158,6 +240,8 @@ pub trait PeerNetwork: Send + Sync {
     async fn publish_dkg_round2(
         &self,
         ns: DkgNamespace,
+        sender_identifier: Identifier,
+        sender_commitments: &[[u8; POINT_LEN]],
         recipients: &[(SpoInfo, round2::Package)],
     ) -> EpochResult<()>;
     async fn publish_sign_round1(&self, payload: Sign1Payload) -> EpochResult<()>;
@@ -172,7 +256,23 @@ pub trait PeerNetwork: Send + Sync {
         &self,
         ns: DkgNamespace,
         peer: &SpoInfo,
+        recipient_identifier: Identifier,
+        sender_commitments: &[[u8; POINT_LEN]],
     ) -> EpochResult<Option<round2::Package>>;
+    /// Return provable Round 1 faults retained while fetching `peer`'s payload.
+    async fn dkg_round1_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+    ) -> EpochResult<Vec<DkgFaultEvidence>>;
+    /// Return provable Round 2 faults retained while fetching `peer`'s payload.
+    async fn dkg_round2_fault_evidence(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+        recipient_identifier: Identifier,
+        sender_commitments: &[[u8; POINT_LEN]],
+    ) -> EpochResult<Vec<DkgFaultEvidence>>;
     async fn fetch_sign_round1(
         &self,
         epoch: u64,

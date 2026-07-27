@@ -39,9 +39,36 @@ pub const TREASURY_INFO_TITLE: &str = "bitcoin/treasury.treasury_info.mint";
 /// one hash; its hash is the ban-list policy id).
 pub const SPO_BANS_TITLE: &str = "bitcoin/spo_bans.spo_bans.mint";
 
-/// Blueprint title of the fault_verifier minting policy (parameterless — its
-/// blueprint `hash` is final; FaultProof tokens are minted under it).
-pub const FAULT_VERIFIER_TITLE: &str = "bitcoin/fault_verifier.fault_verifier.mint";
+/// Blueprint title of the Round 1 invalid-payload fault verifier.
+pub const FAULT_VERIFIER_ROUND1_TITLE: &str =
+    "bitcoin/fault_verifier_round1.fault_verifier_round1.mint";
+
+/// Blueprint title of the Round 2 invalid-payload fault verifier.
+pub const FAULT_VERIFIER_ROUND2_TITLE: &str =
+    "bitcoin/fault_verifier_round2.fault_verifier_round2.mint";
+
+/// Blueprint title of the direct equivocation fault verifier.
+pub const FAULT_VERIFIER_EQUIVOCATION_TITLE: &str =
+    "bitcoin/fault_verifier_equivocation.fault_verifier_equivocation.mint";
+
+/// The three specialized fault verifier policies accepted by `spo_bans`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultVerifierKind {
+    Round1,
+    Round2,
+    Equivocation,
+}
+
+impl FaultVerifierKind {
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Round1 => FAULT_VERIFIER_ROUND1_TITLE,
+            Self::Round2 => FAULT_VERIFIER_ROUND2_TITLE,
+            Self::Equivocation => FAULT_VERIFIER_EQUIVOCATION_TITLE,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum BlueprintError {
@@ -202,13 +229,33 @@ pub fn spos_registry_script(
     )
 }
 
-/// `treasury_info` parameterized by the registry policy id.
+/// `treasury_info` parameterized by (registry policy id, TM-NFT policy id). N10b
+/// added the 2nd param: `treasury.ak::FederationReset` authenticates the referenced
+/// Confirmed TM by the TM NFT (`tm_nft_policy_id` = the binocular
+/// TreasuryMovementValidator script hash — derive it with [`script_hash_v3`] over
+/// `cardano.tm_script_cbor`). Every caller MUST pass the same value or they compute
+/// a different treasury_info hash (→ a different address, → the state UTxO is
+/// unfindable).
 pub fn treasury_info_script(
     blueprint_json: &str,
     registry_policy_id: &[u8; 28],
+    tm_nft_policy_id: &[u8; 28],
 ) -> Result<ParameterizedScript, BlueprintError> {
     let code = validator_compiled_code(blueprint_json, TREASURY_INFO_TITLE)?;
-    apply_params(&code, &[bytes(registry_policy_id)])
+    apply_params(&code, &[bytes(registry_policy_id), bytes(tm_nft_policy_id)])
+}
+
+/// The TM-NFT policy id = the binocular `TreasuryMovementValidator` script hash,
+/// derived from its fully-applied CBOR (`cardano.tm_script_cbor`, the same bytes
+/// `binocular tm-script` prints). This is the 2nd parameter every
+/// [`treasury_info_script`] call needs (N10b), so all callers agree on the
+/// treasury_info address.
+pub fn tm_nft_policy_from_script_cbor(
+    tm_script_cbor_hex: &str,
+) -> Result<[u8; 28], BlueprintError> {
+    let cbor = hex::decode(tm_script_cbor_hex.trim())
+        .map_err(|e| BlueprintError::BadHex(e.to_string()))?;
+    Ok(script_hash_v3(&cbor))
 }
 
 /// The blueprint's own `hash` field of the validator titled `title` — final
@@ -233,19 +280,49 @@ pub fn validator_hash(blueprint_json: &str, title: &str) -> Result<[u8; 28], Blu
         .map_err(|_| BlueprintError::BadBlueprint(format!("{title}: hash is not 28 bytes")))
 }
 
-/// The `fault_verifier` minting policy, parameterized by the `spos_registry`
-/// policy id (`registration_script_hash`). The EquivocationProof branch
-/// references the accused's registration node to bind `bifrost_id_pk →
-/// accused_pool_id`, so the validator is compiled against that registry policy —
-/// and BOTH fault kinds (InvalidPayload + Equivocation) mint under the resulting
-/// (parameterized) policy id. The applied hash is the FaultProof policy id; the
-/// returned cbor is provided as the mint witness.
+/// A specialized fault verifier minting policy, parameterized by the
+/// `spos_registry` policy id (`registration_script_hash`). The validator reads
+/// the accused registration node to bind `bifrost_id_pk -> accused_pool_id`.
 pub fn fault_verifier_script(
+    blueprint_json: &str,
+    kind: FaultVerifierKind,
+    registration_script_hash: &[u8; 28],
+) -> Result<ParameterizedScript, BlueprintError> {
+    let code = validator_compiled_code(blueprint_json, kind.title())?;
+    apply_params(&code, &[bytes(registration_script_hash)])
+}
+
+pub fn fault_verifier_round1_script(
     blueprint_json: &str,
     registration_script_hash: &[u8; 28],
 ) -> Result<ParameterizedScript, BlueprintError> {
-    let code = validator_compiled_code(blueprint_json, FAULT_VERIFIER_TITLE)?;
-    apply_params(&code, &[bytes(registration_script_hash)])
+    fault_verifier_script(
+        blueprint_json,
+        FaultVerifierKind::Round1,
+        registration_script_hash,
+    )
+}
+
+pub fn fault_verifier_round2_script(
+    blueprint_json: &str,
+    registration_script_hash: &[u8; 28],
+) -> Result<ParameterizedScript, BlueprintError> {
+    fault_verifier_script(
+        blueprint_json,
+        FaultVerifierKind::Round2,
+        registration_script_hash,
+    )
+}
+
+pub fn fault_verifier_equivocation_script(
+    blueprint_json: &str,
+    registration_script_hash: &[u8; 28],
+) -> Result<ParameterizedScript, BlueprintError> {
+    fault_verifier_script(
+        blueprint_json,
+        FaultVerifierKind::Equivocation,
+        registration_script_hash,
+    )
 }
 
 /// `spo_bans` parameterized by its full upstream parameter list (7 params, in
@@ -316,10 +393,9 @@ mod tests {
     const TREASURY_INFO_APPLIED_HASH: &str =
         "c62f114c966a2ad65ecb27a871600b5b480b08ea98b5ff65625ac627";
 
-    // `bitcoin/fault_verifier.fault_verifier.mint` compiledCode + blueprint
-    // `hash` (ft-bifrost-bridge onchain/plutus.json). Parameterized by
-    // `registration_script_hash`, so this is the UNAPPLIED program/hash; the
-    // FaultProof policy id is the hash after applying the registry param.
+    // A parameterized fault-verifier compiledCode fixture. The concrete
+    // validator title is supplied by the blueprint, while the apply mechanics
+    // are identical across Round 1, Round 2, and equivocation policies.
     const FAULT_VERIFIER_CODE: &str = include_str!("../../tests/fixtures/fault_verifier_code.txt");
     const FAULT_VERIFIER_HASH: &str = "3b3a74a942ee06b74e56ae07b1b336c33b5257771c686e0f41293cae";
 
@@ -370,23 +446,23 @@ mod tests {
     #[test]
     fn fault_verifier_script_applies_registry_param() {
         let blueprint = format!(
-            r#"{{"validators":[{{"title":"{FAULT_VERIFIER_TITLE}","compiledCode":"{}","hash":"{FAULT_VERIFIER_HASH}"}}]}}"#,
+            r#"{{"validators":[{{"title":"{FAULT_VERIFIER_ROUND1_TITLE}","compiledCode":"{}","hash":"{FAULT_VERIFIER_HASH}"}}]}}"#,
             FAULT_VERIFIER_CODE.trim()
         );
         // Unapplied blueprint hash.
         assert_eq!(
-            hex::encode(validator_hash(&blueprint, FAULT_VERIFIER_TITLE).unwrap()),
+            hex::encode(validator_hash(&blueprint, FAULT_VERIFIER_ROUND1_TITLE).unwrap()),
             FAULT_VERIFIER_HASH
         );
         // Applying the registry param is deterministic and bakes it into the cbor.
         let reg = [0x11u8; 28];
-        let s1 = fault_verifier_script(&blueprint, &reg).unwrap();
-        let s2 = fault_verifier_script(&blueprint, &reg).unwrap();
+        let s1 = fault_verifier_round1_script(&blueprint, &reg).unwrap();
+        let s2 = fault_verifier_script(&blueprint, FaultVerifierKind::Round1, &reg).unwrap();
         assert_eq!(s1.hash, s2.hash);
         assert_ne!(s1.hash_hex(), FAULT_VERIFIER_HASH);
         assert_ne!(s1.cbor, hex::decode(FAULT_VERIFIER_CODE.trim()).unwrap());
         // A different registry → a different FaultProof policy id.
-        let other = fault_verifier_script(&blueprint, &[0x22u8; 28]).unwrap();
+        let other = fault_verifier_round1_script(&blueprint, &[0x22u8; 28]).unwrap();
         assert_ne!(s1.hash, other.hash);
     }
 
@@ -482,11 +558,20 @@ mod tests {
             .expect("set BIFROST_PLUTUS_JSON to the upstream plutus.json");
         let blueprint = std::fs::read_to_string(path).unwrap();
         let registry = spos_registry_script(&blueprint, &[0xaa; 32], 1).unwrap();
+        // N10b: spos_registry references TreasuryDatum, whose shape changed (federation
+        // fields + last_reset_tm_txid), so its compiled code — and this hash — moved.
         assert_eq!(
             registry.hash_hex(),
-            "796609d4a6a9f0bda089817e69e56e555356b2eca684f747c91baa16"
+            "37df878dca019a2806def25f6befb7b0bfba6de84e192bbf68ad60ba"
         );
-        let treasury = treasury_info_script(&blueprint, &registry.hash).unwrap();
-        assert_eq!(treasury.hash_hex(), TREASURY_INFO_APPLIED_HASH);
+        // N10b: treasury_info is 2-param (registry, tm_nft). A fixed synthetic
+        // tm_nft (0x11*28) makes the applied hash reproducible; because the blueprint
+        // is aiken's own output and apply_params matches `aiken blueprint apply`
+        // byte-for-byte, the pinned hash is aiken's 2-param application.
+        let treasury = treasury_info_script(&blueprint, &registry.hash, &[0x11u8; 28]).unwrap();
+        assert_eq!(
+            treasury.hash_hex(),
+            "e196f69aff75052cf69a9a9a68e9c58345ca4252f1321b1695a89133"
+        );
     }
 }

@@ -39,7 +39,7 @@ use whisky_pallas::WhiskyPallas;
 
 use crate::cardano::blueprint::ParameterizedScript;
 use crate::cardano::mpf;
-use crate::cardano::plutus::{bytes, constr, int_from_u64};
+use crate::cardano::plutus::{bytes, constr, int, int_from_u64};
 use crate::cardano::publish::WalletUtxo;
 use crate::cardano::treasury_info::TreasuryInfoDatum;
 use crate::cardano::tx_common::{network_from_address, whisky_network};
@@ -77,25 +77,28 @@ pub fn output_ref_plutus_data(tx_id: &[u8; 32], output_index: u64) -> PlutusData
 // Bootstrap datum + mint redeemer
 // ---------------------------------------------------------------------------
 
-/// The K1 initial datum: empty MPF identity root + the BTC-side fields.
+/// The K1 initial datum: empty MPF identity root + the current frost key +
+/// the federation fields. In Phase 1 `current_spos_frost_key` == `y_federation`
+/// (the federation is the key-path signer until the first DKG).
 #[must_use]
 pub fn bootstrap_datum(
-    current_treasury_address: Vec<u8>,
-    current_treasury_utxo_id: Vec<u8>,
     current_spos_frost_key: Vec<u8>,
+    y_federation: Vec<u8>,
+    federation_csv_blocks: i64,
 ) -> TreasuryInfoDatum {
     TreasuryInfoDatum {
         bifrost_identity_root: mpf::NULL_HASH,
-        current_treasury_address,
-        current_treasury_utxo_id,
         current_spos_frost_key,
+        y_federation,
+        federation_csv_blocks,
+        // No reset at bootstrap; empty until the first FederationReset consumes a sweep.
+        last_reset_tm_txid: vec![],
     }
 }
 
-/// `TreasuryMintRedeemer = Constr(0, [input_ref, current_treasury_address,
-/// current_treasury_utxo_id, current_spos_frost_key])`. The three byte-fields
-/// must equal the datum's — the validator rebuilds the expected datum from
-/// the redeemer.
+/// `TreasuryMintRedeemer = Constr(0, [input_ref, current_spos_frost_key,
+/// y_federation, federation_csv_blocks])`. The fields must equal the datum's —
+/// the validator rebuilds the expected datum from the redeemer.
 #[must_use]
 pub fn treasury_mint_redeemer(
     tx_id: &[u8; 32],
@@ -106,9 +109,9 @@ pub fn treasury_mint_redeemer(
         0,
         vec![
             output_ref_plutus_data(tx_id, output_index),
-            bytes(&datum.current_treasury_address),
-            bytes(&datum.current_treasury_utxo_id),
             bytes(&datum.current_spos_frost_key),
+            bytes(&datum.y_federation),
+            int(datum.federation_csv_blocks),
         ],
     )
 }
@@ -161,11 +164,19 @@ pub fn build_treasury_bootstrap_tx(
     let script_address = treasury_script.enterprise_address(network);
     let policy_id_hex = treasury_script.hash_hex();
 
-    // The one-shot + fee input: the richest wallet UTxO.
+    // The one-shot + fee input: the richest PURE-ADA wallet UTxO. Pure-ADA is
+    // required — this builder emits a single change output that forwards only
+    // ADA, so a token-bearing one-shot would silently drop its native tokens
+    // and the tx fails ledger value-conservation (ValueNotConservedUTxO, hit on
+    // a preprod wallet carrying leftover test tokens). Matches the pure-ADA
+    // selection in `tx_common::select_fee` / `register_pool::select_inputs`.
     let fee_utxo = wallet_utxos
         .iter()
+        .filter(|u| u.pure_ada)
         .max_by_key(|u| u.lovelace)
-        .ok_or_else(|| EpochError::Chain("no wallet UTxOs for the one-shot input".into()))?;
+        .ok_or_else(|| {
+            EpochError::Chain("no pure-ADA wallet UTxO for the one-shot input".into())
+        })?;
     let tx_id: [u8; 32] = hex::decode(&fee_utxo.tx_hash)
         .ok()
         .and_then(|v| v.try_into().ok())
@@ -361,26 +372,19 @@ mod tests {
     // (a Haskell node would accept it — but tooling parity matters).
     #[test]
     fn mint_redeemer_is_canonical() {
-        let d = bootstrap_datum(vec![1, 2], vec![3, 4], vec![5, 6]);
+        let d = bootstrap_datum(vec![1, 2], vec![3, 4], 6);
         let r = treasury_mint_redeemer(&[0xaa; 32], 1, &d);
         let hex = hex::encode(minicbor::to_vec(&r).unwrap());
-        // Constr 0 indef [ Constr 0 indef [ bytes32, 1 ], 0102, 0304, 0506 ]
+        // Constr 0 indef [ Constr 0 indef [ bytes32, 1 ], 0102, 0304, int 6 ]
         assert_eq!(
             hex,
-            format!(
-                "d8799fd8799f5820{}01ff420102420304420506ff",
-                "aa".repeat(32)
-            )
+            format!("d8799fd8799f5820{}01ff42010242030406ff", "aa".repeat(32))
         );
     }
 
     #[test]
     fn bootstrap_datum_has_empty_root_and_roundtrips() {
-        let d = bootstrap_datum(
-            b"\x51\x20treasury-spk".to_vec(),
-            vec![0x11; 36],
-            vec![0xAB; 32],
-        );
+        let d = bootstrap_datum(vec![0xAB; 32], vec![0xCD; 32], 144);
         assert_eq!(d.bifrost_identity_root, mpf::NULL_HASH);
         let decoded: PlutusData = minicbor::decode(&d.to_cbor()).unwrap();
         assert_eq!(TreasuryInfoDatum::from_plutus_data(&decoded).unwrap(), d);
@@ -388,7 +392,7 @@ mod tests {
 
     #[test]
     fn mint_redeemer_shape() {
-        let d = bootstrap_datum(vec![1, 2], vec![3, 4], vec![5, 6]);
+        let d = bootstrap_datum(vec![1, 2], vec![3, 4], 6);
         let r = treasury_mint_redeemer(&[0xaa; 32], 1, &d);
         let cbor = minicbor::to_vec(&r).unwrap();
         let back: PlutusData = minicbor::decode(&cbor).unwrap();
@@ -413,7 +417,7 @@ mod tests {
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let key = derive_payment_key(mnemonic).unwrap();
         let wallet_addr = crate::cardano::wallet::wallet_address(&key);
-        let mut datum = bootstrap_datum(vec![1], vec![2], vec![3]);
+        let mut datum = bootstrap_datum(vec![1], vec![2], 3);
         datum.bifrost_identity_root = [9u8; 32];
         let utxos = vec![WalletUtxo {
             tx_hash: "aa".repeat(32),
@@ -465,11 +469,7 @@ mod tests {
                 pure_ada: true,
             },
         ];
-        let datum = bootstrap_datum(
-            b"\x51\x20treasury-spk".to_vec(),
-            vec![0x11; 36],
-            vec![0xAB; 32],
-        );
+        let datum = bootstrap_datum(vec![0xAB; 32], vec![0xCD; 32], 144);
 
         let built =
             build_treasury_bootstrap_tx(&script, &wallet_addr, &utxos, &datum, &key, None).unwrap();
