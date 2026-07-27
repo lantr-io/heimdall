@@ -79,6 +79,7 @@ async fn full_cycle_3_spos_over_http() {
         handles.push(tokio::spawn(async move {
             let mut config = EpochConfig::demo_default(SpoIdentity {
                 identifier: id,
+                bifrost_id_pk: Vec::new(),
                 port,
             });
             config.pegin_collection_window = Duration::from_millis(100);
