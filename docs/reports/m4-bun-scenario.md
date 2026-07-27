@@ -73,7 +73,3 @@ observe different chain tips.
 Blockfrost index lag on preprod exceeded ten minutes at times. Deployment steps
 and ban recovery therefore required index-aware settling between transactions.
 
-## Scope
-
-This scenario covers the ZK-free equivocation path. It does not exercise the
-Round-1 or Round-2 invalid-payload proof paths, or treasury movement.
