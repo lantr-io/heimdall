@@ -20,13 +20,20 @@ use frost_secp256k1_tr::keys::dkg::{round1, round2};
 use tokio::sync::RwLock;
 
 use super::canonical::POOL_ID_LEN;
-use super::client::identifier_to_pool_id;
 use super::payloads::{Sign1Payload, Sign2Payload};
 use super::server::{AppState, DkgRoundKey, SharedState};
 use super::wire::{self, ChainViewWire, Dkg1Wire, Dkg2Wire, DkgNamespace, Round2Recipient};
 use crate::cardano::dkg_roster::ChainView;
 use crate::epoch::state::{EpochError, EpochResult, SpoInfo};
 use crate::epoch::traits::{DkgFaultEvidence, PeerNetwork};
+
+/// Pool identifier in the URL space: the u16 the `Identifier` was constructed
+/// from. FROST serializes to 32 big-endian bytes; the final two encode the u16.
+fn identifier_to_pool_id(id: frost_secp256k1_tr::Identifier) -> u16 {
+    let bytes = id.serialize();
+    let n = bytes.len();
+    u16::from_be_bytes([bytes[n - 2], bytes[n - 1]])
+}
 
 /// Wall-clock bound past which a persistent chain-view disagreement with one
 /// peer is flagged (the reconcile design's "impossible-case" tripwire). Under
