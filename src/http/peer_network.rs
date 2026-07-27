@@ -284,7 +284,7 @@ fn push_round1_faults_from_payloads(
             ns.epoch,
             ns.threshold,
             ns.attempt,
-            super::client::identifier_to_pool_id(peer.identifier),
+            identifier_to_pool_id(peer.identifier),
             &wire,
         ) else {
             continue;
@@ -332,7 +332,7 @@ fn push_round2_faults_from_payloads(
             peer_pool,
             &peer.bifrost_id_pk,
             &net.my_pool_id,
-            super::client::identifier_to_pool_id(recipient_identifier),
+            identifier_to_pool_id(recipient_identifier),
             &net.keypair.secret_key(),
             sender_commitments,
             ns.epoch,

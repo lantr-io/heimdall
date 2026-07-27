@@ -239,12 +239,11 @@ async fn step_phase(
         } => submit_phase(chain, me, epoch, roster, tm, leader_attempt).await?,
 
         EpochPhase::AwaitConfirm { tm, .. } => {
-            // First-cycle terminal: return the signed TM.
-            //
-            // TODO: in steady state this phase should poll the chain for
-            // inclusion of `cardano_tx_id` (once submit actually produces one),
-            // then transition back to `Idle` to wait for the next epoch
-            // boundary. Today we finish the cycle unconditionally.
+            // The live Cardano implementation waits for oracle-update
+            // inclusion inside `submit_signed_tm` before reaching this phase.
+            // The first-cycle terminal still returns the signed TM; a future
+            // steady-state loop can retain the phase and wait for the next
+            // epoch boundary instead.
             return Ok(Step::Done(tm));
         }
     };

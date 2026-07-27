@@ -508,6 +508,46 @@ impl BlockfrostCardanoChain {
         self
     }
 
+    /// Wait until a submitted Cardano transaction is indexed, or until its
+    /// validity window has elapsed. A timeout is returned to the epoch loop,
+    /// which re-reads chain state and rebuilds the transaction from fresh
+    /// UTxOs instead of replaying stale bytes.
+    async fn wait_for_cardano_confirmation(&self, tx_hash: &str) -> EpochResult<()> {
+        let timeout = Duration::from_secs(self.validity_window_secs.max(1));
+        let poll = Duration::from_secs(5);
+        let started = tokio::time::Instant::now();
+        loop {
+            match crate::cardano::bf_http::fetch_tx_inclusion(
+                &self.bf_base_url,
+                &self.bf_project_id,
+                tx_hash,
+            )
+            .await
+            {
+                Ok(Some(block_time)) => {
+                    eprintln!(
+                        "[submit] Cardano oracle-update confirmed: tx_hash={tx_hash} block_time={block_time}"
+                    );
+                    return Ok(());
+                }
+                Ok(None) if started.elapsed() < timeout => {
+                    eprintln!("[submit] Cardano tx {tx_hash} pending; polling again in {poll:?}");
+                    tokio::time::sleep(poll).await;
+                }
+                Ok(None) => {
+                    return Err(EpochError::Chain(format!(
+                        "Cardano tx {tx_hash} was not indexed before its validity window expired"
+                    )));
+                }
+                Err(e) => {
+                    return Err(EpochError::Chain(format!(
+                        "Cardano tx {tx_hash} confirmation query failed: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
     /// Locate the bridge Config UTxO (address + config NFT unit `policy_id ++ asset_name`).
     /// Its field 11 (initial_btc_treasury_utxo) anchors the Treasury Movement chain.
     pub fn with_config_utxo(mut self, address: &str, nft_unit: &str) -> Self {
@@ -1421,6 +1461,8 @@ impl CardanoChain for BlockfrostCardanoChain {
             .map_err(|e| EpochError::Chain(format!("blockfrost tx submit: {e}")))?;
 
         eprintln!("[submit] Cardano oracle-update submitted: tx_hash={tx_hash}");
+
+        self.wait_for_cardano_confirmation(&tx_hash).await?;
 
         Ok(())
     }

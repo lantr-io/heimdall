@@ -201,6 +201,43 @@ pub async fn fetch_tx_block_time(
         .ok_or_else(|| format!("txs/{tx_hash}: missing/non-numeric `block_time`"))
 }
 
+/// Return whether a Cardano transaction is included in the indexed chain.
+/// Blockfrost returns 404 while a submitted transaction is still pending (or
+/// has expired from the mempool), so callers can distinguish pending from an
+/// HTTP/API failure.
+pub async fn fetch_tx_inclusion(
+    base_url: &str,
+    project_id: &str,
+    tx_hash: &str,
+) -> Result<Option<i64>, String> {
+    let url = format!("{base_url}/txs/{tx_hash}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("txs/{tx_hash} request: {e}"))?;
+    if resp.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!(
+            "txs/{tx_hash} http {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("txs/{tx_hash} json: {e}"))?;
+    let block_time = v
+        .get("block_time")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("txs/{tx_hash}: missing/non-numeric `block_time`"))?;
+    Ok(Some(block_time))
+}
+
 /// POSIX start time (ms) of `epoch`, from `/epochs/{epoch}`. This is the
 /// epoch-boundary time the eligible-roster ban check compares against — using a
 /// chain-derived boundary (not a node clock) so every SPO derives the same
