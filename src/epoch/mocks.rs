@@ -20,7 +20,10 @@
 //! protection that the real wire layer will need.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -139,6 +142,7 @@ pub struct MockCardanoChain {
     /// context, enabling the ceremony window grid (N21) in tests. `None` (the
     /// default) keeps the mock on relative per-round timeouts.
     schedule_anchor_ms: Option<i64>,
+    tm_confirmed: Arc<AtomicBool>,
 }
 
 impl MockCardanoChain {
@@ -151,6 +155,7 @@ impl MockCardanoChain {
             btc_rpc: None,
             dkg_faults: Arc::new(Mutex::new(Vec::new())),
             schedule_anchor_ms: None,
+            tm_confirmed: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -192,6 +197,11 @@ impl MockCardanoChain {
 
     pub fn submitted_txs(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
         self.submitted_txs.clone()
+    }
+
+    /// Shared test control for whether `AwaitConfirm` may complete.
+    pub fn confirmation_signal(&self) -> Arc<AtomicBool> {
+        self.tm_confirmed.clone()
     }
 
     pub fn dkg_faults(&self) -> Arc<Mutex<Vec<DkgFaultEvidence>>> {
@@ -255,6 +265,10 @@ impl CardanoChain for MockCardanoChain {
             per_pegout_fee: self.fixture.per_pegout_fee,
             btc_confirmed: true,
         })
+    }
+
+    async fn is_tm_confirmed(&self, _txid: &bitcoin::Txid) -> EpochResult<bool> {
+        Ok(self.tm_confirmed.load(Ordering::Acquire))
     }
 
     async fn publish_group_key(&self, y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()> {

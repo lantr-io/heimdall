@@ -1281,6 +1281,11 @@ impl CardanoChain for BlockfrostCardanoChain {
         })
     }
 
+    async fn is_tm_confirmed(&self, txid: &bitcoin::Txid) -> EpochResult<bool> {
+        let treasury = self.query_treasury().await?;
+        Ok(treasury.btc_confirmed && treasury.outpoint.txid == *txid)
+    }
+
     async fn publish_group_key(&self, y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()> {
         *self.treasury_y_51.lock().unwrap() = Some(y_51);
         Ok(())

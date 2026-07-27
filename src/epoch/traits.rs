@@ -134,6 +134,14 @@ pub trait CardanoChain: Send + Sync {
     /// Current treasury UTxO state, as reported by the Cardano oracle.
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo>;
 
+    /// Whether the specific treasury movement is now the confirmed chain tip.
+    /// Mock implementations use the default immediate-success behavior;
+    /// live implementations must verify the observed tip txid and its
+    /// confirmation state.
+    async fn is_tm_confirmed(&self, _txid: &bitcoin::Txid) -> EpochResult<bool> {
+        Ok(true)
+    }
+
     /// Pending peg-out requests to fulfil.
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>>;
 

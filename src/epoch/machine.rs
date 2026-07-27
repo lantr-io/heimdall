@@ -238,16 +238,42 @@ async fn step_phase(
             leader_attempt,
         } => submit_phase(chain, me, epoch, roster, tm, leader_attempt).await?,
 
-        EpochPhase::AwaitConfirm { tm, .. } => {
-            // The live Cardano implementation waits for oracle-update
-            // inclusion inside `submit_signed_tm` before reaching this phase.
-            // The first-cycle terminal still returns the signed TM; a future
-            // steady-state loop can retain the phase and wait for the next
-            // epoch boundary instead.
+        EpochPhase::AwaitConfirm { epoch, tm, .. } => {
+            await_confirm_phase(chain, config, epoch, &tm).await?;
             return Ok(Step::Done(tm));
         }
     };
     Ok(Step::Next(next))
+}
+
+/// Wait for every SPO to observe this exact movement as the confirmed
+/// treasury tip. The leader has already waited for Cardano oracle inclusion;
+/// followers use this chain-level check to converge on the same result.
+async fn await_confirm_phase(
+    chain: &Arc<dyn CardanoChain>,
+    config: &EpochConfig,
+    epoch: u64,
+    tm: &TreasuryMovement,
+) -> EpochResult<()> {
+    let deadline = tokio::time::Instant::now() + config.tm_confirmation_timeout;
+    loop {
+        if chain.is_tm_confirmed(&tm.txid).await? {
+            crate::epoch_log!(
+                config.identity.identifier,
+                epoch,
+                "AwaitConfirm: treasury movement {} is confirmed",
+                tm.txid
+            );
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(EpochError::Chain(format!(
+                "treasury movement {} was not confirmed before timeout ({:?})",
+                tm.txid, config.tm_confirmation_timeout
+            )));
+        }
+        tokio::time::sleep(config.poll_interval).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,6 +1042,57 @@ mod tests {
     #[tokio::test]
     async fn full_cycle_2_of_2_all_derive_same_treasury() {
         multi_instance_same_treasury(2, 2).await;
+    }
+
+    #[tokio::test]
+    async fn followers_wait_in_await_confirm_until_chain_confirms() {
+        let fixture = demo_static_fixture(2, 2, 18_650);
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        let mut signals = Vec::new();
+        let mut submitted = Vec::new();
+
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let signal = chain.confirmation_signal();
+            signal.store(false, std::sync::atomic::Ordering::Release);
+            submitted.push(chain.submitted_txs());
+            signals.push(signal);
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        // Wait until the leader has submitted and both nodes should be parked
+        // in AwaitConfirm rather than returning from the cycle.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if submitted.iter().any(|txs| !txs.lock().unwrap().is_empty()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leader submits before confirmation test timeout");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(handles.iter().any(|h| !h.is_finished()));
+
+        for signal in signals {
+            signal.store(true, std::sync::atomic::Ordering::Release);
+        }
+        for handle in handles {
+            handle
+                .await
+                .unwrap()
+                .expect("cycle completes after confirmation");
+        }
     }
 
     /// WI-014 #5 restart recovery: with a persisted DKG for the epoch,

@@ -84,6 +84,9 @@ pub struct ProtocolConfig {
     pub poll_interval_ms: u64,
     pub quorum51_timeout_secs: u64,
     pub leader_timeout_secs: u64,
+    /// Maximum time to wait for the submitted treasury movement to become the
+    /// confirmed chain tip before rebuilding from fresh chain state.
+    pub tm_confirmation_timeout_secs: u64,
     pub pegin_collection_window_secs: u64,
     pub pegin_poll_interval_ms: u64,
     /// Directory for 0600 DKG-state persistence so the signing share survives
@@ -103,6 +106,7 @@ impl Default for ProtocolConfig {
             poll_interval_ms: 5000,
             quorum51_timeout_secs: 300,
             leader_timeout_secs: 10000,
+            tm_confirmation_timeout_secs: 1800,
             pegin_collection_window_secs: 5,
             pegin_poll_interval_ms: 1000,
             state_dir: None,
@@ -449,6 +453,9 @@ impl HeimdallConfig {
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
             quorum51_timeout: Duration::from_secs(self.protocol.quorum51_timeout_secs),
             leader_timeout: Duration::from_secs(self.protocol.leader_timeout_secs),
+            tm_confirmation_timeout: Duration::from_secs(
+                self.protocol.tm_confirmation_timeout_secs,
+            ),
             identity,
             pegin_policy_id,
             pegin_collection_window: Duration::from_secs(
