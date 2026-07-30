@@ -7,7 +7,9 @@
 //! **registered on chain**, so every such script needs a one-time stake
 //! registration before its first withdraw — otherwise submission fails with
 //!
-//!     ConwayCertsFailure (WithdrawalsNotInRewardsCERTS … ScriptHashObj …)
+//! ```text
+//! ConwayCertsFailure (WithdrawalsNotInRewardsCERTS … ScriptHashObj …)
+//! ```
 //!
 //! Registration cannot be folded into the withdrawing transaction: certificates
 //! validate against the **pre-transaction** ledger state, so a withdrawal in the

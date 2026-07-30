@@ -44,14 +44,15 @@ pub struct PegInInput {
 }
 
 /// A peg-out request to fulfil from the treasury.
+///
+/// Carries no treasury pin and no request identity: by the time a request reaches
+/// `build_tm` the caller has already dropped the ones this TM must not pay —
+/// already-paid (`pegout_datum::select_unpaid`) and, under `--require-pegout-pin`,
+/// pinned elsewhere (`pegout_datum::partition_by_pin`). `build_tm` owns only the
+/// skips that depend on the Bitcoin output itself (non-standard script, dust).
 pub struct PegOutRequest {
     pub script_pubkey: ScriptBuf,
     pub amount: Amount,
-    /// The treasury outpoint this request's datum pins the paying TM to
-    /// (`PegOutDatum.source_chain_treasury_utxo_id`). `build_tm` pays the peg-out
-    /// ONLY if this equals the TM's treasury input — see
-    /// [`SkipReason::TreasuryPinMismatch`].
-    pub pinned_treasury_outpoint: OutPoint,
 }
 
 /// Protocol fee parameters.
@@ -70,9 +71,10 @@ pub struct UnsignedTm {
     pub txid: Txid,
     pub prevouts: Vec<TxOut>,
     pub input_spend_info: Vec<TaprootSpendInfo>,
-    /// Peg-out requests dropped from this TM by the deterministic skip rule —
-    /// pinned to another treasury outpoint, a non-standard destination script, or
-    /// sub-dust after the per-pegout fee (see [`SkipReason`]). Surfaced so the
+    /// Peg-out requests dropped from this TM by the output-level skip rule — a
+    /// non-standard destination script, or sub-dust after the per-pegout fee (see
+    /// [`SkipReason`]); already-paid and pin-mismatched requests are filtered
+    /// earlier, by `pegout_datum`, and never reach here. Surfaced so the
     /// operator can see what was skipped; the user reclaims via `peg_out.ak`'s
     /// Cancel path.
     pub skipped_pegouts: Vec<SkippedPegOut>,
@@ -96,10 +98,6 @@ pub enum SkipReason {
     /// The destination scriptPubKey is not a standard, spendable output type
     /// (empty / OP_RETURN / bare / non-standard) — unsafe or non-relayable.
     NonStandardScript,
-    /// The request's datum pins a DIFFERENT treasury outpoint than this TM's
-    /// treasury input, so this TM can never fulfil it. `pinned` is what the datum
-    /// named. See [`build_tm`] for why paying it anyway loses funds.
-    TreasuryPinMismatch { pinned: OutPoint },
 }
 
 impl fmt::Display for SkipReason {
@@ -107,11 +105,6 @@ impl fmt::Display for SkipReason {
         match self {
             Self::BelowDust => write!(f, "amount below dust after fee"),
             Self::NonStandardScript => write!(f, "non-standard/unspendable destination script"),
-            Self::TreasuryPinMismatch { pinned } => write!(
-                f,
-                "datum pins treasury outpoint {pinned}, which is not this TM's treasury input \
-                 (the withdrawer recovers via Cancel, once that path is implemented)"
-            ),
         }
     }
 }
@@ -215,13 +208,11 @@ fn varint_size(n: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Total sort key for a [`SkipReason`], so the skip report has a deterministic
-/// order across SPOs. The discriminant orders the variants; the pinned outpoint
-/// discriminates two mismatched pins on the same destination+amount.
-fn skip_reason_sort_key(r: &SkipReason) -> (u8, [u8; 36]) {
+/// order across SPOs.
+fn skip_reason_sort_key(r: &SkipReason) -> u8 {
     match r {
-        SkipReason::BelowDust => (0, [0u8; 36]),
-        SkipReason::NonStandardScript => (1, [0u8; 36]),
-        SkipReason::TreasuryPinMismatch { pinned } => (2, outpoint_sort_key(pinned)),
+        SkipReason::BelowDust => 0,
+        SkipReason::NonStandardScript => 1,
     }
 }
 
@@ -280,30 +271,11 @@ pub fn build_tm(
     // datum (anyone can lock fBTC at the permissionlessly-payable peg_out.ak
     // address). SKIP a request the TM cannot safely pay rather than fail the
     // whole TM — one tiny/hostile peg-out must not block every peg-in and
-    // peg-out (bridge-wide liveness DoS). The user reclaims via Cancel. Three
-    // ways a request is unpayable:
-    //
-    //  (0) Its datum pins a treasury outpoint that is NOT this TM's treasury
-    //      input. `PegOutDatum.source_chain_treasury_utxo_id` names the treasury
-    //      UTxO the paying TM must spend, and BOTH on-chain paths compare against
-    //      it: completion proves the TM spends it and pays the destination;
-    //      Cancel proves the TM spending it does NOT. Since Bitcoin spends each
-    //      outpoint exactly once, the pin admits at most ONE TM per request —
-    //      which is the bridge's only defense against paying a peg-out twice.
-    //      Paying a mismatched request is unconditional fund loss, in both
-    //      directions:
-    //        - it can never be completed (the produced-verifier requires this TM
-    //          to spend the pinned outpoint), so the BTC leaves with no fBTC
-    //          burn — and since binocular's not-produced verifier is still a
-    //          `fail(...)` stub, Cancel cannot refund the fBTC either, making it
-    //          pure loss today and a double-collect once refunds ship;
-    //        - and re-including an ALREADY-PAID request in a later TM is exactly
-    //          this case (a later TM's treasury input is by construction a
-    //          different outpoint), so without this check every mover tick after
-    //          a confirmed TM re-pays every pending peg-out until its owner
-    //          finally completes it.
-    //      Checked FIRST because it is the cheapest and the only one whose
-    //      omission loses funds rather than merely stalling a withdrawal.
+    // peg-out (bridge-wide liveness DoS). The user reclaims via Cancel. Two ways
+    // a request is unpayable HERE — the skips that depend on the Bitcoin output
+    // itself. The two that depend on Cardano history (already paid by an earlier
+    // TM; pinned to another treasury outpoint) are applied by the caller before
+    // this point, via `pegout_datum::select_unpaid` / `partition_by_pin`:
     //
     //  (1) Non-standard destination scriptPubKey. An empty script is
     //      anyone-can-spend (treasury BTC claimable by anyone — fund loss),
@@ -316,26 +288,13 @@ pub fn build_tm(
     //      output exists.
     //
     // DETERMINISM: every SPO must skip the SAME set to build byte-identical TMs
-    // for FROST. The pin check compares two consensus values (the datum field and
-    // the treasury input every SPO already agrees on); the script check is
-    // network-independent; the dust check needs `per_pegout_fee` to be a
-    // consensus value — see WI-009 / technical_questions.md §2. (The proper
-    // long-term fix for (2) is the contract rejecting sub-min peg-outs at lock
-    // time via a config min-fbtc value; for (1), validating the destination at
-    // lock time.)
-    let treasury_outpoint = treasury.outpoint;
+    // for FROST. The script check is network-independent; the dust check needs
+    // `per_pegout_fee` to be a consensus value — see WI-009 /
+    // technical_questions.md §2. (The proper long-term fix for (2) is the
+    // contract rejecting sub-min peg-outs at lock time via a config min-fbtc
+    // value; for (1), validating the destination at lock time.)
     let mut skipped_pegouts = Vec::new();
     pegouts.retain(|po| {
-        if po.pinned_treasury_outpoint != treasury_outpoint {
-            skipped_pegouts.push(SkippedPegOut {
-                script_pubkey: po.script_pubkey.clone(),
-                amount: po.amount,
-                reason: SkipReason::TreasuryPinMismatch {
-                    pinned: po.pinned_treasury_outpoint,
-                },
-            });
-            return false;
-        }
         if !is_standard_payable(&po.script_pubkey) {
             skipped_pegouts.push(SkippedPegOut {
                 script_pubkey: po.script_pubkey.clone(),
@@ -484,8 +443,7 @@ pub fn build_tm(
     // The skip report is a cross-SPO divergence signal (the epoch machine logs it
     // on that basis), so order it deterministically too — `retain` above collected
     // these in caller order, which is the chain query's listing order and not a
-    // consensus input. Same key as the outputs, plus the pin, which here is NOT
-    // constant: mismatched pins are exactly what lands in this list.
+    // consensus input.
     skipped_pegouts.sort_by(|a, b| {
         a.script_pubkey
             .as_bytes()
@@ -802,37 +760,14 @@ mod tests {
         }
     }
 
-    /// The treasury byte every test but `test_input_ordering` sweeps from.
-    const DEFAULT_TREASURY_TXID_BYTE: u8 = 0xAA;
-
-    /// The outpoint `make_treasury_input(txid_byte, _)` produces — what a peg-out
-    /// must pin to be payable by that TM.
-    fn treasury_outpoint_for(txid_byte: u8) -> OutPoint {
-        OutPoint {
-            txid: make_txid(txid_byte),
-            vout: 0,
-        }
-    }
-
-    /// A payable peg-out: pinned to the default test treasury.
+    /// A payable peg-out with a valid P2TR-length destination (34 bytes:
+    /// OP_1 <32-byte key>).
     fn make_pegout(script_byte: u8, sats: u64) -> PegOutRequest {
-        make_pegout_pinned(
-            script_byte,
-            sats,
-            treasury_outpoint_for(DEFAULT_TREASURY_TXID_BYTE),
-        )
-    }
-
-    /// A peg-out pinned to an explicit treasury outpoint — pass a foreign outpoint
-    /// to exercise the pin-mismatch skip.
-    fn make_pegout_pinned(script_byte: u8, sats: u64, pin: OutPoint) -> PegOutRequest {
-        // Use a valid P2TR-length scriptPubKey (34 bytes: OP_1 <32-byte key>)
         let secp = Secp256k1::new();
         let key = xonly_from_seed([script_byte; 32]);
         PegOutRequest {
             script_pubkey: ScriptBuf::new_p2tr(&secp, key, None),
             amount: Amount::from_sat(sats),
-            pinned_treasury_outpoint: pin,
         }
     }
 
@@ -1001,11 +936,7 @@ mod tests {
         let tm = build_tm(
             make_treasury_input(treasury_txid_byte, 10_000_000),
             pegins,
-            vec![make_pegout_pinned(
-                0x10,
-                50_000,
-                treasury_outpoint_for(treasury_txid_byte),
-            )],
+            vec![make_pegout(0x10, 50_000)],
             change,
             &fee_params,
         )
@@ -1161,12 +1092,10 @@ mod tests {
             PegOutRequest {
                 script_pubkey: ScriptBuf::new(), // empty (anyone-can-spend)
                 amount: Amount::from_sat(100_000),
-                pinned_treasury_outpoint: treasury_outpoint_for(DEFAULT_TREASURY_TXID_BYTE),
             },
             PegOutRequest {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x02, 0xde, 0xad]), // OP_RETURN
                 amount: Amount::from_sat(100_000),
-                pinned_treasury_outpoint: treasury_outpoint_for(DEFAULT_TREASURY_TXID_BYTE),
             },
         ];
         let tm = build_tm(
@@ -1187,126 +1116,16 @@ mod tests {
         );
     }
 
-    // --- Treasury pin (the double-payout defense) ---
-
-    // A peg-out whose datum pins a DIFFERENT treasury outpoint is skipped: this TM
-    // could never be proven to fulfil it (the on-chain produced-verifier requires
-    // the TM to spend the pinned outpoint), so paying it would send BTC that can
-    // never be completed while leaving Cancel open.
-    #[test]
-    fn test_pegout_pinned_to_other_treasury_is_skipped() {
-        let fee_params = default_fee_params();
-        let foreign = treasury_outpoint_for(0xBE);
-        let tm = build_tm(
-            make_treasury_input(DEFAULT_TREASURY_TXID_BYTE, 10_000_000),
-            vec![],
-            vec![
-                make_pegout(0x10, 100_000),                 // pinned here — paid
-                make_pegout_pinned(0x11, 100_000, foreign), // pinned elsewhere — skipped
-            ],
-            change_address(),
-            &fee_params,
-        )
-        .unwrap();
-
-        assert_eq!(tm.tx.output.len(), 2); // change + the one payable peg-out
-        assert_eq!(tm.skipped_pegouts.len(), 1);
-        assert_eq!(
-            tm.skipped_pegouts[0].reason,
-            SkipReason::TreasuryPinMismatch { pinned: foreign }
-        );
-    }
-
-    // The same outpoint but a different vout is a different UTxO — the pin is
-    // compared whole, not by txid.
-    #[test]
-    fn test_pegout_pin_compares_vout_not_just_txid() {
-        let fee_params = default_fee_params();
-        let same_txid_other_vout = OutPoint {
-            txid: make_txid(DEFAULT_TREASURY_TXID_BYTE),
-            vout: 1,
-        };
-        let tm = build_tm(
-            make_treasury_input(DEFAULT_TREASURY_TXID_BYTE, 10_000_000), // vout 0
-            vec![],
-            vec![make_pegout_pinned(0x10, 100_000, same_txid_other_vout)],
-            change_address(),
-            &fee_params,
-        )
-        .unwrap();
-
-        assert_eq!(tm.tx.output.len(), 1); // change only
-        assert_eq!(
-            tm.skipped_pegouts[0].reason,
-            SkipReason::TreasuryPinMismatch {
-                pinned: same_txid_other_vout
-            }
-        );
-    }
-
-    // THE REGRESSION THIS FILTER EXISTS FOR: an already-paid peg-out lingers at the
-    // peg-out address until its owner completes it (which needs 40+ BTC confs and
-    // the oracle challenge window), so the very next TM re-reads it. That next TM
-    // spends the PREVIOUS TM's treasury output — a different outpoint — so the pin
-    // no longer matches and the request must NOT be paid a second time.
-    #[test]
-    fn test_already_paid_pegout_is_not_paid_again_by_the_next_tm() {
-        let fee_params = default_fee_params();
-        let request = || make_pegout(0x10, 100_000); // pinned to treasury 0xAA
-
-        // TM #1 spends the pinned treasury → pays the peg-out.
-        let tm1 = build_tm(
-            make_treasury_input(DEFAULT_TREASURY_TXID_BYTE, 10_000_000),
-            vec![],
-            vec![request()],
-            change_address(),
-            &fee_params,
-        )
-        .unwrap();
-        assert_eq!(tm1.tx.output.len(), 2, "TM #1 must pay the peg-out");
-        assert!(tm1.skipped_pegouts.is_empty());
-
-        // TM #2 spends TM #1's treasury output — a different outpoint. The same
-        // still-pending request must be skipped, not paid again.
-        let tm2_treasury = OutPoint {
-            txid: tm1.txid,
-            vout: 0,
-        };
-        let tm2 = build_tm(
-            TreasuryInput {
-                outpoint: tm2_treasury,
-                value: Amount::from_sat(9_000_000),
-                spend_info: make_treasury_spend_info(),
-            },
-            vec![],
-            vec![request()],
-            change_address(),
-            &fee_params,
-        )
-        .unwrap();
-        assert_eq!(
-            tm2.tx.output.len(),
-            1,
-            "TM #2 must NOT re-pay the already-paid peg-out"
-        );
-        assert_eq!(tm2.skipped_pegouts.len(), 1);
-        assert!(matches!(
-            tm2.skipped_pegouts[0].reason,
-            SkipReason::TreasuryPinMismatch { .. }
-        ));
-    }
-
     // Determinism: two SPOs handed the same requests in OPPOSITE order build
     // byte-identical TMs. Peg-outs sharing a destination scriptPubKey are the case
     // a spk-only sort leaves to the caller's ordering.
     #[test]
     fn test_pegout_ordering_is_total_across_equal_destinations() {
         let fee_params = default_fee_params();
-        let pin = treasury_outpoint_for(DEFAULT_TREASURY_TXID_BYTE);
         // Same destination, different amounts — plus a second destination.
         let build = |pegouts| {
             build_tm(
-                make_treasury_input(DEFAULT_TREASURY_TXID_BYTE, 10_000_000),
+                make_treasury_input(0xAA, 10_000_000),
                 vec![],
                 pegouts,
                 change_address(),
@@ -1315,14 +1134,14 @@ mod tests {
             .unwrap()
         };
         let a = build(vec![
-            make_pegout_pinned(0x10, 100_000, pin),
-            make_pegout_pinned(0x10, 200_000, pin),
-            make_pegout_pinned(0x11, 150_000, pin),
+            make_pegout(0x10, 100_000),
+            make_pegout(0x10, 200_000),
+            make_pegout(0x11, 150_000),
         ]);
         let b = build(vec![
-            make_pegout_pinned(0x11, 150_000, pin),
-            make_pegout_pinned(0x10, 200_000, pin),
-            make_pegout_pinned(0x10, 100_000, pin),
+            make_pegout(0x11, 150_000),
+            make_pegout(0x10, 200_000),
+            make_pegout(0x10, 100_000),
         ]);
 
         assert_eq!(a.tx.output.len(), 4);

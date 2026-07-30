@@ -460,9 +460,6 @@ mod tests {
                     [3u8; 20],
                 )),
                 amount: Amount::from_sat(400_000),
-                // Pinned to this TM's treasury input, else the skip rule drops it
-                // and the test would sign a TM with no peg-out output.
-                pinned_treasury_outpoint: treasury_outpoint,
             }],
             treasury_spk,
             &FeeParams {

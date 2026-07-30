@@ -408,6 +408,9 @@ pub struct EpochConfig {
     pub poll_interval: Duration,
     pub quorum51_timeout: Duration,
     pub leader_timeout: Duration,
+    /// Maximum time to wait for the submitted treasury movement to become the
+    /// confirmed chain tip before rebuilding from fresh chain state.
+    pub tm_confirmation_timeout: Duration,
     pub identity: SpoIdentity,
     /// Cardano policy ID (script hash) identifying peg-in request UTxOs.
     pub pegin_policy_id: [u8; 28],
@@ -468,6 +471,7 @@ impl EpochConfig {
             poll_interval: Duration::from_millis(5000),
             quorum51_timeout: Duration::from_secs(300),
             leader_timeout: Duration::from_secs(10000),
+            tm_confirmation_timeout: Duration::from_secs(1800),
             identity,
             pegin_policy_id: [0u8; 28],
             pegin_collection_window: Duration::from_secs(5),

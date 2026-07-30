@@ -39,12 +39,6 @@ pub struct EpochBoundaryEvent {
 pub struct PegOutRequestUtxo {
     pub script_pubkey: bitcoin::ScriptBuf,
     pub amount: bitcoin::Amount,
-    /// The treasury outpoint the request's datum pins the paying TM to
-    /// (`PegOutDatum.source_chain_treasury_utxo_id`). `build_tm` skips any request
-    /// whose pin is not the TM's treasury input — without that check a request is
-    /// re-paid by every later TM. Chain implementations MUST report the datum's
-    /// value verbatim and never substitute the current treasury.
-    pub pinned_treasury_outpoint: bitcoin::OutPoint,
 }
 
 /// The current treasury UTxO state, as reported by the Cardano-side
@@ -140,8 +134,35 @@ pub trait CardanoChain: Send + Sync {
     /// Current treasury UTxO state, as reported by the Cardano oracle.
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo>;
 
-    /// Pending peg-out requests to fulfil.
+    /// Whether the specific treasury movement is now the confirmed chain tip.
+    /// Mock implementations use the default immediate-success behavior;
+    /// live implementations must verify the observed tip txid and its
+    /// confirmation state.
+    async fn is_tm_confirmed(&self, _txid: &bitcoin::Txid) -> EpochResult<bool> {
+        Ok(true)
+    }
+
+    /// Open peg-out requests at the `peg_out.ak` address — INCLUDING ones an earlier TM already
+    /// paid (a request UTxO is spent by its owner's Complete tx, which lags the payment by hours or
+    /// never happens). `BuildTm` subtracts [`Self::query_paid_pegout_payments`] from this set.
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>>;
+
+    /// Every peg-out payment already committed on Bitcoin by an earlier movement, as
+    /// `(destination scriptPubKey, satoshi actually paid)` — one entry per payment, duplicates
+    /// included, because several distinct requests may share a destination and amount.
+    ///
+    /// Read from the Confirmed TM datums' `fulfilled_peg_outs` lists plus still-live in-flight TMs.
+    /// `BuildTm` pays a request only when this multiset has no matching payment left to account for,
+    /// so each request is paid exactly once. An implementation that cannot produce a trustworthy
+    /// history (an unreadable TM datum, whose payments would be invisible) MUST return an error
+    /// rather than an incomplete list — under-reporting here re-pays treasury BTC irrecoverably.
+    ///
+    /// Default: empty, valid only alongside a `query_pegout_requests` that returns nothing.
+    async fn query_paid_pegout_payments(
+        &self,
+    ) -> EpochResult<Vec<(bitcoin::ScriptBuf, bitcoin::Amount)>> {
+        Ok(vec![])
+    }
 
     /// A pool's stake, for the off-chain min-stake gate (register_spo R2): the
     /// contract can't read stake, so SPOs query it and require `active_stake >=

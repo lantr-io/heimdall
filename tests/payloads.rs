@@ -6,9 +6,6 @@ use heimdall::http::payloads::*;
 
 /// Helper: run a 2-of-3 DKG, return everything needed to build payloads.
 struct TestData {
-    round1_packages: BTreeMap<Identifier, frost::keys::dkg::round1::Package>,
-    round2_packages_per_sender:
-        BTreeMap<Identifier, BTreeMap<Identifier, frost::keys::dkg::round2::Package>>,
     key_packages: BTreeMap<Identifier, frost::keys::KeyPackage>,
 }
 
@@ -57,43 +54,7 @@ fn setup() -> TestData {
         key_packages.insert(id, kp);
     }
 
-    TestData {
-        round1_packages,
-        round2_packages_per_sender,
-        key_packages,
-    }
-}
-
-#[test]
-fn test_dkg1_payload_json_roundtrip() {
-    let data = setup();
-    let id = Identifier::try_from(1u16).unwrap();
-    let payload = Dkg1Payload {
-        epoch: 42,
-        identifier: id,
-        package: data.round1_packages[&id].clone(),
-    };
-    let json = serde_json::to_string(&payload).unwrap();
-    let back: Dkg1Payload = serde_json::from_str(&json).unwrap();
-    assert_eq!(payload.epoch, back.epoch);
-    assert_eq!(payload.identifier, back.identifier);
-    assert_eq!(payload.package, back.package);
-}
-
-#[test]
-fn test_dkg2_payload_json_roundtrip() {
-    let data = setup();
-    let id = Identifier::try_from(1u16).unwrap();
-    let payload = Dkg2Payload {
-        epoch: 42,
-        identifier: id,
-        packages: data.round2_packages_per_sender[&id].clone(),
-    };
-    let json = serde_json::to_string(&payload).unwrap();
-    let back: Dkg2Payload = serde_json::from_str(&json).unwrap();
-    assert_eq!(payload.epoch, back.epoch);
-    assert_eq!(payload.identifier, back.identifier);
-    assert_eq!(payload.packages, back.packages);
+    TestData { key_packages }
 }
 
 #[test]

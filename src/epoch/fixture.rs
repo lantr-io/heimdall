@@ -55,13 +55,6 @@ pub struct StaticPegIn {
 pub struct StaticPegOut {
     pub script_pubkey: ScriptBuf,
     pub amount: Amount,
-    /// The treasury outpoint the request's datum pins the paying TM to. Not an
-    /// `Option` defaulting to the fixture's treasury: that default would make the
-    /// pin match by construction and silently render `build_tm`'s pin filter
-    /// vacuous on the daemon path. Every fixture must state the pin, because
-    /// whether it matches `StaticFixture::treasury_outpoint` IS the property under
-    /// test.
-    pub pinned_treasury_outpoint: bitcoin::OutPoint,
 }
 
 /// Build a demo fixture with `max_signers` SPOs, `min_signers` threshold,

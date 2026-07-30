@@ -147,15 +147,30 @@ with the spec elaborated in tandem). Concrete work:
 
 Dependency: (a) → (b,c,d) → (e).
 
-**Signing-model sub-question (open).** Whether the fee must be an *exact*
-consensus value or a governance-set *bound* depends on the FROST signing model:
-(A) every SPO independently reconstructs the identical tx (exact value
-required), vs (B) a leader proposes the tx and each signer validates-then-signs
-(a bound suffices, and signers must NEVER blind-sign — they validate inputs,
-peg-out destinations/amounts at gross − fee, treasury next-address, and that
-the fee is within bounds). (B) handles real-time Bitcoin fee movement better. A
-governance-updatable Config UTxO (c) supports either. To be decided with the
-spec elaboration (a).
+*Update 2026-07-15 (params-UTxO revision, `b96c7f9`):* items (b)/(c) changed shape. The Config
+stays **immutable** (`config.ak` `spend = False` is now normative — no governance spend branch
+needed); the tunables move to a new **Operational parameters UTxO**
+(`{min_stake, fee_rate_sat_per_vb, per_pegout_fee (floor), min_peg_out_fbtc}`, group-signed
+updates, read by no on-chain validator → updates invalidate no in-flight txs), and the effective
+`per_pegout_fee` is **pinned per PegOutDatum at lock time** — the verifiers compare against the
+datum fee, closing a theft race found in review (fee raise after a TM paid → completion bricked +
+cancel double-pay). New contract-CR items: the params contract, the PegOutDatum fee field, Config
+fields #18–20 (genesis outpoint + params NFT identity). heimdall (e): read fee params from the
+params UTxO at the batch snapshot slot.
+
+**Signing-model sub-question — RESOLVED 2026-07-15: (A) exact, "Model A′".**
+Every SPO reconstructs the identical tx; `fee_rate_sat_per_vb` is an exact
+consensus value in the Config, and fee-market agility comes from the roster
+group-signing Config parameter updates (an explicit collective act — each
+signer sanity-checks the rate; refusal just keeps the old rate). The
+leader-proposed-fee alternative (and full model B) was rejected: a low-ball
+proposal is valid-looking, unpunishable, deniable, and detected only after a
+wasted signing ceremony + hours of Bitcoin-confirmation ambiguity. Stuck-TM
+recovery = fee-update ceremony → rebuild the same frozen batch at the new rate
+(new txid/namespace, fresh nonces) → re-sign → the replacement races the stuck
+original (the TM chain absorbs the loser). tm.json is now signed
+(sign-the-hash) like every other payload. Spec: `docs/spec-gaps-fill`
+(`859d170`).
 
 ### 2d. Minimum peg-out fBTC value belongs in the Config (not just off-chain skip)
 
@@ -170,17 +185,31 @@ the unfulfillable PegOut UTxO on-chain (the user must Cancel to reclaim), and
 the skip threshold is only deterministic across SPOs if `per_peg_out_fee` is a
 consensus value (2b).
 
-The proper fix is on-chain: **add a `min_peg_out_fbtc` value to `ConfigDatum`
-and have `peg_out.ak` reject a lock whose fBTC value is below it.** Then
-sub-dust peg-outs cannot be created in the first place, the griefing vector is
-closed at the source, and the off-chain skip becomes a belt-and-suspenders
-guard rather than the only defense. The minimum must be ≥ `per_peg_out_fee +
-dust` (and realistically higher, since the spec already positions Bifrost for
-large liquidity moves, not retail-size withdrawals). **Question for
-FluidTokens:** add `min_peg_out_fbtc` to the Config and enforce it in
-`peg_out.ak` at lock time — folded into the §2 code-ward contract changes (b).
+~~The proper fix is on-chain: add a `min_peg_out_fbtc` value to `ConfigDatum`
+and have `peg_out.ak` reject a lock whose fBTC value is below it.~~
 
-## 3. Update-Y (treasury key rotation) — contract gap OPEN (spec resolved upstream)
+**Update 2026-07-15 (spec-gaps review, `docs/spec-gaps-fill`):** the lock-time
+enforcement ask is **withdrawn** — creating a script output runs no validator
+on Cardano, so `peg_out.ak` *cannot* reject a lock (only a co-required beacon
+mint could, and analysis showed no lock-time check is security-critical: a bad
+request harms only its creator). What is now normative in the spec instead:
+`min_peg_out_fbtc` as ConfigDatum field #20 (consensus value), the
+**deterministic skip rule** in TM construction (the actual griefing defense —
+heimdall's `build_tm` already implements it), normative client-side checks at
+request creation, and the **proof-based Cancel** (not-produced verifier,
+Config #14) as the recovery path. Remaining for the §2 contract changes (b):
+the Config fee/min fields + governance spend branch + enabling the two TM
+verifiers — no `peg_out.ak` lock-time change.
+
+## 3. Update-Y (treasury key rotation) — contract gap OPEN (spec now fully in the .md)
+
+*Update 2026-07-15 (spec-gaps review):* the Update-Y transaction is now fully specified in
+`technical_documentation.md` (branch `docs/spec-gaps-fill`, `28bc7fe`): a Transaction-catalog
+entry — spends the Treasury state UTxO, only `current_spos_frost_key` changes, authorized by
+BIP340 under the **spent** datum's key over
+`sha2_256("bifrost-update-y" ‖ spent_outpoint ‖ epoch ‖ new_key)`, permissionless submission,
+Phase-1 handled by K1 seeding the field with $Y_{federation}$. The **code-ward gap below stands
+unchanged** (no rotation branch in `treasury.ak`; gates K2).
 
 Spec resolved upstream (`8b042f9`): Update-Y is in the Transaction catalog,
 authorized by a FROST group signature from the **current** (outgoing) roster,
@@ -237,6 +266,22 @@ Halo2 verifiers are wired. The expected verifier boundary is the two-input
 shape above. The verifier policy must check the public-input count and order,
 convert `accused_pool_id` to the same little-endian BLS scalar as Heimdall, and
 mint exactly `blake2b_256(accused_pool_id || evidence_hash)`.
+
+### 5b. InvalidPayload binding scheme — RESOLVED 2026-07-15 (spec); implementation open
+
+*Resolution (spec-gaps review, `1e26700` on `docs/spec-gaps-fill`) — "Option B, self-committing
+payloads":* every fault-provable payload (DKG R1/R2, sign R2) appends `poseidon_commit =
+Poseidon(structured_fields)` as the final 32 bytes of its canonical layout; the on-chain verifier
+recomputes `sha2_256(full bytes)`, verifies the accused's signature, slices the trailer, and
+requires the ZK public input to equal it — collision resistance welds proof to signature, framing
+needs a second preimage. Mismatched commitments are malformed transport (fetch-time rule → treated
+as never published). Round-2 binding: HKDF is replaced by the Poseidon KDF
+(`k = Poseidon("bifrost-dkg-share" ‖ ss.x ‖ recipient_pool_id)`), and the circuit statement is two
+secp scalar multiplications, Poseidon, XOR, and a commitment check. WI-022 remains the
+implementation work: add the trailer to the WI-013 transport and fetch validation, switch the
+KDF, point the circuits' public input at the commitment, and implement the real verifier policies.
+The "FluidTokens design call" framing is retired — the spec decides and code diverging from it is
+a CR.
 
 (Equivocation is **not** an open FluidTokens question: the verifier is *our* code
 — FluidTokens PR #20, open — implementing their spec §9.2, and its remaining

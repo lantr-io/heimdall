@@ -238,17 +238,42 @@ async fn step_phase(
             leader_attempt,
         } => submit_phase(chain, me, epoch, roster, tm, leader_attempt).await?,
 
-        EpochPhase::AwaitConfirm { tm, .. } => {
-            // First-cycle terminal: return the signed TM.
-            //
-            // TODO: in steady state this phase should poll the chain for
-            // inclusion of `cardano_tx_id` (once submit actually produces one),
-            // then transition back to `Idle` to wait for the next epoch
-            // boundary. Today we finish the cycle unconditionally.
+        EpochPhase::AwaitConfirm { epoch, tm, .. } => {
+            await_confirm_phase(chain, config, epoch, &tm).await?;
             return Ok(Step::Done(tm));
         }
     };
     Ok(Step::Next(next))
+}
+
+/// Wait for every SPO to observe this exact movement as the confirmed
+/// treasury tip. The leader has already waited for Cardano oracle inclusion;
+/// followers use this chain-level check to converge on the same result.
+async fn await_confirm_phase(
+    chain: &Arc<dyn CardanoChain>,
+    config: &EpochConfig,
+    epoch: u64,
+    tm: &TreasuryMovement,
+) -> EpochResult<()> {
+    let deadline = tokio::time::Instant::now() + config.tm_confirmation_timeout;
+    loop {
+        if chain.is_tm_confirmed(&tm.txid).await? {
+            crate::epoch_log!(
+                config.identity.identifier,
+                epoch,
+                "AwaitConfirm: treasury movement {} is confirmed",
+                tm.txid
+            );
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(EpochError::Chain(format!(
+                "treasury movement {} was not confirmed before timeout ({:?})",
+                tm.txid, config.tm_confirmation_timeout
+            )));
+        }
+        tokio::time::sleep(config.poll_interval).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -666,16 +691,55 @@ async fn build_tm_phase(
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     };
 
-    let pegouts = chain.query_pegout_requests().await?;
+    // Open peg-outs on Cardano MINUS the ones already paid. A request UTxO survives at the
+    // `peg_out.ak` address until its owner's Complete tx spends it — which needs this TM's Bitcoin
+    // confirmation plus an oracle proof, hours later or never — so the open set keeps returning
+    // withdrawals earlier movements already paid, and paying it as-is drains the treasury once per
+    // movement. The paid history comes from the Confirmed TM datums' `fulfilled_peg_outs` lists
+    // (plus in-flight TMs, already committed in signed Bitcoin bytes) and is matched as a MULTISET
+    // on (destination, net amount): distinct requests may share that pair, so counting pays each
+    // exactly once where a set would strand all but the first.
+    let open_pegouts = chain.query_pegout_requests().await?;
+    let paid_payments = chain.query_paid_pegout_payments().await?;
+    let mut paid = crate::cardano::pegout_datum::PaidPegOuts::from_payments(
+        paid_payments
+            .iter()
+            .map(|(spk, amount)| (spk.as_bytes(), amount.to_sat())),
+    );
+    let mut pegouts = Vec::with_capacity(open_pegouts.len());
+    let mut skipped_paid = Vec::new();
+    for p in open_pegouts {
+        let net = p
+            .amount
+            .to_sat()
+            .saturating_sub(treasury.per_pegout_fee.to_sat());
+        if net > 0 && paid.claim(p.script_pubkey.as_bytes(), net) {
+            skipped_paid.push(p);
+        } else {
+            pegouts.push(p);
+        }
+    }
     crate::epoch_log!(
         me,
         epoch,
-        "  chain query: treasury={} sat, {} frozen pegins, {} pegouts, fee_rate={}sat/vb",
+        "  chain query: treasury={} sat, {} frozen pegins, {} unpaid pegouts ({} skipped: already \
+         paid by an earlier TM; {} payment(s) on record), fee_rate={}sat/vb",
         treasury.value.to_sat(),
         frozen_pegins.len(),
         pegouts.len(),
+        skipped_paid.len(),
+        paid_payments.len(),
         treasury.fee_rate_sat_per_vb,
     );
+    for p in &skipped_paid {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  skipped peg-out → {} ({} sat): already paid by an earlier TM",
+            hex::encode(p.script_pubkey.as_bytes()),
+            p.amount.to_sat(),
+        );
+    }
 
     let secp = Secp256k1::new();
 
@@ -722,7 +786,6 @@ async fn build_tm_phase(
         .map(|p| PegOutRequest {
             script_pubkey: p.script_pubkey,
             amount: p.amount,
-            pinned_treasury_outpoint: p.pinned_treasury_outpoint,
         })
         .collect();
 
@@ -741,21 +804,6 @@ async fn build_tm_phase(
         },
     )
     .map_err(|e| EpochError::TmBuild(e.to_string()))?;
-
-    // Surface peg-outs the deterministic skip rule dropped. Every SPO drops the
-    // same set (that is what keeps the TM bytes identical), so a divergence here
-    // is the first place an operator sees a chain-state disagreement — and a
-    // pin-mismatch skip is how a stale or already-paid request shows up.
-    for s in &unsigned.skipped_pegouts {
-        crate::epoch_log!(
-            me,
-            epoch,
-            "  skipped peg-out → {} ({} sat): {}",
-            hex::encode(s.script_pubkey.as_bytes()),
-            s.amount.to_sat(),
-            s.reason,
-        );
-    }
 
     let sighashes = compute_sighashes(&unsigned);
     let num_inputs = unsigned.tx.input.len();
@@ -1033,6 +1081,57 @@ mod tests {
     #[tokio::test]
     async fn full_cycle_2_of_2_all_derive_same_treasury() {
         multi_instance_same_treasury(2, 2).await;
+    }
+
+    #[tokio::test]
+    async fn followers_wait_in_await_confirm_until_chain_confirms() {
+        let fixture = demo_static_fixture(2, 2, 18_650);
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        let mut signals = Vec::new();
+        let mut submitted = Vec::new();
+
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let signal = chain.confirmation_signal();
+            signal.store(false, std::sync::atomic::Ordering::Release);
+            submitted.push(chain.submitted_txs());
+            signals.push(signal);
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        // Wait until the leader has submitted and both nodes should be parked
+        // in AwaitConfirm rather than returning from the cycle.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if submitted.iter().any(|txs| !txs.lock().unwrap().is_empty()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leader submits before confirmation test timeout");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(handles.iter().any(|h| !h.is_finished()));
+
+        for signal in signals {
+            signal.store(true, std::sync::atomic::Ordering::Release);
+        }
+        for handle in handles {
+            handle
+                .await
+                .unwrap()
+                .expect("cycle completes after confirmation");
+        }
     }
 
     /// WI-014 #5 restart recovery: with a persisted DKG for the epoch,
