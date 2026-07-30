@@ -722,6 +722,7 @@ async fn build_tm_phase(
         .map(|p| PegOutRequest {
             script_pubkey: p.script_pubkey,
             amount: p.amount,
+            pinned_treasury_outpoint: p.pinned_treasury_outpoint,
         })
         .collect();
 
@@ -740,6 +741,21 @@ async fn build_tm_phase(
         },
     )
     .map_err(|e| EpochError::TmBuild(e.to_string()))?;
+
+    // Surface peg-outs the deterministic skip rule dropped. Every SPO drops the
+    // same set (that is what keeps the TM bytes identical), so a divergence here
+    // is the first place an operator sees a chain-state disagreement — and a
+    // pin-mismatch skip is how a stale or already-paid request shows up.
+    for s in &unsigned.skipped_pegouts {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  skipped peg-out → {} ({} sat): {}",
+            hex::encode(s.script_pubkey.as_bytes()),
+            s.amount.to_sat(),
+            s.reason,
+        );
+    }
 
     let sighashes = compute_sighashes(&unsigned);
     let num_inputs = unsigned.tx.input.len();

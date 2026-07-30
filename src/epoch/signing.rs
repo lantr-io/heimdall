@@ -437,12 +437,13 @@ mod tests {
         let pegin_spend = treasury_spend_info(&secp, y_51, y_fed, 144);
 
         let treasury_spk = ScriptBuf::new_p2tr_tweaked(treasury_spend.output_key());
+        let treasury_outpoint = OutPoint {
+            txid: Txid::from_byte_array([1u8; 32]),
+            vout: 0,
+        };
         let unsigned = build_tm(
             TreasuryInput {
-                outpoint: OutPoint {
-                    txid: Txid::from_byte_array([1u8; 32]),
-                    vout: 0,
-                },
+                outpoint: treasury_outpoint,
                 value: Amount::from_sat(10_000_000),
                 spend_info: treasury_spend,
             },
@@ -459,6 +460,9 @@ mod tests {
                     [3u8; 20],
                 )),
                 amount: Amount::from_sat(400_000),
+                // Pinned to this TM's treasury input, else the skip rule drops it
+                // and the test would sign a TM with no peg-out output.
+                pinned_treasury_outpoint: treasury_outpoint,
             }],
             treasury_spk,
             &FeeParams {

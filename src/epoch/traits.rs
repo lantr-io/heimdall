@@ -39,6 +39,12 @@ pub struct EpochBoundaryEvent {
 pub struct PegOutRequestUtxo {
     pub script_pubkey: bitcoin::ScriptBuf,
     pub amount: bitcoin::Amount,
+    /// The treasury outpoint the request's datum pins the paying TM to
+    /// (`PegOutDatum.source_chain_treasury_utxo_id`). `build_tm` skips any request
+    /// whose pin is not the TM's treasury input — without that check a request is
+    /// re-paid by every later TM. Chain implementations MUST report the datum's
+    /// value verbatim and never substitute the current treasury.
+    pub pinned_treasury_outpoint: bitcoin::OutPoint,
 }
 
 /// The current treasury UTxO state, as reported by the Cardano-side

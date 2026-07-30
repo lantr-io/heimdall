@@ -275,6 +275,10 @@ impl CardanoChain for MockCardanoChain {
             .map(|p| PegOutRequestUtxo {
                 script_pubkey: p.script_pubkey.clone(),
                 amount: p.amount,
+                // Verbatim from the fixture — never substituted with
+                // `query_treasury`'s outpoint, which would make the pin match by
+                // construction and render the filter untestable here.
+                pinned_treasury_outpoint: p.pinned_treasury_outpoint,
             })
             .collect())
     }

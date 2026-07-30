@@ -1262,6 +1262,16 @@ impl CardanoChain for BlockfrostCardanoChain {
             .await
     }
 
+    /// Not yet implemented on the daemon path — the epoch machine currently builds
+    /// TMs that sweep peg-ins only (the CLI `sweep-pegins` / `run-mover` path is
+    /// what pays peg-outs today).
+    ///
+    /// When wiring this up, delegate to
+    /// [`crate::cardano::pegout_datum::fetch_pegout_requests`] rather than
+    /// re-decoding the datum here: it reports each request's
+    /// `pinned_treasury_outpoint` (datum field[2]) verbatim, which `build_tm`'s skip
+    /// rule needs to avoid re-paying an already-paid peg-out. Never substitute the
+    /// current treasury for the pin — that would defeat the check entirely.
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>> {
         Ok(vec![])
     }

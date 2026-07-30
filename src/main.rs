@@ -4860,30 +4860,73 @@ fn run_sweep_pegins(
                 "[sweep] no cardano.blockfrost_project_id — peg-out collection is Blockfrost-only \
                  (N2C is peg-in only); building TM without peg-outs"
             );
-            Vec::new()
+            Default::default()
         }
     };
     println!(
         "scanned {} peg-out request(s) at {pegout_script_address}",
-        pegout_data.len()
+        pegout_data.requests.len()
     );
-    let mut pegout_requests = Vec::with_capacity(pegout_data.len());
-    for po in &pegout_data {
+    // Undecodable requests never reach `build_tm`, so they cannot appear in
+    // `skipped_pegouts`. Report them here or the counts below claim there is
+    // nothing pending while fBTC sits stuck at the script address.
+    if pegout_data.malformed > 0 {
+        eprintln!(
+            "[sweep] {} peg-out UTxO(s) at {pegout_script_address} have an undecodable datum and \
+             can NEVER be paid by any TM (see the [pegout] lines above); their fBTC is stuck until \
+             the owner cancels",
+            pegout_data.malformed
+        );
+    }
+    // The deployed produced-verifier (binocular `PegOutProducedVerifier.scanTm`)
+    // requires a TM output paying EXACTLY the locked fBTC quantity — `peg_out.ak`
+    // cross-checks its redeemer's `peg_out_amount` against
+    // `quantity_of(peg_out_input.value)`, i.e. the GROSS amount. `build_tm` pays
+    // gross − per_pegout_fee, so any non-zero fee means no output matches and the
+    // peg-out becomes uncompletable: the BTC leaves the treasury and (with the
+    // not-produced verifier still a `fail(...)` stub) the fBTC cannot be refunded
+    // either. The upstream verifier's own docs say heimdall must run with
+    // per_pegout_fee = 0 until the verifier subtracts a fee. Warn loudly rather
+    // than refuse — the operator may be targeting a bridge with a fee-aware
+    // verifier — but never let this pass silently. Tracked in WI-009.
+    if !pegout_data.requests.is_empty() && cfg.bitcoin.per_pegout_fee_sat != 0 {
+        eprintln!(
+            "[sweep] WARNING: bitcoin.per_pegout_fee_sat = {} (non-zero). The deployed peg-out \
+             produced-verifier requires an output equal to the GROSS locked fBTC, so every \
+             peg-out this TM pays will be UNCOMPLETABLE (BTC spent, fBTC neither burned nor \
+             refundable). Set per_pegout_fee_sat = 0 unless this bridge's verifier subtracts the \
+             fee. See WI-009.",
+            cfg.bitcoin.per_pegout_fee_sat
+        );
+    }
+
+    let mut pegout_requests = Vec::with_capacity(pegout_data.requests.len());
+    for po in &pegout_data.requests {
         println!(
-            "  peg-out → {} — {} sat",
+            "  peg-out → {} — {} sat (pinned treasury {})",
             hex::encode(&po.destination_script_pubkey),
-            po.amount_sat
+            po.amount_sat,
+            po.pinned_treasury_outpoint,
         );
         pegout_requests.push(PegOutRequest {
             script_pubkey: ScriptBuf::from_bytes(po.destination_script_pubkey.clone()),
             amount: Amount::from_sat(po.amount_sat),
+            pinned_treasury_outpoint: po.pinned_treasury_outpoint,
         });
     }
 
     // Auto-mover: with nothing pending, don't post a treasury→treasury self-move
-    // (it would just burn fee) — skip this tick.
+    // (it would just burn fee) — skip this tick. This runs before the treasury is
+    // resolved, so it cannot apply the pin filter; the post-`build_tm` check does
+    // that. `malformed` is reported but deliberately does NOT keep the mover
+    // awake — those UTxOs are permanently unpayable, so treating them as pending
+    // work would burn a fee every tick forever.
     if auto_mode && pegin_inputs.is_empty() && pegout_requests.is_empty() {
-        println!("[mover] nothing to sweep (0 peg-ins, 0 peg-outs) — skipping tick");
+        println!(
+            "[mover] nothing to sweep (0 peg-ins, 0 payable peg-outs, {} undecodable) — \
+             skipping tick",
+            pegout_data.malformed
+        );
         return Ok(());
     }
 
@@ -4932,8 +4975,13 @@ fn run_sweep_pegins(
         }
     };
 
+    // Batch sizes, captured before `build_tm` consumes the vectors — the auto-mover
+    // idle check below compares against these rather than inspecting the built tx.
+    let n_pegins = pegin_inputs.len();
+    let n_pegouts = pegout_requests.len();
+
     // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..] = one
-    // payment per peg-out (sorted by scriptPubKey inside build_tm).
+    // payment per peg-out (sorted by (scriptPubKey, amount) inside build_tm).
     let unsigned = build_tm(
         TreasuryInput {
             outpoint: treasury_outpoint,
@@ -4947,9 +4995,9 @@ fn run_sweep_pegins(
     )
     .map_err(|e| format!("build sweep: {e}"))?;
 
-    // Surface any peg-outs the TM dropped as unpayable (non-standard destination
-    // or sub-dust after fee) so the operator sees them — the TM still pays the
-    // rest rather than aborting.
+    // Surface any peg-outs the TM dropped as unpayable (pinned to another
+    // treasury outpoint, non-standard destination, or sub-dust after fee) so the
+    // operator sees them — the TM still pays the rest rather than aborting.
     for s in &unsigned.skipped_pegouts {
         eprintln!(
             "[sweep] skipped peg-out → {} ({} sat): {}",
@@ -4957,6 +5005,25 @@ fn run_sweep_pegins(
             s.amount.to_sat(),
             s.reason
         );
+    }
+
+    // Auto-mover, second pass: the "nothing pending" check above ran BEFORE the
+    // treasury was resolved, so it could not apply the pin filter. Re-check now
+    // that the batch is final — an already-paid peg-out lingers at the peg-out
+    // address until its owner completes it, and is permanently pin-mismatched
+    // from here on, so without this the mover would burn a miner fee on an empty
+    // treasury→treasury self-move every single tick.
+    //
+    // Tested on the COUNTS, not on the built tx's shape: `input.len() == 1 &&
+    // output.len() == 1` would be a proxy that silently stops firing the day a TM
+    // grows another output (an OP_RETURN commitment, an anchor, an explicit
+    // federation output), quietly resuming the fee burn.
+    if auto_mode && n_pegins == 0 && unsigned.skipped_pegouts.len() == n_pegouts {
+        println!(
+            "[mover] nothing left to sweep after the skip rule (0 peg-ins, \
+             {n_pegouts} peg-out(s) all skipped) — skipping tick"
+        );
+        return Ok(());
     }
 
     // output[0] is the new treasury; if it doesn't carry the treasury

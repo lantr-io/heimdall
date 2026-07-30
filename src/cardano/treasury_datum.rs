@@ -325,6 +325,13 @@ pub fn outpoint_from_swept_key(k: &[u8]) -> Option<OutPoint> {
     Some(OutPoint { txid, vout })
 }
 
+// The inverse encoder is `cardano::tm_chain::outpoint_bytes` — it produces these
+// exact bytes and carries the non-palindromic byte-order test. Use it rather than
+// hand-rolling another copy: this layout is also a PegOut datum's
+// `source_chain_treasury_utxo_id` and a prevout inside raw Bitcoin transaction
+// bytes, which is why binocular's on-chain `PegOutProducedVerifier` can memcmp the
+// datum field straight against the raw TM's input region.
+
 /// Parse a **Confirmed** (Constr 1) treasury-movement datum.
 ///
 /// Returns [`TreasuryDatumError::NotConfirmed`] for an Unconfirmed (Constr 0)
