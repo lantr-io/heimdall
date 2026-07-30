@@ -805,6 +805,22 @@ async fn build_tm_phase(
     )
     .map_err(|e| EpochError::TmBuild(e.to_string()))?;
 
+    // Surface peg-outs `build_tm`'s output-level skip rule dropped (non-standard
+    // destination, sub-dust after the fee). Every SPO drops the same set — that is
+    // what keeps the TM bytes identical — so a divergence here is the first place
+    // an operator sees a chain-state disagreement. Without this the daemon drops
+    // them silently, unlike the CLI sweep path.
+    for s in &unsigned.skipped_pegouts {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  skipped peg-out → {} ({} sat): {}",
+            hex::encode(s.script_pubkey.as_bytes()),
+            s.amount.to_sat(),
+            s.reason,
+        );
+    }
+
     let sighashes = compute_sighashes(&unsigned);
     let num_inputs = unsigned.tx.input.len();
 

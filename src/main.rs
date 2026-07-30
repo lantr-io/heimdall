@@ -5052,7 +5052,10 @@ fn run_sweep_pegins(
                  deployed peg-out produced-verifier requires an output equal to the GROSS locked \
                  fBTC, so every peg-out this TM pays will be UNCOMPLETABLE (BTC spent, fBTC \
                  neither burned nor refundable). Set per_pegout_fee_sat = 0 unless this bridge's \
-                 verifier subtracts the fee. See WI-009."
+                 verifier subtracts the fee — but NOT while peg-outs paid under the old fee are \
+                 still open: the paid-history filter matches on gross − fee, so changing the fee \
+                 makes those payments unrecognisable and RE-PAYS them. Drain the open set first. \
+                 See WI-009."
             );
         }
 

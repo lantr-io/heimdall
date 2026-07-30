@@ -49,7 +49,7 @@ pub struct PegOutRequestData {
     pub amount_sat: u64,
     /// `source_chain_treasury_utxo_id` (datum field[2]): the 36-byte Bitcoin outpoint (txid
     /// internal ++ vout LE) the paying TM MUST spend. Only a TM spending this outpoint may pay
-    /// this request — see [`select_fulfillable`].
+    /// this request — see [`partition_by_pin`].
     pub pinned_treasury_outpoint: [u8; 36],
     /// The Cardano UTxO `(tx_hash, output_index)` holding this request. Diagnostics + a total
     /// sort order; never enters the TM bytes.
@@ -255,8 +255,9 @@ pub fn partition_by_pin(
 /// order — so two SPOs reading the same chain state build the same TM.
 ///
 /// These are ALL open requests, including ones an earlier TM already paid (they linger until their
-/// owner completes them). Pass the result through [`select_fulfillable`] with the TM's treasury
-/// input before building — that is what keeps a paid request out of the next TM.
+/// owner completes them). Pass the result through [`select_unpaid`], and through
+/// [`partition_by_pin`] with the TM's treasury input, before building — that is what keeps a paid
+/// request out of the next TM.
 pub async fn fetch_pegout_requests(
     base_url: &str,
     project_id: &str,

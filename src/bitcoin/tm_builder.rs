@@ -326,11 +326,12 @@ pub fn build_tm(
     // a destination but differing in amount would keep their caller-supplied
     // relative order (sort_by is stable), so the TM bytes — and therefore the
     // FROST message — would depend on the order the chain query happened to
-    // return, which is not a consensus input. Beyond that no tiebreaker is needed:
-    // requests equal in BOTH spk and amount produce byte-identical TxOuts, so
-    // their relative order cannot change the tx. (In particular do NOT add the
-    // pinned outpoint as a third key: `retain` above has already forced every
-    // survivor's pin to equal `treasury_outpoint`, so it is a constant here.)
+    // return, which is not a consensus input. Beyond that no tiebreaker is needed
+    // — and none is available: requests equal in BOTH spk and amount produce
+    // byte-identical TxOuts, so their relative order cannot change the tx, and a
+    // `PegOutRequest` carries nothing else (no pin, no request id) precisely
+    // because everything that distinguishes such requests was already applied
+    // upstream by `pegout_datum`.
     pegouts.sort_by(|a, b| {
         a.script_pubkey
             .as_bytes()
