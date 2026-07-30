@@ -691,16 +691,55 @@ async fn build_tm_phase(
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     };
 
-    let pegouts = chain.query_pegout_requests().await?;
+    // Open peg-outs on Cardano MINUS the ones already paid. A request UTxO survives at the
+    // `peg_out.ak` address until its owner's Complete tx spends it — which needs this TM's Bitcoin
+    // confirmation plus an oracle proof, hours later or never — so the open set keeps returning
+    // withdrawals earlier movements already paid, and paying it as-is drains the treasury once per
+    // movement. The paid history comes from the Confirmed TM datums' `fulfilled_peg_outs` lists
+    // (plus in-flight TMs, already committed in signed Bitcoin bytes) and is matched as a MULTISET
+    // on (destination, net amount): distinct requests may share that pair, so counting pays each
+    // exactly once where a set would strand all but the first.
+    let open_pegouts = chain.query_pegout_requests().await?;
+    let paid_payments = chain.query_paid_pegout_payments().await?;
+    let mut paid = crate::cardano::pegout_datum::PaidPegOuts::from_payments(
+        paid_payments
+            .iter()
+            .map(|(spk, amount)| (spk.as_bytes(), amount.to_sat())),
+    );
+    let mut pegouts = Vec::with_capacity(open_pegouts.len());
+    let mut skipped_paid = Vec::new();
+    for p in open_pegouts {
+        let net = p
+            .amount
+            .to_sat()
+            .saturating_sub(treasury.per_pegout_fee.to_sat());
+        if net > 0 && paid.claim(p.script_pubkey.as_bytes(), net) {
+            skipped_paid.push(p);
+        } else {
+            pegouts.push(p);
+        }
+    }
     crate::epoch_log!(
         me,
         epoch,
-        "  chain query: treasury={} sat, {} frozen pegins, {} pegouts, fee_rate={}sat/vb",
+        "  chain query: treasury={} sat, {} frozen pegins, {} unpaid pegouts ({} skipped: already \
+         paid by an earlier TM; {} payment(s) on record), fee_rate={}sat/vb",
         treasury.value.to_sat(),
         frozen_pegins.len(),
         pegouts.len(),
+        skipped_paid.len(),
+        paid_payments.len(),
         treasury.fee_rate_sat_per_vb,
     );
+    for p in &skipped_paid {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  skipped peg-out → {} ({} sat): already paid by an earlier TM",
+            hex::encode(p.script_pubkey.as_bytes()),
+            p.amount.to_sat(),
+        );
+    }
 
     let secp = Secp256k1::new();
 
