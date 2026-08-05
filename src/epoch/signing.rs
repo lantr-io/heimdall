@@ -58,6 +58,22 @@ pub async fn sign_phase(
 
     match round {
         SigningRound::Round1 => {
+            // --- Co-signer gate: the attested completed-peg-outs root ---
+            //
+            // The trie root is ATTESTED, not verified on-chain: the Confirm
+            // transition copies whatever root the FROST quorum signed into the TM.
+            // So the ONLY thing standing between a wrong root and chain truth is
+            // every participant recomputing it before contributing a nonce.
+            //
+            // A wrong root is not cosmetic. Too FEW entries and a peg-out this TM
+            // pays can never be completed — its BTC is spent and its fBTC stays
+            // locked. Too MANY and a peg-out nobody paid becomes provably
+            // completed, burning fBTC against BTC that never moved.
+            //
+            // This runs BEFORE the first nonce commitment leaves the node, because
+            // a published commitment is a signing input the others can use.
+            verify_cpo_root(config, me, epoch, &tm)?;
+
             crate::epoch_log!(
                 me,
                 epoch,
@@ -215,6 +231,56 @@ pub async fn sign_phase(
             })
         }
     }
+}
+
+/// Recompute the completed-peg-outs root this TM should commit, from THIS node's
+/// own persisted trie, and refuse to sign on a mismatch.
+///
+/// Heimdall's TM is deterministic: every SPO independently rebuilds it and there
+/// is no leader proposal to inspect, so today this compares a node's TM against
+/// its own trie. That still catches the failure this gate exists for — a trie
+/// that has drifted from the one the TM was built against (a stale
+/// `cpo-trie.json`, a half-applied recovery, a node that never reconstructed) —
+/// and it is the exact hook a future leader-proposes-TM wire format plugs into:
+/// the check is `tm bytes + local trie`, with no dependence on who built the tx.
+///
+/// Refusing is the safe direction. A TM nobody signs is a missed movement; a TM
+/// signed with a wrong root is an unrecoverable accounting error on the peg-out
+/// ledger — see the call site for what each direction of error costs.
+fn verify_cpo_root(
+    config: &EpochConfig,
+    me: Identifier,
+    epoch: u64,
+    tm: &TreasuryMovement,
+) -> EpochResult<()> {
+    use crate::bitcoin::tm_builder::verify_committed_root;
+    use crate::cardano::cpo_trie::CpoTrie;
+
+    let trie = match config.state_dir.as_deref() {
+        Some(dir) => CpoTrie::load(dir)
+            .map_err(|e| EpochError::TmBuild(format!("completed-peg-outs trie: {e}")))?
+            .unwrap_or_default(),
+        None => CpoTrie::empty(),
+    };
+
+    let root = verify_committed_root(&tm.unsigned_tx, &tm.fulfilled, &trie).map_err(|e| {
+        EpochError::TmBuild(format!(
+            "REFUSING TO SIGN treasury movement {}: {e}. This node's completed-peg-outs \
+             trie disagrees with the root the transaction attests; signing would make that \
+             root chain truth. Reconcile with `reconstruct-cpo-trie` before signing again.",
+            tm.txid
+        ))
+    })?;
+
+    crate::epoch_log!(
+        me,
+        epoch,
+        "  completed-peg-outs root {} verified against the local trie ({} fulfilled peg-out(s)) \
+         — safe to sign",
+        hex::encode(root),
+        tm.fulfilled.len(),
+    );
+    Ok(())
 }
 
 // FIXME: `poll_sign_round1` (and round2) waits for commitments from
@@ -460,12 +526,22 @@ mod tests {
                     [3u8; 20],
                 )),
                 amount: Amount::from_sat(400_000),
+                per_pegout_fee: Amount::from_sat(1_000),
+                por_id: [7u8; 32],
+                outpoint: [8u8; 36],
+                created: 0,
             }],
             treasury_spk,
             &FeeParams {
                 fee_rate_sat_per_vb: 1,
-                per_pegout_fee: Amount::from_sat(1_000),
             },
+            // `created: 0` with a `now` of 0 and no margin keeps the request
+            // inside the freshness window without pinning a wall-clock time.
+            &crate::bitcoin::tm_builder::Freshness {
+                now_ms: 0,
+                margin_ms: 0,
+            },
+            &crate::cardano::cpo_trie::CpoTrie::empty(),
         )
         .unwrap();
         let sighashes = compute_sighashes(&unsigned);
@@ -479,6 +555,8 @@ mod tests {
             input_spend_info: unsigned.input_spend_info.clone(),
             sighashes: sighashes.clone(),
             signatures: vec![None; num_inputs],
+            fulfilled: unsigned.fulfilled.clone(),
+            cpo_root: unsigned.cpo_root,
         };
 
         // Drive sign_phase for every SPO in parallel.

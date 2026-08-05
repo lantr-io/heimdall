@@ -40,6 +40,22 @@ use crate::epoch::traits::{
 use crate::http::payloads::{Sign1Payload, Sign2Payload};
 use crate::http::wire::DkgNamespace;
 
+/// A stand-in `por_id` for a fixture peg-out.
+///
+/// A fixture peg-out has no Cardano UTxO, so it has no real
+/// `hash_output_ref(outpoint)`. Deriving one from the payment keeps it unique per
+/// `(destination, amount)`, stable across runs (so mock TMs stay deterministic),
+/// and domain-separated from any real por_id, which hashes a Plutus-encoded
+/// `OutputReference` rather than this tag.
+fn fixture_por_id(spk: &bitcoin::ScriptBuf, amount: bitcoin::Amount) -> [u8; 32] {
+    use bitcoin::hashes::{Hash as _, HashEngine, sha256};
+    let mut eng = sha256::Hash::engine();
+    eng.input(b"heimdall-mock-por-id-v1");
+    eng.input(spk.as_bytes());
+    eng.input(&amount.to_sat().to_le_bytes());
+    sha256::Hash::from_engine(eng).to_byte_array()
+}
+
 // ---------------------------------------------------------------------------
 // Clocks
 // ---------------------------------------------------------------------------
@@ -289,11 +305,23 @@ impl CardanoChain for MockCardanoChain {
             .map(|p| PegOutRequestUtxo {
                 script_pubkey: p.script_pubkey.clone(),
                 amount: p.amount,
+                per_pegout_fee: self.fixture.per_pegout_fee,
+                // The fixture has no Cardano UTxO behind it, so the request
+                // identity is derived from the payment itself: unique per
+                // (destination, amount), stable across runs, and never colliding
+                // with a real por_id (which hashes a real 32-byte tx hash).
+                created: 0,
+                por_id: fixture_por_id(&p.script_pubkey, p.amount),
+                outpoint: [0u8; 36],
             })
             .collect())
     }
 
-    async fn submit_signed_tm(&self, tx_bytes: &[u8]) -> EpochResult<()> {
+    async fn submit_signed_tm(
+        &self,
+        tx_bytes: &[u8],
+        _fulfilled_por_outpoints: &[[u8; 36]],
+    ) -> EpochResult<()> {
         self.submitted_txs.lock().unwrap().push(tx_bytes.to_vec());
         if let Some(rpc) = &self.btc_rpc {
             broadcast_btc_tx(rpc, tx_bytes).await?;

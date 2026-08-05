@@ -35,10 +35,24 @@ pub struct EpochBoundaryEvent {
 }
 
 /// A pending peg-out request.
+///
+/// Carries everything the rev-5.1 builder needs: the payment, the request's own
+/// datum-pinned fee and `created` time, and its identity (`por_id` = the
+/// completed-peg-outs trie key, `outpoint` = the TM datum's hint entry).
 #[derive(Debug, Clone)]
 pub struct PegOutRequestUtxo {
     pub script_pubkey: bitcoin::ScriptBuf,
+    /// Gross locked fBTC.
     pub amount: bitcoin::Amount,
+    /// `per_pegout_fee` from this request's own datum. The TM pays
+    /// `amount − per_pegout_fee`.
+    pub per_pegout_fee: bitcoin::Amount,
+    /// `created` (POSIX ms) from the datum — the freshness filter's input.
+    pub created: i64,
+    /// `sha256(serialise_data(OutputReference))` of the request UTxO.
+    pub por_id: [u8; 32],
+    /// The request's Cardano outpoint, 36 bytes (tx hash ‖ output index LE).
+    pub outpoint: [u8; 36],
 }
 
 /// The current treasury UTxO state, as reported by the Cardano-side
@@ -147,6 +161,20 @@ pub trait CardanoChain: Send + Sync {
     /// never happens). `BuildTm` subtracts [`Self::query_paid_pegout_payments`] from this set.
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>>;
 
+    /// Chain "now" in POSIX milliseconds — the tip block's time.
+    ///
+    /// The peg-out freshness filter compares a datum's `created` against this, and
+    /// every SPO must reach the same verdict or the TM bytes diverge and FROST
+    /// fails. A CHAIN time converges across nodes; a local wall clock does not.
+    /// The default is the local clock, which is correct only for mocks and for a
+    /// single-node demo.
+    async fn chain_now_ms(&self) -> EpochResult<i64> {
+        Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0))
+    }
+
     /// Every peg-out payment already committed on Bitcoin by an earlier movement, as
     /// `(destination scriptPubKey, satoshi actually paid)` — one entry per payment, duplicates
     /// included, because several distinct requests may share a destination and amount.
@@ -200,7 +228,17 @@ pub trait CardanoChain: Send + Sync {
     /// impl will need two separate sinks: one for broadcasting the
     /// signed BTC tx, and another for posting the resulting Cardano
     /// side-effects (minting fBTC, closing peg-out requests).
-    async fn submit_signed_tm(&self, tx_bytes: &[u8]) -> EpochResult<()>;
+    /// Broadcast the signed BTC tx and post the Unconfirmed TM record to Cardano.
+    ///
+    /// `fulfilled_por_outpoints` is the rev-5.1 data-availability hint written into
+    /// the posted datum's 6th field: the Cardano outpoints (36 bytes each) of the
+    /// peg-out requests this TM fulfils. Nothing on-chain reads it; it exists so a
+    /// cold-starting SPO can rebuild the completed-peg-outs trie from chain data.
+    async fn submit_signed_tm(
+        &self,
+        tx_bytes: &[u8],
+        fulfilled_por_outpoints: &[[u8; 36]],
+    ) -> EpochResult<()>;
 }
 
 // ---------------------------------------------------------------------------

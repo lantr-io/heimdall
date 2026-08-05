@@ -127,6 +127,13 @@ pub struct TreasuryMovement {
     pub sighashes: Vec<[u8; 32]>,
     /// Final aggregated Schnorr signature per input, populated after Sign.
     pub signatures: Vec<Option<frost::Signature>>,
+    /// The peg-outs this TM fulfils, in payment-output order. Drives three
+    /// things: the `"CPOR1"` root the tx commits, the co-signer's pre-signing
+    /// root check, and the `fulfilled_por_outpoints` hint `publish.rs` writes.
+    pub fulfilled: Vec<crate::bitcoin::tm_builder::FulfilledPegOut>,
+    /// The completed-peg-outs root this TM commits — the same 32 bytes
+    /// `committed_cpo_root(&unsigned_tx)` reads back out of the commitment output.
+    pub cpo_root: [u8; 32],
 }
 
 impl TreasuryMovement {
@@ -426,6 +433,14 @@ pub struct EpochConfig {
     /// process restarts for the epoch (WI-014 #5). `None` → in-memory only (the
     /// share is lost on restart and DKG re-runs next boundary).
     pub state_dir: Option<std::path::PathBuf>,
+    /// Freshness margin for peg-out selection: a request is payable only while at
+    /// least this far from its cancel deadline (`created +
+    /// peg_out_cancel_timeout_ms`, 30 days). Paying one any later risks the owner
+    /// cancelling for the fBTC after taking the BTC — the treasury pays twice.
+    ///
+    /// Must be the SAME on every SPO: it is a skip rule, and a skip rule that
+    /// differs makes two nodes build different TM bytes and fail FROST.
+    pub pegout_freshness_margin: Duration,
     /// Demo-only DKG fault injection (never set in production). Makes THIS node
     /// misbehave so the fault-detection + ban flow can be exercised live.
     pub inject_fault: Option<InjectFault>,
@@ -478,6 +493,7 @@ impl EpochConfig {
             pegin_poll_interval: Duration::from_millis(1000),
             pegin_refund_timeout_blocks: 4320,
             state_dir: None,
+            pegout_freshness_margin: Duration::from_millis(7 * 24 * 3600 * 1000),
             inject_fault: None,
         }
     }

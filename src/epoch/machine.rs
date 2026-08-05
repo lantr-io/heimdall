@@ -36,7 +36,7 @@ use frost_secp256k1_tr as frost;
 
 use crate::bitcoin::taproot::treasury_spend_info;
 use crate::bitcoin::tm_builder::{
-    FeeParams, PegInInput, PegOutRequest, TreasuryInput, build_tm, compute_sighashes,
+    FeeParams, Freshness, PegInInput, PegOutRequest, TreasuryInput, build_tm, compute_sighashes,
 };
 use crate::cardano::pegin_datum::{ParsedPegIn, parse_pegin_request};
 use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInSource};
@@ -214,7 +214,7 @@ async fn step_phase(
             roster,
             group_keys,
             frozen_pegins,
-        } => build_tm_phase(chain, epoch, roster, group_keys, frozen_pegins).await?,
+        } => build_tm_phase(chain, config, epoch, roster, group_keys, frozen_pegins).await?,
 
         EpochPhase::Sign {
             epoch,
@@ -264,6 +264,7 @@ async fn await_confirm_phase(
                 "AwaitConfirm: treasury movement {} is confirmed",
                 tm.txid
             );
+            advance_cpo_trie(config, epoch, tm)?;
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -274,6 +275,57 @@ async fn await_confirm_phase(
         }
         tokio::time::sleep(config.poll_interval).await;
     }
+}
+
+/// Fold a CONFIRMED TM's peg-outs into this node's persisted completed-peg-outs
+/// trie.
+///
+/// Only after confirmation: an in-flight TM can still be replaced (RBF) or simply
+/// never mine, and a trie that recorded it would then attest a root no chain state
+/// backs — every later TM this node builds would be refused by its peers.
+///
+/// The post-insert root MUST equal the root the TM committed. If it does not, the
+/// node's view and the quorum's have diverged and the trie is NOT written: a wrong
+/// trie is worse than a stale one, because the stale one fails loudly at the next
+/// signing round while the wrong one signs confidently wrong roots.
+///
+/// A node without `state_dir` keeps no trie, so there is nothing to advance.
+fn advance_cpo_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> EpochResult<()> {
+    use crate::cardano::cpo_trie::{CpoEntry, CpoTrie};
+
+    let me = config.identity.identifier;
+    let Some(dir) = config.state_dir.as_deref() else {
+        return Ok(());
+    };
+    let mut trie = CpoTrie::load(dir)
+        .map_err(|e| EpochError::TmBuild(format!("completed-peg-outs trie: {e}")))?
+        .unwrap_or_default();
+
+    let entries: Vec<CpoEntry> = tm.fulfilled.iter().map(CpoEntry::from).collect();
+    let new_root = trie
+        .insert_batch(&entries)
+        .map_err(|e| EpochError::TmBuild(format!("completed-peg-outs trie: {e}")))?;
+    if new_root != tm.cpo_root {
+        return Err(EpochError::TmBuild(format!(
+            "completed-peg-outs trie diverged: TM {} committed root {} but this node's trie \
+             reaches {} after inserting its {} fulfilled peg-out(s) — NOT persisting; run \
+             `reconstruct-cpo-trie`",
+            tm.txid,
+            hex::encode(tm.cpo_root),
+            hex::encode(new_root),
+            entries.len(),
+        )));
+    }
+    trie.save(dir)
+        .map_err(|e| EpochError::TmBuild(format!("completed-peg-outs trie: {e}")))?;
+    crate::epoch_log!(
+        me,
+        epoch,
+        "  completed-peg-outs trie advanced to root {} ({} entr(y|ies))",
+        hex::encode(new_root),
+        trie.len(),
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -667,8 +719,59 @@ async fn collect_pegins_phase(
 // build_tm
 // ---------------------------------------------------------------------------
 
+/// Load this node's completed-peg-outs trie from `state_dir`.
+///
+/// A missing file is the genesis state (empty trie, root = 32 zero bytes — the
+/// same root the Aiken bootstrap mint pins), NOT an error: a bridge that has
+/// completed no peg-out is exactly in that state. A file that exists but is
+/// corrupt IS an error — signing a root derived from corrupt state would attest
+/// something this node cannot justify.
+///
+/// A node that joined a bridge with existing history must run
+/// `reconstruct-cpo-trie` first; starting empty there means every root it
+/// proposes is wrong and every root it verifies is refused, which is loud.
+fn load_cpo_trie(
+    state_dir: Option<&std::path::Path>,
+    me: frost::Identifier,
+    epoch: u64,
+) -> EpochResult<crate::cardano::cpo_trie::CpoTrie> {
+    use crate::cardano::cpo_trie::CpoTrie;
+    let Some(dir) = state_dir else {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  completed-peg-outs trie: no protocol.state_dir configured — using the empty \
+             (genesis) trie; set state_dir before paying peg-outs on a live bridge"
+        );
+        return Ok(CpoTrie::empty());
+    };
+    match CpoTrie::load(dir).map_err(|e| EpochError::TmBuild(e.to_string()))? {
+        Some(t) => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "  completed-peg-outs trie: {} entr(y|ies), root {}",
+                t.len(),
+                hex::encode(t.root())
+            );
+            Ok(t)
+        }
+        None => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "  completed-peg-outs trie: no persisted state at {} — using the empty (genesis) \
+                 trie; run `reconstruct-cpo-trie` if this bridge already has history",
+                dir.display()
+            );
+            Ok(CpoTrie::empty())
+        }
+    }
+}
+
 async fn build_tm_phase(
     chain: &Arc<dyn CardanoChain>,
+    config: &EpochConfig,
     epoch: u64,
     roster: Roster,
     group_keys: GroupKeys,
@@ -709,10 +812,9 @@ async fn build_tm_phase(
     let mut pegouts = Vec::with_capacity(open_pegouts.len());
     let mut skipped_paid = Vec::new();
     for p in open_pegouts {
-        let net = p
-            .amount
-            .to_sat()
-            .saturating_sub(treasury.per_pegout_fee.to_sat());
+        // The net is `gross − the request's OWN datum fee`: that is what the TM
+        // pays and therefore what a Confirmed datum records.
+        let net = p.amount.to_sat().saturating_sub(p.per_pegout_fee.to_sat());
         if net > 0 && paid.claim(p.script_pubkey.as_bytes(), net) {
             skipped_paid.push(p);
         } else {
@@ -786,8 +888,22 @@ async fn build_tm_phase(
         .map(|p| PegOutRequest {
             script_pubkey: p.script_pubkey,
             amount: p.amount,
+            per_pegout_fee: p.per_pegout_fee,
+            por_id: p.por_id,
+            outpoint: p.outpoint,
+            created: p.created,
         })
         .collect();
+
+    // The completed-peg-outs trie: this node's own copy, which decides both which
+    // requests are still owed a payment and the root this TM will commit.
+    let cpo_trie = load_cpo_trie(config.state_dir.as_deref(), me, epoch)?;
+
+    // Chain "now" for the freshness filter. Read from the chain, not the local
+    // clock: it is a skip-rule input, and every SPO must reach the same verdict or
+    // the TM bytes diverge.
+    let chain_now_ms = chain.chain_now_ms().await?;
+    let pegout_freshness_margin_ms = config.pegout_freshness_margin.as_millis() as i64;
 
     let unsigned = build_tm(
         TreasuryInput {
@@ -800,8 +916,12 @@ async fn build_tm_phase(
         change_script,
         &FeeParams {
             fee_rate_sat_per_vb: treasury.fee_rate_sat_per_vb,
-            per_pegout_fee: treasury.per_pegout_fee,
         },
+        &Freshness {
+            now_ms: chain_now_ms,
+            margin_ms: pegout_freshness_margin_ms,
+        },
+        &cpo_trie,
     )
     .map_err(|e| EpochError::TmBuild(e.to_string()))?;
 
@@ -831,13 +951,18 @@ async fn build_tm_phase(
         input_spend_info: unsigned.input_spend_info,
         sighashes,
         signatures: vec![None; num_inputs],
+        fulfilled: unsigned.fulfilled,
+        cpo_root: unsigned.cpo_root,
     };
 
     crate::epoch_log!(
         me,
         epoch,
-        "  -> built unsigned tx: txid={} ({num_inputs} inputs)",
-        tm.txid
+        "  -> built unsigned tx: txid={} ({num_inputs} inputs), commits completed-peg-outs \
+         root {} over {} fulfilled peg-out(s)",
+        tm.txid,
+        hex::encode(tm.cpo_root),
+        tm.fulfilled.len(),
     );
 
     Ok(EpochPhase::Sign {
@@ -949,7 +1074,8 @@ async fn submit_phase(
             tm.txid,
             tx_bytes.len()
         );
-        chain.submit_signed_tm(&tx_bytes).await?;
+        let hint: Vec<[u8; 36]> = tm.fulfilled.iter().map(|f| f.outpoint).collect();
+        chain.submit_signed_tm(&tx_bytes, &hint).await?;
     } else {
         crate::epoch_log!(
             me,

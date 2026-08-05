@@ -77,7 +77,7 @@ impl WalletUtxo {
 
 /// Encode the treasury oracle datum:
 /// `Constr(constructor, [BoundedBytes(btc_tx), BoundedBytes(creator_pkh), BigInt(created_ms),
-/// BigInt(epoch), BigInt(leader_reward)])`.
+/// BigInt(epoch), BigInt(leader_reward), [BoundedBytes(outpoint_36) ..]])`.
 ///
 /// Constructor 0 = unconfirmed TM tx; 1 = confirmed (set by Binocular after a
 /// Bitcoin proof). `creator` is the poster's payment key hash (it may GC the
@@ -85,7 +85,21 @@ impl WalletUtxo {
 /// anchored by the TM mint policy to the tx's validity upper bound. `epoch` /
 /// `leader_reward` are the N7 fields (Cardano epoch; a copy of the Config
 /// `leader_reward` tunable) — carried through Confirm, not yet enforced on-chain
-/// (pin + payout land with N9). Canonical encoding via `cardano::plutus::constr`.
+/// (pin + payout land with N9).
+///
+/// Field 5 `fulfilled_por_outpoints` is the rev-5.1 data-availability HINT: the
+/// Cardano outpoints (36 bytes each, tx hash ‖ output index LE) of the peg-out
+/// requests this TM fulfils. Nothing on-chain reads it — neither the TM mint
+/// branch nor the Confirm spend — because the FROST-signed `"CPOR1"` root
+/// commitment inside `btc_tx` is the sole integrity anchor. It exists so a cold
+/// starting SPO can rebuild the completed-peg-outs trie from chain data alone:
+/// the Unconfirmed record's inline datum survives in Cardano history forever and
+/// is indexable by address, which transaction metadata is not.
+///
+/// The list is always written, empty included: a zero-peg-out TM writes `[]`, and
+/// the field's PRESENCE is what tells a reader the record is the 6-field shape.
+///
+/// Canonical encoding via `cardano::plutus::constr`.
 fn encode_datum_hex(
     btc_tx: &[u8],
     constructor: u8,
@@ -93,6 +107,7 @@ fn encode_datum_hex(
     created_ms: i64,
     epoch: i64,
     leader_reward: i64,
+    fulfilled_por_outpoints: &[[u8; 36]],
 ) -> String {
     let datum = crate::cardano::plutus::constr(
         u64::from(constructor),
@@ -102,6 +117,12 @@ fn encode_datum_hex(
             crate::cardano::plutus::int(created_ms),
             crate::cardano::plutus::int(epoch),
             crate::cardano::plutus::int(leader_reward),
+            crate::cardano::plutus::array(
+                fulfilled_por_outpoints
+                    .iter()
+                    .map(|op| crate::cardano::plutus::bytes(op))
+                    .collect(),
+            ),
         ],
     );
     let cbor = minicbor::to_vec(&datum).expect("datum CBOR encode");
@@ -156,6 +177,10 @@ pub fn build_oracle_update_tx(
     // yet enforced on-chain — the pin + payout land with N9.
     epoch: u64,
     leader_reward: u64,
+    // The rev-5.1 data-availability hint: the Cardano outpoints (36 bytes each) of the peg-out
+    // requests this TM fulfils, straight from `UnsignedTm::fulfilled`. Pass an empty slice for a
+    // TM that fulfils none — the field is written either way.
+    fulfilled_por_outpoints: &[[u8; 36]],
 ) -> EpochResult<String> {
     let pkh = pub_key_hash_hex(key);
     let (latest_slot, latest_time_secs) = latest_slot_time;
@@ -169,6 +194,7 @@ pub fn build_oracle_update_tx(
         created_ms,
         epoch as i64,
         leader_reward as i64,
+        fulfilled_por_outpoints,
     );
     let asset_unit = format!("{treasury_policy_id}{treasury_asset_name_hex}");
 
@@ -340,40 +366,83 @@ mod tests {
     use super::*;
     use pallas_primitives::conway::PlutusData;
 
+    fn decode(hex_str: &str) -> pallas_primitives::conway::Constr<PlutusData> {
+        let cbor = hex::decode(hex_str).unwrap();
+        match pallas_codec::minicbor::decode::<PlutusData>(&cbor).expect("decode") {
+            PlutusData::Constr(c) => c,
+            _ => panic!("expected Constr"),
+        }
+    }
+
     #[test]
-    fn encode_datum_is_constr_0_with_creator_created_epoch_leader_reward() {
+    fn encode_datum_is_constr_0_with_the_six_unconfirmed_fields() {
         let btc_tx = vec![0x02, 0x00, 0x00, 0x00];
         let creator = vec![0x7a; 28];
-        let hex_str = encode_datum_hex(&btc_tx, 0, &creator, 1_700_000_000_000, 42, 2_000_000);
-        let cbor = hex::decode(&hex_str).unwrap();
-        let decoded: PlutusData = pallas_codec::minicbor::decode(&cbor).expect("decode");
-        match decoded {
-            PlutusData::Constr(c) => {
-                assert_eq!(c.tag, 121, "should be constructor 0 (unconfirmed)");
-                // N7: [signed_btc_tx, creator, created, epoch, leader_reward]
-                assert_eq!(c.fields.len(), 5);
-                match &c.fields[0] {
-                    PlutusData::BoundedBytes(b) => {
-                        let v: Vec<u8> = b.clone().into();
-                        assert_eq!(v, btc_tx);
-                    }
-                    _ => panic!("expected BoundedBytes"),
-                }
-                match &c.fields[1] {
-                    PlutusData::BoundedBytes(b) => {
-                        let v: Vec<u8> = b.clone().into();
-                        assert_eq!(v, creator);
-                    }
-                    _ => panic!("expected BoundedBytes creator"),
-                }
-                assert!(matches!(&c.fields[2], PlutusData::BigInt(_)), "created");
-                assert!(matches!(&c.fields[3], PlutusData::BigInt(_)), "epoch");
-                assert!(
-                    matches!(&c.fields[4], PlutusData::BigInt(_)),
-                    "leader_reward"
-                );
+        let op1 = crate::cardano::cpo_trie::hint_bytes(&[0xaa; 32], 1);
+        let op2 = crate::cardano::cpo_trie::hint_bytes(&[0xbb; 32], 0);
+        let c = decode(&encode_datum_hex(
+            &btc_tx,
+            0,
+            &creator,
+            1_700_000_000_000,
+            42,
+            2_000_000,
+            &[op1, op2],
+        ));
+        assert_eq!(c.tag, 121, "should be constructor 0 (unconfirmed)");
+        // rev 5.1: [signed_btc_tx, creator, created, epoch, leader_reward,
+        //           fulfilled_por_outpoints]
+        assert_eq!(c.fields.len(), 6);
+        match &c.fields[0] {
+            PlutusData::BoundedBytes(b) => {
+                let v: Vec<u8> = b.clone().into();
+                assert_eq!(v, btc_tx);
             }
-            _ => panic!("expected Constr"),
+            _ => panic!("expected BoundedBytes"),
+        }
+        match &c.fields[1] {
+            PlutusData::BoundedBytes(b) => {
+                let v: Vec<u8> = b.clone().into();
+                assert_eq!(v, creator);
+            }
+            _ => panic!("expected BoundedBytes creator"),
+        }
+        assert!(matches!(&c.fields[2], PlutusData::BigInt(_)), "created");
+        assert!(matches!(&c.fields[3], PlutusData::BigInt(_)), "epoch");
+        assert!(
+            matches!(&c.fields[4], PlutusData::BigInt(_)),
+            "leader_reward"
+        );
+        match &c.fields[5] {
+            PlutusData::Array(items) => assert_eq!(items.len(), 2),
+            other => panic!("expected an Array of outpoints, got {other:?}"),
+        }
+    }
+
+    // The hint round-trips through the reader reconstruction uses, so what heimdall
+    // writes is exactly what a cold-starting node reads back.
+    #[test]
+    fn the_written_hint_is_what_the_reconstruction_reader_parses() {
+        let op1 = crate::cardano::cpo_trie::hint_bytes(&[0xaa; 32], 1);
+        let op2 = crate::cardano::cpo_trie::hint_bytes(&[0xbb; 32], 7);
+        let hex_str = encode_datum_hex(&[0x02], 0, &[0x7a; 28], 1, 2, 3, &[op1, op2]);
+        let cbor = hex::decode(&hex_str).unwrap();
+        let pd: PlutusData = pallas_codec::minicbor::decode(&cbor).unwrap();
+        assert_eq!(
+            crate::cardano::cpo_trie::unconfirmed_hint(&pd),
+            vec![op1, op2]
+        );
+    }
+
+    // A zero-peg-out TM still writes the field — as an empty list, which is what
+    // distinguishes "fulfilled nothing" from the retired 5-field shape.
+    #[test]
+    fn a_zero_pegout_tm_writes_an_empty_hint_list() {
+        let c = decode(&encode_datum_hex(&[0x02], 0, &[0x7a; 28], 1, 2, 3, &[]));
+        assert_eq!(c.fields.len(), 6);
+        match &c.fields[5] {
+            PlutusData::Array(items) => assert!(items.is_empty()),
+            other => panic!("expected an empty Array, got {other:?}"),
         }
     }
 }

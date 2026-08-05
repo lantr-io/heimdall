@@ -1316,6 +1316,21 @@ impl CardanoChain for BlockfrostCardanoChain {
         Ok(vec![])
     }
 
+    /// Chain "now" from the Cardano tip block's time (`/blocks/latest`), in ms.
+    ///
+    /// A chain time, not the local clock: it feeds the peg-out freshness skip
+    /// rule, and two SPOs that disagree there build different TM bytes and fail
+    /// the FROST round. Every honest node reading the same tip agrees.
+    async fn chain_now_ms(&self) -> EpochResult<i64> {
+        let secs = crate::cardano::bf_http::fetch_latest_block_time(
+            &self.bf_base_url,
+            &self.bf_project_id,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("chain now: {e}")))?;
+        Ok(secs.saturating_mul(1000))
+    }
+
     /// The peg-out payments already committed on Bitcoin, read from the TM validator's Confirmed
     /// datums plus still-live in-flight TMs. Errors when the history cannot be trusted, so a
     /// caller can never silently treat a paid request as unpaid.
@@ -1376,7 +1391,11 @@ impl CardanoChain for BlockfrostCardanoChain {
             .map_err(EpochError::Chain)
     }
 
-    async fn submit_signed_tm(&self, tx_bytes: &[u8]) -> EpochResult<()> {
+    async fn submit_signed_tm(
+        &self,
+        tx_bytes: &[u8],
+        fulfilled_por_outpoints: &[[u8; 36]],
+    ) -> EpochResult<()> {
         eprintln!(
             "[submit] signed BTC tx: {} bytes, hex: {}",
             tx_bytes.len(),
@@ -1505,6 +1524,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             self.validity_window_secs,
             epoch,
             leader_reward,
+            fulfilled_por_outpoints,
         )?;
 
         let cardano_tx_cbor = hex::decode(&signed_tx_hex)

@@ -91,7 +91,19 @@ pub struct ProtocolConfig {
     pub pegin_poll_interval_ms: u64,
     /// Directory for 0600 DKG-state persistence so the signing share survives
     /// restarts for the epoch (WI-014). Unset → in-memory only.
+    ///
+    /// Also the home of the completed-peg-outs trie (`cpo-trie.json`). Unset means
+    /// the trie is rebuilt as empty on every start, which is correct only on a
+    /// bridge that has completed no peg-outs — set this in any real deployment.
     pub state_dir: Option<String>,
+    /// Peg-out freshness margin (ms): a peg-out is payable only while at least
+    /// this far from its cancel deadline (`created + 30 days`). Paying one later
+    /// lets the owner take the BTC and then Cancel for the fBTC, so the treasury
+    /// pays twice. Default 7 days.
+    ///
+    /// MUST match across SPOs — it is a TM skip rule, and a divergent skip rule
+    /// produces divergent TM bytes and a failed FROST round.
+    pub pegout_freshness_margin_ms: u64,
 }
 
 impl Default for ProtocolConfig {
@@ -110,6 +122,11 @@ impl Default for ProtocolConfig {
             pegin_collection_window_secs: 5,
             pegin_poll_interval_ms: 1000,
             state_dir: None,
+            // 7 days. Large enough that a request selected now cannot reach its
+            // 30-day cancel deadline before the TM confirms, even after a long
+            // Bitcoin fee-market stall; small enough that a request stays payable
+            // for most of its life.
+            pegout_freshness_margin_ms: 7 * 24 * 3600 * 1000,
         }
     }
 }
@@ -122,6 +139,14 @@ pub struct BitcoinConfig {
     /// `"regtest"`, `"testnet4"`, `"signet"`, `"mainnet"`.
     pub network: String,
     pub fee_rate_sat_per_vb: u64,
+    /// Per-peg-out protocol fee (satoshi) used only where no request datum
+    /// supplies one — the demo `StaticFixture` peg-outs.
+    ///
+    /// A real TM does NOT read this. Since rev 5.1 each PegOut request pins its own
+    /// `per_pegout_fee` in its datum, and `peg-out.ak` binds the completed-peg-outs
+    /// trie value against THAT value; a TM paying `gross − some_local_config` would
+    /// produce an entry the Complete branch cannot match, spending BTC for a
+    /// completion nobody can prove.
     pub per_pegout_fee_sat: u64,
     pub federation_csv_blocks: u32,
     /// 32-byte hex seed for the Y_federation key.
@@ -186,6 +211,14 @@ pub struct CardanoConfig {
     /// Custom Blockfrost-compatible API base URL (e.g. yaci-devkit's
     /// http://localhost:8080/api/v1). None → public blockfrost.io.
     pub blockfrost_url: Option<String>,
+    /// Kupo base URL, e.g. `http://localhost:1442`.
+    ///
+    /// Needed ONLY to rebuild the completed-peg-outs trie from chain history
+    /// (`reconstruct-cpo-trie`): that read wants the inline datums of already-SPENT
+    /// outputs, which a Blockfrost-compatible UTxO-set API cannot serve. Steady-state
+    /// operation never touches it, so a node with a healthy `cpo-trie.json` runs
+    /// without Kupo configured.
+    pub kupo_url: Option<String>,
     pub socket_path: Option<String>,
     pub network_magic: Option<u64>,
     pub pegin_script_address: Option<String>,
@@ -300,6 +333,7 @@ impl Default for CardanoConfig {
         Self {
             blockfrost_project_id: None,
             blockfrost_url: None,
+            kupo_url: None,
             socket_path: None,
             network_magic: None,
             pegin_script_address: None,
@@ -468,6 +502,9 @@ impl HeimdallConfig {
                 .state_dir
                 .as_deref()
                 .map(std::path::PathBuf::from),
+            pegout_freshness_margin: Duration::from_millis(
+                self.protocol.pegout_freshness_margin_ms,
+            ),
             // Demo-only; the harness/CLI sets this after building the config.
             inject_fault: None,
         }

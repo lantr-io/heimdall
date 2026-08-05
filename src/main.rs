@@ -620,12 +620,25 @@ enum Commands {
         /// double-spend an outpoint that no longer exists. Repeatable.
         #[arg(long = "exclude-pegin")]
         exclude_pegin: Vec<String>,
-        /// Skip peg-outs whose datum pins a treasury outpoint other than this TM's input (spec
-        /// §"Deterministic skip rule (peg-outs)"): they can never be completed against this
-        /// movement. Off by default — the payment-history filter already prevents re-payment, and
-        /// enforcing the pin pays nothing until every request is re-created against the live tip.
+    },
+    /// Rebuild the completed-peg-outs trie from Cardano history and persist it to
+    /// `protocol.state_dir`.
+    ///
+    /// Needed on a cold start, after losing `cpo-trie.json`, or when joining a
+    /// bridge that already has peg-out history: without a correct trie this node
+    /// proposes roots its peers refuse, and refuses the roots they propose.
+    ///
+    /// Reads through Kupo (`cardano.kupo_url`), not Blockfrost — the rebuild needs
+    /// the inline datums of already-SPENT outputs, which a UTxO-set API cannot
+    /// serve. Every step is checked against the root each Treasury Movement
+    /// attested, so a garbled data-availability hint costs time, never correctness.
+    ReconstructCpoTrie {
         #[arg(long)]
-        require_pegout_pin: bool,
+        config: Option<String>,
+        /// Print the reconstructed root and entry count without writing
+        /// `cpo-trie.json`.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Read-only: chain-source the current Bitcoin treasury from Cardano state
     /// (WI-028). Scans the TM validator address (`cardano.treasury_address`),
@@ -680,12 +693,6 @@ enum Commands {
         /// `sweep-pegins --exclude-pegin`). Repeatable.
         #[arg(long = "exclude-pegin")]
         exclude_pegin: Vec<String>,
-        /// Skip peg-outs whose datum pins a treasury outpoint other than this TM's input (spec
-        /// §"Deterministic skip rule (peg-outs)"): they can never be completed against this
-        /// movement. Off by default — the payment-history filter already prevents re-payment, and
-        /// enforcing the pin pays nothing until every request is re-created against the live tip.
-        #[arg(long)]
-        require_pegout_pin: bool,
     },
 }
 
@@ -1146,7 +1153,6 @@ fn main() {
             broadcast,
             existing_tm_hex,
             exclude_pegin,
-            require_pegout_pin,
         } => {
             let cfg = load_config(config.as_deref());
             // CLI flags override; otherwise fall back to the [cardano] config.
@@ -1188,7 +1194,6 @@ fn main() {
                 broadcast,
                 existing_tm_hex.as_deref(),
                 &exclude_pegin,
-                require_pegout_pin,
                 false, // auto_mode
             ) {
                 eprintln!("Error: {e}");
@@ -1207,7 +1212,6 @@ fn main() {
             once,
             broadcast,
             exclude_pegin,
-            require_pegout_pin,
         } => {
             let cfg = load_config(config.as_deref());
             // CLI flags override; otherwise fall back to the [cardano] config.
@@ -1248,7 +1252,6 @@ fn main() {
                 once,
                 broadcast,
                 &exclude_pegin,
-                require_pegout_pin,
             ) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
@@ -1257,6 +1260,13 @@ fn main() {
         Commands::ShowTreasury { config } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_show_treasury(&cfg) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::ReconstructCpoTrie { config, dry_run } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_reconstruct_cpo_trie(&cfg, dry_run) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1742,11 +1752,60 @@ fn csv_blocks_u16(cfg: &HeimdallConfig) -> Result<u16, String> {
     })
 }
 
-/// Build `FeeParams` from the Bitcoin config section.
+/// Build `FeeParams` (miner fee only) from the Bitcoin config section.
+///
+/// The per-peg-out PROTOCOL fee is not here: since rev 5.1 each request pins its
+/// own fee in its datum, and `peg-out.ak` binds the completed-peg-outs trie value
+/// against that value. `bitcoin.per_pegout_fee_sat` survives only as the fee this
+/// node's own `pegout-request` CLI writes into a new request.
 fn fee_params_from_cfg(cfg: &HeimdallConfig) -> heimdall::bitcoin::tm_builder::FeeParams {
     heimdall::bitcoin::tm_builder::FeeParams {
         fee_rate_sat_per_vb: cfg.bitcoin.fee_rate_sat_per_vb,
-        per_pegout_fee: bitcoin::Amount::from_sat(cfg.bitcoin.per_pegout_fee_sat),
+    }
+}
+
+/// Load this node's completed-peg-outs trie from `protocol.state_dir`.
+///
+/// No `state_dir`, or no file yet, means the genesis (empty) trie — correct on a
+/// bridge that has completed no peg-out, and loud everywhere else: every root this
+/// node then proposes is refused by peers whose trie is populated.
+fn cpo_trie_from_cfg(cfg: &HeimdallConfig) -> Result<heimdall::cardano::cpo_trie::CpoTrie, String> {
+    use heimdall::cardano::cpo_trie::CpoTrie;
+    let Some(dir) = cfg.protocol.state_dir.as_deref() else {
+        eprintln!(
+            "[cpo] no protocol.state_dir — using the empty (genesis) completed-peg-outs trie"
+        );
+        return Ok(CpoTrie::empty());
+    };
+    let dir = std::path::Path::new(dir);
+    match CpoTrie::load(dir).map_err(|e| e.to_string())? {
+        Some(t) => {
+            eprintln!(
+                "[cpo] completed-peg-outs trie: {} entr(y|ies), root {}",
+                t.len(),
+                hex::encode(t.root())
+            );
+            Ok(t)
+        }
+        None => {
+            eprintln!(
+                "[cpo] no completed-peg-outs trie at {} — using the empty (genesis) trie; run \
+                 `reconstruct-cpo-trie` if this bridge already has history",
+                dir.display()
+            );
+            Ok(CpoTrie::empty())
+        }
+    }
+}
+
+/// The freshness window for peg-out selection. `now_ms` must be CHAIN time.
+fn freshness_from_cfg(
+    cfg: &HeimdallConfig,
+    now_ms: i64,
+) -> heimdall::bitcoin::tm_builder::Freshness {
+    heimdall::bitcoin::tm_builder::Freshness {
+        now_ms,
+        margin_ms: cfg.protocol.pegout_freshness_margin_ms as i64,
     }
 }
 
@@ -1800,6 +1859,13 @@ fn run_treasury_self_send(
         vec![],
         treasury_spk,
         &fee_params_from_cfg(cfg),
+        // No peg-outs, so the freshness window is inert.
+        &heimdall::bitcoin::tm_builder::Freshness {
+            now_ms: 0,
+            margin_ms: 0,
+        },
+        // A self-send fulfils nothing, so it re-commits the trie's current root.
+        &cpo_trie_from_cfg(cfg)?,
     )
     .map_err(|e| format!("build self-send: {e}"))?;
 
@@ -1878,6 +1944,11 @@ fn run_federation_spend(
         vec![],
         treasury_spk,
         &fee_params_from_cfg(cfg),
+        &heimdall::bitcoin::tm_builder::Freshness {
+            now_ms: 0,
+            margin_ms: 0,
+        },
+        &cpo_trie_from_cfg(cfg)?,
     )
     .map_err(|e| format!("build federation spend: {e}"))?;
 
@@ -4328,7 +4399,6 @@ fn run_mover(
     once: bool,
     broadcast: bool,
     exclude_pegin: &[String],
-    require_pegout_pin: bool,
 ) -> Result<(), String> {
     use std::time::Duration;
 
@@ -4351,7 +4421,6 @@ fn run_mover(
             broadcast,
             None, // no existing-tm override
             exclude_pegin,
-            require_pegout_pin,
             true, // auto_mode → busy/idle skips instead of erroring
         );
         // In --once mode (documented "for testing") propagate the tick result so the
@@ -4365,6 +4434,87 @@ fn run_mover(
         }
         std::thread::sleep(Duration::from_secs(interval_secs));
     }
+}
+
+/// `reconstruct-cpo-trie`: rebuild the completed-peg-outs trie from Cardano
+/// history through Kupo, then persist it to `protocol.state_dir`.
+///
+/// Writes only on success, and only the whole trie: a partial rebuild is worse
+/// than no rebuild, because the node would sign roots derived from a set it
+/// believes is complete. Every TM's running root is checked against the root that
+/// TM attested, so an unexplainable movement aborts the run and names itself.
+fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), String> {
+    use heimdall::cardano::cpo_trie::{ReconstructConfig, reconstruct};
+    use heimdall::cardano::kupo::KupoClient;
+
+    let kupo_url = cfg
+        .cardano
+        .kupo_url
+        .as_deref()
+        .ok_or("set cardano.kupo_url — reconstruction needs the datums of SPENT outputs, which a Blockfrost-compatible UTxO API cannot serve")?;
+    let tm_address = cfg
+        .cardano
+        .treasury_address
+        .as_deref()
+        .ok_or("set cardano.treasury_address (the TM validator address)")?;
+    let pegout_address = cfg
+        .cardano
+        .pegout_script_address
+        .as_deref()
+        .ok_or("set cardano.pegout_script_address")?;
+    let unit = cfg
+        .cardano
+        .bridged_token_unit
+        .as_deref()
+        .ok_or("set cardano.bridged_token_unit (<policy_hex><asset_name_hex>)")?
+        .trim()
+        .to_ascii_lowercase();
+    if unit.len() < 56 {
+        return Err(format!(
+            "cardano.bridged_token_unit '{unit}' is too short: expected a 56-hex policy id \
+             followed by the asset name"
+        ));
+    }
+    let (fbtc_policy_id, fbtc_asset_name_hex) = unit.split_at(56);
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    let kupo = KupoClient::new(kupo_url);
+    let recon = ReconstructConfig {
+        tm_address: tm_address.to_string(),
+        pegout_address: pegout_address.to_string(),
+        fbtc_policy_id: fbtc_policy_id.to_string(),
+        fbtc_asset_name_hex: fbtc_asset_name_hex.to_string(),
+    };
+    println!("reconstructing the completed-peg-outs trie via kupo {kupo_url}");
+    let trie = rt
+        .block_on(reconstruct(&kupo, &recon))
+        .map_err(|e| e.to_string())?;
+
+    println!(
+        "  reconstructed root : {} ({} entr(y|ies))",
+        hex::encode(trie.root()),
+        trie.len()
+    );
+    for (por_id, value) in trie.entries() {
+        println!("    {} -> {}", hex::encode(por_id), hex::encode(value));
+    }
+
+    if dry_run {
+        println!("  --dry-run: not written");
+        return Ok(());
+    }
+    let dir = cfg
+        .protocol
+        .state_dir
+        .as_deref()
+        .ok_or("set protocol.state_dir to persist the trie (or pass --dry-run)")?;
+    let dir = std::path::Path::new(dir);
+    trie.save(dir).map_err(|e| e.to_string())?;
+    println!(
+        "  written            : {}",
+        heimdall::cardano::cpo_trie::CpoTrie::state_path(dir).display()
+    );
+    Ok(())
 }
 
 /// Read-only `show-treasury`: chain-source the current treasury from Cardano and
@@ -4669,10 +4819,6 @@ fn run_sweep_pegins(
     broadcast: bool,
     existing_tm_hex: Option<&str>,
     exclude_pegin: &[String],
-    // Enforce the spec's peg-out pin rule: skip requests whose datum names a treasury outpoint
-    // other than this TM's input (they cannot be completed against this movement). Off by default
-    // — the payment-history filter already prevents re-payment; see `partition_by_pin`.
-    require_pegout_pin: bool,
     // Auto-mover mode (WI-028 background loop): a treasury movement already in
     // flight, or nothing pending to sweep, is a no-op skip (returns Ok) rather
     // than an error — so the loop just waits for the next tick. One-shot
@@ -4861,9 +5007,9 @@ fn run_sweep_pegins(
     }
 
     // Collect every OPEN peg-out at the peg_out.ak address (the SPO's spec job — a TM pays the
-    // pending peg-outs pinned to its own treasury input alongside sweeping every peg-in).
-    // Destination scriptPubKey + amount + pinned treasury outpoint come from each on-chain PegOut
-    // UTxO; the pin filter is applied below, once the treasury input is known.
+    // pending peg-outs alongside sweeping every peg-in). Destination scriptPubKey, gross amount,
+    // the datum-pinned per-peg-out fee, `created`, and the request identity all come from the
+    // on-chain PegOut UTxO; the skip rules are applied below and inside `build_tm`.
     // Blockfrost-backed (the demo path); the pallas N2C path is peg-in only.
     // Peg-out collection is Blockfrost-only (the N2C path is peg-in only). When no Blockfrost is
     // configured, skip it with a loud warning rather than hard-failing — an N2C-only sweep that
@@ -4977,9 +5123,7 @@ fn run_sweep_pegins(
             scan.unconfirmed.len(),
         );
 
-        let per_pegout_fee = cfg.bitcoin.per_pegout_fee_sat;
-        let (unpaid, already_paid) =
-            pegout_datum::select_unpaid(pegout_data, per_pegout_fee, &mut paid);
+        let (unpaid, already_paid) = pegout_datum::select_unpaid(pegout_data, &mut paid);
         for po in &already_paid {
             println!(
                 "  skip peg-out → {} — {} sat ({}#{}): already paid by an earlier TM (awaiting the \
@@ -4991,73 +5135,13 @@ fn run_sweep_pegins(
             );
         }
 
-        // The datum's pinned treasury outpoint decides *completability*: only the TM spending it can
-        // satisfy the on-chain produced verifier. Paying a stale-pinned request once is not a drain,
-        // but it is BTC the owner can keep while still cancelling for the fBTC — warn always, and
-        // skip under --require-pegout-pin (spec §"Deterministic skip rule (peg-outs)").
-        let (pinned_here, pinned_elsewhere) =
-            pegout_datum::partition_by_pin(unpaid, &treasury_outpoint);
-        for po in &pinned_elsewhere {
-            let verb = if require_pegout_pin {
-                "skip"
-            } else {
-                "WARNING"
-            };
-            println!(
-                "  {verb} peg-out → {} — {} sat ({}#{}): pins treasury {} but this TM spends {} — \
-                 it cannot be completed against this movement{}",
-                hex::encode(&po.destination_script_pubkey),
-                po.amount_sat,
-                po.cardano_utxo.0,
-                po.cardano_utxo.1,
-                hex::encode(po.pinned_treasury_outpoint),
-                hex::encode(heimdall::cardano::tm_chain::outpoint_bytes(
-                    &treasury_outpoint
-                )),
-                if require_pegout_pin {
-                    " (skipped)"
-                } else {
-                    " (paying anyway; pass --require-pegout-pin to skip)"
-                },
-            );
-        }
-        let payable = if require_pegout_pin {
-            pinned_here
-        } else {
-            let mut all = pinned_here;
-            all.extend(pinned_elsewhere);
-            // Restore the scan's deterministic order after the pin partition split it.
-            all.sort_by(|a, b| {
-                a.destination_script_pubkey
-                    .cmp(&b.destination_script_pubkey)
-                    .then(a.amount_sat.cmp(&b.amount_sat))
-                    .then(a.cardano_utxo.cmp(&b.cardano_utxo))
-            });
-            all
-        };
-
-        // Completability also depends on the AMOUNT, not just the pin: binocular's
-        // `PegOutProducedVerifier.scanTm` requires an output paying exactly
-        // `peg_out_amount`, which `peg_out.ak` binds to the GROSS locked fBTC
-        // quantity. `build_tm` pays gross − per_pegout_fee, so a non-zero fee means
-        // no output matches and every peg-out here is uncompletable — BTC spent,
-        // and with the not-produced (Cancel) verifier still a `fail(...)` stub the
-        // fBTC is not refundable either. The verifier's own docs say heimdall must
-        // run with per_pegout_fee = 0 until it subtracts a fee. Warn rather than
-        // refuse: the operator may target a bridge whose verifier is fee-aware.
-        // Tracked in WI-009.
-        if !payable.is_empty() && per_pegout_fee != 0 {
-            eprintln!(
-                "[sweep] WARNING: bitcoin.per_pegout_fee_sat = {per_pegout_fee} (non-zero). The \
-                 deployed peg-out produced-verifier requires an output equal to the GROSS locked \
-                 fBTC, so every peg-out this TM pays will be UNCOMPLETABLE (BTC spent, fBTC \
-                 neither burned nor refundable). Set per_pegout_fee_sat = 0 unless this bridge's \
-                 verifier subtracts the fee — but NOT while peg-outs paid under the old fee are \
-                 still open: the paid-history filter matches on gross − fee, so changing the fee \
-                 makes those payments unrecognisable and RE-PAYS them. Drain the open set first. \
-                 See WI-009."
-            );
-        }
+        // The treasury-outpoint PIN is GONE (rev 5.1). A peg-out used to name the one
+        // treasury outpoint the paying TM had to spend, and heimdall skipped requests
+        // pinned elsewhere. The completed-peg-outs trie replaces that binding: a request
+        // is completable by whichever TM pays it, proven by membership in the trie the
+        // quorum attests. `build_tm` now owns the remaining skips (already in the trie,
+        // outside the freshness window, dust, non-standard script).
+        let payable = unpaid;
 
         for po in &payable {
             println!(
@@ -5070,6 +5154,10 @@ fn run_sweep_pegins(
             pegout_requests.push(PegOutRequest {
                 script_pubkey: ScriptBuf::from_bytes(po.destination_script_pubkey.clone()),
                 amount: Amount::from_sat(po.amount_sat),
+                per_pegout_fee: Amount::from_sat(po.per_pegout_fee),
+                por_id: po.por_id,
+                outpoint: po.outpoint,
+                created: po.created,
             });
         }
     }
@@ -5081,8 +5169,24 @@ fn run_sweep_pegins(
         return Ok(());
     }
 
-    // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..] = one
-    // payment per peg-out (sorted by (scriptPubKey, amount) inside build_tm).
+    // Chain "now" for the freshness filter: the Cardano tip's block time, never the
+    // local clock — the filter is a TM skip rule, so a divergent verdict means
+    // divergent TM bytes and a failed FROST round. Without Blockfrost there are no
+    // peg-outs to filter anyway, so 0 is inert.
+    let chain_now_ms = match cfg.cardano.blockfrost_project_id.as_deref() {
+        Some(pid) if !pegout_requests.is_empty() => {
+            let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+            rt.block_on(bf_http::fetch_latest_block_time(&base_url, pid))
+                .map_err(|e| format!("chain now: {e}"))?
+                .saturating_mul(1000)
+        }
+        _ => 0,
+    };
+    let cpo_trie = cpo_trie_from_cfg(cfg)?;
+
+    // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..m] = one
+    // payment per peg-out (sorted by (scriptPubKey, net amount, por_id) inside build_tm); the LAST
+    // output is the mandatory "CPOR1" completed-peg-outs root commitment.
     let unsigned = build_tm(
         TreasuryInput {
             outpoint: treasury_outpoint,
@@ -5093,8 +5197,16 @@ fn run_sweep_pegins(
         pegout_requests,
         treasury_spk.clone(),
         &fee_params_from_cfg(cfg),
+        &freshness_from_cfg(cfg, chain_now_ms),
+        &cpo_trie,
     )
     .map_err(|e| format!("build sweep: {e}"))?;
+
+    println!(
+        "  completed-peg-outs root committed: {} ({} fulfilled peg-out(s))",
+        hex::encode(unsigned.cpo_root),
+        unsigned.fulfilled.len(),
+    );
 
     // Surface any peg-outs the TM dropped as unpayable (non-standard destination
     // or sub-dust after fee) so the operator sees them — the TM still pays the
@@ -5292,7 +5404,8 @@ fn run_sweep_pegins(
         );
         chain = chain.with_validity_window(cfg.cardano.tm_validity_window_secs.unwrap_or(1800));
         let chain = apply_tm_policy(chain, cfg)?;
-        rt.block_on(chain.submit_signed_tm(&raw))
+        let hint: Vec<[u8; 36]> = unsigned.fulfilled.iter().map(|f| f.outpoint).collect();
+        rt.block_on(chain.submit_signed_tm(&raw, &hint))
             .map_err(|e| format!("submit_signed_tm: {e}"))?;
         return Ok(());
     }

@@ -45,20 +45,182 @@ pub struct PegInInput {
 
 /// A peg-out request to fulfil from the treasury.
 ///
-/// Carries no treasury pin and no request identity: by the time a request reaches
-/// `build_tm` the caller has already dropped the ones this TM must not pay —
-/// already-paid (`pegout_datum::select_unpaid`) and, under `--require-pegout-pin`,
-/// pinned elsewhere (`pegout_datum::partition_by_pin`). `build_tm` owns only the
-/// skips that depend on the Bitcoin output itself (non-standard script, dust).
+/// Carries its own request identity (`por_id`, `outpoint`) and its own
+/// datum-pinned `per_pegout_fee`, because the rev-5.1 completed-peg-outs trie is
+/// keyed by `por_id` and valued by `dest_spk ‖ le8(amount − per_pegout_fee)` —
+/// `peg-out.ak`'s Complete branch rebuilds exactly those bytes from the request's
+/// own datum, never from a live config value.
+///
+/// The already-paid filter (`pegout_datum::select_unpaid`) still runs in the
+/// caller. `build_tm` owns the skips it can decide itself: non-standard script,
+/// sub-dust net, a `created` outside the freshness window, and a `por_id` the
+/// local trie already records as completed.
 pub struct PegOutRequest {
     pub script_pubkey: ScriptBuf,
+    /// Gross locked fBTC (satoshi).
     pub amount: Amount,
+    /// The request's OWN `per_pegout_fee` datum field. The TM pays
+    /// `amount − per_pegout_fee`.
+    pub per_pegout_fee: Amount,
+    /// `sha256(serialise_data(OutputReference))` of the request UTxO — Aiken
+    /// `bifrost/utils.hash_output_ref`. The completed-peg-outs trie key.
+    pub por_id: [u8; 32],
+    /// The request's Cardano outpoint, 36 bytes: tx hash (32) ++ output index as
+    /// 4 little-endian bytes. Published verbatim as the TM datum's
+    /// `fulfilled_por_outpoints` hint.
+    pub outpoint: [u8; 36],
+    /// `created` (POSIX ms) from the request datum — the freshness filter input.
+    pub created: i64,
 }
 
-/// Protocol fee parameters.
+/// Miner-fee parameters. The per-peg-out protocol fee is NOT here: since rev 5.1
+/// it is pinned per request in the peg-out datum (see
+/// [`PegOutRequest::per_pegout_fee`]).
 pub struct FeeParams {
     pub fee_rate_sat_per_vb: u64,
-    pub per_pegout_fee: Amount,
+}
+
+/// Freshness window for peg-out selection.
+///
+/// A peg-out this TM pays must still be un-cancellable when the TM confirms:
+/// `peg_out.ak::Cancel` refunds the requester's fBTC once
+/// `created + peg_out_cancel_timeout_ms` has passed, and a request cancelled after
+/// its BTC was paid is a double spend of treasury funds. So a request is payable
+/// only while it is at least `margin_ms` away from that deadline.
+///
+/// DETERMINISM: `now_ms` must be a CHAIN-derived time (the Cardano tip's block
+/// time), not the local wall clock, or two SPOs can classify a borderline request
+/// differently and build different TM bytes. Callers pass the same tip time they
+/// used for the rest of the chain snapshot.
+pub struct Freshness {
+    /// Chain "now", POSIX milliseconds.
+    pub now_ms: i64,
+    /// Required distance (ms) from the cancel deadline.
+    pub margin_ms: i64,
+}
+
+/// `peg_out.ak::peg_out_cancel_timeout_ms` — 30 days in ms. A request may be
+/// cancelled by its owner once `created + this` has elapsed.
+pub const PEG_OUT_CANCEL_TIMEOUT_MS: i64 = 2_592_000_000;
+
+// ---------------------------------------------------------------------------
+// Completed-peg-outs root commitment ("CPOR1")
+// ---------------------------------------------------------------------------
+
+/// First 7 bytes of a completed-peg-outs root commitment scriptPubKey:
+/// `OP_RETURN`(0x6a) `OP_PUSHBYTES_37`(0x25) `"CPOR1"`. Mirrors
+/// `TreasuryMovementValidator.RootCommitmentPrefix`.
+pub const CPO_COMMITMENT_PREFIX: [u8; 7] = [0x6a, 0x25, 0x43, 0x50, 0x4f, 0x52, 0x31];
+
+/// Length of a well-formed commitment scriptPubKey: prefix(7) + root(32) = 39.
+pub const CPO_COMMITMENT_SCRIPT_LEN: usize = 39;
+
+/// Extra vsize the commitment output costs over the 34-byte-scriptPubKey output
+/// [`estimate_vsize`] budgets for: its scriptPubKey is 39 bytes, so 5 bytes more
+/// of non-witness data (weight 4·5, vsize +5).
+const CPO_COMMITMENT_EXTRA_VBYTES: u64 = 5;
+
+/// The commitment output's scriptPubKey for `root`.
+#[must_use]
+pub fn cpo_commitment_script(root: &[u8; 32]) -> ScriptBuf {
+    let mut v = Vec::with_capacity(CPO_COMMITMENT_SCRIPT_LEN);
+    v.extend_from_slice(&CPO_COMMITMENT_PREFIX);
+    v.extend_from_slice(root);
+    ScriptBuf::from_bytes(v)
+}
+
+/// True iff `spk` is a completed-peg-outs root commitment. Length AND prefix, so
+/// a short script cannot be sliced past its end and a 39-byte payment script
+/// cannot masquerade as one.
+#[must_use]
+pub fn is_cpo_commitment(spk: &bitcoin::Script) -> bool {
+    let b = spk.as_bytes();
+    b.len() == CPO_COMMITMENT_SCRIPT_LEN
+        && b[..CPO_COMMITMENT_PREFIX.len()] == CPO_COMMITMENT_PREFIX
+}
+
+/// The completed-peg-outs root a TM attests, read from its outputs.
+///
+/// Byte-identical rule to `TreasuryMovementValidator.committedRoot`: scan the FULL
+/// output list, EXACTLY ONE commitment must be present (at any position), and the
+/// root is script bytes `[7, 39)`. Zero fails and two or more fail — the on-chain
+/// validator rejects both, so a TM built or received with either is unconfirmable.
+pub fn committed_cpo_root(tx: &Transaction) -> Result<[u8; 32], String> {
+    let mut found: Option<[u8; 32]> = None;
+    let mut count = 0usize;
+    for out in &tx.output {
+        if is_cpo_commitment(&out.script_pubkey) {
+            count += 1;
+            let mut root = [0u8; 32];
+            root.copy_from_slice(&out.script_pubkey.as_bytes()[CPO_COMMITMENT_PREFIX.len()..]);
+            found = Some(root);
+        }
+    }
+    match count {
+        1 => Ok(found.expect("count == 1")),
+        0 => Err("missing root commitment (no \"CPOR1\" OP_RETURN output)".to_string()),
+        n => Err(format!("multiple root commitments ({n} \"CPOR1\" outputs)")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Completed-peg-outs trie, as the builder sees it
+// ---------------------------------------------------------------------------
+
+/// One peg-out this TM fulfils, in the form the completed-peg-outs trie stores.
+#[derive(Debug, Clone)]
+pub struct FulfilledPegOut {
+    /// Trie key.
+    pub por_id: [u8; 32],
+    /// The request's Cardano outpoint (the TM datum's data-availability hint).
+    pub outpoint: [u8; 36],
+    /// Destination scriptPubKey, as paid.
+    pub script_pubkey: ScriptBuf,
+    /// `gross − per_pegout_fee`, as paid.
+    pub net_amount: Amount,
+}
+
+impl FulfilledPegOut {
+    /// Trie value: `scriptPubKey ‖ amount as 8 little-endian bytes`. `peg-out.ak`
+    /// rebuilds exactly these bytes, so any change here breaks peg-out completion.
+    #[must_use]
+    pub fn trie_value(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(self.script_pubkey.len() + 8);
+        v.extend_from_slice(self.script_pubkey.as_bytes());
+        v.extend_from_slice(&self.net_amount.to_sat().to_le_bytes());
+        v
+    }
+}
+
+/// The completed-peg-outs trie, as much of it as the builder needs.
+///
+/// Declared here rather than taking `cardano::cpo_trie::CpoTrie` directly so the
+/// `bitcoin` modules keep no dependency on the `cardano` ones (the same reason
+/// [`outpoint_sort_key`] is duplicated from `tm_chain`).
+pub trait CpoTrieView {
+    /// Is this peg-out already recorded as completed? A completed request must
+    /// never be paid again — the on-chain trie is append-only, so a second
+    /// payment could never be proven and the BTC would simply be gone.
+    fn contains(&self, por_id: &[u8; 32]) -> bool;
+
+    /// The root that holds after `fulfilled` is inserted. With an empty slice
+    /// this is the CURRENT root — every TM commits a root, including one that
+    /// fulfils no peg-out.
+    fn root_after(&self, fulfilled: &[FulfilledPegOut]) -> Result<[u8; 32], String>;
+}
+
+/// A trie view for callers that have no trie yet: nothing is completed and the
+/// root never moves off `root`. Test/bootstrap use only — a TM built against this
+/// commits a root that ignores the peg-outs it pays, which co-signers reject.
+pub struct FixedCpoRoot(pub [u8; 32]);
+
+impl CpoTrieView for FixedCpoRoot {
+    fn contains(&self, _por_id: &[u8; 32]) -> bool {
+        false
+    }
+    fn root_after(&self, _fulfilled: &[FulfilledPegOut]) -> Result<[u8; 32], String> {
+        Ok(self.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -71,13 +233,20 @@ pub struct UnsignedTm {
     pub txid: Txid,
     pub prevouts: Vec<TxOut>,
     pub input_spend_info: Vec<TaprootSpendInfo>,
-    /// Peg-out requests dropped from this TM by the output-level skip rule — a
-    /// non-standard destination script, or sub-dust after the per-pegout fee (see
-    /// [`SkipReason`]); already-paid and pin-mismatched requests are filtered
-    /// earlier, by `pegout_datum`, and never reach here. Surfaced so the
+    /// Peg-out requests dropped from this TM by the skip rules (see
+    /// [`SkipReason`]); already-paid requests are filtered earlier, by
+    /// `pegout_datum::select_unpaid`, and never reach here. Surfaced so the
     /// operator can see what was skipped; the user reclaims via `peg_out.ak`'s
     /// Cancel path.
     pub skipped_pegouts: Vec<SkippedPegOut>,
+    /// The peg-outs this TM pays, in payment-output order (`tx.output[1..=n]`).
+    /// Their `(por_id, trie_value())` pairs are exactly what [`Self::cpo_root`]
+    /// commits, and their `outpoint`s are the datum hint `publish.rs` writes.
+    pub fulfilled: Vec<FulfilledPegOut>,
+    /// The completed-peg-outs MPF root this TM commits, i.e. the root that holds
+    /// after [`Self::fulfilled`] is inserted. Also readable back out of the tx
+    /// with [`committed_cpo_root`] — the two agree by construction.
+    pub cpo_root: [u8; 32],
 }
 
 /// A peg-out request excluded from a TM (see [`UnsignedTm::skipped_pegouts`]).
@@ -86,6 +255,7 @@ pub struct SkippedPegOut {
     pub script_pubkey: ScriptBuf,
     /// The gross amount from the PegOut UTxO (before the per-pegout fee).
     pub amount: Amount,
+    pub por_id: [u8; 32],
     pub reason: SkipReason,
 }
 
@@ -98,6 +268,16 @@ pub enum SkipReason {
     /// The destination scriptPubKey is not a standard, spendable output type
     /// (empty / OP_RETURN / bare / non-standard) — unsafe or non-relayable.
     NonStandardScript,
+    /// The local completed-peg-outs trie already records this `por_id`. Paying it
+    /// again would spend treasury BTC for a completion that is already proven.
+    AlreadyCompleted,
+    /// `created` is in the future relative to chain now — the request cannot be
+    /// evaluated against the cancel deadline yet.
+    NotYetCreated,
+    /// The request is within the freshness margin of its cancel deadline
+    /// (`created + peg_out_cancel_timeout_ms`). Paying it risks the owner
+    /// cancelling for the fBTC after taking the BTC.
+    NearCancelDeadline,
 }
 
 impl fmt::Display for SkipReason {
@@ -105,6 +285,11 @@ impl fmt::Display for SkipReason {
         match self {
             Self::BelowDust => write!(f, "amount below dust after fee"),
             Self::NonStandardScript => write!(f, "non-standard/unspendable destination script"),
+            Self::AlreadyCompleted => write!(f, "already recorded in the completed-peg-outs trie"),
+            Self::NotYetCreated => write!(f, "datum `created` is in the future"),
+            Self::NearCancelDeadline => {
+                write!(f, "too close to the peg-out cancel deadline")
+            }
         }
     }
 }
@@ -132,6 +317,10 @@ pub enum TmBuildError {
     /// block is absent from the treasury `TaprootSpendInfo` (the leaf handed in
     /// does not belong to this tree).
     FederationLeafSpend(String),
+    /// The completed-peg-outs trie could not produce the post-TM root (duplicate
+    /// `por_id`, corrupt local state). Fatal: a TM without a correct `"CPOR1"`
+    /// commitment can never confirm on Cardano.
+    CpoRoot(String),
 }
 
 impl fmt::Display for TmBuildError {
@@ -156,6 +345,7 @@ impl fmt::Display for TmBuildError {
                  and {spend_infos} spend infos (all must match)"
             ),
             Self::FederationLeafSpend(m) => write!(f, "federation leaf spend: {m}"),
+            Self::CpoRoot(m) => write!(f, "completed-peg-outs root: {m}"),
         }
     }
 }
@@ -213,6 +403,9 @@ fn skip_reason_sort_key(r: &SkipReason) -> u8 {
     match r {
         SkipReason::BelowDust => 0,
         SkipReason::NonStandardScript => 1,
+        SkipReason::AlreadyCompleted => 2,
+        SkipReason::NotYetCreated => 3,
+        SkipReason::NearCancelDeadline => 4,
     }
 }
 
@@ -253,7 +446,8 @@ fn is_standard_payable(spk: &bitcoin::Script) -> bool {
 /// - **Locktime:** 0
 /// - **Inputs:** `[0]` = treasury, `[1..k]` = peg-ins sorted by `(txid || vout_le)`
 /// - **Outputs:** `[0]` = treasury change, `[1..m]` = peg-out payments sorted
-///   by `(script_pubkey, amount)`
+///   by `(script_pubkey, amount, por_id)`, `[m+1]` = the `"CPOR1"` commitment,
+///   always LAST and always present
 /// - **Fee:** `vsize * fee_rate_sat_per_vb`
 /// - **Change:** `sum(inputs) - sum(peg_out_outputs) - miner_fee`
 ///
@@ -265,17 +459,18 @@ pub fn build_tm(
     mut pegouts: Vec<PegOutRequest>,
     change_script_pubkey: ScriptBuf,
     fee_params: &FeeParams,
+    freshness: &Freshness,
+    cpo: &dyn CpoTrieView,
 ) -> Result<UnsignedTm, TmBuildError> {
     // --- Drop unpayable peg-outs (skip, don't abort) ---
     // The peg-out destination + amount come from attacker-controllable on-chain
     // datum (anyone can lock fBTC at the permissionlessly-payable peg_out.ak
     // address). SKIP a request the TM cannot safely pay rather than fail the
     // whole TM — one tiny/hostile peg-out must not block every peg-in and
-    // peg-out (bridge-wide liveness DoS). The user reclaims via Cancel. Two ways
-    // a request is unpayable HERE — the skips that depend on the Bitcoin output
-    // itself. The two that depend on Cardano history (already paid by an earlier
-    // TM; pinned to another treasury outpoint) are applied by the caller before
-    // this point, via `pegout_datum::select_unpaid` / `partition_by_pin`:
+    // peg-out (bridge-wide liveness DoS). The user reclaims via Cancel. Four ways
+    // a request is unpayable HERE. The one that depends on Cardano *payment*
+    // history (already paid by an earlier, not-yet-recorded TM) is applied by the
+    // caller before this point, via `pegout_datum::select_unpaid`:
     //
     //  (1) Non-standard destination scriptPubKey. An empty script is
     //      anyone-can-spend (treasury BTC claimable by anyone — fund loss),
@@ -283,66 +478,88 @@ pub fn build_tm(
     //      script makes the whole TM non-relayable (dead on arrival, taking the
     //      batched peg-ins with it). Accepting only P2PKH/P2SH/P2WPKH/P2WSH/P2TR
     //      also caps every peg-out spk at 34 bytes, so estimate_vsize's
-    //      per-output assumption stays a safe upper bound.
-    //  (2) Net (gross − per-pegout fee) below the dust threshold — no valid
-    //      output exists.
+    //      per-output assumption stays a safe upper bound — and rules out a
+    //      payment that could be mistaken for the 39-byte "CPOR1" commitment.
+    //  (2) Net (gross − the request's OWN per_pegout_fee) below the dust
+    //      threshold — no valid output exists.
+    //  (3) Already in the local completed-peg-outs trie. The trie is the record
+    //      of what the FROST quorum has attested; re-paying an entry in it spends
+    //      treasury BTC for a completion that is already provable.
+    //  (4) Outside the freshness window: `created` in the future, or within
+    //      `margin_ms` of `created + PEG_OUT_CANCEL_TIMEOUT_MS`. A request the
+    //      owner can cancel after taking the BTC is a treasury double spend.
     //
     // DETERMINISM: every SPO must skip the SAME set to build byte-identical TMs
-    // for FROST. The script check is network-independent; the dust check needs
-    // `per_pegout_fee` to be a consensus value — see WI-009 /
-    // technical_questions.md §2. (The proper long-term fix for (2) is the
-    // contract rejecting sub-min peg-outs at lock time via a config min-fbtc
-    // value; for (1), validating the destination at lock time.)
+    // for FROST. (1) is network-independent, (2) now reads a datum-pinned fee so
+    // it is a consensus value, (3) is consensus once the trie is chain-attested,
+    // and (4) is consensus only insofar as `freshness.now_ms` is chain-derived —
+    // see [`Freshness`].
     let mut skipped_pegouts = Vec::new();
     pegouts.retain(|po| {
+        let mut skip = |reason| {
+            skipped_pegouts.push(SkippedPegOut {
+                script_pubkey: po.script_pubkey.clone(),
+                amount: po.amount,
+                por_id: po.por_id,
+                reason,
+            });
+            false
+        };
         if !is_standard_payable(&po.script_pubkey) {
-            skipped_pegouts.push(SkippedPegOut {
-                script_pubkey: po.script_pubkey.clone(),
-                amount: po.amount,
-                reason: SkipReason::NonStandardScript,
-            });
-            return false;
+            return skip(SkipReason::NonStandardScript);
         }
-        let payable = matches!(
-            po.amount.checked_sub(fee_params.per_pegout_fee),
+        if cpo.contains(&po.por_id) {
+            return skip(SkipReason::AlreadyCompleted);
+        }
+        if po.created > freshness.now_ms {
+            return skip(SkipReason::NotYetCreated);
+        }
+        // Saturating: a `created` near i64::MAX must not wrap into "fresh".
+        let deadline = po.created.saturating_add(PEG_OUT_CANCEL_TIMEOUT_MS);
+        if deadline.saturating_sub(freshness.now_ms) < freshness.margin_ms {
+            return skip(SkipReason::NearCancelDeadline);
+        }
+        if !matches!(
+            po.amount.checked_sub(po.per_pegout_fee),
             Some(net) if net >= DUST_THRESHOLD
-        );
-        if !payable {
-            skipped_pegouts.push(SkippedPegOut {
-                script_pubkey: po.script_pubkey.clone(),
-                amount: po.amount,
-                reason: SkipReason::BelowDust,
-            });
+        ) {
+            return skip(SkipReason::BelowDust);
         }
-        payable
+        true
     });
 
     // --- Sort peg-in inputs lexicographically by (txid || vout_le) ---
     pegins.sort_by(|a, b| outpoint_sort_key(&a.outpoint).cmp(&outpoint_sort_key(&b.outpoint)));
 
-    // --- Sort peg-out outputs by (script_pubkey, amount) ---
-    // Spec orders outputs by raw scriptPubKey; amount breaks ties. The amount
+    // --- Sort peg-out outputs by (script_pubkey, net amount, por_id) ---
+    // Spec orders outputs by raw scriptPubKey; the net amount breaks ties. That
     // tiebreaker is load-bearing: with a spk-only comparator two requests sharing
     // a destination but differing in amount would keep their caller-supplied
     // relative order (sort_by is stable), so the TM bytes — and therefore the
     // FROST message — would depend on the order the chain query happened to
-    // return, which is not a consensus input. Beyond that no tiebreaker is needed
-    // — and none is available: requests equal in BOTH spk and amount produce
-    // byte-identical TxOuts, so their relative order cannot change the tx, and a
-    // `PegOutRequest` carries nothing else (no pin, no request id) precisely
-    // because everything that distinguishes such requests was already applied
-    // upstream by `pegout_datum`.
+    // return, which is not a consensus input. `por_id` is the final tiebreaker:
+    // two requests equal in spk and net amount produce byte-identical TxOuts, so
+    // their order cannot change the tx, but it DOES change the order of
+    // `UnsignedTm::fulfilled` and hence of the datum hint. Sorting on the unique
+    // `por_id` makes that list a function of the selected set alone.
+    //
+    // Sort on the NET amount (what the output pays), not the gross: two requests
+    // with different gross amounts and different datum fees can pay the same net,
+    // and it is the paid value that decides output order.
     pegouts.sort_by(|a, b| {
+        let net = |p: &PegOutRequest| p.amount.to_sat().saturating_sub(p.per_pegout_fee.to_sat());
         a.script_pubkey
             .as_bytes()
             .cmp(b.script_pubkey.as_bytes())
-            .then(a.amount.cmp(&b.amount))
+            .then(net(a).cmp(&net(b)))
+            .then(a.por_id.cmp(&b.por_id))
     });
 
     // --- Build inputs ---
     let num_inputs = 1 + pegins.len();
     let num_pegout_outputs = pegouts.len();
-    let num_outputs = num_pegout_outputs + 1; // +1 for change
+    // +1 change, +1 the mandatory "CPOR1" commitment.
+    let num_outputs = num_pegout_outputs + 2;
 
     let mut inputs = Vec::with_capacity(num_inputs);
     let mut prevouts = Vec::with_capacity(num_inputs);
@@ -384,22 +601,36 @@ pub fn build_tm(
     // --- Compute peg-out totals ---
     let mut total_pegout = Amount::ZERO;
     let mut pegout_outputs = Vec::with_capacity(num_pegout_outputs);
+    let mut fulfilled = Vec::with_capacity(num_pegout_outputs);
 
     for po in pegouts.iter() {
         // `retain` above guarantees net >= DUST_THRESHOLD for every remaining peg-out.
         let net_amount = po
             .amount
-            .checked_sub(fee_params.per_pegout_fee)
+            .checked_sub(po.per_pegout_fee)
             .expect("retained => amount > fee");
         total_pegout = total_pegout.checked_add(net_amount).expect("no overflow");
         pegout_outputs.push(TxOut {
             value: net_amount,
             script_pubkey: po.script_pubkey.clone(),
         });
+        fulfilled.push(FulfilledPegOut {
+            por_id: po.por_id,
+            outpoint: po.outpoint,
+            script_pubkey: po.script_pubkey.clone(),
+            net_amount,
+        });
     }
 
+    // --- The attested completed-peg-outs root ---
+    // Computed from the SELECTED set, so it is a function of the same skip rules
+    // every SPO applies. A zero-peg-out TM re-commits the unchanged root.
+    let cpo_root = cpo.root_after(&fulfilled).map_err(TmBuildError::CpoRoot)?;
+
     // --- Estimate fee ---
-    let vsize = estimate_vsize(num_inputs, num_outputs);
+    // The commitment output's scriptPubKey is 39 bytes, 5 more than the 34-byte
+    // budget `estimate_vsize` assumes per output.
+    let vsize = estimate_vsize(num_inputs, num_outputs) + CPO_COMMITMENT_EXTRA_VBYTES;
     let miner_fee = Amount::from_sat(vsize * fee_params.fee_rate_sat_per_vb);
 
     let required = total_pegout.checked_add(miner_fee).expect("no overflow");
@@ -430,6 +661,14 @@ pub fn build_tm(
         script_pubkey: change_script_pubkey,
     });
     outputs.extend(pegout_outputs);
+    // The commitment is LAST. Its position is free (the validator scans the whole
+    // output list), but a fixed position keeps the layout a stated invariant that
+    // co-signers and reconstruction can both rely on. Value 0: an OP_RETURN output
+    // is provably unspendable, so a zero value is standard and burns nothing.
+    outputs.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: cpo_commitment_script(&cpo_root),
+    });
 
     // --- Assemble transaction ---
     let tx = Transaction {
@@ -451,6 +690,7 @@ pub fn build_tm(
             .cmp(b.script_pubkey.as_bytes())
             .then(a.amount.cmp(&b.amount))
             .then_with(|| skip_reason_sort_key(&a.reason).cmp(&skip_reason_sort_key(&b.reason)))
+            .then(a.por_id.cmp(&b.por_id))
     });
 
     Ok(UnsignedTm {
@@ -459,7 +699,40 @@ pub fn build_tm(
         prevouts,
         input_spend_info,
         skipped_pegouts,
+        fulfilled,
+        cpo_root,
     })
+}
+
+/// Re-derive the completed-peg-outs root a TM SHOULD commit and compare it with
+/// the root the TM actually commits — the co-signer's pre-signing gate.
+///
+/// `fulfilled` is the peg-out set the verifier independently determined this TM
+/// pays (for a self-built TM, [`UnsignedTm::fulfilled`]; for a peer proposal, the
+/// set the verifier resolved from the proposal's payment outputs). `cpo` is the
+/// verifier's OWN persisted trie. A mismatch means the proposer's trie disagrees
+/// with the verifier's, and signing would attest a root the verifier cannot
+/// justify — so the caller MUST refuse to sign.
+///
+/// This also catches a TM with zero or several `"CPOR1"` outputs, which the
+/// on-chain Confirm branch rejects outright.
+pub fn verify_committed_root(
+    tx: &Transaction,
+    fulfilled: &[FulfilledPegOut],
+    cpo: &dyn CpoTrieView,
+) -> Result<[u8; 32], String> {
+    let committed = committed_cpo_root(tx)?;
+    let expected = cpo.root_after(fulfilled)?;
+    if committed != expected {
+        return Err(format!(
+            "completed-peg-outs root mismatch: TM commits {}, local trie expects {} \
+             after {} fulfilled peg-out(s)",
+            hex::encode(committed),
+            hex::encode(expected),
+            fulfilled.len(),
+        ));
+    }
+    Ok(committed)
 }
 
 // ---------------------------------------------------------------------------
@@ -761,21 +1034,77 @@ mod tests {
         }
     }
 
+    /// Chain "now" every test builds against, and the default 7-day freshness
+    /// margin. `make_pegout` dates requests 1 day ago, comfortably inside the
+    /// 30-day cancel window.
+    const NOW_MS: i64 = 1_700_000_000_000;
+    const MARGIN_MS: i64 = 7 * 24 * 3600 * 1000;
+    const DAY_MS: i64 = 24 * 3600 * 1000;
+    const TEST_FEE: u64 = 1_000;
+
+    fn fresh() -> Freshness {
+        Freshness {
+            now_ms: NOW_MS,
+            margin_ms: MARGIN_MS,
+        }
+    }
+
+    /// An empty completed-peg-outs trie: nothing completed yet, genesis root.
+    fn empty_cpo() -> crate::cardano::cpo_trie::CpoTrie {
+        crate::cardano::cpo_trie::CpoTrie::empty()
+    }
+
+    /// `build_tm` with the default freshness window and an empty trie — the
+    /// shape almost every test wants.
+    fn build_tm_t(
+        treasury: TreasuryInput,
+        pegins: Vec<PegInInput>,
+        pegouts: Vec<PegOutRequest>,
+        change_script_pubkey: ScriptBuf,
+        fee_params: &FeeParams,
+    ) -> Result<UnsignedTm, TmBuildError> {
+        build_tm(
+            treasury,
+            pegins,
+            pegouts,
+            change_script_pubkey,
+            fee_params,
+            &fresh(),
+            &empty_cpo(),
+        )
+    }
+
     /// A payable peg-out with a valid P2TR-length destination (34 bytes:
-    /// OP_1 <32-byte key>).
+    /// OP_1 <32-byte key>). Identity is derived from `(script_byte, sats)` so
+    /// two calls with the same arguments describe the same request.
     fn make_pegout(script_byte: u8, sats: u64) -> PegOutRequest {
+        make_pegout_full(script_byte, sats, TEST_FEE, NOW_MS - DAY_MS)
+    }
+
+    fn make_pegout_full(script_byte: u8, sats: u64, fee: u64, created: i64) -> PegOutRequest {
+        use bitcoin::hashes::{Hash as _, sha256};
         let secp = Secp256k1::new();
         let key = xonly_from_seed([script_byte; 32]);
+        let mut tag = Vec::new();
+        tag.push(script_byte);
+        tag.extend_from_slice(&sats.to_le_bytes());
+        tag.extend_from_slice(&fee.to_le_bytes());
+        let por_id = sha256::Hash::hash(&tag).to_byte_array();
+        let mut outpoint = [0u8; 36];
+        outpoint[..32].copy_from_slice(&por_id);
         PegOutRequest {
             script_pubkey: ScriptBuf::new_p2tr(&secp, key, None),
             amount: Amount::from_sat(sats),
+            per_pegout_fee: Amount::from_sat(fee),
+            por_id,
+            outpoint,
+            created,
         }
     }
 
     fn default_fee_params() -> FeeParams {
         FeeParams {
             fee_rate_sat_per_vb: 10,
-            per_pegout_fee: Amount::from_sat(1_000),
         }
     }
 
@@ -801,7 +1130,7 @@ mod tests {
         assert_eq!(sk.x_only_public_key(&secp).0, xonly_from_seed([1u8; 32]));
 
         let fee_params = default_fee_params();
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 1_000_000),
             vec![make_pegin_input(0xBB, 0, 500_000)],
             vec![],
@@ -853,7 +1182,7 @@ mod tests {
         let treasury_si = treasury_spend_info(&secp, y_51, y_fed, 144);
         let pegin_si = pegin_spend_info(&secp, y_51, depositor, 720);
 
-        let tm = build_tm(
+        let tm = build_tm_t(
             TreasuryInput {
                 outpoint: OutPoint {
                     txid: make_txid(0xAA),
@@ -904,7 +1233,7 @@ mod tests {
         let change = change_address();
 
         let build = || {
-            build_tm(
+            build_tm_t(
                 make_treasury_input(0xAA, 10_000_000),
                 vec![make_pegin_input(0xBB, 0, 5_000_000)],
                 vec![make_pegout(0x10, 100_000)],
@@ -934,7 +1263,7 @@ mod tests {
             make_pegin_input(0xBB, 0, 1_000_000),
         ];
 
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(treasury_txid_byte, 10_000_000),
             pegins,
             vec![make_pegout(0x10, 50_000)],
@@ -976,7 +1305,7 @@ mod tests {
             scripts
         };
 
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![],
             vec![po1, po2, po3],
@@ -1005,7 +1334,7 @@ mod tests {
         let fee_params = default_fee_params();
         let change = change_address();
 
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![make_pegin_input(0xBB, 0, 5_000_000)],
             vec![make_pegout(0x10, 100_000)],
@@ -1016,7 +1345,10 @@ mod tests {
 
         let total_in: u64 = tm.prevouts.iter().map(|p| p.value.to_sat()).sum();
         let total_out: u64 = tm.tx.output.iter().map(|o| o.value.to_sat()).sum();
-        let vsize = estimate_vsize(tm.tx.input.len(), tm.tx.output.len());
+        // The commitment output is budgeted as a normal output PLUS the 5 extra
+        // bytes its 39-byte scriptPubKey costs over the 34-byte assumption.
+        let vsize =
+            estimate_vsize(tm.tx.input.len(), tm.tx.output.len()) + CPO_COMMITMENT_EXTRA_VBYTES;
         let expected_fee = vsize * fee_params.fee_rate_sat_per_vb;
 
         assert_eq!(total_in - total_out, expected_fee);
@@ -1028,7 +1360,7 @@ mod tests {
         let change = change_address();
         let requested = 100_000u64;
 
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![],
             vec![make_pegout(0x10, requested)],
@@ -1038,10 +1370,7 @@ mod tests {
         .unwrap();
 
         // Output 0 is change; output 1 is the pegout
-        assert_eq!(
-            tm.tx.output[1].value.to_sat(),
-            requested - fee_params.per_pegout_fee.to_sat()
-        );
+        assert_eq!(tm.tx.output[1].value.to_sat(), requested - TEST_FEE);
     }
 
     // Unfulfillable peg-outs (amount <= fee, or net below dust) are SKIPPED, not
@@ -1052,7 +1381,7 @@ mod tests {
         let fee_params = default_fee_params(); // per_pegout_fee = 1000, dust = 330
         let change = change_address();
 
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![],
             vec![
@@ -1065,12 +1394,11 @@ mod tests {
         )
         .unwrap();
 
-        // Only the payable peg-out is paid (output[0] is change).
-        assert_eq!(tm.tx.output.len(), 2);
-        assert_eq!(
-            tm.tx.output[1].value.to_sat(),
-            100_000 - fee_params.per_pegout_fee.to_sat()
-        );
+        // Only the payable peg-out is paid (output[0] is change, last is the
+        // commitment).
+        assert_eq!(tm.tx.output.len(), 3);
+        assert_eq!(tm.tx.output[1].value.to_sat(), 100_000 - TEST_FEE);
+        assert!(is_cpo_commitment(&tm.tx.output[2].script_pubkey));
         // The two unfulfillable ones are reported as skipped, with gross amounts.
         assert_eq!(tm.skipped_pegouts.len(), 2);
         let mut skipped: Vec<u64> = tm
@@ -1092,14 +1420,14 @@ mod tests {
             make_pegout(0x10, 100_000), // P2TR — payable
             PegOutRequest {
                 script_pubkey: ScriptBuf::new(), // empty (anyone-can-spend)
-                amount: Amount::from_sat(100_000),
+                ..make_pegout(0x20, 100_000)
             },
             PegOutRequest {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x02, 0xde, 0xad]), // OP_RETURN
-                amount: Amount::from_sat(100_000),
+                ..make_pegout(0x21, 100_000)
             },
         ];
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![],
             pegouts,
@@ -1108,7 +1436,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(tm.tx.output.len(), 2); // change + the one P2TR payment
+        assert_eq!(tm.tx.output.len(), 3); // change + the P2TR payment + commitment
         assert_eq!(tm.skipped_pegouts.len(), 2);
         assert!(
             tm.skipped_pegouts
@@ -1125,7 +1453,7 @@ mod tests {
         let fee_params = default_fee_params();
         // Same destination, different amounts — plus a second destination.
         let build = |pegouts| {
-            build_tm(
+            build_tm_t(
                 make_treasury_input(0xAA, 10_000_000),
                 vec![],
                 pegouts,
@@ -1145,8 +1473,9 @@ mod tests {
             make_pegout(0x10, 100_000),
         ]);
 
-        assert_eq!(a.tx.output.len(), 4);
+        assert_eq!(a.tx.output.len(), 5); // change + 3 payments + commitment
         assert_eq!(a.txid, b.txid, "TM bytes must not depend on input order");
+        assert_eq!(a.cpo_root, b.cpo_root);
     }
 
     // A TM built entirely of unfulfillable peg-outs still succeeds (no payments,
@@ -1154,7 +1483,7 @@ mod tests {
     #[test]
     fn test_all_pegouts_skipped_still_builds() {
         let fee_params = default_fee_params();
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![],
             vec![make_pegout(0x11, 500), make_pegout(0x12, 900)],
@@ -1162,8 +1491,465 @@ mod tests {
             &fee_params,
         )
         .unwrap();
-        assert_eq!(tm.tx.output.len(), 1); // change only
+        assert_eq!(tm.tx.output.len(), 2); // change + commitment only
         assert_eq!(tm.skipped_pegouts.len(), 2);
+        assert!(tm.fulfilled.is_empty());
+    }
+
+    // --- CPOR1 root commitment ---
+
+    // Byte-exact shape: the on-chain reader slices bytes [7, 39) of a 39-byte
+    // scriptPubKey whose first 7 bytes are OP_RETURN OP_PUSHBYTES_37 "CPOR1".
+    #[test]
+    fn commitment_script_is_the_39_byte_cpor1_layout() {
+        let root = [0x5a; 32];
+        let spk = cpo_commitment_script(&root);
+        assert_eq!(spk.len(), CPO_COMMITMENT_SCRIPT_LEN);
+        assert_eq!(
+            hex::encode(&spk.as_bytes()[..7]),
+            "6a2543504f5231",
+            "OP_RETURN OP_PUSHBYTES_37 \"CPOR1\""
+        );
+        assert_eq!(&spk.as_bytes()[7..], &root);
+        assert!(is_cpo_commitment(&spk));
+    }
+
+    // Every TM commits, in the LAST output, at value 0 — including one that
+    // fulfils no peg-out (it re-commits the unchanged root).
+    #[test]
+    fn every_tm_emits_exactly_one_commitment_last_at_value_zero() {
+        for pegouts in [vec![], vec![make_pegout(0x10, 100_000)]] {
+            let tm = build_tm_t(
+                make_treasury_input(0xAA, 10_000_000),
+                vec![],
+                pegouts,
+                change_address(),
+                &default_fee_params(),
+            )
+            .unwrap();
+            let last = tm.tx.output.last().unwrap();
+            assert!(is_cpo_commitment(&last.script_pubkey), "commitment is last");
+            assert_eq!(last.value, Amount::ZERO);
+            assert_eq!(
+                tm.tx
+                    .output
+                    .iter()
+                    .filter(|o| is_cpo_commitment(&o.script_pubkey))
+                    .count(),
+                1,
+                "exactly one — the validator rejects zero and rejects two"
+            );
+            assert_eq!(committed_cpo_root(&tm.tx).unwrap(), tm.cpo_root);
+        }
+    }
+
+    // A zero-peg-out TM commits the trie's CURRENT root, unchanged.
+    #[test]
+    fn a_zero_pegout_tm_commits_the_unchanged_root() {
+        use crate::cardano::cpo_trie::{CpoEntry, CpoTrie};
+        let mut trie = CpoTrie::empty();
+        trie.insert_batch(&[CpoEntry::new([9u8; 32], &[0xaa; 22], 4242)])
+            .unwrap();
+        let before = trie.root();
+
+        let tm = build_tm(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![],
+            change_address(),
+            &default_fee_params(),
+            &fresh(),
+            &trie,
+        )
+        .unwrap();
+        assert_eq!(tm.cpo_root, before);
+        assert_eq!(committed_cpo_root(&tm.tx).unwrap(), before);
+    }
+
+    // The root is a function of the SELECTED set only: peg-outs the skip rules
+    // dropped must not appear in it, and feeding the same set in a different order
+    // must produce the same bytes.
+    #[test]
+    fn the_committed_root_covers_exactly_the_paid_set() {
+        use crate::cardano::cpo_trie::{CpoEntry, CpoTrie};
+        let paid = make_pegout(0x10, 100_000);
+        let dust = make_pegout(0x11, 500); // below dust after the fee
+        let expected_entry = CpoEntry::new(
+            paid.por_id,
+            paid.script_pubkey.as_bytes(),
+            100_000 - TEST_FEE,
+        );
+
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![make_pegout(0x11, 500), make_pegout(0x10, 100_000)],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+
+        assert_eq!(tm.fulfilled.len(), 1);
+        assert_eq!(tm.fulfilled[0].por_id, paid.por_id);
+        assert_eq!(
+            tm.cpo_root,
+            CpoTrie::empty().root_after(&[expected_entry]).unwrap(),
+            "the skipped peg-out must not be in the root"
+        );
+        let _ = dust;
+    }
+
+    // Determinism: two SPOs handed the same requests in opposite order commit the
+    // same root AND build the same bytes.
+    #[test]
+    fn the_committed_root_does_not_depend_on_input_order() {
+        let build = |pegouts| {
+            build_tm_t(
+                make_treasury_input(0xAA, 10_000_000),
+                vec![],
+                pegouts,
+                change_address(),
+                &default_fee_params(),
+            )
+            .unwrap()
+        };
+        let a = build(vec![
+            make_pegout(0x10, 100_000),
+            make_pegout(0x11, 200_000),
+            make_pegout(0x12, 300_000),
+        ]);
+        let b = build(vec![
+            make_pegout(0x12, 300_000),
+            make_pegout(0x10, 100_000),
+            make_pegout(0x11, 200_000),
+        ]);
+        assert_eq!(a.cpo_root, b.cpo_root);
+        assert_eq!(a.txid, b.txid);
+        let ids_a: Vec<[u8; 32]> = a.fulfilled.iter().map(|f| f.por_id).collect();
+        let ids_b: Vec<[u8; 32]> = b.fulfilled.iter().map(|f| f.por_id).collect();
+        assert_eq!(ids_a, ids_b, "the hint order must be a function of the set");
+    }
+
+    // Two requests identical in destination and net amount produce byte-identical
+    // TxOuts but DIFFERENT por_ids — so `fulfilled` (and hence the datum hint)
+    // must still be ordered deterministically, by por_id.
+    #[test]
+    fn fulfilled_order_is_total_across_identical_payments() {
+        let p1 = make_pegout_full(0x10, 100_000, TEST_FEE, NOW_MS - DAY_MS);
+        let mut p2 = make_pegout_full(0x10, 100_000, TEST_FEE, NOW_MS - DAY_MS);
+        // Same payment, different request identity.
+        p2.por_id = [0xff; 32];
+        p2.outpoint = [0xff; 36];
+        assert_ne!(p1.por_id, p2.por_id);
+
+        let build = |pegouts| {
+            build_tm_t(
+                make_treasury_input(0xAA, 10_000_000),
+                vec![],
+                pegouts,
+                change_address(),
+                &default_fee_params(),
+            )
+            .unwrap()
+        };
+        let a = build(vec![
+            make_pegout_full(0x10, 100_000, TEST_FEE, NOW_MS - DAY_MS),
+            PegOutRequest {
+                por_id: [0xff; 32],
+                outpoint: [0xff; 36],
+                ..make_pegout_full(0x10, 100_000, TEST_FEE, NOW_MS - DAY_MS)
+            },
+        ]);
+        let b = build(vec![
+            PegOutRequest {
+                por_id: [0xff; 32],
+                outpoint: [0xff; 36],
+                ..make_pegout_full(0x10, 100_000, TEST_FEE, NOW_MS - DAY_MS)
+            },
+            make_pegout_full(0x10, 100_000, TEST_FEE, NOW_MS - DAY_MS),
+        ]);
+        let ids_a: Vec<[u8; 32]> = a.fulfilled.iter().map(|f| f.por_id).collect();
+        let ids_b: Vec<[u8; 32]> = b.fulfilled.iter().map(|f| f.por_id).collect();
+        assert_eq!(ids_a, ids_b);
+        assert_eq!(a.cpo_root, b.cpo_root);
+        let _ = (p1, p2);
+    }
+
+    // A peg-out cannot smuggle itself in as the commitment: the prefix begins with
+    // OP_RETURN, which `is_standard_payable` rejects outright.
+    #[test]
+    fn a_pegout_cannot_masquerade_as_the_commitment() {
+        let hostile = PegOutRequest {
+            script_pubkey: cpo_commitment_script(&[0xde; 32]),
+            ..make_pegout(0x10, 100_000)
+        };
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![hostile],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+        assert_eq!(tm.skipped_pegouts.len(), 1);
+        assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::NonStandardScript);
+        assert_eq!(committed_cpo_root(&tm.tx).unwrap(), tm.cpo_root);
+    }
+
+    #[test]
+    fn committed_cpo_root_rejects_zero_and_multiple_commitments() {
+        let mut tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+        // Two commitments — what the on-chain validator refuses to choose between.
+        tm.tx.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: cpo_commitment_script(&[0x11; 32]),
+        });
+        assert!(committed_cpo_root(&tm.tx).is_err());
+        // None at all.
+        tm.tx
+            .output
+            .retain(|o| !is_cpo_commitment(&o.script_pubkey));
+        assert!(committed_cpo_root(&tm.tx).is_err());
+    }
+
+    // --- per-request fee ---
+
+    // The fee is per REQUEST now: two peg-outs in one TM with different datum fees
+    // each pay their own gross − own fee.
+    #[test]
+    fn each_pegout_pays_its_own_datum_fee() {
+        let a = make_pegout_full(0x10, 100_000, 1_000, NOW_MS - DAY_MS);
+        let b = make_pegout_full(0x11, 100_000, 7_500, NOW_MS - DAY_MS);
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![a, b],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+        let mut paid: Vec<u64> = tm.fulfilled.iter().map(|f| f.net_amount.to_sat()).collect();
+        paid.sort_unstable();
+        assert_eq!(paid, vec![92_500, 99_000]);
+    }
+
+    // The dust rule reads the request's own fee, not a shared one.
+    #[test]
+    fn dust_is_measured_against_the_requests_own_fee() {
+        // Same gross; only the pinned fee differs.
+        let payable = make_pegout_full(0x10, 1_500, 1_000, NOW_MS - DAY_MS); // net 500 >= 330
+        let dusty = make_pegout_full(0x11, 1_500, 1_400, NOW_MS - DAY_MS); // net 100 < 330
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![payable, dusty],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+        assert_eq!(tm.fulfilled.len(), 1);
+        assert_eq!(tm.fulfilled[0].net_amount.to_sat(), 500);
+        assert_eq!(tm.skipped_pegouts.len(), 1);
+        assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::BelowDust);
+    }
+
+    // --- freshness filter ---
+
+    // A request close to its 30-day Cancel deadline must be skipped: the owner
+    // could take the BTC and then Cancel for the fBTC.
+    #[test]
+    fn a_pegout_near_its_cancel_deadline_is_skipped() {
+        // Cancel fires at created + 30 days. Age it so only 6 days remain, inside
+        // the 7-day margin.
+        let created = NOW_MS - (PEG_OUT_CANCEL_TIMEOUT_MS - 6 * DAY_MS);
+        let stale = make_pegout_full(0x10, 100_000, TEST_FEE, created);
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![stale],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+        assert!(tm.fulfilled.is_empty());
+        assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::NearCancelDeadline);
+    }
+
+    // Exactly at the margin is still payable; one millisecond past it is not.
+    #[test]
+    fn the_freshness_margin_boundary_is_inclusive() {
+        let at_margin = NOW_MS - (PEG_OUT_CANCEL_TIMEOUT_MS - MARGIN_MS);
+        let build = |created| {
+            build_tm_t(
+                make_treasury_input(0xAA, 10_000_000),
+                vec![],
+                vec![make_pegout_full(0x10, 100_000, TEST_FEE, created)],
+                change_address(),
+                &default_fee_params(),
+            )
+            .unwrap()
+        };
+        assert_eq!(build(at_margin).fulfilled.len(), 1, "exactly at the margin");
+        assert!(
+            build(at_margin - 1).fulfilled.is_empty(),
+            "one ms past the margin"
+        );
+    }
+
+    // A `created` in the future cannot be evaluated against the deadline. It is
+    // also attacker-controllable (the requester writes it), so skip rather than
+    // guess.
+    #[test]
+    fn a_pegout_created_in_the_future_is_skipped() {
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![make_pegout_full(0x10, 100_000, TEST_FEE, NOW_MS + 1)],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+        assert!(tm.fulfilled.is_empty());
+        assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::NotYetCreated);
+    }
+
+    // `created` at i64::MAX must not wrap the deadline arithmetic into "fresh".
+    #[test]
+    fn an_absurd_created_does_not_overflow_the_deadline() {
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![make_pegout_full(0x10, 100_000, TEST_FEE, i64::MAX)],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+        assert!(tm.fulfilled.is_empty());
+        assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::NotYetCreated);
+    }
+
+    // --- already-completed skip ---
+
+    // The trie is the durable record of what has been paid and proven. A request
+    // already in it must never be paid again — its BTC would be unrecoverable.
+    #[test]
+    fn a_pegout_already_in_the_trie_is_skipped() {
+        use crate::cardano::cpo_trie::{CpoEntry, CpoTrie};
+        let done = make_pegout(0x10, 100_000);
+        let open = make_pegout(0x11, 200_000);
+        let mut trie = CpoTrie::empty();
+        trie.insert_batch(&[CpoEntry::new(
+            done.por_id,
+            done.script_pubkey.as_bytes(),
+            100_000 - TEST_FEE,
+        )])
+        .unwrap();
+
+        let tm = build_tm(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![make_pegout(0x10, 100_000), make_pegout(0x11, 200_000)],
+            change_address(),
+            &default_fee_params(),
+            &fresh(),
+            &trie,
+        )
+        .unwrap();
+
+        assert_eq!(tm.fulfilled.len(), 1);
+        assert_eq!(tm.fulfilled[0].por_id, open.por_id);
+        assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::AlreadyCompleted);
+        let _ = done;
+    }
+
+    // --- verify_committed_root (the co-signer gate) ---
+
+    #[test]
+    fn verify_committed_root_accepts_a_tm_built_from_the_same_trie() {
+        use crate::cardano::cpo_trie::CpoTrie;
+        let trie = CpoTrie::empty();
+        let tm = build_tm(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![make_pegout(0x10, 100_000)],
+            change_address(),
+            &default_fee_params(),
+            &fresh(),
+            &trie,
+        )
+        .unwrap();
+        let root = verify_committed_root(&tm.tx, &tm.fulfilled, &trie).unwrap();
+        assert_eq!(root, tm.cpo_root);
+    }
+
+    // A leader whose trie is AHEAD of ours proposes a root we cannot derive — we
+    // must refuse rather than attest it.
+    #[test]
+    fn verify_committed_root_refuses_a_root_from_a_divergent_trie() {
+        use crate::cardano::cpo_trie::{CpoEntry, CpoTrie};
+        let mut leader_trie = CpoTrie::empty();
+        leader_trie
+            .insert_batch(&[CpoEntry::new([0x99; 32], &[0x77; 22], 1234)])
+            .unwrap();
+        let tm = build_tm(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![make_pegout(0x10, 100_000)],
+            change_address(),
+            &default_fee_params(),
+            &fresh(),
+            &leader_trie,
+        )
+        .unwrap();
+        let err = verify_committed_root(&tm.tx, &tm.fulfilled, &CpoTrie::empty()).unwrap_err();
+        assert!(err.contains("root mismatch"), "{err}");
+    }
+
+    // A TM that pays a peg-out but leaves it out of the committed root is the
+    // dangerous case: the BTC moves and the completion can never be proven.
+    #[test]
+    fn verify_committed_root_refuses_a_root_that_omits_a_paid_pegout() {
+        use crate::cardano::cpo_trie::CpoTrie;
+        let trie = CpoTrie::empty();
+        let mut tm = build_tm(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![make_pegout(0x10, 100_000)],
+            change_address(),
+            &default_fee_params(),
+            &fresh(),
+            &trie,
+        )
+        .unwrap();
+        // Rewrite the commitment to the pre-payment (empty) root.
+        let last = tm.tx.output.len() - 1;
+        tm.tx.output[last].script_pubkey = cpo_commitment_script(&trie.root());
+        assert!(verify_committed_root(&tm.tx, &tm.fulfilled, &trie).is_err());
+    }
+
+    #[test]
+    fn verify_committed_root_refuses_a_tm_with_no_commitment() {
+        use crate::cardano::cpo_trie::CpoTrie;
+        let trie = CpoTrie::empty();
+        let mut tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+        tm.tx
+            .output
+            .retain(|o| !is_cpo_commitment(&o.script_pubkey));
+        assert!(verify_committed_root(&tm.tx, &[], &trie).is_err());
     }
 
     #[test]
@@ -1171,7 +1957,7 @@ mod tests {
         let fee_params = default_fee_params();
         let change = change_address();
 
-        let result = build_tm(
+        let result = build_tm_t(
             make_treasury_input(0xAA, 1_000), // very little
             vec![],
             vec![make_pegout(0x10, 100_000)],
@@ -1192,7 +1978,7 @@ mod tests {
         let fee_params = default_fee_params();
         let change = change_address();
 
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![],
             vec![make_pegout(0x10, 100_000)],
@@ -1202,18 +1988,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(tm.tx.input.len(), 1); // just treasury
-        assert_eq!(tm.tx.output.len(), 2); // pegout + change
+        assert_eq!(tm.tx.output.len(), 3); // change + pegout + commitment
     }
 
     #[test]
     fn test_no_pegouts() {
         let fee_params = FeeParams {
             fee_rate_sat_per_vb: 10,
-            per_pegout_fee: Amount::ZERO,
         };
         let change = change_address();
 
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![make_pegin_input(0xBB, 0, 5_000_000)],
             vec![],
@@ -1223,18 +2008,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(tm.tx.input.len(), 2); // treasury + pegin
-        assert_eq!(tm.tx.output.len(), 1); // change only
+        assert_eq!(tm.tx.output.len(), 2); // change + commitment
     }
 
     #[test]
     fn test_no_pegins_no_pegouts() {
         let fee_params = FeeParams {
             fee_rate_sat_per_vb: 10,
-            per_pegout_fee: Amount::ZERO,
         };
         let change = change_address();
 
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![],
             vec![],
@@ -1244,7 +2028,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(tm.tx.input.len(), 1); // just treasury
-        assert_eq!(tm.tx.output.len(), 1); // just change
+        assert_eq!(tm.tx.output.len(), 2); // change + commitment
     }
 
     // --- Sighash ---
@@ -1254,7 +2038,7 @@ mod tests {
         let fee_params = default_fee_params();
         let change = change_address();
 
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![make_pegin_input(0xBB, 0, 5_000_000)],
             vec![make_pegout(0x10, 100_000)],
@@ -1272,7 +2056,7 @@ mod tests {
         let fee_params = default_fee_params();
         let change = change_address();
 
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![
                 make_pegin_input(0xBB, 0, 2_000_000),
@@ -1299,7 +2083,7 @@ mod tests {
         let change = change_address();
 
         let build = || {
-            build_tm(
+            build_tm_t(
                 make_treasury_input(0xAA, 10_000_000),
                 vec![make_pegin_input(0xBB, 0, 5_000_000)],
                 vec![make_pegout(0x10, 100_000)],
@@ -1345,7 +2129,7 @@ mod tests {
 
         // Build a simple TM: one treasury input, one pegout, change back
         let fee_params = default_fee_params();
-        let tm = build_tm(
+        let tm = build_tm_t(
             TreasuryInput {
                 outpoint: OutPoint {
                     txid: make_txid(0xAA),
@@ -1432,7 +2216,7 @@ mod tests {
 
         let secp = Secp256k1::new();
         // treasury locked under (Y_51 = seed[1], y_fed = seed[3], csv = 144)
-        let tm = build_tm(
+        let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![],
             vec![],
