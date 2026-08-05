@@ -281,6 +281,10 @@ pub struct BlockfrostHistory {
     /// One client for the whole run. Reconstruction issues one request per
     /// transaction, and a per-request client would open a socket for each.
     client: reqwest::Client,
+    /// Backoff schedule for transient failures ([`retry::DEFAULT_DELAYS`]). A
+    /// field rather than a constant so a test can assert the retry BEHAVIOUR in
+    /// milliseconds instead of the seconds production wants.
+    delays: Vec<std::time::Duration>,
 }
 
 /// One attempt's failure, classified so the retry wrapper can tell a blip from a
@@ -357,7 +361,15 @@ impl BlockfrostHistory {
             base_url: bf_http::base_url(project_id, custom_url),
             project_id: project_id.to_string(),
             client: reqwest::Client::new(),
+            delays: retry::DEFAULT_DELAYS.to_vec(),
         }
+    }
+
+    /// Shorten the backoff so a retry test runs in milliseconds.
+    #[cfg(test)]
+    fn with_delays(mut self, delays: Vec<std::time::Duration>) -> Self {
+        self.delays = delays;
+        self
     }
 
     /// `GET {base_url}/{path}`, retried through transient failures.
@@ -397,7 +409,7 @@ impl BlockfrostHistory {
                 .map_err(|e| Fail::Permanent(format!("{path} json: {e}")))
         };
         retry::retry_transient(
-            &retry::DEFAULT_DELAYS,
+            &self.delays,
             "cpo-history",
             |e| matches!(e, Fail::Transient(_)),
             attempt,
@@ -659,6 +671,7 @@ mod tests {
     };
     use crate::cardano::plutus::{array, bytes, constr, int, int_from_u64};
     use bitcoin::hashes::Hash as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // -- the synthetic world both fake servers serve ------------------------
     //
@@ -683,9 +696,41 @@ mod tests {
         output_index: u32,
         /// unit -> quantity, Blockfrost form.
         assets: BTreeMap<String, u64>,
-        /// Inline datum CBOR. `None` = an output with no datum at all.
+        /// Datum CBOR. `None` = an output with no datum at all.
+        datum: Option<Vec<u8>>,
+        /// Is the datum stored INLINE in the output?
+        ///
+        /// Only the Blockfrost rendering cares. `true` puts the bytes in
+        /// `inline_datum`; `false` sends `data_hash` alone, so the client must go
+        /// to `/scripts/datum/{hash}/cbor` for the preimage. Kupo always reports a
+        /// hash and a separate `/datums/{hash}` fetch either way, which is exactly
+        /// why the two backends must still agree.
+        inline: bool,
+        spent: bool,
+    }
+
+    /// A `FxOut` with an inline datum — the common case.
+    fn fx(
+        address: &str,
+        tx_hash: String,
+        output_index: u32,
+        assets: BTreeMap<String, u64>,
         datum: Option<Vec<u8>>,
         spent: bool,
+    ) -> FxOut {
+        FxOut {
+            address: address.to_string(),
+            tx_hash,
+            output_index,
+            assets,
+            datum,
+            inline: true,
+            spent,
+        }
+    }
+
+    fn datum_hash_hex(d: &[u8]) -> String {
+        hex::encode(crate::cardano::hash::blake2b_256(d))
     }
 
     fn pd_hex(d: &PlutusData) -> Vec<u8> {
@@ -749,8 +794,8 @@ mod tests {
                         "output_index": o.output_index,
                         "address": o.address,
                         "value": { "coins": 2_000_000, "assets": assets },
-                        "datum_hash": o.datum.as_ref().map(|d| hex::encode(crate::cardano::hash::blake2b_256(d))),
-                        "datum_type": o.datum.as_ref().map(|_| "inline"),
+                        "datum_hash": o.datum.as_deref().map(datum_hash_hex),
+                        "datum_type": o.datum.as_ref().map(|_| if o.inline { "inline" } else { "hash" }),
                         "created_at": { "slot_no": 1 },
                         "spent_at": o.spent.then(|| serde_json::json!({ "slot_no": 2 })),
                     })
@@ -765,8 +810,8 @@ mod tests {
         ) -> axum::Json<serde_json::Value> {
             let found = world.iter().find_map(|o| {
                 o.datum
-                    .as_ref()
-                    .filter(|d| hex::encode(crate::cardano::hash::blake2b_256(d)) == hash)
+                    .as_deref()
+                    .filter(|d| datum_hash_hex(d) == hash)
                     .map(hex::encode)
             });
             axum::Json(serde_json::json!({ "datum": found }))
@@ -781,12 +826,31 @@ mod tests {
 
     // --- Blockfrost-shaped fake server ------------------------------------
 
+    /// How the fake serves `/scripts/datum/{hash}` — the branchy part of
+    /// [`BlockfrostHistory::datum_by_hash`].
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DatumRoute {
+        /// `/scripts/datum/{hash}/cbor` returns `{"cbor": ...}`. What Blockfrost does.
+        Cbor,
+        /// Only the non-`/cbor` route exists, and it carries a `cbor` field.
+        NonCborRouteOnly,
+        /// Both routes exist but serve only `json_value` — no recoverable bytes.
+        JsonValueOnly,
+        /// Neither route knows the hash. The preimage is gone.
+        Missing,
+    }
+
     async fn spawn_blockfrost(world: Vec<FxOut>) -> String {
+        spawn_blockfrost_with(world, DatumRoute::Cbor).await
+    }
+
+    async fn spawn_blockfrost_with(world: Vec<FxOut>, mode: DatumRoute) -> String {
         use axum::extract::{Path, State};
         use axum::routing::get;
         use std::sync::Arc;
 
         type W = Arc<Vec<FxOut>>;
+        type S = (W, DatumRoute);
 
         // Every distinct tx hash that created an output at `address`. The real
         // endpoint also lists transactions that only SPENT there; the fake adds
@@ -794,7 +858,7 @@ mod tests {
         // handling is exercised.
         async fn address_txs(
             Path(address): Path<String>,
-            State(world): State<W>,
+            State((world, _)): State<S>,
         ) -> axum::Json<serde_json::Value> {
             let mut hashes: Vec<String> = Vec::new();
             for o in world.iter().filter(|o| o.address == address) {
@@ -812,9 +876,19 @@ mod tests {
             axum::Json(serde_json::json!(items))
         }
 
+        /// An output's datum as `/txs/{hash}/utxos` reports it: bytes in
+        /// `inline_datum` for an inline datum, `data_hash` ALONE otherwise.
+        fn datum_fields(o: &FxOut) -> (Option<String>, Option<String>) {
+            match (&o.datum, o.inline) {
+                (None, _) => (None, None),
+                (Some(d), true) => (Some(hex::encode(d)), Some(datum_hash_hex(d))),
+                (Some(d), false) => (None, Some(datum_hash_hex(d))),
+            }
+        }
+
         async fn tx_utxos(
             Path(hash): Path<String>,
-            State(world): State<W>,
+            State((world, _)): State<S>,
         ) -> axum::Json<serde_json::Value> {
             let outputs: Vec<serde_json::Value> = world
                 .iter()
@@ -828,21 +902,64 @@ mod tests {
                             "unit": u, "quantity": q.to_string()
                         }));
                     }
+                    let (inline_datum, data_hash) = datum_fields(o);
                     serde_json::json!({
                         "address": o.address,
                         "output_index": o.output_index,
                         "amount": amount,
-                        "inline_datum": o.datum.as_ref().map(hex::encode),
-                        "data_hash": o.datum.as_ref().map(|d| hex::encode(crate::cardano::hash::blake2b_256(d))),
+                        "inline_datum": inline_datum,
+                        "data_hash": data_hash,
                     })
                 })
                 .collect();
             axum::Json(serde_json::json!({ "hash": hash, "inputs": [], "outputs": outputs }))
         }
 
+        /// `/scripts/datum/{hash}` and `/scripts/datum/{hash}/cbor`, behaving as
+        /// `mode` says. A 404 means "this route does not serve that hash".
+        async fn scripts_datum(
+            Path(hash): Path<String>,
+            State((world, mode)): State<S>,
+        ) -> axum::response::Response {
+            scripts_datum_inner(&hash, &world, mode, true)
+        }
+
+        async fn scripts_datum_cbor(
+            Path(hash): Path<String>,
+            State((world, mode)): State<S>,
+        ) -> axum::response::Response {
+            scripts_datum_inner(&hash, &world, mode, false)
+        }
+
+        fn scripts_datum_inner(
+            hash: &str,
+            world: &[FxOut],
+            mode: DatumRoute,
+            plain_route: bool,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse as _;
+            let not_found = || axum::http::StatusCode::NOT_FOUND.into_response();
+            let Some(d) = world
+                .iter()
+                .filter_map(|o| o.datum.as_deref())
+                .find(|d| datum_hash_hex(d) == hash)
+            else {
+                return not_found();
+            };
+            let body = match (mode, plain_route) {
+                (DatumRoute::Missing, _) => return not_found(),
+                (DatumRoute::Cbor, true) | (DatumRoute::NonCborRouteOnly, false) => {
+                    return not_found();
+                }
+                (DatumRoute::JsonValueOnly, _) => serde_json::json!({ "json_value": { "int": 1 } }),
+                _ => serde_json::json!({ "cbor": hex::encode(d) }),
+            };
+            axum::Json(body).into_response()
+        }
+
         async fn asset_addresses(
             Path(unit): Path<String>,
-            State(world): State<W>,
+            State((world, _)): State<S>,
         ) -> axum::Json<serde_json::Value> {
             let mut addrs: Vec<String> = Vec::new();
             for o in world
@@ -862,7 +979,7 @@ mod tests {
 
         async fn address_asset_utxos(
             Path((address, unit)): Path<(String, String)>,
-            State(world): State<W>,
+            State((world, _)): State<S>,
         ) -> axum::Json<serde_json::Value> {
             let items: Vec<serde_json::Value> = world
                 .iter()
@@ -876,11 +993,13 @@ mod tests {
                             "unit": u, "quantity": q.to_string()
                         }));
                     }
+                    let (inline_datum, data_hash) = datum_fields(o);
                     serde_json::json!({
                         "tx_hash": o.tx_hash,
                         "output_index": o.output_index,
                         "amount": amount,
-                        "inline_datum": o.datum.as_ref().map(hex::encode),
+                        "inline_datum": inline_datum,
+                        "data_hash": data_hash,
                     })
                 })
                 .collect();
@@ -890,12 +1009,14 @@ mod tests {
         let app = axum::Router::new()
             .route("/addresses/{address}/transactions", get(address_txs))
             .route("/txs/{hash}/utxos", get(tx_utxos))
+            .route("/scripts/datum/{hash}", get(scripts_datum))
+            .route("/scripts/datum/{hash}/cbor", get(scripts_datum_cbor))
             .route("/assets/{unit}/addresses", get(asset_addresses))
             .route(
                 "/addresses/{address}/utxos/{unit}",
                 get(address_asset_utxos),
             )
-            .with_state(Arc::new(world));
+            .with_state((Arc::new(world) as W, mode));
         serve(app).await
     }
 
@@ -1020,66 +1141,75 @@ mod tests {
 
         let world = vec![
             // The Unconfirmed record, SPENT by its own Confirm transition — the
-            // whole reason reconstruction needs spent outputs.
-            FxOut {
-                address: TM_ADDR.into(),
-                tx_hash: "a1".repeat(32),
-                output_index: 0,
-                assets: BTreeMap::new(),
-                datum: Some(pd_hex(&unconfirmed)),
-                spent: true,
-            },
+            // whole reason reconstruction needs spent outputs. Inline datum.
+            fx(
+                TM_ADDR,
+                "a1".repeat(32),
+                0,
+                BTreeMap::new(),
+                Some(pd_hex(&unconfirmed)),
+                true,
+            ),
+            // The Confirmed record, deliberately NOT inline.
+            //
+            // On the Blockfrost path this is the only output whose datum the walk
+            // cannot read from `/txs/{hash}/utxos`; it must go to
+            // `/scripts/datum/{hash}/cbor`. Reconstruction hard-errors on an
+            // unresolvable datum at the TM address, so this fixture succeeding is
+            // proof the hash-only path resolved — and the equivalence test then
+            // proves it resolved to the same bytes Kupo serves.
             FxOut {
                 address: TM_ADDR.into(),
                 tx_hash: "b2".repeat(32),
                 output_index: 0,
                 assets: BTreeMap::new(),
                 datum: Some(pd_hex(&confirmed)),
+                inline: false,
                 spent: false,
             },
             // A junk UTxO at the permissionlessly-payable TM address: its datum
             // resolves, it just is not a TM record.
-            FxOut {
-                address: TM_ADDR.into(),
-                tx_hash: "c3".repeat(32),
-                output_index: 7,
-                assets: BTreeMap::new(),
-                datum: Some(pd_hex(&bytes(b"junk"))),
-                spent: false,
-            },
-            FxOut {
-                address: PEGOUT_ADDR.into(),
-                tx_hash: hex::encode(por_tx_a),
-                output_index: 0,
-                assets: assets_of(&[(&fbtc, gross_a)]),
-                datum: Some(pd_hex(&pegout_datum(&spk_a))),
-                spent: true,
-            },
-            FxOut {
-                address: PEGOUT_ADDR.into(),
-                tx_hash: hex::encode(por_tx_b),
-                output_index: 1,
-                assets: assets_of(&[(&fbtc, gross_b)]),
-                datum: Some(pd_hex(&pegout_datum(&spk_b))),
-                spent: true,
-            },
+            fx(
+                TM_ADDR,
+                "c3".repeat(32),
+                7,
+                BTreeMap::new(),
+                Some(pd_hex(&bytes(b"junk"))),
+                false,
+            ),
+            fx(
+                PEGOUT_ADDR,
+                hex::encode(por_tx_a),
+                0,
+                assets_of(&[(&fbtc, gross_a)]),
+                Some(pd_hex(&pegout_datum(&spk_a))),
+                true,
+            ),
+            fx(
+                PEGOUT_ADDR,
+                hex::encode(por_tx_b),
+                1,
+                assets_of(&[(&fbtc, gross_b)]),
+                Some(pd_hex(&pegout_datum(&spk_b))),
+                true,
+            ),
             // Value sent to the peg-out address that is not a request (no fBTC).
-            FxOut {
-                address: PEGOUT_ADDR.into(),
-                tx_hash: "ee".repeat(32),
-                output_index: 0,
-                assets: BTreeMap::new(),
-                datum: None,
-                spent: false,
-            },
-            FxOut {
-                address: CPO_ADDR.into(),
-                tx_hash: "cf".repeat(32),
-                output_index: 0,
-                assets: assets_of(&[(&cpo_unit, 1)]),
-                datum: Some(pd_hex(&cpo_datum)),
-                spent: false,
-            },
+            fx(
+                PEGOUT_ADDR,
+                "ee".repeat(32),
+                0,
+                BTreeMap::new(),
+                None,
+                false,
+            ),
+            fx(
+                CPO_ADDR,
+                "cf".repeat(32),
+                0,
+                assets_of(&[(&cpo_unit, 1)]),
+                Some(pd_hex(&cpo_datum)),
+                false,
+            ),
         ];
         (world, root)
     }
@@ -1211,38 +1341,115 @@ mod tests {
     /// `datum: None`, so `reconstruct` can hard-error on it. A backend that
     /// dropped the output instead would produce a trie that silently omits a
     /// movement.
+    ///
+    /// Both backends must fail the SAME way. Kupo loses a preimage by being run
+    /// with `--prune-utxo`; a Blockfrost-compatible API loses one by not serving
+    /// `/scripts/datum/{hash}`. Different causes, identical verdict.
     #[tokio::test]
-    async fn an_unresolvable_datum_is_surfaced_not_dropped() {
-        // Kupo that knows the hash but has no preimage (a --prune-utxo index).
-        let world = vec![FxOut {
-            address: TM_ADDR.into(),
-            tx_hash: "a1".repeat(32),
-            output_index: 0,
-            assets: BTreeMap::new(),
-            datum: Some(pd_hex(&bytes(b"whatever"))),
-            spent: true,
-        }];
-        let url = spawn_pruned_kupo(world).await;
-        let hist = KupoHistory::new(&url)
-            .address_history(TM_ADDR)
-            .await
-            .unwrap();
-        assert_eq!(hist.len(), 1);
-        assert!(hist[0].datum.is_none());
-        assert!(
-            hist[0].datum_note.contains("no preimage"),
-            "{}",
-            hist[0].datum_note
-        );
+    async fn an_unresolvable_datum_hard_errors_the_same_way_on_both_backends() {
+        // Kupo that knows the hash but answers `{"datum": null}`.
+        let kupo_url = spawn_pruned_kupo(vec![fx(
+            TM_ADDR,
+            "a1".repeat(32),
+            0,
+            BTreeMap::new(),
+            Some(pd_hex(&bytes(b"whatever"))),
+            true,
+        )])
+        .await;
+        // Blockfrost serving the SHARED world, whose Confirmed TM record is
+        // hash-only, with both datum routes 404ing.
+        let (w, _) = world();
+        let bf_url = spawn_blockfrost_with(w, DatumRoute::Missing).await;
 
-        // And reconstruction refuses to continue past it.
-        let err = reconstruct(&KupoHistory::new(&url), &recon_cfg())
-            .await
-            .unwrap_err();
+        let kupo = KupoHistory::new(&kupo_url);
+        let bf = BlockfrostHistory::new("preprodtest", Some(&bf_url));
+
+        // 1. The output is SURFACED, not dropped, by both.
+        for (name, hist) in [
+            ("kupo", kupo.address_history(TM_ADDR).await.unwrap()),
+            ("blockfrost", bf.address_history(TM_ADDR).await.unwrap()),
+        ] {
+            let gap = hist
+                .iter()
+                .find(|o| o.datum.is_none())
+                .unwrap_or_else(|| panic!("{name}: the unresolvable output must still be listed"));
+            assert!(
+                gap.datum_note.contains("preimage"),
+                "{name}: {}",
+                gap.datum_note
+            );
+        }
+
+        // 2. Reconstruction refuses to continue past it, on both.
+        for (name, source) in [
+            ("kupo", &kupo as &dyn CpoHistorySource),
+            ("blockfrost", &bf as &dyn CpoHistorySource),
+        ] {
+            let err = reconstruct(source, &recon_cfg()).await.unwrap_err();
+            assert!(matches!(err, CpoTrieError::Source(_)), "{name}: {err}");
+            let msg = format!("{err}");
+            assert!(msg.contains("unexplained gap"), "{name}: {msg}");
+            assert!(
+                msg.contains(source.datum_gap_advice()),
+                "{name} must carry its OWN remediation: {msg}"
+            );
+        }
+    }
+
+    /// The hash-only path, end to end and on the shared fixture: the Confirmed TM
+    /// record's datum lives behind `/scripts/datum/{hash}/cbor`, so a trie only
+    /// comes out if that fetch worked. Kupo reads the same record through
+    /// `/datums/{hash}` and must land on the same root.
+    #[tokio::test]
+    async fn blockfrost_resolves_a_hash_only_datum() {
+        let (w, expected_root) = world();
         assert!(
-            matches!(err, CpoTrieError::Source(_)) && format!("{err}").contains("unexplained gap"),
-            "{err}"
+            w.iter().any(|o| o.datum.is_some() && !o.inline),
+            "the shared fixture must contain a hash-only datum"
         );
+        let bf_url = spawn_blockfrost(w).await;
+        let trie = reconstruct(
+            &BlockfrostHistory::new("preprodtest", Some(&bf_url)),
+            &recon_cfg(),
+        )
+        .await
+        .expect("the hash-only datum must resolve through /scripts/datum/{hash}/cbor");
+        assert_eq!(trie.root(), expected_root);
+        assert_eq!(trie.len(), 2);
+    }
+
+    /// Some backends serve the CBOR on the plain `/scripts/datum/{hash}` route
+    /// instead of the `/cbor` one. The client tries both before giving up.
+    #[tokio::test]
+    async fn blockfrost_falls_back_to_the_non_cbor_datum_route() {
+        let (w, expected_root) = world();
+        let bf_url = spawn_blockfrost_with(w, DatumRoute::NonCborRouteOnly).await;
+        let trie = reconstruct(
+            &BlockfrostHistory::new("preprodtest", Some(&bf_url)),
+            &recon_cfg(),
+        )
+        .await
+        .expect("the plain /scripts/datum/{hash} route must be tried too");
+        assert_eq!(trie.root(), expected_root);
+    }
+
+    /// A backend that offers only the JSON-value form of a datum is "no preimage",
+    /// never a guess. The JSON form cannot be re-serialized to the exact bytes the
+    /// datum hash commits to, so accepting it would put unverifiable data into a
+    /// trie this node signs with.
+    #[tokio::test]
+    async fn blockfrost_treats_a_json_only_datum_as_no_preimage() {
+        let (w, _) = world();
+        let bf_url = spawn_blockfrost_with(w, DatumRoute::JsonValueOnly).await;
+        let err = reconstruct(
+            &BlockfrostHistory::new("preprodtest", Some(&bf_url)),
+            &recon_cfg(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CpoTrieError::Source(_)), "{err}");
+        assert!(format!("{err}").contains("unexplained gap"), "{err}");
     }
 
     /// A Kupo whose `/datums/{hash}` always answers `{"datum": null}`.
@@ -1264,7 +1471,7 @@ mod tests {
                         "output_index": o.output_index,
                         "address": o.address,
                         "value": { "coins": 2_000_000, "assets": {} },
-                        "datum_hash": o.datum.as_ref().map(|d| hex::encode(crate::cardano::hash::blake2b_256(d))),
+                        "datum_hash": o.datum.as_deref().map(datum_hash_hex),
                         "datum_type": "inline",
                         "created_at": { "slot_no": 1 },
                         "spent_at": null,
@@ -1291,27 +1498,145 @@ mod tests {
     #[tokio::test]
     async fn blockfrost_ignores_foreign_outputs_and_spend_only_transactions() {
         let world = vec![
-            FxOut {
-                address: TM_ADDR.into(),
-                tx_hash: "aa".repeat(32),
-                output_index: 1,
-                assets: BTreeMap::new(),
-                datum: Some(pd_hex(&bytes(b"mine"))),
-                spent: false,
-            },
-            FxOut {
-                address: "someone_else".into(),
-                tx_hash: "aa".repeat(32),
-                output_index: 0,
-                assets: BTreeMap::new(),
-                datum: Some(pd_hex(&bytes(b"theirs"))),
-                spent: false,
-            },
+            fx(
+                TM_ADDR,
+                "aa".repeat(32),
+                1,
+                BTreeMap::new(),
+                Some(pd_hex(&bytes(b"mine"))),
+                false,
+            ),
+            fx(
+                "someone_else",
+                "aa".repeat(32),
+                0,
+                BTreeMap::new(),
+                Some(pd_hex(&bytes(b"theirs"))),
+                false,
+            ),
         ];
         let bf = BlockfrostHistory::new("preprodtest", Some(&spawn_blockfrost(world).await));
         let hist = bf.address_history(TM_ADDR).await.unwrap();
         assert_eq!(hist.len(), 1, "only the output AT the address");
         assert_eq!(hist[0].output_index, 1);
+    }
+
+    // -- retry classification ----------------------------------------------
+    //
+    // The Blockfrost path issues one request per transaction, so it WILL meet a
+    // 429 on a long history. Misclassifying one costs the whole reconstruction:
+    // giving up on a transient failure aborts a rare, expensive command, and
+    // retrying a permanent one just repeats it. Each class is pinned separately.
+
+    /// A server that replies with `codes[n]` to the nth request, then 200.
+    ///
+    /// Returns the URL and the request counter, so a test can assert HOW MANY
+    /// attempts happened, not merely that the call eventually succeeded.
+    async fn spawn_flaky(codes: Vec<u16>) -> (String, std::sync::Arc<AtomicUsize>) {
+        use axum::extract::State;
+        use axum::response::IntoResponse as _;
+        use axum::routing::get;
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        type S = (Arc<Vec<u16>>, Arc<AtomicUsize>);
+
+        async fn handler(State((codes, hits)): State<S>) -> axum::response::Response {
+            let n = hits.fetch_add(1, Ordering::SeqCst);
+            match codes.get(n) {
+                Some(&code) => (
+                    axum::http::StatusCode::from_u16(code).unwrap(),
+                    "backend says no",
+                )
+                    .into_response(),
+                None => axum::Json(serde_json::json!([])).into_response(),
+            }
+        }
+
+        let app = axum::Router::new()
+            .route("/addresses/{address}/transactions", get(handler))
+            .with_state((Arc::new(codes), Arc::clone(&hits)));
+        (serve(app).await, hits)
+    }
+
+    /// Millisecond backoff so a retry assertion is not a seven-second test.
+    fn fast_delays() -> Vec<std::time::Duration> {
+        vec![
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_429_is_retried_until_it_succeeds() {
+        let (url, hits) = spawn_flaky(vec![429]).await;
+        let bf = BlockfrostHistory::new("preprodtest", Some(&url)).with_delays(fast_delays());
+        bf.address_history("addr").await.expect("retried past 429");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one retry, then success");
+    }
+
+    #[tokio::test]
+    async fn a_5xx_is_retried_and_gives_up_after_the_schedule() {
+        let (url, hits) = spawn_flaky(vec![503, 500, 502, 500]).await;
+        let bf = BlockfrostHistory::new("preprodtest", Some(&url)).with_delays(fast_delays());
+        let err = bf.address_history("addr").await.unwrap_err();
+        assert!(
+            err.contains("503") || err.contains("500") || err.contains("502"),
+            "{err}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "attempts = delays + 1, then the error surfaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_4xx_is_permanent_and_not_retried() {
+        let (url, hits) = spawn_flaky(vec![400, 400, 400, 400]).await;
+        let bf = BlockfrostHistory::new("preprodtest", Some(&url)).with_delays(fast_delays());
+        let err = bf.address_history("addr").await.unwrap_err();
+        assert!(err.contains("400"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "no retry for a 4xx");
+    }
+
+    /// 404 is an ANSWER — "no history at this address" — not a failure. Conflating
+    /// it with an error would make a cold-start reconstruction of a fresh bridge
+    /// fail instead of returning an empty trie.
+    #[tokio::test]
+    async fn a_404_is_an_empty_answer_not_an_error() {
+        let (url, hits) = spawn_flaky(vec![404, 404, 404]).await;
+        let bf = BlockfrostHistory::new("preprodtest", Some(&url)).with_delays(fast_delays());
+        assert!(bf.address_history("addr").await.unwrap().is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "no retry for a 404");
+    }
+
+    /// A 200 whose body is not JSON is the backend's final word, not a blip.
+    #[tokio::test]
+    async fn an_unparsable_body_is_permanent() {
+        use axum::routing::get;
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/addresses/{address}/transactions",
+            get(move || {
+                let counted = Arc::clone(&counted);
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    "not json at all"
+                }
+            }),
+        );
+        let url = serve(app).await;
+        let bf = BlockfrostHistory::new("preprodtest", Some(&url)).with_delays(fast_delays());
+        let err = bf.address_history("addr").await.unwrap_err();
+        assert!(err.contains("json"), "{err}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "no retry for a parse failure"
+        );
     }
 
     // -- pure unit tests ---------------------------------------------------

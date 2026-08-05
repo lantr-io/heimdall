@@ -4531,11 +4531,10 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
         fbtc_asset_name_hex: fbtc_asset_name_hex.to_string(),
         cpo_policy_id: Some(cpo_policy_id),
     };
-    println!(
-        "reconstructing the completed-peg-outs trie via {} {}",
-        source.backend(),
-        source.endpoint()
-    );
+    // `reconstruct` itself logs the active backend and its endpoint before its
+    // first read, so every caller reports it identically and this command does not
+    // repeat the line.
+    println!("reconstructing the completed-peg-outs trie");
     let trie = rt
         .block_on(reconstruct(source.as_ref(), &recon))
         .map_err(|e| e.to_string())?;
