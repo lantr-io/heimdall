@@ -521,6 +521,25 @@ pub enum MpfError {
     RootMismatch,
 }
 
+impl std::fmt::Display for MpfError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            Self::KeyPresent => "key already present",
+            Self::KeyAbsent => "key absent from the trie",
+            Self::ProofTooDeep => "proof is deeper than the 64-nibble path",
+            Self::CursorOutOfRange => "proof step pushes the cursor past the path",
+            Self::BadNeighborsLen => "Branch neighbors blob is not 128 bytes",
+            Self::BadNibble => "Fork neighbor nibble is not a 4-bit value",
+            Self::BadHashLen => "a 32-byte field has the wrong length",
+            Self::InvalidFork => "Fork/Leaf neighbor shares the path's branch nibble",
+            Self::RootMismatch => "computed root does not match the expected root",
+        };
+        f.write_str(msg)
+    }
+}
+
+impl std::error::Error for MpfError {}
+
 /// A trie node. Radix-16 Patricia with prefix (`skip`) compression.
 ///
 /// Children are `Arc`-shared so rebuilding the insert path clones cheap pointers
