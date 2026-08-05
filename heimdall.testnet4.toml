@@ -28,4 +28,8 @@ submit = false
 # No local treasury UTXO fields: the anchor outpoint lives on-chain in
 # the bridge Config UTxO (field 11) and the current treasury is resolved
 # by walking the Confirmed Treasury Movement chain — set the [cardano]
+# Kupo base URL. Needed ONLY by `reconstruct-cpo-trie`, which rebuilds the
+# completed-peg-outs trie from the inline datums of already-SPENT outputs — a read
+# a Blockfrost-compatible UTxO API cannot serve. Steady-state operation never uses it.
+# kupo_url = "http://localhost:1442"
 # config_address / config_nft_* fields for the SPO daemon.

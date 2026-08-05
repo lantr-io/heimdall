@@ -9,6 +9,10 @@ federation_timeout_secs = 300
 leader_timeout_secs = 10000
 pegin_collection_window_secs = 5
 pegin_poll_interval_ms = 1000
+# A peg-out is payable only while at least this far from its 30-day Cancel
+# deadline. Paying one later lets the owner take the BTC and then Cancel for the
+# fBTC. MUST match across SPOs — it is a TM skip rule. 7 days.
+pegout_freshness_margin_ms = 604800000
 
 [bitcoin]
 network = "testnet4"
@@ -32,6 +36,10 @@ submit = false          # broadcast signed BTC tx to rpc_url (false: binocular r
 # anchor's satoshi value is fetched via rpc_url gettxout.
 
 [cardano]
+# Kupo base URL. Needed ONLY by `reconstruct-cpo-trie`, which rebuilds the
+# completed-peg-outs trie from the inline datums of already-SPENT outputs — a read
+# a Blockfrost-compatible UTxO API cannot serve. Steady-state operation never uses it.
+# kupo_url = "http://localhost:1442"
 blockfrost_project_id = "preprodsTOaoyjcqGmy4SOSazxuHkbuXFOOkp8f"
 # socket_path = "/run/cardano-node/node.socket"
 # network_magic = 1
