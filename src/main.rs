@@ -4477,6 +4477,23 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
     }
     let (fbtc_policy_id, fbtc_asset_name_hex) = unit.split_at(56);
 
+    // Required, not optional. Every per-movement assertion is relative to the
+    // previous movement, so a replay that stops one TM short of the tip passes
+    // every one of them and still yields a short trie. Only the on-chain singleton
+    // catches that, and a node signing off a short trie proposes roots the quorum
+    // refuses while producing membership proofs `peg-out.ak` rejects.
+    let cpo_policy_id = cfg
+        .cardano
+        .cpo_policy_id
+        .as_deref()
+        .ok_or(
+            "set cardano.cpo_policy_id — the reconstructed trie is cross-checked against the \
+             on-chain completed-peg-outs singleton, and that is the only check covering the \
+             finished trie as a whole",
+        )?
+        .trim()
+        .to_ascii_lowercase();
+
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
     let kupo = KupoClient::new(kupo_url);
     let recon = ReconstructConfig {
@@ -4484,6 +4501,7 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
         pegout_address: pegout_address.to_string(),
         fbtc_policy_id: fbtc_policy_id.to_string(),
         fbtc_asset_name_hex: fbtc_asset_name_hex.to_string(),
+        cpo_policy_id: Some(cpo_policy_id),
     };
     println!("reconstructing the completed-peg-outs trie via kupo {kupo_url}");
     let trie = rt
@@ -5404,7 +5422,24 @@ fn run_sweep_pegins(
         );
         chain = chain.with_validity_window(cfg.cardano.tm_validity_window_secs.unwrap_or(1800));
         let chain = apply_tm_policy(chain, cfg)?;
-        let hint: Vec<[u8; 36]> = unsigned.fulfilled.iter().map(|f| f.outpoint).collect();
+        // The data-availability hint describes the peg-outs of the tx being posted.
+        // Under --existing-tm-hex the posted bytes are somebody ELSE'S transaction:
+        // the locally built TM's `fulfilled` list says nothing about which requests
+        // that tx pays, and attaching it would publish a hint that points at the
+        // wrong peg-out requests. Post an empty hint instead — the field is
+        // unverified and reconstruction's fallback matcher recovers the true set
+        // from the tx's own payment outputs against the attested root, so the only
+        // cost is a slower rebuild.
+        let hint: Vec<[u8; 36]> = if override_in_effect {
+            println!(
+                "  [override] posting an EMPTY fulfilled_por_outpoints hint: the overriding tx \
+                 is not the locally built TM, so the local peg-out set does not describe it. \
+                 Reconstruction falls back to matching payments against the committed root."
+            );
+            Vec::new()
+        } else {
+            unsigned.fulfilled.iter().map(|f| f.outpoint).collect()
+        };
         rt.block_on(chain.submit_signed_tm(&raw, &hint))
             .map_err(|e| format!("submit_signed_tm: {e}"))?;
         return Ok(());

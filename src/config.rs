@@ -219,6 +219,14 @@ pub struct CardanoConfig {
     /// operation never touches it, so a node with a healthy `cpo-trie.json` runs
     /// without Kupo configured.
     pub kupo_url: Option<String>,
+    /// Policy id (script hash) of the completed-peg-outs trie validator — Config
+    /// field 3. It identifies the on-chain CPO singleton (asset name `"CPO"`).
+    ///
+    /// `reconstruct-cpo-trie` cross-checks its finished trie against that
+    /// singleton's root and refuses to write on a mismatch. That is the only check
+    /// covering the trie as a WHOLE — the per-movement assertions cannot notice a
+    /// replay that stopped one movement early — so the command requires this.
+    pub cpo_policy_id: Option<String>,
     pub socket_path: Option<String>,
     pub network_magic: Option<u64>,
     pub pegin_script_address: Option<String>,
@@ -334,6 +342,7 @@ impl Default for CardanoConfig {
             blockfrost_project_id: None,
             blockfrost_url: None,
             kupo_url: None,
+            cpo_policy_id: None,
             socket_path: None,
             network_magic: None,
             pegin_script_address: None,

@@ -40,6 +40,11 @@ submit = false          # broadcast signed BTC tx to rpc_url (false: binocular r
 # completed-peg-outs trie from the inline datums of already-SPENT outputs — a read
 # a Blockfrost-compatible UTxO API cannot serve. Steady-state operation never uses it.
 # kupo_url = "http://localhost:1442"
+# Policy id of the completed-peg-outs trie validator (Config field 3). Required by
+# `reconstruct-cpo-trie`: it cross-checks the rebuilt trie against the on-chain CPO
+# singleton and refuses to write on a mismatch — the only check that covers the
+# finished trie as a whole.
+# cpo_policy_id = "..."
 blockfrost_project_id = "preprodsTOaoyjcqGmy4SOSazxuHkbuXFOOkp8f"
 # socket_path = "/run/cardano-node/node.socket"
 # network_magic = 1

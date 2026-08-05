@@ -278,6 +278,9 @@ pub enum SkipReason {
     /// (`created + peg_out_cancel_timeout_ms`). Paying it risks the owner
     /// cancelling for the fBTC after taking the BTC.
     NearCancelDeadline,
+    /// The same `por_id` appeared earlier in this very batch. Paying it twice
+    /// would move BTC that the (idempotent) trie insert never accounts for.
+    DuplicateRequest,
 }
 
 impl fmt::Display for SkipReason {
@@ -290,6 +293,7 @@ impl fmt::Display for SkipReason {
             Self::NearCancelDeadline => {
                 write!(f, "too close to the peg-out cancel deadline")
             }
+            Self::DuplicateRequest => write!(f, "duplicate request in this TM's batch"),
         }
     }
 }
@@ -406,6 +410,7 @@ fn skip_reason_sort_key(r: &SkipReason) -> u8 {
         SkipReason::AlreadyCompleted => 2,
         SkipReason::NotYetCreated => 3,
         SkipReason::NearCancelDeadline => 4,
+        SkipReason::DuplicateRequest => 5,
     }
 }
 
@@ -495,6 +500,17 @@ pub fn build_tm(
     // and (4) is consensus only insofar as `freshness.now_ms` is chain-derived —
     // see [`Freshness`].
     let mut skipped_pegouts = Vec::new();
+    // Every `por_id` already accepted into THIS TM.
+    //
+    // A `por_id` identifies a request UTxO, so the chain scan cannot produce two —
+    // but a caller that concatenated two overlapping scans could. That would pay
+    // the same request twice while the trie recorded ONE entry (a trie insert is
+    // idempotent on an identical key/value), so the committed root would not
+    // account for the second payment and the treasury would be short with no
+    // completion to show for it. Dedupe rather than abort: the duplicate describes
+    // a request already being paid by this very TM, so dropping it is exactly
+    // right, and one caller bug must not block every peg-in and peg-out.
+    let mut seen_por_ids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     pegouts.retain(|po| {
         let mut skip = |reason| {
             skipped_pegouts.push(SkippedPegOut {
@@ -510,6 +526,9 @@ pub fn build_tm(
         }
         if cpo.contains(&po.por_id) {
             return skip(SkipReason::AlreadyCompleted);
+        }
+        if !seen_por_ids.insert(po.por_id) {
+            return skip(SkipReason::DuplicateRequest);
         }
         if po.created > freshness.now_ms {
             return skip(SkipReason::NotYetCreated);
@@ -1867,6 +1886,57 @@ mod tests {
         assert_eq!(tm.fulfilled[0].por_id, open.por_id);
         assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::AlreadyCompleted);
         let _ = done;
+    }
+
+    // The same request listed twice would be PAID twice while the trie recorded
+    // one entry (inserting an identical key/value is idempotent), so the committed
+    // root would not account for the second payment. Unreachable through today's
+    // UTxO scan, pinned because the cost of being wrong is treasury BTC.
+    #[test]
+    fn a_duplicated_request_is_paid_once() {
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![make_pegout(0x10, 100_000), make_pegout(0x10, 100_000)],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+
+        assert_eq!(tm.fulfilled.len(), 1, "one payment for one request");
+        assert_eq!(tm.tx.output.len(), 3, "change + one payment + commitment");
+        assert_eq!(tm.skipped_pegouts.len(), 1);
+        assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::DuplicateRequest);
+        // The root must still be exactly the root of the one entry that was paid.
+        assert_eq!(
+            tm.cpo_root,
+            empty_cpo()
+                .root_after(&[(&tm.fulfilled[0]).into()])
+                .unwrap()
+        );
+    }
+
+    // Two DISTINCT requests that happen to pay the same destination and amount are
+    // not duplicates — the dedupe keys on por_id, not on the payment.
+    #[test]
+    fn identical_payments_from_distinct_requests_are_both_paid() {
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![
+                make_pegout(0x10, 100_000),
+                PegOutRequest {
+                    por_id: [0xff; 32],
+                    outpoint: [0xff; 36],
+                    ..make_pegout(0x10, 100_000)
+                },
+            ],
+            change_address(),
+            &default_fee_params(),
+        )
+        .unwrap();
+        assert_eq!(tm.fulfilled.len(), 2);
+        assert!(tm.skipped_pegouts.is_empty());
     }
 
     // --- verify_committed_root (the co-signer gate) ---

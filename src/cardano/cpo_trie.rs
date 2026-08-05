@@ -34,6 +34,26 @@
 //! SPO — that path needs a Kupo index because the data-availability hint lives in
 //! the inline datum of a SPENT output.
 //!
+//! ## Cardano rollbacks
+//!
+//! The persisted trie is APPEND-ONLY and has NO automatic rollback handling. A
+//! Cardano rollback that un-confirms a Treasury Movement leaves this node's trie
+//! holding entries the chain no longer backs, and every root it then proposes is
+//! ahead of the quorum's.
+//!
+//! That failure is loud, not silent: the co-signer gate refuses to sign, and
+//! [`CpoTrie::load`]'s successor `advance_cpo_trie` refuses to persist a root the
+//! confirming TM did not commit. **Recovery is a full `reconstruct-cpo-trie`**,
+//! which rebuilds from the post-rollback chain and cross-checks the result against
+//! the on-chain CPO singleton.
+//!
+//! Rollbacks are already bounded here: [`crate::epoch::machine`] only advances the
+//! trie after a TM is CONFIRMED, and a Bitcoin-confirmed movement deep enough to
+//! have been oracle-proven is not a shallow reorg candidate. Automatic rollback
+//! handling (watching for a chain-point regression and truncating the trie) is a
+//! tracked follow-up, deliberately NOT implemented here — it needs a persisted
+//! chain point per entry and a rollback signal heimdall does not yet consume.
+//!
 //! ## Query surface
 //!
 //! Steady-state operation (build, co-sign, publish) touches ONLY the
@@ -166,6 +186,15 @@ pub enum CpoTrieError {
     },
     /// The network / index layer failed.
     Kupo(String),
+    /// Reconstruction finished, but the trie it produced does not match the root
+    /// the on-chain CPO singleton holds. The replay is missing or inventing
+    /// entries; using it would make this node sign roots the chain disagrees with,
+    /// and produce membership proofs `peg-out.ak` rejects.
+    RootMismatch {
+        reconstructed: [u8; 32],
+        on_chain: [u8; 32],
+        entries: usize,
+    },
 }
 
 impl fmt::Display for CpoTrieError {
@@ -196,6 +225,18 @@ impl fmt::Display for CpoTrieError {
                 hex::encode(committed_root)
             ),
             Self::Kupo(m) => write!(f, "kupo: {m}"),
+            Self::RootMismatch {
+                reconstructed,
+                on_chain,
+                entries,
+            } => write!(
+                f,
+                "reconstruction produced root {} over {entries} entr(y|ies), but the on-chain \
+                 completed-peg-outs singleton holds {} — refusing to persist a trie the chain \
+                 disagrees with",
+                hex::encode(reconstructed),
+                hex::encode(on_chain),
+            ),
         }
     }
 }
@@ -594,16 +635,26 @@ pub fn confirmed_payments(tm: &ConfirmedTm) -> Vec<(Vec<u8>, u64)> {
 /// fine on-chain, so real history contains them, and reconstruction must fall back
 /// to matching rather than refuse to read the chain. A present-but-malformed entry
 /// (not 36 bytes) is dropped: the hint is UNVERIFIED attacker-supplied data.
+///
+/// Constructor 0 is accepted in BOTH plutus-core encodings — the compact tag 121
+/// form and the general tag-102 + `any_constructor` form — matching
+/// `parse_pegout_datum` and the registry/treasury decoders. A node accepts either,
+/// and reading a legitimate record as "no hint" would silently force the fallback
+/// matcher.
+///
+/// Every failure path returns an empty hint rather than an error. That is safe
+/// precisely because the hint is never trusted: `replay` checks each candidate
+/// against the quorum-attested root, and an empty hint just means the fallback
+/// matcher does the work.
 #[must_use]
 pub fn unconfirmed_hint(data: &PlutusData) -> Vec<[u8; 36]> {
-    let PlutusData::Constr(c) = data else {
+    let Ok((constructor, fields)) = crate::cardano::plutus::as_constr(data) else {
         return Vec::new();
     };
-    if c.tag != 121 {
+    if constructor != 0 {
         return Vec::new();
     }
-    let fields: Vec<&PlutusData> = c.fields.iter().collect();
-    let Some(PlutusData::Array(items)) = fields.get(5).copied() else {
+    let Some(PlutusData::Array(items)) = fields.get(5) else {
         return Vec::new();
     };
     items
@@ -633,6 +684,19 @@ pub struct ReconstructConfig {
     pub fbtc_policy_id: String,
     /// The bridged-token asset name, hex (may be empty).
     pub fbtc_asset_name_hex: String,
+    /// Policy id (script hash) of the completed-peg-outs trie validator, hex —
+    /// Config field 3. Identifies the on-chain CPO singleton, whose datum holds
+    /// the root the chain currently believes.
+    ///
+    /// `Some` turns on the final safety net: the reconstructed root MUST equal the
+    /// singleton's. Every step of the replay is already checked against a
+    /// quorum-attested root, but only this compares the FINISHED trie against the
+    /// value peg-out completions will actually be proven against — it is what
+    /// catches a replay that stopped early or skipped the last movement.
+    ///
+    /// `None` skips the check and logs loudly. Only for a bridge whose trie
+    /// singleton is not deployed yet, and for tests.
+    pub cpo_policy_id: Option<String>,
 }
 
 /// A peg-out request as chain history remembers it — open or long since spent.
@@ -666,9 +730,10 @@ impl HistoricalPor {
 ///    its own `"CPOR1"` output), resolve its data-availability hint through the
 ///    matching Unconfirmed record, insert those entries, and ASSERT the running
 ///    root equals the committed root.
-/// 5. If the hint is absent, garbled, or produces the wrong root, fall back to
+/// 5. If a hint is absent, garbled, or produces the wrong root, fall back to
 ///    matching the TM's payment outputs against the peg-out requests that were
 ///    open at that point, and search assignments until the running root matches.
+/// 6. Cross-check the FINISHED trie against the on-chain CPO singleton's datum.
 ///
 /// The committed root turns every step from trust into search-and-check: a hostile
 /// hint cannot corrupt the result, only make reconstruction slower.
@@ -682,12 +747,43 @@ pub async fn reconstruct(
         .map_err(CpoTrieError::Kupo)?;
 
     let mut confirmed: Vec<ConfirmedTm> = Vec::new();
-    // btc_txid -> the hint published by the Unconfirmed record for that tx.
-    let mut hints: HashMap<[u8; 32], Vec<[u8; 36]>> = HashMap::new();
+    // btc_txid -> EVERY hint published for that tx.
+    //
+    // A Vec, not one entry: posting a TM record is PERMISSIONLESS, so anyone can
+    // publish a second record embedding the same signed BTC tx with a garbage
+    // hint. Last-writer-wins would let that record displace the honest one and
+    // push every replay of that TM into the (bounded, abortable) fallback search —
+    // a cheap denial of service against reconstruction. Keeping all candidates
+    // costs nothing: each is checked against the committed root before use, so a
+    // hostile one is simply the one that does not verify.
+    let mut hints: HashMap<[u8; 32], Vec<Vec<[u8; 36]>>> = HashMap::new();
 
     for m in &tm_matches {
+        // A datum Kupo cannot resolve is a HARD ERROR, never a skip.
+        //
+        // We cannot tell an unresolvable Confirmed record from unresolvable junk,
+        // and silently dropping a Confirmed record produces a trie that is missing
+        // a whole movement's entries while looking complete. If the dropped record
+        // is the chain tip, nothing downstream notices — the running-root assertion
+        // has no later TM to fail against. That is precisely the confidently-wrong
+        // trie this function exists to make impossible.
+        //
+        // The operational cause is a Kupo that did not witness the datum preimage
+        // (`--prune-utxo`, or an index started after the output was created); the
+        // fix is a full index, not a softer reader.
         let Some(datum) = kupo.resolve_datum(m).await.map_err(CpoTrieError::Kupo)? else {
-            continue;
+            return Err(CpoTrieError::Kupo(format!(
+                "cannot resolve the datum of {}#{} at the TM address {} (datum_hash={}, \
+                 datum_type={}) — refusing to reconstruct with an unexplained gap: if that \
+                 output is a Confirmed TM record, skipping it yields a trie that silently \
+                 omits a movement. Re-index Kupo over the full history (no --prune-utxo) and \
+                 retry.",
+                m.transaction_id,
+                m.output_index,
+                cfg.tm_address,
+                m.datum_hash.as_deref().unwrap_or("<none>"),
+                m.datum_type.as_deref().unwrap_or("<none>"),
+            )));
         };
         match parse_confirmed_tm_datum(&datum) {
             Ok(tm) => confirmed.push(tm),
@@ -698,11 +794,15 @@ pub async fn reconstruct(
                     use bitcoin::hashes::Hash as _;
                     let hint = unconfirmed_hint(&datum);
                     if !hint.is_empty() {
-                        hints.insert(u.btc_txid.to_byte_array(), hint);
+                        hints
+                            .entry(u.btc_txid.to_byte_array())
+                            .or_default()
+                            .push(hint);
                     }
                 }
             }
-            // A junk UTxO at a permissionlessly-payable address is not an error.
+            // A junk UTxO at a permissionlessly-payable address is not an error —
+            // its datum RESOLVED, it just is not a TM record.
             Err(_) => {}
         }
     }
@@ -710,7 +810,96 @@ pub async fn reconstruct(
     let ordered = chain_order(confirmed);
     let history = fetch_pegout_history(kupo, cfg).await?;
 
-    replay(&ordered, &hints, &history)
+    let trie = replay(&ordered, &hints, &history)?;
+
+    // --- the final safety net ---
+    match cfg.cpo_policy_id.as_deref() {
+        Some(policy) => {
+            let on_chain = fetch_onchain_cpo_root(kupo, policy).await?;
+            if on_chain != trie.root() {
+                return Err(CpoTrieError::RootMismatch {
+                    reconstructed: trie.root(),
+                    on_chain,
+                    entries: trie.len(),
+                });
+            }
+            eprintln!(
+                "[cpo] reconstructed root matches the on-chain CPO singleton ({})",
+                hex::encode(on_chain)
+            );
+        }
+        None => eprintln!(
+            "[cpo] WARNING: no cpo_policy_id configured — the reconstructed root was NOT \
+             cross-checked against the on-chain CPO singleton. Set cardano.cpo_policy_id \
+             before trusting this trie to sign with."
+        ),
+    }
+    Ok(trie)
+}
+
+/// The root held by the on-chain completed-peg-outs singleton.
+///
+/// The singleton is the ONE unspent output carrying the CPO NFT (`policy` +
+/// asset name `"CPO"`), and its datum's first field is the root — the same read
+/// `bifrost/utils.get_mpf_from_output` performs on-chain, and the value
+/// `peg-out.ak` proves membership against. Anything other than exactly one such
+/// output is an error: zero means the trie is not deployed (or Kupo is not
+/// indexing it), and several mean the NFT is not a singleton, so no root is
+/// authoritative.
+async fn fetch_onchain_cpo_root(
+    kupo: &KupoClient,
+    policy_hex: &str,
+) -> Result<[u8; 32], CpoTrieError> {
+    let policy = policy_hex.trim().to_ascii_lowercase();
+    // Kupo asset pattern: "{policy_id}.{asset_name}".
+    let pattern = format!("{policy}.{CPO_ASSET_NAME_HEX}");
+    let matches = kupo
+        .matches(&pattern, MatchFilter::Unspent)
+        .await
+        .map_err(CpoTrieError::Kupo)?;
+    let held: Vec<_> = matches
+        .iter()
+        .filter(|m| m.asset_quantity(&policy, CPO_ASSET_NAME_HEX) == 1)
+        .collect();
+    let m = match held.as_slice() {
+        [only] => *only,
+        [] => {
+            return Err(CpoTrieError::Kupo(format!(
+                "no unspent output holds the completed-peg-outs NFT {pattern} — the trie \
+                 singleton is not deployed, or Kupo is not indexing that policy"
+            )));
+        }
+        many => {
+            return Err(CpoTrieError::Kupo(format!(
+                "{} unspent outputs hold the completed-peg-outs NFT {pattern} — it is not a \
+                 singleton, so no root is authoritative",
+                many.len()
+            )));
+        }
+    };
+    let datum = kupo
+        .resolve_datum(m)
+        .await
+        .map_err(CpoTrieError::Kupo)?
+        .ok_or_else(|| {
+            CpoTrieError::Kupo(format!(
+                "the completed-peg-outs singleton {}#{} has no resolvable datum",
+                m.transaction_id, m.output_index
+            ))
+        })?;
+    parse_cpo_trie_datum(&datum).map_err(CpoTrieError::Decode)
+}
+
+/// Decode `CompletedPegOutsMerkleTreeDatum { root }` — the root is field 0 of the
+/// datum's Constr, exactly as `bifrost/utils.get_mpf_from_output` reads it
+/// on-chain (it takes the head of `unconstr_fields` and requires 32 bytes).
+pub fn parse_cpo_trie_datum(data: &PlutusData) -> Result<[u8; 32], String> {
+    let (_, fields) =
+        crate::cardano::plutus::as_constr(data).map_err(|e| format!("CPO trie datum: {e}"))?;
+    let root = crate::cardano::plutus::field_bytes(fields, 0)
+        .map_err(|_| "CPO trie datum: field[0] (root) is not BoundedBytes".to_string())?;
+    <[u8; 32]>::try_from(root.as_slice())
+        .map_err(|_| format!("CPO trie datum: root is {} bytes, expected 32", root.len()))
 }
 
 /// Order Confirmed TM records by treasury linkage.
@@ -789,6 +978,15 @@ async fn fetch_pegout_history(
         if gross == 0 {
             continue; // no fBTC locked — not a peg-out request
         }
+        // Unlike the TM-address scan, an unresolvable datum here is a SKIP, not an
+        // error — and the asymmetry is deliberate.
+        //
+        // A missing peg-out request cannot silently shrink the trie: it just means
+        // no candidate matches some TM's payment, and that TM then fails its
+        // running-root assertion by name. The failure is loud either way, so
+        // erroring here would buy nothing while handing anyone a denial of service
+        // — the peg-out address is permissionlessly payable, so a single junk UTxO
+        // with an unwitnessed datum would block every reconstruction forever.
         let Some(datum) = kupo.resolve_datum(m).await.map_err(CpoTrieError::Kupo)? else {
             continue;
         };
@@ -812,9 +1010,15 @@ async fn fetch_pegout_history(
 
 /// Replay the Confirmed chain into a trie, asserting the running root after every
 /// TM.
+///
+/// The two `continue`s below (no commitment; commitment equals the current root)
+/// are the only places a TM contributes nothing, and both are backstopped: the
+/// caller cross-checks the finished trie against the on-chain CPO singleton, so a
+/// TM wrongly treated as inert shows up as a root mismatch rather than as a
+/// quietly short trie.
 fn replay(
     ordered: &[ConfirmedTm],
-    hints: &HashMap<[u8; 32], Vec<[u8; 36]>>,
+    hints: &HashMap<[u8; 32], Vec<Vec<[u8; 36]>>>,
     history: &HashMap<[u8; 36], HistoricalPor>,
 ) -> Result<CpoTrie, CpoTrieError> {
     let mut trie = CpoTrie::empty();
@@ -830,18 +1034,25 @@ fn replay(
             continue;
         }
 
-        // --- 1. the published hint ---
-        let hinted: Vec<CpoEntry> = hints
-            .get(&tm.btc_txid)
-            .map(|outpoints| {
-                outpoints
-                    .iter()
-                    .filter_map(|op| history.get(op))
-                    .map(HistoricalPor::entry)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !hinted.is_empty() && trie.root_after(&hinted).ok() == Some(committed) {
+        // --- 1. the published hints ---
+        //
+        // Every candidate hint for this txid is tried, and each is accepted only
+        // if it reproduces the attested root. Posting a TM record is
+        // permissionless, so one of these may be a hostile fabrication; it simply
+        // fails the check while the honest one passes.
+        let mut resolved = None;
+        for outpoints in hints.get(&tm.btc_txid).map(Vec::as_slice).unwrap_or(&[]) {
+            let hinted: Vec<CpoEntry> = outpoints
+                .iter()
+                .filter_map(|op| history.get(op))
+                .map(HistoricalPor::entry)
+                .collect();
+            if !hinted.is_empty() && trie.root_after(&hinted).ok() == Some(committed) {
+                resolved = Some(hinted);
+                break;
+            }
+        }
+        if let Some(hinted) = resolved {
             trie.insert_batch(&hinted)?;
             continue;
         }
@@ -1343,6 +1554,74 @@ mod tests {
         assert_eq!(unconfirmed_hint(&d), vec![good]);
     }
 
+    // Constructor 0 in the general tag-102 form is legal Plutus data a node
+    // accepts, and `parse_pegout_datum` already accepts it. Reading such a record
+    // as "no hint" would silently force the fallback matcher.
+    #[test]
+    fn hint_reads_the_tag_102_constructor_0_form() {
+        use crate::cardano::plutus::{array, bytes, int};
+        use pallas_primitives::MaybeIndefArray;
+        use pallas_primitives::conway::Constr;
+        let op = hint_bytes(&[0xaa; 32], 1);
+        let d = PlutusData::Constr(Constr {
+            tag: 102,
+            any_constructor: Some(0),
+            fields: MaybeIndefArray::Indef(vec![
+                bytes(&[0x02]),
+                bytes(&[0x7a; 28]),
+                int(1),
+                int(2),
+                int(3),
+                array(vec![bytes(&op)]),
+            ]),
+        });
+        assert_eq!(unconfirmed_hint(&d), vec![op]);
+    }
+
+    // A Confirmed record (constructor 1) has no hint field, and its field 5 is
+    // `created` — reading it as a hint would be nonsense.
+    #[test]
+    fn hint_of_a_non_zero_constructor_is_empty() {
+        use crate::cardano::plutus::{bytes, constr, int};
+        let confirmed_datum = constr(
+            1,
+            vec![
+                bytes(&[0xcc; 32]),
+                crate::cardano::plutus::array(vec![]),
+                crate::cardano::plutus::array(vec![]),
+                crate::cardano::plutus::bool_data(false),
+                bytes(&[0x7a; 28]),
+                int(1_700_000_000_000),
+            ],
+        );
+        assert!(unconfirmed_hint(&confirmed_datum).is_empty());
+    }
+
+    // --- CPO singleton datum ---
+
+    // The hex form is what goes into Kupo asset patterns and asset-unit strings;
+    // the byte form is what the Aiken constant says. Pin them to each other so the
+    // singleton lookup cannot drift from `constants.ak`.
+    #[test]
+    fn the_cpo_asset_name_hex_matches_the_bytes() {
+        assert_eq!(CPO_ASSET_NAME, b"CPO");
+        assert_eq!(hex::encode(CPO_ASSET_NAME), CPO_ASSET_NAME_HEX);
+    }
+
+    #[test]
+    fn parses_the_cpo_trie_datum_root() {
+        use crate::cardano::plutus::{bytes, constr};
+        let d = constr(0, vec![bytes(&[0x5a; 32])]);
+        assert_eq!(parse_cpo_trie_datum(&d).unwrap(), [0x5a; 32]);
+        // The Aiken reader takes the HEAD of unconstr_fields, so extra trailing
+        // fields are irrelevant — but the root must be exactly 32 bytes.
+        let padded = constr(0, vec![bytes(&[0x5a; 32]), bytes(b"extra")]);
+        assert_eq!(parse_cpo_trie_datum(&padded).unwrap(), [0x5a; 32]);
+        assert!(parse_cpo_trie_datum(&constr(0, vec![bytes(&[0x5a; 31])])).is_err());
+        assert!(parse_cpo_trie_datum(&constr(0, vec![])).is_err());
+        assert!(parse_cpo_trie_datum(&bytes(b"nope")).is_err());
+    }
+
     #[test]
     fn hint_bytes_roundtrips_and_is_little_endian() {
         let b = hint_bytes(&[0xab; 32], 258);
@@ -1401,7 +1680,7 @@ mod tests {
                 commitment_out(root),
             ],
         );
-        let hints = HashMap::from([([0xa1u8; 32], vec![p.outpoint])]);
+        let hints = HashMap::from([([0xa1u8; 32], vec![vec![p.outpoint]])]);
         let trie = replay(&[tm], &hints, &history).unwrap();
         assert_eq!(trie.root(), root);
         assert!(trie.contains(&p.por_id));
@@ -1437,7 +1716,7 @@ mod tests {
             ],
         );
         // Hint names an outpoint that is not in history at all.
-        let hints = HashMap::from([([0xa1u8; 32], vec![hint_bytes(&[0x77; 32], 4)])]);
+        let hints = HashMap::from([([0xa1u8; 32], vec![vec![hint_bytes(&[0x77; 32], 4)]])]);
         let trie = replay(&[tm], &hints, &history).unwrap();
         assert_eq!(trie.root(), root);
         assert!(trie.contains(&p.por_id));
@@ -1517,8 +1796,8 @@ mod tests {
             ],
         );
         let hints = HashMap::from([
-            ([0xa1u8; 32], vec![p1.outpoint]),
-            ([0xb2u8; 32], vec![p2.outpoint]),
+            ([0xa1u8; 32], vec![vec![p1.outpoint]]),
+            ([0xb2u8; 32], vec![vec![p2.outpoint]]),
         ]);
         let trie = replay(&chain_order(vec![tm2, tm1]), &hints, &history).unwrap();
         assert_eq!(trie.root(), root2);
@@ -1563,6 +1842,42 @@ mod tests {
             format!("{err}").contains("no open peg-out request matches"),
             "{err}"
         );
+    }
+
+    // Posting a TM record is permissionless, so anyone can publish a SECOND record
+    // embedding the same signed tx with a garbage hint. With last-writer-wins that
+    // record would displace the honest hint and force the bounded fallback search —
+    // a cheap denial of service. Every candidate must be tried.
+    #[test]
+    fn a_hostile_duplicate_hint_does_not_displace_the_honest_one() {
+        let p = hist(0x11, 0xaa, 1000);
+        let history = history_of(vec![p.clone()]);
+        let root = CpoTrie::empty().root_after(&[p.entry()]).unwrap();
+        let tm = confirmed(
+            0xa1,
+            vec![],
+            vec![
+                payment_out(0x00, 999_000),
+                payment_out(0xaa, 1000),
+                commitment_out(root),
+            ],
+        );
+        // The garbage hint is stored FIRST, so a last-writer-wins map would keep
+        // the honest one and this test would pass for the wrong reason. Order it
+        // the other way round too.
+        for hints in [
+            vec![vec![hint_bytes(&[0x77; 32], 4)], vec![p.outpoint]],
+            vec![vec![p.outpoint], vec![hint_bytes(&[0x77; 32], 4)]],
+        ] {
+            let trie = replay(
+                std::slice::from_ref(&tm),
+                &HashMap::from([([0xa1u8; 32], hints)]),
+                &history,
+            )
+            .unwrap();
+            assert_eq!(trie.root(), root);
+            assert!(trie.contains(&p.por_id));
+        }
     }
 
     // Pre-rev-5.1 TMs carry no commitment. They fulfilled nothing under the trie

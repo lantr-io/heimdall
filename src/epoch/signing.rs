@@ -62,7 +62,7 @@ pub async fn sign_phase(
             //
             // The trie root is ATTESTED, not verified on-chain: the Confirm
             // transition copies whatever root the FROST quorum signed into the TM.
-            // So the ONLY thing standing between a wrong root and chain truth is
+            // So the only thing standing between a wrong root and chain truth is
             // every participant recomputing it before contributing a nonce.
             //
             // A wrong root is not cosmetic. Too FEW entries and a peg-out this TM
@@ -70,8 +70,22 @@ pub async fn sign_phase(
             // locked. Too MANY and a peg-out nobody paid becomes provably
             // completed, burning fBTC against BTC that never moved.
             //
-            // This runs BEFORE the first nonce commitment leaves the node, because
-            // a published commitment is a signing input the others can use.
+            // BE PRECISE ABOUT WHAT THIS BUYS TODAY. Heimdall has no
+            // leader-proposes-TM wire format: each node signs the TM it built
+            // itself, moments ago, from the same trie. Against that input the
+            // check is very nearly a tautology. What it actually catches is the
+            // narrow window it spans — the persisted trie changing on disk between
+            // `build_tm_phase` and here (a concurrent `reconstruct-cpo-trie`, an
+            // operator edit, a half-applied recovery), plus a corrupt or
+            // unreadable trie file.
+            //
+            // Its real value is INTERFACE SHAPE: the check takes (tm bytes, local
+            // trie) and nothing else, so the moment a TM arrives from a peer it is
+            // already a genuine co-signer gate with no changes here. Wiring it now
+            // means the guarantee is not bolted on after the wire format lands.
+            //
+            // It runs BEFORE the first nonce commitment leaves the node, because a
+            // published commitment is a signing input the others can use.
             verify_cpo_root(config, me, epoch, &tm)?;
 
             crate::epoch_log!(
@@ -236,13 +250,17 @@ pub async fn sign_phase(
 /// Recompute the completed-peg-outs root this TM should commit, from THIS node's
 /// own persisted trie, and refuse to sign on a mismatch.
 ///
-/// Heimdall's TM is deterministic: every SPO independently rebuilds it and there
-/// is no leader proposal to inspect, so today this compares a node's TM against
-/// its own trie. That still catches the failure this gate exists for — a trie
-/// that has drifted from the one the TM was built against (a stale
-/// `cpo-trie.json`, a half-applied recovery, a node that never reconstructed) —
-/// and it is the exact hook a future leader-proposes-TM wire format plugs into:
-/// the check is `tm bytes + local trie`, with no dependence on who built the tx.
+/// Scope, stated honestly: heimdall's TM is deterministic and there is no leader
+/// proposal to inspect, so this re-reads the trie from disk and re-checks a TM the
+/// same node built minutes earlier. Against a self-built TM in one uninterrupted
+/// run the comparison is near-tautological. What it genuinely guards is the window
+/// it spans — the on-disk trie changing between build and sign — and a trie file
+/// that has become corrupt or unreadable in the meantime.
+///
+/// It is written as `(tm bytes, local trie)` with no dependence on who built the
+/// transaction, so it becomes a real co-signer gate unchanged the moment a
+/// leader-proposes-TM wire format exists (`Design.md` specifies
+/// `/sign/{epoch}/tm.json`; it was never implemented).
 ///
 /// Refusing is the safe direction. A TM nobody signs is a missed movement; a TM
 /// signed with a wrong root is an unrecoverable accounting error on the peg-out
