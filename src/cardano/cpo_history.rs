@@ -38,9 +38,15 @@
 //! - [`CpoHistorySource::address_history`] MUST return EVERY output ever created
 //!   at the address, spent ones included. A Confirm transition spends the
 //!   `Unconfirmed` record, and that spent record is where the hint lives.
-//! - A datum the backend cannot resolve MUST come back as `datum: None`, never as
-//!   a silently dropped output. `reconstruct` turns a missing datum at the TM
-//!   address into a hard error, and it can only do that if it sees the output.
+//! - [`HistoricalOutput::datum`] MUST distinguish an output with NO datum at all
+//!   ([`DatumState::Absent`]) from one whose datum hash is known but whose
+//!   preimage the backend could not supply ([`DatumState::Unresolved`]), never as
+//!   a silently dropped output. `reconstruct` SKIPS the former even at the TM
+//!   address — no protocol record is ever written without an inline datum, so a
+//!   bare payment provably is not one — and HARD-ERRORS on the latter, because an
+//!   unread datum there might be a `Confirmed` record. Collapsing the two into
+//!   one `None` is exactly what let a single datum-less payment to the TM address
+//!   block every SPO's reconstruction forever; see `cpo_trie`'s module doc.
 //! - Asset quantities MUST be keyed by the Blockfrost UNIT form
 //!   (`<policy_hex><asset_name_hex>`), so the algorithm's asset lookups are
 //!   backend-independent. [`KupoHistory`] converts Kupo's dotted keys.
@@ -60,6 +66,54 @@ use crate::cardano::retry;
 // The backend-independent output shape
 // ---------------------------------------------------------------------------
 
+/// What chain history reports about one output's datum — a THREE-way reading,
+/// not a two-way one.
+///
+/// [`Self::Absent`] and [`Self::Unresolved`] must never collapse into a single
+/// `None`: [`crate::cardano::cpo_trie::reconstruct`] treats them oppositely at the
+/// TM address. An output with NO datum at all is skipped even there, because
+/// every genuine `Unconfirmed`/`Confirmed` record is written with an inline
+/// datum, so a bare payment provably is not one — the TM address is
+/// permissionlessly payable, and treating a bare payment as fatal let a single
+/// junk UTxO block every reconstruction forever. An output whose datum EXISTS but
+/// could not be read is a hard error: it might be an unread `Confirmed` record,
+/// and dropping one yields a trie that silently omits a whole movement.
+#[derive(Debug, Clone)]
+pub enum DatumState {
+    /// The output carries no datum at all — no hash, no inline bytes.
+    Absent,
+    /// A datum hash is known, but the backend could not produce its preimage
+    /// (Kupo run with `--prune-utxo`, or a Blockfrost-compatible API that does
+    /// not serve `/scripts/datum/{hash}`).
+    Unresolved {
+        /// The datum hash, for naming the offending output in an error message.
+        datum_hash: String,
+    },
+    /// The datum resolved to `PlutusData`, however it was carried on the wire
+    /// (inline bytes, or a hash the backend could supply the preimage of).
+    Resolved(PlutusData),
+}
+
+impl DatumState {
+    /// The resolved data, if any. `None` for both [`Self::Absent`] and
+    /// [`Self::Unresolved`] — a caller that only needs "is there usable data
+    /// here" (the peg-out address's skip-on-either case) can stay agnostic to
+    /// which.
+    #[must_use]
+    pub fn resolved(&self) -> Option<&PlutusData> {
+        match self {
+            Self::Resolved(d) => Some(d),
+            Self::Absent | Self::Unresolved { .. } => None,
+        }
+    }
+
+    /// Is this output entirely without a datum?
+    #[must_use]
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
 /// One transaction output as chain history remembers it — spent or unspent —
 /// with its datum already resolved.
 ///
@@ -74,10 +128,10 @@ pub struct HistoricalOutput {
     /// Native assets, keyed `<policy_hex><asset_name_hex>` (lowercase) — the
     /// Blockfrost `unit`. Lovelace is not included; no caller needs it.
     pub assets: BTreeMap<String, u64>,
-    /// `None` when the output carries no datum at all, AND when the backend
-    /// cannot supply the preimage of a datum hash it knows. The two are
-    /// distinguished by [`Self::datum_note`], never by dropping the output.
-    pub datum: Option<PlutusData>,
+    /// See [`DatumState`]: absent, present-but-unresolved, or resolved. The
+    /// first two MUST NOT collapse into one value — that collapse is exactly
+    /// what let a datum-less junk payment block reconstruction forever.
+    pub datum: DatumState,
     /// What the backend reported about the datum, verbatim enough to diagnose a
     /// gap ("no datum", "inline", "hash=… (unresolved)"). Only ever used to build
     /// an error message.
@@ -172,18 +226,30 @@ impl KupoHistory {
     }
 
     /// Convert one match, resolving its datum.
+    ///
+    /// Kupo's match ALWAYS carries `datum_hash` when the output has a datum at
+    /// all — even one whose preimage Kupo lacks — so that field alone is what
+    /// tells [`DatumState::Absent`] apart from [`DatumState::Unresolved`].
     async fn convert(&self, m: &KupoMatch) -> Result<HistoricalOutput, String> {
-        let datum = self.client.resolve_datum(m).await?;
-        let datum_note = match (&datum, &m.datum_hash) {
-            (Some(_), _) => format!(
-                "resolved, datum_type={}",
-                m.datum_type.as_deref().unwrap_or("<none>")
+        let resolved = self.client.resolve_datum(m).await?;
+        let (datum, datum_note) = match (resolved, &m.datum_hash) {
+            (Some(pd), _) => (
+                DatumState::Resolved(pd),
+                format!(
+                    "resolved, datum_type={}",
+                    m.datum_type.as_deref().unwrap_or("<none>")
+                ),
             ),
-            (None, Some(h)) => format!(
-                "datum_hash={h}, datum_type={} — Kupo has no preimage",
-                m.datum_type.as_deref().unwrap_or("<none>")
+            (None, Some(h)) => (
+                DatumState::Unresolved {
+                    datum_hash: h.clone(),
+                },
+                format!(
+                    "datum_hash={h}, datum_type={} — Kupo has no preimage",
+                    m.datum_type.as_deref().unwrap_or("<none>")
+                ),
             ),
-            (None, None) => "no datum".to_string(),
+            (None, None) => (DatumState::Absent, "no datum".to_string()),
         };
         Ok(HistoricalOutput {
             tx_hash: m.transaction_id.to_ascii_lowercase(),
@@ -510,27 +576,37 @@ impl BlockfrostHistory {
 
     /// Resolve an output's datum: inline bytes when present, else the preimage of
     /// `data_hash` from `GET /scripts/datum/{hash}`.
+    ///
+    /// `data_hash` being absent (with no inline bytes either) is
+    /// [`DatumState::Absent`] — the output has no datum at all. `data_hash`
+    /// present but the preimage unavailable is [`DatumState::Unresolved`], never
+    /// the same value: `reconstruct` treats the two oppositely at the TM address.
     async fn resolve_datum(
         &self,
         inline: Option<&str>,
         data_hash: Option<&str>,
         at: &str,
-    ) -> Result<(Option<PlutusData>, String), String> {
+    ) -> Result<(DatumState, String), String> {
         if let Some(hex_str) = inline {
             let bytes =
                 hex::decode(hex_str.trim()).map_err(|e| format!("inline datum hex ({at}): {e}"))?;
-            return Ok((Some(decode_datum(&bytes, at)?), "inline".to_string()));
+            return Ok((
+                DatumState::Resolved(decode_datum(&bytes, at)?),
+                "inline".to_string(),
+            ));
         }
         let Some(hash) = data_hash else {
-            return Ok((None, "no datum".to_string()));
+            return Ok((DatumState::Absent, "no datum".to_string()));
         };
         match self.datum_by_hash(hash).await? {
             Some(bytes) => Ok((
-                Some(decode_datum(&bytes, at)?),
+                DatumState::Resolved(decode_datum(&bytes, at)?),
                 format!("data_hash={hash}, resolved"),
             )),
             None => Ok((
-                None,
+                DatumState::Unresolved {
+                    datum_hash: hash.to_string(),
+                },
                 format!("data_hash={hash} — the backend serves no CBOR preimage"),
             )),
         }
@@ -735,6 +811,17 @@ mod tests {
 
     fn pd_hex(d: &PlutusData) -> Vec<u8> {
         pallas_codec::minicbor::to_vec(d).expect("plutus data encodes")
+    }
+
+    /// Which of the three [`DatumState`] variants `d` is, for an equality
+    /// assertion between backends — `DatumState` itself does not derive
+    /// `PartialEq` ([`PlutusData`] does not either).
+    fn datum_kind(d: &DatumState) -> &'static str {
+        match d {
+            DatumState::Absent => "absent",
+            DatumState::Unresolved { .. } => "unresolved",
+            DatumState::Resolved(_) => "resolved",
+        }
     }
 
     fn unit(policy: &str, name: &str) -> String {
@@ -1033,7 +1120,10 @@ mod tests {
 
     /// A chain with two peg-out requests, one Treasury Movement paying both, its
     /// spent `Unconfirmed` record carrying the hint, and the CPO singleton holding
-    /// the resulting root.
+    /// the resulting root. Also carries, at the TM address, a resolvable
+    /// hash-only Confirmed datum AND a genuinely datum-less junk output — the two
+    /// cases [`DatumState`] exists to keep apart — so the equivalence tests below
+    /// prove both backends agree on the distinction, not just on the happy path.
     fn world() -> (Vec<FxOut>, [u8; 32]) {
         let por_tx_a = [0x11u8; 32];
         let por_tx_b = [0x22u8; 32];
@@ -1177,6 +1267,13 @@ mod tests {
                 Some(pd_hex(&bytes(b"junk"))),
                 false,
             ),
+            // A datum-LESS junk payment at the TM address: no datum at all, so it
+            // is provably not a TM record (every genuine Unconfirmed/Confirmed
+            // record carries an inline datum) and MUST be skipped rather than
+            // aborting reconstruction. This is the case the 2026-08 fix exists
+            // for: before it, this single output would have blocked every
+            // reconstruction.
+            fx(TM_ADDR, "d4".repeat(32), 0, BTreeMap::new(), None, false),
             fx(
                 PEGOUT_ADDR,
                 hex::encode(por_tx_a),
@@ -1274,9 +1371,20 @@ mod tests {
                 assert_eq!(k.tx_hash, b.tx_hash);
                 assert_eq!(k.output_index, b.output_index);
                 assert_eq!(k.assets, b.assets, "{}#{}", k.tx_hash, k.output_index);
+                // The DatumState kind must agree (Absent stays Absent, Resolved
+                // stays Resolved) — the whole point of the shared fixture is that
+                // "no datum" and "hash-only, resolved" are not confused by either
+                // backend.
                 assert_eq!(
-                    k.datum.as_ref().map(pd_hex),
-                    b.datum.as_ref().map(pd_hex),
+                    datum_kind(&k.datum),
+                    datum_kind(&b.datum),
+                    "{}#{} datum state",
+                    k.tx_hash,
+                    k.output_index
+                );
+                assert_eq!(
+                    k.datum.resolved().map(pd_hex),
+                    b.datum.resolved().map(pd_hex),
                     "{}#{} datum",
                     k.tx_hash,
                     k.output_index
@@ -1309,7 +1417,7 @@ mod tests {
             assert_eq!(found[0].asset_quantity(CPO_POLICY, CPO_ASSET_NAME_HEX), 1);
             assert_eq!(
                 crate::cardano::cpo_trie::parse_cpo_trie_datum(
-                    found[0].datum.as_ref().expect("singleton datum")
+                    found[0].datum.resolved().expect("singleton datum")
                 )
                 .unwrap(),
                 root,
@@ -1338,9 +1446,10 @@ mod tests {
     }
 
     /// A datum the backend cannot resolve must arrive as an OUTPUT with
-    /// `datum: None`, so `reconstruct` can hard-error on it. A backend that
-    /// dropped the output instead would produce a trie that silently omits a
-    /// movement.
+    /// `datum: DatumState::Unresolved { .. }` — never as `Absent`, and never
+    /// dropped — so `reconstruct` can hard-error on it by name. A backend that
+    /// dropped the output, or reported it `Absent`, would produce a trie that
+    /// silently omits a movement.
     ///
     /// Both backends must fail the SAME way. Kupo loses a preimage by being run
     /// with `--prune-utxo`; a Blockfrost-compatible API loses one by not serving
@@ -1372,7 +1481,7 @@ mod tests {
         ] {
             let gap = hist
                 .iter()
-                .find(|o| o.datum.is_none())
+                .find(|o| matches!(o.datum, DatumState::Unresolved { .. }))
                 .unwrap_or_else(|| panic!("{name}: the unresolvable output must still be listed"));
             assert!(
                 gap.datum_note.contains("preimage"),
@@ -1670,7 +1779,7 @@ mod tests {
             tx_hash: "aa".into(),
             output_index: 0,
             assets: assets_of(&[("c0ffee43504f", 1)]),
-            datum: None,
+            datum: DatumState::Absent,
             datum_note: "no datum".into(),
         };
         assert_eq!(o.asset_quantity("C0FFEE", "43504F"), 1);

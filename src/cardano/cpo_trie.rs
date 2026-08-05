@@ -41,6 +41,32 @@
 //! test environments, demos, and non-SPO tooling). The ALGORITHM below is shared
 //! verbatim — the backend decides only where the bytes come from.
 //!
+//! ## Datum-less outputs at bridge addresses
+//!
+//! Both the TM address and the peg-out address are permissionlessly payable, so
+//! [`reconstruct`] reads a THREE-way state per output
+//! ([`crate::cardano::cpo_history::DatumState`]), not a two-way one:
+//!
+//! - **No datum at all** ([`DatumState::Absent`]) is SKIPPED, even at the TM
+//!   address. Every genuine `Unconfirmed`/`Confirmed` record, and every genuine
+//!   peg-out request, is created with an inline datum, so a bare payment provably
+//!   is not one.
+//! - **A datum that exists but cannot be read** ([`DatumState::Unresolved`]) is a
+//!   HARD ERROR at the TM address, naming the output. It might be an unread
+//!   `Confirmed` record, and dropping it would yield a trie that silently omits a
+//!   whole movement while still looking complete.
+//!
+//! Conflating the two — treating any absent datum as fatal — let a single junk,
+//! datum-less payment to the TM address block reconstruction forever, for every
+//! SPO. This module now matches binocular's Scala mirror,
+//! `binocular.watchtower.CpoReconstruction` (`scanTmAddress`), which draws the
+//! same distinction.
+//!
+//! The asymmetry between the two addresses is intentional and unchanged: an
+//! UNRESOLVABLE datum at the PEG-OUT address is a skip, never fatal, because a
+//! missing request cannot shrink the trie silently — it just makes some TM fail
+//! its own running-root assertion, by name.
+//!
 //! ## Cardano rollbacks
 //!
 //! The persisted trie is APPEND-ONLY and has NO automatic rollback handling. A
@@ -77,7 +103,7 @@ use serde::{Deserialize, Serialize};
 use crate::bitcoin::tm_builder::{
     CPO_COMMITMENT_PREFIX, CPO_COMMITMENT_SCRIPT_LEN, CpoTrieView, FulfilledPegOut,
 };
-use crate::cardano::cpo_history::CpoHistorySource;
+use crate::cardano::cpo_history::{CpoHistorySource, DatumState};
 use crate::cardano::mpf;
 use crate::cardano::treasury_datum::{ConfirmedTm, TreasuryDatumError, parse_confirmed_tm_datum};
 
@@ -776,30 +802,43 @@ pub async fn reconstruct(
     let mut hints: HashMap<[u8; 32], Vec<Vec<[u8; 36]>>> = HashMap::new();
 
     for m in &tm_matches {
-        // A datum the backend cannot resolve is a HARD ERROR, never a skip.
-        //
-        // We cannot tell an unresolvable Confirmed record from unresolvable junk,
-        // and silently dropping a Confirmed record produces a trie that is missing
-        // a whole movement's entries while looking complete. If the dropped record
-        // is the chain tip, nothing downstream notices — the running-root assertion
-        // has no later TM to fail against. That is precisely the confidently-wrong
-        // trie this function exists to make impossible.
-        //
-        // The operational cause is an index that did not witness the datum preimage
-        // (a Kupo run with `--prune-utxo`, or an index started after the output was
-        // created); the fix is a full index, not a softer reader. The backend
-        // supplies its own remediation line.
-        let Some(datum) = m.datum.as_ref() else {
-            return Err(CpoTrieError::Source(format!(
-                "cannot resolve the datum of {}#{} at the TM address {} ({}) — refusing to \
-                 reconstruct with an unexplained gap: if that output is a Confirmed TM record, \
-                 skipping it yields a trie that silently omits a movement. {}",
-                m.tx_hash,
-                m.output_index,
-                cfg.tm_address,
-                m.datum_note,
-                source.datum_gap_advice(),
-            )));
+        // A THREE-way read, not a two-way one (see the module doc).
+        let datum = match &m.datum {
+            // No datum AT ALL: provably not a TM record. Every TM record —
+            // Unconfirmed and Confirmed alike — is created with an inline datum,
+            // so a bare payment to the permissionlessly-payable TM address is
+            // ordinary junk, and skipping it costs nothing. Conflating this with
+            // the unresolvable case below let ONE junk UTxO block every
+            // reconstruction forever.
+            DatumState::Absent => continue,
+            // A datum EXISTS and could not be read. This is a HARD ERROR, never a
+            // skip: we cannot tell an unresolvable Confirmed record from
+            // unresolvable junk, and silently dropping a Confirmed record produces
+            // a trie that is missing a whole movement's entries while looking
+            // complete. If the dropped record is the chain tip, nothing
+            // downstream notices — the running-root assertion has no later TM to
+            // fail against. That is precisely the confidently-wrong trie this
+            // function exists to make impossible.
+            //
+            // The operational cause is an index that did not witness the datum
+            // preimage (a Kupo run with `--prune-utxo`, or an index started after
+            // the output was created); the fix is a full index, not a softer
+            // reader. The backend supplies its own remediation line; the hash
+            // names exactly which output is unaccounted for.
+            DatumState::Unresolved { datum_hash } => {
+                return Err(CpoTrieError::Source(format!(
+                    "cannot resolve the datum (hash {datum_hash}) of {}#{} at the TM address {} \
+                     ({}) — refusing to reconstruct with an unexplained gap: if that output is a \
+                     Confirmed TM record, skipping it yields a trie that silently omits a \
+                     movement. {}",
+                    m.tx_hash,
+                    m.output_index,
+                    cfg.tm_address,
+                    m.datum_note,
+                    source.datum_gap_advice(),
+                )));
+            }
+            DatumState::Resolved(d) => d,
         };
         match parse_confirmed_tm_datum(datum) {
             Ok(tm) => confirmed.push(tm),
@@ -892,7 +931,7 @@ async fn fetch_onchain_cpo_root(
             )));
         }
     };
-    let datum = m.datum.as_ref().ok_or_else(|| {
+    let datum = m.datum.resolved().ok_or_else(|| {
         CpoTrieError::Source(format!(
             "the completed-peg-outs singleton {}#{} has no resolvable datum ({})",
             m.tx_hash, m.output_index, m.datum_note
@@ -998,7 +1037,11 @@ async fn fetch_pegout_history(
         // erroring here would buy nothing while handing anyone a denial of service
         // — the peg-out address is permissionlessly payable, so a single junk UTxO
         // with an unwitnessed datum would block every reconstruction forever.
-        let Some(datum) = m.datum.as_ref() else {
+        //
+        // `resolved()` treats DatumState::Absent and DatumState::Unresolved alike
+        // here — unlike the TM-address scan, this address does not distinguish
+        // them: neither can silently shrink the trie, so both are a plain skip.
+        let Some(datum) = m.datum.resolved() else {
             continue;
         };
         let Ok(parsed) = crate::cardano::pegout_datum::parse_pegout_datum(datum) else {
@@ -1902,14 +1945,15 @@ mod tests {
 
     // --- reconstruct, over a trait-level fake -----------------------------
     //
-    // These pin the parts of `reconstruct` that live ABOVE the fetch layer:
-    // the hard error on an unresolvable TM datum, the deliberate SKIP on an
-    // unresolvable peg-out datum, and the final cross-check against the on-chain
-    // singleton. A fake source reaches every one of them without a server, and
-    // being trait-level they hold for both backends by construction.
-    // `cardano::cpo_history` covers the two real backends over HTTP.
+    // These pin the parts of `reconstruct` that live ABOVE the fetch layer: the
+    // hard error on an unresolvable TM datum, the deliberate SKIP on a
+    // datum-less TM output and on a datum-less or unresolvable peg-out one, and
+    // the final cross-check against the on-chain singleton. A fake source
+    // reaches every one of them without a server, and being trait-level they
+    // hold for both backends by construction. `cardano::cpo_history` covers the
+    // two real backends over HTTP.
 
-    use crate::cardano::cpo_history::{CpoHistorySource, HistoricalOutput};
+    use crate::cardano::cpo_history::{CpoHistorySource, DatumState, HistoricalOutput};
     use async_trait::async_trait;
 
     const T_ADDR: &str = "tm-address";
@@ -1951,6 +1995,10 @@ mod tests {
         }
     }
 
+    /// `datum: None` builds a genuinely datum-less output ([`DatumState::Absent`])
+    /// — junk at a permissionlessly-payable address, never an error. Use
+    /// [`fake_out_unresolved`] for an output whose datum hash is known but whose
+    /// preimage the backend could not supply.
     fn fake_out(
         tx: [u8; 32],
         index: u32,
@@ -1964,9 +2012,33 @@ mod tests {
             datum_note: if datum.is_some() {
                 "inline".into()
             } else {
-                "unresolved".into()
+                "no datum".into()
             },
-            datum,
+            datum: match datum {
+                Some(d) => DatumState::Resolved(d),
+                None => DatumState::Absent,
+            },
+        }
+    }
+
+    /// An output whose datum hash IS known but whose preimage the backend could
+    /// not supply — [`DatumState::Unresolved`], distinct from a genuinely
+    /// datum-less output. This is the case that must still hard-error at the TM
+    /// address.
+    fn fake_out_unresolved(
+        tx: [u8; 32],
+        index: u32,
+        assets: &[(String, u64)],
+        datum_hash: &str,
+    ) -> HistoricalOutput {
+        HistoricalOutput {
+            tx_hash: hex::encode(tx),
+            output_index: index,
+            assets: assets.iter().cloned().collect(),
+            datum_note: format!("datum_hash={datum_hash} — no preimage"),
+            datum: DatumState::Unresolved {
+                datum_hash: datum_hash.to_string(),
+            },
         }
     }
 
@@ -2062,27 +2134,51 @@ mod tests {
         assert_eq!(trie.len(), 1);
     }
 
-    // An output at the TM address whose datum the backend cannot supply aborts the
-    // run. Skipping it could drop a whole movement while the trie still looks
-    // complete — the one failure mode reconstruction must never have.
+    // An output at the TM address whose datum EXISTS but cannot be supplied
+    // aborts the run. Skipping it could drop a whole movement while the trie
+    // still looks complete — the one failure mode reconstruction must never
+    // have. The message must name the datum hash, so an operator knows exactly
+    // which output to re-index.
     #[tokio::test]
     async fn reconstruct_hard_errors_on_an_unresolvable_tm_datum() {
         let (mut world, _) = one_movement_world();
-        world.tm.push(fake_out([0xee; 32], 3, &[], None));
+        let hash = "ab".repeat(32);
+        world
+            .tm
+            .push(fake_out_unresolved([0xee; 32], 3, &[], &hash));
         let err = reconstruct(&world, &fake_cfg()).await.unwrap_err();
         assert!(matches!(err, CpoTrieError::Source(_)), "{err}");
         let msg = format!("{err}");
         assert!(msg.contains("unexplained gap"), "{msg}");
+        assert!(msg.contains(&hash), "the message must name the hash: {msg}");
         assert!(
             msg.contains("fake advice"),
             "the backend's remediation: {msg}"
         );
     }
 
-    // The mirror image: at the PEG-OUT address an unresolvable datum is skipped.
-    // The address is permissionlessly payable, so erroring would let anyone block
-    // every reconstruction with one junk UTxO — and a missing request cannot
-    // silently shrink the trie, it only makes some TM fail its own assertion.
+    // A TM-address output with NO datum at all is provably not a TM record —
+    // every genuine Unconfirmed/Confirmed record carries an inline datum — so it
+    // MUST be skipped rather than treated the same as an unresolvable one.
+    // Before the fix this hard-errored exactly like the case above, meaning one
+    // junk, datum-less payment to the TM address could block every SPO's
+    // reconstruction forever.
+    #[tokio::test]
+    async fn reconstruct_skips_a_datum_less_output_at_the_tm_address() {
+        let (mut world, root) = one_movement_world();
+        world.tm.push(fake_out([0xee; 32], 3, &[], None));
+        let trie = reconstruct(&world, &fake_cfg())
+            .await
+            .expect("a datum-less junk output at the TM address must not abort reconstruction");
+        assert_eq!(trie.root(), root);
+        assert_eq!(trie.len(), 1);
+    }
+
+    // The mirror image: at the PEG-OUT address BOTH a datum-less output and an
+    // unresolvable one are skipped, never fatal. The address is permissionlessly
+    // payable, so erroring on either would let anyone block every reconstruction
+    // with one junk UTxO — and a missing request cannot silently shrink the
+    // trie, it only makes some TM fail its own assertion.
     #[tokio::test]
     async fn reconstruct_skips_an_unresolvable_pegout_datum() {
         let (mut world, root) = one_movement_world();
@@ -2091,6 +2187,19 @@ mod tests {
             0,
             &[(format!("{FBTC}66425443"), 5_000)],
             None,
+        ));
+        let trie = reconstruct(&world, &fake_cfg()).await.unwrap();
+        assert_eq!(trie.root(), root);
+    }
+
+    #[tokio::test]
+    async fn reconstruct_skips_a_hash_only_unresolvable_pegout_datum() {
+        let (mut world, root) = one_movement_world();
+        world.pegout.push(fake_out_unresolved(
+            [0xef; 32],
+            0,
+            &[(format!("{FBTC}66425443"), 5_000)],
+            &"cd".repeat(32),
         ));
         let trie = reconstruct(&world, &fake_cfg()).await.unwrap();
         assert_eq!(trie.root(), root);
