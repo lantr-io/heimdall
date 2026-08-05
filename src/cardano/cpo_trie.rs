@@ -31,8 +31,15 @@
 //! The trie is durable local state ([`CpoTrie::save`] / [`CpoTrie::load`], the same
 //! 0600 atomic-rename pattern as the DKG state). It is also fully derivable from
 //! chain history ([`reconstruct`]) for a cold start, a recovery, or a newly joined
-//! SPO — that path needs a Kupo index because the data-availability hint lives in
-//! the inline datum of a SPENT output.
+//! SPO — that path must read the inline datums of SPENT outputs, because the
+//! data-availability hint lives in the `Unconfirmed` record its own Confirm
+//! transition consumes.
+//!
+//! Two backends serve that read, behind
+//! [`crate::cardano::cpo_history::CpoHistorySource`]: a Kupo index (the production
+//! recommendation for SPOs) and a plain Blockfrost-compatible API (heavier, for
+//! test environments, demos, and non-SPO tooling). The ALGORITHM below is shared
+//! verbatim — the backend decides only where the bytes come from.
 //!
 //! ## Cardano rollbacks
 //!
@@ -58,7 +65,7 @@
 //!
 //! Steady-state operation (build, co-sign, publish) touches ONLY the
 //! Blockfrost-compatible subset a Dolos node serves — see `cardano::bf_http`.
-//! Kupo is used exclusively by [`reconstruct`].
+//! History queries happen exclusively inside [`reconstruct`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -70,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use crate::bitcoin::tm_builder::{
     CPO_COMMITMENT_PREFIX, CPO_COMMITMENT_SCRIPT_LEN, CpoTrieView, FulfilledPegOut,
 };
-use crate::cardano::kupo::{KupoClient, MatchFilter};
+use crate::cardano::cpo_history::CpoHistorySource;
 use crate::cardano::mpf;
 use crate::cardano::treasury_datum::{ConfirmedTm, TreasuryDatumError, parse_confirmed_tm_datum};
 
@@ -184,8 +191,9 @@ pub enum CpoTrieError {
         committed_root: [u8; 32],
         reason: String,
     },
-    /// The network / index layer failed.
-    Kupo(String),
+    /// The network / index layer failed — either backend (see
+    /// [`crate::cardano::cpo_history`]).
+    Source(String),
     /// Reconstruction finished, but the trie it produced does not match the root
     /// the on-chain CPO singleton holds. The replay is missing or inventing
     /// entries; using it would make this node sign roots the chain disagrees with,
@@ -224,7 +232,7 @@ impl fmt::Display for CpoTrieError {
                 hex::encode(btc_txid),
                 hex::encode(committed_root)
             ),
-            Self::Kupo(m) => write!(f, "kupo: {m}"),
+            Self::Source(m) => write!(f, "chain history: {m}"),
             Self::RootMismatch {
                 reconstructed,
                 on_chain,
@@ -737,14 +745,23 @@ impl HistoricalPor {
 ///
 /// The committed root turns every step from trust into search-and-check: a hostile
 /// hint cannot corrupt the result, only make reconstruction slower.
+///
+/// `source` decides only WHERE the bytes come from (Kupo or a plain
+/// Blockfrost-compatible API). Every step above, and every check, is identical for
+/// both — that is the point of the trait.
 pub async fn reconstruct(
-    kupo: &KupoClient,
+    source: &dyn CpoHistorySource,
     cfg: &ReconstructConfig,
 ) -> Result<CpoTrie, CpoTrieError> {
-    let tm_matches = kupo
-        .matches(&cfg.tm_address, MatchFilter::All)
+    eprintln!(
+        "[cpo] reconstruction backend: {} ({})",
+        source.backend(),
+        source.endpoint()
+    );
+    let tm_matches = source
+        .address_history(&cfg.tm_address)
         .await
-        .map_err(CpoTrieError::Kupo)?;
+        .map_err(CpoTrieError::Source)?;
 
     let mut confirmed: Vec<ConfirmedTm> = Vec::new();
     // btc_txid -> EVERY hint published for that tx.
@@ -759,7 +776,7 @@ pub async fn reconstruct(
     let mut hints: HashMap<[u8; 32], Vec<Vec<[u8; 36]>>> = HashMap::new();
 
     for m in &tm_matches {
-        // A datum Kupo cannot resolve is a HARD ERROR, never a skip.
+        // A datum the backend cannot resolve is a HARD ERROR, never a skip.
         //
         // We cannot tell an unresolvable Confirmed record from unresolvable junk,
         // and silently dropping a Confirmed record produces a trie that is missing
@@ -768,31 +785,30 @@ pub async fn reconstruct(
         // has no later TM to fail against. That is precisely the confidently-wrong
         // trie this function exists to make impossible.
         //
-        // The operational cause is a Kupo that did not witness the datum preimage
-        // (`--prune-utxo`, or an index started after the output was created); the
-        // fix is a full index, not a softer reader.
-        let Some(datum) = kupo.resolve_datum(m).await.map_err(CpoTrieError::Kupo)? else {
-            return Err(CpoTrieError::Kupo(format!(
-                "cannot resolve the datum of {}#{} at the TM address {} (datum_hash={}, \
-                 datum_type={}) — refusing to reconstruct with an unexplained gap: if that \
-                 output is a Confirmed TM record, skipping it yields a trie that silently \
-                 omits a movement. Re-index Kupo over the full history (no --prune-utxo) and \
-                 retry.",
-                m.transaction_id,
+        // The operational cause is an index that did not witness the datum preimage
+        // (a Kupo run with `--prune-utxo`, or an index started after the output was
+        // created); the fix is a full index, not a softer reader. The backend
+        // supplies its own remediation line.
+        let Some(datum) = m.datum.as_ref() else {
+            return Err(CpoTrieError::Source(format!(
+                "cannot resolve the datum of {}#{} at the TM address {} ({}) — refusing to \
+                 reconstruct with an unexplained gap: if that output is a Confirmed TM record, \
+                 skipping it yields a trie that silently omits a movement. {}",
+                m.tx_hash,
                 m.output_index,
                 cfg.tm_address,
-                m.datum_hash.as_deref().unwrap_or("<none>"),
-                m.datum_type.as_deref().unwrap_or("<none>"),
+                m.datum_note,
+                source.datum_gap_advice(),
             )));
         };
-        match parse_confirmed_tm_datum(&datum) {
+        match parse_confirmed_tm_datum(datum) {
             Ok(tm) => confirmed.push(tm),
             Err(TreasuryDatumError::NotConfirmed) => {
                 // Unconfirmed record: the hint's home. Its txid is recomputed from
                 // the embedded signed tx, never taken on trust.
-                if let Some(u) = crate::cardano::treasury_datum::parse_unconfirmed_tm(&datum) {
+                if let Some(u) = crate::cardano::treasury_datum::parse_unconfirmed_tm(datum) {
                     use bitcoin::hashes::Hash as _;
-                    let hint = unconfirmed_hint(&datum);
+                    let hint = unconfirmed_hint(datum);
                     if !hint.is_empty() {
                         hints
                             .entry(u.btc_txid.to_byte_array())
@@ -808,14 +824,14 @@ pub async fn reconstruct(
     }
 
     let ordered = chain_order(confirmed);
-    let history = fetch_pegout_history(kupo, cfg).await?;
+    let history = fetch_pegout_history(source, cfg).await?;
 
     let trie = replay(&ordered, &hints, &history)?;
 
     // --- the final safety net ---
     match cfg.cpo_policy_id.as_deref() {
         Some(policy) => {
-            let on_chain = fetch_onchain_cpo_root(kupo, policy).await?;
+            let on_chain = fetch_onchain_cpo_root(source, policy).await?;
             if on_chain != trie.root() {
                 return Err(CpoTrieError::RootMismatch {
                     reconstructed: trie.root(),
@@ -843,20 +859,19 @@ pub async fn reconstruct(
 /// asset name `"CPO"`), and its datum's first field is the root — the same read
 /// `bifrost/utils.get_mpf_from_output` performs on-chain, and the value
 /// `peg-out.ak` proves membership against. Anything other than exactly one such
-/// output is an error: zero means the trie is not deployed (or Kupo is not
+/// output is an error: zero means the trie is not deployed (or the backend is not
 /// indexing it), and several mean the NFT is not a singleton, so no root is
 /// authoritative.
 async fn fetch_onchain_cpo_root(
-    kupo: &KupoClient,
+    source: &dyn CpoHistorySource,
     policy_hex: &str,
 ) -> Result<[u8; 32], CpoTrieError> {
     let policy = policy_hex.trim().to_ascii_lowercase();
-    // Kupo asset pattern: "{policy_id}.{asset_name}".
-    let pattern = format!("{policy}.{CPO_ASSET_NAME_HEX}");
-    let matches = kupo
-        .matches(&pattern, MatchFilter::Unspent)
+    let unit = format!("{policy}.{CPO_ASSET_NAME_HEX}");
+    let matches = source
+        .unspent_with_asset(&policy, CPO_ASSET_NAME_HEX)
         .await
-        .map_err(CpoTrieError::Kupo)?;
+        .map_err(CpoTrieError::Source)?;
     let held: Vec<_> = matches
         .iter()
         .filter(|m| m.asset_quantity(&policy, CPO_ASSET_NAME_HEX) == 1)
@@ -864,30 +879,26 @@ async fn fetch_onchain_cpo_root(
     let m = match held.as_slice() {
         [only] => *only,
         [] => {
-            return Err(CpoTrieError::Kupo(format!(
-                "no unspent output holds the completed-peg-outs NFT {pattern} — the trie \
-                 singleton is not deployed, or Kupo is not indexing that policy"
+            return Err(CpoTrieError::Source(format!(
+                "no unspent output holds the completed-peg-outs NFT {unit} — the trie \
+                 singleton is not deployed, or the backend is not indexing that policy"
             )));
         }
         many => {
-            return Err(CpoTrieError::Kupo(format!(
-                "{} unspent outputs hold the completed-peg-outs NFT {pattern} — it is not a \
+            return Err(CpoTrieError::Source(format!(
+                "{} unspent outputs hold the completed-peg-outs NFT {unit} — it is not a \
                  singleton, so no root is authoritative",
                 many.len()
             )));
         }
     };
-    let datum = kupo
-        .resolve_datum(m)
-        .await
-        .map_err(CpoTrieError::Kupo)?
-        .ok_or_else(|| {
-            CpoTrieError::Kupo(format!(
-                "the completed-peg-outs singleton {}#{} has no resolvable datum",
-                m.transaction_id, m.output_index
-            ))
-        })?;
-    parse_cpo_trie_datum(&datum).map_err(CpoTrieError::Decode)
+    let datum = m.datum.as_ref().ok_or_else(|| {
+        CpoTrieError::Source(format!(
+            "the completed-peg-outs singleton {}#{} has no resolvable datum ({})",
+            m.tx_hash, m.output_index, m.datum_note
+        ))
+    })?;
+    parse_cpo_trie_datum(datum).map_err(CpoTrieError::Decode)
 }
 
 /// Decode `CompletedPegOutsMerkleTreeDatum { root }` — the root is field 0 of the
@@ -965,13 +976,13 @@ fn chain_order(confirmed: Vec<ConfirmedTm>) -> Vec<ConfirmedTm> {
 /// outpoint. Spent ones are included: a completed request's UTxO no longer exists,
 /// but its entry is exactly what the trie must contain.
 async fn fetch_pegout_history(
-    kupo: &KupoClient,
+    source: &dyn CpoHistorySource,
     cfg: &ReconstructConfig,
 ) -> Result<HashMap<[u8; 36], HistoricalPor>, CpoTrieError> {
-    let matches = kupo
-        .matches(&cfg.pegout_address, MatchFilter::All)
+    let matches = source
+        .address_history(&cfg.pegout_address)
         .await
-        .map_err(CpoTrieError::Kupo)?;
+        .map_err(CpoTrieError::Source)?;
     let mut out = HashMap::new();
     for m in &matches {
         let gross = m.asset_quantity(&cfg.fbtc_policy_id, &cfg.fbtc_asset_name_hex);
@@ -987,13 +998,13 @@ async fn fetch_pegout_history(
         // erroring here would buy nothing while handing anyone a denial of service
         // — the peg-out address is permissionlessly payable, so a single junk UTxO
         // with an unwitnessed datum would block every reconstruction forever.
-        let Some(datum) = kupo.resolve_datum(m).await.map_err(CpoTrieError::Kupo)? else {
+        let Some(datum) = m.datum.as_ref() else {
             continue;
         };
-        let Ok(parsed) = crate::cardano::pegout_datum::parse_pegout_datum(&datum) else {
+        let Ok(parsed) = crate::cardano::pegout_datum::parse_pegout_datum(datum) else {
             continue; // junk UTxO at a permissionlessly-payable address
         };
-        let tx_hash = tx_hash_from_hex(&m.transaction_id)?;
+        let tx_hash = tx_hash_from_hex(&m.tx_hash)?;
         let outpoint = hint_bytes(&tx_hash, m.output_index);
         out.insert(
             outpoint,
@@ -1887,5 +1898,250 @@ mod tests {
         let old = confirmed(0xa1, vec![], vec![payment_out(0x00, 999_000)]);
         let trie = replay(&[old], &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(trie.root(), EMPTY_ROOT);
+    }
+
+    // --- reconstruct, over a trait-level fake -----------------------------
+    //
+    // These pin the parts of `reconstruct` that live ABOVE the fetch layer:
+    // the hard error on an unresolvable TM datum, the deliberate SKIP on an
+    // unresolvable peg-out datum, and the final cross-check against the on-chain
+    // singleton. A fake source reaches every one of them without a server, and
+    // being trait-level they hold for both backends by construction.
+    // `cardano::cpo_history` covers the two real backends over HTTP.
+
+    use crate::cardano::cpo_history::{CpoHistorySource, HistoricalOutput};
+    use async_trait::async_trait;
+
+    const T_ADDR: &str = "tm-address";
+    const P_ADDR: &str = "pegout-address";
+    const POLICY: &str = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
+    const FBTC: &str = "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0";
+
+    #[derive(Default)]
+    struct FakeSource {
+        tm: Vec<HistoricalOutput>,
+        pegout: Vec<HistoricalOutput>,
+        singleton: Vec<HistoricalOutput>,
+    }
+
+    #[async_trait]
+    impl CpoHistorySource for FakeSource {
+        fn backend(&self) -> &'static str {
+            "fake"
+        }
+        fn endpoint(&self) -> &str {
+            "memory://"
+        }
+        fn datum_gap_advice(&self) -> &'static str {
+            "fake advice"
+        }
+        async fn address_history(&self, address: &str) -> Result<Vec<HistoricalOutput>, String> {
+            Ok(match address {
+                T_ADDR => self.tm.clone(),
+                P_ADDR => self.pegout.clone(),
+                other => return Err(format!("unexpected address {other}")),
+            })
+        }
+        async fn unspent_with_asset(
+            &self,
+            _policy_hex: &str,
+            _asset_name_hex: &str,
+        ) -> Result<Vec<HistoricalOutput>, String> {
+            Ok(self.singleton.clone())
+        }
+    }
+
+    fn fake_out(
+        tx: [u8; 32],
+        index: u32,
+        assets: &[(String, u64)],
+        datum: Option<PlutusData>,
+    ) -> HistoricalOutput {
+        HistoricalOutput {
+            tx_hash: hex::encode(tx),
+            output_index: index,
+            assets: assets.iter().cloned().collect(),
+            datum_note: if datum.is_some() {
+                "inline".into()
+            } else {
+                "unresolved".into()
+            },
+            datum,
+        }
+    }
+
+    /// A Confirmed TM datum paying `(spk, net)` and committing `root`.
+    fn confirmed_datum(txid: [u8; 32], payments: &[(Vec<u8>, u64)], root: [u8; 32]) -> PlutusData {
+        use crate::cardano::plutus::{array, bool_data, bytes, constr, int, int_from_u64};
+        let mut spk = CPO_COMMITMENT_PREFIX.to_vec();
+        spk.extend_from_slice(&root);
+        let entry = |s: &[u8], a: u64| constr(0, vec![bytes(s), int_from_u64(a)]);
+        let mut outs = vec![entry(&[0x51; 34], 900_000)];
+        outs.extend(payments.iter().map(|(s, a)| entry(s, *a)));
+        outs.push(entry(&spk, 0));
+        constr(
+            1,
+            vec![
+                bytes(&txid),
+                array(vec![]),
+                array(outs),
+                bool_data(false),
+                bytes(&[0x7a; 28]),
+                int(1_700_000_000_000),
+            ],
+        )
+    }
+
+    fn pegout_request_datum(spk: &[u8], fee: u64) -> PlutusData {
+        use crate::cardano::plutus::{bytes, constr, int, int_from_u64};
+        constr(
+            0,
+            vec![
+                constr(0, vec![bytes(&[0x01; 28])]),
+                bytes(spk),
+                int_from_u64(fee),
+                int(1_700_000_000_000),
+            ],
+        )
+    }
+
+    fn fake_cfg() -> ReconstructConfig {
+        ReconstructConfig {
+            tm_address: T_ADDR.into(),
+            pegout_address: P_ADDR.into(),
+            fbtc_policy_id: FBTC.into(),
+            fbtc_asset_name_hex: "66425443".into(),
+            cpo_policy_id: Some(POLICY.into()),
+        }
+    }
+
+    /// One TM, one request, no hint — the fallback matcher does the work, and the
+    /// finished trie matches the singleton.
+    fn one_movement_world() -> (FakeSource, [u8; 32]) {
+        use crate::cardano::plutus::{bytes, constr};
+        let por_tx = [0x11u8; 32];
+        let spk = vec![0xaau8; 22];
+        let (gross, fee) = (100_000u64, 1_000u64);
+        let entry = CpoEntry::new(por_id(&por_tx, 0), &spk, gross - fee);
+        let root = CpoTrie::from_entries(&[entry]).unwrap().root();
+        let fbtc_unit = format!("{FBTC}66425443");
+        (
+            FakeSource {
+                tm: vec![fake_out(
+                    [0xb2; 32],
+                    0,
+                    &[],
+                    Some(confirmed_datum(
+                        [0xa1; 32],
+                        &[(spk.clone(), gross - fee)],
+                        root,
+                    )),
+                )],
+                pegout: vec![fake_out(
+                    por_tx,
+                    0,
+                    &[(fbtc_unit, gross)],
+                    Some(pegout_request_datum(&spk, fee)),
+                )],
+                singleton: vec![fake_out(
+                    [0xcf; 32],
+                    0,
+                    &[(format!("{POLICY}{CPO_ASSET_NAME_HEX}"), 1)],
+                    Some(constr(0, vec![bytes(&root)])),
+                )],
+            },
+            root,
+        )
+    }
+
+    #[tokio::test]
+    async fn reconstruct_rebuilds_the_trie_and_cross_checks_the_singleton() {
+        let (world, root) = one_movement_world();
+        let trie = reconstruct(&world, &fake_cfg()).await.unwrap();
+        assert_eq!(trie.root(), root);
+        assert_eq!(trie.len(), 1);
+    }
+
+    // An output at the TM address whose datum the backend cannot supply aborts the
+    // run. Skipping it could drop a whole movement while the trie still looks
+    // complete — the one failure mode reconstruction must never have.
+    #[tokio::test]
+    async fn reconstruct_hard_errors_on_an_unresolvable_tm_datum() {
+        let (mut world, _) = one_movement_world();
+        world.tm.push(fake_out([0xee; 32], 3, &[], None));
+        let err = reconstruct(&world, &fake_cfg()).await.unwrap_err();
+        assert!(matches!(err, CpoTrieError::Source(_)), "{err}");
+        let msg = format!("{err}");
+        assert!(msg.contains("unexplained gap"), "{msg}");
+        assert!(
+            msg.contains("fake advice"),
+            "the backend's remediation: {msg}"
+        );
+    }
+
+    // The mirror image: at the PEG-OUT address an unresolvable datum is skipped.
+    // The address is permissionlessly payable, so erroring would let anyone block
+    // every reconstruction with one junk UTxO — and a missing request cannot
+    // silently shrink the trie, it only makes some TM fail its own assertion.
+    #[tokio::test]
+    async fn reconstruct_skips_an_unresolvable_pegout_datum() {
+        let (mut world, root) = one_movement_world();
+        world.pegout.push(fake_out(
+            [0xee; 32],
+            0,
+            &[(format!("{FBTC}66425443"), 5_000)],
+            None,
+        ));
+        let trie = reconstruct(&world, &fake_cfg()).await.unwrap();
+        assert_eq!(trie.root(), root);
+    }
+
+    // The last safety net: a replay that stopped short passes every per-movement
+    // assertion and still yields a short trie. Only the singleton catches it.
+    #[tokio::test]
+    async fn reconstruct_refuses_a_trie_the_singleton_disagrees_with() {
+        use crate::cardano::plutus::{bytes, constr};
+        let (mut world, _) = one_movement_world();
+        world.singleton = vec![fake_out(
+            [0xcf; 32],
+            0,
+            &[(format!("{POLICY}{CPO_ASSET_NAME_HEX}"), 1)],
+            Some(constr(0, vec![bytes(&[0x5a; 32])])),
+        )];
+        let err = reconstruct(&world, &fake_cfg()).await.unwrap_err();
+        assert!(matches!(err, CpoTrieError::RootMismatch { .. }), "{err}");
+    }
+
+    // Zero outputs holding the NFT means the singleton is not deployed or not
+    // indexed; several mean it is not a singleton. Neither may pass as "checked".
+    #[tokio::test]
+    async fn reconstruct_reports_a_missing_or_duplicated_singleton() {
+        let (mut world, _) = one_movement_world();
+        world.singleton = vec![];
+        let err = reconstruct(&world, &fake_cfg()).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("no unspent output holds"),
+            "{err}"
+        );
+
+        let (mut world, root) = one_movement_world();
+        use crate::cardano::plutus::{bytes, constr};
+        let unit = format!("{POLICY}{CPO_ASSET_NAME_HEX}");
+        world.singleton = vec![
+            fake_out(
+                [0xcf; 32],
+                0,
+                &[(unit.clone(), 1)],
+                Some(constr(0, vec![bytes(&root)])),
+            ),
+            fake_out(
+                [0xdf; 32],
+                0,
+                &[(unit, 1)],
+                Some(constr(0, vec![bytes(&root)])),
+            ),
+        ];
+        let err = reconstruct(&world, &fake_cfg()).await.unwrap_err();
+        assert!(format!("{err}").contains("not a singleton"), "{err}");
     }
 }

@@ -1,20 +1,25 @@
 //! Minimal Kupo client — the chain-history reader the completed-peg-outs trie
 //! reconstruction needs.
 //!
-//! ## Why Kupo and not Blockfrost
+//! ## Why Kupo
 //!
 //! Reconstruction (cold start, disaster recovery, a newly joined SPO) has to read
 //! the inline datums of **spent** outputs: every Treasury Movement's `Unconfirmed`
 //! record is spent by its own Confirm transition, and that spent record is where
 //! the rev-5.1 data-availability hint (`fulfilled_por_outpoints`) lives. A
-//! Blockfrost-compatible API indexes the *current* UTxO set by address; it cannot
-//! answer "every output ever created at this address, spent ones included".
-//! Kupo can: `GET /matches/{pattern}` returns created-and-since-spent matches with
+//! Blockfrost-compatible API indexes the *current* UTxO set by address, so it
+//! cannot answer "every output ever created at this address" in one query. Kupo
+//! can: `GET /matches/{pattern}` returns created-and-since-spent matches with
 //! their datum hashes, and `GET /datums/{hash}` returns the datum bytes.
 //!
-//! So Kupo is used ONLY on the reconstruction path. Steady-state operation stays
-//! on the Blockfrost-compatible subset a Dolos node serves — see the endpoint list
-//! in `cardano::cpo_trie`.
+//! Kupo is therefore the RECOMMENDED reconstruction backend, and it is used ONLY
+//! there. Steady-state operation stays on the Blockfrost-compatible subset a Dolos
+//! node serves — see the endpoint list in `cardano::cpo_trie`.
+//!
+//! It is not the only backend. `cardano::cpo_history` also reconstructs through a
+//! plain Blockfrost-compatible API, by walking the address transaction history and
+//! reading each transaction's outputs — many more requests, same result. This
+//! client is wrapped by `cpo_history::KupoHistory`; nothing else calls it.
 //!
 //! ## Scope
 //!

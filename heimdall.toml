@@ -36,9 +36,16 @@ submit = false          # broadcast signed BTC tx to rpc_url (false: binocular r
 # anchor's satoshi value is fetched via rpc_url gettxout.
 
 [cardano]
-# Kupo base URL. Needed ONLY by `reconstruct-cpo-trie`, which rebuilds the
+# Kupo base URL. OPTIONAL, and used ONLY by `reconstruct-cpo-trie`, which rebuilds the
 # completed-peg-outs trie from the inline datums of already-SPENT outputs — a read
 # a Blockfrost-compatible UTxO API cannot serve. Steady-state operation never uses it.
+#
+# Set    -> reconstruction reads Kupo. Recommended for production SPOs: one request
+#           per address, and self-hosted, as the spec requires of consensus-relevant reads.
+# Unset  -> reconstruction falls back to the Blockfrost-compatible transaction-history
+#           endpoints (blockfrost_project_id below). Same trie, same checks, but it walks
+#           the whole address history — roughly one request per transaction. Meant for
+#           test environments, demos, and non-SPO tooling.
 # kupo_url = "http://localhost:1442"
 # Policy id of the completed-peg-outs trie validator (Config field 3). Required by
 # `reconstruct-cpo-trie`: it cross-checks the rebuilt trie against the on-chain CPO

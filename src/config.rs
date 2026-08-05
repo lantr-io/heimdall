@@ -211,13 +211,21 @@ pub struct CardanoConfig {
     /// Custom Blockfrost-compatible API base URL (e.g. yaci-devkit's
     /// http://localhost:8080/api/v1). None → public blockfrost.io.
     pub blockfrost_url: Option<String>,
-    /// Kupo base URL, e.g. `http://localhost:1442`.
+    /// Kupo base URL, e.g. `http://localhost:1442`. OPTIONAL.
     ///
-    /// Needed ONLY to rebuild the completed-peg-outs trie from chain history
+    /// Used ONLY to rebuild the completed-peg-outs trie from chain history
     /// (`reconstruct-cpo-trie`): that read wants the inline datums of already-SPENT
     /// outputs, which a Blockfrost-compatible UTxO-set API cannot serve. Steady-state
     /// operation never touches it, so a node with a healthy `cpo-trie.json` runs
     /// without Kupo configured.
+    ///
+    /// Set → reconstruction reads Kupo. Unset → it falls back to the
+    /// Blockfrost-compatible transaction-history endpoints
+    /// (`blockfrost_project_id`). Both produce the same trie under the same
+    /// checks, but a production SPO SHOULD run Kupo: it answers a whole address
+    /// history in one request, whereas the Blockfrost path issues roughly one
+    /// request per transaction that ever touched the address. See
+    /// `cardano::cpo_history`.
     pub kupo_url: Option<String>,
     /// Policy id (script hash) of the completed-peg-outs trie validator — Config
     /// field 3. It identifies the on-chain CPO singleton (asset name `"CPO"`).

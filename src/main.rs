@@ -628,10 +628,16 @@ enum Commands {
     /// bridge that already has peg-out history: without a correct trie this node
     /// proposes roots its peers refuse, and refuses the roots they propose.
     ///
-    /// Reads through Kupo (`cardano.kupo_url`), not Blockfrost — the rebuild needs
-    /// the inline datums of already-SPENT outputs, which a UTxO-set API cannot
-    /// serve. Every step is checked against the root each Treasury Movement
-    /// attested, so a garbled data-availability hint costs time, never correctness.
+    /// The rebuild needs the inline datums of already-SPENT outputs, which a
+    /// UTxO-set API cannot serve. Two backends can supply them: Kupo when
+    /// `cardano.kupo_url` is set (recommended for SPOs — one request per address),
+    /// otherwise the Blockfrost-compatible API from `cardano.blockfrost_project_id`,
+    /// which walks the address transaction history instead (many more requests;
+    /// meant for test environments, demos, and non-SPO tooling).
+    ///
+    /// Both run the SAME algorithm. Every step is checked against the root each
+    /// Treasury Movement attested, so a garbled data-availability hint costs time,
+    /// never correctness.
     ReconstructCpoTrie {
         #[arg(long)]
         config: Option<String>,
@@ -4437,21 +4443,21 @@ fn run_mover(
 }
 
 /// `reconstruct-cpo-trie`: rebuild the completed-peg-outs trie from Cardano
-/// history through Kupo, then persist it to `protocol.state_dir`.
+/// history, then persist it to `protocol.state_dir`.
+///
+/// The history read runs on EITHER backend — Kupo when `cardano.kupo_url` is set
+/// (the production recommendation), else the Blockfrost-compatible API already
+/// configured for steady-state operation. Both run the same algorithm and the same
+/// checks; see `cardano::cpo_history`.
 ///
 /// Writes only on success, and only the whole trie: a partial rebuild is worse
 /// than no rebuild, because the node would sign roots derived from a set it
 /// believes is complete. Every TM's running root is checked against the root that
 /// TM attested, so an unexplainable movement aborts the run and names itself.
 fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), String> {
+    use heimdall::cardano::cpo_history::{BlockfrostHistory, CpoHistorySource, KupoHistory};
     use heimdall::cardano::cpo_trie::{ReconstructConfig, reconstruct};
-    use heimdall::cardano::kupo::KupoClient;
 
-    let kupo_url = cfg
-        .cardano
-        .kupo_url
-        .as_deref()
-        .ok_or("set cardano.kupo_url — reconstruction needs the datums of SPENT outputs, which a Blockfrost-compatible UTxO API cannot serve")?;
     let tm_address = cfg
         .cardano
         .treasury_address
@@ -4494,8 +4500,30 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
         .trim()
         .to_ascii_lowercase();
 
+    // Backend selection: Kupo when configured, else the Blockfrost-compatible API.
+    //
+    // Kupo is what a production SPO should run — it answers a whole address
+    // history in one request, and it is self-hosted, which the spec requires of
+    // every consensus-relevant read. The Blockfrost path is for test
+    // environments, demos, and non-SPO tooling: it reconstructs the same trie
+    // with the same checks, but it walks the address's transaction history and
+    // costs roughly one request per transaction.
+    let source: Box<dyn CpoHistorySource> = match cfg.cardano.kupo_url.as_deref() {
+        Some(url) => Box::new(KupoHistory::new(url)),
+        None => {
+            let project_id = cfg.cardano.blockfrost_project_id.as_deref().ok_or(
+                "set cardano.kupo_url (recommended for SPOs) or cardano.blockfrost_project_id \
+                 — reconstruction reads the datums of SPENT outputs, which needs either a Kupo \
+                 index or a Blockfrost-compatible transaction-history API",
+            )?;
+            Box::new(BlockfrostHistory::new(
+                project_id,
+                cfg.cardano.blockfrost_url.as_deref(),
+            ))
+        }
+    };
+
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
-    let kupo = KupoClient::new(kupo_url);
     let recon = ReconstructConfig {
         tm_address: tm_address.to_string(),
         pegout_address: pegout_address.to_string(),
@@ -4503,9 +4531,13 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
         fbtc_asset_name_hex: fbtc_asset_name_hex.to_string(),
         cpo_policy_id: Some(cpo_policy_id),
     };
-    println!("reconstructing the completed-peg-outs trie via kupo {kupo_url}");
+    println!(
+        "reconstructing the completed-peg-outs trie via {} {}",
+        source.backend(),
+        source.endpoint()
+    );
     let trie = rt
-        .block_on(reconstruct(&kupo, &recon))
+        .block_on(reconstruct(source.as_ref(), &recon))
         .map_err(|e| e.to_string())?;
 
     println!(
