@@ -159,6 +159,10 @@ pub struct MockCardanoChain {
     /// default) keeps the mock on relative per-round timeouts.
     schedule_anchor_ms: Option<i64>,
     tm_confirmed: Arc<AtomicBool>,
+    /// The root the mock reports as the on-chain completed-peg-outs singleton's.
+    /// `None` (the default) is the unconfigured chain: `BuildTm` skips the
+    /// cross-check instead of treating it as the empty trie.
+    cpo_root: Option<[u8; 32]>,
 }
 
 impl MockCardanoChain {
@@ -172,7 +176,15 @@ impl MockCardanoChain {
             dkg_faults: Arc::new(Mutex::new(Vec::new())),
             schedule_anchor_ms: None,
             tm_confirmed: Arc::new(AtomicBool::new(true)),
+            cpo_root: None,
         }
+    }
+
+    /// Report `root` as the on-chain completed-peg-outs singleton's root, so a
+    /// test can drive `BuildTm`'s stale-trie refusal from both sides.
+    pub fn with_cpo_root(mut self, root: [u8; 32]) -> Self {
+        self.cpo_root = Some(root);
+        self
     }
 
     /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning
@@ -285,6 +297,10 @@ impl CardanoChain for MockCardanoChain {
 
     async fn is_tm_confirmed(&self, _txid: &bitcoin::Txid) -> EpochResult<bool> {
         Ok(self.tm_confirmed.load(Ordering::Acquire))
+    }
+
+    async fn query_cpo_root(&self) -> EpochResult<Option<[u8; 32]>> {
+        Ok(self.cpo_root)
     }
 
     async fn publish_group_key(&self, y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()> {

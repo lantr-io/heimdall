@@ -730,6 +730,10 @@ async fn collect_pegins_phase(
 /// A node that joined a bridge with existing history must run
 /// `reconstruct-cpo-trie` first; starting empty there means every root it
 /// proposes is wrong and every root it verifies is refused, which is loud.
+///
+/// Loading says nothing about whether the file still describes the deployment
+/// this node is signing for — [`cross_check_cpo_root`] is what decides that, and
+/// `BuildTm` runs it on the result before anything is built.
 fn load_cpo_trie(
     state_dir: Option<&std::path::Path>,
     me: frost::Identifier,
@@ -765,6 +769,66 @@ fn load_cpo_trie(
                 dir.display()
             );
             Ok(CpoTrie::empty())
+        }
+    }
+}
+
+/// Refuse to attest a completed-peg-outs root the chain does not hold.
+///
+/// [`load_cpo_trie`] trusts `cpo-trie.json` verbatim, and an ABSENT file is the
+/// only path to the genesis trie — so a re-bootstrap, which mints a FRESH
+/// zero-root CPO singleton while the state directory still holds the previous
+/// deployment's populated trie, leaves this node ready to commit a root that
+/// deployment no longer has. Peers reject that TM; a quorum of equally stale
+/// nodes attests it and produces membership proofs `peg-out.ak` refuses.
+///
+/// The on-chain singleton is the only check that covers the whole trie — every
+/// per-movement assertion in `reconstruct` is relative to the previous movement,
+/// so a trie that is right about its entries and short by a movement passes them
+/// all. Run before `build_tm`, so nothing is signed off a stale trie.
+///
+/// `None` from the chain is "not configured", not "empty": it warns and proceeds,
+/// because a node with no `cardano.cpo_policy_id` cannot tell the two apart.
+async fn cross_check_cpo_root(
+    chain: &Arc<dyn CardanoChain>,
+    cpo_trie: &crate::cardano::cpo_trie::CpoTrie,
+    state_dir: Option<&std::path::Path>,
+    me: frost::Identifier,
+    epoch: u64,
+) -> EpochResult<()> {
+    let local = cpo_trie.root();
+    match chain.query_cpo_root().await? {
+        Some(on_chain) if on_chain != local => Err(EpochError::TmBuild(format!(
+            "completed-peg-outs trie is out of sync with the chain: local root {} ({} entries) \
+             != on-chain CPO singleton root {}. Refusing to attest — a TM built on a stale trie \
+             commits a root the chain does not hold. Rebuild with `reconstruct-cpo-trie` (and \
+             delete the stale {}/cpo-trie.json if the bridge was re-bootstrapped).",
+            hex::encode(local),
+            cpo_trie.len(),
+            hex::encode(on_chain),
+            state_dir.map_or_else(
+                || "<protocol.state_dir>".to_string(),
+                |d| d.display().to_string()
+            ),
+        ))),
+        Some(on_chain) => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "  completed-peg-outs trie: root matches the on-chain CPO singleton ({})",
+                hex::encode(on_chain)
+            );
+            Ok(())
+        }
+        None => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "  completed-peg-outs trie: WARNING: no cpo_policy_id configured — the local root \
+                 was NOT cross-checked against the on-chain CPO singleton. Set \
+                 cardano.cpo_policy_id before trusting this trie to sign with."
+            );
+            Ok(())
         }
     }
 }
@@ -898,6 +962,7 @@ async fn build_tm_phase(
     // The completed-peg-outs trie: this node's own copy, which decides both which
     // requests are still owed a payment and the root this TM will commit.
     let cpo_trie = load_cpo_trie(config.state_dir.as_deref(), me, epoch)?;
+    cross_check_cpo_root(chain, &cpo_trie, config.state_dir.as_deref(), me, epoch).await?;
 
     // Chain "now" for the freshness filter. Read from the chain, not the local
     // clock: it is a skip-rule input, and every SPO must reach the same verdict or
@@ -1435,5 +1500,76 @@ mod tests {
         let (k1, _) = next_window(1_000_000, w, 1_000_000);
         let (k2, _) = next_window(1_000_000, w, 1_060_000);
         assert_ne!(k1 * DKG_ATTEMPTS_PER_WINDOW, k2 * DKG_ATTEMPTS_PER_WINDOW);
+    }
+
+    fn cpo_check_chain(on_chain_root: Option<[u8; 32]>) -> Arc<dyn CardanoChain> {
+        let mock = MockCardanoChain::new(demo_static_fixture(2, 2, 18_900));
+        Arc::new(match on_chain_root {
+            Some(root) => mock.with_cpo_root(root),
+            None => mock,
+        })
+    }
+
+    /// The trie the chain agrees with is signable: the cross-check passes and
+    /// `BuildTm` goes on to build.
+    #[tokio::test]
+    async fn cpo_cross_check_accepts_a_matching_root() {
+        let trie = crate::cardano::cpo_trie::CpoTrie::empty();
+        let chain = cpo_check_chain(Some(trie.root()));
+        let id = Identifier::try_from(1u16).unwrap();
+        cross_check_cpo_root(&chain, &trie, None, id, 0)
+            .await
+            .expect("a root the chain holds must be attestable");
+    }
+
+    /// The re-bootstrap case: a leftover populated trie against a fresh
+    /// zero-root singleton. Nothing may be signed, and the operator must be told
+    /// which command rebuilds the trie.
+    #[tokio::test]
+    async fn cpo_cross_check_refuses_a_stale_root() {
+        let trie = crate::cardano::cpo_trie::CpoTrie::empty();
+        let chain = cpo_check_chain(Some([0x11u8; 32]));
+        let id = Identifier::try_from(1u16).unwrap();
+        let err = cross_check_cpo_root(
+            &chain,
+            &trie,
+            Some(std::path::Path::new("/var/lib/hd")),
+            id,
+            0,
+        )
+        .await
+        .expect_err("a root the chain does not hold must not be attestable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reconstruct-cpo-trie"),
+            "the refusal must name the command that fixes it: {msg}"
+        );
+        assert!(
+            msg.contains(&hex::encode([0x11u8; 32])),
+            "the refusal must show the on-chain root: {msg}"
+        );
+        assert!(
+            msg.contains("/var/lib/hd/cpo-trie.json"),
+            "the refusal must name the stale file: {msg}"
+        );
+    }
+
+    /// An unconfigured `cardano.cpo_policy_id` reports `None`, which is "cannot
+    /// check", not "empty trie" — it warns and proceeds, or every such node would
+    /// refuse to sign for a bridge with any peg-out history.
+    #[tokio::test]
+    async fn cpo_cross_check_passes_when_the_chain_cannot_answer() {
+        let mut trie = crate::cardano::cpo_trie::CpoTrie::empty();
+        trie.insert_batch(&[crate::cardano::cpo_trie::CpoEntry::new(
+            [7u8; 32],
+            &[0x51, 0x20],
+            1_000,
+        )])
+        .unwrap();
+        let chain = cpo_check_chain(None);
+        let id = Identifier::try_from(1u16).unwrap();
+        cross_check_cpo_root(&chain, &trie, None, id, 0)
+            .await
+            .expect("an unchecked root must still be attestable");
     }
 }

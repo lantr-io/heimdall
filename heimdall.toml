@@ -5,10 +5,16 @@
 dkg_round_timeout_secs = 300
 poll_interval_ms = 5000
 quorum51_timeout_secs = 300
-federation_timeout_secs = 300
 leader_timeout_secs = 10000
 pegin_collection_window_secs = 5
 pegin_poll_interval_ms = 1000
+# Durable directory for this node's completed-peg-outs trie mirror (cpo-trie.json),
+# and for the DKG share that survives a restart. Unset means the EMPTY (genesis)
+# trie on every start — correct only on a bridge that has completed no peg-out.
+# Set it before paying peg-outs, and rebuild after a re-bootstrap with
+# `reconstruct-cpo-trie`. BuildTm cross-checks the loaded root against the
+# on-chain CPO singleton (see cardano.cpo_policy_id) and refuses to sign on a mismatch.
+# state_dir = "/var/lib/heimdall"
 # A peg-out is payable only while at least this far from its 30-day Cancel
 # deadline. Paying one later lets the owner take the BTC and then Cancel for the
 # fBTC. MUST match across SPOs — it is a TM skip rule. 7 days.

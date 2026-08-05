@@ -1371,6 +1371,14 @@ async fn run_demo(
             cfg.cardano.blockfrost_url.as_deref(),
         );
 
+        // The on-chain completed-peg-outs singleton, so BuildTm can cross-check the
+        // persisted trie against it before signing anything. Unset cpo_policy_id
+        // leaves the check off and BuildTm says so once per movement.
+        bf_chain = bf_chain.with_cpo_source(
+            cfg.cardano.cpo_policy_id.as_deref(),
+            cfg.cardano.kupo_url.as_deref(),
+        );
+
         if let Some(mnemonic) = &cfg.cardano.mnemonic {
             let wallet_addr = heimdall::cardano::wallet::wallet_address_from_mnemonic(mnemonic)
                 .expect("cardano.mnemonic must be a valid BIP-39 mnemonic");
@@ -1802,6 +1810,76 @@ fn cpo_trie_from_cfg(cfg: &HeimdallConfig) -> Result<heimdall::cardano::cpo_trie
             Ok(CpoTrie::empty())
         }
     }
+}
+
+/// Refuse to build a TM off a trie the chain does not hold — the CLI mirror of
+/// `epoch::machine::cross_check_cpo_root`.
+///
+/// [`cpo_trie_from_cfg`] trusts `cpo-trie.json` verbatim, so a re-bootstrap that
+/// mints a FRESH zero-root CPO singleton while this box still holds the previous
+/// deployment's trie leaves `sweep-pegins` / `run-mover` ready to commit a root
+/// the chain no longer has. Confirm then copies that root into the singleton's
+/// datum, and every membership proof built against the real payment history is
+/// refused by `peg-out.ak`.
+///
+/// No `cardano.cpo_policy_id` means the check cannot run at all; that warns and
+/// proceeds, because an unconfigured node cannot tell "not checked" from "empty".
+fn cross_check_cpo_trie_from_cfg(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+    trie: &heimdall::cardano::cpo_trie::CpoTrie,
+) -> Result<(), String> {
+    use heimdall::cardano::cpo_history::{BlockfrostHistory, CpoHistorySource, KupoHistory};
+
+    let Some(policy) = cfg.cardano.cpo_policy_id.as_deref() else {
+        eprintln!(
+            "[cpo] WARNING: no cardano.cpo_policy_id — the local root was NOT cross-checked \
+             against the on-chain completed-peg-outs singleton. Set it before signing a TM on a \
+             live bridge."
+        );
+        return Ok(());
+    };
+    // Same backend selection as `reconstruct-cpo-trie`, so both reads see the same index.
+    let source: Box<dyn CpoHistorySource> = match cfg.cardano.kupo_url.as_deref() {
+        Some(url) => Box::new(KupoHistory::new(url)),
+        None => {
+            let project_id = cfg.cardano.blockfrost_project_id.as_deref().ok_or(
+                "set cardano.kupo_url or cardano.blockfrost_project_id — cardano.cpo_policy_id \
+                 is set, so the completed-peg-outs singleton must be readable to cross-check \
+                 the local trie",
+            )?;
+            Box::new(BlockfrostHistory::new(
+                project_id,
+                cfg.cardano.blockfrost_url.as_deref(),
+            ))
+        }
+    };
+    let on_chain = rt
+        .block_on(heimdall::cardano::cpo_trie::fetch_onchain_cpo_root(
+            source.as_ref(),
+            policy.trim(),
+        ))
+        .map_err(|e| format!("read the on-chain completed-peg-outs singleton: {e}"))?;
+    if on_chain != trie.root() {
+        return Err(format!(
+            "completed-peg-outs trie is out of sync with the chain: local root {} ({} entries) \
+             != on-chain CPO singleton root {}. Refusing to build — a TM built on a stale trie \
+             commits a root the chain does not hold. Rebuild with `reconstruct-cpo-trie` (and \
+             delete the stale {}/cpo-trie.json if the bridge was re-bootstrapped).",
+            hex::encode(trie.root()),
+            trie.len(),
+            hex::encode(on_chain),
+            cfg.protocol
+                .state_dir
+                .as_deref()
+                .unwrap_or("<protocol.state_dir>"),
+        ));
+    }
+    eprintln!(
+        "[cpo] local root matches the on-chain completed-peg-outs singleton ({})",
+        hex::encode(on_chain)
+    );
+    Ok(())
 }
 
 /// The freshness window for peg-out selection. `now_ms` must be CHAIN time.
@@ -5232,6 +5310,9 @@ fn run_sweep_pegins(
         _ => 0,
     };
     let cpo_trie = cpo_trie_from_cfg(cfg)?;
+    // Before anything is built or signed: this TM commits `cpo_trie`'s root, so a
+    // trie that has fallen out of sync with the chain must stop the sweep here.
+    cross_check_cpo_trie_from_cfg(&rt, cfg, &cpo_trie)?;
 
     // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..m] = one
     // payment per peg-out (sorted by (scriptPubKey, net amount, por_id) inside build_tm); the LAST
@@ -5425,6 +5506,10 @@ fn run_sweep_pegins(
             treasury_config,
             fixture.roster.clone(),
             cfg.cardano.blockfrost_url.as_deref(),
+        );
+        chain = chain.with_cpo_source(
+            cfg.cardano.cpo_policy_id.as_deref(),
+            cfg.cardano.kupo_url.as_deref(),
         );
         if let Some(mnemonic) = &cfg.cardano.mnemonic {
             chain = chain

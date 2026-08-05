@@ -446,6 +446,14 @@ pub struct BlockfrostCardanoChain {
     last_submitted_txid: Mutex<Option<bitcoin::Txid>>,
     /// Optional automatic DKG fault proof mint + ApplyBan configuration.
     fault_ban_flow: Option<DkgFaultBanFlow>,
+    /// Policy id of the completed-peg-outs trie validator (Config field 3). When
+    /// set, `query_cpo_root` reads the on-chain CPO singleton so `BuildTm` can
+    /// cross-check its persisted trie against it. `None` disables the check.
+    cpo_policy_id: Option<String>,
+    /// Kupo base URL, used only to answer `query_cpo_root` when it is set — the
+    /// same backend choice `reconstruct-cpo-trie` makes, so both reads see the
+    /// same index. `None` falls back to the Blockfrost-compatible API.
+    kupo_url: Option<String>,
 }
 
 impl BlockfrostCardanoChain {
@@ -491,7 +499,18 @@ impl BlockfrostCardanoChain {
             config_nft_unit: None,
             last_submitted_txid: Mutex::new(None),
             fault_ban_flow: None,
+            cpo_policy_id: None,
+            kupo_url: None,
         }
+    }
+
+    /// Locate the on-chain completed-peg-outs singleton so `query_cpo_root` can
+    /// answer. Without it every `BuildTm` runs its trie unchecked, which is the
+    /// state in which a stale persisted trie gets attested.
+    pub fn with_cpo_source(mut self, cpo_policy_id: Option<&str>, kupo_url: Option<&str>) -> Self {
+        self.cpo_policy_id = cpo_policy_id.map(|s| s.trim().to_ascii_lowercase());
+        self.kupo_url = kupo_url.map(str::to_string);
+        self
     }
 
     /// Mint the TM NFT under the real TreasuryMovementValidator policy (CBOR from
@@ -1380,6 +1399,31 @@ impl CardanoChain for BlockfrostCardanoChain {
             }
         }
         Ok(payments)
+    }
+
+    async fn query_cpo_root(&self) -> EpochResult<Option<[u8; 32]>> {
+        let Some(policy) = self.cpo_policy_id.as_deref() else {
+            return Ok(None);
+        };
+        // Same backend selection as `reconstruct-cpo-trie` (see run_reconstruct_cpo_trie):
+        // Kupo when configured, else the Blockfrost-compatible API. Reading the singleton
+        // is a plain unspent-with-asset query, which both backends serve.
+        let source: Box<dyn crate::cardano::cpo_history::CpoHistorySource> =
+            match self.kupo_url.as_deref() {
+                Some(url) => Box::new(crate::cardano::cpo_history::KupoHistory::new(url)),
+                None => Box::new(crate::cardano::cpo_history::BlockfrostHistory::new(
+                    &self.bf_project_id,
+                    Some(&self.bf_base_url),
+                )),
+            };
+        crate::cardano::cpo_trie::fetch_onchain_cpo_root(source.as_ref(), policy)
+            .await
+            .map(Some)
+            .map_err(|e| {
+                EpochError::Chain(format!(
+                    "read the on-chain completed-peg-outs singleton: {e}"
+                ))
+            })
     }
 
     async fn query_pool_stake(

@@ -901,7 +901,12 @@ pub async fn reconstruct(
 /// output is an error: zero means the trie is not deployed (or the backend is not
 /// indexing it), and several mean the NFT is not a singleton, so no root is
 /// authoritative.
-async fn fetch_onchain_cpo_root(
+///
+/// Public because steady-state operation needs it too, not just reconstruction:
+/// `CardanoChain::query_cpo_root` reads it before every TM so a persisted
+/// `cpo-trie.json` that has fallen out of sync with the chain is caught before
+/// anything is signed.
+pub async fn fetch_onchain_cpo_root(
     source: &dyn CpoHistorySource,
     policy_hex: &str,
 ) -> Result<[u8; 32], CpoTrieError> {

@@ -192,6 +192,24 @@ pub trait CardanoChain: Send + Sync {
         Ok(vec![])
     }
 
+    /// The root held by the on-chain completed-peg-outs singleton, when this
+    /// node is configured to locate it (`cardano.cpo_policy_id`).
+    ///
+    /// This is the tripwire for a persisted `cpo-trie.json` that has fallen out
+    /// of sync with the chain — most sharply after a re-bootstrap, which mints a
+    /// FRESH zero-root CPO singleton while the node's state directory still holds
+    /// the previous deployment's populated trie. `BuildTm` compares this against
+    /// its local root and refuses to attest on a mismatch: a TM built on a stale
+    /// trie commits a root the chain does not hold, so every honest peer rejects
+    /// it, and a quorum of equally stale nodes would attest it anyway.
+    ///
+    /// `None` means "not configured / cannot be checked", never "empty trie". The
+    /// empty trie has a real root (32 zero bytes), and reporting it here would
+    /// turn an unconfigured node into one that rejects every non-genesis trie.
+    async fn query_cpo_root(&self) -> EpochResult<Option<[u8; 32]>> {
+        Ok(None)
+    }
+
     /// A pool's stake, for the off-chain min-stake gate (register_spo R2): the
     /// contract can't read stake, so SPOs query it and require `active_stake >=
     /// min_stake` before building register_spo and before admitting the SPO to
