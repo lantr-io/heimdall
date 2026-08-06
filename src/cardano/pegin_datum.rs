@@ -36,11 +36,13 @@ const DUST_THRESHOLD: Amount = Amount::from_sat(330);
 const BEACON_MARKER: &[u8; 3] = b"BFR";
 
 /// Full scriptPubKey length of the beacon OP_RETURN:
-/// OP_RETURN (1) + push-35 (1) + "BFR" (3) + xonly (32) = 37 bytes.
-const BEACON_SCRIPT_LEN: usize = 37;
+/// OP_RETURN (1) + push-67 (1) + "BFR" (3) + D (32) + Q_auth (32) = 69 bytes.
+const BEACON_SCRIPT_LEN: usize = 69;
 
-/// Push-opcode value matching a 35-byte payload ("BFR" || xonly).
-const BEACON_PUSH_OPCODE: u8 = 0x23; // OP_PUSHBYTES_35
+/// Push-opcode value matching a 67-byte payload ("BFR" || D || Q_auth).
+/// The retired 35-byte form (0x23) is not accepted: it carried no `D`, which is
+/// what forced the refund key to be guessed instead of read.
+const BEACON_PUSH_OPCODE: u8 = 0x43; // OP_PUSHBYTES_67
 
 /// A peg-in that has been parsed out of a Cardano datum and resolved
 /// to a concrete Bitcoin `(outpoint, value)` paying to the
@@ -156,14 +158,18 @@ pub fn extract_raw_btc_tx(data: &PlutusData) -> Result<Vec<u8>, ParseError> {
 ///
 /// ScriptPubKey shape (37 bytes):
 /// ```text
-/// 6a 23 42 46 52 <32-byte-xonly>
-/// ^^ ^^ ^^^^^^^^
-/// |  |  "BFR"
-/// |  push-35 (0x23)
+/// 6a 43 42 46 52 <32-byte D> <32-byte Q_auth>
+/// ^^ ^^ ^^^^^^^^ ^^^^^^^^^^^ ^^^^^^^^^^^^^^^^
+/// |  |  "BFR"    refund key   completion key
+/// |  push-67 (0x43)
 /// OP_RETURN
 /// ```
-pub fn parse_beacon(tx: &Transaction) -> Result<UntweakedPublicKey, ParseError> {
-    let mut found: Option<UntweakedPublicKey> = None;
+/// Returns `(D, Q_auth)` — the depositor's refund key and its BIP-322 completion
+/// key, both read directly from the 67-byte beacon.
+pub fn parse_beacon(
+    tx: &Transaction,
+) -> Result<(UntweakedPublicKey, UntweakedPublicKey), ParseError> {
+    let mut found: Option<(UntweakedPublicKey, UntweakedPublicKey)> = None;
     for out in &tx.output {
         let bytes = out.script_pubkey.as_bytes();
         if bytes.len() != BEACON_SCRIPT_LEN {
@@ -172,12 +178,14 @@ pub fn parse_beacon(tx: &Transaction) -> Result<UntweakedPublicKey, ParseError> 
         if bytes[0] != 0x6a || bytes[1] != BEACON_PUSH_OPCODE || &bytes[2..5] != BEACON_MARKER {
             continue;
         }
-        let xonly = UntweakedPublicKey::from_slice(&bytes[5..37])
+        let refund = UntweakedPublicKey::from_slice(&bytes[5..37])
+            .map_err(|e| ParseError::InvalidBeaconXonly(e.to_string()))?;
+        let auth = UntweakedPublicKey::from_slice(&bytes[37..69])
             .map_err(|e| ParseError::InvalidBeaconXonly(e.to_string()))?;
         if found.is_some() {
             return Err(ParseError::AmbiguousBeacon);
         }
-        found = Some(xonly);
+        found = Some((refund, auth));
     }
     found.ok_or(ParseError::NoBeacon)
 }
@@ -192,20 +200,17 @@ pub fn parse_beacon(tx: &Transaction) -> Result<UntweakedPublicKey, ParseError> 
 /// a protocol parameter (720 blocks per demo).
 ///
 /// The peg-in tree is `Taproot(Y_51, <refund_timeout> OP_CSV OP_DROP <D> OP_CHECKSIG)`.
-/// The refund key `D` is the depositor's own Taproot output key — crucially it is
-/// **not** the `BFR` beacon, which carries `Q_auth` (the BIP-322 completion key, a
-/// possibly-decoupled wallet). Because `D` is the merkle-root input needed for the
-/// key-path tweak, we recover it by trying each candidate — the beacon (legacy
-/// raw-`D` deposits) plus every P2TR output of the tx (BIP-322 deposits, where the
-/// refund leaf is keyed to the depositor's change / self-send output) — and keeping
-/// the one whose reconstructed peg-in address actually appears as a tx output.
+/// Both depositor keys are READ from the 67-byte beacon: `D`, the refund key that
+/// is the merkle-root input to the key-path tweak, and `Q_auth`, the BIP-322
+/// completion key (a possibly-decoupled wallet). The retired 35-byte beacon carried
+/// only `Q_auth`, so `D` had to be recovered by reconstructing the peg-in address
+/// for every candidate key in the tx and seeing which one appeared as an output —
+/// a search that was ambiguous whenever more than one candidate reconstructed.
 pub fn parse_pegin_request(
     req: &CardanoPegInRequest,
     y_51: UntweakedPublicKey,
     refund_timeout: u16,
 ) -> Result<ParsedPegIn, ParseError> {
-    use std::collections::BTreeSet;
-
     // 1. Decode the Cardano datum: we only trust field[1] (raw tx).
     let plutus: PlutusData = pallas_codec::minicbor::decode(&req.datum_cbor)
         .map_err(|e| ParseError::BadDatumShape(format!("cbor: {e}")))?;
@@ -216,46 +221,28 @@ pub fn parse_pegin_request(
         deserialize(&btc_tx_bytes).map_err(|e| ParseError::InvalidBtcTx(e.to_string()))?;
     let btc_txid = btc_tx.compute_txid();
 
-    // 3. Recover Q_auth from the OP_RETURN beacon (for BIP-322 completion).
-    let beacon_auth_outputkey = parse_beacon(&btc_tx)?;
+    // 3. Read both depositor keys from the OP_RETURN beacon: D (refund) and
+    //    Q_auth (BIP-322 completion).
+    let (refund_key, beacon_auth_outputkey) = parse_beacon(&btc_tx)?;
 
-    // 4. Recover the refund key D and the deposit output by reconstructing the
-    //    peg-in address `Taproot(Y_51, refund_leaf(D, refund_timeout))` for each
-    //    candidate D and matching it against a tx output. Candidates: the beacon
-    //    (legacy raw-D) + every P2TR output key (BIP-322: D = the depositor's own
-    //    output key, which appears as the change / self-send output).
-    let mut candidates: Vec<UntweakedPublicKey> = vec![beacon_auth_outputkey];
-    for out in &btc_tx.output {
-        let b = out.script_pubkey.as_bytes();
-        if b.len() == 34 && b[0] == 0x51 && b[1] == 0x20 {
-            if let Ok(k) = UntweakedPublicKey::from_slice(&b[2..34]) {
-                candidates.push(k);
-            }
-        }
-    }
-
+    // 4. Locate the deposit output. D is known, so the peg-in address
+    //    `Taproot(Y_51, refund_leaf(D, refund_timeout))` is computed once rather
+    //    than searched for. Two outputs paying that same address remain ambiguous —
+    //    this function resolves the peg-in from the tx alone, with no datum outpoint
+    //    to disambiguate them — so that case is still refused.
     let secp = Secp256k1::new();
-    let mut matched: Option<(usize, Amount, UntweakedPublicKey, TaprootSpendInfo)> = None;
-    let mut matched_vouts: BTreeSet<usize> = BTreeSet::new();
-    for d in candidates {
-        let spend_info = pegin_spend_info(&secp, y_51, d, refund_timeout);
-        let expected_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
-        let mut hit = None;
-        for (vout, txout) in btc_tx.output.iter().enumerate() {
-            if txout.script_pubkey == expected_spk {
-                matched_vouts.insert(vout);
-                hit = Some((vout, txout.value));
-            }
-        }
-        if let Some((vout, value)) = hit {
-            matched.get_or_insert((vout, value, d, spend_info));
-        }
-    }
-    // Two *distinct* outputs reconstructing is genuinely ambiguous.
-    if matched_vouts.len() > 1 {
+    let spend_info = pegin_spend_info(&secp, y_51, refund_key, refund_timeout);
+    let expected_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
+    let mut hits = btc_tx
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, txout)| txout.script_pubkey == expected_spk);
+    let (vout, txout) = hits.next().ok_or(ParseError::NoPegInOutput)?;
+    if hits.next().is_some() {
         return Err(ParseError::AmbiguousPegInOutput);
     }
-    let (vout, value, refund_key, spend_info) = matched.ok_or(ParseError::NoPegInOutput)?;
+    let value = txout.value;
 
     if value < DUST_THRESHOLD {
         return Err(ParseError::DustOutput);
@@ -318,10 +305,12 @@ mod tests {
         ScriptBuf::new_p2tr_tweaked(si.output_key())
     }
 
-    fn beacon_spk(xonly: [u8; 32]) -> ScriptBuf {
-        let mut payload = Vec::with_capacity(35);
+    /// Build a 67-byte dual-key beacon. `refund` is D, `auth` is Q_auth.
+    fn beacon_spk_dual(refund: [u8; 32], auth: [u8; 32]) -> ScriptBuf {
+        let mut payload = Vec::with_capacity(67);
         payload.extend_from_slice(BEACON_MARKER);
-        payload.extend_from_slice(&xonly);
+        payload.extend_from_slice(&refund);
+        payload.extend_from_slice(&auth);
         script::Builder::new()
             .push_opcode(OP_RETURN)
             .push_slice(<&bitcoin::script::PushBytes>::try_from(payload.as_slice()).unwrap())
@@ -340,7 +329,7 @@ mod tests {
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(depositor_xonly_bytes),
+                script_pubkey: beacon_spk_dual(depositor_xonly_bytes, depositor_xonly_bytes),
             },
             TxOut {
                 value: Amount::from_sat(500_000),
@@ -437,8 +426,22 @@ mod tests {
     /// `Y_51`-internal reconstruction + `D`-discovery; under the old `Y_fed` + beacon-as-`D`
     /// reader it returns `NoPegInOutput`.
     #[test]
-    fn parse_real_bip322_y51_deposit() {
-        let raw_tx = hex::decode("02000000018305aabd35b5312e2ff451d25df8556b8a919fdcc2d589f7308f8a92db38fd7a0200000000ffffffff03521600000000000022512047e8a68afb967b171f231d3635e44d96f4a883c2a98110c578e8afbf2af4b5fd0000000000000000256a23424652346dd9ec860a874859b0ca49f8844b7c5dbd01d36301e4a5b60c03a07b68aeeddc27000000000000225120681d0ee1e24d4bb8ac00cb5a62755eca29e71cb60116bc31c6a79d3863b640c200000000").unwrap();
+    fn real_legacy_bip322_deposit_is_refused() {
+        // A REAL preprod deposit, recorded before the dual-key beacon. It is the
+        // best evidence for why that beacon exists: its two depositor keys are
+        // genuinely decoupled —
+        //   D      = 681d0ee1e24d4bb8ac00cb5a62755eca29e71cb60116bc31c6a79d3863b640c2
+        //            (the change / self-send output key, committed in the refund leaf)
+        //   Q_auth = 346dd9ec860a874859b0ca49f8844b7c5dbd01d36301e4a5b60c03a07b68aeed
+        //            (the BIP-322 completion key, all the 35-byte beacon carried)
+        // Only Q_auth was on chain, so D had to be recovered by trying every P2TR
+        // output against the reconstructed peg-in address.
+        //
+        // Legacy beacons are now refused outright rather than dual-read (WI-037), so
+        // this deposit no longer parses: its 37-byte beacon script never matches the
+        // 69-byte dual-key form, and no beacon is found at all.
+        let raw_tx = hex::decode("02000000018305aabd35b5312e2ff451d25df8556b8a919fdcc2d589f7308f8a92db38fd7a0200000000ffffffff03521600000000000022512047e8a68afb967b171f231d3635e44d96f4a883c2a98110c578e8afbf2af4b5fd0000000000000000256a23424652346dd9ec860a874859b0ca49f8844b7c5dbd01d36301e4a5b60c03a07b68aeeddc27000000000000225120681d0ee1e24d4bb8ac00cb5a62755eca29e71cb60116bc31c6a79d3863b640c200000000")
+            .unwrap();
         let y_51 = UntweakedPublicKey::from_slice(
             &hex::decode("b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854")
                 .unwrap(),
@@ -446,39 +449,29 @@ mod tests {
         .unwrap();
 
         let req = make_request(build_datum_bytes(raw_tx));
-        let parsed =
-            parse_pegin_request(&req, y_51, 720).expect("real deposit must parse under Y_51");
-
-        assert_eq!(parsed.btc_vout, 0);
-        assert_eq!(parsed.value, Amount::from_sat(5714));
-        // Refund key D = the depositor's change/self-send output key, NOT the beacon.
-        assert_eq!(
-            hex::encode(parsed.depositor_xonly_pubkey.serialize()),
-            "681d0ee1e24d4bb8ac00cb5a62755eca29e71cb60116bc31c6a79d3863b640c2"
-        );
-        // Beacon carries Q_auth (decoupled), distinct from D.
-        assert_eq!(
-            hex::encode(parsed.beacon_auth_outputkey.serialize()),
-            "346dd9ec860a874859b0ca49f8844b7c5dbd01d36301e4a5b60c03a07b68aeed"
-        );
-        assert_ne!(parsed.depositor_xonly_pubkey, parsed.beacon_auth_outputkey);
-        // Reconstructed spend info == the on-chain deposit output key 47e8a68a….
-        let spk = ScriptBuf::new_p2tr_tweaked(parsed.spend_info.output_key());
-        assert_eq!(
-            hex::encode(&spk.as_bytes()[2..34]),
-            "47e8a68afb967b171f231d3635e44d96f4a883c2a98110c578e8afbf2af4b5fd"
-        );
+        assert!(matches!(
+            parse_pegin_request(&req, y_51, 720).unwrap_err(),
+            ParseError::NoBeacon
+        ));
     }
 
     /// The same deposit must NOT parse under the wrong internal key (the demo `Y_fed`),
     /// confirming `6af7c67`'s `Y_fed` reader genuinely can't see this deposit.
     #[test]
-    fn real_bip322_deposit_rejected_under_y_fed() {
-        let raw_tx = hex::decode("02000000018305aabd35b5312e2ff451d25df8556b8a919fdcc2d589f7308f8a92db38fd7a0200000000ffffffff03521600000000000022512047e8a68afb967b171f231d3635e44d96f4a883c2a98110c578e8afbf2af4b5fd0000000000000000256a23424652346dd9ec860a874859b0ca49f8844b7c5dbd01d36301e4a5b60c03a07b68aeeddc27000000000000225120681d0ee1e24d4bb8ac00cb5a62755eca29e71cb60116bc31c6a79d3863b640c200000000").unwrap();
-        let req = make_request(build_datum_bytes(raw_tx));
+    fn valid_deposit_does_not_reconstruct_under_the_wrong_treasury_key() {
+        // The peg-in address is Taproot(Y, refund_leaf(D)), so a deposit built under
+        // one treasury key must not resolve under another. This used to be shown with
+        // the real preprod deposit, but that fixture is now refused at the beacon
+        // before any key is tried, so the property needs a dual-key deposit.
+        // `build_pegin_tx` builds under `test_y_fed()`; parse under a different key.
+        let xonly = depositor_xonly();
+        let tx = build_pegin_tx(xonly, Amount::from_sat(50_000));
+        let req = make_request(build_datum_bytes(serialize(&tx)));
+        let other_treasury_key = xonly_from_seed([0xAB; 32]);
+        assert_ne!(other_treasury_key, test_y_fed());
         assert!(matches!(
-            parse_pegin_request(&req, test_y_fed(), 720),
-            Err(ParseError::NoPegInOutput)
+            parse_pegin_request(&req, other_treasury_key, 720).unwrap_err(),
+            ParseError::NoPegInOutput
         ));
     }
 
@@ -491,7 +484,7 @@ mod tests {
         let tx = build_tx_with_outputs(vec![
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(xonly),
+                script_pubkey: beacon_spk_dual(xonly, xonly),
             },
             TxOut {
                 value: Amount::from_sat(100_000),
@@ -668,11 +661,11 @@ mod tests {
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(xonly),
+                script_pubkey: beacon_spk_dual(xonly, xonly),
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(xonly), // second beacon
+                script_pubkey: beacon_spk_dual(xonly, xonly), // second beacon
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
@@ -696,7 +689,7 @@ mod tests {
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(xonly_a),
+                script_pubkey: beacon_spk_dual(xonly_a, xonly_a),
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
@@ -711,7 +704,7 @@ mod tests {
         let xonly = depositor_xonly();
         let tx = build_tx_with_outputs(vec![TxOut {
             value: Amount::ZERO,
-            script_pubkey: beacon_spk(xonly),
+            script_pubkey: beacon_spk_dual(xonly, xonly),
         }]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
         assert!(matches!(
@@ -739,7 +732,7 @@ mod tests {
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(xonly),
+                script_pubkey: beacon_spk_dual(xonly, xonly),
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
@@ -764,7 +757,7 @@ mod tests {
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(xonly),
+                script_pubkey: beacon_spk_dual(xonly, xonly),
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
@@ -784,7 +777,7 @@ mod tests {
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: beacon_spk(xonly),
+                script_pubkey: beacon_spk_dual(xonly, xonly),
             },
         ]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
@@ -797,7 +790,7 @@ mod tests {
         let invalid_xonly = [0xFFu8; 32];
         let tx = build_tx_with_outputs(vec![TxOut {
             value: Amount::ZERO,
-            script_pubkey: beacon_spk(invalid_xonly),
+            script_pubkey: beacon_spk_dual(invalid_xonly, invalid_xonly),
         }]);
         let req = make_request(build_datum_bytes(serialize(&tx)));
         assert!(matches!(
@@ -812,7 +805,9 @@ mod tests {
     fn beacon_parser_direct_happy() {
         let xonly = depositor_xonly();
         let tx = build_pegin_tx(xonly, Amount::from_sat(50_000));
-        assert_eq!(parse_beacon(&tx).unwrap().serialize(), xonly);
+        let (refund, auth) = parse_beacon(&tx).unwrap();
+        assert_eq!(refund.serialize(), xonly, "D is the first key");
+        assert_eq!(auth.serialize(), xonly, "Q_auth is the second");
     }
 
     #[test]

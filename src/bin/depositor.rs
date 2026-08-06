@@ -12,8 +12,9 @@
 //! ```text
 //! Input  0..N : funding UTXO(s) (P2WPKH controlled by depositor WIF) — signed
 //! Output 0    : peg-in P2TR (internal key Y_fed, single leaf = depositor refund)
-//! Output 1    : OP_RETURN "BFR" || depositor_auth_outputkey (32 bytes)  [Bifrost beacon]
-//!               (depositor's key-path Taproot output key = the BIP-322 completion key)
+//! Output 1    : OP_RETURN "BFR" || D || Q_auth (67 bytes)  [Bifrost dual-key beacon]
+//!               D      = depositor_xonly, the key committed in the refund leaf above
+//!               Q_auth = depositor's key-path Taproot output key = BIP-322 completion key
 //! Output 2    : P2WPKH change back to depositor
 //! ```
 //!
@@ -260,7 +261,7 @@ fn run() -> Result<(), String> {
     let depositor_auth_outputkey: [u8; 32] = depositor_auth_spk.as_bytes()[2..34]
         .try_into()
         .expect("p2tr scriptPubKey is OP_1 PUSH32 <32-byte key>");
-    let beacon_spk = build_beacon_spk(depositor_auth_outputkey);
+    let beacon_spk = build_beacon_spk(depositor_xonly.serialize(), depositor_auth_outputkey);
     let change_spk = ScriptBuf::new_p2wpkh(&depositor_compressed.wpubkey_hash());
     let funding_spk = change_spk.clone();
 
@@ -358,10 +359,17 @@ fn pegin_address(
     Address::from_script(&spk, network).expect("P2TR script always has a valid address")
 }
 
-fn build_beacon_spk(depositor_xonly_bytes: [u8; 32]) -> ScriptBuf {
-    let mut payload = Vec::with_capacity(35);
+/// The 67-byte dual-key beacon: `"BFR" || D || Q_auth`.
+///
+/// `D` is the refund key committed in the peg-in Taproot leaf; carrying it means a
+/// sweeper reads the refund key instead of recovering it by trying candidate outputs
+/// against the reconstructed peg-in address. `Q_auth` is the BIP-322 completion key,
+/// which may belong to a different wallet.
+fn build_beacon_spk(refund_xonly: [u8; 32], auth_outputkey: [u8; 32]) -> ScriptBuf {
+    let mut payload = Vec::with_capacity(67);
     payload.extend_from_slice(b"BFR");
-    payload.extend_from_slice(&depositor_xonly_bytes);
+    payload.extend_from_slice(&refund_xonly);
+    payload.extend_from_slice(&auth_outputkey);
     script::Builder::new()
         .push_opcode(OP_RETURN)
         .push_slice(<&bitcoin::script::PushBytes>::try_from(payload.as_slice()).unwrap())
