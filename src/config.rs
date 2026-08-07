@@ -522,6 +522,11 @@ impl HeimdallConfig {
             pegout_freshness_margin: Duration::from_millis(
                 self.protocol.pegout_freshness_margin_ms,
             ),
+            // Only ever used if it turns out to BE the treasury's current key —
+            // i.e. the bootstrap handoff. See `EpochConfig::y_fed_seed`.
+            y_fed_seed: hex::decode(&self.bitcoin.y_fed_seed_hex)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok()),
             // Demo-only; the harness/CLI sets this after building the config.
             inject_fault: None,
         }

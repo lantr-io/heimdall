@@ -441,6 +441,16 @@ pub struct EpochConfig {
     /// Must be the SAME on every SPO: it is a skip rule, and a skip rule that
     /// differs makes two nodes build different TM bytes and fail FROST.
     pub pegout_freshness_margin: Duration,
+    /// The federation signing seed (`bitcoin.y_fed_seed_hex`), when this node
+    /// has one. Used for exactly one thing: authorizing the BOOTSTRAP Update-Y,
+    /// while the treasury is still keyed to `y_federation` and no roster exists
+    /// to sign its own succession.
+    ///
+    /// Holding a seed grants nothing on its own —
+    /// [`crate::epoch::rotation`] signs with it only when its x-only key IS the
+    /// treasury's `current_spos_frost_key`. After the first handoff the key is
+    /// the roster's and this seed stops matching, permanently.
+    pub y_fed_seed: Option<[u8; 32]>,
     /// Demo-only DKG fault injection (never set in production). Makes THIS node
     /// misbehave so the fault-detection + ban flow can be exercised live.
     pub inject_fault: Option<InjectFault>,
@@ -494,6 +504,7 @@ impl EpochConfig {
             pegin_refund_timeout_blocks: 4320,
             state_dir: None,
             pegout_freshness_margin: Duration::from_millis(7 * 24 * 3600 * 1000),
+            y_fed_seed: None,
             inject_fault: None,
         }
     }

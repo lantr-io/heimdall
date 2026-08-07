@@ -19,7 +19,7 @@ use frost_secp256k1_tr::keys::dkg::{round1, round2};
 use crate::circuits::fault_evidence::{
     EquivocationEvidence, Round1PokFaultEvidence, Round2ShareFaultEvidence,
 };
-use crate::epoch::state::{EpochResult, Roster, SpoInfo};
+use crate::epoch::state::{EpochError, EpochResult, Roster, SpoInfo};
 use crate::http::canonical::POINT_LEN;
 use crate::http::payloads::{Sign1Payload, Sign2Payload};
 use crate::http::wire::DkgNamespace;
@@ -85,6 +85,34 @@ pub struct TreasuryUtxo {
     /// in-flight TM it could not read) is already spending this tip; the mock
     /// reports a simple always-confirmed treasury.
     pub btc_confirmed: bool,
+}
+
+/// Everything the epoch machine needs to authorize an on-chain Update-Y — the
+/// key handoff that makes a completed DKG the treasury's actual controller.
+///
+/// `treasury.ak`'s `UpdateY` branch is gated purely on a BIP-340 signature by
+/// the *spent* datum's `current_spos_frost_key` over a message pinned to the
+/// spent outpoint, so the outgoing roster authorizes its own succession and
+/// nobody else can. Everything here is read off-chain by
+/// [`CardanoChain::plan_update_y`]; the machine's only job is to produce the
+/// signature and hand the plan back to [`CardanoChain::submit_update_y`].
+#[derive(Debug, Clone)]
+pub struct UpdateYPlan {
+    /// The epoch the rotation is stamped with (part of the signed message).
+    pub epoch: u64,
+    /// The datum's current (outgoing) `current_spos_frost_key`, x-only. The
+    /// authorizing signature must verify under exactly this key.
+    pub current_key: bitcoin::key::UntweakedPublicKey,
+    /// The incoming key this rotation installs — the just-derived Y_51.
+    pub new_key: bitcoin::key::UntweakedPublicKey,
+    /// The exact 32-byte message the outgoing key signs:
+    /// `sha2_256("bifrost-update-y" ‖ spent_txid ‖ vout LE ‖ epoch BE ‖ new_key)`.
+    /// Pinned to the spent state UTxO, so a signature cannot be replayed
+    /// against a later one.
+    pub sig_msg: [u8; 32],
+    /// The `treasury_info` state UTxO being spent, `<cardano_txid>:<vout>` — for
+    /// logs and for detecting that the plan went stale under us.
+    pub state_outpoint: String,
 }
 
 /// Provable DKG misbehavior captured by the peer transport.
@@ -207,13 +235,59 @@ pub trait CardanoChain: Send + Sync {
         pool_id: &str,
     ) -> EpochResult<crate::cardano::stake::PoolStake>;
 
-    /// Publish the new FROST group key after DKG. The key becomes the
-    /// internal key (Y_51) of the next treasury Taproot address.
+    /// Locate the live `treasury_info` state and describe the Update-Y that
+    /// would install `new_y_51` as `current_spos_frost_key` for `epoch`.
     ///
-    /// In the mock this updates the treasury Y_51 so subsequent
-    /// `query_treasury` calls return a treasury the FROST group can
-    /// sign for. In production this posts the key to the on-chain
-    /// treasury oracle.
+    /// `Ok(None)` means "nothing to rotate": either this backend has no
+    /// `treasury_info` state to spend (the mock / an unconfigured node), or the
+    /// datum already holds `new_y_51` — a re-run of the same epoch's ceremony,
+    /// or a roster that re-derived the key it already had.
+    ///
+    /// This only *reads*. Producing the authorizing signature needs the
+    /// outgoing roster's key material, which lives in the epoch machine, not
+    /// here; [`Self::submit_update_y`] takes the result back.
+    async fn plan_update_y(
+        &self,
+        _epoch: u64,
+        _new_y_51: bitcoin::key::UntweakedPublicKey,
+    ) -> EpochResult<Option<UpdateYPlan>> {
+        Ok(None)
+    }
+
+    /// Submit the Update-Y transaction described by `plan`, authorized by a
+    /// 64-byte BIP-340 `signature` under `plan.current_key` over
+    /// `plan.sig_msg`. Returns the Cardano tx id.
+    ///
+    /// The signature is the whole authorization — `treasury.ak`'s `UpdateY`
+    /// branch is permissionless — so any node may submit, and every node but
+    /// the leader normally declines to.
+    ///
+    /// Implementations must re-locate the state UTxO and refuse if it has moved
+    /// since the plan was made: the signature is pinned to the spent outpoint,
+    /// so a moved state means the signature is worthless and building on it
+    /// would only produce a transaction that cannot validate. A rotation
+    /// already submitted but not yet confirmed still reads as unspent, so a
+    /// retry in that window re-submits and is rejected by the node — noisy, but
+    /// the next `plan_update_y` sees the settled datum and reports nothing to
+    /// rotate.
+    async fn submit_update_y(
+        &self,
+        _plan: &UpdateYPlan,
+        _signature: &[u8; 64],
+    ) -> EpochResult<String> {
+        Err(EpochError::Chain(
+            "this chain backend cannot submit an Update-Y transaction".into(),
+        ))
+    }
+
+    /// Record the new FROST group key locally after DKG. The key becomes the
+    /// internal key (Y_51) of the next treasury Taproot address, so subsequent
+    /// `query_treasury` calls return a treasury the new FROST group can sign
+    /// for.
+    ///
+    /// This is the node's own view, NOT the on-chain publication — that is
+    /// [`Self::plan_update_y`] + [`Self::submit_update_y`], which rotate the
+    /// `treasury_info` datum under the outgoing roster's signature.
     async fn publish_group_key(&self, y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()>;
 
     /// Publish a DKG fault proof and apply the corresponding SPO ban.

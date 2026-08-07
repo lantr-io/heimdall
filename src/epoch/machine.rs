@@ -6,7 +6,7 @@
 //!
 //! - `idle_phase`          — block until the chain reports an epoch boundary
 //! - `epoch_start_phase`   — snapshot the roster
-//! - `publish_keys_phase`  — log the group key (no-op for the first cycle)
+//! - `publish_keys_phase`  — publish the group key: BIP-340 x-only + Update-Y handoff
 //! - `collect_pegins_phase`— poll the Cardano peg-in source over a
 //!                           configured collection window, parse each
 //!                           datum into a validated `ParsedPegIn`, and
@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use bitcoin::Witness;
 use bitcoin::hashes::Hash;
-use bitcoin::key::{Secp256k1, UntweakedPublicKey};
+use bitcoin::key::Secp256k1;
 use frost_secp256k1_tr as frost;
 
 use crate::bitcoin::taproot::treasury_spend_info;
@@ -41,12 +41,14 @@ use crate::bitcoin::tm_builder::{
 use crate::cardano::pegin_datum::{ParsedPegIn, parse_pegin_request};
 use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInSource};
 use crate::epoch::dkg::dkg_phase;
+use crate::epoch::rotation;
 use crate::epoch::signing::sign_phase;
 use crate::epoch::state::{
     CascadeLevel, DKG_ATTEMPTS_PER_WINDOW, DkgCollected, DkgRound, EpochConfig, EpochError,
     EpochPhase, EpochResult, GroupKeys, Roster, SignCollected, SigningRound, TreasuryMovement,
 };
 use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
+use crate::frost::xonly::group_xonly;
 use std::collections::BTreeMap;
 
 /// Run the epoch state machine for one full cycle and return the
@@ -190,7 +192,9 @@ async fn step_phase(
             epoch,
             roster,
             group_keys,
-        } => publish_keys_phase(chain, epoch, roster, group_keys).await?,
+        } => {
+            publish_keys_phase(chain, peers, clock, rng, config, epoch, roster, group_keys).await?
+        }
 
         EpochPhase::CollectPegins {
             epoch,
@@ -573,20 +577,27 @@ fn try_resume_dkg(
 // publish_keys
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_keys_phase(
     chain: &Arc<dyn CardanoChain>,
+    peers: &Arc<dyn PeerNetwork>,
+    clock: &Arc<dyn Clock>,
+    rng: &Arc<dyn RngSource>,
+    config: &EpochConfig,
     epoch: u64,
     roster: Roster,
     group_keys: GroupKeys,
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
-    let y_51 = frost_vk_to_xonly(&group_keys.verifying_key)?;
+    let group = group_xonly(&group_keys.verifying_key).map_err(EpochError::Frost)?;
+    let y_51 = group.xonly;
 
     crate::epoch_log!(
         me,
         epoch,
-        "PublishKeys: group_key = {}",
-        hex::encode(y_51.serialize())
+        "PublishKeys: group_key = {} (derived point parity 0x{:02x}; stored x-only per BIP-340)",
+        hex::encode(y_51.serialize()),
+        group.parity_byte()
     );
 
     // Finalize (WI-014 #4): derive the NEW treasury Taproot address from the
@@ -626,6 +637,54 @@ async fn publish_keys_phase(
             epoch,
             "  (new treasury address preview unavailable pre-handoff: {e})"
         ),
+    }
+
+    // N10c/N-b: actually hand the treasury over. Deriving Y_51 changes nothing
+    // on its own — `treasury_info.current_spos_frost_key` is what the bridge
+    // treats as the roster in charge, and until the Update-Y lands the OLD
+    // roster still controls it. This is the step that makes a completed
+    // ceremony consequential, rather than something an operator has to
+    // replicate by hand with the `update-y` CLI.
+    //
+    // Skipping is normal, not exceptional: `plan_update_y` returns None when
+    // the datum already names this key (a re-run, or an unchanged roster
+    // re-deriving) and when the backend has no treasury_info state at all.
+    match chain.plan_update_y(epoch, y_51).await? {
+        None => crate::epoch_log!(
+            me,
+            epoch,
+            "  no Update-Y needed (treasury_info already names this key, or no state to rotate)"
+        ),
+        Some(plan) => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "  Update-Y: rotating treasury_info {} from {} to {}",
+                plan.state_outpoint,
+                hex::encode(plan.current_key.serialize()),
+                hex::encode(plan.new_key.serialize())
+            );
+            let (signature, authority) =
+                rotation::authorize_update_y(peers, clock, rng, config, me, &plan).await?;
+            crate::epoch_log!(me, epoch, "  Update-Y authorized by {authority}");
+
+            // The signature IS the authorization, so one submission suffices and
+            // a second would only burn a fee losing the race for the same input.
+            // Everyone else holds a verified signature and would take over on a
+            // leader cascade.
+            let leader = roster.leader(0);
+            if me == leader {
+                let tx_id = chain.submit_update_y(&plan, &signature).await?;
+                crate::epoch_log!(me, epoch, "  Update-Y submitted: cardano tx {tx_id}");
+            } else {
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "  Update-Y: follower (leader = {:?}) — signature verified, not submitting",
+                    leader
+                );
+            }
+        }
     }
 
     chain.publish_group_key(y_51).await?;
@@ -922,7 +981,9 @@ async fn build_tm_phase(
 
     // Treasury *change output*: send to the new roster's Taproot address,
     // using the just-derived FROST group key as the internal key.
-    let new_y_51 = frost_vk_to_xonly(&group_keys.verifying_key)?;
+    let new_y_51 = group_xonly(&group_keys.verifying_key)
+        .map_err(EpochError::Frost)?
+        .xonly;
     let change_spend = treasury_spend_info(
         &secp,
         new_y_51,
@@ -1190,28 +1251,6 @@ async fn submit_phase(
     })
 }
 
-/// Convert a FROST verifying key to bitcoin's `UntweakedPublicKey` (the
-/// 32-byte x-only encoding). The verifying key serializes as a 33-byte
-/// compressed point — drop the parity prefix.
-///
-/// TODO: this silently discards the parity bit. `frost-secp256k1-tr`
-/// handles BIP-341 even-Y normalization internally during signing, so
-/// the tweaked `output_key` is valid, but any code that wants to
-/// re-derive the *pre-tweak* point needs to remember the parity.
-fn frost_vk_to_xonly(vk: &frost::VerifyingKey) -> EpochResult<UntweakedPublicKey> {
-    let bytes = vk
-        .serialize()
-        .map_err(|e| EpochError::Frost(format!("verifying_key serialize: {e}")))?;
-    if bytes.len() != 33 {
-        return Err(EpochError::Frost(format!(
-            "expected 33-byte compressed verifying key, got {}",
-            bytes.len()
-        )));
-    }
-    UntweakedPublicKey::from_slice(&bytes[1..33])
-        .map_err(|e| EpochError::Frost(format!("xonly: {e}")))
-}
-
 /// Best-effort extraction of the epoch number from a phase, used by
 /// the dispatch-line trace. `Idle` has no epoch yet.
 fn current_epoch(phase: &EpochPhase) -> u64 {
@@ -1316,6 +1355,117 @@ mod tests {
     #[tokio::test]
     async fn full_cycle_2_of_2_all_derive_same_treasury() {
         multi_instance_same_treasury(2, 2).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // N10c / N-b: the derived key actually reaches the chain
+    // -----------------------------------------------------------------------
+
+    /// The acceptance for N-b: a completed DKG cycle PUBLISHES Y_51 — it rotates
+    /// `treasury_info.current_spos_frost_key` through the Update-Y path, with the
+    /// outgoing key authorizing the succession.
+    ///
+    /// This is the bootstrap handoff: the treasury is still keyed to
+    /// `y_federation`, so the authorization is a local BIP-340 signature under
+    /// the federation seed. The mock chain applies `treasury.ak`'s actual gate —
+    /// it verifies the signature under the key being replaced, over the message
+    /// pinned to the spent state UTxO — so an unsigned or misdirected rotation
+    /// would be rejected here exactly as on-chain.
+    ///
+    /// Before this wiring the ceremony ended at `publish_group_key`, which only
+    /// updated the node's own in-memory view: every SPO derived a treasury the
+    /// chain had never heard of.
+    #[tokio::test]
+    async fn a_completed_dkg_hands_the_treasury_over_via_update_y() {
+        let seed = [0x42u8; 32];
+        let secp = Secp256k1::new();
+        let fed_kp = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&seed).unwrap(),
+        );
+        let fed_xonly = fed_kp.x_only_public_key().0;
+        let state_txid = [0xc3u8; 32];
+        let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, state_txid);
+
+        let fixture = demo_static_fixture(2, 2, 18_900);
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone()).with_treasury_info(treasury_info.clone()),
+            );
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let mut config = fast_config(id);
+            config.y_fed_seed = Some(seed);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(h.await.unwrap().expect("epoch cycle completes"));
+        }
+
+        let state = treasury_info.lock().unwrap();
+        // Exactly one rotation: the signature is the authorization, so only the
+        // leader submits — a second would race for an already-spent input.
+        assert_eq!(
+            state.rotations.len(),
+            1,
+            "the cycle must post exactly one Update-Y"
+        );
+        let (rotated_epoch, new_key, signature) = state.rotations[0];
+        assert_eq!(rotated_epoch, fixture.roster.epoch);
+        assert_eq!(
+            state.current_key, new_key,
+            "the datum must now name the incoming key"
+        );
+        assert_ne!(
+            state.current_key, fed_xonly,
+            "the treasury must have left the federation key"
+        );
+
+        // The signature is over the message pinned to the SPENT state UTxO and
+        // naming this successor — recomputed here rather than trusted, so a
+        // rotation authorized against some other outpoint or key would fail.
+        let expected_msg = crate::cardano::treasury_info::update_y_sig_msg(
+            &state_txid,
+            0,
+            rotated_epoch,
+            &new_key.serialize(),
+        );
+        secp.verify_schnorr(
+            &bitcoin::secp256k1::schnorr::Signature::from_slice(&signature).unwrap(),
+            &bitcoin::secp256k1::Message::from_digest(expected_msg),
+            &fed_xonly,
+        )
+        .expect("the OUTGOING key must have authorized its own succession");
+
+        // The key that reached the chain is the one the roster actually derived:
+        // rebuilding the treasury Taproot from it reproduces the TM's change
+        // output byte-for-byte. That is what makes the published datum and the
+        // Bitcoin address the same handoff rather than two independent guesses.
+        //
+        // Both keys are `new_key` because the mock collapses Y_fed onto the group
+        // key once one is published (`MockCardanoChain::query_treasury`), which is
+        // also what `build_tm_phase` read when it built this output.
+        let expected_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(
+            treasury_spend_info(
+                &secp,
+                new_key,
+                new_key,
+                fixture.federation_csv_blocks as u16,
+            )
+            .output_key(),
+        );
+        assert_eq!(
+            tms[0].unsigned_tx.output[0].script_pubkey, expected_spk,
+            "the published key must be the internal key of the treasury the TM pays into"
+        );
     }
 
     // -----------------------------------------------------------------------

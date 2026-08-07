@@ -1457,6 +1457,20 @@ async fn run_demo(
                      stake-weighted (WI-012) — demo.min_signers is ignored on this path"
                 );
                 bf_chain = bf_chain.with_registry_roster(source);
+                // N10c: the same treasury_info the roster is verified against is
+                // the one a completed DKG rotates (Update-Y). Configured together
+                // or not at all.
+                match heimdall::cardano::blockfrost_chain::UpdateYFlow::from_config(&cfg.cardano) {
+                    Ok(Some(flow)) => {
+                        println!("on-chain key handoff:  enabled (Update-Y after each DKG)");
+                        bf_chain = bf_chain.with_update_y_flow(flow);
+                    }
+                    Ok(None) => unreachable!("registry roster is configured"),
+                    Err(e) => {
+                        eprintln!("fatal: Update-Y flow config: {e}");
+                        std::process::exit(1);
+                    }
+                }
                 // Ban filtering (WI-011/012): only if cardano.ban_bootstrap is set.
                 match heimdall::cardano::ban_list::BanListSource::from_config(&cfg.cardano) {
                     Ok(Some(bans)) => {

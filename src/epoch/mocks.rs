@@ -35,7 +35,7 @@ use crate::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
 use crate::epoch::state::{EpochError, EpochResult, Roster, SpoInfo};
 use crate::epoch::traits::{
     CardanoChain, Clock, CycleRng, DkgFaultEvidence, EpochBoundaryEvent, PeerNetwork,
-    PegOutRequestUtxo, RngSource, TreasuryUtxo,
+    PegOutRequestUtxo, RngSource, TreasuryUtxo, UpdateYPlan,
 };
 use crate::http::payloads::{Sign1Payload, Sign2Payload};
 use crate::http::wire::DkgNamespace;
@@ -163,6 +163,28 @@ pub struct MockCardanoChain {
     /// `None` (the default) is the unconfigured chain: `BuildTm` skips the
     /// cross-check instead of treating it as the empty trie.
     cpo_root: Option<[u8; 32]>,
+    /// In-memory stand-in for the `treasury_info` state UTxO. `None` (the
+    /// default) is a chain with nothing to rotate, so `plan_update_y` reports
+    /// no handoff.
+    ///
+    /// Shared behind an `Arc` because it models CHAIN state: a multi-node test
+    /// gives each node its own `MockCardanoChain` (they must each see the epoch
+    /// boundary) but they all rotate the one treasury.
+    treasury_info: Option<Arc<Mutex<MockTreasuryInfo>>>,
+}
+
+/// The `treasury_info` datum + its outpoint, enforcing the one rule that
+/// matters: `treasury.ak` rotates the key only for a valid BIP-340 signature
+/// under the key being replaced, over the message pinned to the spent outpoint.
+#[derive(Debug, Clone)]
+pub struct MockTreasuryInfo {
+    /// The datum's `current_spos_frost_key`.
+    pub current_key: bitcoin::key::UntweakedPublicKey,
+    /// The state UTxO the next rotation must be pinned to.
+    pub txid: [u8; 32],
+    pub vout: u32,
+    /// Accepted rotations, in order: `(epoch, new_key, signature)`.
+    pub rotations: Vec<(u64, bitcoin::key::UntweakedPublicKey, [u8; 64])>,
 }
 
 impl MockCardanoChain {
@@ -177,7 +199,30 @@ impl MockCardanoChain {
             schedule_anchor_ms: None,
             tm_confirmed: Arc::new(AtomicBool::new(true)),
             cpo_root: None,
+            treasury_info: None,
         }
+    }
+
+    /// A fresh `treasury_info` state keyed to `current_key`, on the UTxO `txid`
+    /// the first Update-Y signature will be pinned to. Share the handle across
+    /// every node's chain with [`Self::with_treasury_info`].
+    pub fn treasury_info_state(
+        current_key: bitcoin::key::UntweakedPublicKey,
+        txid: [u8; 32],
+    ) -> Arc<Mutex<MockTreasuryInfo>> {
+        Arc::new(Mutex::new(MockTreasuryInfo {
+            current_key,
+            txid,
+            vout: 0,
+            rotations: Vec::new(),
+        }))
+    }
+
+    /// Give this chain a `treasury_info` state, so a completed DKG has something
+    /// to hand the treasury over to.
+    pub fn with_treasury_info(mut self, state: Arc<Mutex<MockTreasuryInfo>>) -> Self {
+        self.treasury_info = Some(state);
+        self
     }
 
     /// Report `root` as the on-chain completed-peg-outs singleton's root, so a
@@ -301,6 +346,86 @@ impl CardanoChain for MockCardanoChain {
 
     async fn query_cpo_root(&self) -> EpochResult<Option<[u8; 32]>> {
         Ok(self.cpo_root)
+    }
+
+    async fn plan_update_y(
+        &self,
+        epoch: u64,
+        new_y_51: bitcoin::key::UntweakedPublicKey,
+    ) -> EpochResult<Option<UpdateYPlan>> {
+        let Some(state) = &self.treasury_info else {
+            return Ok(None);
+        };
+        let state = state.lock().unwrap();
+        if state.current_key == new_y_51 {
+            return Ok(None);
+        }
+        Ok(Some(UpdateYPlan {
+            epoch,
+            current_key: state.current_key,
+            new_key: new_y_51,
+            sig_msg: crate::cardano::treasury_info::update_y_sig_msg(
+                &state.txid,
+                state.vout,
+                epoch,
+                &new_y_51.serialize(),
+            ),
+            state_outpoint: format!("{}:{}", hex::encode(state.txid), state.vout),
+        }))
+    }
+
+    /// Applies `treasury.ak`'s `UpdateY` gate for real: the rotation lands only
+    /// if `signature` is a valid BIP-340 signature under the key being replaced,
+    /// over the message pinned to THIS state UTxO. A test that stubs this out
+    /// would prove nothing about the handoff.
+    async fn submit_update_y(
+        &self,
+        plan: &UpdateYPlan,
+        signature: &[u8; 64],
+    ) -> EpochResult<String> {
+        let state = self
+            .treasury_info
+            .as_ref()
+            .ok_or_else(|| EpochError::Chain("mock has no treasury_info".into()))?;
+        let mut state = state.lock().unwrap();
+
+        if state.current_key != plan.current_key {
+            return Err(EpochError::Chain(
+                "treasury_info key changed since the plan was made".into(),
+            ));
+        }
+        let expected = crate::cardano::treasury_info::update_y_sig_msg(
+            &state.txid,
+            state.vout,
+            plan.epoch,
+            &plan.new_key.serialize(),
+        );
+        if expected != plan.sig_msg {
+            return Err(EpochError::Chain(
+                "update-y message is not pinned to the spent state UTxO".into(),
+            ));
+        }
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(signature)
+            .map_err(|e| EpochError::Chain(format!("update-y signature: {e}")))?;
+        secp.verify_schnorr(
+            &sig,
+            &bitcoin::secp256k1::Message::from_digest(expected),
+            &state.current_key,
+        )
+        .map_err(|e| {
+            EpochError::Chain(format!("update-y signature rejected by the treasury: {e}"))
+        })?;
+
+        state.current_key = plan.new_key;
+        state.rotations.push((plan.epoch, plan.new_key, *signature));
+        // The state moves to a new UTxO, as a real spend would — so a replayed
+        // signature no longer matches the outpoint it is pinned to.
+        let mut next = [0u8; 32];
+        next[..8].copy_from_slice(&(state.rotations.len() as u64).to_be_bytes());
+        next[8..].copy_from_slice(&plan.new_key.serialize()[..24]);
+        state.txid = next;
+        Ok(hex::encode(next))
     }
 
     async fn publish_group_key(&self, y_51: bitcoin::key::UntweakedPublicKey) -> EpochResult<()> {

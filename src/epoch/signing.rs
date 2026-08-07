@@ -466,11 +466,10 @@ mod tests {
         }
     }
 
-    /// Convert a FROST verifying key to bitcoin's `UntweakedPublicKey`.
+    /// The group key's BIP-340 x-only form — the same deliberate even-Y
+    /// normalization the production path takes.
     fn frost_vk_to_xonly(vk: &frost::VerifyingKey) -> UntweakedPublicKey {
-        let bytes = vk.serialize().unwrap();
-        // 33-byte compressed: discard parity byte, take 32-byte x-coord.
-        UntweakedPublicKey::from_slice(&bytes[1..33]).unwrap()
+        crate::frost::xonly::group_xonly(vk).unwrap().xonly
     }
 
     /// Drive 3 SPOs through DKG then sign_phase for a 2-input TM; every
