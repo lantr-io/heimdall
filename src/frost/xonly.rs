@@ -53,22 +53,6 @@ impl GroupXOnly {
     pub fn parity_byte(&self) -> u8 {
         if self.had_odd_y { 0x03 } else { 0x02 }
     }
-
-    /// The 32-byte x-only encoding — what goes on-chain.
-    #[must_use]
-    pub fn serialize(&self) -> [u8; 32] {
-        self.xonly.serialize()
-    }
-
-    /// The 33-byte compressed encoding of the point the DKG derived, parity
-    /// restored. Round-trips with [`group_xonly`]'s input.
-    #[must_use]
-    pub fn compressed(&self) -> [u8; 33] {
-        let mut out = [0u8; 33];
-        out[0] = self.parity_byte();
-        out[1..].copy_from_slice(&self.xonly.serialize());
-        out
-    }
 }
 
 /// Normalize a FROST verifying key to its BIP-340 x-only form, keeping the
@@ -121,30 +105,23 @@ mod tests {
     use frost::Identifier;
     use std::collections::BTreeMap;
 
-    /// Run a 2-of-2 DKG and return both key packages plus the group package.
-    fn dkg_2_of_2(
+    /// A fresh 2-of-2 group. The parity property under test is a property of
+    /// the resulting key, not of how it was produced, so the dealer is used —
+    /// an interactive ceremony would cost 40× here for nothing.
+    fn dealt_2_of_2(
         rng: &mut impl rand_core::CryptoRngCore,
     ) -> (
         BTreeMap<Identifier, frost::keys::KeyPackage>,
         frost::keys::PublicKeyPackage,
     ) {
-        let id1 = Identifier::try_from(1u16).unwrap();
-        let id2 = Identifier::try_from(2u16).unwrap();
-        let (s1, p1) = participant::dkg_part1(id1, 2, 2, rng).unwrap();
-        let (s2, p2) = participant::dkg_part1(id2, 2, 2, rng).unwrap();
-        let r1_for_1: BTreeMap<_, _> = [(id2, p2)].into_iter().collect();
-        let r1_for_2: BTreeMap<_, _> = [(id1, p1)].into_iter().collect();
-        let (s1r2, out1) = participant::dkg_part2(s1, &r1_for_1).unwrap();
-        let (s2r2, out2) = participant::dkg_part2(s2, &r1_for_2).unwrap();
-        let r2_for_1: BTreeMap<_, _> = [(id2, out2.get(&id1).unwrap().clone())]
+        let (shares, pkp) =
+            frost::keys::generate_with_dealer(2, 2, frost::keys::IdentifierList::Default, rng)
+                .unwrap();
+        let kps = shares
             .into_iter()
+            .map(|(id, s)| (id, frost::keys::KeyPackage::try_from(s).unwrap()))
             .collect();
-        let r2_for_2: BTreeMap<_, _> = [(id1, out1.get(&id2).unwrap().clone())]
-            .into_iter()
-            .collect();
-        let (kp1, pkp) = participant::dkg_part3(&s1r2, &r1_for_1, &r2_for_1).unwrap();
-        let (kp2, _) = participant::dkg_part3(&s2r2, &r1_for_2, &r2_for_2).unwrap();
-        ([(id1, kp1), (id2, kp2)].into_iter().collect(), pkp)
+        (kps, pkp)
     }
 
     /// Untweaked 2-of-2 FROST signature over `msg` — the shape the Update-Y
@@ -181,18 +158,18 @@ mod tests {
     #[test]
     fn x_only_key_is_the_even_y_point_and_parity_round_trips() {
         let mut rng = rand::thread_rng();
-        let (_, pkp) = dkg_2_of_2(&mut rng);
+        let (_, pkp) = dealt_2_of_2(&mut rng);
         let vk = pkp.verifying_key();
+        let compressed = vk.serialize().unwrap();
         let g = group_xonly(vk).unwrap();
 
-        // The compressed form reconstructs exactly what the ceremony derived.
-        assert_eq!(g.compressed().to_vec(), vk.serialize().unwrap());
-        // The x-only form is the even-Y point with the same x.
-        assert_eq!(g.parity_byte(), if g.had_odd_y { 0x03 } else { 0x02 });
-        assert_eq!(&g.compressed()[1..], &g.serialize()[..]);
+        // Parity is reported, not guessed, and the x coordinate is untouched —
+        // together these reconstruct exactly what the ceremony derived.
+        assert_eq!(g.parity_byte(), compressed[0]);
+        assert_eq!(&g.xonly.serialize()[..], &compressed[1..]);
         // secp256k1 agrees this is a valid x-only key.
         assert_eq!(
-            UntweakedPublicKey::from_slice(&g.serialize()).unwrap(),
+            UntweakedPublicKey::from_slice(&g.xonly.serialize()).unwrap(),
             g.xonly
         );
     }
@@ -211,7 +188,7 @@ mod tests {
 
         // P(odd) = 1/2 per ceremony; 40 draws makes a miss ~1e-12.
         for _ in 0..40 {
-            let (key_packages, pkp) = dkg_2_of_2(&mut rng);
+            let (key_packages, pkp) = dealt_2_of_2(&mut rng);
             let g = group_xonly(pkp.verifying_key()).unwrap();
             let sig_bytes = frost_sign(&key_packages, &pkp, &msg, &mut rng);
             let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(&sig_bytes).unwrap();

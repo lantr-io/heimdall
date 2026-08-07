@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use heimdall::http::server::{AppState, DkgRoundKey, SharedState, router};
+use heimdall::http::server::{AppState, RoundKey, SharedState, router};
 use tokio::sync::RwLock;
 
 fn make_shared_state() -> SharedState {
@@ -39,7 +39,7 @@ async fn test_dkg_spec_route_serves_stored_json() {
         let mut s = state.write().await;
         s.own_pool_id_hex = pool_hex.clone();
         s.dkg.insert(
-            (1, 51, 0, DkgRoundKey::Round1),
+            (1, 51, 0, RoundKey::Round1),
             r#"{"hello":"world"}"#.to_string(),
         );
     }
@@ -77,8 +77,10 @@ async fn test_sign_routes_serve_stored_json_and_gate_on_pool_id() {
     {
         let mut s = state.write().await;
         s.own_pool_id_hex = pool_hex.clone();
-        s.sign1.insert((4, 0), r#"{"round":1}"#.to_string());
-        s.sign2.insert((4, 0), r#"{"round":2}"#.to_string());
+        s.sign
+            .insert((4, 0, RoundKey::Round1), r#"{"round":1}"#.to_string());
+        s.sign
+            .insert((4, 0, RoundKey::Round2), r#"{"round":2}"#.to_string());
     }
     let base = spawn_server(state).await;
 

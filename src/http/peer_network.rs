@@ -20,7 +20,7 @@ use frost_secp256k1_tr::keys::dkg::{round1, round2};
 use tokio::sync::RwLock;
 
 use super::canonical::POOL_ID_LEN;
-use super::server::{AppState, DkgRoundKey, SharedState};
+use super::server::{AppState, RoundKey, SharedState};
 use super::wire::{
     self, ChainViewWire, Dkg1Wire, Dkg2Wire, DkgNamespace, Round2Recipient, Sign1Wire, Sign2Wire,
     SignNamespace,
@@ -28,18 +28,7 @@ use super::wire::{
 use crate::cardano::dkg_roster::ChainView;
 use crate::epoch::state::{EpochError, EpochResult, SpoInfo};
 use crate::epoch::traits::{DkgFaultEvidence, PeerNetwork};
-
-/// The u16 a FROST `Identifier` was constructed from — its participant index.
-/// FROST serializes to 32 big-endian bytes; the final two encode the u16.
-///
-/// This is the identifier bound into canonical bytes on both the DKG and the
-/// signing rounds. It is NOT a `pool_id` (the 28-byte membership id), despite
-/// what this function was called until WI-038.
-fn identifier_u16(id: frost_secp256k1_tr::Identifier) -> u16 {
-    let bytes = id.serialize();
-    let n = bytes.len();
-    u16::from_be_bytes([bytes[n - 2], bytes[n - 1]])
-}
+use crate::frost::identifier_u16;
 
 /// Wall-clock bound past which a persistent chain-view disagreement with one
 /// peer is flagged (the reconcile design's "impossible-case" tripwire). Under
@@ -72,7 +61,7 @@ struct ViewState {
 /// Key under which a fetched peer payload's raw bytes are retained for
 /// equivocation evidence: a re-fetch returning *different* bytes for the
 /// same key is itself the proof of a double-publish.
-type EvidenceKey = (u64, u64, u64, DkgRoundKey, Vec<u8>);
+type EvidenceKey = (u64, u64, u64, RoundKey, Vec<u8>);
 
 #[derive(Debug, Clone)]
 struct RetainedDkgPayloads {
@@ -246,7 +235,7 @@ impl HttpPeerNetwork {
     fn retained_payloads(
         &self,
         ns: DkgNamespace,
-        round: DkgRoundKey,
+        round: RoundKey,
         peer_pool_id: &[u8],
     ) -> Vec<Vec<u8>> {
         let key = (
@@ -312,7 +301,7 @@ fn push_round2_faults_from_payloads(
     payloads: &[Vec<u8>],
 ) {
     let round1_signed_payload = net
-        .retained_payloads(ns, DkgRoundKey::Round1, &peer.pool_id)
+        .retained_payloads(ns, RoundKey::Round1, &peer.pool_id)
         .into_iter()
         .find_map(|bytes| {
             let wire = serde_json::from_slice::<Dkg1Wire>(&bytes).ok()?;
@@ -425,7 +414,7 @@ fn push_round2_equivocations(
 /// ceremony poisons it — a late node would see a phantom participant and wait
 /// a full round for shares that never come.
 fn gc_dkg_blobs(
-    dkg: &mut std::collections::BTreeMap<(u64, u64, u64, DkgRoundKey), String>,
+    dkg: &mut std::collections::BTreeMap<(u64, u64, u64, RoundKey), String>,
     ns: DkgNamespace,
 ) {
     let keep_from = ns
@@ -483,10 +472,8 @@ impl PeerNetwork for HttpPeerNetwork {
         .map_err(peer_err)?;
         let json = serde_json::to_string(&wire).map_err(peer_err)?;
         let mut s = self.state.write().await;
-        s.dkg.insert(
-            (ns.epoch, ns.threshold, ns.attempt, DkgRoundKey::Round1),
-            json,
-        );
+        s.dkg
+            .insert((ns.epoch, ns.threshold, ns.attempt, RoundKey::Round1), json);
         gc_dkg_blobs(&mut s.dkg, ns);
         Ok(())
     }
@@ -521,10 +508,8 @@ impl PeerNetwork for HttpPeerNetwork {
         .map_err(peer_err)?;
         let json = serde_json::to_string(&wire).map_err(peer_err)?;
         let mut s = self.state.write().await;
-        s.dkg.insert(
-            (ns.epoch, ns.threshold, ns.attempt, DkgRoundKey::Round2),
-            json,
-        );
+        s.dkg
+            .insert((ns.epoch, ns.threshold, ns.attempt, RoundKey::Round2), json);
         gc_dkg_blobs(&mut s.dkg, ns);
         Ok(())
     }
@@ -546,7 +531,8 @@ impl PeerNetwork for HttpPeerNetwork {
         .map_err(peer_err)?;
         let json = serde_json::to_string(&wire).map_err(peer_err)?;
         let mut s = self.state.write().await;
-        s.sign1.insert((ns.epoch, ns.session), json);
+        s.sign
+            .insert((ns.epoch, ns.session, RoundKey::Round1), json);
         Ok(())
     }
 
@@ -567,7 +553,8 @@ impl PeerNetwork for HttpPeerNetwork {
         .map_err(peer_err)?;
         let json = serde_json::to_string(&wire).map_err(peer_err)?;
         let mut s = self.state.write().await;
-        s.sign2.insert((ns.epoch, ns.session), json);
+        s.sign
+            .insert((ns.epoch, ns.session, RoundKey::Round2), json);
         Ok(())
     }
 
@@ -589,7 +576,7 @@ impl PeerNetwork for HttpPeerNetwork {
                 ns.epoch,
                 ns.threshold,
                 ns.attempt,
-                DkgRoundKey::Round1,
+                RoundKey::Round1,
                 peer.pool_id.clone(),
             ),
             &bytes,
@@ -645,7 +632,7 @@ impl PeerNetwork for HttpPeerNetwork {
                 ns.epoch,
                 ns.threshold,
                 ns.attempt,
-                DkgRoundKey::Round2,
+                RoundKey::Round2,
                 peer.pool_id.clone(),
             ),
             &bytes,
@@ -683,7 +670,7 @@ impl PeerNetwork for HttpPeerNetwork {
         peer: &SpoInfo,
     ) -> EpochResult<Vec<DkgFaultEvidence>> {
         let peer_pool = pool_id_arr(&peer.pool_id)?;
-        let payloads = self.retained_payloads(ns, DkgRoundKey::Round1, &peer.pool_id);
+        let payloads = self.retained_payloads(ns, RoundKey::Round1, &peer.pool_id);
         let mut out = Vec::new();
         push_round1_faults_from_payloads(&mut out, ns, peer, &peer_pool, &payloads);
         push_round1_equivocations(&mut out, ns, peer, &peer_pool, &payloads);
@@ -698,7 +685,7 @@ impl PeerNetwork for HttpPeerNetwork {
         sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
     ) -> EpochResult<Vec<DkgFaultEvidence>> {
         let peer_pool = pool_id_arr(&peer.pool_id)?;
-        let payloads = self.retained_payloads(ns, DkgRoundKey::Round2, &peer.pool_id);
+        let payloads = self.retained_payloads(ns, RoundKey::Round2, &peer.pool_id);
         let mut out = Vec::new();
         push_round2_faults_from_payloads(
             self,
@@ -1046,7 +1033,7 @@ mod tests {
 
         // A real key package, so the commitments and share are genuine.
         let mut rng = rand::thread_rng();
-        let (shares, pkp) = frost_secp256k1_tr::keys::generate_with_dealer(
+        let (shares, _pkp) = frost_secp256k1_tr::keys::generate_with_dealer(
             2,
             2,
             frost_secp256k1_tr::keys::IdentifierList::Default,
@@ -1056,7 +1043,6 @@ mod tests {
         let kp = frost_secp256k1_tr::keys::KeyPackage::try_from(shares[&id(1)].clone()).unwrap();
         let kp_other =
             frost_secp256k1_tr::keys::KeyPackage::try_from(shares[&id(2)].clone()).unwrap();
-        let _ = pkp;
 
         let ns = SignNamespace::new(7, 0, [0x5a; 32]);
         let (nonces, commitments) = participant::sign_round1(&kp, &mut rng);

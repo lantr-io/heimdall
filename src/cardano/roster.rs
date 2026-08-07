@@ -403,6 +403,12 @@ pub struct RegistryRosterSource {
     pub registry_policy_hex: String,
     pub treasury_info_address: String,
     pub treasury_info_policy_hex: String,
+    /// The parameterized `treasury_info` script itself, retained because
+    /// SPENDING the state UTxO (the Update-Y key handoff) needs the script as a
+    /// witness, not just its hash. Reading the roster only needs the address and
+    /// policy above, but re-deriving the script elsewhere would mean a second
+    /// blueprint read and a second copy of the parameterization rules.
+    pub treasury_info_script: blueprint::ParameterizedScript,
     /// Treasury NFT asset name (hex), fixed at K1.
     pub treasury_info_asset_name_hex: String,
     /// `Roster::min_signers` override until WI-012's stake-weighted threshold.
@@ -455,6 +461,7 @@ impl RegistryRosterSource {
             registry_policy_hex: registry.hash_hex(),
             treasury_info_address: treasury.enterprise_address(network),
             treasury_info_policy_hex: treasury.hash_hex(),
+            treasury_info_script: treasury,
             treasury_info_asset_name_hex: treasury_info_asset_name_hex.to_string(),
             min_signers: None,
         })

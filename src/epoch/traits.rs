@@ -19,7 +19,7 @@ use frost_secp256k1_tr::keys::dkg::{round1, round2};
 use crate::circuits::fault_evidence::{
     EquivocationEvidence, Round1PokFaultEvidence, Round2ShareFaultEvidence,
 };
-use crate::epoch::state::{EpochError, EpochResult, Roster, SpoInfo};
+use crate::epoch::state::{EpochResult, Roster, SpoInfo};
 use crate::http::canonical::POINT_LEN;
 use crate::http::wire::{DkgNamespace, SignNamespace};
 
@@ -245,13 +245,14 @@ pub trait CardanoChain: Send + Sync {
     /// This only *reads*. Producing the authorizing signature needs the
     /// outgoing roster's key material, which lives in the epoch machine, not
     /// here; [`Self::submit_update_y`] takes the result back.
+    /// Required, not defaulted: a backend that silently answered "nothing to
+    /// rotate" would be indistinguishable from a treasury that is already up to
+    /// date, which is precisely the failure this method exists to prevent.
     async fn plan_update_y(
         &self,
-        _epoch: u64,
-        _new_y_51: bitcoin::key::UntweakedPublicKey,
-    ) -> EpochResult<Option<UpdateYPlan>> {
-        Ok(None)
-    }
+        epoch: u64,
+        new_y_51: bitcoin::key::UntweakedPublicKey,
+    ) -> EpochResult<Option<UpdateYPlan>>;
 
     /// Submit the Update-Y transaction described by `plan`, authorized by a
     /// 64-byte BIP-340 `signature` under `plan.current_key` over
@@ -271,13 +272,9 @@ pub trait CardanoChain: Send + Sync {
     /// rotate.
     async fn submit_update_y(
         &self,
-        _plan: &UpdateYPlan,
-        _signature: &[u8; 64],
-    ) -> EpochResult<String> {
-        Err(EpochError::Chain(
-            "this chain backend cannot submit an Update-Y transaction".into(),
-        ))
-    }
+        plan: &UpdateYPlan,
+        signature: &[u8; 64],
+    ) -> EpochResult<String>;
 
     /// Record the new FROST group key locally after DKG. The key becomes the
     /// internal key (Y_51) of the next treasury Taproot address, so subsequent

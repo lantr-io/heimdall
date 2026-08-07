@@ -15,6 +15,7 @@ use heimdall::epoch::mocks::{MockCardanoChain, OsRngSource, SeededRngSource, Sys
 use heimdall::epoch::run_epoch_loop;
 use heimdall::epoch::state::SpoIdentity;
 use heimdall::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
+use heimdall::frost::xonly::group_xonly;
 use heimdall::http::peer_network::HttpPeerNetwork;
 use heimdall::http::server::router;
 
@@ -1456,21 +1457,11 @@ async fn run_demo(
                     "note: eligible roster = registry − active bans; FROST threshold is \
                      stake-weighted (WI-012) — demo.min_signers is ignored on this path"
                 );
-                bf_chain = bf_chain.with_registry_roster(source);
                 // N10c: the same treasury_info the roster is verified against is
-                // the one a completed DKG rotates (Update-Y). Configured together
-                // or not at all.
-                match heimdall::cardano::blockfrost_chain::UpdateYFlow::from_config(&cfg.cardano) {
-                    Ok(Some(flow)) => {
-                        println!("on-chain key handoff:  enabled (Update-Y after each DKG)");
-                        bf_chain = bf_chain.with_update_y_flow(flow);
-                    }
-                    Ok(None) => unreachable!("registry roster is configured"),
-                    Err(e) => {
-                        eprintln!("fatal: Update-Y flow config: {e}");
-                        std::process::exit(1);
-                    }
-                }
+                // the one a completed DKG rotates (Update-Y), so configuring the
+                // registry roster enables the handoff by construction.
+                println!("on-chain key handoff:  enabled (Update-Y after each DKG)");
+                bf_chain = bf_chain.with_registry_roster(source);
                 // Ban filtering (WI-011/012): only if cardano.ban_bootstrap is set.
                 match heimdall::cardano::ban_list::BanListSource::from_config(&cfg.cardano) {
                     Ok(Some(bans)) => {
@@ -4760,17 +4751,11 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
         cfg.demo.min_signers,
         cfg.demo.max_signers,
     );
-    let vk = dkg
-        .public_key_package
-        .verifying_key()
-        .serialize()
-        .map_err(|e| format!("group verifying key serialize: {e}"))?;
-    let y_51 = bitcoin::key::UntweakedPublicKey::from_slice(&vk[1..33])
-        .map_err(|e| format!("group key x-only: {e}"))?;
+    let y_51 = group_xonly(dkg.public_key_package.verifying_key())?.xonly;
     let csv = csv_blocks_u16(cfg)?;
     let expected_spk =
         ScriptBuf::new_p2tr_tweaked(treasury_spend_info(&secp, y_51, y_fed, csv).output_key());
-    println!("our Y_51:             {}", hex::encode(&vk[1..33]));
+    println!("our Y_51:             {}", hex::encode(y_51.serialize()));
     println!(
         "expected treasury spk: {}",
         hex::encode(expected_spk.as_bytes())
@@ -5039,14 +5024,8 @@ fn run_sweep_pegins(
         cfg.demo.min_signers,
         cfg.demo.max_signers,
     );
-    let vk = dkg
-        .public_key_package
-        .verifying_key()
-        .serialize()
-        .map_err(|e| format!("group verifying key serialize: {e}"))?;
-    let y_51 = bitcoin::key::UntweakedPublicKey::from_slice(&vk[1..33])
-        .map_err(|e| format!("group key x-only: {e}"))?;
-    println!("  FROST group key Y_51: {}", hex::encode(&vk[1..33]));
+    let y_51 = group_xonly(dkg.public_key_package.verifying_key())?.xonly;
+    println!("  FROST group key Y_51: {}", hex::encode(y_51.serialize()));
     let csv = csv_blocks_u16(cfg)?;
     let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
 

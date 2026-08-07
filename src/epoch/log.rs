@@ -7,13 +7,11 @@
 
 use frost_secp256k1_tr::Identifier;
 
-/// Render an `Identifier` as the small integer pool index that the
-/// demo fixtures use (1, 2, 3, …). Identifiers serialize as 32-byte
-/// big-endian scalars; in the demo only the last two bytes are used.
+/// Render an `Identifier` as the small integer participant index (1, 2, 3, …)
+/// for trace output. The same value the wire layer binds into canonical bytes —
+/// see [`crate::frost::identifier_u16`], which owns the conversion.
 pub fn id_short(id: Identifier) -> u16 {
-    let bytes = id.serialize();
-    let n = bytes.len();
-    u16::from_be_bytes([bytes[n - 2], bytes[n - 1]])
+    crate::frost::identifier_u16(id)
 }
 
 /// Format the first `take` bytes of `data` as hex with an ellipsis if

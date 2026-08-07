@@ -21,9 +21,10 @@ use axum::{
 };
 use tokio::sync::RwLock;
 
-/// Which DKG round a stored payload belongs to.
+/// Which of a two-round protocol's rounds a stored payload belongs to. Shared
+/// by the DKG and the signing ceremony — both are two-round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DkgRoundKey {
+pub enum RoundKey {
     Round1,
     Round2,
 }
@@ -34,14 +35,14 @@ pub struct AppState {
     /// This server's own `pool_id`, hex — the only one it serves.
     pub own_pool_id_hex: String,
     /// Published DKG payload JSON, keyed by `(epoch, threshold, attempt, round)`.
-    pub dkg: BTreeMap<(u64, u64, u64, DkgRoundKey), String>,
-    /// Published signing payload JSON, keyed by `(epoch, session)` — one FROST
-    /// session per TM input, plus the reserved rotation session. Stored as the
-    /// pre-signed JSON string for the same reason DKG payloads are: the
-    /// publisher signs canonical bytes, and the server must hand back exactly
-    /// what was signed rather than a re-serialization of it.
-    pub sign1: BTreeMap<(u64, u32), String>,
-    pub sign2: BTreeMap<(u64, u32), String>,
+    pub dkg: BTreeMap<(u64, u64, u64, RoundKey), String>,
+    /// Published signing payload JSON, keyed by `(epoch, session, round)` — one
+    /// FROST session per TM input, plus the reserved rotation session. Folds the
+    /// round into the key exactly as `dkg` above does, so serving needs no
+    /// branch. Stored as the pre-signed JSON string for the same reason DKG
+    /// payloads are: the publisher signs canonical bytes, and the server must
+    /// hand back exactly what was signed, not a re-serialization of it.
+    pub sign: BTreeMap<(u64, u32, RoundKey), String>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -81,7 +82,7 @@ async fn serve_dkg(
     epoch: u64,
     threshold: u64,
     attempt: u64,
-    round: DkgRoundKey,
+    round: RoundKey,
     file: String,
 ) -> Result<impl IntoResponse, StatusCode> {
     let s = state.read().await;
@@ -98,14 +99,14 @@ async fn get_dkg1(
     State(state): State<SharedState>,
     Path((epoch, threshold, attempt, file)): Path<(u64, u64, u64, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    serve_dkg(state, epoch, threshold, attempt, DkgRoundKey::Round1, file).await
+    serve_dkg(state, epoch, threshold, attempt, RoundKey::Round1, file).await
 }
 
 async fn get_dkg2(
     State(state): State<SharedState>,
     Path((epoch, threshold, attempt, file)): Path<(u64, u64, u64, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    serve_dkg(state, epoch, threshold, attempt, DkgRoundKey::Round2, file).await
+    serve_dkg(state, epoch, threshold, attempt, RoundKey::Round2, file).await
 }
 
 /// Serve one signing-round blob. Like the DKG routes, the `<pool_id>.json`
@@ -113,19 +114,16 @@ async fn get_dkg2(
 /// other pool_id is a 404 rather than someone else's bytes under the wrong name.
 async fn serve_sign(
     state: SharedState,
-    round: DkgRoundKey,
+    round: RoundKey,
     epoch: u64,
     session: u32,
     file: String,
 ) -> Result<impl IntoResponse, StatusCode> {
     let s = state.read().await;
     check_pool_id(&file, &s.own_pool_id_hex)?;
-    let map = match round {
-        DkgRoundKey::Round1 => &s.sign1,
-        DkgRoundKey::Round2 => &s.sign2,
-    };
-    let body = map
-        .get(&(epoch, session))
+    let body = s
+        .sign
+        .get(&(epoch, session, round))
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(([(header::CONTENT_TYPE, "application/json")], body))
@@ -135,12 +133,12 @@ async fn get_sign1(
     State(state): State<SharedState>,
     Path((epoch, session, file)): Path<(u64, u32, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    serve_sign(state, DkgRoundKey::Round1, epoch, session, file).await
+    serve_sign(state, RoundKey::Round1, epoch, session, file).await
 }
 
 async fn get_sign2(
     State(state): State<SharedState>,
     Path((epoch, session, file)): Path<(u64, u32, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    serve_sign(state, DkgRoundKey::Round2, epoch, session, file).await
+    serve_sign(state, RoundKey::Round2, epoch, session, file).await
 }

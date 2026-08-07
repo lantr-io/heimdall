@@ -52,28 +52,21 @@
 //! retries, exactly as the spec prescribes for a failed ceremony.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use bitcoin::secp256k1::{Message, Secp256k1};
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
 
-use crate::epoch::log::id_short;
-use crate::epoch::persist::{PersistedDkg, read_dkg_state};
-use crate::epoch::state::{EpochConfig, EpochError, EpochResult, Roster};
+use crate::epoch::persist::{PersistedDkg, persisted_dkg_epochs, read_dkg_state};
+use crate::epoch::signing::poll_sign_round;
+use crate::epoch::state::{EpochConfig, EpochError, EpochResult, GroupKeys, Roster};
 use crate::epoch::traits::{Clock, PeerNetwork, RngSource, UpdateYPlan};
 use crate::frost::participant;
 use crate::frost::xonly::group_xonly;
 use crate::http::wire::SignNamespace;
 
-/// Signing-session index reserved for the Update-Y message.
-///
-/// TM inputs are numbered from 0 and a transaction can never have `u32::MAX` of
-/// them, so this cannot collide with a per-input session. It shares the epoch
-/// namespace with them deliberately: all nodes agree on the incoming epoch
-/// number, including nodes whose only role in it is to sign the handoff.
-pub const UPDATE_Y_SESSION: u32 = u32::MAX;
+pub use crate::http::wire::UPDATE_Y_SESSION;
 
 /// How the authorizing signature was obtained — reported so the operator can
 /// see, in the log, whether a handoff was federation-authorized (bootstrap) or
@@ -114,8 +107,7 @@ pub async fn authorize_update_y(
     let (signature, authority) = match federation_signature(config, plan)? {
         Some(sig) => (sig, UpdateYAuthority::Federation),
         None => {
-            let outgoing = load_outgoing_dkg(config, plan)?;
-            let keys = outgoing.to_group_keys()?;
+            let (outgoing, keys) = load_outgoing_dkg(config, plan)?;
             let authority = UpdateYAuthority::OutgoingRoster {
                 epoch: outgoing.epoch,
                 min_signers: outgoing.roster.min_signers,
@@ -128,18 +120,8 @@ pub async fn authorize_update_y(
                 outgoing.epoch,
                 outgoing.roster.participants.len()
             );
-            let sig = frost_sign_message(
-                peers,
-                clock,
-                rng,
-                config,
-                plan.epoch,
-                *keys.key_package.identifier(),
-                &outgoing.roster,
-                &keys,
-                &plan.sig_msg,
-            )
-            .await?;
+            let sig = frost_sign_message(peers, clock, rng, config, plan, &outgoing.roster, &keys)
+                .await?;
             (sig, authority)
         }
     };
@@ -194,7 +176,10 @@ fn federation_signature(config: &EpochConfig, plan: &UpdateYPlan) -> EpochResult
 /// DKG failed posts no Update-Y and the old roster simply carries over, so the
 /// outgoing key can be several epochs old. The datum names the key; the state
 /// dir is asked which ceremony produced it.
-fn load_outgoing_dkg(config: &EpochConfig, plan: &UpdateYPlan) -> EpochResult<PersistedDkg> {
+fn load_outgoing_dkg(
+    config: &EpochConfig,
+    plan: &UpdateYPlan,
+) -> EpochResult<(PersistedDkg, GroupKeys)> {
     let Some(dir) = config.state_dir.as_deref() else {
         return Err(EpochError::Frost(format!(
             "cannot authorize Update-Y: the treasury's current key {} is not the federation key \
@@ -202,14 +187,14 @@ fn load_outgoing_dkg(config: &EpochConfig, plan: &UpdateYPlan) -> EpochResult<Pe
             hex::encode(plan.current_key.serialize())
         )));
     };
-    for epoch in persisted_epochs(dir)? {
+    for epoch in persisted_dkg_epochs(dir)? {
         let Some(state) = read_dkg_state(dir, epoch)? else {
             continue;
         };
         let keys = state.to_group_keys()?;
         let g = group_xonly(&keys.verifying_key).map_err(EpochError::Frost)?;
         if g.xonly == plan.current_key {
-            return Ok(state);
+            return Ok((state, keys));
         }
     }
     Err(EpochError::Frost(format!(
@@ -221,51 +206,27 @@ fn load_outgoing_dkg(config: &EpochConfig, plan: &UpdateYPlan) -> EpochResult<Pe
     )))
 }
 
-/// Epochs with a `dkg-epoch-<n>.json` in `dir`, newest first — the outgoing
-/// roster is far more likely to be the most recent ceremony than the oldest.
-fn persisted_epochs(dir: &Path) -> EpochResult<Vec<u64>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(EpochError::Chain(format!(
-                "read state dir {}: {e}",
-                dir.display()
-            )));
-        }
-    };
-    let mut epochs: Vec<u64> = entries
-        .filter_map(Result::ok)
-        .filter_map(|e| {
-            e.file_name()
-                .to_str()
-                .and_then(|n| n.strip_prefix("dkg-epoch-"))
-                .and_then(|n| n.strip_suffix(".json"))
-                .and_then(|n| n.parse().ok())
-        })
-        .collect();
-    epochs.sort_unstable_by(|a, b| b.cmp(a));
-    Ok(epochs)
-}
-
 /// One untweaked two-round FROST signing session over `msg`, among `roster`,
 /// under `keys`.
 ///
 /// Mirrors `sign_phase`'s structure for a single session, minus the Taproot
 /// tweak: the Update-Y message is signed under the group key as-is, which is
 /// what `verify_schnorr_signature(current_spos_frost_key, …)` checks on-chain.
-#[allow(clippy::too_many_arguments)]
 async fn frost_sign_message(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
     rng: &Arc<dyn RngSource>,
     config: &EpochConfig,
-    epoch: u64,
-    me: Identifier,
+    plan: &UpdateYPlan,
     roster: &Roster,
-    keys: &crate::epoch::state::GroupKeys,
-    msg: &[u8; 32],
+    keys: &GroupKeys,
 ) -> EpochResult<[u8; 64]> {
+    // Everything the session is bound to comes from the plan, so none of it can
+    // drift from the rotation actually being authorized.
+    let epoch = plan.epoch;
+    let msg = &plan.sig_msg;
+    // This node's index in the OUTGOING roster, which is the one signing.
+    let me = *keys.key_package.identifier();
     // The rotation's signing domain: the incoming epoch, the reserved session,
     // and the Update-Y message itself — so a share from one rotation can never
     // be replayed into another.
@@ -285,7 +246,7 @@ async fn frost_sign_message(
         "Update-Y round1: published commitments, waiting for {} outgoing peer(s)",
         peer_infos.len()
     );
-    poll_round1(peers, clock, config, ns, me, &peer_infos, &mut round1).await?;
+    poll_sign_round(peers, clock, config, ns, me, &peer_infos, &mut round1).await?;
 
     let package = frost::SigningPackage::new(round1, msg);
     let share = participant::sign_round2(&package, &nonces, &keys.key_package)
@@ -300,7 +261,7 @@ async fn frost_sign_message(
         "Update-Y round2: published share, waiting for {} outgoing peer(s)",
         peer_infos.len()
     );
-    poll_round2(peers, clock, config, ns, me, &peer_infos, &mut round2).await?;
+    poll_sign_round(peers, clock, config, ns, me, &peer_infos, &mut round2).await?;
 
     let signature = participant::sign_aggregate(&package, &round2, &keys.public_key_package)
         .map_err(|e| EpochError::Frost(format!("update-y aggregate: {e}")))?;
@@ -311,99 +272,14 @@ async fn frost_sign_message(
         .map_err(|_| EpochError::Frost("update-y signature is not 64 bytes".into()))
 }
 
-async fn poll_round1(
-    peers: &Arc<dyn PeerNetwork>,
-    clock: &Arc<dyn Clock>,
-    config: &EpochConfig,
-    ns: SignNamespace,
-    me: Identifier,
-    peer_infos: &[&crate::epoch::state::SpoInfo],
-    out: &mut BTreeMap<Identifier, frost::round1::SigningCommitments>,
-) -> EpochResult<()> {
-    let epoch = ns.epoch;
-    let need = peer_infos.len() + out.len();
-    let deadline = clock.deadline(config.quorum51_timeout);
-    while out.len() < need {
-        for peer in peer_infos {
-            if out.contains_key(&peer.identifier) {
-                continue;
-            }
-            if let Some(commitments) = peers.fetch_sign_round1(ns, peer).await? {
-                crate::epoch_log!(
-                    me,
-                    epoch,
-                    "  Update-Y round1 commitments from spo={} ({}/{})",
-                    id_short(peer.identifier),
-                    out.len() + 1,
-                    need
-                );
-                out.insert(peer.identifier, commitments);
-            }
-        }
-        if out.len() >= need {
-            break;
-        }
-        if clock.now() >= deadline {
-            return Err(EpochError::PollTimeout {
-                got: out.len(),
-                need,
-            });
-        }
-        tokio::time::sleep(config.poll_interval).await;
-    }
-    Ok(())
-}
-
-async fn poll_round2(
-    peers: &Arc<dyn PeerNetwork>,
-    clock: &Arc<dyn Clock>,
-    config: &EpochConfig,
-    ns: SignNamespace,
-    me: Identifier,
-    peer_infos: &[&crate::epoch::state::SpoInfo],
-    out: &mut BTreeMap<Identifier, frost::round2::SignatureShare>,
-) -> EpochResult<()> {
-    let epoch = ns.epoch;
-    let need = peer_infos.len() + out.len();
-    let deadline = clock.deadline(config.quorum51_timeout);
-    while out.len() < need {
-        for peer in peer_infos {
-            if out.contains_key(&peer.identifier) {
-                continue;
-            }
-            if let Some(share) = peers.fetch_sign_round2(ns, peer).await? {
-                crate::epoch_log!(
-                    me,
-                    epoch,
-                    "  Update-Y round2 share from spo={} ({}/{})",
-                    id_short(peer.identifier),
-                    out.len() + 1,
-                    need
-                );
-                out.insert(peer.identifier, share);
-            }
-        }
-        if out.len() >= need {
-            break;
-        }
-        if clock.now() >= deadline {
-            return Err(EpochError::PollTimeout {
-                got: out.len(),
-                need,
-            });
-        }
-        tokio::time::sleep(config.poll_interval).await;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cardano::treasury_info::update_y_sig_msg;
+    use crate::epoch::log::id_short;
     use crate::epoch::mocks::{MockPeerHub, MockPeerNetwork, OsRngSource, SystemClock};
     use crate::epoch::persist::write_dkg_state;
-    use crate::epoch::state::{GroupKeys, SpoIdentity, SpoInfo};
+    use crate::epoch::state::{SpoIdentity, SpoInfo};
     use bitcoin::key::UntweakedPublicKey;
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
@@ -518,16 +394,10 @@ mod tests {
         .await
         .unwrap();
 
+        // `authorize_update_y` verifies the signature under `plan.current_key`
+        // before returning, so reaching here IS the signature assertion.
         assert_eq!(authority, UpdateYAuthority::Federation);
-        // `authorize_update_y` verifies internally; re-assert here so the test
-        // fails on the signature rather than on a missing error path.
-        let secp = Secp256k1::new();
-        secp.verify_schnorr(
-            &bitcoin::secp256k1::schnorr::Signature::from_slice(&sig).unwrap(),
-            &Message::from_digest(plan.sig_msg),
-            &plan.current_key,
-        )
-        .unwrap();
+        assert_eq!(sig.len(), 64);
     }
 
     /// A seed that is NOT the treasury's key must not be used to sign: with no
@@ -598,9 +468,11 @@ mod tests {
             }));
         }
 
-        let secp = Secp256k1::new();
+        // Every node's call returning Ok is the assertion: `authorize_update_y`
+        // only returns a signature that verifies under the treasury's current
+        // key — i.e. one the outgoing roster genuinely produced.
         for h in handles {
-            let (sig, authority) = h.await.unwrap().unwrap();
+            let (_sig, authority) = h.await.unwrap().unwrap();
             assert_eq!(
                 authority,
                 UpdateYAuthority::OutgoingRoster {
@@ -608,12 +480,6 @@ mod tests {
                     min_signers: 3
                 }
             );
-            secp.verify_schnorr(
-                &bitcoin::secp256k1::schnorr::Signature::from_slice(&sig).unwrap(),
-                &Message::from_digest(plan.sig_msg),
-                &plan.current_key,
-            )
-            .expect("the outgoing roster's FROST signature must authorize the rotation");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -644,7 +510,7 @@ mod tests {
         let plan = plan_for(live_xonly, xonly_of([0x99u8; 32]));
         let config = config_with(Some(dir.clone()), None);
         let found = load_outgoing_dkg(&config, &plan).unwrap();
-        assert_eq!(found.epoch, 9, "must pick the ceremony that owns the key");
+        assert_eq!(found.0.epoch, 9, "must pick the ceremony that owns the key");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

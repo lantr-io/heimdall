@@ -22,6 +22,8 @@
 use frost::Signature;
 use frost::keys::dkg::{round1, round2};
 use frost::keys::{SigningShare, VerifiableSecretSharingCommitment};
+use frost::round1::{NonceCommitment, SigningCommitments};
+use frost::round2::SignatureShare;
 use frost_secp256k1_tr as frost;
 
 use super::canonical::{POINT_LEN, SHARE_LEN, SIG_LEN};
@@ -106,6 +108,43 @@ pub fn round2_share_bytes(pkg: &round2::Package) -> Result<[u8; SHARE_LEN], Brid
 pub fn round2_from_share(share: &[u8; SHARE_LEN]) -> Result<round2::Package, BridgeError> {
     let signing_share = SigningShare::deserialize(share)?;
     Ok(round2::Package::new(signing_share))
+}
+
+// ── Signing rounds (WI-038) ────────────────────────────────────────────
+
+/// The two compressed nonce-commitment points a signing Round 1 payload
+/// carries: `(hiding, binding)`.
+pub fn sign_round1_fields(
+    commitments: &SigningCommitments,
+) -> Result<([u8; POINT_LEN], [u8; POINT_LEN]), BridgeError> {
+    Ok((
+        to_point(commitments.hiding().serialize()?)?,
+        to_point(commitments.binding().serialize()?)?,
+    ))
+}
+
+/// Rebuild the commitments from the wire fields (receive side).
+pub fn sign_round1_from_fields(
+    hiding: &[u8; POINT_LEN],
+    binding: &[u8; POINT_LEN],
+) -> Result<SigningCommitments, BridgeError> {
+    Ok(SigningCommitments::new(
+        NonceCommitment::deserialize(hiding)?,
+        NonceCommitment::deserialize(binding)?,
+    ))
+}
+
+/// The 32-byte signature-share scalar a signing Round 2 payload carries.
+pub fn sign_round2_share_bytes(share: &SignatureShare) -> Result<[u8; SHARE_LEN], BridgeError> {
+    let s = share.serialize();
+    s.as_slice()
+        .try_into()
+        .map_err(|_| BridgeError::BadShareLen(s.len()))
+}
+
+/// Rebuild a signature share from its 32-byte scalar (receive side).
+pub fn sign_round2_from_share(share: &[u8; SHARE_LEN]) -> Result<SignatureShare, BridgeError> {
+    Ok(SignatureShare::deserialize(share)?)
 }
 
 #[cfg(test)]

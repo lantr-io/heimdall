@@ -373,74 +373,6 @@ fn prepare_dkg_fault(
     }
 }
 
-/// Everything needed to spend the live `treasury_info` state UTxO with the
-/// `UpdateY` redeemer — the on-chain half of the DKG key handoff (N10c/N-b).
-///
-/// [`crate::cardano::roster::RegistryRosterSource`] already carries the
-/// treasury_info *address* (it reads the identity root from that UTxO), but
-/// spending it also needs the parameterized script itself, so this keeps the
-/// `ParameterizedScript` rather than just its hash. Built from exactly the same
-/// config fields, so a node with a real registry roster can always rotate.
-#[derive(Debug, Clone)]
-pub struct UpdateYFlow {
-    treasury: crate::cardano::blueprint::ParameterizedScript,
-    treasury_address: String,
-    asset_name_hex: String,
-}
-
-impl UpdateYFlow {
-    /// Build from `[cardano]` config. `Ok(None)` when the registry fields are
-    /// absent (a fixture-roster node has no `treasury_info` to rotate); an error
-    /// when they are inconsistent, matching `RegistryRosterSource::from_config`.
-    pub fn from_config(cardano: &crate::config::CardanoConfig) -> Result<Option<Self>, String> {
-        let fields = (
-            cardano.registry_blueprint.as_deref(),
-            cardano.registry_bootstrap.as_deref(),
-            cardano.treasury_info_asset_name.as_deref(),
-        );
-        let (blueprint_path, bootstrap, asset_name_hex) = match fields {
-            (None, None, None) => return Ok(None),
-            (Some(b), Some(r), Some(a)) => (b, r, a),
-            _ => {
-                return Err("set all of cardano.registry_blueprint, \
-                     cardano.registry_bootstrap and cardano.treasury_info_asset_name (or none)"
-                    .into());
-            }
-        };
-        let blueprint_json = std::fs::read_to_string(blueprint_path)
-            .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
-        let (tx_id, index) = crate::cardano::roster::parse_outref(bootstrap)
-            .map_err(|e| format!("registry bootstrap outref: {e}"))?;
-        let registry = crate::cardano::blueprint::spos_registry_script(
-            &blueprint_json,
-            &tx_id,
-            u64::from(index),
-        )
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-        let tm_nft = cardano.tm_nft_policy()?;
-        let treasury = crate::cardano::blueprint::treasury_info_script(
-            &blueprint_json,
-            &registry.hash,
-            &tm_nft,
-        )
-        .map_err(|e| format!("parameterize treasury_info: {e}"))?;
-        let mainnet = cardano
-            .blockfrost_project_id
-            .as_deref()
-            .is_some_and(|p| p.starts_with("mainnet"));
-        let network = if mainnet {
-            pallas_addresses::Network::Mainnet
-        } else {
-            pallas_addresses::Network::Testnet
-        };
-        Ok(Some(Self {
-            treasury_address: treasury.enterprise_address(network),
-            treasury,
-            asset_name_hex: asset_name_hex.to_string(),
-        }))
-    }
-}
-
 pub struct BlockfrostCardanoChain {
     /// Pooled Blockfrost client — used ONLY for `transactions_submit` (the leader's
     /// oracle-update POST). Reads go through fresh `bf_http` clients instead: the
@@ -526,10 +458,6 @@ pub struct BlockfrostCardanoChain {
     /// address plus the bridged-token unit that identifies one. `None` → the daemon pays
     /// no peg-out, and says so loudly on every build.
     pegout_source: Option<PegOutSource>,
-    /// The `treasury_info` script + NFT needed to post the DKG key handoff
-    /// (N10c/N-b). `None` → `plan_update_y` reports nothing to rotate and the
-    /// derived key is only ever this node's local view.
-    update_y_flow: Option<UpdateYFlow>,
 }
 
 /// The two values `pegout_datum::fetch_pegout_requests` needs. The `sweep-pegins` CLI takes
@@ -589,7 +517,6 @@ impl BlockfrostCardanoChain {
             cpo_policy_id: None,
             kupo_url: None,
             pegout_source: None,
-            update_y_flow: None,
         }
     }
 
@@ -685,29 +612,23 @@ impl BlockfrostCardanoChain {
         self
     }
 
-    /// Enable posting the DKG key handoff on-chain (`UpdateY` on `treasury_info`).
-    pub fn with_update_y_flow(mut self, flow: UpdateYFlow) -> Self {
-        self.update_y_flow = Some(flow);
-        self
-    }
-
     /// Locate + decode the singleton `treasury_info` state UTxO (the one holding
     /// the K1 NFT) at the script address.
     async fn find_treasury_info_state(
         &self,
-        flow: &UpdateYFlow,
+        registry: &crate::cardano::roster::RegistryRosterSource,
     ) -> EpochResult<crate::cardano::treasury_spend::TreasuryStateUtxo> {
         let utxos = crate::cardano::bf_http::fetch_address_utxos(
             &self.bf_base_url,
             &self.bf_project_id,
-            &flow.treasury_address,
+            &registry.treasury_info_address,
         )
         .await
         .map_err(|e| EpochError::Chain(format!("treasury_info UTxO query: {e}")))?;
         crate::cardano::treasury_spend::find_treasury_state(
             &utxos,
-            &flow.treasury.hash_hex(),
-            &flow.asset_name_hex,
+            &registry.treasury_info_policy_hex,
+            &registry.treasury_info_asset_name_hex,
         )
         .map_err(|e| EpochError::Chain(format!("locate treasury_info state: {e}")))
     }
@@ -1441,7 +1362,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         epoch: u64,
         new_y_51: bitcoin::key::UntweakedPublicKey,
     ) -> EpochResult<Option<crate::epoch::traits::UpdateYPlan>> {
-        let Some(flow) = &self.update_y_flow else {
+        let Some(registry) = &self.registry_roster else {
             eprintln!(
                 "[update-y] no treasury_info configured (cardano.registry_blueprint / \
                  registry_bootstrap / treasury_info_asset_name) — the derived group key stays \
@@ -1449,7 +1370,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             );
             return Ok(None);
         };
-        let state = self.find_treasury_info_state(flow).await?;
+        let state = self.find_treasury_info_state(registry).await?;
 
         let current_key =
             bitcoin::key::UntweakedPublicKey::from_slice(&state.datum.current_spos_frost_key)
@@ -1490,7 +1411,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         plan: &crate::epoch::traits::UpdateYPlan,
         signature: &[u8; 64],
     ) -> EpochResult<String> {
-        let flow = self.update_y_flow.as_ref().ok_or_else(|| {
+        let registry = self.registry_roster.as_ref().ok_or_else(|| {
             EpochError::Chain("no treasury_info configured — cannot submit Update-Y".into())
         })?;
         let key = self.payment_key.as_ref().ok_or_else(|| {
@@ -1507,7 +1428,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         // been spent (a peer's rotation, a registration). The signature is
         // pinned to the outpoint it was made for, so a moved state must fail
         // loudly rather than build a transaction that cannot validate.
-        let state = self.find_treasury_info_state(flow).await?;
+        let state = self.find_treasury_info_state(registry).await?;
         let outpoint = format!("{}:{}", state.tx_hash, state.output_index);
         if outpoint != plan.state_outpoint {
             return Err(EpochError::Chain(format!(
@@ -1538,7 +1459,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             .map_err(|_| EpochError::Chain("epoch too large for Plutus Int".into()))?;
         let built = crate::cardano::update_y::build_update_y_tx(
             &crate::cardano::update_y::UpdateYRequest {
-                treasury_script: &flow.treasury,
+                treasury_script: &registry.treasury_info_script,
                 state: &state,
                 new_spos_frost_key: &plan.new_key.serialize(),
                 epoch: epoch_i64,

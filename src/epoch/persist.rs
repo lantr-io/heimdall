@@ -81,10 +81,48 @@ impl PersistedDkg {
     }
 }
 
+const DKG_STATE_PREFIX: &str = "dkg-epoch-";
+const DKG_STATE_SUFFIX: &str = ".json";
+
 /// `<state_dir>/dkg-epoch-<epoch>.json`.
 #[must_use]
 pub fn dkg_state_path(state_dir: &Path, epoch: u64) -> PathBuf {
-    state_dir.join(format!("dkg-epoch-{epoch}.json"))
+    state_dir.join(format!("{DKG_STATE_PREFIX}{epoch}{DKG_STATE_SUFFIX}"))
+}
+
+/// Every epoch with persisted DKG state in `state_dir`, newest first.
+///
+/// Lives here, beside [`dkg_state_path`], because it is the inverse of that
+/// filename: a rename there would otherwise leave this silently enumerating
+/// nothing, and its caller (the Update-Y rotation, which finds the outgoing
+/// ceremony by group key) would report "no persisted DKG has that key" rather
+/// than a missing-file error.
+///
+/// A missing directory is `Ok(empty)` — a node that has never persisted a
+/// ceremony has no outgoing share, which is a legitimate state, not an error.
+pub fn persisted_dkg_epochs(state_dir: &Path) -> EpochResult<Vec<u64>> {
+    let entries = match std::fs::read_dir(state_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(EpochError::Chain(format!(
+                "read state dir {}: {e}",
+                state_dir.display()
+            )));
+        }
+    };
+    let mut epochs: Vec<u64> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix(DKG_STATE_PREFIX))
+                .and_then(|n| n.strip_suffix(DKG_STATE_SUFFIX))
+                .and_then(|n| n.parse().ok())
+        })
+        .collect();
+    epochs.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(epochs)
 }
 
 /// Atomically persist the DKG state: the dir is created `0700`, the file is

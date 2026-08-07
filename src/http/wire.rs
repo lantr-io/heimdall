@@ -729,6 +729,14 @@ pub struct SignNamespace {
     pub message: [u8; SIGN_MESSAGE_LEN],
 }
 
+/// Session index reserved for the Update-Y key-rotation ceremony.
+///
+/// TM inputs are numbered from 0 and a transaction can never have `u32::MAX` of
+/// them, so this cannot collide with a per-input session. It lives here, beside
+/// [`SignNamespace`], because the session-index space is the namespace's — a
+/// reserved value in it is not the rotation module's private business.
+pub const UPDATE_Y_SESSION: u32 = u32::MAX;
+
 impl SignNamespace {
     #[must_use]
     pub fn new(epoch: u64, session: u32, message: [u8; SIGN_MESSAGE_LEN]) -> Self {
@@ -736,6 +744,16 @@ impl SignNamespace {
             epoch,
             session,
             message,
+        }
+    }
+
+    /// How this session is named in trace output.
+    #[must_use]
+    pub fn session_label(&self) -> String {
+        if self.session == UPDATE_Y_SESSION {
+            "update-y".to_string()
+        } else {
+            format!("input {}", self.session)
         }
     }
 }
@@ -766,26 +784,25 @@ pub struct Sign2Wire {
     pub signature: String,
 }
 
-fn commitment_points(
-    commitments: &frost::round1::SigningCommitments,
-) -> Result<([u8; POINT_LEN], [u8; POINT_LEN]), WireError> {
-    let point = |v: Vec<u8>| -> Result<[u8; POINT_LEN], WireError> {
-        v.try_into().map_err(|v: Vec<u8>| {
-            WireError::Field(format!(
-                "nonce commitment is {} bytes, want {POINT_LEN}",
-                v.len()
-            ))
-        })
-    };
-    let hiding = commitments
-        .hiding()
-        .serialize()
-        .map_err(|e| WireError::Field(format!("hiding commitment: {e}")))?;
-    let binding = commitments
-        .binding()
-        .serialize()
-        .map_err(|e| WireError::Field(format!("binding commitment: {e}")))?;
-    Ok((point(hiding)?, point(binding)?))
+/// Reject a signing payload that claims an identifier the roster does not
+/// assign to its publisher. Aggregation keys shares by identifier and a roster
+/// change renumbers participants positionally, so this must never be inferred
+/// from the payload; the message names both values because an identifier
+/// mismatch is otherwise one of the hardest wedges to diagnose.
+fn check_sign_identifier(
+    round: u8,
+    claimed: u16,
+    peer_identifier: u16,
+    peer_pool_id: &[u8; POOL_ID_LEN],
+) -> Result<(), WireError> {
+    if claimed == peer_identifier {
+        return Ok(());
+    }
+    Err(WireError::Field(format!(
+        "sign round{round} claims identifier {claimed} but the roster assigns \
+         {peer_identifier} to pool {}",
+        hex::encode(peer_pool_id)
+    )))
 }
 
 /// Build and sign this SPO's signing Round 1 payload.
@@ -797,7 +814,7 @@ pub fn build_sign_round1(
     my_identifier: u16,
     commitments: &frost::round1::SigningCommitments,
 ) -> Result<Sign1Wire, WireError> {
-    let (hiding, binding) = commitment_points(commitments)?;
+    let (hiding, binding) = frost_bridge::sign_round1_fields(commitments)?;
     let canonical_bytes = canonical::sign_round1(
         ns.epoch,
         ns.session,
@@ -827,13 +844,7 @@ pub fn verify_sign_round1(
     peer_identifier: u16,
     wire: &Sign1Wire,
 ) -> Result<frost::round1::SigningCommitments, WireError> {
-    if wire.identifier != peer_identifier {
-        return Err(WireError::Field(format!(
-            "sign round1 claims identifier {} but the roster assigns {peer_identifier} to pool {}",
-            wire.identifier,
-            hex::encode(peer_pool_id)
-        )));
-    }
+    check_sign_identifier(1, wire.identifier, peer_identifier, peer_pool_id)?;
     let hiding = hex_n::<POINT_LEN>(&wire.hiding, "hiding")?;
     let binding = hex_n::<POINT_LEN>(&wire.binding, "binding")?;
     let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
@@ -848,14 +859,7 @@ pub fn verify_sign_round1(
     );
     auth::verify_payload(secp, peer_bifrost_id_pk, &canonical_bytes, &signature)?;
 
-    let nonce = |b: &[u8; POINT_LEN], what: &str| {
-        frost::round1::NonceCommitment::deserialize(b)
-            .map_err(|e| WireError::Field(format!("{what} commitment: {e}")))
-    };
-    Ok(frost::round1::SigningCommitments::new(
-        nonce(&hiding, "hiding")?,
-        nonce(&binding, "binding")?,
-    ))
+    Ok(frost_bridge::sign_round1_from_fields(&hiding, &binding)?)
 }
 
 /// Build and sign this SPO's signing Round 2 payload.
@@ -867,13 +871,7 @@ pub fn build_sign_round2(
     my_identifier: u16,
     share: &frost::round2::SignatureShare,
 ) -> Result<Sign2Wire, WireError> {
-    let bytes = share.serialize();
-    let share_bytes: [u8; SHARE_LEN] = bytes.as_slice().try_into().map_err(|_| {
-        WireError::Field(format!(
-            "signature share is {} bytes, want {SHARE_LEN}",
-            bytes.len()
-        ))
-    })?;
+    let share_bytes = frost_bridge::sign_round2_share_bytes(share)?;
     let canonical_bytes = canonical::sign_round2(
         ns.epoch,
         ns.session,
@@ -898,13 +896,7 @@ pub fn verify_sign_round2(
     peer_identifier: u16,
     wire: &Sign2Wire,
 ) -> Result<frost::round2::SignatureShare, WireError> {
-    if wire.identifier != peer_identifier {
-        return Err(WireError::Field(format!(
-            "sign round2 claims identifier {} but the roster assigns {peer_identifier} to pool {}",
-            wire.identifier,
-            hex::encode(peer_pool_id)
-        )));
-    }
+    check_sign_identifier(2, wire.identifier, peer_identifier, peer_pool_id)?;
     let share_bytes = hex_n::<SHARE_LEN>(&wire.share, "share")?;
     let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
     let canonical_bytes = canonical::sign_round2(
@@ -916,8 +908,7 @@ pub fn verify_sign_round2(
         &share_bytes,
     );
     auth::verify_payload(secp, peer_bifrost_id_pk, &canonical_bytes, &signature)?;
-    frost::round2::SignatureShare::deserialize(&share_bytes)
-        .map_err(|e| WireError::Field(format!("signature share: {e}")))
+    Ok(frost_bridge::sign_round2_from_share(&share_bytes)?)
 }
 
 #[cfg(test)]

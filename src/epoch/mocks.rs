@@ -37,8 +37,7 @@ use crate::epoch::traits::{
     CardanoChain, Clock, CycleRng, DkgFaultEvidence, EpochBoundaryEvent, PeerNetwork,
     PegOutRequestUtxo, RngSource, TreasuryUtxo, UpdateYPlan,
 };
-use crate::http::wire::DkgNamespace;
-use crate::http::wire::SignNamespace;
+use crate::http::wire::{DkgNamespace, SignNamespace};
 
 /// A stand-in `por_id` for a fixture peg-out.
 ///

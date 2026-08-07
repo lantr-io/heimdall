@@ -129,7 +129,7 @@ pub async fn sign_phase(
                 );
                 let ns = input_namespace(epoch, &tm, i);
                 let map = collected.round1.entry(i).or_default();
-                poll_sign_round1(peers, clock, config, ns, me, &peer_infos, map).await?;
+                poll_sign_round(peers, clock, config, ns, me, &peer_infos, map).await?;
             }
             crate::epoch_log!(
                 me,
@@ -196,7 +196,7 @@ pub async fn sign_phase(
 
                 collected.round2.entry(i).or_default().insert(me, share);
 
-                let ns = SignNamespace::new(epoch, i, sighash);
+                let ns = input_namespace(epoch, &tm, i);
                 peers.publish_sign_round2(ns, me, share).await?;
                 crate::epoch_log!(me, epoch, "    -> published share for input {i}");
 
@@ -209,7 +209,7 @@ pub async fn sign_phase(
                     peer_infos.len()
                 );
                 let shares = collected.round2.entry(i).or_default();
-                poll_sign_round2(peers, clock, config, ns, me, &peer_infos, shares).await?;
+                poll_sign_round(peers, clock, config, ns, me, &peer_infos, shares).await?;
 
                 // Aggregate.
                 let signature = participant::sign_aggregate_with_tweak(
@@ -310,16 +310,61 @@ fn input_namespace(epoch: u64, tm: &TreasuryMovement, i: u32) -> SignNamespace {
     SignNamespace::new(epoch, i, tm.sighashes[i as usize])
 }
 
-async fn poll_sign_round1(
+/// The payload one signing round collects from each peer, and how to fetch it.
+///
+/// Implemented for exactly the two FROST round types so [`poll_sign_round`] can
+/// be written once for both, without an async closure (whose lifetime the
+/// borrow checker cannot relate to the borrowed `SpoInfo`).
+pub(crate) trait SignRoundPayload: Sized {
+    /// Round number, for trace output.
+    const ROUND: u8;
+    async fn fetch(
+        peers: &Arc<dyn PeerNetwork>,
+        ns: SignNamespace,
+        peer: &crate::epoch::state::SpoInfo,
+    ) -> EpochResult<Option<Self>>;
+}
+
+impl SignRoundPayload for frost::round1::SigningCommitments {
+    const ROUND: u8 = 1;
+    async fn fetch(
+        peers: &Arc<dyn PeerNetwork>,
+        ns: SignNamespace,
+        peer: &crate::epoch::state::SpoInfo,
+    ) -> EpochResult<Option<Self>> {
+        peers.fetch_sign_round1(ns, peer).await
+    }
+}
+
+impl SignRoundPayload for frost::round2::SignatureShare {
+    const ROUND: u8 = 2;
+    async fn fetch(
+        peers: &Arc<dyn PeerNetwork>,
+        ns: SignNamespace,
+        peer: &crate::epoch::state::SpoInfo,
+    ) -> EpochResult<Option<Self>> {
+        peers.fetch_sign_round2(ns, peer).await
+    }
+}
+
+/// Poll every peer for one signing round of `ns` until all have answered or the
+/// quorum deadline fires. Shared by the TM inputs and the Update-Y rotation
+/// ceremony ([`crate::epoch::rotation`]) — one session is one session, and the
+/// threshold-aware version of this loop (the FIXME above) must only ever be
+/// written once.
+///
+/// Results are filed under the ROSTER's identifier for each peer, never one a
+/// payload claimed for itself: the transport has already verified the payload
+/// was signed by that peer under exactly that identifier.
+pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
     config: &EpochConfig,
     ns: SignNamespace,
     me: Identifier,
     peer_infos: &[&crate::epoch::state::SpoInfo],
-    out: &mut BTreeMap<Identifier, frost::round1::SigningCommitments>,
+    out: &mut BTreeMap<Identifier, T>,
 ) -> EpochResult<()> {
-    let (epoch, input_index) = (ns.epoch, ns.session);
     let need = peer_infos.len() + out.len(); // self already present
     let deadline = clock.deadline(config.quorum51_timeout);
     while out.len() < need {
@@ -327,62 +372,18 @@ async fn poll_sign_round1(
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            // Filed under the ROSTER's identifier for this peer, never one the
-            // payload claimed: the transport has already verified the payload
-            // was signed by this peer under exactly that identifier.
-            if let Some(commitments) = peers.fetch_sign_round1(ns, peer).await? {
+            if let Some(value) = T::fetch(peers, ns, peer).await? {
                 crate::epoch_log!(
                     me,
-                    epoch,
-                    "     received round1 commitments for input {input_index} from spo={} ({}/{})",
+                    ns.epoch,
+                    "     received round{} for {} from spo={} ({}/{})",
+                    T::ROUND,
+                    ns.session_label(),
                     id_short(peer.identifier),
                     out.len() + 1,
                     need
                 );
-                out.insert(peer.identifier, commitments);
-            }
-        }
-        if out.len() >= need {
-            break;
-        }
-        if clock.now() >= deadline {
-            return Err(EpochError::PollTimeout {
-                got: out.len(),
-                need,
-            });
-        }
-        tokio::time::sleep(config.poll_interval).await;
-    }
-    Ok(())
-}
-
-async fn poll_sign_round2(
-    peers: &Arc<dyn PeerNetwork>,
-    clock: &Arc<dyn Clock>,
-    config: &EpochConfig,
-    ns: SignNamespace,
-    me: Identifier,
-    peer_infos: &[&crate::epoch::state::SpoInfo],
-    out: &mut BTreeMap<Identifier, frost::round2::SignatureShare>,
-) -> EpochResult<()> {
-    let (epoch, input_index) = (ns.epoch, ns.session);
-    let need = peer_infos.len() + out.len();
-    let deadline = clock.deadline(config.quorum51_timeout);
-    while out.len() < need {
-        for peer in peer_infos {
-            if out.contains_key(&peer.identifier) {
-                continue;
-            }
-            if let Some(share) = peers.fetch_sign_round2(ns, peer).await? {
-                crate::epoch_log!(
-                    me,
-                    epoch,
-                    "     received round2 share for input {input_index} from spo={} ({}/{})",
-                    id_short(peer.identifier),
-                    out.len() + 1,
-                    need
-                );
-                out.insert(peer.identifier, share);
+                out.insert(peer.identifier, value);
             }
         }
         if out.len() >= need {
