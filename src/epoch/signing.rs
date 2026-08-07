@@ -93,6 +93,13 @@ pub async fn sign_phase(
             // published commitment is a signing input the others can use.
             verify_cpo_root(config, me, epoch, &tm)?;
 
+            // [SPI-2]: the same gate for the swept peg-ins root. Everything the
+            // honesty note above says about the CPO gate applies verbatim: the
+            // TM is self-built today, so what this catches is the on-disk trie
+            // moving between build and sign, and it becomes a genuine co-signer
+            // gate unchanged once a leader-proposed TM arrives over the wire.
+            verify_spi_root(config, me, epoch, &tm)?;
+
             crate::epoch_log!(
                 me,
                 epoch,
@@ -292,6 +299,56 @@ fn verify_cpo_root(
          — safe to sign",
         hex::encode(root),
         tm.fulfilled.len(),
+    );
+    Ok(())
+}
+
+/// [SPI-2]: recompute the swept peg-ins root from THIS node's own persisted
+/// trie plus the proposed TM's inputs, and refuse to sign on a mismatch.
+///
+/// The scope note on [`verify_cpo_root`] applies unchanged: heimdall's TM is
+/// self-built, so against one uninterrupted run the check is near-tautological.
+/// What it guards is the window between `build_tm_phase` computing `tm.spi_root`
+/// and this node signing – the persisted trie changing on disk in between, or a
+/// corrupt file – and it is written as `(tm, local trie)` so it becomes a real
+/// co-signer gate the moment a leader-proposes-TM wire format exists.
+///
+/// Refusing is the safe direction: a spurious entry in the swept set mints fBTC
+/// against BTC that never reached the treasury ([SPI-2]'s "Why" in the spec),
+/// while a refused TM is a missed movement the next epoch retries.
+fn verify_spi_root(
+    config: &EpochConfig,
+    me: Identifier,
+    epoch: u64,
+    tm: &TreasuryMovement,
+) -> EpochResult<()> {
+    use crate::cardano::spi_trie::SpiTrie;
+
+    let trie = match config.state_dir.as_deref() {
+        Some(dir) => SpiTrie::load(dir)
+            .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?
+            .unwrap_or_default(),
+        None => SpiTrie::empty(),
+    };
+
+    let inputs = tm.input_outpoints();
+    let root = trie.verify_proposed(&tm.spi_root, &inputs).map_err(|e| {
+        EpochError::TmBuild(format!(
+            "REFUSING TO SIGN treasury movement {}: {e}. This node's swept peg-ins trie \
+             disagrees with the root the movement implies; signing would attest a swept set \
+             this node cannot justify. Reconcile spi-trie.json with the confirmed TM chain \
+             before signing again.",
+            tm.txid
+        ))
+    })?;
+
+    crate::epoch_log!(
+        me,
+        epoch,
+        "  swept peg-ins root {} verified against the local trie ({} swept input(s)) \
+         – safe to sign",
+        hex::encode(root),
+        inputs.len().saturating_sub(1),
     );
     Ok(())
 }
@@ -570,7 +627,7 @@ mod tests {
         let num_inputs = unsigned.tx.input.len();
         assert_eq!(num_inputs, 2);
 
-        let tm_template = TreasuryMovement {
+        let mut tm_template = TreasuryMovement {
             txid: unsigned.txid,
             unsigned_tx: unsigned.tx.clone(),
             prevouts: unsigned.prevouts.clone(),
@@ -579,7 +636,13 @@ mod tests {
             signatures: vec![None; num_inputs],
             fulfilled: unsigned.fulfilled.clone(),
             cpo_root: unsigned.cpo_root,
+            spi_root: [0u8; 32],
         };
+        // The honest [SPI-2] root: no state_dir in this test, so the local trie
+        // is empty and the implied root is the empty trie advanced by the TM.
+        tm_template.spi_root = crate::cardano::spi_trie::SpiTrie::empty()
+            .root_after(&tm_template.input_outpoints())
+            .unwrap();
 
         // Drive sign_phase for every SPO in parallel.
         let mut sign_handles = Vec::new();
@@ -658,5 +721,90 @@ mod tests {
             secp.verify_schnorr(&schnorr_sig, &msg, &xonly)
                 .expect("taproot signature must verify under output key");
         }
+    }
+
+    // --- [SPI-2] co-signer gate -------------------------------------------
+
+    /// A 36-byte outpoint: txid internal order (32 bytes of `b`) ++ vout LE.
+    fn spi_op(b: u8, vout: u32) -> [u8; 36] {
+        let mut o = [b; 36];
+        o[32..].copy_from_slice(&vout.to_le_bytes());
+        o
+    }
+
+    /// A minimal TM carrying only what `verify_spi_root` reads: inputs and the
+    /// proposed `spi_root`.
+    fn spi_tm(inputs: &[[u8; 36]], spi_root: [u8; 32]) -> TreasuryMovement {
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|op| bitcoin::TxIn {
+                    previous_output: bitcoin::OutPoint {
+                        txid: Txid::from_byte_array(op[..32].try_into().unwrap()),
+                        vout: u32::from_le_bytes(op[32..].try_into().unwrap()),
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            output: vec![],
+        };
+        TreasuryMovement {
+            txid: tx.compute_txid(),
+            unsigned_tx: tx,
+            prevouts: vec![],
+            input_spend_info: vec![],
+            sighashes: vec![],
+            signatures: vec![],
+            fulfilled: vec![],
+            cpo_root: [0u8; 32],
+            spi_root,
+        }
+    }
+
+    /// [SPI-2]: before contributing any signing material, this node recomputes
+    /// the swept peg-ins root from its OWN persisted trie plus the proposed
+    /// TM's inputs. A matching root passes; a stale or forged root – including
+    /// the on-disk trie changing between build and sign – is refused.
+    #[test]
+    fn verify_spi_root_refuses_a_mismatched_proposed_root() {
+        use crate::cardano::spi_trie::SpiTrie;
+
+        let dir = std::env::temp_dir().join(format!("spi-gate-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let me = Identifier::try_from(1u16).unwrap();
+        let mut config = EpochConfig::demo_default(SpoIdentity {
+            identifier: me,
+            bifrost_id_pk: Vec::new(),
+            port: 0,
+        });
+        config.state_dir = Some(dir.clone());
+
+        // This node's trie already holds one earlier sweep.
+        let mut local = SpiTrie::empty();
+        local
+            .insert_for_confirmed_tm(&[spi_op(0x10, 0), spi_op(0x11, 0)])
+            .unwrap();
+        local.save(&dir).unwrap();
+
+        // The proposed TM sweeps two new deposits; its honest root is the local
+        // trie advanced by its inputs.
+        let inputs = [spi_op(0xaa, 0), spi_op(0x01, 0), spi_op(0x02, 3)];
+        let honest = local.root_after(&inputs).unwrap();
+        verify_spi_root(&config, me, 0, &spi_tm(&inputs, honest))
+            .expect("the honest root must pass the gate");
+
+        // A stale root – the trie WITHOUT this TM's entries – is refused.
+        verify_spi_root(&config, me, 0, &spi_tm(&inputs, local.root()))
+            .expect_err("a stale spi_root must be refused");
+
+        // The window the gate spans: the on-disk trie changes between build and
+        // sign, so the root computed at build time no longer holds.
+        SpiTrie::empty().save(&dir).unwrap();
+        verify_spi_root(&config, me, 0, &spi_tm(&inputs, honest))
+            .expect_err("a trie that moved under the proposal must refuse the old root");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

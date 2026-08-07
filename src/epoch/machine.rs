@@ -269,6 +269,7 @@ async fn await_confirm_phase(
                 tm.txid
             );
             advance_cpo_trie(config, epoch, tm)?;
+            advance_spi_trie(config, epoch, tm)?;
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -326,6 +327,53 @@ fn advance_cpo_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> 
         me,
         epoch,
         "  completed-peg-outs trie advanced to root {} ({} entr(y|ies))",
+        hex::encode(new_root),
+        trie.len(),
+    );
+    Ok(())
+}
+
+/// Fold a CONFIRMED TM's swept deposits into this node's persisted swept
+/// peg-ins trie: every tx input except input 0 becomes an entry [SPI-1], all
+/// valued with the TM's own input-0 outpoint [SPI-3].
+///
+/// Same discipline as [`advance_cpo_trie`], for the same reasons: only after
+/// confirmation, and only if the post-insert root equals `tm.spi_root` – on a
+/// divergence the file is NOT written, because a wrong trie signs confidently
+/// wrong roots while a stale one fails loudly at the next [SPI-2] gate.
+///
+/// A node without `state_dir` keeps no trie, so there is nothing to advance.
+fn advance_spi_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> EpochResult<()> {
+    use crate::cardano::spi_trie::SpiTrie;
+
+    let me = config.identity.identifier;
+    let Some(dir) = config.state_dir.as_deref() else {
+        return Ok(());
+    };
+    let mut trie = SpiTrie::load(dir)
+        .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?
+        .unwrap_or_default();
+
+    let inputs = tm.input_outpoints();
+    let new_root = trie
+        .insert_for_confirmed_tm(&inputs)
+        .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?;
+    if new_root != tm.spi_root {
+        return Err(EpochError::TmBuild(format!(
+            "swept peg-ins trie diverged: TM {} carries root {} but this node's trie reaches \
+             {} after inserting its {} swept input(s) – NOT persisting",
+            tm.txid,
+            hex::encode(tm.spi_root),
+            hex::encode(new_root),
+            inputs.len().saturating_sub(1),
+        )));
+    }
+    trie.save(dir)
+        .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?;
+    crate::epoch_log!(
+        me,
+        epoch,
+        "  swept peg-ins trie advanced to root {} ({} entr(y|ies))",
         hex::encode(new_root),
         trie.len(),
     );
@@ -1176,6 +1224,27 @@ async fn build_tm_phase(
     let sighashes = compute_sighashes(&unsigned);
     let num_inputs = unsigned.tx.input.len();
 
+    // The swept peg-ins root this TM implies: this node's persisted SPI trie
+    // advanced by every tx input except input 0 ([SPI-1]). Every co-signer
+    // recomputes it from its own trie before signing ([SPI-2], `verify_spi_root`).
+    let spi_root = {
+        use crate::cardano::spi_trie::SpiTrie;
+        let trie = match config.state_dir.as_deref() {
+            Some(dir) => SpiTrie::load(dir)
+                .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?
+                .unwrap_or_default(),
+            None => SpiTrie::empty(),
+        };
+        let inputs: Vec<[u8; 36]> = unsigned
+            .tx
+            .input
+            .iter()
+            .map(|i| crate::cardano::tm_chain::outpoint_bytes(&i.previous_output))
+            .collect();
+        trie.root_after(&inputs)
+            .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?
+    };
+
     let tm = TreasuryMovement {
         txid: unsigned.txid,
         unsigned_tx: unsigned.tx,
@@ -1185,6 +1254,7 @@ async fn build_tm_phase(
         signatures: vec![None; num_inputs],
         fulfilled: unsigned.fulfilled,
         cpo_root: unsigned.cpo_root,
+        spi_root,
     };
 
     crate::epoch_log!(
@@ -2207,5 +2277,94 @@ mod tests {
         cross_check_cpo_root(&chain, &trie, None, id, 0)
             .await
             .expect("an unchecked root must still be attestable");
+    }
+
+    // --- swept peg-ins trie wiring [SPI-1] [SPI-3] -------------------------
+
+    /// A 36-byte outpoint: txid internal order (32 bytes of `b`) ++ vout LE.
+    fn spi_op(b: u8, vout: u32) -> [u8; 36] {
+        let mut o = [b; 36];
+        o[32..].copy_from_slice(&vout.to_le_bytes());
+        o
+    }
+
+    fn outpoint(bytes: [u8; 36]) -> bitcoin::OutPoint {
+        use bitcoin::hashes::Hash;
+        bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array(bytes[..32].try_into().unwrap()),
+            vout: u32::from_le_bytes(bytes[32..].try_into().unwrap()),
+        }
+    }
+
+    /// A minimal TM whose only meaningful content is its inputs and `spi_root`
+    /// – exactly what the swept peg-ins wiring reads.
+    fn spi_tm(inputs: &[[u8; 36]], spi_root: [u8; 32]) -> TreasuryMovement {
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|op| bitcoin::TxIn {
+                    previous_output: outpoint(*op),
+                    ..Default::default()
+                })
+                .collect(),
+            output: vec![],
+        };
+        TreasuryMovement {
+            txid: tx.compute_txid(),
+            unsigned_tx: tx,
+            prevouts: vec![],
+            input_spend_info: vec![],
+            sighashes: vec![],
+            signatures: vec![],
+            fulfilled: vec![],
+            cpo_root: [0u8; 32],
+            spi_root,
+        }
+    }
+
+    /// A CONFIRMED TM advances the persisted swept peg-ins trie: every input
+    /// except input 0 becomes an entry [SPI-1], all valued with the TM's own
+    /// input-0 outpoint [SPI-3]. A TM whose `spi_root` disagrees with what this
+    /// node's trie reaches is refused and the trie file is NOT touched.
+    #[test]
+    fn a_confirmed_tm_advances_the_persisted_spi_trie() {
+        use crate::cardano::spi_trie::SpiTrie;
+
+        let dir = std::env::temp_dir().join(format!("spi-advance-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = fast_config(Identifier::try_from(1u16).unwrap());
+        config.state_dir = Some(dir.clone());
+
+        let t = spi_op(0xaa, 0);
+        let a = spi_op(0x01, 0);
+        let b = spi_op(0x02, 3);
+        let root = SpiTrie::empty().root_after(&[t, a, b]).unwrap();
+        let tm = spi_tm(&[t, a, b], root);
+        advance_spi_trie(&config, 0, &tm).expect("a matching root advances the trie");
+
+        let trie = SpiTrie::load(&dir).unwrap().expect("trie persisted");
+        assert_eq!(trie.root(), root);
+        assert!(trie.contains(&a));
+        assert!(trie.contains(&b));
+        assert!(!trie.contains(&t), "input 0 must not become an entry");
+        assert_eq!(trie.get(&a), Some(t.as_slice()));
+
+        // A divergent spi_root is refused, and the persisted trie stays put.
+        let tm_bad = spi_tm(&[spi_op(0xbb, 0), spi_op(0x03, 1)], [9u8; 32]);
+        advance_spi_trie(&config, 0, &tm_bad).expect_err("a divergent root must be refused");
+        let untouched = SpiTrie::load(&dir).unwrap().expect("trie still present");
+        assert_eq!(
+            untouched.root(),
+            root,
+            "a refused TM must not change the file"
+        );
+
+        // No state_dir → nothing to advance, and no error.
+        config.state_dir = None;
+        advance_spi_trie(&config, 0, &tm).expect("no state_dir keeps no trie");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

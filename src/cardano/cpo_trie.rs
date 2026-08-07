@@ -105,6 +105,7 @@ use crate::bitcoin::tm_builder::{
 };
 use crate::cardano::cpo_history::{CpoHistorySource, DatumState};
 use crate::cardano::mpf;
+use crate::cardano::state_file;
 use crate::cardano::treasury_datum::{ConfirmedTm, TreasuryDatumError, parse_confirmed_tm_datum};
 use tracing::{info, warn};
 
@@ -539,13 +540,8 @@ impl CpoTrie {
         };
         let bytes = serde_json::to_vec_pretty(&persisted)
             .map_err(|e| CpoTrieError::State(format!("encode: {e}")))?;
-        create_dir_0700(state_dir)?;
-        let path = Self::state_path(state_dir);
-        let tmp = path.with_extension("tmp");
-        write_file_0600(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| CpoTrieError::State(format!("rename to {}: {e}", path.display())))?;
-        Ok(())
+        state_file::write_atomic_0600(state_dir, &Self::state_path(state_dir), &bytes)
+            .map_err(CpoTrieError::State)
     }
 }
 
@@ -574,48 +570,6 @@ struct PersistedCpoTrie {
 struct PersistedEntry {
     por_id: String,
     value: String,
-}
-
-#[cfg(unix)]
-fn create_dir_0700(dir: &Path) -> Result<(), CpoTrieError> {
-    use std::os::unix::fs::DirBuilderExt;
-    if dir.exists() {
-        return Ok(());
-    }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|e| CpoTrieError::State(format!("create {}: {e}", dir.display())))
-}
-
-#[cfg(not(unix))]
-fn create_dir_0700(dir: &Path) -> Result<(), CpoTrieError> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| CpoTrieError::State(format!("create {}: {e}", dir.display())))
-}
-
-#[cfg(unix)]
-fn write_file_0600(path: &Path, bytes: &[u8]) -> Result<(), CpoTrieError> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| CpoTrieError::State(format!("open {}: {e}", path.display())))?;
-    f.write_all(bytes)
-        .map_err(|e| CpoTrieError::State(format!("write {}: {e}", path.display())))?;
-    f.sync_all()
-        .map_err(|e| CpoTrieError::State(format!("sync {}: {e}", path.display())))
-}
-
-#[cfg(not(unix))]
-fn write_file_0600(path: &Path, bytes: &[u8]) -> Result<(), CpoTrieError> {
-    std::fs::write(path, bytes)
-        .map_err(|e| CpoTrieError::State(format!("write {}: {e}", path.display())))
 }
 
 // ---------------------------------------------------------------------------

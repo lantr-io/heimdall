@@ -642,3 +642,132 @@ Unconfirmed records, and a fake tip would deadlock the `btc_confirmed` polling l
 - Design doc: `../ft-bifrost-bridge/docs/superpowers/specs/2026-07-20-tm-confirmed-chain-design.md`
 - Driver: `../ft-bifrost-bridge/documentation/technical_documentation.md` ("Post signed TM",
   "The TM chain").
+
+---
+
+## DEC-023: SPI Proof Endpoint Wire Format
+
+**Date:** 2026-08-07
+**Decision:** Serve swept peg-ins proofs as JSON with hex-encoded byte fields at `GET /spi/proof/{peg_in_utxo_id}`
+**Status:** Accepted
+
+### Context
+
+Spec 2026-08-06-bridge-state-singleton-design rule [SPI-4] requires an unauthenticated
+GET route that serves a swept peg-ins membership (or non-membership) proof for a given
+`peg_in_utxo_id`. The spec does not fix the wire format, so this entry does.
+
+### Decision
+
+- Route: `GET /spi/proof/{peg_in_utxo_id}`. The path segment is the 36-byte
+  `peg_in_utxo_id` (txid internal order ++ vout LE, the `tm_chain::outpoint_bytes`
+  encoding), hex-encoded. Anything that is not exactly 36 bytes of hex is a 400.
+- Response, membership (the outpoint is in the trie):
+
+  ```json
+  {
+    "member": true,
+    "peg_in_utxo_id": "<hex, 36 bytes>",
+    "root": "<hex, 32 bytes>",
+    "value": "<hex, 36 bytes>",
+    "proof": [ ...steps ]
+  }
+  ```
+
+  `value` is the sweeping TM's input-0 outpoint ([SPI-3]).
+- Response, non-membership: same shape with `"member": false` and no `value`.
+- `proof` is a JSON array of MPF proof steps, one object per step, all byte fields
+  hex-encoded (implemented by `spi_trie::proof_to_json`):
+  - `{"type":"branch","skip":n,"neighbors":"<hex, 128 bytes>"}`
+  - `{"type":"fork","skip":n,"neighbor":{"nibble":n,"prefix":"<hex>","root":"<hex>"}}`
+  - `{"type":"leaf","skip":n,"key":"<hex>","value":"<hex>"}`
+- The proof verifies against `root` via `mpf::verify_inclusion` (membership) or
+  `mpf::verify_exclusion` (non-membership).
+
+### Rationale
+
+- Hex strings keep the payload greppable and language-neutral; every field is a plain
+  byte string with a fixed meaning, so no client needs a CBOR decoder.
+- The step objects mirror `mpf::ProofStep` one-to-one, so the mapping is mechanical in
+  both directions and cannot lose information.
+- Returning `root` in the body lets a client verify the proof offline and compare the
+  root against the on-chain singleton on its own schedule.
+- Non-membership answers 200 with `member: false` (not 404): the trie answers the
+  question either way, and the exclusion proof is the useful payload.
+
+## DEC-024: SPI Trie Production Wiring
+
+**Date:** 2026-08-07
+**Decision:** Serve /spi/proof from the persisted trie loaded per request; advance the trie on TM confirmation; enforce the [SPI-2] gate before signing
+**Status:** Accepted
+
+### Context
+
+The first SPI trie cut (DEC-023) shipped the module and the proof route, but the
+route read an `AppState.spi` field nothing ever populated: a deployed node would
+have answered every query with a valid-looking exclusion proof against the empty
+trie, presenting "was never swept" as authoritative for deposits that WERE swept.
+`SpiTrie::verify_proposed` likewise had no caller, so [SPI-2] was not enforced.
+
+### Decision
+
+- `GET /spi/proof/{peg_in_utxo_id}` loads `spi-trie.json` from
+  `protocol.state_dir` at the point of use, the same idiom `verify_cpo_root`
+  and `advance_cpo_trie` use for `cpo-trie.json`. No in-memory trie snapshot.
+  - `state_dir` unset: 503. The node keeps no trie, so it must not answer.
+  - File absent: the genesis state (empty trie, nothing swept yet). The route
+    answers honestly with exclusion proofs against the zero root.
+  - File corrupt: 500 (`SpiTrie::load` refuses a root that fails its self-check).
+- `advance_spi_trie` (epoch machine, next to `advance_cpo_trie`) folds every
+  CONFIRMED TM's inputs except input 0 into the persisted trie [SPI-1] [SPI-3].
+  It refuses to persist when the post-insert root disagrees with `tm.spi_root`.
+- `TreasuryMovement` carries `spi_root`: the builder's trie advanced by the tx
+  inputs, computed in `build_tm_phase`. The TM does not yet COMMIT this root on
+  Bitcoin; the spec's `BTMR1` commitment output (replacing `CPOR1`) is a
+  separate task, and when it lands the proposed root should be read back out of
+  the tx like `committed_cpo_root` does today.
+- `verify_spi_root` (sign_phase Round1, next to `verify_cpo_root`) reloads the
+  trie and runs `SpiTrie::verify_proposed(&tm.spi_root, inputs)` before any
+  signing material leaves the node [SPI-2]. Same honesty note as the CPO gate:
+  the TM is self-built today, so what this catches is the on-disk trie moving
+  between build and sign; the shape becomes a real co-signer gate unchanged
+  once a leader-proposed TM wire format exists.
+
+### Rationale
+
+- Loading at the point of use cannot drift: whatever the last confirmed TM
+  persisted is what the route serves and what the gate verifies.
+- 503 without `state_dir` beats a technically-valid exclusion proof that is
+  operationally a lie.
+- Refusing to persist or sign on a root mismatch is the safe direction: a stale
+  trie fails loudly at the next gate, a wrong one signs confidently wrong roots.
+
+## DEC-025: SPI Trie Storage Discipline and Duplicate-Key Semantics
+
+**Date:** 2026-08-07
+**Decision:** Share one atomic-write helper between the trie state files; treat a repeated peg-in outpoint as a no-op only when the value is identical
+**Status:** Accepted
+
+### Context
+
+`spi-trie.json` needs the same on-disk handling `cpo-trie.json` already had, and
+`insert_for_confirmed_tm` can be reached twice for the same confirmed TM (a
+restart replays the tail of the TM chain).
+
+### Decision
+
+- The 0700-directory / 0600-file / temp+rename write moved out of `cpo_trie.rs`
+  into `src/cardano/state_file.rs`, and both tries call it. `epoch::persist`
+  deliberately keeps its own copy: it force-chmods a pre-existing temp file and
+  tolerates a failed `sync_all`, which the shared helper does not.
+  - Rejected: a second copy of the helper inside `spi_trie.rs`. Two copies of a
+    security-relevant write path drift, and only one of them gets the fix.
+- Re-inserting a `peg_in_utxo_id` with the SAME value is a no-op. The same key
+  with a DIFFERENT value is `SpiTrieError::Conflict`.
+  - Rejected: last-write-wins. A Bitcoin outpoint is spent once, so two
+    sweeping TMs for one deposit means one input is wrong; either choice yields
+    a root no TM ever committed, and the [SPI-2] gate would then refuse every
+    later TM with no way to tell which source lied.
+- Persisted entries are hex strings and the file records its own root. `load`
+  recomputes the root from the entries and refuses the file on a mismatch, so a
+  hand-edited or truncated file cannot silently change what this node signs.

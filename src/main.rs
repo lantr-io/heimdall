@@ -1810,6 +1810,13 @@ async fn run_demo(
     });
     let spo_label = hex::encode(&my_pool_id[..4]);
     let net = Arc::new(HttpPeerNetwork::new(secp, keypair, my_pool_id));
+    // The [SPI-4] proof route loads the swept peg-ins trie from
+    // `protocol.state_dir` per request; without it the route answers 503.
+    net.shared_state().write().await.state_dir = cfg
+        .protocol
+        .state_dir
+        .as_deref()
+        .map(std::path::PathBuf::from);
     let app = router(net.shared_state());
     let bind_addr = &cfg.http.bind_address;
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
