@@ -405,7 +405,7 @@ mod tests {
     use super::*;
     use crate::bitcoin::taproot::treasury_spend_info;
     use crate::bitcoin::tm_builder::{
-        FeeParams, PegInInput, PegOutRequest, TreasuryInput, build_tm, compute_sighashes,
+        PegInInput, PegOutRequest, TmParams, TreasuryInput, build_tm, compute_sighashes,
     };
     use crate::epoch::dkg::dkg_phase;
     use crate::epoch::mocks::{
@@ -556,9 +556,7 @@ mod tests {
                 created: 0,
             }],
             treasury_spk,
-            &FeeParams {
-                fee_rate_sat_per_vb: 1,
-            },
+            &TmParams::fee_rate_only(1),
             // `created: 0` with a `now` of 0 and no margin keeps the request
             // inside the freshness window without pinning a wall-clock time.
             &crate::bitcoin::tm_builder::Freshness {

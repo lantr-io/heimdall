@@ -36,8 +36,18 @@ pub struct StaticFixture {
     pub pegins: Vec<StaticPegIn>,
     /// Peg-out requests waiting to be paid out.
     pub pegouts: Vec<StaticPegOut>,
+    /// The mock bridge's operational parameters — what the Config UTxO's fields
+    /// #12–#14 are on a real chain (see `cardano::config_params`). One fixture is
+    /// shared by every node of a test, which is the property that matters: TM bytes
+    /// must not depend on who built them.
     pub fee_rate_sat_per_vb: u64,
+    /// The fee a fixture peg-out request pins in its (imaginary) datum — NOT the
+    /// Config #13 floor, which is [`Self::per_pegout_fee_floor`].
     pub per_pegout_fee: Amount,
+    /// Config #13 — floor for a request's datum fee. Zero disables the skip.
+    pub per_pegout_fee_floor: Amount,
+    /// Config #14 — minimum fBTC a request may lock. Zero disables the skip.
+    pub min_peg_out_fbtc: Amount,
     /// Per-SPO bifrost identity keypairs, so the HTTP demo can construct
     /// each `HttpPeerNetwork` with the secret matching the `bifrost_id_pk`
     /// in `roster`. Empty for the config-driven fixture (real deployments
@@ -121,6 +131,10 @@ pub fn demo_static_fixture(min_signers: u16, max_signers: u16, base_port: u16) -
         pegouts: vec![],
         fee_rate_sat_per_vb: 1,
         per_pegout_fee: Amount::from_sat(1_000),
+        // The demo bridge enforces neither floor: its peg-outs are synthetic, and
+        // the point of the fixture is the DKG/signing path, not selection bounds.
+        per_pegout_fee_floor: Amount::ZERO,
+        min_peg_out_fbtc: Amount::ZERO,
         bifrost_keypairs,
     }
 }
@@ -193,6 +207,8 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
         pegouts: vec![],
         fee_rate_sat_per_vb: cfg.bitcoin.fee_rate_sat_per_vb,
         per_pegout_fee: Amount::from_sat(cfg.bitcoin.per_pegout_fee_sat),
+        per_pegout_fee_floor: Amount::ZERO,
+        min_peg_out_fbtc: Amount::ZERO,
         // WI-023: the no-registry demo derives each node's key from `--index`
         // via these fixture keypairs. A real on-chain-registry deployment
         // ignores them and loads each node's key from its own

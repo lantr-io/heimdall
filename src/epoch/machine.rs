@@ -36,7 +36,7 @@ use frost_secp256k1_tr as frost;
 
 use crate::bitcoin::taproot::treasury_spend_info;
 use crate::bitcoin::tm_builder::{
-    FeeParams, Freshness, PegInInput, PegOutRequest, TreasuryInput, build_tm, compute_sighashes,
+    Freshness, PegInInput, PegOutRequest, TreasuryInput, build_tm, compute_sighashes,
 };
 use crate::cardano::pegin_datum::{ParsedPegIn, parse_pegin_request};
 use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInSource};
@@ -957,14 +957,24 @@ async fn build_tm_phase(
     // yet folded into the trie) is already closed above: `query_treasury` blocks until
     // `btc_confirmed`, so this node never builds a second TM while one is in flight.
     let pegouts = chain.query_pegout_requests().await?;
+
+    // Freeze this batch's consensus inputs — chain "now" and the Config's
+    // operational parameters — at one chain point, AFTER the wait above (the batch
+    // starts where the previous movement ended, not where this phase was entered).
+    // Everything downstream that must match across SPOs reads this snapshot and
+    // nothing else; in particular the fee rate is the Config's, so two operators
+    // with different `bitcoin.fee_rate_sat_per_vb` still build identical bytes.
+    let snapshot = chain.query_batch_snapshot().await?;
     crate::epoch_log!(
         me,
         epoch,
-        "  chain query: treasury={} sat, {} frozen pegins, {} open pegouts, fee_rate={}sat/vb",
+        "  chain query: treasury={} sat, {} frozen pegins, {} open pegouts, fee_rate={}sat/vb \
+         (params: {})",
         treasury.value.to_sat(),
         frozen_pegins.len(),
         pegouts.len(),
-        treasury.fee_rate_sat_per_vb,
+        snapshot.tm_params.fee_rate_sat_per_vb,
+        snapshot.source,
     );
 
     let secp = Secp256k1::new();
@@ -1053,10 +1063,9 @@ async fn build_tm_phase(
         })
         .collect();
 
-    // Chain "now" for the freshness filter. Read from the chain, not the local
-    // clock: it is a skip-rule input, and every SPO must reach the same verdict or
-    // the TM bytes diverge.
-    let chain_now_ms = chain.chain_now_ms().await?;
+    // The freshness margin is the one selection input that stays node-local: the
+    // spec makes it heimdall's own bound on the signed-but-unconfirmed race, not a
+    // Config tunable. `now_ms` it compares against is the snapshot's chain time.
     let pegout_freshness_margin_ms = config.pegout_freshness_margin.as_millis() as i64;
 
     let unsigned = build_tm(
@@ -1068,11 +1077,9 @@ async fn build_tm_phase(
         pegin_inputs,
         pegout_requests,
         change_script,
-        &FeeParams {
-            fee_rate_sat_per_vb: treasury.fee_rate_sat_per_vb,
-        },
+        &snapshot.tm_params,
         &Freshness {
-            now_ms: chain_now_ms,
+            now_ms: snapshot.now_ms,
             margin_ms: pegout_freshness_margin_ms,
         },
         &cpo_trie,
@@ -1572,6 +1579,69 @@ mod tests {
             tms[1].txid, tms[0].txid,
             "both SPOs must reduce identical chain state to identical TM bytes"
         );
+    }
+
+    /// WI-040: the batch snapshot's Operational-params floors reach `build_tm` on the daemon
+    /// path. The mock serves them where a live chain serves Config #13/#14, so this pins the
+    /// wire `query_batch_snapshot → build_tm_phase → build_tm` — the plumbing whose absence
+    /// was the reason the two skip rules could not be implemented at all.
+    #[tokio::test]
+    async fn daemon_tm_skips_pegouts_under_the_snapshot_floors() {
+        use crate::epoch::fixture::StaticPegOut;
+        use bitcoin::Amount;
+
+        let mut fixture = demo_static_fixture(2, 2, 18_900);
+        let payable = p2wpkh(0x07);
+        let too_small = p2wpkh(0x08);
+        let now = now_ms();
+
+        // Config #14 = 40_000 sat: the 30_000-sat request is under the protocol minimum.
+        fixture.min_peg_out_fbtc = Amount::from_sat(40_000);
+        // Config #13 = the fee the fixture requests pin, so they all clear the floor —
+        // isolating the #14 rule under test.
+        fixture.per_pegout_fee_floor = fixture.per_pegout_fee;
+        fixture.pegouts.push(StaticPegOut {
+            script_pubkey: payable.clone(),
+            amount: Amount::from_sat(50_000),
+            created: now,
+        });
+        fixture.pegouts.push(StaticPegOut {
+            script_pubkey: too_small.clone(),
+            amount: Amount::from_sat(30_000),
+            created: now,
+        });
+
+        let empty_root = crate::cardano::cpo_trie::CpoTrie::empty().root();
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(empty_root));
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(h.await.unwrap().expect("epoch cycle completes"));
+        }
+
+        let outputs = &tms[0].unsigned_tx.output;
+        assert!(
+            outputs.iter().any(|o| o.script_pubkey == payable),
+            "a request above min_peg_out_fbtc must still be paid"
+        );
+        assert!(
+            outputs.iter().all(|o| o.script_pubkey != too_small),
+            "a request locking less than the snapshot's min_peg_out_fbtc must be skipped"
+        );
+        assert_eq!(tms[1].txid, tms[0].txid);
     }
 
     /// The double-pay guard on the daemon path, WI-031 shape: a request an earlier movement

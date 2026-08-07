@@ -301,7 +301,7 @@ Outputs:
   [0..m-1] Peg-out payments, sorted by scriptPubKey bytes
   [m]      Treasury change -> new roster's Taproot address
 
-Fee: tx_vsize * fee_rate_sat_per_vb (protocol parameter)
+Fee: tx_vsize * fee_rate_sat_per_vb (Config datum #12, read at the batch snapshot slot)
 ```
 
 **Implementation** (`src/bitcoin/tm_builder.rs`):
@@ -315,7 +315,7 @@ Input types:
 | `TreasuryInput` | `outpoint: OutPoint`, `value: Amount`, `spend_info: TaprootSpendInfo` |
 | `PegInInput` | `outpoint: OutPoint`, `value: Amount`, `spend_info: TaprootSpendInfo` |
 | `PegOutRequest` | `script_pubkey: ScriptBuf`, `amount: Amount` |
-| `FeeParams` | `fee_rate_sat_per_vb: u64`, `per_pegout_fee: Amount` |
+| `TmParams` | `fee_rate_sat_per_vb: u64`, `per_pegout_fee_floor: Amount`, `min_peg_out_fbtc: Amount` — Config #12-#14, NOT local config (`cardano::config_params`) |
 
 Output type:
 

@@ -46,7 +46,9 @@ use pallas_primitives::conway::PlutusData;
 use pallas_wallet::PrivateKey;
 
 use crate::bitcoin::taproot::treasury_spend_info;
+use crate::bitcoin::tm_builder::TmParams;
 use crate::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
+use crate::cardano::config_params;
 use crate::cardano::fault_proof::FaultProofKind;
 use crate::cardano::publish::{WalletUtxo, build_oracle_update_tx};
 use crate::cardano::treasury_datum::{
@@ -55,7 +57,9 @@ use crate::cardano::treasury_datum::{
 };
 use crate::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 use crate::epoch::state::{EpochError, EpochResult, Roster};
-use crate::epoch::traits::{CardanoChain, EpochBoundaryEvent, PegOutRequestUtxo, TreasuryUtxo};
+use crate::epoch::traits::{
+    BatchSnapshot, CardanoChain, EpochBoundaryEvent, PegOutRequestUtxo, TreasuryUtxo,
+};
 
 const FAULT_TOKEN_CONFIRM_POLL_SECS: u64 = 5;
 const FAULT_TOKEN_CONFIRM_TIMEOUT_SECS: u64 = 300;
@@ -384,8 +388,14 @@ pub struct BlockfrostCardanoChain {
     treasury_policy_id: String,
     /// Asset name of the treasury marker token (hex).
     treasury_asset_name_hex: String,
-    /// Off-chain treasury parameters (leaf keys, CSV, fees).
+    /// Off-chain treasury parameters (leaf keys, CSV, bootstrap outpoint).
     treasury_config: TreasuryConfig,
+    /// `bitcoin.fee_rate_sat_per_vb` — the DEV override, used only when no Config
+    /// UTxO is configured or the deployed Config predates the operational-parameter
+    /// fields. A node whose peers read the Config while it reads this agrees with
+    /// them only by coincidence; see `cardano::config_params`. Defaults to 1 sat/vB;
+    /// set it with [`Self::with_local_fee_rate`].
+    local_fee_rate_sat_per_vb: u64,
     /// Fallback roster.
     fallback_roster: Roster,
     /// On-chain SPO registry source. When set, `query_roster` reads the
@@ -496,6 +506,7 @@ impl BlockfrostCardanoChain {
             treasury_policy_id: treasury_policy_id.into(),
             treasury_asset_name_hex: treasury_asset_name_hex.into(),
             treasury_config,
+            local_fee_rate_sat_per_vb: 1,
             fallback_roster,
             registry_roster: None,
             ban_source: None,
@@ -599,10 +610,19 @@ impl BlockfrostCardanoChain {
     }
 
     /// Locate the bridge Config UTxO (address + config NFT unit `policy_id ++ asset_name`).
-    /// Its field 11 (initial_btc_treasury_utxo) anchors the Treasury Movement chain.
+    /// Its field #11 (initial_btc_treasury_utxo) anchors the Treasury Movement chain, and
+    /// its fields #12–#16 are the operational parameters every TM is built from.
     pub fn with_config_utxo(mut self, address: &str, nft_unit: &str) -> Self {
         self.config_address = Some(address.to_string());
         self.config_nft_unit = Some(nft_unit.to_string());
+        self
+    }
+
+    /// The `bitcoin.fee_rate_sat_per_vb` dev override, for the paths that have no
+    /// Config UTxO to read (see [`Self::query_batch_snapshot`]).
+    #[must_use]
+    pub fn with_local_fee_rate(mut self, sat_per_vb: u64) -> Self {
+        self.local_fee_rate_sat_per_vb = sat_per_vb;
         self
     }
 
@@ -707,72 +727,39 @@ impl BlockfrostCardanoChain {
         Ok(self)
     }
 
-    /// Read the Config UTxO's field 11 (initial_btc_treasury_utxo). Returns the 36-byte
-    /// anchor outpoint and the config UTxO's Cardano outpoint (the Genesis mint reference).
-    async fn query_config_anchor(&self) -> EpochResult<([u8; 36], (String, u32), u64)> {
+    /// Read + decode the bridge Config UTxO (`cardano::config_params`).
+    async fn query_config(&self) -> EpochResult<config_params::ConfigView> {
         let (addr, unit) = match (&self.config_address, &self.config_nft_unit) {
-            (Some(a), Some(u)) => (a, u),
+            (Some(a), Some(u)) => (a.as_str(), u.as_str()),
             _ => {
                 return Err(EpochError::Chain(
-                    "cardano.config_address / config_nft_policy_id not set — required to \
-                     resolve the treasury anchor (config field 11)"
+                    "cardano.config_address / config_nft_policy_id not set — required to read \
+                     the bridge Config UTxO (the treasury anchor and the operational parameters)"
                         .into(),
                 ));
             }
         };
-        // Lenient raw-HTTP parse (tolerates yaci-devkit, which omits `tx_index`) — the SDK's
-        // addresses_utxos requires it and errors on that backend (as query_wallet_utxos already does).
-        let utxos = crate::cardano::bf_http::fetch_address_utxos(
-            &self.bf_base_url,
-            &self.bf_project_id,
-            addr,
-        )
-        .await
-        .map_err(|e| EpochError::Chain(format!("blockfrost config query: {e}")))?;
-        let utxo = utxos
-            .iter()
-            .find(|u| u.inline_datum.is_some() && u.amount.iter().any(|a| &a.unit == unit))
-            .ok_or_else(|| {
-                EpochError::Chain(format!(
-                    "no Config UTxO with NFT {unit} and an inline datum at {addr}"
-                ))
-            })?;
-        let datum_cbor = hex::decode(utxo.inline_datum.as_deref().unwrap())
-            .map_err(|e| EpochError::Chain(format!("config datum hex decode: {e}")))?;
-        let datum: PlutusData = minicbor::decode(&datum_cbor)
-            .map_err(|e| EpochError::Chain(format!("config datum CBOR decode: {e}")))?;
-        let fields = crate::cardano::plutus::constr_fields(&datum, 0)
-            .map_err(|e| EpochError::Chain(format!("config datum: {e}")))?;
-        if fields.len() < 12 {
-            return Err(EpochError::Chain(format!(
+        config_params::fetch_config(&self.bf_base_url, &self.bf_project_id, addr, unit)
+            .await
+            .map_err(EpochError::Chain)
+    }
+
+    /// The Config UTxO's field #11 (initial_btc_treasury_utxo). Returns the 36-byte
+    /// anchor outpoint, the config UTxO's Cardano outpoint (the Genesis mint
+    /// reference), and field #15 (leader_reward, carried into the posted TM datum;
+    /// its on-chain pin against this field lands with N9 — zero on a Config that
+    /// predates the operational-parameter fields).
+    async fn query_config_anchor(&self) -> EpochResult<([u8; 36], (String, u32), u64)> {
+        let view = self.query_config().await?;
+        let anchor = view.params.initial_btc_treasury_utxo.ok_or_else(|| {
+            EpochError::Chain(format!(
                 "config datum has {} fields — no treasury anchor (field 11); run \
                  `binocular update-config` to migrate the deployed config",
-                fields.len()
-            )));
-        }
-        let anchor_bytes = crate::cardano::plutus::field_bytes(fields, 11)
-            .map_err(|e| EpochError::Chain(format!("config field 11: {e}")))?;
-        let anchor: [u8; 36] = anchor_bytes.try_into().map_err(|v: Vec<u8>| {
-            EpochError::Chain(format!(
-                "config field 11 must be a 36-byte outpoint, got {} bytes",
-                v.len()
+                view.params.field_count
             ))
         })?;
-        // N7: leader_reward is Config field 15 (present once the operational-parameter tunables are
-        // appended; absent on a bare upstream config → 0). Carried into the posted TM datum; its
-        // on-chain pin against this field lands with N9.
-        let leader_reward = if fields.len() > 15 {
-            crate::cardano::plutus::field_int(fields, 15)
-                .map_err(|e| EpochError::Chain(format!("config field 15 (leader_reward): {e}")))?
-                .max(0) as u64
-        } else {
-            0
-        };
-        Ok((
-            anchor,
-            (utxo.tx_hash.clone(), utxo.output_index as u32),
-            leader_reward,
-        ))
+        let leader_reward = view.params.tunables.map_or(0, |t| t.leader_reward);
+        Ok((anchor, (view.utxo.tx_hash, view.utxo.index), leader_reward))
     }
 
     /// All Confirmed TM records at the treasury address carrying the TM NFT, parsed for
@@ -1271,8 +1258,6 @@ impl CardanoChain for BlockfrostCardanoChain {
                 y_51,
                 y_fed: self.treasury_config.y_fed,
                 federation_csv_blocks: csv,
-                fee_rate_sat_per_vb: self.treasury_config.fee_rate_sat_per_vb,
-                per_pegout_fee: self.treasury_config.per_pegout_fee,
                 btc_confirmed,
             });
         }
@@ -1346,8 +1331,6 @@ impl CardanoChain for BlockfrostCardanoChain {
             y_51,
             y_fed,
             federation_csv_blocks: csv,
-            fee_rate_sat_per_vb: self.treasury_config.fee_rate_sat_per_vb,
-            per_pegout_fee: self.treasury_config.per_pegout_fee,
             btc_confirmed,
         })
     }
@@ -1568,19 +1551,45 @@ impl CardanoChain for BlockfrostCardanoChain {
             .collect())
     }
 
-    /// Chain "now" from the Cardano tip block's time (`/blocks/latest`), in ms.
+    /// Freeze the batch's consensus inputs at the Cardano tip: the tip block's
+    /// time (`/blocks/latest`) and the Config UTxO's operational parameters.
     ///
-    /// A chain time, not the local clock: it feeds the peg-out freshness skip
-    /// rule, and two SPOs that disagree there build different TM bytes and fail
-    /// the FROST round. Every honest node reading the same tip agrees.
-    async fn chain_now_ms(&self) -> EpochResult<i64> {
-        let secs = crate::cardano::bf_http::fetch_latest_block_time(
-            &self.bf_base_url,
-            &self.bf_project_id,
-        )
-        .await
-        .map_err(|e| EpochError::Chain(format!("chain now: {e}")))?;
-        Ok(secs.saturating_mul(1000))
+    /// Chain values, not local ones. The time feeds the peg-out freshness skip
+    /// rule and the parameters feed the fee and the two selection floors, so two
+    /// SPOs that disagree on any of them build different TM bytes and fail the
+    /// FROST round. Every honest node reading the same tip agrees.
+    ///
+    /// With no Config UTxO configured this degrades to the node's local
+    /// `bitcoin.fee_rate_sat_per_vb` and no floors — the pre-WI-040 behaviour,
+    /// which the returned [`ParamSource`] names so it shows up in the logs.
+    async fn query_batch_snapshot(&self) -> EpochResult<BatchSnapshot> {
+        let (addr, unit) = match (&self.config_address, &self.config_nft_unit) {
+            (Some(a), Some(u)) => (a.as_str(), u.as_str()),
+            _ => {
+                let secs = crate::cardano::bf_http::fetch_latest_block_time(
+                    &self.bf_base_url,
+                    &self.bf_project_id,
+                )
+                .await
+                .map_err(|e| EpochError::Chain(format!("chain now: {e}")))?;
+                return Ok(BatchSnapshot::local_override(
+                    secs.saturating_mul(1000),
+                    TmParams::fee_rate_only(self.local_fee_rate_sat_per_vb),
+                    "cardano.config_address / config_nft_policy_id not set",
+                ));
+            }
+        };
+        let snapshot =
+            config_params::fetch_param_snapshot(&self.bf_base_url, &self.bf_project_id, addr, unit)
+                .await
+                .map_err(|e| EpochError::Chain(format!("batch parameter snapshot: {e}")))?;
+        let (tm_params, source) =
+            config_params::resolve_tm_params(Some(&snapshot), self.local_fee_rate_sat_per_vb);
+        Ok(BatchSnapshot {
+            now_ms: snapshot.time_ms,
+            tm_params,
+            source,
+        })
     }
 
     async fn query_cpo_root(&self) -> EpochResult<Option<[u8; 32]>> {
