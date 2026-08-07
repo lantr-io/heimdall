@@ -6,7 +6,7 @@
 //! history alone. The algorithm it runs — chain-order the Confirmed Treasury
 //! Movements, try every published data-availability hint, fall back to matching
 //! payments against peg-out requests, assert the running root after every
-//! movement, cross-check the finished trie against the on-chain CPO singleton —
+//! movement, cross-check the finished trie against the bridge state singleton —
 //! is the security-critical part, and it is IDENTICAL whatever serves the bytes.
 //!
 //! Only the reads differ. This module is that seam: one trait,
@@ -194,7 +194,7 @@ pub trait CpoHistorySource: Send + Sync {
     /// Every UNSPENT output holding at least one unit of
     /// `policy_hex`.`asset_name_hex`, with datums resolved.
     ///
-    /// Used only to locate the on-chain completed-peg-outs singleton. The caller
+    /// Used only to locate the on-chain bridge state singleton. The caller
     /// enforces the singleton rule (exactly one output holding quantity 1); this
     /// method just reports what the index has.
     async fn unspent_with_asset(
@@ -741,9 +741,9 @@ impl CpoHistorySource for BlockfrostHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cardano::bridge_state::{BSS_ASSET_NAME_HEX, parse_bridge_state};
     use crate::cardano::cpo_trie::{
-        CPO_ASSET_NAME_HEX, CpoTrie, CpoTrieError, ReconstructConfig, hint_bytes, por_id,
-        reconstruct, trie_value,
+        CpoTrie, CpoTrieError, ReconstructConfig, hint_bytes, por_id, reconstruct, trie_value,
     };
     use crate::cardano::plutus::{array, bytes, constr, int, int_from_u64};
     use bitcoin::hashes::Hash as _;
@@ -1119,7 +1119,7 @@ mod tests {
     // -- the world ---------------------------------------------------------
 
     /// A chain with two peg-out requests, one Treasury Movement paying both, its
-    /// spent `Unconfirmed` record carrying the hint, and the CPO singleton holding
+    /// spent `Unconfirmed` record carrying the hint, and the bridge state singleton holding
     /// the resulting root. Also carries, at the TM address, a resolvable
     /// hash-only Confirmed datum AND a genuinely datum-less junk output — the two
     /// cases [`DatumState`] exists to keep apart — so the equivalence tests below
@@ -1225,10 +1225,20 @@ mod tests {
                 ],
             )
         };
-        let cpo_datum = constr(0, vec![bytes(&root)]);
+        // The bridge state singleton. `spi_root` is a distinct placeholder, so a
+        // positional read of field 0 cannot pass for `cpo_root`.
+        let cpo_datum = constr(
+            0,
+            vec![
+                bytes(&[0x5b; 32]),
+                bytes(&root),
+                bytes(&[0x7c; 36]),
+                int_from_u64(1_000_000),
+            ],
+        );
 
         let fbtc = unit(FBTC_POLICY, FBTC_NAME);
-        let cpo_unit = unit(CPO_POLICY, CPO_ASSET_NAME_HEX);
+        let cpo_unit = unit(CPO_POLICY, BSS_ASSET_NAME_HEX);
 
         let world = vec![
             // The Unconfirmed record, SPENT by its own Confirm transition — the
@@ -1395,7 +1405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_backends_find_the_cpo_singleton() {
+    async fn both_backends_find_the_bridge_state_singleton() {
         let (w, root) = world();
         let kupo = KupoHistory::new(&spawn_kupo(w.clone()).await);
         let bf = BlockfrostHistory::new("preprodtest", Some(&spawn_blockfrost(w).await));
@@ -1403,26 +1413,26 @@ mod tests {
         for (name, found) in [
             (
                 "kupo",
-                kupo.unspent_with_asset(CPO_POLICY, CPO_ASSET_NAME_HEX)
+                kupo.unspent_with_asset(CPO_POLICY, BSS_ASSET_NAME_HEX)
                     .await
                     .unwrap(),
             ),
             (
                 "blockfrost",
-                bf.unspent_with_asset(CPO_POLICY, CPO_ASSET_NAME_HEX)
+                bf.unspent_with_asset(CPO_POLICY, BSS_ASSET_NAME_HEX)
                     .await
                     .unwrap(),
             ),
         ] {
             assert_eq!(found.len(), 1, "{name}: expected the singleton alone");
-            assert_eq!(found[0].asset_quantity(CPO_POLICY, CPO_ASSET_NAME_HEX), 1);
+            assert_eq!(found[0].asset_quantity(CPO_POLICY, BSS_ASSET_NAME_HEX), 1);
+            // `cpo_root` BY NAME, per [LIB-1].
             assert_eq!(
-                crate::cardano::cpo_trie::parse_cpo_trie_datum(
-                    found[0].datum.resolved().expect("singleton datum")
-                )
-                .unwrap(),
+                parse_bridge_state(found[0].datum.resolved().expect("singleton datum"))
+                    .unwrap()
+                    .cpo_root,
                 root,
-                "{name}: singleton root"
+                "{name}: singleton cpo_root"
             );
         }
     }

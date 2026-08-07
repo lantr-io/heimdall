@@ -17,7 +17,8 @@
 //!
 //! The root is **attested, not derived**. Each FROST-signed TM carries exactly one
 //! BTMR1 OP_RETURN output holding the root that must hold after it, and the
-//! on-chain Confirm transition copies that root into the CPO singleton UTxO. The
+//! on-chain Confirm transition copies that root into the `cpo_root` field of the
+//! bridge state singleton UTxO (see [`crate::cardano::bridge_state`]). The
 //! chain therefore never recomputes the root — the quorum's signature is the only
 //! integrity anchor.
 //!
@@ -78,7 +79,7 @@
 //! [`CpoTrie::load`]'s successor `advance_cpo_trie` refuses to persist a root the
 //! confirming TM did not commit. **Recovery is a full `reconstruct-cpo-trie`**,
 //! which rebuilds from the post-rollback chain and cross-checks the result against
-//! the on-chain CPO singleton.
+//! the bridge state singleton's `cpo_root`.
 //!
 //! Rollbacks are already bounded here: [`crate::epoch::machine`] only advances the
 //! trie after a TM is CONFIRMED, and a Bitcoin-confirmed movement deep enough to
@@ -101,19 +102,12 @@ use pallas_primitives::PlutusData;
 use serde::{Deserialize, Serialize};
 
 use crate::bitcoin::tm_builder::{CpoTrieView, FulfilledPegOut, btmr1_roots, is_btmr1_commitment};
+use crate::cardano::bridge_state::fetch_bridge_state;
 use crate::cardano::cpo_history::{CpoHistorySource, DatumState};
 use crate::cardano::mpf;
 use crate::cardano::state_file;
 use crate::cardano::treasury_datum::{ConfirmedTm, TreasuryDatumError, parse_confirmed_tm_datum};
 use tracing::{info, warn};
-
-/// Asset name of the completed-peg-outs trie NFT — Aiken
-/// `bifrost/constants.ak::completed_peg_outs_root_asset_name`, the 3 ASCII bytes
-/// `"CPO"`.
-pub const CPO_ASSET_NAME: &[u8] = b"CPO";
-
-/// Hex of [`CPO_ASSET_NAME`], for asset-unit strings.
-pub const CPO_ASSET_NAME_HEX: &str = "43504f";
 
 /// The genesis root: 32 zero bytes.
 ///
@@ -221,7 +215,7 @@ pub enum CpoTrieError {
     /// [`crate::cardano::cpo_history`]).
     Source(String),
     /// Reconstruction finished, but the trie it produced does not match the root
-    /// the on-chain CPO singleton holds. The replay is missing or inventing
+    /// the bridge state singleton holds in `cpo_root`. The replay is missing or inventing
     /// entries; using it would make this node sign roots the chain disagrees with,
     /// and produce membership proofs `peg-out.ak` rejects.
     RootMismatch {
@@ -266,7 +260,7 @@ impl fmt::Display for CpoTrieError {
             } => write!(
                 f,
                 "reconstruction produced root {} over {entries} entr(y|ies), but the on-chain \
-                 completed-peg-outs singleton holds {} — refusing to persist a trie the chain \
+                 bridge state singleton holds cpo_root {} — refusing to persist a trie the chain \
                  disagrees with",
                 hex::encode(reconstructed),
                 hex::encode(on_chain),
@@ -677,12 +671,13 @@ pub struct ReconstructConfig {
     pub fbtc_policy_id: String,
     /// The bridged-token asset name, hex (may be empty).
     pub fbtc_asset_name_hex: String,
-    /// Policy id (script hash) of the completed-peg-outs trie validator, hex —
-    /// Config field 3. Identifies the on-chain CPO singleton, whose datum holds
-    /// the root the chain currently believes.
+    /// Policy id (script hash) of the bridge state singleton validator, hex —
+    /// Config field 3, `bridge_state_policy`. With asset name `"BSS"` it
+    /// identifies the on-chain BridgeState UTxO, whose `cpo_root` is the root the
+    /// chain currently believes.
     ///
     /// `Some` turns on the final safety net: the reconstructed root MUST equal the
-    /// singleton's. Every step of the replay is already checked against a
+    /// singleton's `cpo_root`. Every step of the replay is already checked against a
     /// quorum-attested root, but only this compares the FINISHED trie against the
     /// value peg-out completions will actually be proven against — it is what
     /// catches a replay that stopped early or skipped the last movement.
@@ -726,7 +721,7 @@ impl HistoricalPor {
 /// 5. If a hint is absent, garbled, or produces the wrong root, fall back to
 ///    matching the TM's payment outputs against the peg-out requests that were
 ///    open at that point, and search assignments until the running root matches.
-/// 6. Cross-check the FINISHED trie against the on-chain CPO singleton's datum.
+/// 6. Cross-check the FINISHED trie against the bridge state singleton's `cpo_root`.
 ///
 /// The committed root turns every step from trust into search-and-check: a hostile
 /// hint cannot corrupt the result, only make reconstruction slower.
@@ -829,7 +824,9 @@ pub async fn reconstruct(
     // --- the final safety net ---
     match cfg.cpo_policy_id.as_deref() {
         Some(policy) => {
-            let on_chain = fetch_onchain_cpo_root(source, policy).await?;
+            // `cpo_root` BY NAME, per [LIB-1]: the singleton's field 0 is
+            // `spi_root`, so a positional read here would compare the wrong root.
+            let on_chain = fetch_bridge_state(source, policy).await?.cpo_root;
             if on_chain != trie.root() {
                 return Err(CpoTrieError::RootMismatch {
                     reconstructed: trie.root(),
@@ -838,82 +835,17 @@ pub async fn reconstruct(
                 });
             }
             info!(
-                "[cpo] reconstructed root matches the on-chain CPO singleton ({})",
+                "[cpo] reconstructed root matches the bridge state singleton's cpo_root ({})",
                 hex::encode(on_chain)
             );
         }
         None => warn!(
             "[cpo] WARNING: no cpo_policy_id configured — the reconstructed root was NOT \
-             cross-checked against the on-chain CPO singleton. Set cardano.cpo_policy_id \
+             cross-checked against the bridge state singleton. Set cardano.cpo_policy_id \
              before trusting this trie to sign with."
         ),
     }
     Ok(trie)
-}
-
-/// The root held by the on-chain completed-peg-outs singleton.
-///
-/// The singleton is the ONE unspent output carrying the CPO NFT (`policy` +
-/// asset name `"CPO"`), and its datum's first field is the root — the same read
-/// `bifrost/utils.get_mpf_from_output` performs on-chain, and the value
-/// `peg-out.ak` proves membership against. Anything other than exactly one such
-/// output is an error: zero means the trie is not deployed (or the backend is not
-/// indexing it), and several mean the NFT is not a singleton, so no root is
-/// authoritative.
-///
-/// Public because steady-state operation needs it too, not just reconstruction:
-/// `CardanoChain::query_cpo_root` reads it before every TM so a persisted
-/// `cpo-trie.json` that has fallen out of sync with the chain is caught before
-/// anything is signed.
-pub async fn fetch_onchain_cpo_root(
-    source: &dyn CpoHistorySource,
-    policy_hex: &str,
-) -> Result<[u8; 32], CpoTrieError> {
-    let policy = policy_hex.trim().to_ascii_lowercase();
-    let unit = format!("{policy}.{CPO_ASSET_NAME_HEX}");
-    let matches = source
-        .unspent_with_asset(&policy, CPO_ASSET_NAME_HEX)
-        .await
-        .map_err(CpoTrieError::Source)?;
-    let held: Vec<_> = matches
-        .iter()
-        .filter(|m| m.asset_quantity(&policy, CPO_ASSET_NAME_HEX) == 1)
-        .collect();
-    let m = match held.as_slice() {
-        [only] => *only,
-        [] => {
-            return Err(CpoTrieError::Source(format!(
-                "no unspent output holds the completed-peg-outs NFT {unit} — the trie \
-                 singleton is not deployed, or the backend is not indexing that policy"
-            )));
-        }
-        many => {
-            return Err(CpoTrieError::Source(format!(
-                "{} unspent outputs hold the completed-peg-outs NFT {unit} — it is not a \
-                 singleton, so no root is authoritative",
-                many.len()
-            )));
-        }
-    };
-    let datum = m.datum.resolved().ok_or_else(|| {
-        CpoTrieError::Source(format!(
-            "the completed-peg-outs singleton {}#{} has no resolvable datum ({})",
-            m.tx_hash, m.output_index, m.datum_note
-        ))
-    })?;
-    parse_cpo_trie_datum(datum).map_err(CpoTrieError::Decode)
-}
-
-/// Decode `CompletedPegOutsMerkleTreeDatum { root }` — the root is field 0 of the
-/// datum's Constr, exactly as `bifrost/utils.get_mpf_from_output` reads it
-/// on-chain (it takes the head of `unconstr_fields` and requires 32 bytes).
-pub fn parse_cpo_trie_datum(data: &PlutusData) -> Result<[u8; 32], String> {
-    let (_, fields) =
-        crate::cardano::plutus::as_constr(data).map_err(|e| format!("CPO trie datum: {e}"))?;
-    let root = crate::cardano::plutus::field_bytes(fields, 0)
-        .map_err(|_| "CPO trie datum: field[0] (root) is not BoundedBytes".to_string())?;
-    <[u8; 32]>::try_from(root.as_slice())
-        .map_err(|_| format!("CPO trie datum: root is {} bytes, expected 32", root.len()))
 }
 
 /// Order Confirmed TM records by treasury linkage.
@@ -1031,7 +963,7 @@ async fn fetch_pegout_history(
 ///
 /// The two `continue`s below (no commitment; commitment equals the current root)
 /// are the only places a TM contributes nothing, and both are backstopped: the
-/// caller cross-checks the finished trie against the on-chain CPO singleton, so a
+/// caller cross-checks the finished trie against the bridge state singleton, so a
 /// TM wrongly treated as inert shows up as a root mismatch rather than as a
 /// quietly short trie.
 fn replay(
@@ -1621,30 +1553,9 @@ mod tests {
         assert!(unconfirmed_hint(&confirmed_datum).is_empty());
     }
 
-    // --- CPO singleton datum ---
-
-    // The hex form is what goes into Kupo asset patterns and asset-unit strings;
-    // the byte form is what the Aiken constant says. Pin them to each other so the
-    // singleton lookup cannot drift from `constants.ak`.
-    #[test]
-    fn the_cpo_asset_name_hex_matches_the_bytes() {
-        assert_eq!(CPO_ASSET_NAME, b"CPO");
-        assert_eq!(hex::encode(CPO_ASSET_NAME), CPO_ASSET_NAME_HEX);
-    }
-
-    #[test]
-    fn parses_the_cpo_trie_datum_root() {
-        use crate::cardano::plutus::{bytes, constr};
-        let d = constr(0, vec![bytes(&[0x5a; 32])]);
-        assert_eq!(parse_cpo_trie_datum(&d).unwrap(), [0x5a; 32]);
-        // The Aiken reader takes the HEAD of unconstr_fields, so extra trailing
-        // fields are irrelevant — but the root must be exactly 32 bytes.
-        let padded = constr(0, vec![bytes(&[0x5a; 32]), bytes(b"extra")]);
-        assert_eq!(parse_cpo_trie_datum(&padded).unwrap(), [0x5a; 32]);
-        assert!(parse_cpo_trie_datum(&constr(0, vec![bytes(&[0x5a; 31])])).is_err());
-        assert!(parse_cpo_trie_datum(&constr(0, vec![])).is_err());
-        assert!(parse_cpo_trie_datum(&bytes(b"nope")).is_err());
-    }
+    // The singleton datum and its asset name moved to `cardano::bridge_state`:
+    // the state UTxO now carries four fields under the `"BSS"` NFT, and the
+    // one-field `"CPO"` datum this module used to parse no longer exists.
 
     #[test]
     fn hint_bytes_roundtrips_and_is_little_endian() {
@@ -2049,6 +1960,29 @@ mod tests {
         )
     }
 
+    /// The bridge state singleton's unit, and a datum committing `cpo_root`.
+    /// `spi_root` is a distinct placeholder, so a positional read of field 0
+    /// cannot pass for `cpo_root`.
+    fn bss_unit() -> String {
+        format!(
+            "{POLICY}{}",
+            crate::cardano::bridge_state::BSS_ASSET_NAME_HEX
+        )
+    }
+
+    fn bss_datum(cpo_root: [u8; 32]) -> PlutusData {
+        use crate::cardano::plutus::{bytes, constr, int_from_u64};
+        constr(
+            0,
+            vec![
+                bytes(&[0x5b; 32]),
+                bytes(&cpo_root),
+                bytes(&[0x7c; 36]),
+                int_from_u64(1_000_000),
+            ],
+        )
+    }
+
     fn fake_cfg() -> ReconstructConfig {
         ReconstructConfig {
             tm_address: T_ADDR.into(),
@@ -2062,7 +1996,6 @@ mod tests {
     /// One TM, one request, no hint — the fallback matcher does the work, and the
     /// finished trie matches the singleton.
     fn one_movement_world() -> (FakeSource, [u8; 32]) {
-        use crate::cardano::plutus::{bytes, constr};
         let por_tx = [0x11u8; 32];
         let spk = vec![0xaau8; 22];
         let (gross, fee) = (100_000u64, 1_000u64);
@@ -2090,8 +2023,8 @@ mod tests {
                 singleton: vec![fake_out(
                     [0xcf; 32],
                     0,
-                    &[(format!("{POLICY}{CPO_ASSET_NAME_HEX}"), 1)],
-                    Some(constr(0, vec![bytes(&root)])),
+                    &[(bss_unit(), 1)],
+                    Some(bss_datum(root)),
                 )],
             },
             root,
@@ -2181,13 +2114,12 @@ mod tests {
     // assertion and still yields a short trie. Only the singleton catches it.
     #[tokio::test]
     async fn reconstruct_refuses_a_trie_the_singleton_disagrees_with() {
-        use crate::cardano::plutus::{bytes, constr};
         let (mut world, _) = one_movement_world();
         world.singleton = vec![fake_out(
             [0xcf; 32],
             0,
-            &[(format!("{POLICY}{CPO_ASSET_NAME_HEX}"), 1)],
-            Some(constr(0, vec![bytes(&[0x5a; 32])])),
+            &[(bss_unit(), 1)],
+            Some(bss_datum([0x5a; 32])),
         )];
         let err = reconstruct(&world, &fake_cfg()).await.unwrap_err();
         assert!(matches!(err, CpoTrieError::RootMismatch { .. }), "{err}");
@@ -2206,21 +2138,10 @@ mod tests {
         );
 
         let (mut world, root) = one_movement_world();
-        use crate::cardano::plutus::{bytes, constr};
-        let unit = format!("{POLICY}{CPO_ASSET_NAME_HEX}");
+        let unit = bss_unit();
         world.singleton = vec![
-            fake_out(
-                [0xcf; 32],
-                0,
-                &[(unit.clone(), 1)],
-                Some(constr(0, vec![bytes(&root)])),
-            ),
-            fake_out(
-                [0xdf; 32],
-                0,
-                &[(unit, 1)],
-                Some(constr(0, vec![bytes(&root)])),
-            ),
+            fake_out([0xcf; 32], 0, &[(unit.clone(), 1)], Some(bss_datum(root))),
+            fake_out([0xdf; 32], 0, &[(unit, 1)], Some(bss_datum(root))),
         ];
         let err = reconstruct(&world, &fake_cfg()).await.unwrap_err();
         assert!(format!("{err}").contains("not a singleton"), "{err}");

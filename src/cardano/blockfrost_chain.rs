@@ -532,8 +532,9 @@ pub struct BlockfrostCardanoChain {
     last_submitted_txid: Mutex<Option<bitcoin::Txid>>,
     /// Optional automatic DKG fault proof mint + ApplyBan configuration.
     fault_ban_flow: Option<DkgFaultBanFlow>,
-    /// Policy id of the completed-peg-outs trie validator (Config field 3). When
-    /// set, `query_cpo_root` reads the on-chain CPO singleton so `BuildTm` can
+    /// Policy id of the bridge state singleton validator (Config field 3,
+    /// `bridge_state_policy`). When set, `query_cpo_root` reads that singleton's
+    /// `cpo_root` so `BuildTm` can
     /// cross-check its persisted trie against it. `None` disables the check.
     cpo_policy_id: Option<String>,
     /// Kupo base URL, used only to answer `query_cpo_root` when it is set — the
@@ -623,7 +624,7 @@ impl BlockfrostCardanoChain {
         self
     }
 
-    /// Locate the on-chain completed-peg-outs singleton so `query_cpo_root` can
+    /// Locate the on-chain bridge state singleton so `query_cpo_root` can
     /// answer. Without it every `BuildTm` runs its trie unchecked, which is the
     /// state in which a stale persisted trie gets attested.
     pub fn with_cpo_source(mut self, cpo_policy_id: Option<&str>, kupo_url: Option<&str>) -> Self {
@@ -1820,14 +1821,11 @@ impl CardanoChain for BlockfrostCardanoChain {
                     Some(&self.bf_base_url),
                 )),
             };
-        crate::cardano::cpo_trie::fetch_onchain_cpo_root(source.as_ref(), policy)
+        // `cpo_root` BY NAME, per [LIB-1]: field 0 of the singleton is `spi_root`.
+        crate::cardano::bridge_state::fetch_bridge_state(source.as_ref(), policy)
             .await
-            .map(Some)
-            .map_err(|e| {
-                EpochError::Chain(format!(
-                    "read the on-chain completed-peg-outs singleton: {e}"
-                ))
-            })
+            .map(|state| Some(state.cpo_root))
+            .map_err(|e| EpochError::Chain(format!("read the bridge state singleton: {e}")))
     }
 
     async fn query_pool_stake(

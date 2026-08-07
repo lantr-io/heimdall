@@ -16,6 +16,7 @@ pub mod bf_http;
 pub mod blockfrost_chain;
 pub mod blockfrost_source;
 pub mod blueprint;
+pub mod bridge_state;
 pub mod btc_rpc;
 pub mod config_params;
 pub mod cpo_history;

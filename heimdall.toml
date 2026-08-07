@@ -12,8 +12,9 @@ pegin_poll_interval_ms = 1000
 # and for the DKG share that survives a restart. Unset means the EMPTY (genesis)
 # trie on every start — correct only on a bridge that has completed no peg-out.
 # Set it before paying peg-outs, and rebuild after a re-bootstrap with
-# `reconstruct-cpo-trie`. BuildTm cross-checks the loaded root against the
-# on-chain CPO singleton (see cardano.cpo_policy_id) and refuses to sign on a mismatch.
+# `reconstruct-cpo-trie`. BuildTm cross-checks the loaded root against the cpo_root
+# in the on-chain bridge state singleton (see cardano.cpo_policy_id) and refuses to
+# sign on a mismatch.
 # state_dir = "/var/lib/heimdall"
 # A peg-out is payable only while at least this far from its 30-day Cancel
 # deadline. Paying one later lets the owner take the BTC and then Cancel for the
@@ -53,10 +54,13 @@ submit = false          # broadcast signed BTC tx to rpc_url (false: binocular r
 #           the whole address history — roughly one request per transaction. Meant for
 #           test environments, demos, and non-SPO tooling.
 # kupo_url = "http://localhost:1442"
-# Policy id of the completed-peg-outs trie validator (Config field 3). Required by
-# `reconstruct-cpo-trie`: it cross-checks the rebuilt trie against the on-chain CPO
-# singleton and refuses to write on a mismatch — the only check that covers the
-# finished trie as a whole.
+# Policy id of the bridge state singleton validator: Config field 3,
+# `bridge_state_policy`. Heimdall finds the singleton by the NFT
+# (this policy, asset name "BSS" = hex 425353); the old "CPO" (43504f) name is gone.
+# The key keeps its old name, but the VALUE is the bridge state policy.
+# Required by `reconstruct-cpo-trie`: it cross-checks the rebuilt trie against the
+# cpo_root in that singleton's datum and refuses to write on a mismatch — the only
+# check that covers the finished trie as a whole.
 # cpo_policy_id = "..."
 blockfrost_project_id = "preprodsTOaoyjcqGmy4SOSazxuHkbuXFOOkp8f"
 # socket_path = "/run/cardano-node/node.socket"

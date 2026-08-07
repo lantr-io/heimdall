@@ -2271,7 +2271,7 @@ fn spi_trie_from_cfg(cfg: &HeimdallConfig) -> Result<heimdall::cardano::spi_trie
 /// `epoch::machine::cross_check_cpo_root`.
 ///
 /// [`cpo_trie_from_cfg`] trusts `cpo-trie.json` verbatim, so a re-bootstrap that
-/// mints a FRESH zero-root CPO singleton while this box still holds the previous
+/// mints a FRESH zero-root bridge state singleton while this box still holds the previous
 /// deployment's trie leaves `sweep-pegins` / `run-mover` ready to commit a root
 /// the chain no longer has. Confirm then copies that root into the singleton's
 /// datum, and every membership proof built against the real payment history is
@@ -2289,7 +2289,7 @@ fn cross_check_cpo_trie_from_cfg(
     let Some(policy) = cfg.cardano.cpo_policy_id.as_deref() else {
         warn!(
             "[cpo] no cardano.cpo_policy_id — the local root was NOT cross-checked \
-             against the on-chain completed-peg-outs singleton. Set it before signing a TM on a \
+             against the on-chain bridge state singleton. Set it before signing a TM on a \
              live bridge."
         );
         return Ok(CpoTrust::Unverified);
@@ -2300,7 +2300,7 @@ fn cross_check_cpo_trie_from_cfg(
         None => {
             let project_id = cfg.cardano.blockfrost_project_id.as_deref().ok_or(
                 "set cardano.kupo_url or cardano.blockfrost_project_id — cardano.cpo_policy_id \
-                 is set, so the completed-peg-outs singleton must be readable to cross-check \
+                 is set, so the bridge state singleton must be readable to cross-check \
                  the local trie",
             )?;
             Box::new(BlockfrostHistory::new(
@@ -2309,17 +2309,20 @@ fn cross_check_cpo_trie_from_cfg(
             ))
         }
     };
+    // `cpo_root` BY NAME, per [LIB-1]: field 0 of the singleton is `spi_root`.
     let on_chain = rt
-        .block_on(heimdall::cardano::cpo_trie::fetch_onchain_cpo_root(
+        .block_on(heimdall::cardano::bridge_state::fetch_bridge_state(
             source.as_ref(),
             policy.trim(),
         ))
-        .map_err(|e| format!("read the on-chain completed-peg-outs singleton: {e}"))?;
+        .map_err(|e| format!("read the bridge state singleton: {e}"))?
+        .cpo_root;
     if on_chain != trie.root() {
         return Err(format!(
             "completed-peg-outs trie is out of sync with the chain: local root {} ({} entries) \
-             != on-chain CPO singleton root {}. Refusing to build — a TM built on a stale trie \
-             commits a root the chain does not hold. Rebuild with `reconstruct-cpo-trie` (and \
+             != the bridge state singleton's cpo_root {}. Refusing to build — a TM built on a \
+             stale trie commits a root the chain does not hold. Rebuild with \
+             `reconstruct-cpo-trie` (and \
              delete the stale {}/cpo-trie.json if the bridge was re-bootstrapped).",
             hex::encode(trie.root()),
             trie.len(),
@@ -2331,7 +2334,7 @@ fn cross_check_cpo_trie_from_cfg(
         ));
     }
     info!(
-        "[cpo] local root matches the on-chain completed-peg-outs singleton ({})",
+        "[cpo] local root matches the bridge state singleton's cpo_root ({})",
         hex::encode(on_chain)
     );
     Ok(CpoTrust::Verified)
@@ -2342,7 +2345,7 @@ fn cross_check_cpo_trie_from_cfg(
 /// trie is the sole already-paid record, so "not cross-checked" has to be actionable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CpoTrust {
-    /// Cross-checked against the on-chain CPO singleton.
+    /// Cross-checked against the on-chain bridge state singleton's `cpo_root`.
     Verified,
     /// No `cardano.cpo_policy_id` — the local root was never checked against the chain.
     Unverified,

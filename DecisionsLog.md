@@ -814,3 +814,73 @@ returned, which cannot work once the root lives inside the transaction bytes.
   as its length-and-prefix half. Both readers go through it — the Bitcoin one
   over `TxOut::script_pubkey` and the Cardano one over the Confirmed datum's
   output bytes — so 7 / 39 / 71 can never drift apart between the two.
+
+---
+
+## DEC-027: The BridgeState Singleton Decoder Replaces the One-Field CPO Reader
+
+**Date:** 2026-08-07
+**Decision:** A strict four-field `BridgeState` decoder in `cardano::bridge_state`; the
+singleton is fetched by the `"BSS"` NFT; every caller takes `cpo_root` by name
+**Status:** Accepted
+**Spec:** ft-bifrost-bridge `docs/superpowers/specs/2026-08-06-bridge-state-singleton-design.md`,
+§BridgeState, the singleton datum ([LIB-1] to [LIB-3]), §Off-chain: heimdall ([OH-4])
+
+### Context
+
+Rev 5.4 replaces the one-field completed-peg-outs trie datum with a four-field
+`BridgeState` under a new NFT asset name, `"BSS"` (hex `425353`), not `"CPO"`
+(hex `43504f`). Field 0 of the new datum is `spi_root`, not `cpo_root`.
+
+### Decision
+
+- `parse_bridge_state` pins the constructor tag AND the arity. The old
+  `parse_cpo_trie_datum` took the head of the field list and checked neither, so
+  against a `BridgeState` datum it would have returned `spi_root` where the
+  caller wanted `cpo_root`. That failure is silent and asymmetric: a wrong root
+  makes an MPF membership proof fail harmlessly, but it makes a non-membership
+  proof succeed, which cancels a peg-out already paid in BTC.
+  - Rejected: keeping the old reader with an index argument. That is one
+    character away from the bug it fixes, which is why [LIB-1] requires access
+    by name.
+- Byte lengths are part of the decode: 32 for each root, 36 for
+  `treasury_utxo_id` (`btc_txid ‖ vout`). A short value is a wrong value.
+- `treasury_amount` is rejected when negative rather than cast. A satoshi amount
+  has no negative reading, and `u64::try_from` on a decoded `i64` is the only
+  place the sign can be caught before it becomes a huge unsigned value.
+- `fetch_onchain_cpo_root` became `fetch_bridge_state`, returning the typed
+  state. Its zero-holder and several-holder errors stay distinct, as before:
+  zero means not deployed or not indexed, several mean the NFT is not a
+  singleton. All three callers (`reconstruct`, `BlockfrostChain::query_cpo_root`,
+  the `build-tm` preflight in `main.rs`) now read `state.cpo_root` by name.
+- `CPO_ASSET_NAME` / `CPO_ASSET_NAME_HEX` and `parse_cpo_trie_datum` were
+  removed with their tests, rather than left as dead exports. Nothing in
+  heimdall reads a one-field singleton datum any more, and a leftover `"CPO"`
+  asset-name constant is exactly the thing a future lookup would reach for.
+  The Aiken `utils.get_mpf_from_output` helper still exists on-chain for the CPI
+  trie ([LIB-2]); heimdall has no CPI trie reader today.
+  - Their bytes-to-hex pin test came WITH them, as
+    `the_bss_asset_name_hex_matches_the_bytes`. `BSS_ASSET_NAME` (the Aiken byte
+    form) and `BSS_ASSET_NAME_HEX` (the asset-unit form) are two spellings of one
+    fact, and only a test that ties them together stops the hex from drifting
+    back to `43504f` on its own.
+- The `cpo_policy_id` config key keeps its name. Renaming it to
+  `bridge_state_policy` is a config-compatibility change, not part of [OH-4].
+  Because the name now lies, the DOCS carry the truth: `config.rs` and
+  `heimdall.toml` both say the value is Config field 3 `bridge_state_policy`,
+  looked up with asset name `"BSS"` (hex `425353`), and that `"CPO"` (`43504f`)
+  is gone. An operator reads only those two places.
+- The zero-holder error of `fetch_bridge_state` names `cardano.cpo_policy_id`
+  first. A wrong policy id and a sick indexer produce the SAME empty result, and
+  the wrong policy id is far likelier right after this rename, so the message
+  must not point only at the backend.
+- The prose sweep from "CPO singleton" to "bridge state singleton" covers the
+  modules this change touches (`cpo_trie`, `cpo_history`, `blockfrost_chain`,
+  `config`, `main`, `heimdall.toml`). `epoch::machine`, `epoch::traits` and
+  `epoch::mocks` still say "CPO singleton" in doc comments and in operator
+  messages.
+  - Rejected: sweeping them here. Their operator strings are the ones a live SPO
+    reads on a mismatch, and changing message text is a behaviour change that
+    belongs with the `cpo_policy_id` -> `bridge_state_policy` config rename, not
+    with [OH-4]. They name the right UTxO by the old word; they are not wrong
+    about what is read.

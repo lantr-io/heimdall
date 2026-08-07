@@ -280,13 +280,20 @@ pub struct CardanoConfig {
     /// request per transaction that ever touched the address. See
     /// `cardano::cpo_history`.
     pub kupo_url: Option<String>,
-    /// Policy id (script hash) of the completed-peg-outs trie validator — Config
-    /// field 3. It identifies the on-chain CPO singleton (asset name `"CPO"`).
+    /// Policy id (script hash) of the bridge state singleton validator — Config
+    /// field 3, `bridge_state_policy`. With asset name `"BSS"` (hex `425353`) it
+    /// identifies the on-chain BridgeState UTxO, whose datum field 1 is the
+    /// completed-peg-outs root.
+    ///
+    /// The KEY keeps its old `cpo_policy_id` name for config compatibility, but the
+    /// VALUE is the bridge state policy. It is not a separate completed-peg-outs
+    /// policy, and heimdall no longer looks up asset name `"CPO"` (hex `43504f`).
     ///
     /// `reconstruct-cpo-trie` cross-checks its finished trie against that
-    /// singleton's root and refuses to write on a mismatch. That is the only check
-    /// covering the trie as a WHOLE — the per-movement assertions cannot notice a
-    /// replay that stopped one movement early — so the command requires this.
+    /// singleton's `cpo_root` and refuses to write on a mismatch. That is the only
+    /// check covering the trie as a WHOLE — the per-movement assertions cannot
+    /// notice a replay that stopped one movement early — so the command requires
+    /// this.
     pub cpo_policy_id: Option<String>,
     pub socket_path: Option<String>,
     pub network_magic: Option<u64>,
