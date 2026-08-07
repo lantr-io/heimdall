@@ -65,6 +65,11 @@ pub struct StaticPegIn {
 pub struct StaticPegOut {
     pub script_pubkey: ScriptBuf,
     pub amount: Amount,
+    /// Cardano slot this request was created at — the TM batch cutoff's input
+    /// (`cardano::pegout_datum::PegOutRequestData::created_slot` on a real chain).
+    /// 0 = older than any cutoff, so fixture peg-outs are eligible for every batch
+    /// unless a test says otherwise.
+    pub created_slot: u64,
     /// The datum's `created` (POSIX ms) — the fulfillment freshness filter's input. A plain
     /// `i64` with no default: `build_tm` skips a request whose `created` is in the future or
     /// within the margin of `created + PEG_OUT_CANCEL_TIMEOUT_MS`, so a fixture that let this

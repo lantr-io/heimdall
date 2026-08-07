@@ -1547,6 +1547,7 @@ impl CardanoChain for BlockfrostCardanoChain {
                 created: r.created,
                 por_id: r.por_id,
                 outpoint: r.outpoint,
+                created_slot: r.created_slot,
             })
             .collect())
     }
@@ -1585,8 +1586,12 @@ impl CardanoChain for BlockfrostCardanoChain {
                 .map_err(|e| EpochError::Chain(format!("batch parameter snapshot: {e}")))?;
         let (tm_params, source) =
             config_params::resolve_tm_params(Some(&snapshot), self.local_fee_rate_sat_per_vb);
+        let batch =
+            config_params::batch_at(&self.bf_base_url, &self.bf_project_id, &snapshot).await;
         Ok(BatchSnapshot {
             now_ms: snapshot.time_ms,
+            slot: snapshot.slot,
+            batch,
             tm_params,
             source,
         })

@@ -163,6 +163,10 @@ pub struct MockCardanoChain {
     /// `None` (the default) is the unconfigured chain: `BuildTm` skips the
     /// cross-check instead of treating it as the empty trie.
     cpo_root: Option<[u8; 32]>,
+    /// The TM batch opportunity the mock reports (N19). `None` (the default) is a
+    /// chain with no grid, so `BuildTm` applies no membership cutoff — the behaviour
+    /// of a deployment whose Config carries no `schedule`.
+    batch: crate::epoch::batch::BatchWindow,
     /// In-memory stand-in for the `treasury_info` state UTxO. `None` (the
     /// default) is a chain with nothing to rotate, so `plan_update_y` reports
     /// no handoff.
@@ -197,6 +201,7 @@ impl MockCardanoChain {
             btc_rpc: None,
             dkg_faults: Arc::new(Mutex::new(Vec::new())),
             schedule_anchor_ms: None,
+            batch: crate::epoch::batch::BatchWindow::NoGrid,
             tm_confirmed: Arc::new(AtomicBool::new(true)),
             cpo_root: None,
             treasury_info: None,
@@ -234,6 +239,12 @@ impl MockCardanoChain {
 
     /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning
     /// the ceremony window grid on for this mock chain.
+    /// Report a TM batch opportunity, so `BuildTm` applies the membership cutoff.
+    pub fn with_batch(mut self, batch: crate::epoch::batch::BatchSlot) -> Self {
+        self.batch = crate::epoch::batch::BatchWindow::Open(batch);
+        self
+    }
+
     pub fn with_schedule_anchor_ms(mut self, anchor_ms: i64) -> Self {
         self.schedule_anchor_ms = Some(anchor_ms);
         self
@@ -343,7 +354,7 @@ impl CardanoChain for MockCardanoChain {
     /// property the real Config provides. `now_ms` stays the local clock (the trait
     /// default) — mock fixtures carry wall-clock `created` times.
     async fn query_batch_snapshot(&self) -> EpochResult<BatchSnapshot> {
-        Ok(BatchSnapshot::local_override(
+        let mut snapshot = BatchSnapshot::local_override(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -354,7 +365,10 @@ impl CardanoChain for MockCardanoChain {
                 min_peg_out_fbtc: self.fixture.min_peg_out_fbtc,
             },
             "mock chain (StaticFixture)",
-        ))
+        );
+        snapshot.batch = self.batch;
+        snapshot.slot = self.batch.open().map_or(0, |b| b.slot);
+        Ok(snapshot)
     }
 
     async fn is_tm_confirmed(&self, _txid: &bitcoin::Txid) -> EpochResult<bool> {
@@ -471,6 +485,7 @@ impl CardanoChain for MockCardanoChain {
                 created: p.created,
                 por_id: fixture_por_id(&p.script_pubkey, p.amount),
                 outpoint: [0u8; 36],
+                created_slot: Some(p.created_slot),
             })
             .collect())
     }

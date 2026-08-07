@@ -62,6 +62,16 @@ pub struct PegOutRequestData {
     /// This UTxO's outpoint in the 36-byte hint encoding (tx hash ‖ index LE), published in the
     /// TM datum's `fulfilled_por_outpoints`.
     pub outpoint: [u8; 36],
+    /// Absolute Cardano slot at which this request UTxO was CREATED, filled in by
+    /// [`resolve_created_slots`] (`None` until then).
+    ///
+    /// This — not the datum's `created` — is what the TM batch cutoff `C_i` compares
+    /// against. `created` is requester-set and verified by nothing, so a request could
+    /// backdate itself into a batch its peers would exclude; the creating transaction's
+    /// slot is a chain fact every SPO reads identically. `None` means the slot could not
+    /// be resolved, and the batch freeze treats that as "not provably old enough" and
+    /// defers the request rather than guessing.
+    pub created_slot: Option<u64>,
 }
 
 impl PegOutRequestData {
@@ -192,6 +202,7 @@ pub async fn fetch_pegout_requests(
                 cardano_utxo: (utxo.tx_hash.clone(), utxo.output_index),
                 por_id: crate::cardano::cpo_trie::por_id(&tx_hash, u64::from(utxo.output_index)),
                 outpoint: crate::cardano::cpo_trie::hint_bytes(&tx_hash, utxo.output_index),
+                created_slot: None,
             })
         })();
         match request {
@@ -218,6 +229,55 @@ pub async fn fetch_pegout_requests(
         requests: out,
         malformed,
     })
+}
+
+/// Fill in each request's [`PegOutRequestData::created_slot`] from the chain.
+///
+/// One `/txs/{hash}` lookup per DISTINCT creating transaction — several requests
+/// minted together cost one request, and the count is bounded by the number of open
+/// peg-outs, which the per-batch capacity already caps. Batches are hours apart, so
+/// this is a handful of reads per movement.
+///
+/// `tip` is a known `(slot, time_ms)` pair on the same chain, used only when the
+/// backend omits `slot` from `/txs` (yaci-devkit). A request whose slot cannot be
+/// resolved keeps `None`: the freeze then defers it instead of assuming it is old
+/// enough, so a flaky lookup costs latency, never a divergent batch.
+pub async fn resolve_created_slots(
+    base_url: &str,
+    project_id: &str,
+    requests: &mut [PegOutRequestData],
+    tip: Option<(u64, i64)>,
+) {
+    let mut seen: std::collections::HashMap<String, Option<u64>> = std::collections::HashMap::new();
+    for req in requests.iter_mut() {
+        let tx_hash = req.cardano_utxo.0.clone();
+        let slot = match seen.get(&tx_hash) {
+            Some(cached) => *cached,
+            None => {
+                let resolved = match bf_http::fetch_tx_point(base_url, project_id, &tx_hash).await {
+                    Ok(point) => point.slot.or_else(|| {
+                        tip.map(|(ref_slot, ref_time_ms)| {
+                            bf_http::slot_at_time(
+                                ref_slot,
+                                ref_time_ms,
+                                point.block_time_secs.saturating_mul(1000),
+                            )
+                        })
+                    }),
+                    Err(e) => {
+                        eprintln!(
+                            "[pegout] could not resolve the creation slot of {tx_hash} ({e}) \
+                                 — deferring that request to a later batch"
+                        );
+                        None
+                    }
+                };
+                seen.insert(tx_hash, resolved);
+                resolved
+            }
+        };
+        req.created_slot = slot;
+    }
 }
 
 #[cfg(test)]
@@ -267,7 +327,26 @@ mod tests {
             cardano_utxo: ("ab".repeat(32), 0),
             por_id: crate::cardano::cpo_trie::por_id(&tx, 0),
             outpoint: crate::cardano::cpo_trie::hint_bytes(&tx, 0),
+            created_slot: Some(0),
         }
+    }
+
+    /// The batch cutoff and the FIFO order key off `created_slot` — the CREATING
+    /// transaction's slot — never the datum's `created`, which the requester sets and
+    /// nothing verifies. A backdated request must not be able to talk its way into a
+    /// batch its peers would exclude.
+    #[test]
+    fn created_slot_is_chain_sourced_and_independent_of_the_datum() {
+        let mut r = request(b"\x51\x20dest", 100_000, 1_000);
+        assert_eq!(r.created, 1_700_000_000_000, "the datum's own field");
+        assert_eq!(
+            r.created_slot,
+            Some(0),
+            "resolved separately, from the chain"
+        );
+        // Backdating the datum leaves the chain-sourced slot untouched.
+        r.created = 1;
+        assert_eq!(r.created_slot, Some(0));
     }
 
     #[test]
