@@ -35,8 +35,6 @@ pub struct TreasuryConfig {
     pub y_51: bitcoin::key::UntweakedPublicKey,
     pub y_fed: bitcoin::key::UntweakedPublicKey,
     pub federation_csv_blocks: u32,
-    pub fee_rate_sat_per_vb: u64,
-    pub per_pegout_fee: Amount,
     /// The current treasury Bitcoin UTxO, tracked OFF-CHAIN by the SPO (spec
     /// §640/§1677: "known from the previous TM's change output, or from protocol
     /// bootstrap"). heimdall builds every TM, so in steady state it knows its own
@@ -164,8 +162,6 @@ pub fn treasury_from_btc_tx_bytes(
         y_51: config.y_51,
         y_fed: config.y_fed,
         federation_csv_blocks: config.federation_csv_blocks,
-        fee_rate_sat_per_vb: config.fee_rate_sat_per_vb,
-        per_pegout_fee: config.per_pegout_fee,
         btc_confirmed,
     })
 }
@@ -228,8 +224,6 @@ pub fn parse_treasury_datum(
         y_51: config.y_51,
         y_fed: config.y_fed,
         federation_csv_blocks: config.federation_csv_blocks,
-        fee_rate_sat_per_vb: config.fee_rate_sat_per_vb,
-        per_pegout_fee: config.per_pegout_fee,
         btc_confirmed,
     })
 }
@@ -661,8 +655,6 @@ mod tests {
             y_51: y_fed, // bootstrap: internal key = federation
             y_fed,
             federation_csv_blocks: 144,
-            fee_rate_sat_per_vb: 1,
-            per_pegout_fee: Amount::from_sat(1_000),
             treasury_outpoint: OutPoint::null(),
             treasury_value: Amount::from_sat(10_000_000),
         }
@@ -681,7 +673,6 @@ mod tests {
         assert_eq!(treasury.value, Amount::from_sat(10_000_000));
         assert_eq!(treasury.outpoint.vout, 0);
         assert_eq!(treasury.federation_csv_blocks, 144);
-        assert_eq!(treasury.fee_rate_sat_per_vb, 1);
     }
 
     #[test]

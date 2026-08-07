@@ -201,6 +201,25 @@ Config #14) as the recovery path. Remaining for the §2 contract changes (b):
 the Config fee/min fields + governance spend branch + enabling the two TM
 verifiers — no `peg_out.ak` lock-time change.
 
+**Update 2026-08-07 — item (e) DONE, heimdall reads the params (WI-040).** The
+separate params UTxO of the 2026-07-15 revision was dropped again: with
+`update_auth` governance on the Config (field #10) a params singleton's update
+policy coincided with the Config's, so the tunables are **Config fields #12–#16**
+(`fee_rate_sat_per_vb`, `per_pegout_fee` floor, `min_peg_out_fbtc`,
+`leader_reward`, `schedule`) alongside #9 `min_stake`. heimdall decodes them in
+`src/cardano/config_params.rs` and freezes them per batch at the chain tip
+(`CardanoChain::query_batch_snapshot` → `BatchSnapshot`), so the §2b divergence
+risk above is closed: `TmParams` (the renamed `FeeParams`) carries the Config's
+fee rate and both floors, and the two skip rules of 2b/2d — datum fee below the
+Config floor, locked amount below `min_peg_out_fbtc` — are implemented in
+`build_tm`. `bitcoin.fee_rate_sat_per_vb` / `bitcoin.per_pegout_fee_sat` remain
+only as the dev override for the single-signer admin spends, the mock demo, and a
+Config that predates the append; `heimdall show-config-params` reports which of
+the two is in force. Still open, and NOT part of this: the slot-aligned batch grid
+that would make every SPO snapshot the identical slot (plan N19) — today each node
+snapshots its own tip, so a governance Update landing mid-batch is detected (the
+snapshot is retaken) rather than made impossible.
+
 ## 3. Update-Y (treasury key rotation) — contract gap OPEN (spec now fully in the .md)
 
 *Update 2026-07-15 (spec-gaps review):* the Update-Y transaction is now fully specified in

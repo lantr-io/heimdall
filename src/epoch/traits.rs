@@ -57,8 +57,12 @@ pub struct PegOutRequestUtxo {
 /// The current treasury UTxO state, as reported by the Cardano-side
 /// oracle (Binocular / watchtower). The SPO never queries Bitcoin
 /// directly for this — a trusted oracle UTxO on Cardano carries the
-/// outpoint, value, and fee parameters, and the SPO reads it from
-/// there.
+/// outpoint and value, and the SPO reads it from there.
+///
+/// It carries no fee parameters: those are the Config UTxO's operational
+/// parameters, read per batch as [`BatchSnapshot::tm_params`] (WI-040). They used
+/// to ride along here, sourced from each node's own `heimdall.toml` — a
+/// per-operator value in a computation every SPO must agree on byte-for-byte.
 ///
 /// `y_51` is the internal key of the *current* treasury — the key it
 /// was locked under. `BuildTm` uses `y_51` for the treasury *input*
@@ -76,14 +80,53 @@ pub struct TreasuryUtxo {
     /// The Taproot script-tree leaf key for the federation fallback.
     pub y_fed: bitcoin::key::UntweakedPublicKey,
     pub federation_csv_blocks: u32,
-    pub fee_rate_sat_per_vb: u64,
-    pub per_pegout_fee: bitcoin::Amount,
     /// Whether it is safe to begin the NEXT treasury movement off this UTxO.
     /// A new movement can only begin once the previous one is confirmed, so the
     /// Blockfrost impl (WI-028) sets this false when an Unconfirmed TM (or an
     /// in-flight TM it could not read) is already spending this tip; the mock
     /// reports a simple always-confirmed treasury.
     pub btc_confirmed: bool,
+}
+
+/// The consensus inputs a TM batch is frozen against, all read at ONE chain point
+/// (spec §Operational parameters, determinism rule; WI-040).
+///
+/// Both fields decide TM bytes — `now_ms` through the peg-out freshness filter,
+/// `tm_params` through the miner fee and the two selection floors — so they are
+/// taken together rather than polled independently: a node that read its fee rate
+/// at one slot and its "now" at another has no single moment it can claim to have
+/// built for. Today the point is the chain tip when the batch is frozen; the batch
+/// grid (plan N19) will make it a shared grid slot, at which point every SPO reads
+/// the identical snapshot by construction.
+#[derive(Debug, Clone)]
+pub struct BatchSnapshot {
+    /// Chain "now", POSIX milliseconds — the tip block's time. A CHAIN time
+    /// converges across nodes; a local wall clock does not.
+    pub now_ms: i64,
+    /// Operational parameters in force at the snapshot — Config #12–#14. (#16, the
+    /// schedule, is not here: nothing in TM construction consumes it. It is decoded
+    /// by `cardano::config_params` and reported by `show-config-params` / the
+    /// mover's startup banner, and drives the batch grid when plan N19 lands.)
+    pub tm_params: crate::bitcoin::tm_builder::TmParams,
+    /// Config UTxO the parameters came from, or the local-override reason.
+    pub source: crate::cardano::config_params::ParamSource,
+}
+
+impl BatchSnapshot {
+    /// A snapshot whose parameters came from this node's own config rather than
+    /// the chain — mocks, offline CLI paths, and Config-less deployments.
+    #[must_use]
+    pub fn local_override(
+        now_ms: i64,
+        tm_params: crate::bitcoin::tm_builder::TmParams,
+        why: &'static str,
+    ) -> Self {
+        Self {
+            now_ms,
+            tm_params,
+            source: crate::cardano::config_params::ParamSource::LocalOverride(why),
+        }
+    }
 }
 
 /// Everything the epoch machine needs to authorize an on-chain Update-Y — the
@@ -192,18 +235,24 @@ pub trait CardanoChain: Send + Sync {
     /// only `{scriptPubKey, amount}`.)
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>>;
 
-    /// Chain "now" in POSIX milliseconds — the tip block's time.
+    /// Freeze this batch's consensus inputs: the chain time the peg-out freshness
+    /// filter compares against, and the operational parameters TM construction
+    /// reads (Config #12–#14), both **as of one chain point**.
     ///
-    /// The peg-out freshness filter compares a datum's `created` against this, and
-    /// every SPO must reach the same verdict or the TM bytes diverge and FROST
-    /// fails. A CHAIN time converges across nodes; a local wall clock does not.
-    /// The default is the local clock, which is correct only for mocks and for a
-    /// single-node demo.
-    async fn chain_now_ms(&self) -> EpochResult<i64> {
-        Ok(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0))
+    /// Every field of the result feeds bytes that all SPOs must produce
+    /// identically, so all of it is chain-derived and read once, together — see
+    /// [`BatchSnapshot`]. The default is the local clock plus no parameters at all,
+    /// correct only for mocks and single-node demos; the caller supplies its local
+    /// fee-rate override for that case.
+    async fn query_batch_snapshot(&self) -> EpochResult<BatchSnapshot> {
+        Ok(BatchSnapshot::local_override(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+            crate::bitcoin::tm_builder::TmParams::fee_rate_only(1),
+            "mock chain",
+        ))
     }
 
     /// The root held by the on-chain completed-peg-outs singleton, when this

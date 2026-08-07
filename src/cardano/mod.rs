@@ -17,6 +17,7 @@ pub mod blockfrost_chain;
 pub mod blockfrost_source;
 pub mod blueprint;
 pub mod btc_rpc;
+pub mod config_params;
 pub mod cpo_history;
 pub mod cpo_trie;
 pub mod dkg_roster;

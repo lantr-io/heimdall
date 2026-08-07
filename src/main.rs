@@ -658,6 +658,17 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Read-only: print the bridge Config UTxO's operational parameters (WI-040) —
+    /// the values every SPO must agree on to build byte-identical Treasury
+    /// Movements. Reads `cardano.config_address` + `cardano.config_nft_policy_id`
+    /// at the current chain tip and reports the fee rate (#12), the per-peg-out fee
+    /// floor (#13), `min_peg_out_fbtc` (#14), `leader_reward` (#15), the schedule
+    /// (#16) and `min_stake` (#9) — plus whether this node would instead fall back
+    /// to its local `bitcoin.fee_rate_sat_per_vb`. Posts nothing.
+    ShowConfigParams {
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Background auto-mover (WI-028): every `--interval-secs`, chain-source the
     /// current treasury from Cardano (no config edits), collect pending peg-ins +
     /// peg-outs, and — if the treasury is free and there is work — build, FROST-sign
@@ -1271,6 +1282,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::ShowConfigParams { config } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_show_config_params(&cfg) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::ReconstructCpoTrie { config, dry_run } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_reconstruct_cpo_trie(&cfg, dry_run) {
@@ -1357,8 +1375,6 @@ async fn run_demo(
             y_51: fixture.y_51,
             y_fed: fixture.y_fed,
             federation_csv_blocks: fixture.federation_csv_blocks,
-            fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
-            per_pegout_fee: fixture.per_pegout_fee,
             treasury_outpoint: fixture.treasury_outpoint,
             treasury_value: fixture.treasury_value,
         };
@@ -1370,7 +1386,10 @@ async fn run_demo(
             treasury_config,
             fixture.roster.clone(),
             cfg.cardano.blockfrost_url.as_deref(),
-        );
+        )
+        // Only reached when no Config UTxO is configured — with one, the batch's
+        // fee rate is the Config's (WI-040).
+        .with_local_fee_rate(cfg.bitcoin.fee_rate_sat_per_vb);
 
         // The on-chain completed-peg-outs singleton, so BuildTm can cross-check the
         // persisted trie against it before signing anything. Unset cpo_policy_id
@@ -1807,16 +1826,127 @@ fn csv_blocks_u16(cfg: &HeimdallConfig) -> Result<u16, String> {
     })
 }
 
-/// Build `FeeParams` (miner fee only) from the Bitcoin config section.
+/// TM parameters for the SINGLE-SIGNER admin spends (`treasury-self-send`,
+/// `federation-spend`): the local `bitcoin.fee_rate_sat_per_vb`, no selection
+/// floors.
+///
+/// Legitimate here precisely because these transactions have no co-signers — one
+/// operator's key spends, so there is no cross-SPO agreement for a local value to
+/// break. Every path that FROST-signs reads the Config UTxO instead
+/// ([`batch_params`], `heimdall::cardano::config_params`).
 ///
 /// The per-peg-out PROTOCOL fee is not here: since rev 5.1 each request pins its
 /// own fee in its datum, and `peg-out.ak` binds the completed-peg-outs trie value
 /// against that value. `bitcoin.per_pegout_fee_sat` survives only as the fee this
 /// node's own `pegout-request` CLI writes into a new request.
-fn fee_params_from_cfg(cfg: &HeimdallConfig) -> heimdall::bitcoin::tm_builder::FeeParams {
-    heimdall::bitcoin::tm_builder::FeeParams {
-        fee_rate_sat_per_vb: cfg.bitcoin.fee_rate_sat_per_vb,
+fn dev_tm_params_from_cfg(cfg: &HeimdallConfig) -> heimdall::bitcoin::tm_builder::TmParams {
+    heimdall::bitcoin::tm_builder::TmParams::fee_rate_only(cfg.bitcoin.fee_rate_sat_per_vb)
+}
+
+/// Freeze the batch's parameters for the CLI sweep path (`sweep-pegins` /
+/// `run-mover`), the mirror of `CardanoChain::query_batch_snapshot`.
+///
+/// Returns the TM parameters and the snapshot's chain time (POSIX ms, the
+/// peg-out freshness filter's "now"; `None` when there is no Config UTxO to
+/// snapshot, leaving the caller to source its own). With a Config
+/// UTxO configured every value is the chain's and this node's `bitcoin.*fee*`
+/// keys are ignored — which is what lets two operators with different TOMLs
+/// co-sign the same TM. Without one it falls back to those keys and says so.
+fn batch_params(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+) -> Result<(heimdall::bitcoin::tm_builder::TmParams, Option<i64>), String> {
+    use heimdall::cardano::config_params::{ParamSource, fetch_param_snapshot, resolve_tm_params};
+
+    let local = cfg.bitcoin.fee_rate_sat_per_vb;
+    let Some(loc) = config_locator(cfg) else {
+        let (p, _) = resolve_tm_params(None, local);
+        return Ok((p, None));
+    };
+    let snapshot = rt.block_on(fetch_param_snapshot(
+        &loc.base_url,
+        &loc.project_id,
+        &loc.address,
+        &loc.nft_unit,
+    ))?;
+    if let Some(t) = &snapshot.config.params.tunables {
+        println!(
+            "  operational params (Config {} @ slot {}): fee_rate={} sat/vB, \
+             per_pegout_fee floor={} sat, min_peg_out_fbtc={} sat, leader_reward={} lovelace",
+            snapshot.config.utxo,
+            snapshot.slot,
+            t.fee_rate_sat_per_vb,
+            t.per_pegout_fee_floor,
+            t.min_peg_out_fbtc,
+            t.leader_reward,
+        );
     }
+    let time_ms = snapshot.time_ms;
+    let (p, src) = resolve_tm_params(Some(&snapshot), local);
+    if let ParamSource::LocalOverride(why) = &src {
+        eprintln!(
+            "[params] WARNING: building on the LOCAL bitcoin.fee_rate_sat_per_vb ({local} \
+             sat/vB) — {why}. Co-signers reading a different value build different TM bytes."
+        );
+    }
+    Ok((p, Some(time_ms)))
+}
+
+/// Everything needed to fetch the bridge Config UTxO: the Blockfrost endpoint and
+/// the (address, NFT unit) pair that identifies the singleton.
+struct ConfigLocator {
+    project_id: String,
+    base_url: String,
+    address: String,
+    nft_unit: String,
+}
+
+/// The Config locator, when this node is configured to locate it
+/// (`cardano.config_address` + `cardano.config_nft_policy_id` + Blockfrost).
+fn config_locator(cfg: &HeimdallConfig) -> Option<ConfigLocator> {
+    let (pid, addr, policy) = (
+        cfg.cardano.blockfrost_project_id.as_deref()?,
+        cfg.cardano.config_address.as_deref()?,
+        cfg.cardano.config_nft_policy_id.as_deref()?,
+    );
+    Some(ConfigLocator {
+        project_id: pid.to_string(),
+        base_url: heimdall::cardano::bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref()),
+        address: addr.to_string(),
+        nft_unit: format!(
+            "{policy}{}",
+            cfg.cardano.config_nft_asset_name.as_deref().unwrap_or("")
+        ),
+    })
+}
+
+/// Read the bridge Config UTxO, when this node is configured to locate it.
+///
+/// `Ok(None)` means "not configured", never "empty" — callers fall back to their
+/// local config key. A configured-but-unreadable Config is an error: silently
+/// dropping to a local value is how nodes end up disagreeing.
+fn config_view(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+) -> Result<Option<heimdall::cardano::config_params::ConfigView>, String> {
+    let Some(loc) = config_locator(cfg) else {
+        return Ok(None);
+    };
+    rt.block_on(heimdall::cardano::config_params::fetch_config(
+        &loc.base_url,
+        &loc.project_id,
+        &loc.address,
+        &loc.nft_unit,
+    ))
+    .map(Some)
+}
+
+/// The protocol `min_stake` (Config #9) when the Config UTxO is reachable.
+fn config_min_stake(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+) -> Result<Option<u64>, String> {
+    Ok(config_view(rt, cfg)?.map(|v| v.params.min_stake))
 }
 
 /// Load this node's completed-peg-outs trie from `protocol.state_dir`.
@@ -1994,7 +2124,7 @@ fn run_treasury_self_send(
         vec![],
         vec![],
         treasury_spk,
-        &fee_params_from_cfg(cfg),
+        &dev_tm_params_from_cfg(cfg),
         // No peg-outs, so the freshness window is inert.
         &heimdall::bitcoin::tm_builder::Freshness {
             now_ms: 0,
@@ -2079,7 +2209,7 @@ fn run_federation_spend(
         vec![],
         vec![],
         treasury_spk,
-        &fee_params_from_cfg(cfg),
+        &dev_tm_params_from_cfg(cfg),
         &heimdall::bitcoin::tm_builder::Freshness {
             now_ms: 0,
             margin_ms: 0,
@@ -3473,8 +3603,35 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
     // ── R2 min-stake gate: gates submission; a dry run only warns ──
+    //
+    // The threshold is the protocol's, i.e. Config #9 — read from the chain when a
+    // Config UTxO is configured, so every SPO gates on the same number and a
+    // governance change takes effect without a config edit. `cardano.min_stake_lovelace`
+    // is the fallback for a node with no Config locator (WI-040).
     let stake_source = StakeSource::from_config(cfg.cardano.stake_source.as_deref())?;
-    match cfg.cardano.min_stake_lovelace {
+    let min_stake = match config_min_stake(&rt, cfg)? {
+        Some(on_chain) => {
+            println!("min-stake source:  Config #9 (on-chain) = {on_chain}");
+            if let Some(local) = cfg.cardano.min_stake_lovelace
+                && local != on_chain
+            {
+                eprintln!(
+                    "[register-spo] NOTE: cardano.min_stake_lovelace ({local}) differs from the \
+                     on-chain Config #9 ({on_chain}); the chain value wins"
+                );
+            }
+            if on_chain == 0 {
+                eprintln!(
+                    "[register-spo] WARNING: the deployed Config's min_stake is 0 — the R2 gate \
+                     admits any pool. That is what governance published; raise it with a Config \
+                     Update, not by editing this node's config"
+                );
+            }
+            Some(on_chain)
+        }
+        None => cfg.cardano.min_stake_lovelace,
+    };
+    match min_stake {
         Some(threshold) => {
             // yaci-store reads stake per-epoch; Blockfrost ignores the epoch.
             let epoch = match stake_source {
@@ -3514,14 +3671,15 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         None => {
             if args.submit {
                 return Err(
-                    "cardano.min_stake_lovelace is not configured — the R2 gate cannot run; \
-                     set it (the protocol min_stake) before submitting"
+                    "no min_stake threshold — the R2 gate cannot run. Configure the bridge \
+                     Config UTxO (cardano.config_address + config_nft_policy_id) to read the \
+                     protocol's Config #9, or set cardano.min_stake_lovelace, before submitting"
                         .into(),
                 );
             }
             eprintln!(
-                "[register-spo] WARNING: cardano.min_stake_lovelace not configured; \
-                 dry run only — submission would be refused"
+                "[register-spo] WARNING: no min_stake threshold (no Config UTxO configured and \
+                 no cardano.min_stake_lovelace); dry run only — submission would be refused"
             );
         }
     }
@@ -4538,6 +4696,23 @@ fn run_mover(
 ) -> Result<(), String> {
     use std::time::Duration;
 
+    // The Config's schedule (#16) is the protocol's batch cadence; this loop's
+    // `--interval-secs` is a local sleep. They are not yet the same thing — the
+    // slot-aligned batch grid is plan N19 — so report the drift rather than
+    // silently ticking off-grid.
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    if let Some(schedule) = config_view(&rt, cfg)?
+        .and_then(|v| v.params.tunables)
+        .map(|t| t.schedule)
+    {
+        println!(
+            "[mover] Config schedule: tm_batch_interval={} slots (this mover ticks every \
+             {interval_secs}s; the slot-aligned batch grid lands with N19)",
+            schedule.tm_batch_interval,
+        );
+    }
+    drop(rt);
+
     let mut tick: u64 = 0;
     loop {
         tick += 1;
@@ -4693,6 +4868,102 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
         "  written            : {}",
         heimdall::cardano::cpo_trie::CpoTrie::state_path(dir).display()
     );
+    Ok(())
+}
+
+/// Read-only `show-config-params`: print the Config UTxO's operational parameters
+/// as of the current tip — the snapshot a TM batch built now would use (WI-040).
+///
+/// Operationally this is the "do we all agree?" check: run it on every SPO and the
+/// output must be identical, because these values decide TM bytes. A node
+/// reporting a LOCAL source here cannot co-sign with one reporting the Config.
+fn run_show_config_params(cfg: &HeimdallConfig) -> Result<(), String> {
+    use heimdall::cardano::config_params::{ParamSource, fetch_param_snapshot, resolve_tm_params};
+
+    let loc = config_locator(cfg).ok_or(
+        "set cardano.config_address, cardano.config_nft_policy_id and \
+         cardano.blockfrost_project_id to read the bridge Config UTxO",
+    )?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let snapshot = rt.block_on(fetch_param_snapshot(
+        &loc.base_url,
+        &loc.project_id,
+        &loc.address,
+        &loc.nft_unit,
+    ))?;
+
+    println!("config UTxO        : {}", snapshot.config.utxo);
+    println!(
+        "snapshot slot      : {} (tip time {} ms)",
+        snapshot.slot, snapshot.time_ms
+    );
+    println!(
+        "datum fields       : {}",
+        snapshot.config.params.field_count
+    );
+    println!(
+        "#9  min_stake      : {} lovelace",
+        snapshot.config.params.min_stake
+    );
+    match &snapshot.config.params.initial_btc_treasury_utxo {
+        Some(a) => println!("#11 treasury anchor: {}", hex::encode(a)),
+        None => println!("#11 treasury anchor: (absent)"),
+    }
+    match &snapshot.config.params.tunables {
+        Some(t) => {
+            println!("#12 fee_rate       : {} sat/vB", t.fee_rate_sat_per_vb);
+            println!(
+                "#13 per_pegout_fee : {} sat (floor)",
+                t.per_pegout_fee_floor
+            );
+            println!("#14 min_peg_out    : {} sat", t.min_peg_out_fbtc);
+            println!("#15 leader_reward  : {} lovelace", t.leader_reward);
+            let s = &t.schedule;
+            println!("#16 schedule (slots, E-relative):");
+            println!(
+                "      dkg_r1_deadline={} dkg_r2_deadline={} update_y_deadline={}",
+                s.dkg_r1_deadline, s.dkg_r2_deadline, s.update_y_deadline
+            );
+            println!(
+                "      tm_batch_interval={} sign_r1_window={} sign_r2_window={}",
+                s.tm_batch_interval, s.sign_r1_window, s.sign_r2_window
+            );
+            println!(
+                "      leader_slot_t={} tm_recovery_window={} final_tm_cutoff={} \
+                 stability_window={}",
+                s.leader_slot_t, s.tm_recovery_window, s.final_tm_cutoff, s.stability_window
+            );
+            println!(
+                "      (decoded and reported; the batch grid that consumes it is plan N19 — \
+                 run-mover still ticks on --interval-secs)"
+            );
+        }
+        None => println!(
+            "#12-#16            : ABSENT — this Config predates the operational-parameter \
+             append; TMs fall back to the local bitcoin.fee_rate_sat_per_vb"
+        ),
+    }
+
+    let (params, source) = resolve_tm_params(Some(&snapshot), cfg.bitcoin.fee_rate_sat_per_vb);
+    println!("\nTM parameters in force: {source}");
+    println!(
+        "  fee_rate={} sat/vB, per_pegout_fee floor={} sat, min_peg_out_fbtc={} sat",
+        params.fee_rate_sat_per_vb,
+        params.per_pegout_fee_floor.to_sat(),
+        params.min_peg_out_fbtc.to_sat(),
+    );
+    if matches!(source, ParamSource::LocalOverride(_)) {
+        println!(
+            "  local bitcoin.fee_rate_sat_per_vb = {} — a DEV override; co-signers reading a \
+             different value build different TM bytes",
+            cfg.bitcoin.fee_rate_sat_per_vb
+        );
+    } else {
+        println!(
+            "  (local bitcoin.fee_rate_sat_per_vb = {} is IGNORED — dev override only)",
+            cfg.bitcoin.fee_rate_sat_per_vb
+        );
+    }
     Ok(())
 }
 
@@ -5329,12 +5600,20 @@ fn run_sweep_pegins(
         return Ok(());
     }
 
-    // Chain "now" for the freshness filter: the Cardano tip's block time, never the
-    // local clock — the filter is a TM skip rule, so a divergent verdict means
-    // divergent TM bytes and a failed FROST round. Without Blockfrost there are no
-    // peg-outs to filter anyway, so 0 is inert.
-    let chain_now_ms = match cfg.cardano.blockfrost_project_id.as_deref() {
-        Some(pid) if !pegout_requests.is_empty() => {
+    // Freeze this batch's consensus inputs at one chain point (WI-040): the
+    // operational parameters TM construction reads (Config #12-#14) and the chain
+    // "now" the freshness filter compares `created` against. Chain values, never
+    // this node's: both decide TM bytes, and a divergent verdict means a divergent
+    // txid and a failed FROST round.
+    let (tm_params, snapshot_now_ms) = batch_params(&rt, cfg)?;
+    // No Config UTxO to snapshot: fall back to the tip time alone. Without
+    // Blockfrost there are no peg-outs to filter anyway, so 0 is inert.
+    let chain_now_ms = match (
+        snapshot_now_ms,
+        cfg.cardano.blockfrost_project_id.as_deref(),
+    ) {
+        (Some(ms), _) => ms,
+        (None, Some(pid)) if !pegout_requests.is_empty() => {
             let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
             rt.block_on(bf_http::fetch_latest_block_time(&base_url, pid))
                 .map_err(|e| format!("chain now: {e}"))?
@@ -5355,7 +5634,7 @@ fn run_sweep_pegins(
         pegin_inputs,
         pegout_requests,
         treasury_spk.clone(),
-        &fee_params_from_cfg(cfg),
+        &tm_params,
         &freshness_from_cfg(cfg, chain_now_ms),
         &cpo_trie,
     )
@@ -5522,8 +5801,6 @@ fn run_sweep_pegins(
             y_51: fixture.y_51,
             y_fed: fixture.y_fed,
             federation_csv_blocks: fixture.federation_csv_blocks,
-            fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
-            per_pegout_fee: fixture.per_pegout_fee,
             treasury_outpoint: fixture.treasury_outpoint,
             treasury_value: fixture.treasury_value,
         };
@@ -5535,7 +5812,8 @@ fn run_sweep_pegins(
             treasury_config,
             fixture.roster.clone(),
             cfg.cardano.blockfrost_url.as_deref(),
-        );
+        )
+        .with_local_fee_rate(cfg.bitcoin.fee_rate_sat_per_vb);
         chain = chain.with_cpo_source(
             cfg.cardano.cpo_policy_id.as_deref(),
             cfg.cardano.kupo_url.as_deref(),

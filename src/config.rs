@@ -138,15 +138,28 @@ impl Default for ProtocolConfig {
 pub struct BitcoinConfig {
     /// `"regtest"`, `"testnet4"`, `"signet"`, `"mainnet"`.
     pub network: String,
-    pub fee_rate_sat_per_vb: u64,
-    /// Per-peg-out protocol fee (satoshi) used only where no request datum
-    /// supplies one — the demo `StaticFixture` peg-outs.
+    /// **DEV OVERRIDE.** Bitcoin miner fee rate (sat/vB) for the paths that cannot
+    /// read the chain's: the single-signer admin spends (`treasury-self-send`,
+    /// `federation-spend`), the mock/fixture demo, and a deployment whose Config
+    /// UTxO is unset or predates the operational-parameter fields.
     ///
-    /// A real TM does NOT read this. Since rev 5.1 each PegOut request pins its own
-    /// `per_pegout_fee` in its datum, and `peg-out.ak` binds the completed-peg-outs
-    /// trie value against THAT value; a TM paying `gross − some_local_config` would
-    /// produce an entry the Complete branch cannot match, spending BTC for a
-    /// completion nobody can prove.
+    /// A production TM does NOT read this. Since WI-040 the fee rate is Config
+    /// datum field #12, read from the Config UTxO at the batch snapshot slot
+    /// (`cardano::config_params`): it multiplies into the treasury change output, so
+    /// two SPOs holding different values sign different bytes and the FROST round
+    /// cannot converge. `show-config-params` reports which of the two is in force.
+    pub fee_rate_sat_per_vb: u64,
+    /// **DEV OVERRIDE.** Per-peg-out protocol fee (satoshi) this node's own
+    /// `pegout-request` CLI pins into a request it creates, and the fee the demo
+    /// `StaticFixture` peg-outs carry.
+    ///
+    /// A real TM does NOT read this — in either of its two roles. The fee it PAYS is
+    /// the one each PegOut request pins in its own datum (rev 5.1): `peg-out.ak`
+    /// binds the completed-peg-outs trie value against THAT value, so a TM paying
+    /// `gross − some_local_config` would produce an entry the Complete branch cannot
+    /// match, spending BTC for a completion nobody can prove. The FLOOR that fee
+    /// must clear is Config datum field #13, read at the batch snapshot slot — a
+    /// skip rule, so it too must be identical across SPOs.
     pub per_pegout_fee_sat: u64,
     pub federation_csv_blocks: u32,
     /// 32-byte hex seed for the Y_federation key.
@@ -250,12 +263,16 @@ pub struct CardanoConfig {
     pub treasury_policy_id: Option<String>,
     pub treasury_asset_name: Option<String>,
     pub mnemonic: Option<String>,
-    /// register_spo R2 min-stake threshold (lovelace). A registering pool's
-    /// `active_stake` must be `>=` this to build register_spo / join the DKG
-    /// candidate set. Canonically the on-chain `ConfigDatum.min_stake`; until
-    /// heimdall reads the Config UTxO (WI-009-adjacent) the operator sets it
-    /// here. `None` → no gate configured (the caller must error rather than
-    /// admit unconditionally).
+    /// **FALLBACK.** register_spo R2 min-stake threshold (lovelace). A registering
+    /// pool's `active_stake` must be `>=` this to build register_spo / join the DKG
+    /// candidate set.
+    ///
+    /// Canonically the on-chain `ConfigDatum.min_stake` (field #9), which
+    /// `register-spo` reads whenever [`Self::config_address`] +
+    /// [`Self::config_nft_policy_id`] are set — the chain value wins, and a
+    /// divergent local one is reported. This key remains for a node with no Config
+    /// locator. `None` with no Config → no gate configured (the caller must error
+    /// rather than admit unconditionally).
     pub min_stake_lovelace: Option<u64>,
     /// Where the DKG roster threshold + R2 gate read per-pool active stake.
     /// `None`/`"blockfrost"` (default) → Blockfrost `/pools/{id}.active_stake`
@@ -290,6 +307,11 @@ pub struct CardanoConfig {
     /// Bech32 address of the bridge Config UTxO (the config script address, from
     /// `binocular deploy-bridge`). The Config UTxO's field 11 (initial_btc_treasury_utxo)
     /// anchors the Treasury Movement chain; the first TM mint references it.
+    ///
+    /// It also carries the **operational parameters** (fields #12-#16) every TM is
+    /// built from, so setting this + [`Self::config_nft_policy_id`] is what moves a
+    /// node off its local `bitcoin.fee_rate_sat_per_vb` and onto the value its
+    /// co-signers use — see `cardano::config_params` and `show-config-params`.
     pub config_address: Option<String>,
     /// Config NFT policy id (56 hex chars) locating the Config UTxO. Required alongside
     /// `tm_script_cbor` and `config_address`.

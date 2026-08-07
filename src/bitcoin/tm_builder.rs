@@ -74,11 +74,47 @@ pub struct PegOutRequest {
     pub created: i64,
 }
 
-/// Miner-fee parameters. The per-peg-out protocol fee is NOT here: since rev 5.1
-/// it is pinned per request in the peg-out datum (see
-/// [`PegOutRequest::per_pegout_fee`]).
-pub struct FeeParams {
+/// The Config-resident operational parameters TM construction consumes —
+/// `ConfigDatum` fields #12, #13 and #14 — read **as of the batch snapshot slot**
+/// (spec §Operational parameters, determinism rule).
+///
+/// Every field here is a consensus input: it decides either the transaction's
+/// amounts or its skip set, so two SPOs holding different values build different
+/// TM bytes and FROST signing cannot converge. That is why they live in the
+/// Config UTxO rather than each node's `heimdall.toml` — see
+/// [`crate::cardano::config_params`], which resolves them (and falls back to the
+/// node-local dev override only when no Config UTxO is configured).
+///
+/// The *effective* per-peg-out protocol fee is NOT here: since rev 5.1 it is
+/// pinned per request in the peg-out datum (see [`PegOutRequest::per_pegout_fee`]),
+/// and #13 below is only the floor that fee must clear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmParams {
+    /// Config #12 — the EXACT miner fee rate: `miner fee = vsize × rate`.
     pub fee_rate_sat_per_vb: u64,
+    /// Config #13 — the floor for a request's own datum-pinned `per_pegout_fee`.
+    /// A request paying less is skipped (it would under-pay the protocol).
+    pub per_pegout_fee_floor: Amount,
+    /// Config #14 — the minimum fBTC a PegOut request may lock. A request
+    /// locking less is skipped.
+    pub min_peg_out_fbtc: Amount,
+}
+
+impl TmParams {
+    /// Fee rate only, both selection floors disabled (zero).
+    ///
+    /// The shape of a Config that predates the operational-parameter append —
+    /// and of the dev/offline paths (`treasury-self-send`, `federation-spend`,
+    /// the mock/fixture chain), which are single-signer and so have no
+    /// cross-SPO agreement to lose.
+    #[must_use]
+    pub fn fee_rate_only(fee_rate_sat_per_vb: u64) -> Self {
+        Self {
+            fee_rate_sat_per_vb,
+            per_pegout_fee_floor: Amount::ZERO,
+            min_peg_out_fbtc: Amount::ZERO,
+        }
+    }
 }
 
 /// Freshness window for peg-out selection.
@@ -282,6 +318,14 @@ pub enum SkipReason {
     /// The same `por_id` appeared earlier in this very batch. Paying it twice
     /// would move BTC that the (idempotent) trie insert never accounts for.
     DuplicateRequest,
+    /// The locked fBTC is below `min_peg_out_fbtc` (Config #14) at the batch
+    /// snapshot slot — a request smaller than the protocol accepts.
+    BelowMinPegOut,
+    /// The request's own datum `per_pegout_fee` is below the protocol floor
+    /// (Config #13) at the batch snapshot slot. `peg-out.ak` binds completion to
+    /// the datum fee, so paying it would settle a withdrawal that never covered
+    /// the protocol's cost.
+    FeeBelowFloor,
 }
 
 impl fmt::Display for SkipReason {
@@ -295,6 +339,12 @@ impl fmt::Display for SkipReason {
                 write!(f, "too close to the peg-out cancel deadline")
             }
             Self::DuplicateRequest => write!(f, "duplicate request in this TM's batch"),
+            Self::BelowMinPegOut => {
+                write!(f, "locked amount below the Config min_peg_out_fbtc")
+            }
+            Self::FeeBelowFloor => {
+                write!(f, "datum per_pegout_fee below the Config floor")
+            }
         }
     }
 }
@@ -412,6 +462,8 @@ fn skip_reason_sort_key(r: &SkipReason) -> u8 {
         SkipReason::NotYetCreated => 3,
         SkipReason::NearCancelDeadline => 4,
         SkipReason::DuplicateRequest => 5,
+        SkipReason::BelowMinPegOut => 6,
+        SkipReason::FeeBelowFloor => 7,
     }
 }
 
@@ -464,7 +516,7 @@ pub fn build_tm(
     mut pegins: Vec<PegInInput>,
     mut pegouts: Vec<PegOutRequest>,
     change_script_pubkey: ScriptBuf,
-    fee_params: &FeeParams,
+    params: &TmParams,
     freshness: &Freshness,
     cpo: &dyn CpoTrieView,
 ) -> Result<UnsignedTm, TmBuildError> {
@@ -473,8 +525,8 @@ pub fn build_tm(
     // datum (anyone can lock fBTC at the permissionlessly-payable peg_out.ak
     // address). SKIP a request the TM cannot safely pay rather than fail the
     // whole TM — one tiny/hostile peg-out must not block every peg-in and
-    // peg-out (bridge-wide liveness DoS). The user reclaims via Cancel. Four ways
-    // a request is unpayable HERE; payment history is the fifth, and since WI-031 it
+    // peg-out (bridge-wide liveness DoS). The user reclaims via Cancel. Five ways
+    // a request is unpayable HERE; payment history is the sixth, and since WI-031 it
     // is decided here too, from the `por_id` trie the caller hands in:
     //
     //  (1) Non-standard destination scriptPubKey. An empty script is
@@ -493,12 +545,19 @@ pub fn build_tm(
     //  (4) Outside the freshness window: `created` in the future, or within
     //      `margin_ms` of `created + PEG_OUT_CANCEL_TIMEOUT_MS`. A request the
     //      owner can cancel after taking the BTC is a treasury double spend.
+    //  (5) Below an Operational-params floor: locked fBTC under `min_peg_out_fbtc`
+    //      (Config #14), or a datum `per_pegout_fee` under the protocol floor
+    //      (Config #13). Neither is checked when the request is created — anyone
+    //      can write a `PegOutDatum` directly at the permissionless address — so
+    //      this skip is where the two governance bounds are actually enforced.
     //
     // DETERMINISM: every SPO must skip the SAME set to build byte-identical TMs
     // for FROST. (1) is network-independent, (2) now reads a datum-pinned fee so
     // it is a consensus value, (3) is consensus once the trie is chain-attested,
-    // and (4) is consensus only insofar as `freshness.now_ms` is chain-derived —
-    // see [`Freshness`].
+    // (4) is consensus only insofar as `freshness.now_ms` is chain-derived —
+    // see [`Freshness`] — and (5) is consensus because both floors come from the
+    // Config UTxO read at the batch snapshot slot, never from `heimdall.toml`
+    // (see [`TmParams`]).
     let mut skipped_pegouts = Vec::new();
     // Every `por_id` already accepted into THIS TM.
     //
@@ -529,6 +588,12 @@ pub fn build_tm(
         }
         if !seen_por_ids.insert(po.por_id) {
             return skip(SkipReason::DuplicateRequest);
+        }
+        if po.amount < params.min_peg_out_fbtc {
+            return skip(SkipReason::BelowMinPegOut);
+        }
+        if po.per_pegout_fee < params.per_pegout_fee_floor {
+            return skip(SkipReason::FeeBelowFloor);
         }
         if po.created > freshness.now_ms {
             return skip(SkipReason::NotYetCreated);
@@ -650,7 +715,7 @@ pub fn build_tm(
     // The commitment output's scriptPubKey is 39 bytes, 5 more than the 34-byte
     // budget `estimate_vsize` assumes per output.
     let vsize = estimate_vsize(num_inputs, num_outputs) + CPO_COMMITMENT_EXTRA_VBYTES;
-    let miner_fee = Amount::from_sat(vsize * fee_params.fee_rate_sat_per_vb);
+    let miner_fee = Amount::from_sat(vsize * params.fee_rate_sat_per_vb);
 
     let required = total_pegout.checked_add(miner_fee).expect("no overflow");
     if total_input < required {
@@ -1080,14 +1145,14 @@ mod tests {
         pegins: Vec<PegInInput>,
         pegouts: Vec<PegOutRequest>,
         change_script_pubkey: ScriptBuf,
-        fee_params: &FeeParams,
+        params: &TmParams,
     ) -> Result<UnsignedTm, TmBuildError> {
         build_tm(
             treasury,
             pegins,
             pegouts,
             change_script_pubkey,
-            fee_params,
+            params,
             &fresh(),
             &empty_cpo(),
         )
@@ -1121,10 +1186,8 @@ mod tests {
         }
     }
 
-    fn default_fee_params() -> FeeParams {
-        FeeParams {
-            fee_rate_sat_per_vb: 10,
-        }
+    fn default_params() -> TmParams {
+        TmParams::fee_rate_only(10)
     }
 
     fn change_address() -> ScriptBuf {
@@ -1148,13 +1211,13 @@ mod tests {
         let sk = sk_from_seed([1u8; 32]);
         assert_eq!(sk.x_only_public_key(&secp).0, xonly_from_seed([1u8; 32]));
 
-        let fee_params = default_fee_params();
+        let params = default_params();
         let tm = build_tm_t(
             make_treasury_input(0xAA, 1_000_000),
             vec![make_pegin_input(0xBB, 0, 500_000)],
             vec![],
             change_address(),
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -1220,7 +1283,7 @@ mod tests {
             }],
             vec![],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
 
@@ -1248,7 +1311,7 @@ mod tests {
 
     #[test]
     fn test_build_tm_deterministic() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let change = change_address();
 
         let build = || {
@@ -1257,7 +1320,7 @@ mod tests {
                 vec![make_pegin_input(0xBB, 0, 5_000_000)],
                 vec![make_pegout(0x10, 100_000)],
                 change.clone(),
-                &fee_params,
+                &params,
             )
             .unwrap()
         };
@@ -1271,7 +1334,7 @@ mod tests {
 
     #[test]
     fn test_input_ordering() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let change = change_address();
         let treasury_txid_byte = 0xFF;
 
@@ -1287,7 +1350,7 @@ mod tests {
             pegins,
             vec![make_pegout(0x10, 50_000)],
             change,
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -1306,7 +1369,7 @@ mod tests {
 
     #[test]
     fn test_output_ordering() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let change = change_address();
 
         // Create pegouts with script_pubkeys that sort in a known order
@@ -1329,7 +1392,7 @@ mod tests {
             vec![],
             vec![po1, po2, po3],
             change.clone(),
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -1350,7 +1413,7 @@ mod tests {
 
     #[test]
     fn test_fee_deduction() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let change = change_address();
 
         let tm = build_tm_t(
@@ -1358,7 +1421,7 @@ mod tests {
             vec![make_pegin_input(0xBB, 0, 5_000_000)],
             vec![make_pegout(0x10, 100_000)],
             change,
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -1368,14 +1431,14 @@ mod tests {
         // bytes its 39-byte scriptPubKey costs over the 34-byte assumption.
         let vsize =
             estimate_vsize(tm.tx.input.len(), tm.tx.output.len()) + CPO_COMMITMENT_EXTRA_VBYTES;
-        let expected_fee = vsize * fee_params.fee_rate_sat_per_vb;
+        let expected_fee = vsize * params.fee_rate_sat_per_vb;
 
         assert_eq!(total_in - total_out, expected_fee);
     }
 
     #[test]
     fn test_pegout_protocol_fee() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let change = change_address();
         let requested = 100_000u64;
 
@@ -1384,7 +1447,7 @@ mod tests {
             vec![],
             vec![make_pegout(0x10, requested)],
             change,
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -1397,7 +1460,7 @@ mod tests {
     // peg-out must not block the whole sweep.
     #[test]
     fn test_subdust_pegouts_are_skipped_not_fatal() {
-        let fee_params = default_fee_params(); // per_pegout_fee = 1000, dust = 330
+        let params = default_params(); // per_pegout_fee = 1000, dust = 330
         let change = change_address();
 
         let tm = build_tm_t(
@@ -1409,7 +1472,7 @@ mod tests {
                 make_pegout(0x12, 1_200),   // net 200 < dust -> skip
             ],
             change,
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -1434,7 +1497,7 @@ mod tests {
     // lose funds or make the TM non-relayable.
     #[test]
     fn test_nonstandard_destination_pegouts_are_skipped() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let pegouts = vec![
             make_pegout(0x10, 100_000), // P2TR — payable
             PegOutRequest {
@@ -1451,7 +1514,7 @@ mod tests {
             vec![],
             pegouts,
             change_address(),
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -1469,7 +1532,7 @@ mod tests {
     // a spk-only sort leaves to the caller's ordering.
     #[test]
     fn test_pegout_ordering_is_total_across_equal_destinations() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         // Same destination, different amounts — plus a second destination.
         let build = |pegouts| {
             build_tm_t(
@@ -1477,7 +1540,7 @@ mod tests {
                 vec![],
                 pegouts,
                 change_address(),
-                &fee_params,
+                &params,
             )
             .unwrap()
         };
@@ -1501,13 +1564,13 @@ mod tests {
     // all skipped) rather than aborting.
     #[test]
     fn test_all_pegouts_skipped_still_builds() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let tm = build_tm_t(
             make_treasury_input(0xAA, 10_000_000),
             vec![],
             vec![make_pegout(0x11, 500), make_pegout(0x12, 900)],
             change_address(),
-            &fee_params,
+            &params,
         )
         .unwrap();
         assert_eq!(tm.tx.output.len(), 2); // change + commitment only
@@ -1543,7 +1606,7 @@ mod tests {
                 vec![],
                 pegouts,
                 change_address(),
-                &default_fee_params(),
+                &default_params(),
             )
             .unwrap();
             let last = tm.tx.output.last().unwrap();
@@ -1576,7 +1639,7 @@ mod tests {
             vec![],
             vec![],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
             &fresh(),
             &trie,
         )
@@ -1604,7 +1667,7 @@ mod tests {
             vec![],
             vec![make_pegout(0x11, 500), make_pegout(0x10, 100_000)],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
 
@@ -1628,7 +1691,7 @@ mod tests {
                 vec![],
                 pegouts,
                 change_address(),
-                &default_fee_params(),
+                &default_params(),
             )
             .unwrap()
         };
@@ -1667,7 +1730,7 @@ mod tests {
                 vec![],
                 pegouts,
                 change_address(),
-                &default_fee_params(),
+                &default_params(),
             )
             .unwrap()
         };
@@ -1707,7 +1770,7 @@ mod tests {
             vec![],
             vec![hostile],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
         assert_eq!(tm.skipped_pegouts.len(), 1);
@@ -1722,7 +1785,7 @@ mod tests {
             vec![],
             vec![],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
         // Two commitments — what the on-chain validator refuses to choose between.
@@ -1751,7 +1814,7 @@ mod tests {
             vec![],
             vec![a, b],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
         let mut paid: Vec<u64> = tm.fulfilled.iter().map(|f| f.net_amount.to_sat()).collect();
@@ -1770,7 +1833,7 @@ mod tests {
             vec![],
             vec![payable, dusty],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
         assert_eq!(tm.fulfilled.len(), 1);
@@ -1794,7 +1857,7 @@ mod tests {
             vec![],
             vec![stale],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
         assert!(tm.fulfilled.is_empty());
@@ -1811,7 +1874,7 @@ mod tests {
                 vec![],
                 vec![make_pegout_full(0x10, 100_000, TEST_FEE, created)],
                 change_address(),
-                &default_fee_params(),
+                &default_params(),
             )
             .unwrap()
         };
@@ -1832,7 +1895,7 @@ mod tests {
             vec![],
             vec![make_pegout_full(0x10, 100_000, TEST_FEE, NOW_MS + 1)],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
         assert!(tm.fulfilled.is_empty());
@@ -1847,7 +1910,7 @@ mod tests {
             vec![],
             vec![make_pegout_full(0x10, 100_000, TEST_FEE, i64::MAX)],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
         assert!(tm.fulfilled.is_empty());
@@ -1876,7 +1939,7 @@ mod tests {
             vec![],
             vec![make_pegout(0x10, 100_000), make_pegout(0x11, 200_000)],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
             &fresh(),
             &trie,
         )
@@ -1899,7 +1962,7 @@ mod tests {
             vec![],
             vec![make_pegout(0x10, 100_000), make_pegout(0x10, 100_000)],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
 
@@ -1914,6 +1977,81 @@ mod tests {
                 .root_after(&[(&tm.fulfilled[0]).into()])
                 .unwrap()
         );
+    }
+
+    // Config #14: a request locking less fBTC than the protocol minimum is skipped,
+    // not paid. Nothing checks this when the request is created — the peg-out
+    // address is permissionless — so the TM builder is where the bound bites.
+    #[test]
+    fn a_pegout_below_min_peg_out_fbtc_is_skipped() {
+        let params = TmParams {
+            min_peg_out_fbtc: Amount::from_sat(100_000),
+            ..default_params()
+        };
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            // 99_999 is one satoshi short; 100_000 is exactly at the floor and passes
+            // (the bound is inclusive, matching `>=` in the spec's minimum).
+            vec![make_pegout(0x10, 99_999), make_pegout(0x11, 100_000)],
+            change_address(),
+            &params,
+        )
+        .unwrap();
+
+        assert_eq!(tm.fulfilled.len(), 1);
+        assert_eq!(tm.skipped_pegouts.len(), 1);
+        assert_eq!(tm.skipped_pegouts[0].amount, Amount::from_sat(99_999));
+        assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::BelowMinPegOut);
+    }
+
+    // Config #13: the floor is on the request's OWN datum-pinned fee, which is what
+    // `peg-out.ak` binds completion to — so an under-paying request must not be
+    // settled at all rather than settled at the floor.
+    #[test]
+    fn a_pegout_under_the_fee_floor_is_skipped() {
+        let params = TmParams {
+            per_pegout_fee_floor: Amount::from_sat(TEST_FEE),
+            ..default_params()
+        };
+        let tm = build_tm(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![
+                make_pegout_full(0x10, 100_000, TEST_FEE - 1, NOW_MS - DAY_MS),
+                make_pegout_full(0x11, 100_000, TEST_FEE, NOW_MS - DAY_MS),
+            ],
+            change_address(),
+            &params,
+            &fresh(),
+            &empty_cpo(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            tm.fulfilled.len(),
+            1,
+            "only the request at the floor is paid"
+        );
+        assert_eq!(tm.skipped_pegouts.len(), 1);
+        assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::FeeBelowFloor);
+    }
+
+    // Zero floors (a Config that predates the operational-parameter append, and every
+    // single-signer dev path) leave the two rules inert — the pre-WI-040 behaviour.
+    #[test]
+    fn zero_floors_skip_nothing() {
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![make_pegout_full(0x10, 1_000, 0, NOW_MS - DAY_MS)],
+            change_address(),
+            &TmParams::fee_rate_only(10),
+        )
+        .unwrap();
+
+        assert_eq!(tm.fulfilled.len(), 1);
+        assert!(tm.skipped_pegouts.is_empty());
     }
 
     // Two DISTINCT requests that happen to pay the same destination and amount are
@@ -1932,7 +2070,7 @@ mod tests {
                 },
             ],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
         assert_eq!(tm.fulfilled.len(), 2);
@@ -1950,7 +2088,7 @@ mod tests {
             vec![],
             vec![make_pegout(0x10, 100_000)],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
             &fresh(),
             &trie,
         )
@@ -1973,7 +2111,7 @@ mod tests {
             vec![],
             vec![make_pegout(0x10, 100_000)],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
             &fresh(),
             &leader_trie,
         )
@@ -1993,7 +2131,7 @@ mod tests {
             vec![],
             vec![make_pegout(0x10, 100_000)],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
             &fresh(),
             &trie,
         )
@@ -2013,7 +2151,7 @@ mod tests {
             vec![],
             vec![],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
         tm.tx
@@ -2024,7 +2162,7 @@ mod tests {
 
     #[test]
     fn test_insufficient_funds_error() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let change = change_address();
 
         let result = build_tm_t(
@@ -2032,7 +2170,7 @@ mod tests {
             vec![],
             vec![make_pegout(0x10, 100_000)],
             change,
-            &fee_params,
+            &params,
         );
 
         assert!(matches!(
@@ -2045,7 +2183,7 @@ mod tests {
 
     #[test]
     fn test_no_pegins() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let change = change_address();
 
         let tm = build_tm_t(
@@ -2053,7 +2191,7 @@ mod tests {
             vec![],
             vec![make_pegout(0x10, 100_000)],
             change,
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -2063,9 +2201,7 @@ mod tests {
 
     #[test]
     fn test_no_pegouts() {
-        let fee_params = FeeParams {
-            fee_rate_sat_per_vb: 10,
-        };
+        let params = TmParams::fee_rate_only(10);
         let change = change_address();
 
         let tm = build_tm_t(
@@ -2073,7 +2209,7 @@ mod tests {
             vec![make_pegin_input(0xBB, 0, 5_000_000)],
             vec![],
             change,
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -2083,9 +2219,7 @@ mod tests {
 
     #[test]
     fn test_no_pegins_no_pegouts() {
-        let fee_params = FeeParams {
-            fee_rate_sat_per_vb: 10,
-        };
+        let params = TmParams::fee_rate_only(10);
         let change = change_address();
 
         let tm = build_tm_t(
@@ -2093,7 +2227,7 @@ mod tests {
             vec![],
             vec![],
             change,
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -2105,7 +2239,7 @@ mod tests {
 
     #[test]
     fn test_sighash_count_matches_inputs() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let change = change_address();
 
         let tm = build_tm_t(
@@ -2113,7 +2247,7 @@ mod tests {
             vec![make_pegin_input(0xBB, 0, 5_000_000)],
             vec![make_pegout(0x10, 100_000)],
             change,
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -2123,7 +2257,7 @@ mod tests {
 
     #[test]
     fn test_sighash_differs_per_input() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let change = change_address();
 
         let tm = build_tm_t(
@@ -2134,7 +2268,7 @@ mod tests {
             ],
             vec![make_pegout(0x10, 100_000)],
             change,
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -2149,7 +2283,7 @@ mod tests {
 
     #[test]
     fn test_sighash_deterministic() {
-        let fee_params = default_fee_params();
+        let params = default_params();
         let change = change_address();
 
         let build = || {
@@ -2158,7 +2292,7 @@ mod tests {
                 vec![make_pegin_input(0xBB, 0, 5_000_000)],
                 vec![make_pegout(0x10, 100_000)],
                 change.clone(),
-                &fee_params,
+                &params,
             )
             .unwrap()
         };
@@ -2198,7 +2332,7 @@ mod tests {
         let treasury_script_pubkey = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
 
         // Build a simple TM: one treasury input, one pegout, change back
-        let fee_params = default_fee_params();
+        let params = default_params();
         let tm = build_tm_t(
             TreasuryInput {
                 outpoint: OutPoint {
@@ -2211,7 +2345,7 @@ mod tests {
             vec![],
             vec![make_pegout(0x10, 100_000)],
             treasury_script_pubkey.clone(),
-            &fee_params,
+            &params,
         )
         .unwrap();
 
@@ -2291,7 +2425,7 @@ mod tests {
             vec![],
             vec![],
             change_address(),
-            &default_fee_params(),
+            &default_params(),
         )
         .unwrap();
 

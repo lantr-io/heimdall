@@ -31,11 +31,12 @@ use frost_secp256k1_tr::Identifier;
 use frost_secp256k1_tr::keys::dkg::{round1, round2};
 use tokio::sync::Notify;
 
+use crate::bitcoin::tm_builder::TmParams;
 use crate::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
 use crate::epoch::state::{EpochError, EpochResult, Roster, SpoInfo};
 use crate::epoch::traits::{
-    CardanoChain, Clock, CycleRng, DkgFaultEvidence, EpochBoundaryEvent, PeerNetwork,
-    PegOutRequestUtxo, RngSource, TreasuryUtxo, UpdateYPlan,
+    BatchSnapshot, CardanoChain, Clock, CycleRng, DkgFaultEvidence, EpochBoundaryEvent,
+    PeerNetwork, PegOutRequestUtxo, RngSource, TreasuryUtxo, UpdateYPlan,
 };
 use crate::http::wire::{DkgNamespace, SignNamespace};
 
@@ -333,10 +334,27 @@ impl CardanoChain for MockCardanoChain {
             y_51,
             y_fed,
             federation_csv_blocks: self.fixture.federation_csv_blocks,
-            fee_rate_sat_per_vb: self.fixture.fee_rate_sat_per_vb,
-            per_pegout_fee: self.fixture.per_pegout_fee,
             btc_confirmed: true,
         })
+    }
+
+    /// The fixture stands in for the Config UTxO here: the mock bridge has one
+    /// parameter set, shared by every node in the test, which is exactly the
+    /// property the real Config provides. `now_ms` stays the local clock (the trait
+    /// default) — mock fixtures carry wall-clock `created` times.
+    async fn query_batch_snapshot(&self) -> EpochResult<BatchSnapshot> {
+        Ok(BatchSnapshot::local_override(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+            TmParams {
+                fee_rate_sat_per_vb: self.fixture.fee_rate_sat_per_vb,
+                per_pegout_fee_floor: self.fixture.per_pegout_fee_floor,
+                min_peg_out_fbtc: self.fixture.min_peg_out_fbtc,
+            },
+            "mock chain (StaticFixture)",
+        ))
     }
 
     async fn is_tm_confirmed(&self, _txid: &bitcoin::Txid) -> EpochResult<bool> {
