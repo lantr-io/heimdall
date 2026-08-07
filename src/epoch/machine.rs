@@ -774,6 +774,67 @@ async fn collect_pegins_phase(
     })
 }
 
+/// Freeze the open peg-out set against this batch (spec §TM batches; plan N19).
+///
+/// Three rules, in the order the spec states them: drop anything created after the
+/// batch's stability cutoff `C_i`, order the survivors by the FIFO total order
+/// `(creation slot, creating txid, output index)`, and take the first
+/// `max_pegouts_per_tm`. Everything held back is a candidate for a later batch —
+/// since rev 5.1 retired the peg-out treasury-outpoint pin, an unpicked peg-out is
+/// merely delayed, not stranded.
+///
+/// Without a grid (`snapshot.batch == None`: mock chains, and deployments whose
+/// Config predates the `schedule` append) the cutoff cannot be computed and is
+/// skipped, which is the pre-N19 behaviour. The FIFO order and the capacity cap are
+/// pure and apply regardless — they cost nothing and remove the last dependence on
+/// the order the chain query happened to answer in.
+fn freeze_pegouts(
+    pegouts: Vec<crate::epoch::traits::PegOutRequestUtxo>,
+    snapshot: &crate::epoch::traits::BatchSnapshot,
+    me: frost::Identifier,
+    epoch: u64,
+) -> Vec<crate::epoch::traits::PegOutRequestUtxo> {
+    use crate::epoch::batch::{Caps, FifoKey, SpendVariant, freeze};
+
+    // heimdall builds key-path (51% FROST) movements; the federation script path is
+    // the emergency spend, which carries no peg-outs.
+    let cap = Caps::for_variant(SpendVariant::KeyPath).max_pegouts;
+    let key = |p: &crate::epoch::traits::PegOutRequestUtxo| FifoKey {
+        // An unresolved creation slot sorts last and — under a real cutoff — is
+        // deferred by `u64::MAX > C_i`. Failing closed is the right way round: a
+        // request we cannot place in time must not be signed into a batch our peers
+        // would place differently.
+        created_slot: p.created_slot.unwrap_or(u64::MAX),
+        tx_hash: p.outpoint[..32].try_into().unwrap_or([0u8; 32]),
+        output_index: u32::from_le_bytes(p.outpoint[32..].try_into().unwrap_or([0u8; 4])),
+    };
+
+    let Some(batch) = snapshot.batch.open() else {
+        // No grid: cap and order only.
+        let mut ordered = pegouts;
+        ordered.sort_by_key(&key);
+        ordered.truncate(cap);
+        return ordered;
+    };
+
+    let frozen = freeze(pegouts, batch, cap, key);
+    if frozen.deferred() > 0 {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  batch B_{} (slot {}, cutoff {}): {} peg-out(s) frozen, {} newer than the cutoff, \
+             {} over the {cap}-peg-out capacity — all deferred to a later batch",
+            batch.index,
+            batch.slot,
+            batch.cutoff_slot,
+            frozen.selected.len(),
+            frozen.too_new.len(),
+            frozen.over_cap.len(),
+        );
+    }
+    frozen.selected
+}
+
 // ---------------------------------------------------------------------------
 // build_tm
 // ---------------------------------------------------------------------------
@@ -1050,6 +1111,13 @@ async fn build_tm_phase(
             Vec::new()
         }
     };
+
+    // WI-040/WI-041: freeze the peg-out set against the batch, not against this
+    // node's wall clock. `query_pegout_requests` above answers "open right now",
+    // and "now" differs by seconds between SPOs — a request locked inside that skew
+    // gives one node an extra output, a different txid, and an invalid aggregate.
+    // The batch cutoff makes membership a function of the snapshot slot instead.
+    let pegouts = freeze_pegouts(pegouts, &snapshot, me, epoch);
 
     let pegout_requests: Vec<PegOutRequest> = pegouts
         .into_iter()
@@ -1519,12 +1587,14 @@ mod tests {
         fixture.pegouts.push(StaticPegOut {
             script_pubkey: paid_dest.clone(),
             amount: Amount::from_sat(50_000),
+            created_slot: 0,
             created: now,
         });
         // Created so long ago that its cancel deadline is within the freshness margin.
         fixture.pegouts.push(StaticPegOut {
             script_pubkey: stale_dest.clone(),
             amount: Amount::from_sat(60_000),
+            created_slot: 0,
             created: now - crate::bitcoin::tm_builder::PEG_OUT_CANCEL_TIMEOUT_MS + 1_000,
         });
 
@@ -1603,11 +1673,13 @@ mod tests {
         fixture.pegouts.push(StaticPegOut {
             script_pubkey: payable.clone(),
             amount: Amount::from_sat(50_000),
+            created_slot: 0,
             created: now,
         });
         fixture.pegouts.push(StaticPegOut {
             script_pubkey: too_small.clone(),
             amount: Amount::from_sat(30_000),
+            created_slot: 0,
             created: now,
         });
 
@@ -1644,6 +1716,79 @@ mod tests {
         assert_eq!(tms[1].txid, tms[0].txid);
     }
 
+    /// WI-041's acceptance, end to end: batch membership is a function of the batch,
+    /// not of the moment each node scanned. Two nodes see the SAME open peg-outs — one
+    /// created after the batch's stability cutoff — and both exclude it, so their TM
+    /// bytes agree. Before the freeze, a request landing in the seconds between two
+    /// nodes' scans put an extra output in one node's TM and broke the aggregate.
+    #[tokio::test]
+    async fn daemon_freezes_pegouts_at_the_batch_cutoff() {
+        use crate::epoch::batch::BatchSlot;
+        use crate::epoch::fixture::StaticPegOut;
+        use bitcoin::Amount;
+
+        let batch = BatchSlot {
+            index: 3,
+            slot: 5_000_000,
+            cutoff_slot: 4_900_000,
+        };
+        let mut fixture = demo_static_fixture(2, 2, 18_950);
+        let payable = p2wpkh(0x11);
+        let too_new = p2wpkh(0x12);
+        let now = now_ms();
+
+        fixture.pegouts.push(StaticPegOut {
+            script_pubkey: payable.clone(),
+            amount: Amount::from_sat(50_000),
+            created_slot: batch.cutoff_slot, // exactly at the cutoff: in
+            created: now,
+        });
+        fixture.pegouts.push(StaticPegOut {
+            script_pubkey: too_new.clone(),
+            amount: Amount::from_sat(60_000),
+            created_slot: batch.cutoff_slot + 1, // one slot too new: out
+            created: now,
+        });
+
+        let empty_root = crate::cardano::cpo_trie::CpoTrie::empty().root();
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone())
+                    .with_cpo_root(empty_root)
+                    .with_batch(batch),
+            );
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(h.await.unwrap().expect("epoch cycle completes"));
+        }
+
+        let outputs = &tms[0].unsigned_tx.output;
+        assert!(
+            outputs.iter().any(|o| o.script_pubkey == payable),
+            "a request at the cutoff is in the batch"
+        );
+        assert!(
+            outputs.iter().all(|o| o.script_pubkey != too_new),
+            "a request created after the cutoff must wait for a later batch"
+        );
+        assert_eq!(
+            tms[1].txid, tms[0].txid,
+            "both SPOs freeze the identical batch, so the TM bytes agree"
+        );
+    }
+
     /// The double-pay guard on the daemon path, WI-031 shape: a request an earlier movement
     /// already paid is recorded in the completed-peg-outs trie under its `por_id`, and
     /// `build_tm` skips it (`SkipReason::AlreadyCompleted`) even though its UTxO is still
@@ -1670,6 +1815,7 @@ mod tests {
             fixture.pegouts.push(StaticPegOut {
                 script_pubkey: dest.clone(),
                 amount: gross,
+                created_slot: 0,
                 created: now,
             });
         }
@@ -1744,6 +1890,7 @@ mod tests {
         fixture.pegouts.push(StaticPegOut {
             script_pubkey: dest.clone(),
             amount: Amount::from_sat(50_000),
+            created_slot: 0,
             created: now_ms(),
         });
 

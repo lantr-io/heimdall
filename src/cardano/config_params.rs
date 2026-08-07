@@ -57,6 +57,7 @@ use pallas_primitives::PlutusData;
 use crate::bitcoin::tm_builder::TmParams;
 use crate::cardano::bf_http::{self, BfUtxo};
 use crate::cardano::plutus;
+use crate::epoch::batch::{BatchWindow, GridParams};
 
 /// Field count of a Config datum carrying the operational-parameter append
 /// (#12–#16 on top of upstream's 12 fields, `initial_btc_treasury_utxo` last).
@@ -443,6 +444,90 @@ pub async fn fetch_param_snapshot(
          (last read {}) — refusing to build a batch whose parameters no other SPO would \
          reproduce",
         last.map_or_else(|| "<none>".to_string(), |s| s.config.utxo.to_string()),
+    ))
+}
+
+/// Where `snapshot` stands on the TM batch grid (spec §TM batches; plan N19).
+///
+/// Shared by both TM drivers — the epoch-machine daemon and the CLI sweep — because
+/// a grid derived two ways is a grid two SPOs can disagree about. The anchor (the
+/// epoch boundary) and the pitch (the Config `schedule`) both come from the chain: a
+/// node deriving either locally would freeze a different batch than its peers, which
+/// is the failure this whole mechanism exists to prevent. A missing schedule
+/// (pre-append Config) or an unreadable epoch boundary is reported and degrades to
+/// "no cutoff", never to a guessed one.
+pub async fn batch_at(
+    bf_base_url: &str,
+    bf_project_id: &str,
+    snapshot: &ParamSnapshot,
+) -> BatchWindow {
+    let Some(schedule) = snapshot
+        .config
+        .params
+        .tunables
+        .as_ref()
+        .map(|t| &t.schedule)
+    else {
+        return BatchWindow::NoGrid;
+    };
+    let epoch_start_slot = match epoch_start_slot(bf_base_url, bf_project_id, snapshot).await {
+        Ok(slot) => slot,
+        Err(e) => {
+            eprintln!(
+                "[batch] no epoch anchor ({e}) — building without the batch membership cutoff; \
+                 peg-out selection falls back to whatever is open at this instant"
+            );
+            return BatchWindow::NoGrid;
+        }
+    };
+    let Ok(interval) = u64::try_from(schedule.tm_batch_interval) else {
+        return BatchWindow::NoGrid;
+    };
+    let stability = u64::try_from(schedule.stability_window).unwrap_or(0);
+    let final_cutoff = u64::try_from(schedule.final_tm_cutoff)
+        .ok()
+        .map(|c| epoch_start_slot.saturating_add(c));
+    let grid = match GridParams::new(epoch_start_slot, interval, stability, final_cutoff) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[batch] unusable schedule ({e}) — building without the cutoff");
+            return BatchWindow::NoGrid;
+        }
+    };
+    match grid.current(snapshot.slot) {
+        Some(b) => BatchWindow::Open(b),
+        None => {
+            let next = grid.next(snapshot.slot);
+            eprintln!(
+                "[batch] slot {} is outside this epoch's batch grid (before B_1, or past \
+                 final_tm_cutoff) — the opportunity passes unused; next: {}",
+                snapshot.slot,
+                next.map_or_else(
+                    || "none this epoch".to_string(),
+                    |b| format!("B_{} at slot {}", b.index, b.slot)
+                )
+            );
+            BatchWindow::Closed { next }
+        }
+    }
+}
+
+/// Absolute slot of the current epoch's boundary.
+///
+/// Blockfrost reports the boundary as a TIME, so it is converted with the exact
+/// post-Shelley 1-slot-per-second identity against the snapshot's own (slot, time)
+/// pair — the same conversion every other SPO performs on the same chain facts.
+async fn epoch_start_slot(
+    bf_base_url: &str,
+    bf_project_id: &str,
+    snapshot: &ParamSnapshot,
+) -> Result<u64, String> {
+    let epoch = bf_http::fetch_current_epoch(bf_base_url, bf_project_id).await?;
+    let start_ms = bf_http::fetch_epoch_start_ms(bf_base_url, bf_project_id, epoch).await?;
+    Ok(bf_http::slot_at_time(
+        snapshot.slot,
+        snapshot.time_ms,
+        start_ms,
     ))
 }
 

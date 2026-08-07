@@ -52,6 +52,11 @@ pub struct PegOutRequestUtxo {
     pub por_id: [u8; 32],
     /// The request's Cardano outpoint, 36 bytes (tx hash ‖ output index LE).
     pub outpoint: [u8; 36],
+    /// Absolute Cardano slot this request UTxO was created at — the TM batch
+    /// cutoff's input, and the leading component of the FIFO order (see
+    /// [`crate::epoch::batch`]). NOT the datum's requester-set `created`, which
+    /// anyone may backdate. `None` = unresolved, which defers the request.
+    pub created_slot: Option<u64>,
 }
 
 /// The current treasury UTxO state, as reported by the Cardano-side
@@ -103,6 +108,13 @@ pub struct BatchSnapshot {
     /// Chain "now", POSIX milliseconds — the tip block's time. A CHAIN time
     /// converges across nodes; a local wall clock does not.
     pub now_ms: i64,
+    /// Absolute Cardano slot of the snapshot.
+    pub slot: u64,
+    /// Where this snapshot stands on the TM batch grid (spec §TM batches).
+    /// `Open` carries the membership cutoff; `Closed` means the opportunity passes
+    /// unused; `NoGrid` is the dev/mock case, where no cutoff is applied at all.
+    /// FIFO order and the capacity caps are pure and apply in every case.
+    pub batch: crate::epoch::batch::BatchWindow,
     /// Operational parameters in force at the snapshot — Config #12–#14. (#16, the
     /// schedule, is not here: nothing in TM construction consumes it. It is decoded
     /// by `cardano::config_params` and reported by `show-config-params` / the
@@ -123,6 +135,8 @@ impl BatchSnapshot {
     ) -> Self {
         Self {
             now_ms,
+            slot: 0,
+            batch: crate::epoch::batch::BatchWindow::NoGrid,
             tm_params,
             source: crate::cardano::config_params::ParamSource::LocalOverride(why),
         }

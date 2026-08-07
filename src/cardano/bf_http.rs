@@ -201,6 +201,63 @@ pub async fn fetch_tx_block_time(
         .ok_or_else(|| format!("txs/{tx_hash}: missing/non-numeric `block_time`"))
 }
 
+/// Where a transaction sits on the chain: its absolute slot when the backend
+/// reports one, and its block time.
+///
+/// The slot is what the TM batch grid needs (spec §TM batches: membership is
+/// "created at or before `C_i`", and `C_i` is a slot). Blockfrost reports `slot`
+/// directly; a Blockfrost-compatible backend that omits it leaves `slot: None`
+/// and the caller derives it with [`slot_at_time`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxPoint {
+    pub slot: Option<u64>,
+    pub block_time_secs: i64,
+}
+
+/// `/txs/{hash}` → the transaction's chain position.
+pub async fn fetch_tx_point(
+    base_url: &str,
+    project_id: &str,
+    tx_hash: &str,
+) -> Result<TxPoint, String> {
+    let url = format!("{base_url}/txs/{tx_hash}");
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("txs/{tx_hash} request: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("txs/{tx_hash} json: {e}"))?;
+    let block_time_secs = v
+        .get("block_time")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("txs/{tx_hash}: missing/non-numeric `block_time`"))?;
+    Ok(TxPoint {
+        slot: v.get("slot").and_then(serde_json::Value::as_u64),
+        block_time_secs,
+    })
+}
+
+/// The slot of a block at `block_time_ms`, derived from a known `(slot, time)`
+/// pair on the same chain.
+///
+/// Post-Shelley slots are exactly one second, so this is an exact identity rather
+/// than an estimate — which is what makes it safe for a consensus input: two SPOs
+/// holding DIFFERENT reference pairs still derive the same slot for the same
+/// block. Only used when the backend omits `slot` (yaci-devkit); Blockfrost
+/// reports it and this is not consulted.
+#[must_use]
+pub fn slot_at_time(ref_slot: u64, ref_time_ms: i64, block_time_ms: i64) -> u64 {
+    let delta_secs = (block_time_ms - ref_time_ms) / 1000;
+    if delta_secs >= 0 {
+        ref_slot.saturating_add(delta_secs as u64)
+    } else {
+        ref_slot.saturating_sub(delta_secs.unsigned_abs())
+    }
+}
+
 /// Return whether a Cardano transaction is included in the indexed chain.
 /// Blockfrost returns 404 while a submitted transaction is still pending (or
 /// has expired from the mempool), so callers can distinguish pending from an

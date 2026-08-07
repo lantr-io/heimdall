@@ -6,6 +6,7 @@
 //! variant carries all data needed to resume that phase; transitions
 //! happen inside `run_epoch_loop`'s match arm.
 
+pub mod batch;
 pub mod dkg;
 pub mod fixture;
 pub mod log;

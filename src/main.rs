@@ -669,10 +669,13 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
-    /// Background auto-mover (WI-028): every `--interval-secs`, chain-source the
-    /// current treasury from Cardano (no config edits), collect pending peg-ins +
-    /// peg-outs, and — if the treasury is free and there is work — build, FROST-sign
-    /// and post the next Treasury Movement. Skips ticks when nothing is pending or a
+    /// Background auto-mover (WI-028, N19): at each batch opportunity on the
+    /// protocol's slot grid — B_i = epoch_start + i*tm_batch_interval, from the Config
+    /// `schedule` — chain-source the current treasury from Cardano (no config edits),
+    /// freeze the peg-ins + peg-outs eligible at that batch's stability cutoff, and —
+    /// if the treasury is free and there is work — build, FROST-sign and post the next
+    /// Treasury Movement. Falls back to `--interval-secs` ticks when no grid is
+    /// configured. Skips ticks when nothing is pending or a
     /// movement is already in flight (waits for binocular `confirm-tmtx` to advance
     /// the tip). Runs on the CURRENT contracts with no leader election, so run ONE
     /// instance per bridge. Use `--once` for a single tick and omit `--broadcast`
@@ -698,7 +701,10 @@ enum Commands {
         /// Falls back to `cardano.bridged_token_unit` if omitted.
         #[arg(long)]
         bridged_token_unit: Option<String>,
-        /// Seconds between ticks.
+        /// Poll ceiling in seconds, and the tick cadence when there is no batch grid to
+        /// follow. With a Config `schedule` the mover builds on the protocol's grid
+        /// (B_i = epoch_start + i*tm_batch_interval) and this only bounds how long it
+        /// sleeps between chain checks (clamped to 300s).
         #[arg(long, default_value_t = 60)]
         interval_secs: u64,
         /// Run a single tick and exit (for testing).
@@ -1852,16 +1858,36 @@ fn dev_tm_params_from_cfg(cfg: &HeimdallConfig) -> heimdall::bitcoin::tm_builder
 /// UTxO configured every value is the chain's and this node's `bitcoin.*fee*`
 /// keys are ignored — which is what lets two operators with different TOMLs
 /// co-sign the same TM. Without one it falls back to those keys and says so.
+/// What one batch opportunity is built against: the parameters, the chain "now",
+/// the tip the creation-slot resolver measures against, and the grid opportunity
+/// itself.
+struct SweepBatch {
+    params: heimdall::bitcoin::tm_builder::TmParams,
+    /// Chain tip time (POSIX ms); `None` when there is no Config UTxO to snapshot.
+    now_ms: Option<i64>,
+    /// `(slot, time_ms)` of the snapshot, for resolving request creation slots on a
+    /// backend that omits `slot` from `/txs`.
+    tip: Option<(u64, i64)>,
+    /// The batch opportunity in force, when this deployment has a grid.
+    batch: heimdall::epoch::batch::BatchWindow,
+}
+
 fn batch_params(
     rt: &tokio::runtime::Runtime,
     cfg: &HeimdallConfig,
-) -> Result<(heimdall::bitcoin::tm_builder::TmParams, Option<i64>), String> {
+    verbose: bool,
+) -> Result<SweepBatch, String> {
     use heimdall::cardano::config_params::{ParamSource, fetch_param_snapshot, resolve_tm_params};
 
     let local = cfg.bitcoin.fee_rate_sat_per_vb;
     let Some(loc) = config_locator(cfg) else {
         let (p, _) = resolve_tm_params(None, local);
-        return Ok((p, None));
+        return Ok(SweepBatch {
+            params: p,
+            now_ms: None,
+            tip: None,
+            batch: heimdall::epoch::batch::BatchWindow::NoGrid,
+        });
     };
     let snapshot = rt.block_on(fetch_param_snapshot(
         &loc.base_url,
@@ -1869,7 +1895,7 @@ fn batch_params(
         &loc.address,
         &loc.nft_unit,
     ))?;
-    if let Some(t) = &snapshot.config.params.tunables {
+    if let (true, Some(t)) = (verbose, &snapshot.config.params.tunables) {
         println!(
             "  operational params (Config {} @ slot {}): fee_rate={} sat/vB, \
              per_pegout_fee floor={} sat, min_peg_out_fbtc={} sat, leader_reward={} lovelace",
@@ -1889,7 +1915,23 @@ fn batch_params(
              sat/vB) — {why}. Co-signers reading a different value build different TM bytes."
         );
     }
-    Ok((p, Some(time_ms)))
+    let batch = rt.block_on(heimdall::cardano::config_params::batch_at(
+        &loc.base_url,
+        &loc.project_id,
+        &snapshot,
+    ));
+    if let (true, Some(b)) = (verbose, batch.open()) {
+        println!(
+            "  batch B_{} at slot {} (membership cutoff: created at or before slot {})",
+            b.index, b.slot, b.cutoff_slot
+        );
+    }
+    Ok(SweepBatch {
+        params: p,
+        now_ms: Some(time_ms),
+        tip: Some((snapshot.slot, time_ms)),
+        batch,
+    })
 }
 
 /// Everything needed to fetch the bridge Config UTxO: the Blockfrost endpoint and
@@ -1947,6 +1989,51 @@ fn config_min_stake(
     cfg: &HeimdallConfig,
 ) -> Result<Option<u64>, String> {
     Ok(config_view(rt, cfg)?.map(|v| v.params.min_stake))
+}
+
+/// Freeze the scanned peg-outs against `batch` — the CLI sweep's half of the rule
+/// the epoch machine applies in `freeze_pegouts` (spec §TM batches; plan N19).
+///
+/// Both drivers must reach the same set from the same chain state, so the rule lives
+/// in `epoch::batch` and each driver only supplies its own request type. Without a
+/// grid (no Config schedule, or an unreadable epoch anchor) the cutoff is skipped and
+/// only the FIFO order and the capacity cap apply — the pre-N19 behaviour, minus the
+/// dependence on whatever order the chain query answered in.
+fn freeze_sweep_pegouts(
+    requests: Vec<heimdall::cardano::pegout_datum::PegOutRequestData>,
+    batch: Option<heimdall::epoch::batch::BatchSlot>,
+) -> Vec<heimdall::cardano::pegout_datum::PegOutRequestData> {
+    use heimdall::epoch::batch::{Caps, FifoKey, SpendVariant, freeze};
+
+    let cap = Caps::for_variant(SpendVariant::KeyPath).max_pegouts;
+    let key = |r: &heimdall::cardano::pegout_datum::PegOutRequestData| FifoKey {
+        // Unresolved sorts last and is deferred under a real cutoff: a request whose
+        // place in time we cannot establish must not be signed into a batch our
+        // co-signers would place differently.
+        created_slot: r.created_slot.unwrap_or(u64::MAX),
+        tx_hash: r.outpoint[..32].try_into().unwrap_or([0u8; 32]),
+        output_index: u32::from_le_bytes(r.outpoint[32..].try_into().unwrap_or([0u8; 4])),
+    };
+
+    let Some(batch) = batch else {
+        let mut ordered = requests;
+        ordered.sort_by_key(&key);
+        ordered.truncate(cap);
+        return ordered;
+    };
+
+    let frozen = freeze(requests, batch, cap, key);
+    if frozen.deferred() > 0 {
+        println!(
+            "  batch freeze: {} peg-out(s) in, {} created after the cutoff (slot {}), {} over \
+             the {cap}-peg-out capacity — deferred to a later batch",
+            frozen.selected.len(),
+            frozen.too_new.len(),
+            batch.cutoff_slot,
+            frozen.over_cap.len(),
+        );
+    }
+    frozen.selected
 }
 
 /// Load this node's completed-peg-outs trie from `protocol.state_dir`.
@@ -4696,29 +4783,75 @@ fn run_mover(
 ) -> Result<(), String> {
     use std::time::Duration;
 
-    // The Config's schedule (#16) is the protocol's batch cadence; this loop's
-    // `--interval-secs` is a local sleep. They are not yet the same thing — the
-    // slot-aligned batch grid is plan N19 — so report the drift rather than
-    // silently ticking off-grid.
+    // N19: the mover follows the protocol's BATCH GRID, not a wall-clock interval.
+    // B_i = epoch_start + i * tm_batch_interval, and at each opportunity every SPO
+    // evaluates the same gate against the same frozen set — which is what makes two
+    // independently-run movers agree on the TM bytes. A wall-clock tick cannot: two
+    // nodes ticking 30 s apart scan different chain states.
+    //
+    // `--interval-secs` survives in two roles: the cadence when there is no grid to
+    // follow (no Config schedule, or no Config UTxO at all), and the ceiling on how
+    // long this loop sleeps before re-checking the chain.
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    if let Some(schedule) = config_view(&rt, cfg)?
-        .and_then(|v| v.params.tunables)
-        .map(|t| t.schedule)
-    {
-        println!(
-            "[mover] Config schedule: tm_batch_interval={} slots (this mover ticks every \
-             {interval_secs}s; the slot-aligned batch grid lands with N19)",
-            schedule.tm_batch_interval,
-        );
-    }
-    drop(rt);
+    let poll_ceiling = Duration::from_secs(interval_secs.clamp(1, 300));
 
+    // The batch this process has already built for. The grid says an opportunity is
+    // open for the whole interval, so without this the mover would rebuild the same
+    // batch every poll — burning a fee per poll on a treasury self-move.
+    let mut built_batch: Option<u64> = None;
     let mut tick: u64 = 0;
     loop {
-        tick += 1;
-        println!(
-            "\n═══ auto-mover tick #{tick} (interval {interval_secs}s, broadcast={broadcast}) ═══"
-        );
+        // Where are we on the grid? A quiet probe: the sweep itself re-reads and
+        // reports the snapshot it actually builds against.
+        let probe = match batch_params(&rt, cfg, false) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("[mover] grid probe failed ({e}) — retrying after the poll interval");
+                None
+            }
+        };
+
+        use heimdall::epoch::batch::BatchWindow;
+        match probe.as_ref().map_or(BatchWindow::NoGrid, |p| p.batch) {
+            // An opportunity is open and this process has not built for it yet.
+            BatchWindow::Open(b) if built_batch != Some(b.index) => {
+                built_batch = Some(b.index);
+                tick += 1;
+                println!(
+                    "\n═══ batch B_{} @ slot {} (cutoff {}), tick #{tick}, broadcast={broadcast} ═══",
+                    b.index, b.slot, b.cutoff_slot
+                );
+            }
+            // Already built for this opportunity: the grid says wait for the next one.
+            BatchWindow::Open(b) => {
+                if once {
+                    println!("[mover] batch B_{} already built — nothing to do", b.index);
+                    return Ok(());
+                }
+                std::thread::sleep(poll_ceiling);
+                continue;
+            }
+            // A grid exists but no opportunity is open — before B_1, or past
+            // final_tm_cutoff. The spec is explicit that the opportunity passes UNUSED:
+            // building here would post a movement outside the schedule every SPO agreed
+            // on, which no co-signer would reproduce.
+            BatchWindow::Closed { .. } => {
+                if once {
+                    println!("[mover] no batch opportunity is open — nothing to do");
+                    return Ok(());
+                }
+                std::thread::sleep(poll_ceiling);
+                continue;
+            }
+            // No grid (or the probe failed): fall back to the interval cadence.
+            BatchWindow::NoGrid => {
+                tick += 1;
+                println!(
+                    "\n═══ auto-mover tick #{tick} (no batch grid; interval {interval_secs}s, \
+                     broadcast={broadcast}) ═══"
+                );
+            }
+        }
         let result = run_sweep_pegins(
             cfg,
             cardano_socket,
@@ -4742,8 +4875,11 @@ fn run_mover(
         }
         if let Err(e) = result {
             eprintln!("[mover] tick #{tick} error (continuing): {e}");
+            // A failed build must not consume its opportunity: clear the marker so the
+            // next poll retries the same batch rather than waiting for the next one.
+            built_batch = None;
         }
-        std::thread::sleep(Duration::from_secs(interval_secs));
+        std::thread::sleep(poll_ceiling);
     }
 }
 
@@ -5452,7 +5588,7 @@ fn run_sweep_pegins(
     // Peg-out collection is Blockfrost-only (the N2C path is peg-in only). When no Blockfrost is
     // configured, skip it with a loud warning rather than hard-failing — an N2C-only sweep that
     // previously worked must still build a TM (it just can't include peg-outs over N2C).
-    let pegout_data = match cfg.cardano.blockfrost_project_id.as_deref() {
+    let mut pegout_data = match cfg.cardano.blockfrost_project_id.as_deref() {
         Some(pid) => {
             let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
             rt.block_on(fetch_pegout_requests(
@@ -5487,8 +5623,8 @@ fn run_sweep_pegins(
     );
 
     // Auto-mover: with nothing pending at all, don't post a treasury→treasury self-move
-    // (it would just burn fee) — skip this tick. (Re-checked after the pin filter below, which can
-    // empty the peg-out set.)
+    // (it would just burn fee) — skip this tick. (Re-checked after the batch freeze below,
+    // which can empty the peg-out set.)
     if auto_mode && pegin_inputs.is_empty() && pegout_data.requests.is_empty() {
         println!("[mover] nothing to sweep (0 peg-ins, 0 peg-outs) — skipping tick");
         return Ok(());
@@ -5560,6 +5696,34 @@ fn run_sweep_pegins(
     // one and stranded a re-created identical request permanently. The double-pay window it
     // nominally covered is already closed by the in-flight refusal above (`tip.in_flight`),
     // which stops a second sweep before the previous TM confirms and folds into the trie.
+    // Freeze this batch's consensus inputs at one chain point (WI-040/WI-041): the
+    // operational parameters TM construction reads (Config #12-#14), the chain "now"
+    // the freshness filter compares `created` against, and the batch opportunity whose
+    // cutoff decides membership. Chain values, never this node's: each decides TM
+    // bytes, and a divergent verdict means a divergent txid and a failed FROST round.
+    let sweep_batch = batch_params(&rt, cfg, true)?;
+    let tm_params = sweep_batch.params.clone();
+
+    // Peg-out membership is a function of the batch, not of the instant this node
+    // happened to scan: resolve each request's CREATION SLOT (a chain fact — the datum's
+    // `created` is requester-set and backdatable), then take the cutoff-eligible ones in
+    // the spec's FIFO order up to the per-TM capacity. Anything held back is a candidate
+    // for a later batch; since rev 5.1 retired the outpoint pin, missing a batch costs a
+    // peg-out only latency.
+    rt.block_on(heimdall::cardano::pegout_datum::resolve_created_slots(
+        &bf_http::base_url(
+            cfg.cardano.blockfrost_project_id.as_deref().unwrap_or(""),
+            cfg.cardano.blockfrost_url.as_deref(),
+        ),
+        cfg.cardano.blockfrost_project_id.as_deref().unwrap_or(""),
+        &mut pegout_data.requests,
+        sweep_batch.tip,
+    ));
+    pegout_data.requests = freeze_sweep_pegouts(
+        std::mem::take(&mut pegout_data.requests),
+        sweep_batch.batch.open(),
+    );
+
     let mut pegout_requests: Vec<PegOutRequest> = Vec::new();
     if !pegout_data.requests.is_empty() && cpo_trust == CpoTrust::Unverified {
         // The trie is the only record of what an earlier TM already paid, so a trie this node
@@ -5600,14 +5764,9 @@ fn run_sweep_pegins(
         return Ok(());
     }
 
-    // Freeze this batch's consensus inputs at one chain point (WI-040): the
-    // operational parameters TM construction reads (Config #12-#14) and the chain
-    // "now" the freshness filter compares `created` against. Chain values, never
-    // this node's: both decide TM bytes, and a divergent verdict means a divergent
-    // txid and a failed FROST round.
-    let (tm_params, snapshot_now_ms) = batch_params(&rt, cfg)?;
     // No Config UTxO to snapshot: fall back to the tip time alone. Without
     // Blockfrost there are no peg-outs to filter anyway, so 0 is inert.
+    let snapshot_now_ms = sweep_batch.now_ms;
     let chain_now_ms = match (
         snapshot_now_ms,
         cfg.cardano.blockfrost_project_id.as_deref(),
