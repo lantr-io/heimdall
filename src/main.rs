@@ -1379,6 +1379,42 @@ async fn run_demo(
             cfg.cardano.kupo_url.as_deref(),
         );
 
+        // Peg-out payments (WI-030). Reading a PegOut UTxO needs both the address to scan and
+        // the fBTC unit whose quantity is the locked amount, so half a config is a startup
+        // error rather than a silently peg-in-only daemon. Absent entirely is allowed (and
+        // warned about per build). `.filter(|s| !s.is_empty())` because blanking a TOML key to
+        // "" is a normal way to disable it — an empty address would otherwise be scanned on
+        // every BuildTm, and an empty unit would match zero UTxOs while the daemon reported
+        // itself peg-out-capable.
+        match (
+            cfg.cardano
+                .pegout_script_address
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            cfg.cardano
+                .bridged_token_unit
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        ) {
+            (Some(addr), Some(unit)) => {
+                println!("peg-out requests:     {addr}");
+                bf_chain = bf_chain.with_pegout_source(addr, unit);
+            }
+            (None, None) => eprintln!(
+                "warning: no cardano.pegout_script_address / cardano.bridged_token_unit — this \
+                 daemon builds peg-in-only TMs and pays NO pending withdrawal"
+            ),
+            _ => {
+                eprintln!(
+                    "fatal: set BOTH cardano.pegout_script_address and \
+                     cardano.bridged_token_unit, or NEITHER"
+                );
+                std::process::exit(1);
+            }
+        }
+
         if let Some(mnemonic) = &cfg.cardano.mnemonic {
             let wallet_addr = heimdall::cardano::wallet::wallet_address_from_mnemonic(mnemonic)
                 .expect("cardano.mnemonic must be a valid BIP-39 mnemonic");

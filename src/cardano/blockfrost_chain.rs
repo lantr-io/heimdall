@@ -454,6 +454,21 @@ pub struct BlockfrostCardanoChain {
     /// same backend choice `reconstruct-cpo-trie` makes, so both reads see the
     /// same index. `None` falls back to the Blockfrost-compatible API.
     kupo_url: Option<String>,
+    /// Where `query_pegout_requests` scans for PegOut UTxOs: the `peg_out.ak` bech32
+    /// address plus the bridged-token unit that identifies one. `None` → the daemon pays
+    /// no peg-out, and says so loudly on every build.
+    pegout_source: Option<PegOutSource>,
+}
+
+/// The two values `pegout_datum::fetch_pegout_requests` needs. The `sweep-pegins` CLI takes
+/// them as arguments; the daemon has no argv, so the chain carries them.
+#[derive(Debug, Clone)]
+struct PegOutSource {
+    /// Bech32 address of the `peg_out.ak` script holding PegOut UTxOs.
+    address: String,
+    /// Bridged-token (fBTC) unit `<policy_hex><asset_name_hex>` whose quantity in a UTxO's
+    /// value is the locked peg-out amount.
+    fbtc_unit: String,
 }
 
 impl BlockfrostCardanoChain {
@@ -501,7 +516,23 @@ impl BlockfrostCardanoChain {
             fault_ban_flow: None,
             cpo_policy_id: None,
             kupo_url: None,
+            pegout_source: None,
         }
+    }
+
+    /// Point `query_pegout_requests` at the `peg_out.ak` address (WI-030). Without it the
+    /// daemon builds Treasury Movements that pay no withdrawal at all.
+    #[must_use]
+    pub fn with_pegout_source(
+        mut self,
+        address: impl Into<String>,
+        fbtc_unit: impl Into<String>,
+    ) -> Self {
+        self.pegout_source = Some(PegOutSource {
+            address: address.into(),
+            fbtc_unit: fbtc_unit.into(),
+        });
+        self
     }
 
     /// Locate the on-chain completed-peg-outs singleton so `query_cpo_root` can
@@ -1326,13 +1357,52 @@ impl CardanoChain for BlockfrostCardanoChain {
             .await
     }
 
-    /// NOT YET WIRED: the epoch daemon pays no peg-outs. `cardano::pegout_datum` implements the
-    /// scan (and `build_tm_phase` applies the already-paid filter), but this chain carries no
-    /// peg-out script address / bridged-token unit, so peg-outs reach a TM only through the
-    /// `sweep-pegins` / `run-mover` CLI path. Returning an empty list is under-payment (requests
-    /// roll over), never over-payment — the safe side of the gap.
+    /// Every open PegOut request at the `peg_out.ak` address (WI-030), carried through with
+    /// each request's own datum fields — `per_pegout_fee` and `created` decide what the TM
+    /// pays and whether it may pay it at all, and `por_id` / `outpoint` are what the CPO trie
+    /// and the TM datum's `fulfilled_por_outpoints` are keyed by.
+    ///
+    /// No filtering happens here. `build_tm_phase` subtracts the already-paid multiset and
+    /// `build_tm` applies the spec's skip rule (freshness, dust, non-standard script, already
+    /// in the trie, duplicate within the batch) — keeping every skip decision in one place is
+    /// what lets every SPO reach the identical verdict and build byte-identical TM bytes.
+    ///
+    /// Unconfigured is a loud no-op rather than an error: a daemon deployed before
+    /// `cardano.pegout_script_address` / `cardano.bridged_token_unit` existed must keep
+    /// building peg-in-only TMs, and paying nothing is under-payment (the request stays open
+    /// until its own cancel deadline), never over-payment.
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>> {
-        Ok(vec![])
+        let Some(src) = &self.pegout_source else {
+            eprintln!(
+                "[pegout] WARNING: no cardano.pegout_script_address / cardano.bridged_token_unit \
+                 — this TM pays NO peg-out; every pending withdrawal waits for a later batch"
+            );
+            return Ok(vec![]);
+        };
+
+        // Malformed UTxOs at the (permissionlessly payable) peg-out address are skipped with a
+        // per-UTxO line on stderr inside `fetch_pegout_requests`, matching the CLI sweep path:
+        // one poison datum must not block every Treasury Movement bridge-wide.
+        let requests = crate::cardano::pegout_datum::fetch_pegout_requests(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            &src.address,
+            &src.fbtc_unit,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("fetch_pegout_requests: {e}")))?;
+
+        Ok(requests
+            .into_iter()
+            .map(|r| PegOutRequestUtxo {
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(r.destination_script_pubkey),
+                amount: bitcoin::Amount::from_sat(r.amount_sat),
+                per_pegout_fee: bitcoin::Amount::from_sat(r.per_pegout_fee),
+                created: r.created,
+                por_id: r.por_id,
+                outpoint: r.outpoint,
+            })
+            .collect())
     }
 
     /// Chain "now" from the Cardano tip block's time (`/blocks/latest`), in ms.

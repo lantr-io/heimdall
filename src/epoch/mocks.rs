@@ -326,11 +326,20 @@ impl CardanoChain for MockCardanoChain {
                 // identity is derived from the payment itself: unique per
                 // (destination, amount), stable across runs, and never colliding
                 // with a real por_id (which hashes a real 32-byte tx hash).
-                created: 0,
+                created: p.created,
                 por_id: fixture_por_id(&p.script_pubkey, p.amount),
                 outpoint: [0u8; 36],
             })
             .collect())
+    }
+
+    /// Serve the fixture's payment history rather than inheriting the trait's empty default —
+    /// that default is documented as valid only when `query_pegout_requests` returns nothing,
+    /// which stopped being true once fixtures carry peg-outs.
+    async fn query_paid_pegout_payments(
+        &self,
+    ) -> EpochResult<Vec<(bitcoin::ScriptBuf, bitcoin::Amount)>> {
+        Ok(self.fixture.paid_pegout_payments.clone())
     }
 
     async fn submit_signed_tm(

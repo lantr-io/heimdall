@@ -1290,6 +1290,169 @@ mod tests {
         multi_instance_same_treasury(2, 2).await;
     }
 
+    // -----------------------------------------------------------------------
+    // WI-030: peg-outs on the DAEMON path
+    // -----------------------------------------------------------------------
+
+    /// A standard, payable destination — `build_tm` drops anything else as
+    /// `NonStandardScript`, which would mask the rule under test.
+    fn p2wpkh(tag: u8) -> bitcoin::ScriptBuf {
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(&[tag; 20]);
+        bitcoin::ScriptBuf::from_bytes(spk)
+    }
+
+    /// The mock's `chain_now_ms` is the local clock (the trait default), so fixture
+    /// `created` values must be relative to it or every request lands outside the
+    /// freshness window.
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// The WI-030 acceptance, end to end: `run_epoch_loop` builds a TM that PAYS a pending
+    /// peg-out. Before this, `query_pegout_requests` returned an empty vec on every live
+    /// chain, so the daemon's TMs paid no withdrawal at all and none of the peg-out
+    /// machinery below `build_tm_phase` was reachable outside the CLI.
+    ///
+    /// Also covers the freshness filter that replaced the treasury pin in rev 5.1: a request
+    /// close to its own `created + PEG_OUT_CANCEL_TIMEOUT_MS` cancel deadline must be
+    /// skipped, since paying it risks the owner cancelling for the fBTC after taking the BTC.
+    #[tokio::test]
+    async fn daemon_tm_pays_a_fresh_pegout_and_skips_one_near_its_cancel_deadline() {
+        use crate::epoch::fixture::StaticPegOut;
+        use bitcoin::Amount;
+
+        let mut fixture = demo_static_fixture(2, 2, 18_700);
+        let paid_dest = p2wpkh(0x01);
+        let stale_dest = p2wpkh(0x02);
+        let now = now_ms();
+
+        // Created just now: comfortably inside the window.
+        fixture.pegouts.push(StaticPegOut {
+            script_pubkey: paid_dest.clone(),
+            amount: Amount::from_sat(50_000),
+            created: now,
+        });
+        // Created so long ago that its cancel deadline is within the freshness margin.
+        fixture.pegouts.push(StaticPegOut {
+            script_pubkey: stale_dest.clone(),
+            amount: Amount::from_sat(60_000),
+            created: now - crate::bitcoin::tm_builder::PEG_OUT_CANCEL_TIMEOUT_MS + 1_000,
+        });
+
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(h.await.unwrap().expect("epoch cycle completes"));
+        }
+
+        let outputs = &tms[0].unsigned_tx.output;
+        // Treasury continuation, the one payable peg-out, and the CPOR1 root commitment.
+        let payments: Vec<_> = outputs
+            .iter()
+            .filter(|o| !o.script_pubkey.is_op_return() && !o.script_pubkey.is_p2tr())
+            .collect();
+        assert_eq!(
+            payments.len(),
+            1,
+            "exactly one peg-out payment expected, got {outputs:?}"
+        );
+        assert_eq!(payments[0].script_pubkey, paid_dest);
+        // Paid NET of this request's own datum fee (rev 5.1: per-request, not a global).
+        assert_eq!(
+            payments[0].value,
+            Amount::from_sat(50_000) - fixture.per_pegout_fee,
+        );
+        assert!(
+            outputs.iter().all(|o| o.script_pubkey != stale_dest),
+            "a peg-out inside the freshness margin of its cancel deadline must not be paid"
+        );
+
+        assert_eq!(
+            tms[1].txid, tms[0].txid,
+            "both SPOs must reduce identical chain state to identical TM bytes"
+        );
+    }
+
+    /// The double-pay guard on the daemon path: a request the payment history already
+    /// accounts for is not paid again, even though its UTxO is still open (the owner's
+    /// Complete tx lags the payment, or never comes). Under-reporting here "re-pays treasury
+    /// BTC irrecoverably" per the `query_paid_pegout_payments` contract.
+    #[tokio::test]
+    async fn daemon_tm_does_not_re_pay_a_pegout_an_earlier_tm_already_paid() {
+        use crate::epoch::fixture::StaticPegOut;
+        use bitcoin::Amount;
+
+        let mut fixture = demo_static_fixture(2, 2, 18_750);
+        let already_paid_dest = p2wpkh(0x03);
+        let fresh_dest = p2wpkh(0x04);
+        let now = now_ms();
+        for (dest, gross) in [(&already_paid_dest, 50_000u64), (&fresh_dest, 70_000)] {
+            fixture.pegouts.push(StaticPegOut {
+                script_pubkey: dest.clone(),
+                amount: Amount::from_sat(gross),
+                created: now,
+            });
+        }
+        // An earlier TM already paid the first its NET amount — the multiset is keyed on what
+        // was actually paid, not on the locked gross.
+        fixture.paid_pegout_payments.push((
+            already_paid_dest.clone(),
+            Amount::from_sat(50_000) - fixture.per_pegout_fee,
+        ));
+
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(h.await.unwrap().expect("epoch cycle completes"));
+        }
+
+        let outputs = &tms[0].unsigned_tx.output;
+        let payments: Vec<_> = outputs
+            .iter()
+            .filter(|o| !o.script_pubkey.is_op_return() && !o.script_pubkey.is_p2tr())
+            .collect();
+        assert_eq!(
+            payments.len(),
+            1,
+            "only the unpaid peg-out may be paid, got {outputs:?}"
+        );
+        assert_eq!(payments[0].script_pubkey, fresh_dest);
+        assert!(
+            outputs.iter().all(|o| o.script_pubkey != already_paid_dest),
+            "a peg-out an earlier TM already paid must never be paid twice"
+        );
+    }
+
     #[tokio::test]
     async fn followers_wait_in_await_confirm_until_chain_confirms() {
         let fixture = demo_static_fixture(2, 2, 18_650);
