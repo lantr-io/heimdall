@@ -788,14 +788,17 @@ fn load_cpo_trie(
 /// all. Run before `build_tm`, so nothing is signed off a stale trie.
 ///
 /// `None` from the chain is "not configured", not "empty": it warns and proceeds,
-/// because a node with no `cardano.cpo_policy_id` cannot tell the two apart.
+/// because a node with no `cardano.cpo_policy_id` cannot tell the two apart. It
+/// returns [`CpoTrust::Unverified`] in that case — since WI-031 the trie is the SOLE
+/// already-paid authority, so "not cross-checked" has to be a value the caller can act
+/// on, not just a log line.
 async fn cross_check_cpo_root(
     chain: &Arc<dyn CardanoChain>,
     cpo_trie: &crate::cardano::cpo_trie::CpoTrie,
     state_dir: Option<&std::path::Path>,
     me: frost::Identifier,
     epoch: u64,
-) -> EpochResult<()> {
+) -> EpochResult<CpoTrust> {
     let local = cpo_trie.root();
     match chain.query_cpo_root().await? {
         Some(on_chain) if on_chain != local => Err(EpochError::TmBuild(format!(
@@ -818,7 +821,7 @@ async fn cross_check_cpo_root(
                 "  completed-peg-outs trie: root matches the on-chain CPO singleton ({})",
                 hex::encode(on_chain)
             );
-            Ok(())
+            Ok(CpoTrust::Verified)
         }
         None => {
             crate::epoch_log!(
@@ -828,9 +831,30 @@ async fn cross_check_cpo_root(
                  was NOT cross-checked against the on-chain CPO singleton. Set \
                  cardano.cpo_policy_id before trusting this trie to sign with."
             );
-            Ok(())
+            Ok(CpoTrust::Unverified)
         }
     }
+}
+
+/// Whether this node's completed-peg-outs trie may be trusted to decide which peg-outs
+/// an earlier movement already paid.
+///
+/// Since WI-031 the trie is the ONLY already-paid record: the `(destination, net sat)`
+/// multiset that used to run in front of it could never be keyed by request identity —
+/// a `Confirmed` TM datum carries `fulfilled_peg_outs: [{scriptPubKey, amount}]` and
+/// nothing else, and `fulfilled_por_outpoints` lives only on `Unconfirmed` and is
+/// explicitly an unverified hint — so it strands a re-created identical withdrawal
+/// forever. The trie is keyed by `por_id` and cannot.
+///
+/// The price of removing it is that an untrustworthy trie is no longer backstopped by
+/// anything, so `Unverified` must mean "pay no peg-out", never "pay unchecked".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpoTrust {
+    /// Cross-checked against the on-chain CPO singleton — safe to decide payment with.
+    Verified,
+    /// No `cardano.cpo_policy_id`, so the local root was never checked against the
+    /// chain. The trie may be stale, or belong to a previous deployment.
+    Unverified,
 }
 
 async fn build_tm_phase(
@@ -858,54 +882,31 @@ async fn build_tm_phase(
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     };
 
-    // Open peg-outs on Cardano MINUS the ones already paid. A request UTxO survives at the
-    // `peg_out.ak` address until its owner's Complete tx spends it — which needs this TM's Bitcoin
-    // confirmation plus an oracle proof, hours later or never — so the open set keeps returning
-    // withdrawals earlier movements already paid, and paying it as-is drains the treasury once per
-    // movement. The paid history comes from the Confirmed TM datums' `fulfilled_peg_outs` lists
-    // (plus in-flight TMs, already committed in signed Bitcoin bytes) and is matched as a MULTISET
-    // on (destination, net amount): distinct requests may share that pair, so counting pays each
-    // exactly once where a set would strand all but the first.
-    let open_pegouts = chain.query_pegout_requests().await?;
-    let paid_payments = chain.query_paid_pegout_payments().await?;
-    let mut paid = crate::cardano::pegout_datum::PaidPegOuts::from_payments(
-        paid_payments
-            .iter()
-            .map(|(spk, amount)| (spk.as_bytes(), amount.to_sat())),
-    );
-    let mut pegouts = Vec::with_capacity(open_pegouts.len());
-    let mut skipped_paid = Vec::new();
-    for p in open_pegouts {
-        // The net is `gross − the request's OWN datum fee`: that is what the TM
-        // pays and therefore what a Confirmed datum records.
-        let net = p.amount.to_sat().saturating_sub(p.per_pegout_fee.to_sat());
-        if net > 0 && paid.claim(p.script_pubkey.as_bytes(), net) {
-            skipped_paid.push(p);
-        } else {
-            pegouts.push(p);
-        }
-    }
+    // Open peg-outs on Cardano. A request UTxO survives at the `peg_out.ak` address until
+    // someone completes it — which needs this TM's Bitcoin confirmation plus a membership
+    // proof, hours later or never — so this set keeps returning withdrawals earlier movements
+    // already paid. What filters them is the completed-peg-outs trie, keyed by `por_id`
+    // (`build_tm`'s `AlreadyCompleted` skip), loaded and cross-checked below.
+    //
+    // WI-031 deleted the `(destination scriptPubKey, net sat)` multiset that used to run in
+    // front of it. That key could never carry request identity — a `Confirmed` TM datum holds
+    // `fulfilled_peg_outs: [{scriptPubKey, amount}]` and nothing more, and the
+    // `fulfilled_por_outpoints` hint exists only on `Unconfirmed` and is explicitly unverified
+    // — so a credit left by a long-completed withdrawal was indistinguishable from an unpaid
+    // one, and a user re-requesting the same round amount to the same address was stranded
+    // permanently. The window it nominally covered (paid on Bitcoin, not yet confirmed, so not
+    // yet folded into the trie) is already closed above: `query_treasury` blocks until
+    // `btc_confirmed`, so this node never builds a second TM while one is in flight.
+    let pegouts = chain.query_pegout_requests().await?;
     crate::epoch_log!(
         me,
         epoch,
-        "  chain query: treasury={} sat, {} frozen pegins, {} unpaid pegouts ({} skipped: already \
-         paid by an earlier TM; {} payment(s) on record), fee_rate={}sat/vb",
+        "  chain query: treasury={} sat, {} frozen pegins, {} open pegouts, fee_rate={}sat/vb",
         treasury.value.to_sat(),
         frozen_pegins.len(),
         pegouts.len(),
-        skipped_paid.len(),
-        paid_payments.len(),
         treasury.fee_rate_sat_per_vb,
     );
-    for p in &skipped_paid {
-        crate::epoch_log!(
-            me,
-            epoch,
-            "  skipped peg-out → {} ({} sat): already paid by an earlier TM",
-            hex::encode(p.script_pubkey.as_bytes()),
-            p.amount.to_sat(),
-        );
-    }
 
     let secp = Secp256k1::new();
 
@@ -947,6 +948,38 @@ async fn build_tm_phase(
         })
         .collect();
 
+    // The completed-peg-outs trie: this node's own copy, which decides both which
+    // requests are still owed a payment and the root this TM will commit.
+    let cpo_trie = load_cpo_trie(config.state_dir.as_deref(), me, epoch)?;
+    let cpo_trust =
+        cross_check_cpo_root(chain, &cpo_trie, config.state_dir.as_deref(), me, epoch).await?;
+
+    // The trie is the ONLY already-paid record (WI-031), so a trie this node cannot vouch
+    // for must mean "pay no peg-out", not "pay unchecked". Unchecked payment is not a
+    // degraded mode: with no dedup every open request is re-paid on EVERY movement, which
+    // drains the treasury irrecoverably. Skipping instead costs only latency — the requests
+    // stay open and a later movement, on a node that IS configured, pays them.
+    //
+    // Peg-ins are unaffected: the TM still sweeps them, so a misconfigured node degrades to
+    // the peg-in-only behaviour it had before WI-030 rather than stalling the bridge.
+    let pegouts = match cpo_trust {
+        CpoTrust::Verified => pegouts,
+        CpoTrust::Unverified if pegouts.is_empty() => pegouts,
+        CpoTrust::Unverified => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "  skipping ALL {} open peg-out(s): the completed-peg-outs trie was not \
+                 cross-checked against the chain (no cardano.cpo_policy_id), and it is the only \
+                 record of what an earlier movement already paid — paying without it would \
+                 re-pay every open request on every movement. Peg-ins are unaffected. Set \
+                 cardano.cpo_policy_id (and protocol.state_dir) to pay peg-outs.",
+                pegouts.len(),
+            );
+            Vec::new()
+        }
+    };
+
     let pegout_requests: Vec<PegOutRequest> = pegouts
         .into_iter()
         .map(|p| PegOutRequest {
@@ -958,11 +991,6 @@ async fn build_tm_phase(
             created: p.created,
         })
         .collect();
-
-    // The completed-peg-outs trie: this node's own copy, which decides both which
-    // requests are still owed a payment and the root this TM will commit.
-    let cpo_trie = load_cpo_trie(config.state_dir.as_deref(), me, epoch)?;
-    cross_check_cpo_root(chain, &cpo_trie, config.state_dir.as_deref(), me, epoch).await?;
 
     // Chain "now" for the freshness filter. Read from the chain, not the local
     // clock: it is a skip-rule input, and every SPO must reach the same verdict or
@@ -1343,11 +1371,17 @@ mod tests {
             created: now - crate::bitcoin::tm_builder::PEG_OUT_CANCEL_TIMEOUT_MS + 1_000,
         });
 
+        // The trie is the sole already-paid record (WI-031), so peg-outs are paid only when
+        // the local root is cross-checked. state_dir is unset here, so the local trie is the
+        // empty one — report that same root as the chain's.
+        let empty_root = crate::cardano::cpo_trie::CpoTrie::empty().root();
+
         let hub = MockPeerHub::new();
         let mut handles = Vec::new();
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
-            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(empty_root));
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -1390,43 +1424,63 @@ mod tests {
         );
     }
 
-    /// The double-pay guard on the daemon path: a request the payment history already
-    /// accounts for is not paid again, even though its UTxO is still open (the owner's
-    /// Complete tx lags the payment, or never comes). Under-reporting here "re-pays treasury
-    /// BTC irrecoverably" per the `query_paid_pegout_payments` contract.
+    /// The double-pay guard on the daemon path, WI-031 shape: a request an earlier movement
+    /// already paid is recorded in the completed-peg-outs trie under its `por_id`, and
+    /// `build_tm` skips it (`SkipReason::AlreadyCompleted`) even though its UTxO is still
+    /// open — completion lags the payment by hours, or never comes.
+    ///
+    /// This replaces the identity-free `(destination, net sat)` multiset WI-031 deleted. The
+    /// trie is keyed by request identity, so an unrelated later request to the same address
+    /// for the same amount is a DIFFERENT `por_id` and stays payable — the exact case the
+    /// multiset stranded forever.
     #[tokio::test]
-    async fn daemon_tm_does_not_re_pay_a_pegout_an_earlier_tm_already_paid() {
+    async fn daemon_tm_skips_a_pegout_already_in_the_trie_but_pays_an_identical_new_one() {
+        use crate::cardano::cpo_trie::{CpoEntry, CpoTrie};
         use crate::epoch::fixture::StaticPegOut;
         use bitcoin::Amount;
 
         let mut fixture = demo_static_fixture(2, 2, 18_750);
-        let already_paid_dest = p2wpkh(0x03);
-        let fresh_dest = p2wpkh(0x04);
+        let dest = p2wpkh(0x03);
         let now = now_ms();
-        for (dest, gross) in [(&already_paid_dest, 50_000u64), (&fresh_dest, 70_000)] {
+        // Two requests to the SAME destination for the SAME gross amount. Only the first has
+        // been paid; the multiset guard could not tell them apart, the trie can.
+        let paid_gross = Amount::from_sat(50_000);
+        let fresh_gross = Amount::from_sat(70_000);
+        for gross in [paid_gross, fresh_gross] {
             fixture.pegouts.push(StaticPegOut {
                 script_pubkey: dest.clone(),
-                amount: Amount::from_sat(gross),
+                amount: gross,
                 created: now,
             });
         }
-        // An earlier TM already paid the first its NET amount — the multiset is keyed on what
-        // was actually paid, not on the locked gross.
-        fixture.paid_pegout_payments.push((
-            already_paid_dest.clone(),
-            Amount::from_sat(50_000) - fixture.per_pegout_fee,
-        ));
+
+        // Seed a persisted trie holding only the FIRST request's por_id.
+        let dir = std::env::temp_dir().join(format!("heimdall-cpo-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp state dir");
+        let mut trie = CpoTrie::empty();
+        let net = paid_gross - fixture.per_pegout_fee;
+        trie.insert_batch(&[CpoEntry::new(
+            crate::epoch::mocks::fixture_por_id(&dest, paid_gross),
+            dest.as_bytes(),
+            net.to_sat(),
+        )])
+        .expect("seed trie");
+        trie.save(&dir).expect("persist trie");
+        let seeded_root = trie.root();
 
         let hub = MockPeerHub::new();
         let mut handles = Vec::new();
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
-            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(seeded_root));
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
-            let config = fast_config(id);
+            let mut config = fast_config(id);
+            config.state_dir = Some(dir.clone());
             handles.push(tokio::spawn(async move {
                 run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
             }));
@@ -1444,12 +1498,61 @@ mod tests {
         assert_eq!(
             payments.len(),
             1,
-            "only the unpaid peg-out may be paid, got {outputs:?}"
+            "the trie-recorded request must be skipped and the new one paid, got {outputs:?}"
         );
-        assert_eq!(payments[0].script_pubkey, fresh_dest);
+        assert_eq!(payments[0].script_pubkey, dest);
+        assert_eq!(
+            payments[0].value,
+            fresh_gross - fixture.per_pegout_fee,
+            "the PAID one must be the request absent from the trie — an identity-free filter \
+             would have stranded it"
+        );
+    }
+
+    /// The safety gate that makes deleting the multiset guard sound: with no
+    /// `cardano.cpo_policy_id` the local trie was never cross-checked, so it cannot be trusted
+    /// to say what was already paid — and paying without any dedup re-pays every open request
+    /// on every movement. The daemon must skip peg-outs entirely, while still sweeping
+    /// peg-ins.
+    #[tokio::test]
+    async fn daemon_pays_no_pegout_when_the_trie_was_not_cross_checked() {
+        use crate::epoch::fixture::StaticPegOut;
+        use bitcoin::Amount;
+
+        let mut fixture = demo_static_fixture(2, 2, 18_800);
+        let dest = p2wpkh(0x05);
+        fixture.pegouts.push(StaticPegOut {
+            script_pubkey: dest.clone(),
+            amount: Amount::from_sat(50_000),
+            created: now_ms(),
+        });
+
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            // No `with_cpo_root`: query_cpo_root returns None = "not configured".
+            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(h.await.unwrap().expect("epoch cycle completes"));
+        }
+
+        let outputs = &tms[0].unsigned_tx.output;
         assert!(
-            outputs.iter().all(|o| o.script_pubkey != already_paid_dest),
-            "a peg-out an earlier TM already paid must never be paid twice"
+            outputs
+                .iter()
+                .all(|o| o.script_pubkey.is_op_return() || o.script_pubkey.is_p2tr()),
+            "an uncross-checked trie must yield NO peg-out payment, got {outputs:?}"
         );
     }
 

@@ -1383,7 +1383,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         // Malformed UTxOs at the (permissionlessly payable) peg-out address are skipped with a
         // per-UTxO line on stderr inside `fetch_pegout_requests`, matching the CLI sweep path:
         // one poison datum must not block every Treasury Movement bridge-wide.
-        let requests = crate::cardano::pegout_datum::fetch_pegout_requests(
+        let scan = crate::cardano::pegout_datum::fetch_pegout_requests(
             &self.bf_base_url,
             &self.bf_project_id,
             &src.address,
@@ -1392,7 +1392,17 @@ impl CardanoChain for BlockfrostCardanoChain {
         .await
         .map_err(|e| EpochError::Chain(format!("fetch_pegout_requests: {e}")))?;
 
-        Ok(requests
+        if scan.malformed > 0 {
+            eprintln!(
+                "[pegout] WARNING: {} UTxO(s) at {} carry the bridged token but no decodable \
+                 PegOutDatum — they are NOT payable by any TM and are absent from the open count \
+                 below; their owners can still Cancel",
+                scan.malformed, src.address,
+            );
+        }
+
+        Ok(scan
+            .requests
             .into_iter()
             .map(|r| PegOutRequestUtxo {
                 script_pubkey: bitcoin::ScriptBuf::from_bytes(r.destination_script_pubkey),
@@ -1418,57 +1428,6 @@ impl CardanoChain for BlockfrostCardanoChain {
         .await
         .map_err(|e| EpochError::Chain(format!("chain now: {e}")))?;
         Ok(secs.saturating_mul(1000))
-    }
-
-    /// The peg-out payments already committed on Bitcoin, read from the TM validator's Confirmed
-    /// datums plus still-live in-flight TMs. Errors when the history cannot be trusted, so a
-    /// caller can never silently treat a paid request as unpaid.
-    async fn query_paid_pegout_payments(
-        &self,
-    ) -> EpochResult<Vec<(bitcoin::ScriptBuf, bitcoin::Amount)>> {
-        let scan = scan_tm_utxos(
-            &self.bf_base_url,
-            &self.bf_project_id,
-            &self.treasury_address,
-            &format!(
-                "{}{}",
-                self.treasury_policy_id, self.treasury_asset_name_hex
-            ),
-            // No staleness deadline: it only decides whether an in-flight TM still BLOCKS the tip.
-            // For the payment history a past-deadline movement must still count — it can be mined
-            // at any time, and treating its payments as never-made is precisely the double-pay case.
-            None,
-        )
-        .await
-        .map_err(EpochError::Chain)?;
-        if !scan.pegout_history_is_complete() {
-            return Err(EpochError::Chain(format!(
-                "peg-out payment history is incomplete ({} unreadable TM datum(s), {} opaque \
-                 in-flight TM(s)) — refusing to report it, a peg-out may already be paid",
-                scan.parse_failures, scan.opaque_unconfirmed,
-            )));
-        }
-        let mut payments = Vec::new();
-        for tm in &scan.confirmed {
-            for out in tm.outputs.iter().skip(1) {
-                payments.push((
-                    bitcoin::ScriptBuf::from_bytes(out.script_pub_key.clone()),
-                    bitcoin::Amount::from_sat(out.amount),
-                ));
-            }
-        }
-        // Live (still-confirmable) in-flight TMs only: a dead one — spending an outpoint a Confirmed
-        // TM already swept — can never confirm, and counting it would strand its peg-outs forever.
-        for tm in scan
-            .unconfirmed
-            .iter()
-            .filter(|tm| !tm.inputs.iter().any(|i| scan.consumed.contains(i)))
-        {
-            for (value, spk) in tm.outputs.iter().skip(1) {
-                payments.push((spk.clone(), *value));
-            }
-        }
-        Ok(payments)
     }
 
     async fn query_cpo_root(&self) -> EpochResult<Option<[u8; 32]>> {
@@ -1707,27 +1666,6 @@ pub struct TmScan {
 }
 
 impl TmScan {
-    /// The peg-out payments already committed on Bitcoin, for
-    /// [`pegout_datum::select_unpaid`](crate::cardano::pegout_datum::select_unpaid).
-    ///
-    /// Counts every Confirmed record's peg-out outputs plus those of in-flight TMs that can still
-    /// confirm. A *dead* in-flight TM — one spending an outpoint a Confirmed TM already swept, so it
-    /// can never confirm — is excluded: counting it would strand its peg-outs forever. Staleness is
-    /// deliberately NOT applied here (unlike `in_flight_spends`): a movement past the deadline can
-    /// still be mined, and treating its payments as never-made is exactly the double-pay case.
-    ///
-    /// Callers must additionally refuse to pay peg-outs when `parse_failures > 0` or
-    /// `opaque_unconfirmed > 0` — an unreadable record may hold the very payment we would repeat.
-    #[must_use]
-    pub fn paid_pegouts(&self) -> crate::cardano::pegout_datum::PaidPegOuts {
-        crate::cardano::pegout_datum::PaidPegOuts::from_records(
-            &self.confirmed,
-            self.unconfirmed
-                .iter()
-                .filter(|tm| !tm.inputs.iter().any(|i| self.consumed.contains(i))),
-        )
-    }
-
     /// Whether the peg-out payment history can be trusted. A marker-token datum we could not read is
     /// a real (NFT-mint-gated) TM whose payments are invisible to us, so paying any peg-out while
     /// one exists risks re-paying it.

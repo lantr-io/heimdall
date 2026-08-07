@@ -158,7 +158,11 @@ pub trait CardanoChain: Send + Sync {
 
     /// Open peg-out requests at the `peg_out.ak` address — INCLUDING ones an earlier TM already
     /// paid (a request UTxO is spent by its owner's Complete tx, which lags the payment by hours or
-    /// never happens). `BuildTm` subtracts [`Self::query_paid_pegout_payments`] from this set.
+    /// never happens). What filters the already-paid ones is the completed-peg-outs trie,
+    /// keyed by `por_id` — see `build_tm`'s `AlreadyCompleted` skip. (Before WI-031 an
+    /// identity-free `(destination, net sat)` multiset ran first; it could not tell a
+    /// long-completed withdrawal from an unpaid one, because a `Confirmed` TM datum records
+    /// only `{scriptPubKey, amount}`.)
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>>;
 
     /// Chain "now" in POSIX milliseconds — the tip block's time.
@@ -173,23 +177,6 @@ pub trait CardanoChain: Send + Sync {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0))
-    }
-
-    /// Every peg-out payment already committed on Bitcoin by an earlier movement, as
-    /// `(destination scriptPubKey, satoshi actually paid)` — one entry per payment, duplicates
-    /// included, because several distinct requests may share a destination and amount.
-    ///
-    /// Read from the Confirmed TM datums' `fulfilled_peg_outs` lists plus still-live in-flight TMs.
-    /// `BuildTm` pays a request only when this multiset has no matching payment left to account for,
-    /// so each request is paid exactly once. An implementation that cannot produce a trustworthy
-    /// history (an unreadable TM datum, whose payments would be invisible) MUST return an error
-    /// rather than an incomplete list — under-reporting here re-pays treasury BTC irrecoverably.
-    ///
-    /// Default: empty, valid only alongside a `query_pegout_requests` that returns nothing.
-    async fn query_paid_pegout_payments(
-        &self,
-    ) -> EpochResult<Vec<(bitcoin::ScriptBuf, bitcoin::Amount)>> {
-        Ok(vec![])
     }
 
     /// The root held by the on-chain completed-peg-outs singleton, when this

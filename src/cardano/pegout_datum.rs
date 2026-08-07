@@ -16,7 +16,6 @@
 //!
 //!  - the completed-peg-outs trie (`cardano::cpo_trie`) is the DURABLE record — `build_tm` skips
 //!    any `por_id` already in it;
-//!  - [`PaidPegOuts`] + [`select_unpaid`] cover the window before a payment reaches the trie
 //!    (a TM signed and broadcast but not yet Confirmed on Cardano), by counting the payments in
 //!    the Confirmed TM datums' `fulfilled_peg_outs` lists plus still-live in-flight TMs.
 //!
@@ -33,8 +32,6 @@
 //!
 //! The treasury-outpoint PIN is GONE. It was the pre-rev-5.1 mechanism binding a request to one
 //! specific TM; the trie replaces it, so a request is completable by whichever TM pays it.
-
-use std::collections::HashMap;
 
 use pallas_primitives::PlutusData;
 
@@ -123,136 +120,18 @@ pub fn parse_pegout_datum(data: &PlutusData) -> Result<PegOutDatumFields, String
     })
 }
 
-/// The peg-out payments already committed on Bitcoin by earlier Treasury Movements, as a
-/// **multiset** keyed by `(destination scriptPubKey, satoshi amount actually paid)`.
+/// The result of one peg-out address scan: the decodable requests, plus how many UTxOs
+/// were dropped because their datum could not be decoded.
 ///
-/// This is the double-payment guard. A PegOut UTxO stays at the `peg_out.ak` address until its
-/// owner completes it — which needs the TM's Bitcoin confirmation plus an oracle proof, so it lags
-/// by hours or never happens — and every later scan therefore keeps returning requests an earlier
-/// TM already paid. Heimdall's only record of what was paid is the Confirmed TM datum's
-/// `fulfilled_peg_outs` list, so the payable set is "open requests minus what those datums show
-/// already paid".
-///
-/// **A multiset, not a set.** The datum records only `(scriptPubKey, amount)` — there is no request
-/// identity in it — and several distinct PegOut UTxOs legitimately share one `(destination,
-/// amount)` pair (the live preprod bridge has three identical 2 500-sat requests to one address).
-/// A set-based filter would drop all of them once one was paid, stranding the rest's fBTC forever.
-/// Counting pays each request exactly once.
+/// `malformed` is reported, not just logged (WI-031 item 8): the peg-out address is
+/// permissionlessly payable, so a request whose datum heimdall refuses is invisible in the
+/// "scanned N open peg-out request(s)" count — no TM ever pays it, and while its owner can
+/// still Cancel, an operator watching only the count has no signal that anything was lost.
 #[derive(Debug, Clone, Default)]
-pub struct PaidPegOuts {
-    counts: HashMap<(Vec<u8>, u64), usize>,
-}
-
-impl PaidPegOuts {
-    /// Build the multiset from on-chain TM records.
-    ///
-    /// - `confirmed`: EVERY Confirmed record at the TM validator address, not just the ones on the
-    ///   walked chain. A Confirmed record can only be minted through the confirm transition, which
-    ///   proves the BTC tx was mined, so an off-chain-path record still evidences a real payment.
-    ///   Over-counting only under-pays (recoverable by the request owner), while under-counting
-    ///   double-pays treasury BTC irrecoverably.
-    /// - `live_unconfirmed`: outputs of Unconfirmed (in-flight) TMs that can still confirm. Their
-    ///   payments are already committed in FROST-signed Bitcoin bytes, so they must not be paid a
-    ///   second time. Callers MUST exclude *dead* in-flight TMs (ones spending an outpoint a
-    ///   Confirmed TM already swept — they can never confirm); counting those would strand their
-    ///   peg-outs permanently.
-    ///
-    /// Output 0 of every TM is the treasury continuation, never a peg-out payment, and is skipped —
-    /// otherwise a treasury value that happened to equal a pending request's amount would mask it.
-    #[must_use]
-    pub fn from_records<'a>(
-        confirmed: &[crate::cardano::treasury_datum::ConfirmedTm],
-        live_unconfirmed: impl Iterator<Item = &'a crate::cardano::treasury_datum::UnconfirmedTm>,
-    ) -> Self {
-        let mut counts: HashMap<(Vec<u8>, u64), usize> = HashMap::new();
-        for tm in confirmed {
-            for out in tm.outputs.iter().skip(1) {
-                *counts
-                    .entry((out.script_pub_key.clone(), out.amount))
-                    .or_default() += 1;
-            }
-        }
-        for tm in live_unconfirmed {
-            for (value, spk) in tm.outputs.iter().skip(1) {
-                *counts
-                    .entry((spk.as_bytes().to_vec(), value.to_sat()))
-                    .or_default() += 1;
-            }
-        }
-        Self { counts }
-    }
-
-    /// Build the multiset from an already-flattened payment list — one entry per payment,
-    /// duplicates included (the `CardanoChain::query_paid_pegout_payments` shape).
-    pub fn from_payments<'a>(payments: impl Iterator<Item = (&'a [u8], u64)>) -> Self {
-        let mut counts: HashMap<(Vec<u8>, u64), usize> = HashMap::new();
-        for (spk, sat) in payments {
-            *counts.entry((spk.to_vec(), sat)).or_default() += 1;
-        }
-        Self { counts }
-    }
-
-    /// Total number of recorded peg-out payments.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.counts.values().sum()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.counts.values().all(|c| *c == 0)
-    }
-
-    /// How many payments of `(spk, net_sat)` are still unaccounted for.
-    #[must_use]
-    pub fn remaining(&self, spk: &[u8], net_sat: u64) -> usize {
-        self.counts
-            .get(&(spk.to_vec(), net_sat))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Claim one recorded payment of `(spk, net_sat)`. `true` means this request was already paid
-    /// (and the credit is consumed, so the NEXT identical request is not also filtered out).
-    pub fn claim(&mut self, spk: &[u8], net_sat: u64) -> bool {
-        match self.counts.get_mut(&(spk.to_vec(), net_sat)) {
-            Some(n) if *n > 0 => {
-                *n -= 1;
-                true
-            }
-            _ => false,
-        }
-    }
-}
-
-/// Split open peg-out requests into the ones still owed a payment and the ones an earlier TM
-/// already paid, consuming one credit from `paid` per matched request.
-///
-/// The match is on the amount the TM actually pays — `gross − per_pegout_fee`, read from each
-/// request's OWN datum — because that is what a Confirmed datum records. A request whose gross does
-/// not exceed its fee has no payable amount at all; it is left in `unpaid` and dropped downstream by
-/// `build_tm` (which owns the dust and non-standard-script skips), so the two skip rules stay in
-/// one place.
-///
-/// Deterministic for FROST: the outcome depends only on the Cardano snapshot, and requests sharing
-/// one `(destination, net amount)` key produce byte-identical outputs, so *which* of them is
-/// filtered cannot change the TM bytes.
-#[must_use]
-pub fn select_unpaid(
-    requests: Vec<PegOutRequestData>,
-    paid: &mut PaidPegOuts,
-) -> (Vec<PegOutRequestData>, Vec<PegOutRequestData>) {
-    let mut unpaid = Vec::new();
-    let mut already_paid = Vec::new();
-    for r in requests {
-        let net = r.net_sat();
-        if net > 0 && paid.claim(&r.destination_script_pubkey, net) {
-            already_paid.push(r);
-        } else {
-            unpaid.push(r);
-        }
-    }
-    (unpaid, already_paid)
+pub struct PegOutScan {
+    pub requests: Vec<PegOutRequestData>,
+    /// UTxOs holding the bridged token whose datum did not decode as a `PegOutDatum`.
+    pub malformed: usize,
 }
 
 /// Fetch every PegOut request at `pegout_address`, identified by carrying the `fbtc_unit` token
@@ -262,15 +141,15 @@ pub fn select_unpaid(
 /// same TM.
 ///
 /// These are ALL open requests, including ones an earlier TM already paid (they linger until their
-/// owner completes them). Pass the result through [`select_unpaid`] before building, and hand
-/// `build_tm` the completed-peg-outs trie — between them that is what keeps a paid request out of
-/// the next TM.
+/// owner completes them). What filters those out is the completed-peg-outs trie, keyed by
+/// `por_id`: hand it to `build_tm`, which skips any request already recorded in it
+/// (`SkipReason::AlreadyCompleted`).
 pub async fn fetch_pegout_requests(
     base_url: &str,
     project_id: &str,
     pegout_address: &str,
     fbtc_unit: &str,
-) -> Result<Vec<PegOutRequestData>, String> {
+) -> Result<PegOutScan, String> {
     let utxos = bf_http::fetch_address_utxos(base_url, project_id, pegout_address).await?;
 
     // Blockfrost emits units as lowercase hex; normalise the operator-supplied unit so a
@@ -278,6 +157,7 @@ pub async fn fetch_pegout_requests(
     let fbtc_unit = fbtc_unit.trim().to_ascii_lowercase();
 
     let mut out = Vec::new();
+    let mut malformed = 0usize;
     for utxo in utxos {
         // The peg-out amount is the locked fBTC quantity in the value (no datum field for it).
         let Some(amount_entry) = utxo.amount.iter().find(|a| a.unit == fbtc_unit) else {
@@ -317,6 +197,7 @@ pub async fn fetch_pegout_requests(
         match request {
             Ok(req) => out.push(req),
             Err(why) => {
+                malformed += 1;
                 eprintln!(
                     "[pegout] skipping malformed peg-out UTxO {}#{}: {why}",
                     utxo.tx_hash, utxo.output_index
@@ -333,7 +214,10 @@ pub async fn fetch_pegout_requests(
             .then(a.amount_sat.cmp(&b.amount_sat))
             .then(a.cardano_utxo.cmp(&b.cardano_utxo))
     });
-    Ok(out)
+    Ok(PegOutScan {
+        requests: out,
+        malformed,
+    })
 }
 
 #[cfg(test)]
@@ -466,157 +350,5 @@ mod tests {
             vec![bytes(b"a"), pegout_datum(121, None, vec![]), int(0), int(0)],
         );
         assert!(parse_pegout_datum(&bad).is_err());
-    }
-
-    // --- payment-history filter ---------------------------------------------------------------
-
-    use crate::cardano::treasury_datum::{ConfirmedTm, TmOutput, UnconfirmedTm};
-
-    /// A Confirmed record whose output 0 is the treasury and 1.. are peg-out payments.
-    fn confirmed(treasury_sat: u64, pegouts: &[(&[u8], u64)]) -> ConfirmedTm {
-        let mut outputs = vec![TmOutput {
-            script_pub_key: b"\x51\x20treasury".to_vec(),
-            amount: treasury_sat,
-        }];
-        outputs.extend(pegouts.iter().map(|(spk, amount)| TmOutput {
-            script_pub_key: spk.to_vec(),
-            amount: *amount,
-        }));
-        ConfirmedTm {
-            btc_txid: [0xcc; 32],
-            swept_inputs: vec![],
-            outputs,
-        }
-    }
-
-    fn unconfirmed(inputs: Vec<bitcoin::OutPoint>, pegouts: &[(&[u8], u64)]) -> UnconfirmedTm {
-        let mut outputs = vec![(
-            bitcoin::Amount::from_sat(1_000),
-            bitcoin::ScriptBuf::from_bytes(b"\x51\x20treasury".to_vec()),
-        )];
-        outputs.extend(pegouts.iter().map(|(spk, amount)| {
-            (
-                bitcoin::Amount::from_sat(*amount),
-                bitcoin::ScriptBuf::from_bytes(spk.to_vec()),
-            )
-        }));
-        UnconfirmedTm {
-            btc_txid: "4444444444444444444444444444444444444444444444444444444444444444"
-                .parse()
-                .unwrap(),
-            inputs,
-            outputs,
-            cardano_tx_hash: String::new(),
-            block_time: None,
-        }
-    }
-
-    const DEST_A: &[u8] = b"\x00\x14aaaaaaaaaaaaaaaaaaaa";
-    const DEST_B: &[u8] = b"\x00\x14bbbbbbbbbbbbbbbbbbbb";
-
-    // The core bug: a paid request lingers at the peg-out address until its owner completes it, so
-    // the next TM must not pay it again.
-    #[test]
-    fn already_paid_request_is_filtered_out() {
-        let records = [confirmed(500_000, &[(DEST_A, 50_000)])];
-        let mut paid = PaidPegOuts::from_records(&records, std::iter::empty());
-        let (unpaid, already) = select_unpaid(
-            vec![request(DEST_A, 50_000, 0), request(DEST_B, 60_000, 0)],
-            &mut paid,
-        );
-        assert_eq!(unpaid.len(), 1);
-        assert_eq!(unpaid[0].destination_script_pubkey, DEST_B);
-        assert_eq!(already.len(), 1);
-        assert_eq!(already[0].destination_script_pubkey, DEST_A);
-    }
-
-    // Multiset, not set: three identical requests with one payment recorded → exactly one is
-    // filtered. A set-based filter would strand the other two's fBTC forever.
-    #[test]
-    fn duplicate_requests_are_filtered_one_per_recorded_payment() {
-        let records = [confirmed(500_000, &[(DEST_A, 2_500), (DEST_A, 2_500)])];
-        let mut paid = PaidPegOuts::from_records(&records, std::iter::empty());
-        assert_eq!(paid.remaining(DEST_A, 2_500), 2);
-
-        let (unpaid, already) = select_unpaid(
-            vec![
-                request(DEST_A, 2_500, 0),
-                request(DEST_A, 2_500, 0),
-                request(DEST_A, 2_500, 0),
-            ],
-            &mut paid,
-        );
-        assert_eq!(already.len(), 2, "two payments recorded → two filtered");
-        assert_eq!(unpaid.len(), 1, "the third is still owed its payment");
-    }
-
-    // Output 0 is the treasury continuation, never a peg-out — counting it could mask a request
-    // whose destination/amount happened to match.
-    #[test]
-    fn treasury_output_is_not_counted_as_a_payment() {
-        let records = [confirmed(50_000, &[])];
-        let paid = PaidPegOuts::from_records(&records, std::iter::empty());
-        assert!(paid.is_empty());
-        assert_eq!(paid.remaining(b"\x51\x20treasury", 50_000), 0);
-    }
-
-    // The TM output carries gross − per_pegout_fee, so that is the amount the datum records and the
-    // amount the filter must match on. The fee is now per-REQUEST, read from its own datum.
-    #[test]
-    fn matching_uses_the_net_paid_amount_not_the_gross_request() {
-        let records = [confirmed(500_000, &[(DEST_A, 49_000)])];
-        let mut paid = PaidPegOuts::from_records(&records, std::iter::empty());
-        let (unpaid, already) = select_unpaid(vec![request(DEST_A, 50_000, 1_000)], &mut paid);
-        assert_eq!(
-            already.len(),
-            1,
-            "50_000 gross − 1_000 fee == the 49_000 paid"
-        );
-        assert!(unpaid.is_empty());
-
-        // A request carrying a DIFFERENT pinned fee pays a different net, so the same history
-        // does not account for it. This is why the fee must come from the datum: it is what makes
-        // the filter agree across SPOs without a shared config value.
-        let mut paid = PaidPegOuts::from_records(&records, std::iter::empty());
-        let (unpaid, _) = select_unpaid(vec![request(DEST_A, 50_000, 0)], &mut paid);
-        assert_eq!(unpaid.len(), 1);
-    }
-
-    // Two requests to one destination with different pinned fees but the same NET amount are
-    // interchangeable to the filter — exactly one is claimed per recorded payment.
-    #[test]
-    fn requests_with_different_fees_but_equal_net_share_one_credit() {
-        let records = [confirmed(500_000, &[(DEST_A, 49_000)])];
-        let mut paid = PaidPegOuts::from_records(&records, std::iter::empty());
-        let (unpaid, already) = select_unpaid(
-            vec![request(DEST_A, 50_000, 1_000), request(DEST_A, 49_500, 500)],
-            &mut paid,
-        );
-        assert_eq!(already.len(), 1);
-        assert_eq!(unpaid.len(), 1);
-    }
-
-    // An in-flight TM's payments are already committed in signed Bitcoin bytes: not yet Confirmed,
-    // but must not be paid twice.
-    #[test]
-    fn live_in_flight_payments_are_counted() {
-        let live = unconfirmed(vec![], &[(DEST_A, 50_000)]);
-        let mut paid = PaidPegOuts::from_records(&[], std::iter::once(&live));
-        let (unpaid, already) = select_unpaid(vec![request(DEST_A, 50_000, 0)], &mut paid);
-        assert_eq!(already.len(), 1);
-        assert!(unpaid.is_empty());
-    }
-
-    // A request paid by NO TM stays payable even after many unrelated movements.
-    #[test]
-    fn unrelated_history_does_not_filter_a_fresh_request() {
-        let records = [
-            confirmed(500_000, &[(DEST_B, 60_000)]),
-            confirmed(400_000, &[(DEST_B, 60_000)]),
-        ];
-        let mut paid = PaidPegOuts::from_records(&records, std::iter::empty());
-        let (unpaid, already) = select_unpaid(vec![request(DEST_A, 50_000, 0)], &mut paid);
-        assert_eq!(unpaid.len(), 1);
-        assert!(already.is_empty());
     }
 }

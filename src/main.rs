@@ -1864,7 +1864,7 @@ fn cross_check_cpo_trie_from_cfg(
     rt: &tokio::runtime::Runtime,
     cfg: &HeimdallConfig,
     trie: &heimdall::cardano::cpo_trie::CpoTrie,
-) -> Result<(), String> {
+) -> Result<CpoTrust, String> {
     use heimdall::cardano::cpo_history::{BlockfrostHistory, CpoHistorySource, KupoHistory};
 
     let Some(policy) = cfg.cardano.cpo_policy_id.as_deref() else {
@@ -1873,7 +1873,7 @@ fn cross_check_cpo_trie_from_cfg(
              against the on-chain completed-peg-outs singleton. Set it before signing a TM on a \
              live bridge."
         );
-        return Ok(());
+        return Ok(CpoTrust::Unverified);
     };
     // Same backend selection as `reconstruct-cpo-trie`, so both reads see the same index.
     let source: Box<dyn CpoHistorySource> = match cfg.cardano.kupo_url.as_deref() {
@@ -1915,7 +1915,18 @@ fn cross_check_cpo_trie_from_cfg(
         "[cpo] local root matches the on-chain completed-peg-outs singleton ({})",
         hex::encode(on_chain)
     );
-    Ok(())
+    Ok(CpoTrust::Verified)
+}
+
+/// Whether the local completed-peg-outs trie may be trusted to decide which peg-outs an
+/// earlier movement already paid. Mirrors the epoch machine's own gate — since WI-031 the
+/// trie is the sole already-paid record, so "not cross-checked" has to be actionable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpoTrust {
+    /// Cross-checked against the on-chain CPO singleton.
+    Verified,
+    /// No `cardano.cpo_policy_id` — the local root was never checked against the chain.
+    Unverified,
 }
 
 /// The freshness window for peg-out selection. `now_ms` must be CHAIN time.
@@ -5000,7 +5011,7 @@ fn run_sweep_pegins(
     use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
     use heimdall::cardano::pegin_datum::parse_pegin_request;
     use heimdall::cardano::pegin_source::CardanoPegInSource;
-    use heimdall::cardano::pegout_datum::{self, fetch_pegout_requests};
+    use heimdall::cardano::pegout_datum::fetch_pegout_requests;
     use heimdall::frost::dkg::run_demo_dkg;
 
     let secp = Secp256k1::new();
@@ -5193,18 +5204,28 @@ fn run_sweep_pegins(
                 "[sweep] no cardano.blockfrost_project_id — peg-out collection is Blockfrost-only \
                  (N2C is peg-in only); building TM without peg-outs"
             );
-            Vec::new()
+            heimdall::cardano::pegout_datum::PegOutScan::default()
         }
     };
+    // Report the undecodable UTxOs, not just the decodable ones: a request heimdall cannot
+    // parse is payable by no TM and would otherwise vanish from this count with no signal
+    // (WI-031 item 8).
+    if pegout_data.malformed > 0 {
+        println!(
+            "  WARNING: {} UTxO(s) at {pegout_script_address} carry the bridged token but no \
+             decodable PegOutDatum — no TM can pay them (their owners can still Cancel)",
+            pegout_data.malformed
+        );
+    }
     println!(
         "scanned {} open peg-out request(s) at {pegout_script_address}",
-        pegout_data.len()
+        pegout_data.requests.len()
     );
 
     // Auto-mover: with nothing pending at all, don't post a treasury→treasury self-move
     // (it would just burn fee) — skip this tick. (Re-checked after the pin filter below, which can
     // empty the peg-out set.)
-    if auto_mode && pegin_inputs.is_empty() && pegout_data.is_empty() {
+    if auto_mode && pegin_inputs.is_empty() && pegout_data.requests.is_empty() {
         println!("[mover] nothing to sweep (0 peg-ins, 0 peg-outs) — skipping tick");
         return Ok(());
     }
@@ -5254,59 +5275,42 @@ fn run_sweep_pegins(
         }
     };
 
-    // ── Already-paid filter ────────────────────────────────────────────────────────────────────
-    // An open PegOut UTxO is NOT an unpaid one: it survives at the script address until its owner
-    // completes it (which needs this TM's Bitcoin confirmation plus an oracle proof — hours later,
-    // or never), so the scan above keeps returning withdrawals earlier TMs already paid. The paid
-    // history is reconstructed from the Confirmed TM datums' `fulfilled_peg_outs` lists (plus TMs
-    // still in flight, whose payments are already committed in signed Bitcoin bytes) and subtracted
-    // here, so each request is paid exactly once. Matching is a multiset count on
-    // (destination, net amount) — several distinct requests legitimately share one pair, and a
-    // set-based filter would strand all but the first.
+    // The completed-peg-outs trie, loaded before peg-out selection: it decides both which
+    // requests are still owed a payment (WI-031) and the root this TM commits, so a trie out
+    // of sync with the chain must stop the sweep before anything is built or signed.
+    let cpo_trie = cpo_trie_from_cfg(cfg)?;
+    let cpo_trust = cross_check_cpo_trie_from_cfg(&rt, cfg, &cpo_trie)?;
+
+    // ── Peg-out selection ──────────────────────────────────────────────────────────────────────
+    // An open PegOut UTxO is NOT an unpaid one: it survives at the script address until someone
+    // completes it (which needs this TM's Bitcoin confirmation plus a membership proof — hours
+    // later, or never), so the scan above keeps returning withdrawals earlier TMs already paid.
+    // The completed-peg-outs trie, keyed by `por_id`, is what filters them: `build_tm` skips a
+    // request already in the trie (`AlreadyCompleted`).
+    //
+    // WI-031 deleted the `(destination scriptPubKey, net sat)` multiset that used to run here.
+    // It could never be keyed by request identity — a `Confirmed` TM datum holds
+    // `fulfilled_peg_outs: [{scriptPubKey, amount}]` and nothing more, and the
+    // `fulfilled_por_outpoints` hint exists only on `Unconfirmed` and is explicitly unverified
+    // — so a credit left by a long-completed withdrawal was indistinguishable from an unpaid
+    // one and stranded a re-created identical request permanently. The double-pay window it
+    // nominally covered is already closed by the in-flight refusal above (`tip.in_flight`),
+    // which stops a second sweep before the previous TM confirms and folds into the trie.
     let mut pegout_requests: Vec<PegOutRequest> = Vec::new();
-    if !pegout_data.is_empty() {
-        // Never pay a peg-out without a trustworthy payment history: an unreadable marker-token
-        // datum is a real TM whose payments we cannot see, and paying blind risks repeating one.
-        let scan = tm_scan.as_ref().ok_or(
-            "peg-out payment history unavailable (no TM-UTxO scan) — refusing to pay peg-outs \
-             blind; fix cardano.blockfrost_project_id + cardano.treasury_address",
-        )?;
-        if !scan.pegout_history_is_complete() {
-            return Err(format!(
-                "peg-out payment history is incomplete ({} unreadable TM datum(s), {} opaque \
-                 in-flight TM(s)) — refusing to pay peg-outs, they may already have been paid",
-                scan.parse_failures, scan.opaque_unconfirmed,
-            ));
-        }
-        let mut paid = scan.paid_pegouts();
-        println!(
-            "  peg-out payment history: {} payment(s) recorded across {} Confirmed + {} in-flight TM(s)",
-            paid.len(),
-            scan.confirmed.len(),
-            scan.unconfirmed.len(),
+    if !pegout_data.requests.is_empty() && cpo_trust == CpoTrust::Unverified {
+        // The trie is the only record of what an earlier TM already paid, so a trie this node
+        // cannot vouch for means "pay no peg-out", never "pay unchecked" — unchecked, every
+        // open request is re-paid on every sweep, draining the treasury irrecoverably.
+        // Peg-ins still sweep.
+        eprintln!(
+            "[pegout] skipping ALL {} open peg-out(s): the completed-peg-outs trie was not \
+             cross-checked against the chain (no cardano.cpo_policy_id), and it is the only \
+             record of what an earlier TM already paid. Set cardano.cpo_policy_id (and \
+             protocol.state_dir) to pay peg-outs.",
+            pegout_data.requests.len(),
         );
-
-        let (unpaid, already_paid) = pegout_datum::select_unpaid(pegout_data, &mut paid);
-        for po in &already_paid {
-            println!(
-                "  skip peg-out → {} — {} sat ({}#{}): already paid by an earlier TM (awaiting the \
-                 owner's Complete tx, which is what finally spends this UTxO)",
-                hex::encode(&po.destination_script_pubkey),
-                po.amount_sat,
-                po.cardano_utxo.0,
-                po.cardano_utxo.1,
-            );
-        }
-
-        // The treasury-outpoint PIN is GONE (rev 5.1). A peg-out used to name the one
-        // treasury outpoint the paying TM had to spend, and heimdall skipped requests
-        // pinned elsewhere. The completed-peg-outs trie replaces that binding: a request
-        // is completable by whichever TM pays it, proven by membership in the trie the
-        // quorum attests. `build_tm` now owns the remaining skips (already in the trie,
-        // outside the freshness window, dust, non-standard script).
-        let payable = unpaid;
-
-        for po in &payable {
+    } else if !pegout_data.requests.is_empty() {
+        for po in &pegout_data.requests {
             println!(
                 "  peg-out → {} — {} sat ({}#{})",
                 hex::encode(&po.destination_script_pubkey),
@@ -5345,10 +5349,6 @@ fn run_sweep_pegins(
         }
         _ => 0,
     };
-    let cpo_trie = cpo_trie_from_cfg(cfg)?;
-    // Before anything is built or signed: this TM commits `cpo_trie`'s root, so a
-    // trie that has fallen out of sync with the chain must stop the sweep here.
-    cross_check_cpo_trie_from_cfg(&rt, cfg, &cpo_trie)?;
 
     // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..m] = one
     // payment per peg-out (sorted by (scriptPubKey, net amount, por_id) inside build_tm); the LAST

@@ -51,10 +51,11 @@ pub struct PegInInput {
 /// `peg-out.ak`'s Complete branch rebuilds exactly those bytes from the request's
 /// own datum, never from a live config value.
 ///
-/// The already-paid filter (`pegout_datum::select_unpaid`) still runs in the
-/// caller. `build_tm` owns the skips it can decide itself: non-standard script,
-/// sub-dust net, a `created` outside the freshness window, and a `por_id` the
-/// local trie already records as completed.
+/// `build_tm` owns every skip: non-standard script, sub-dust net, a `created`
+/// outside the freshness window, a `por_id` the local trie already records as
+/// completed, and a `por_id` repeated within this batch. Since WI-031 there is no
+/// separate already-paid filter in the caller — the trie IS that record, and it is
+/// the only one keyed by request identity.
 pub struct PegOutRequest {
     pub script_pubkey: ScriptBuf,
     /// Gross locked fBTC (satoshi).
@@ -234,10 +235,10 @@ pub struct UnsignedTm {
     pub prevouts: Vec<TxOut>,
     pub input_spend_info: Vec<TaprootSpendInfo>,
     /// Peg-out requests dropped from this TM by the skip rules (see
-    /// [`SkipReason`]); already-paid requests are filtered earlier, by
-    /// `pegout_datum::select_unpaid`, and never reach here. Surfaced so the
-    /// operator can see what was skipped; the user reclaims via `peg_out.ak`'s
-    /// Cancel path.
+    /// [`SkipReason`]) — including the already-paid ones, which since WI-031 are
+    /// recognised here by their `por_id` in the completed-peg-outs trie rather than
+    /// pre-filtered by the caller. Surfaced so the operator can see what was
+    /// skipped; the user reclaims via `peg_out.ak`'s Cancel path.
     pub skipped_pegouts: Vec<SkippedPegOut>,
     /// The peg-outs this TM pays, in payment-output order (`tx.output[1..=n]`).
     /// Their `(por_id, trie_value())` pairs are exactly what [`Self::cpo_root`]
@@ -473,9 +474,8 @@ pub fn build_tm(
     // address). SKIP a request the TM cannot safely pay rather than fail the
     // whole TM — one tiny/hostile peg-out must not block every peg-in and
     // peg-out (bridge-wide liveness DoS). The user reclaims via Cancel. Four ways
-    // a request is unpayable HERE. The one that depends on Cardano *payment*
-    // history (already paid by an earlier, not-yet-recorded TM) is applied by the
-    // caller before this point, via `pegout_datum::select_unpaid`:
+    // a request is unpayable HERE; payment history is the fifth, and since WI-031 it
+    // is decided here too, from the `por_id` trie the caller hands in:
     //
     //  (1) Non-standard destination scriptPubKey. An empty script is
     //      anyone-can-spend (treasury BTC claimable by anyone — fund loss),

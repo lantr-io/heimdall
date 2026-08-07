@@ -36,13 +36,6 @@ pub struct StaticFixture {
     pub pegins: Vec<StaticPegIn>,
     /// Peg-out requests waiting to be paid out.
     pub pegouts: Vec<StaticPegOut>,
-    /// Peg-out payments an EARLIER movement already committed on Bitcoin, as
-    /// `(destination, satoshi actually paid)` — what a live chain reads from the Confirmed TM
-    /// datums' `fulfilled_peg_outs`. `CardanoChain` documents its empty default as "valid only
-    /// alongside a `query_pegout_requests` that returns nothing", so a fixture carrying
-    /// `pegouts` must state this too: without it the mock re-pays every request on every cycle
-    /// and the double-pay guard goes untested on the daemon path.
-    pub paid_pegout_payments: Vec<(ScriptBuf, Amount)>,
     pub fee_rate_sat_per_vb: u64,
     pub per_pegout_fee: Amount,
     /// Per-SPO bifrost identity keypairs, so the HTTP demo can construct
@@ -126,7 +119,6 @@ pub fn demo_static_fixture(min_signers: u16, max_signers: u16, base_port: u16) -
         treasury_value: Amount::from_sat(10_000_000),
         pegins: vec![],
         pegouts: vec![],
-        paid_pegout_payments: vec![],
         fee_rate_sat_per_vb: 1,
         per_pegout_fee: Amount::from_sat(1_000),
         bifrost_keypairs,
@@ -199,7 +191,6 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
         treasury_value: Amount::from_sat(10_000_000),
         pegins: vec![],
         pegouts: vec![],
-        paid_pegout_payments: vec![],
         fee_rate_sat_per_vb: cfg.bitcoin.fee_rate_sat_per_vb,
         per_pegout_fee: Amount::from_sat(cfg.bitcoin.per_pegout_fee_sat),
         // WI-023: the no-registry demo derives each node's key from `--index`

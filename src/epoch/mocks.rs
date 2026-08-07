@@ -47,7 +47,7 @@ use crate::http::wire::DkgNamespace;
 /// `(destination, amount)`, stable across runs (so mock TMs stay deterministic),
 /// and domain-separated from any real por_id, which hashes a Plutus-encoded
 /// `OutputReference` rather than this tag.
-fn fixture_por_id(spk: &bitcoin::ScriptBuf, amount: bitcoin::Amount) -> [u8; 32] {
+pub(crate) fn fixture_por_id(spk: &bitcoin::ScriptBuf, amount: bitcoin::Amount) -> [u8; 32] {
     use bitcoin::hashes::{Hash as _, HashEngine, sha256};
     let mut eng = sha256::Hash::engine();
     eng.input(b"heimdall-mock-por-id-v1");
@@ -331,15 +331,6 @@ impl CardanoChain for MockCardanoChain {
                 outpoint: [0u8; 36],
             })
             .collect())
-    }
-
-    /// Serve the fixture's payment history rather than inheriting the trait's empty default —
-    /// that default is documented as valid only when `query_pegout_requests` returns nothing,
-    /// which stopped being true once fixtures carry peg-outs.
-    async fn query_paid_pegout_payments(
-        &self,
-    ) -> EpochResult<Vec<(bitcoin::ScriptBuf, bitcoin::Amount)>> {
-        Ok(self.fixture.paid_pegout_payments.clone())
     }
 
     async fn submit_signed_tm(
