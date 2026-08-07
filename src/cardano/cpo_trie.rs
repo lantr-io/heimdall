@@ -16,7 +16,7 @@
 //! ## Where the root comes from
 //!
 //! The root is **attested, not derived**. Each FROST-signed TM carries exactly one
-//! `"CPOR1"` OP_RETURN output holding the root that must hold after it, and the
+//! BTMR1 OP_RETURN output holding the root that must hold after it, and the
 //! on-chain Confirm transition copies that root into the CPO singleton UTxO. The
 //! chain therefore never recomputes the root — the quorum's signature is the only
 //! integrity anchor.
@@ -100,9 +100,7 @@ use std::path::{Path, PathBuf};
 use pallas_primitives::PlutusData;
 use serde::{Deserialize, Serialize};
 
-use crate::bitcoin::tm_builder::{
-    CPO_COMMITMENT_PREFIX, CPO_COMMITMENT_SCRIPT_LEN, CpoTrieView, FulfilledPegOut,
-};
+use crate::bitcoin::tm_builder::{CpoTrieView, FulfilledPegOut, btmr1_roots, is_btmr1_commitment};
 use crate::cardano::cpo_history::{CpoHistorySource, DatumState};
 use crate::cardano::mpf;
 use crate::cardano::state_file;
@@ -405,7 +403,7 @@ impl CpoTrie {
     /// Recompute the root a proposed TM should commit, and compare.
     ///
     /// This is the co-signer gate. `proposed_root` is the root read out of the
-    /// TM's `"CPOR1"` output; `entries` is the peg-out set the verifier
+    /// TM's BTMR1 output; `entries` is the peg-out set the verifier
     /// independently determined the TM fulfils. A mismatch means the proposer's
     /// trie disagrees with this node's, and this node MUST refuse to sign — the
     /// root is attested, so an unchallenged wrong root becomes chain truth.
@@ -576,30 +574,39 @@ struct PersistedEntry {
 // Reading the commitment out of a Confirmed TM datum
 // ---------------------------------------------------------------------------
 
-/// The completed-peg-outs root a Confirmed TM record attests.
+/// Both roots a Confirmed TM record attests: `(spi_root, cpo_root)`.
 ///
 /// The Confirmed datum's `fulfilled_peg_outs` is EVERY output of the raw BTC tx,
-/// commitment included, so the root is readable straight from chain state without
-/// re-parsing Bitcoin bytes. Same rule as on-chain: exactly one commitment output.
-pub fn confirmed_committed_root(tm: &ConfirmedTm) -> Result<[u8; 32], String> {
+/// commitment included, so the roots are readable straight from chain state
+/// without re-parsing Bitcoin bytes. Same rule as on-chain: exactly one
+/// commitment output; `spi_root` is script bytes `[7, 39)` and `cpo_root` is
+/// script bytes `[39, 71)`.
+pub fn confirmed_committed_roots(tm: &ConfirmedTm) -> Result<([u8; 32], [u8; 32]), String> {
     let mut found = None;
     let mut count = 0usize;
     for out in &tm.outputs {
-        let spk = &out.script_pub_key;
-        if spk.len() == CPO_COMMITMENT_SCRIPT_LEN
-            && spk[..CPO_COMMITMENT_PREFIX.len()] == CPO_COMMITMENT_PREFIX
-        {
+        if let Some(roots) = btmr1_roots(&out.script_pub_key) {
             count += 1;
-            let mut root = [0u8; 32];
-            root.copy_from_slice(&spk[CPO_COMMITMENT_PREFIX.len()..]);
-            found = Some(root);
+            found = Some(roots);
         }
     }
     match count {
         1 => Ok(found.expect("count == 1")),
-        0 => Err("missing root commitment (no \"CPOR1\" output)".to_string()),
+        0 => Err("missing root commitment (no \"BTMR1\" output)".to_string()),
         n => Err(format!("multiple root commitments ({n})")),
     }
+}
+
+/// The completed-peg-outs root a Confirmed TM record attests — the `cpo_root`
+/// half of [`confirmed_committed_roots`], script bytes `[39, 71)`.
+pub fn confirmed_committed_root(tm: &ConfirmedTm) -> Result<[u8; 32], String> {
+    confirmed_committed_roots(tm).map(|(_, cpo)| cpo)
+}
+
+/// The swept peg-ins root a Confirmed TM record attests — the `spi_root` half
+/// of [`confirmed_committed_roots`], script bytes `[7, 39)`.
+pub fn confirmed_committed_spi_root(tm: &ConfirmedTm) -> Result<[u8; 32], String> {
+    confirmed_committed_roots(tm).map(|(spi, _)| spi)
 }
 
 /// The TM's actual peg-out PAYMENTS: every output except the treasury
@@ -609,10 +616,7 @@ pub fn confirmed_payments(tm: &ConfirmedTm) -> Vec<(Vec<u8>, u64)> {
     tm.outputs
         .iter()
         .skip(1)
-        .filter(|o| {
-            !(o.script_pub_key.len() == CPO_COMMITMENT_SCRIPT_LEN
-                && o.script_pub_key[..CPO_COMMITMENT_PREFIX.len()] == CPO_COMMITMENT_PREFIX)
-        })
+        .filter(|o| !is_btmr1_commitment(&o.script_pub_key))
         .map(|o| (o.script_pub_key.clone(), o.amount))
         .collect()
 }
@@ -716,7 +720,7 @@ impl HistoricalPor {
 /// 3. Read every peg-out request ever created (spent included — a completed
 ///    request's UTxO is gone) and index it by outpoint.
 /// 4. Replay the chain. For each Confirmed TM: take the root it committed (from
-///    its own `"CPOR1"` output), resolve its data-availability hint through the
+///    its own BTMR1 output), resolve its data-availability hint through the
 ///    matching Unconfirmed record, insert those entries, and ASSERT the running
 ///    root equals the committed root.
 /// 5. If a hint is absent, garbled, or produces the wrong root, fall back to
@@ -1185,6 +1189,7 @@ fn search<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitcoin::tm_builder::{BTMR1_COMMITMENT_PREFIX, BTMR1_COMMITMENT_SCRIPT_LEN};
     use crate::cardano::treasury_datum::TmOutput;
     use serde_json::Value;
 
@@ -1432,7 +1437,10 @@ mod tests {
     // --- commitment reading ------------------------------------------------
 
     fn commitment_out(root: [u8; 32]) -> TmOutput {
-        let mut spk = CPO_COMMITMENT_PREFIX.to_vec();
+        // BTMR1 layout: prefix ++ spi_root ++ cpo_root. These tests exercise the
+        // cpo half, so the spi half is a fixed placeholder.
+        let mut spk = BTMR1_COMMITMENT_PREFIX.to_vec();
+        spk.extend_from_slice(&[0x99u8; 32]);
         spk.extend_from_slice(&root);
         TmOutput {
             script_pub_key: spk,
@@ -1467,6 +1475,8 @@ mod tests {
             ],
         );
         assert_eq!(confirmed_committed_root(&tm).unwrap(), [0x5a; 32]);
+        // The sibling reads the spi half, script bytes [7, 39).
+        assert_eq!(confirmed_committed_spi_root(&tm).unwrap(), [0x99; 32]);
         // Output 0 is the treasury and the commitment is not a payment.
         assert_eq!(confirmed_payments(&tm), vec![(vec![0xaa; 22], 1000u64)]);
     }
@@ -1487,19 +1497,19 @@ mod tests {
         assert!(confirmed_committed_root(&two).is_err());
     }
 
-    // A 39-byte payment script must not be read as a commitment (the prefix check
+    // A 71-byte payment script must not be read as a commitment (the prefix check
     // is what stops it) — nor a short right-prefixed script (the length check).
     #[test]
     fn confirmed_committed_root_ignores_lookalikes() {
-        let mut short = CPO_COMMITMENT_PREFIX.to_vec();
-        short.extend_from_slice(&[0u8; 31]);
+        let mut short = BTMR1_COMMITMENT_PREFIX.to_vec();
+        short.extend_from_slice(&[0u8; 63]);
         let tm = confirmed(
             1,
             vec![],
             vec![
                 payment_out(0x11, 5),
                 TmOutput {
-                    script_pub_key: vec![0x51; CPO_COMMITMENT_SCRIPT_LEN],
+                    script_pub_key: vec![0x51; BTMR1_COMMITMENT_SCRIPT_LEN],
                     amount: 7,
                 },
                 TmOutput {
@@ -2002,10 +2012,12 @@ mod tests {
         }
     }
 
-    /// A Confirmed TM datum paying `(spk, net)` and committing `root`.
+    /// A Confirmed TM datum paying `(spk, net)` and committing `root` (as the
+    /// cpo half of the BTMR1 commitment; the spi half is a placeholder).
     fn confirmed_datum(txid: [u8; 32], payments: &[(Vec<u8>, u64)], root: [u8; 32]) -> PlutusData {
         use crate::cardano::plutus::{array, bool_data, bytes, constr, int, int_from_u64};
-        let mut spk = CPO_COMMITMENT_PREFIX.to_vec();
+        let mut spk = BTMR1_COMMITMENT_PREFIX.to_vec();
+        spk.extend_from_slice(&[0x99u8; 32]);
         spk.extend_from_slice(&root);
         let entry = |s: &[u8], a: u64| constr(0, vec![bytes(s), int_from_u64(a)]);
         let mut outs = vec![entry(&[0x51; 34], 900_000)];

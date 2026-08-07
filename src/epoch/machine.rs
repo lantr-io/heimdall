@@ -1187,6 +1187,13 @@ async fn build_tm_phase(
     // Config tunable. `now_ms` it compares against is the snapshot's chain time.
     let pegout_freshness_margin_ms = config.pegout_freshness_margin.as_millis() as i64;
 
+    // This node's persisted SPI trie: `build_tm` advances it by every tx input
+    // except input 0 ([SPI-1]) to compute the spi_root its BTMR1 commitment
+    // carries. Every co-signer recomputes that root from its own trie before
+    // signing ([SPI-2], `verify_spi_root`).
+    let spi_trie = crate::cardano::spi_trie::SpiTrie::load_or_empty(config.state_dir.as_deref())
+        .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?;
+
     let unsigned = build_tm(
         TreasuryInput {
             outpoint: treasury.outpoint,
@@ -1202,6 +1209,7 @@ async fn build_tm_phase(
             margin_ms: pegout_freshness_margin_ms,
         },
         &cpo_trie,
+        &spi_trie,
     )
     .map_err(|e| EpochError::TmBuild(e.to_string()))?;
 
@@ -1224,27 +1232,6 @@ async fn build_tm_phase(
     let sighashes = compute_sighashes(&unsigned);
     let num_inputs = unsigned.tx.input.len();
 
-    // The swept peg-ins root this TM implies: this node's persisted SPI trie
-    // advanced by every tx input except input 0 ([SPI-1]). Every co-signer
-    // recomputes it from its own trie before signing ([SPI-2], `verify_spi_root`).
-    let spi_root = {
-        use crate::cardano::spi_trie::SpiTrie;
-        let trie = match config.state_dir.as_deref() {
-            Some(dir) => SpiTrie::load(dir)
-                .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?
-                .unwrap_or_default(),
-            None => SpiTrie::empty(),
-        };
-        let inputs: Vec<[u8; 36]> = unsigned
-            .tx
-            .input
-            .iter()
-            .map(|i| crate::cardano::tm_chain::outpoint_bytes(&i.previous_output))
-            .collect();
-        trie.root_after(&inputs)
-            .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?
-    };
-
     let tm = TreasuryMovement {
         txid: unsigned.txid,
         unsigned_tx: unsigned.tx,
@@ -1254,7 +1241,9 @@ async fn build_tm_phase(
         signatures: vec![None; num_inputs],
         fulfilled: unsigned.fulfilled,
         cpo_root: unsigned.cpo_root,
-        spi_root,
+        // Computed by `build_tm` from the same trie and committed inside the
+        // tx's BTMR1 output — the two agree by construction.
+        spi_root: unsigned.spi_root,
     };
 
     crate::epoch_log!(
@@ -1697,7 +1686,7 @@ mod tests {
         }
 
         let outputs = &tms[0].unsigned_tx.output;
-        // Treasury continuation, the one payable peg-out, and the CPOR1 root commitment.
+        // Treasury continuation, the one payable peg-out, and the BTMR1 root commitment.
         let payments: Vec<_> = outputs
             .iter()
             .filter(|o| !o.script_pubkey.is_op_return() && !o.script_pubkey.is_p2tr())

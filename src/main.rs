@@ -2236,6 +2236,37 @@ fn cpo_trie_from_cfg(cfg: &HeimdallConfig) -> Result<heimdall::cardano::cpo_trie
     }
 }
 
+/// Load this node's swept peg-ins trie from `protocol.state_dir`.
+///
+/// No `state_dir`, or no file yet, means the genesis (empty) trie — correct on a
+/// bridge whose treasury has swept no deposit, and loud everywhere else: the
+/// spi_root this node then commits is refused by peers whose trie is populated.
+fn spi_trie_from_cfg(cfg: &HeimdallConfig) -> Result<heimdall::cardano::spi_trie::SpiTrie, String> {
+    use heimdall::cardano::spi_trie::SpiTrie;
+    let Some(dir) = cfg.protocol.state_dir.as_deref() else {
+        eprintln!("[spi] no protocol.state_dir — using the empty (genesis) swept peg-ins trie");
+        return Ok(SpiTrie::empty());
+    };
+    let dir = std::path::Path::new(dir);
+    match SpiTrie::load(dir).map_err(|e| e.to_string())? {
+        Some(t) => {
+            eprintln!(
+                "[spi] swept peg-ins trie: {} entr(y|ies), root {}",
+                t.len(),
+                hex::encode(t.root())
+            );
+            Ok(t)
+        }
+        None => {
+            eprintln!(
+                "[spi] no swept peg-ins trie at {} — using the empty (genesis) trie",
+                dir.display()
+            );
+            Ok(SpiTrie::empty())
+        }
+    }
+}
+
 /// Refuse to build a TM off a trie the chain does not hold — the CLI mirror of
 /// `epoch::machine::cross_check_cpo_root`.
 ///
@@ -2385,6 +2416,8 @@ fn run_treasury_self_send(
         },
         // A self-send fulfils nothing, so it re-commits the trie's current root.
         &cpo_trie_from_cfg(cfg)?,
+        // …and sweeps nothing, so the spi_root is unchanged too.
+        &spi_trie_from_cfg(cfg)?,
     )
     .map_err(|e| format!("build self-send: {e}"))?;
 
@@ -2468,6 +2501,7 @@ fn run_federation_spend(
             margin_ms: 0,
         },
         &cpo_trie_from_cfg(cfg)?,
+        &spi_trie_from_cfg(cfg)?,
     )
     .map_err(|e| format!("build federation spend: {e}"))?;
 
@@ -5955,6 +5989,10 @@ fn run_sweep_pegins(
     let cpo_trie = cpo_trie_from_cfg(cfg)?;
     let cpo_trust = cross_check_cpo_trie_from_cfg(&rt, cfg, &cpo_trie)?;
 
+    // The swept peg-ins trie: the TM's BTMR1 commitment carries its root
+    // advanced by every swept input, next to the completed-peg-outs root.
+    let spi_trie = spi_trie_from_cfg(cfg)?;
+
     // ── Peg-out selection ──────────────────────────────────────────────────────────────────────
     // An open PegOut UTxO is NOT an unpaid one: it survives at the script address until someone
     // completes it (which needs this TM's Bitcoin confirmation plus a membership proof — hours
@@ -6057,7 +6095,7 @@ fn run_sweep_pegins(
 
     // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..m] = one
     // payment per peg-out (sorted by (scriptPubKey, net amount, por_id) inside build_tm); the LAST
-    // output is the mandatory "CPOR1" completed-peg-outs root commitment.
+    // output is the mandatory BTMR1 two-root commitment (spi_root ++ cpo_root).
     let unsigned = build_tm(
         TreasuryInput {
             outpoint: treasury_outpoint,
@@ -6070,6 +6108,7 @@ fn run_sweep_pegins(
         &tm_params,
         &freshness_from_cfg(cfg, chain_now_ms),
         &cpo_trie,
+        &spi_trie,
     )
     .map_err(|e| format!("build sweep: {e}"))?;
 
@@ -6077,6 +6116,11 @@ fn run_sweep_pegins(
         "  completed-peg-outs root committed: {} ({} fulfilled peg-out(s))",
         hex::encode(unsigned.cpo_root),
         unsigned.fulfilled.len(),
+    );
+    println!(
+        "  swept peg-ins root committed: {} ({} swept input(s))",
+        hex::encode(unsigned.spi_root),
+        unsigned.tx.input.len().saturating_sub(1),
     );
 
     // Surface any peg-outs the TM dropped as unpayable (non-standard destination

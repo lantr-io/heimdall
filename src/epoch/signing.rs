@@ -324,12 +324,8 @@ fn verify_spi_root(
 ) -> EpochResult<()> {
     use crate::cardano::spi_trie::SpiTrie;
 
-    let trie = match config.state_dir.as_deref() {
-        Some(dir) => SpiTrie::load(dir)
-            .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?
-            .unwrap_or_default(),
-        None => SpiTrie::empty(),
-    };
+    let trie = SpiTrie::load_or_empty(config.state_dir.as_deref())
+        .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?;
 
     let inputs = tm.input_outpoints();
     let root = trie.verify_proposed(&tm.spi_root, &inputs).map_err(|e| {
@@ -341,6 +337,27 @@ fn verify_spi_root(
             tm.txid
         ))
     })?;
+
+    // The root the transaction ITSELF commits (BTMR1 output, script bytes
+    // [7, 39)) must be the same 32 bytes — a `spi_root` field that matches
+    // while the committed bytes differ would make the quorum sign an
+    // attestation this node never checked. A TM with no commitment output at
+    // all is not tolerated either: `verify_cpo_root` runs first and refuses it
+    // (exactly one commitment, same rule as on-chain), so skipping the
+    // comparison here cannot let one through.
+    if let Ok(committed) = crate::bitcoin::tm_builder::committed_spi_root(&tm.unsigned_tx) {
+        if committed != root {
+            return Err(EpochError::TmBuild(format!(
+                "REFUSING TO SIGN treasury movement {}: its BTMR1 output commits swept \
+                 peg-ins root {} but this node recomputes {} from its own trie plus the \
+                 movement's inputs. Signing would attest a swept set this node cannot \
+                 justify.",
+                tm.txid,
+                hex::encode(committed),
+                hex::encode(root),
+            )));
+        }
+    }
 
     crate::epoch_log!(
         me,
@@ -621,6 +638,7 @@ mod tests {
                 margin_ms: 0,
             },
             &crate::cardano::cpo_trie::CpoTrie::empty(),
+            &crate::cardano::spi_trie::SpiTrie::empty(),
         )
         .unwrap();
         let sighashes = compute_sighashes(&unsigned);
@@ -806,5 +824,45 @@ mod tests {
             .expect_err("a trie that moved under the proposal must refuse the old root");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [SPI-2] extends to the root the transaction ITSELF commits: the BTMR1
+    /// output carries `spi_root` at script bytes [7, 39), and that committed
+    /// root is what a Confirm makes chain truth. A TM whose `spi_root` field
+    /// matches the local recompute but whose committed bytes disagree must
+    /// still be refused – otherwise the quorum signs an attestation this node
+    /// never checked.
+    #[test]
+    fn cosigner_rejects_tm_with_wrong_spi_root() {
+        use crate::cardano::spi_trie::SpiTrie;
+
+        let me = Identifier::try_from(1u16).unwrap();
+        // No state_dir: the gate's local trie is `SpiTrie::empty()`.
+        let config = EpochConfig::demo_default(SpoIdentity {
+            identifier: me,
+            bifrost_id_pk: Vec::new(),
+            port: 0,
+        });
+
+        let inputs = [spi_op(0xaa, 0), spi_op(0x01, 0), spi_op(0x02, 3)];
+        let honest = SpiTrie::empty().root_after(&inputs).unwrap();
+
+        // The TM's field carries the honest root, but its transaction commits
+        // a DIFFERENT spi_root inside the BTMR1 output (bytes [7, 39)).
+        let mut tm = spi_tm(&inputs, honest);
+        let mut spk = vec![0x6a, 0x45]; // OP_RETURN OP_PUSHBYTES_69
+        spk.extend_from_slice(b"BTMR1");
+        spk.extend_from_slice(&[0xffu8; 32]); // forged spi_root
+        spk.extend_from_slice(&[0u8; 32]); // cpo_root, not under test here
+        tm.unsigned_tx.output.push(bitcoin::TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        });
+        tm.txid = tm.unsigned_tx.compute_txid();
+
+        verify_spi_root(&config, me, 0, &tm).expect_err(
+            "the committed spi_root (script bytes [7, 39)) differs from the locally \
+             recomputed root, so the co-signer must refuse to sign",
+        );
     }
 }

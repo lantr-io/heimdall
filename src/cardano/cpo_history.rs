@@ -1149,10 +1149,11 @@ mod tests {
             .unwrap();
 
         // The Bitcoin TM: output 0 treasury, then the two payments, then the
-        // "CPOR1" commitment. The Unconfirmed record embeds this tx, so its txid
+        // BTMR1 commitment. The Unconfirmed record embeds this tx, so its txid
         // must be the one the Confirmed record reports.
         let commitment_spk = {
-            let mut s = crate::bitcoin::tm_builder::CPO_COMMITMENT_PREFIX.to_vec();
+            let mut s = crate::bitcoin::tm_builder::BTMR1_COMMITMENT_PREFIX.to_vec();
+            s.extend_from_slice(&[0x99u8; 32]); // spi_root placeholder
             s.extend_from_slice(&root);
             s
         };

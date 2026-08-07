@@ -90,7 +90,7 @@ impl WalletUtxo {
 /// Field 5 `fulfilled_por_outpoints` is the rev-5.1 data-availability HINT: the
 /// Cardano outpoints (36 bytes each, tx hash ‖ output index LE) of the peg-out
 /// requests this TM fulfils. Nothing on-chain reads it — neither the TM mint
-/// branch nor the Confirm spend — because the FROST-signed `"CPOR1"` root
+/// branch nor the Confirm spend — because the FROST-signed BTMR1 root
 /// commitment inside `btc_tx` is the sole integrity anchor. It exists so a cold
 /// starting SPO can rebuild the completed-peg-outs trie from chain data alone:
 /// the Unconfirmed record's inline datum survives in Cardano history forever and

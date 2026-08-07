@@ -334,6 +334,17 @@ impl SpiTrie {
         Ok(Some(trie))
     }
 
+    /// Load the persisted trie, falling back to the genesis (empty) trie when
+    /// `state_dir` is unset or holds no file yet. A node that keeps no state has
+    /// swept nothing, which is what both the TM builder and the [SPI-2]
+    /// co-signer gate need. A file that exists but is corrupt is still an error.
+    pub fn load_or_empty(state_dir: Option<&Path>) -> Result<Self, SpiTrieError> {
+        match state_dir {
+            Some(dir) => Ok(Self::load(dir)?.unwrap_or_default()),
+            None => Ok(Self::empty()),
+        }
+    }
+
     /// Persist atomically (write a temp file, then rename), 0600, in a 0700
     /// directory — the same discipline as `CpoTrie::save`.
     pub fn save(&self, state_dir: &Path) -> Result<(), SpiTrieError> {
@@ -353,6 +364,15 @@ impl SpiTrie {
             .map_err(|e| SpiTrieError::State(format!("encode: {e}")))?;
         state_file::write_atomic_0600(state_dir, &Self::state_path(state_dir), &bytes)
             .map_err(SpiTrieError::State)
+    }
+}
+
+/// The builder-facing view: `build_tm` computes the `spi_root` its BTMR1
+/// commitment carries through this trait, keeping the `bitcoin` modules free of
+/// a `cardano` dependency (same story as `CpoTrieView`).
+impl crate::bitcoin::tm_builder::SpiTrieView for SpiTrie {
+    fn root_after_inputs(&self, inputs: &[[u8; 36]]) -> Result<[u8; 32], String> {
+        self.root_after(inputs).map_err(|e| e.to_string())
     }
 }
 

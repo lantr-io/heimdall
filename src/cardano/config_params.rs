@@ -1127,7 +1127,7 @@ mod tests {
     fn two_local_fee_rates_one_config_produce_identical_tm_bytes() {
         use crate::bitcoin::taproot::treasury_spend_info;
         use crate::bitcoin::tm_builder::{
-            Freshness, TreasuryInput, build_tm, cpo_commitment_script,
+            Freshness, TreasuryInput, btmr1_commitment_script, build_tm,
         };
         use bitcoin::key::Secp256k1;
         use bitcoin::secp256k1::SecretKey;
@@ -1155,6 +1155,7 @@ mod tests {
                     margin_ms: 0,
                 },
                 &crate::bitcoin::tm_builder::FixedCpoRoot([0u8; 32]),
+                &crate::bitcoin::tm_builder::FixedSpiRoot([0u8; 32]),
             )
             .unwrap()
             .tx
@@ -1181,7 +1182,7 @@ mod tests {
             let change = tx
                 .output
                 .iter()
-                .find(|o| o.script_pubkey != cpo_commitment_script(&[0u8; 32]))
+                .find(|o| o.script_pubkey != btmr1_commitment_script(&[0u8; 32], &[0u8; 32]))
                 .unwrap();
             10_000_000 - change.value.to_sat()
         };

@@ -771,3 +771,46 @@ restart replays the tail of the TM chain).
 - Persisted entries are hex strings and the file records its own root. `load`
   recomputes the root from the entries and refuses the file on a mismatch, so a
   hand-edited or truncated file cannot silently change what this node signs.
+
+## DEC-026: BTMR1 Two-Root Commitment via a Builder-Side SpiTrieView
+
+**Date:** 2026-08-07
+**Decision:** `build_tm` computes and embeds both roots itself; the spi trie reaches it through a new `SpiTrieView` trait; test-pinned CPO names keep their spelling
+**Status:** Accepted
+**Spec:** ft-bifrost-bridge `docs/superpowers/specs/2026-08-06-bridge-state-singleton-design.md`,
+§Root commitment output, §Checks/Confirm TM ([CTM-26]), §Off-chain: heimdall ([OH-3]),
+§Off-chain rules ([SPI-1] to [SPI-3])
+
+### Context
+
+Rev 5.4 replaces the 39-byte "CPOR1" commitment with the 71-byte "BTMR1"
+output: `OP_RETURN OP_PUSHBYTES_69 "BTMR1" ++ spi_root ++ cpo_root`. Before
+this change the spi_root was computed in `build_tm_phase` AFTER `build_tm`
+returned, which cannot work once the root lives inside the transaction bytes.
+
+### Decision
+
+- `build_tm` gains an eighth parameter, `spi: &dyn SpiTrieView`, mirroring
+  `CpoTrieView`: the trait lives in `tm_builder.rs` and `SpiTrie` implements it
+  in `spi_trie.rs`, so the `bitcoin` modules still never depend on `cardano`.
+  - Rejected: patching the commitment output after `build_tm`. The txid,
+    sighashes and `UnsignedTm` invariants are all fixed at build time.
+- `verify_spi_root` ([SPI-2]) now also compares the root the transaction ITSELF
+  commits (script bytes [7, 39)) against the locally recomputed one. A TM with
+  NO commitment output is not its problem: `verify_cpo_root` runs first and
+  refuses zero-or-many commitments, so the spi gate only cross-checks a present
+  one. This keeps the gate callable on synthetic no-output TMs in tests.
+- Names pinned by the task's tests keep their old spelling even where "cpo" is
+  now half the story: `is_cpo_commitment`, `committed_cpo_root`,
+  `CPO_COMMITMENT_EXTRA_VBYTES` (now 37 per [OH-3]). New names are BTMR1-scoped:
+  `BTMR1_COMMITMENT_PREFIX`, `BTMR1_COMMITMENT_SCRIPT_LEN`,
+  `btmr1_commitment_script`, `committed_roots` / `committed_spi_root`.
+- `cpo_trie::confirmed_committed_root` reads the cpo half at [39, 71) and gains
+  the sibling `confirmed_committed_spi_root` at [7, 39) (shared scanner
+  `confirmed_committed_roots`). The mover and the two dev CLI paths load the
+  spi trie via a new `spi_trie_from_cfg`, mirroring `cpo_trie_from_cfg`.
+- The commitment byte offsets live in exactly one function, `tm_builder::
+  btmr1_roots(spk) -> Option<(spi_root, cpo_root)>`, with `is_btmr1_commitment`
+  as its length-and-prefix half. Both readers go through it — the Bitcoin one
+  over `TxOut::script_pubkey` and the Cardano one over the Confirmed datum's
+  output bytes — so 7 / 39 / 71 can never drift apart between the two.
