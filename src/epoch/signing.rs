@@ -4,8 +4,13 @@
 //! Each TM input runs an independent FROST session: sighashes differ
 //! per input, and every Taproot input has its own merkle root that
 //! must be folded into the signature via BIP-341 tweaking. The phase
-//! therefore publishes one `Sign1Payload`/`Sign2Payload` per input and
-//! polls peers with per-input keys.
+//! therefore publishes one commitment/share payload per input and polls
+//! peers with per-input keys.
+//!
+//! Every payload is authenticated end to end (WI-038): the transport signs the
+//! canonical bytes under this node's `bifrost_id_pk` and verifies a peer's
+//! before handing anything back, binding each payload to its
+//! `(epoch, input, sighash, pool_id, identifier)` domain.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -20,7 +25,7 @@ use crate::epoch::state::{
 };
 use crate::epoch::traits::{Clock, PeerNetwork, RngSource};
 use crate::frost::participant;
-use crate::http::payloads::{Sign1Payload, Sign2Payload};
+use crate::http::wire::SignNamespace;
 
 /// Drive one sub-round of the signing phase for all TM inputs.
 ///
@@ -108,12 +113,7 @@ pub async fn sign_phase(
                     .insert(me, commitments);
 
                 peers
-                    .publish_sign_round1(Sign1Payload {
-                        epoch,
-                        identifier: me,
-                        input_index: i,
-                        commitments,
-                    })
+                    .publish_sign_round1(input_namespace(epoch, &tm, i), me, commitments)
                     .await?;
                 crate::epoch_log!(me, epoch, "  -> published commitments for input {i}");
             }
@@ -127,8 +127,9 @@ pub async fn sign_phase(
                     "  waiting for round1 commitments on input {i} from {} peer(s)...",
                     peer_infos.len()
                 );
+                let ns = input_namespace(epoch, &tm, i);
                 let map = collected.round1.entry(i).or_default();
-                poll_sign_round1(peers, clock, config, epoch, me, i, &peer_infos, map).await?;
+                poll_sign_round1(peers, clock, config, ns, me, &peer_infos, map).await?;
             }
             crate::epoch_log!(
                 me,
@@ -195,14 +196,8 @@ pub async fn sign_phase(
 
                 collected.round2.entry(i).or_default().insert(me, share);
 
-                peers
-                    .publish_sign_round2(Sign2Payload {
-                        epoch,
-                        identifier: me,
-                        input_index: i,
-                        share,
-                    })
-                    .await?;
+                let ns = SignNamespace::new(epoch, i, sighash);
+                peers.publish_sign_round2(ns, me, share).await?;
                 crate::epoch_log!(me, epoch, "    -> published share for input {i}");
 
                 // Poll peers.
@@ -214,7 +209,7 @@ pub async fn sign_phase(
                     peer_infos.len()
                 );
                 let shares = collected.round2.entry(i).or_default();
-                poll_sign_round2(peers, clock, config, epoch, me, i, &peer_infos, shares).await?;
+                poll_sign_round2(peers, clock, config, ns, me, &peer_infos, shares).await?;
 
                 // Aggregate.
                 let signature = participant::sign_aggregate_with_tweak(
@@ -307,16 +302,24 @@ fn verify_cpo_root(
 // soon as `min_signers` have responded. A real implementation should
 // proceed once it has `roster.min_signers` commitments and record the
 // absent peers so the cascade / misbehavior path can react.
+/// The signing domain for TM input `i`: the epoch, the input index, and the
+/// input's own BIP-341 sighash. Two TMs in one epoch share `(epoch, i)` but
+/// never the sighash, which is what stops a commitment captured from one from
+/// replaying into the other.
+fn input_namespace(epoch: u64, tm: &TreasuryMovement, i: u32) -> SignNamespace {
+    SignNamespace::new(epoch, i, tm.sighashes[i as usize])
+}
+
 async fn poll_sign_round1(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
     config: &EpochConfig,
-    epoch: u64,
+    ns: SignNamespace,
     me: Identifier,
-    input_index: u32,
     peer_infos: &[&crate::epoch::state::SpoInfo],
     out: &mut BTreeMap<Identifier, frost::round1::SigningCommitments>,
 ) -> EpochResult<()> {
+    let (epoch, input_index) = (ns.epoch, ns.session);
     let need = peer_infos.len() + out.len(); // self already present
     let deadline = clock.deadline(config.quorum51_timeout);
     while out.len() < need {
@@ -324,16 +327,19 @@ async fn poll_sign_round1(
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            if let Some(payload) = peers.fetch_sign_round1(epoch, peer, input_index).await? {
+            // Filed under the ROSTER's identifier for this peer, never one the
+            // payload claimed: the transport has already verified the payload
+            // was signed by this peer under exactly that identifier.
+            if let Some(commitments) = peers.fetch_sign_round1(ns, peer).await? {
                 crate::epoch_log!(
                     me,
                     epoch,
                     "     received round1 commitments for input {input_index} from spo={} ({}/{})",
-                    id_short(payload.identifier),
+                    id_short(peer.identifier),
                     out.len() + 1,
                     need
                 );
-                out.insert(payload.identifier, payload.commitments);
+                out.insert(peer.identifier, commitments);
             }
         }
         if out.len() >= need {
@@ -354,12 +360,12 @@ async fn poll_sign_round2(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
     config: &EpochConfig,
-    epoch: u64,
+    ns: SignNamespace,
     me: Identifier,
-    input_index: u32,
     peer_infos: &[&crate::epoch::state::SpoInfo],
     out: &mut BTreeMap<Identifier, frost::round2::SignatureShare>,
 ) -> EpochResult<()> {
+    let (epoch, input_index) = (ns.epoch, ns.session);
     let need = peer_infos.len() + out.len();
     let deadline = clock.deadline(config.quorum51_timeout);
     while out.len() < need {
@@ -367,16 +373,16 @@ async fn poll_sign_round2(
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            if let Some(payload) = peers.fetch_sign_round2(epoch, peer, input_index).await? {
+            if let Some(share) = peers.fetch_sign_round2(ns, peer).await? {
                 crate::epoch_log!(
                     me,
                     epoch,
                     "     received round2 share for input {input_index} from spo={} ({}/{})",
-                    id_short(payload.identifier),
+                    id_short(peer.identifier),
                     out.len() + 1,
                     need
                 );
-                out.insert(payload.identifier, payload.share);
+                out.insert(peer.identifier, share);
             }
         }
         if out.len() >= need {

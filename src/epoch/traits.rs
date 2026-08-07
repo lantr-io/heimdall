@@ -21,8 +21,7 @@ use crate::circuits::fault_evidence::{
 };
 use crate::epoch::state::{EpochError, EpochResult, Roster, SpoInfo};
 use crate::http::canonical::POINT_LEN;
-use crate::http::payloads::{Sign1Payload, Sign2Payload};
-use crate::http::wire::DkgNamespace;
+use crate::http::wire::{DkgNamespace, SignNamespace};
 
 // ---------------------------------------------------------------------------
 // CardanoChain
@@ -388,8 +387,26 @@ pub trait PeerNetwork: Send + Sync {
         sender_commitments: &[[u8; POINT_LEN]],
         recipients: &[(SpoInfo, round2::Package)],
     ) -> EpochResult<()>;
-    async fn publish_sign_round1(&self, payload: Sign1Payload) -> EpochResult<()>;
-    async fn publish_sign_round2(&self, payload: Sign2Payload) -> EpochResult<()>;
+    /// Publish this node's signing Round 1 nonce commitments for one session.
+    ///
+    /// Like the DKG rounds, the CONTENT crosses this boundary and the transport
+    /// owns the wire form — building the canonical bytes and BIP-340 signing
+    /// them under this node's `bifrost_id_pk` (WI-038). Callers never touch a
+    /// signature.
+    async fn publish_sign_round1(
+        &self,
+        ns: SignNamespace,
+        identifier: Identifier,
+        commitments: frost_secp256k1_tr::round1::SigningCommitments,
+    ) -> EpochResult<()>;
+    /// Publish this node's signature share for one session. See
+    /// [`Self::publish_sign_round1`].
+    async fn publish_sign_round2(
+        &self,
+        ns: SignNamespace,
+        identifier: Identifier,
+        share: frost_secp256k1_tr::round2::SignatureShare,
+    ) -> EpochResult<()>;
 
     async fn fetch_dkg_round1(
         &self,
@@ -417,18 +434,30 @@ pub trait PeerNetwork: Send + Sync {
         recipient_identifier: Identifier,
         sender_commitments: &[[u8; POINT_LEN]],
     ) -> EpochResult<Vec<DkgFaultEvidence>>;
+    /// Fetch `peer`'s Round 1 commitments for `ns`.
+    ///
+    /// A `Some` has been AUTHENTICATED: the payload carried a BIP-340 signature
+    /// under the peer's registry-bound `bifrost_id_pk` over canonical bytes
+    /// covering `ns` (epoch, session, and the message being signed) and the
+    /// peer's own `pool_id`/identifier. That is why the commitments come back
+    /// bare — the caller files them under `peer.identifier`, never under an
+    /// identifier the payload claimed for itself.
+    ///
+    /// `None` means "not published yet" OR "published but did not verify"; an
+    /// unverifiable payload is dropped with a log line rather than aborting the
+    /// poll, matching the DKG fetch path.
     async fn fetch_sign_round1(
         &self,
-        epoch: u64,
+        ns: SignNamespace,
         peer: &SpoInfo,
-        input_index: u32,
-    ) -> EpochResult<Option<Sign1Payload>>;
+    ) -> EpochResult<Option<frost_secp256k1_tr::round1::SigningCommitments>>;
+    /// Fetch `peer`'s signature share for `ns`. Authenticated exactly as
+    /// [`Self::fetch_sign_round1`].
     async fn fetch_sign_round2(
         &self,
-        epoch: u64,
+        ns: SignNamespace,
         peer: &SpoInfo,
-        input_index: u32,
-    ) -> EpochResult<Option<Sign2Payload>>;
+    ) -> EpochResult<Option<frost_secp256k1_tr::round2::SignatureShare>>;
 }
 
 // ---------------------------------------------------------------------------

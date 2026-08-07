@@ -66,18 +66,57 @@ async fn test_dkg_spec_route_serves_stored_json() {
     assert_eq!(resp.status(), 404);
 }
 
+/// The signing routes follow the same scheme as the DKG ones (WI-038): keyed by
+/// `(epoch, session)`, served verbatim so the bytes the peer verifies are the
+/// bytes the publisher signed, and gated on the `<pool_id>.json` naming THIS
+/// server.
 #[tokio::test]
-async fn test_sign_endpoints_404_when_empty() {
+async fn test_sign_routes_serve_stored_json_and_gate_on_pool_id() {
+    let pool_hex = hex::encode([7u8; 28]);
     let state = make_shared_state();
+    {
+        let mut s = state.write().await;
+        s.own_pool_id_hex = pool_hex.clone();
+        s.sign1.insert((4, 0), r#"{"round":1}"#.to_string());
+        s.sign2.insert((4, 0), r#"{"round":2}"#.to_string());
+    }
     let base = spawn_server(state).await;
 
-    let resp = reqwest::get(format!("{base}/sign/0/round1/0/1"))
+    for (round, body) in [("round1", r#"{"round":1}"#), ("round2", r#"{"round":2}"#)] {
+        let resp = reqwest::get(format!("{base}/sign/4/{round}/0/{pool_hex}.json"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), body);
+    }
+
+    // Another pool's id -> 404: a server only ever holds its own payloads.
+    let other = hex::encode([9u8; 28]);
+    let resp = reqwest::get(format!("{base}/sign/4/round1/0/{other}.json"))
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
 
-    let resp = reqwest::get(format!("{base}/sign/0/round2/0/1"))
+    // A session that was never published -> 404.
+    let resp = reqwest::get(format!("{base}/sign/4/round1/1/{pool_hex}.json"))
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn test_sign_endpoints_404_when_empty() {
+    let pool_hex = hex::encode([7u8; 28]);
+    let state = make_shared_state();
+    {
+        state.write().await.own_pool_id_hex = pool_hex.clone();
+    }
+    let base = spawn_server(state).await;
+
+    for round in ["round1", "round2"] {
+        let resp = reqwest::get(format!("{base}/sign/0/{round}/0/{pool_hex}.json"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
 }

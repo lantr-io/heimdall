@@ -21,6 +21,33 @@
 //!
 //! Round 2 share entries are ordered by `recipient_pool_id`
 //! (lexicographic) for determinism.
+//!
+//! The signing ceremony's two rounds are authenticated the same way (WI-038).
+//! They are NOT in the upstream spec document — the spec covers DKG payloads
+//! only — so the layouts below are heimdall's, deliberately built to the same
+//! shape so one verifier idiom covers both:
+//!
+//! ```text
+//! s1: "bifrost-sign-r1" || epoch(8 BE) || session(8 BE) || pool_id(28)
+//!       || identifier(8 BE) || message(32) || hiding(33) || binding(33)
+//! s2: "bifrost-sign-r2" || epoch(8 BE) || session(8 BE) || pool_id(28)
+//!       || identifier(8 BE) || message(32) || share(32)
+//! ```
+//!
+//! `session` is the FROST session within the epoch (a TM input index, or the
+//! reserved rotation session). `message` is the exact 32 bytes the session
+//! signs — the input's BIP-341 sighash, or the Update-Y preimage hash.
+//!
+//! **Why `message` is in the layout.** `(epoch, session)` alone does not pin a
+//! payload to a ceremony: an epoch runs many treasury movements, each with an
+//! input 0, so a commitment captured from one TM would replay into the next
+//! under the same namespace. Binding the message makes every signing session
+//! its own domain. Both sides already hold it — a verifier only ever checks a
+//! session it is itself participating in — so this costs nothing.
+//!
+//! `identifier` is bound because aggregation keys shares by it. A roster
+//! change renumbers participants (indices are positional), and without this a
+//! payload could be accepted into the wrong signer slot.
 
 /// `blake2b_224(cold_vkey)` membership id — the spec `pool_id`.
 pub const POOL_ID_LEN: usize = 28;
@@ -40,8 +67,13 @@ pub const PAD_COMMIT_LEN: usize = 32;
 /// `min_signers` `t`; it is a constant namespace tag.
 pub const THRESHOLD_51: u64 = 51;
 
+/// The 32-byte message one FROST signing session signs.
+pub const SIGN_MESSAGE_LEN: usize = 32;
+
 const TAG_R1: &[u8] = b"bifrost-dkg-r1";
 const TAG_R2: &[u8] = b"bifrost-dkg-r2";
+const TAG_S1: &[u8] = b"bifrost-sign-r1";
+const TAG_S2: &[u8] = b"bifrost-sign-r2";
 
 /// `epoch || threshold || attempt || pool_id` — the namespace header
 /// shared by both round layouts (each integer 8-byte big-endian).
@@ -122,6 +154,65 @@ pub fn round2(
         out.extend_from_slice(&s.pad_commit);
         out.extend_from_slice(&s.evidence_hash);
     }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Signing rounds
+// ---------------------------------------------------------------------------
+
+/// `epoch || session || pool_id || identifier || message` — the header shared
+/// by both signing-round layouts (integers 8-byte big-endian).
+fn push_sign_header(
+    out: &mut Vec<u8>,
+    epoch: u64,
+    session: u32,
+    pool_id: &[u8; POOL_ID_LEN],
+    identifier: u64,
+    message: &[u8; SIGN_MESSAGE_LEN],
+) {
+    out.extend_from_slice(&epoch.to_be_bytes());
+    out.extend_from_slice(&u64::from(session).to_be_bytes());
+    out.extend_from_slice(pool_id);
+    out.extend_from_slice(&identifier.to_be_bytes());
+    out.extend_from_slice(message);
+}
+
+const SIGN_HEADER_LEN: usize = 8 + 8 + POOL_ID_LEN + 8 + SIGN_MESSAGE_LEN;
+
+/// Signing Round 1 canonical bytes: this signer's two nonce commitments,
+/// bound to the `(epoch, session, pool_id, identifier, message)` domain.
+pub fn sign_round1(
+    epoch: u64,
+    session: u32,
+    pool_id: &[u8; POOL_ID_LEN],
+    identifier: u64,
+    message: &[u8; SIGN_MESSAGE_LEN],
+    hiding: &[u8; POINT_LEN],
+    binding: &[u8; POINT_LEN],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(TAG_S1.len() + SIGN_HEADER_LEN + 2 * POINT_LEN);
+    out.extend_from_slice(TAG_S1);
+    push_sign_header(&mut out, epoch, session, pool_id, identifier, message);
+    out.extend_from_slice(hiding);
+    out.extend_from_slice(binding);
+    out
+}
+
+/// Signing Round 2 canonical bytes: this signer's signature share, bound to
+/// the same domain as its Round 1 commitments.
+pub fn sign_round2(
+    epoch: u64,
+    session: u32,
+    pool_id: &[u8; POOL_ID_LEN],
+    identifier: u64,
+    message: &[u8; SIGN_MESSAGE_LEN],
+    share: &[u8; SHARE_LEN],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(TAG_S2.len() + SIGN_HEADER_LEN + SHARE_LEN);
+    out.extend_from_slice(TAG_S2);
+    push_sign_header(&mut out, epoch, session, pool_id, identifier, message);
+    out.extend_from_slice(share);
     out
 }
 
@@ -233,5 +324,92 @@ mod tests {
         let forward = round2(1, THRESHOLD_51, 0, &pid(0), &[a.clone(), b.clone()]);
         let reversed = round2(1, THRESHOLD_51, 0, &pid(0), &[b, a]);
         assert_eq!(forward, reversed);
+    }
+
+    // -- signing rounds (WI-038) -------------------------------------------
+
+    const SIGN_TAG_LEN: usize = 15; // "bifrost-sign-rN"
+
+    fn s1(epoch: u64, session: u32, id: u64, msg: [u8; 32]) -> Vec<u8> {
+        sign_round1(
+            epoch,
+            session,
+            &pid(1),
+            id,
+            &msg,
+            &[0xaa; POINT_LEN],
+            &[0xbb; POINT_LEN],
+        )
+    }
+
+    #[test]
+    fn sign_round1_length_and_prefix() {
+        let bytes = s1(9, 2, 5, [0x11; 32]);
+        assert_eq!(&bytes[..SIGN_TAG_LEN], TAG_S1);
+        assert_eq!(bytes.len(), SIGN_TAG_LEN + SIGN_HEADER_LEN + 2 * POINT_LEN);
+        assert_eq!(
+            &bytes[SIGN_TAG_LEN..SIGN_TAG_LEN + 8],
+            &9u64.to_be_bytes(),
+            "epoch big-endian right after the tag"
+        );
+        assert_eq!(
+            &bytes[SIGN_TAG_LEN + 8..SIGN_TAG_LEN + 16],
+            &2u64.to_be_bytes(),
+            "session next"
+        );
+        assert_eq!(
+            &bytes[bytes.len() - 2 * POINT_LEN..bytes.len() - POINT_LEN],
+            &[0xaa; POINT_LEN],
+            "hiding then binding"
+        );
+    }
+
+    /// The whole point of the layout: every field that identifies a signing
+    /// session changes the bytes, so a signature over one session's payload
+    /// cannot be replayed into another.
+    #[test]
+    fn every_sign_round1_domain_field_changes_the_bytes() {
+        let base = s1(9, 2, 5, [0x11; 32]);
+        assert_ne!(base, s1(10, 2, 5, [0x11; 32]), "epoch");
+        assert_ne!(base, s1(9, 3, 5, [0x11; 32]), "session");
+        assert_ne!(base, s1(9, 2, 6, [0x11; 32]), "identifier");
+        assert_ne!(base, s1(9, 2, 5, [0x12; 32]), "message");
+        assert_ne!(
+            base,
+            sign_round1(
+                9,
+                2,
+                &pid(2),
+                5,
+                &[0x11; 32],
+                &[0xaa; POINT_LEN],
+                &[0xbb; POINT_LEN]
+            ),
+            "pool_id"
+        );
+    }
+
+    #[test]
+    fn sign_round2_length_and_prefix() {
+        let bytes = sign_round2(9, 2, &pid(1), 5, &[0x11; 32], &[0xcc; SHARE_LEN]);
+        assert_eq!(&bytes[..SIGN_TAG_LEN], TAG_S2);
+        assert_eq!(bytes.len(), SIGN_TAG_LEN + SIGN_HEADER_LEN + SHARE_LEN);
+        assert_eq!(&bytes[bytes.len() - SHARE_LEN..], &[0xcc; SHARE_LEN]);
+    }
+
+    /// Namespace separation across all four round tags: no two rounds can ever
+    /// produce identical canonical bytes, so a signature is only ever valid for
+    /// the round it was made in.
+    #[test]
+    fn round_tags_are_mutually_distinct() {
+        let tags = [TAG_R1, TAG_R2, TAG_S1, TAG_S2];
+        for (i, a) in tags.iter().enumerate() {
+            for b in &tags[i + 1..] {
+                assert_ne!(a, b);
+                // No tag may prefix another, or the remaining fields could be
+                // shifted to forge a match across rounds.
+                assert!(!a.starts_with(b) && !b.starts_with(a));
+            }
+        }
     }
 }

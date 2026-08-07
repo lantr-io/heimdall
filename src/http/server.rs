@@ -21,8 +21,6 @@ use axum::{
 };
 use tokio::sync::RwLock;
 
-use super::payloads::{Sign1Payload, Sign2Payload};
-
 /// Which DKG round a stored payload belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DkgRoundKey {
@@ -37,10 +35,13 @@ pub struct AppState {
     pub own_pool_id_hex: String,
     /// Published DKG payload JSON, keyed by `(epoch, threshold, attempt, round)`.
     pub dkg: BTreeMap<(u64, u64, u64, DkgRoundKey), String>,
-    /// Signing payloads keyed by `(epoch, input_index)` (one FROST session
-    /// per TM input). Unchanged by WI-013.
-    pub sign1: BTreeMap<(u64, u32), Sign1Payload>,
-    pub sign2: BTreeMap<(u64, u32), Sign2Payload>,
+    /// Published signing payload JSON, keyed by `(epoch, session)` — one FROST
+    /// session per TM input, plus the reserved rotation session. Stored as the
+    /// pre-signed JSON string for the same reason DKG payloads are: the
+    /// publisher signs canonical bytes, and the server must hand back exactly
+    /// what was signed rather than a re-serialization of it.
+    pub sign1: BTreeMap<(u64, u32), String>,
+    pub sign2: BTreeMap<(u64, u32), String>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -56,14 +57,8 @@ pub fn router(state: SharedState) -> Router {
             "/dkg/{epoch}/{threshold}/{attempt}/round2/{file}",
             get(get_dkg2),
         )
-        .route(
-            "/sign/{epoch}/round1/{input_index}/{pool_id}",
-            get(get_sign1),
-        )
-        .route(
-            "/sign/{epoch}/round2/{input_index}/{pool_id}",
-            get(get_sign2),
-        )
+        .route("/sign/{epoch}/round1/{session}/{file}", get(get_sign1))
+        .route("/sign/{epoch}/round2/{session}/{file}", get(get_sign2))
         .with_state(state)
 }
 
@@ -113,26 +108,39 @@ async fn get_dkg2(
     serve_dkg(state, epoch, threshold, attempt, DkgRoundKey::Round2, file).await
 }
 
+/// Serve one signing-round blob. Like the DKG routes, the `<pool_id>.json`
+/// segment must name THIS server — it only ever holds its own payloads, so any
+/// other pool_id is a 404 rather than someone else's bytes under the wrong name.
+async fn serve_sign(
+    state: SharedState,
+    round: DkgRoundKey,
+    epoch: u64,
+    session: u32,
+    file: String,
+) -> Result<impl IntoResponse, StatusCode> {
+    let s = state.read().await;
+    check_pool_id(&file, &s.own_pool_id_hex)?;
+    let map = match round {
+        DkgRoundKey::Round1 => &s.sign1,
+        DkgRoundKey::Round2 => &s.sign2,
+    };
+    let body = map
+        .get(&(epoch, session))
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(([(header::CONTENT_TYPE, "application/json")], body))
+}
+
 async fn get_sign1(
     State(state): State<SharedState>,
-    Path((epoch, input_index, _pool_id)): Path<(u64, u32, String)>,
-) -> Result<Json<Sign1Payload>, StatusCode> {
-    let s = state.read().await;
-    s.sign1
-        .get(&(epoch, input_index))
-        .cloned()
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    Path((epoch, session, file)): Path<(u64, u32, String)>,
+) -> Result<impl IntoResponse, StatusCode> {
+    serve_sign(state, DkgRoundKey::Round1, epoch, session, file).await
 }
 
 async fn get_sign2(
     State(state): State<SharedState>,
-    Path((epoch, input_index, _pool_id)): Path<(u64, u32, String)>,
-) -> Result<Json<Sign2Payload>, StatusCode> {
-    let s = state.read().await;
-    s.sign2
-        .get(&(epoch, input_index))
-        .cloned()
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    Path((epoch, session, file)): Path<(u64, u32, String)>,
+) -> Result<impl IntoResponse, StatusCode> {
+    serve_sign(state, DkgRoundKey::Round2, epoch, session, file).await
 }

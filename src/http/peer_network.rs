@@ -20,16 +20,22 @@ use frost_secp256k1_tr::keys::dkg::{round1, round2};
 use tokio::sync::RwLock;
 
 use super::canonical::POOL_ID_LEN;
-use super::payloads::{Sign1Payload, Sign2Payload};
 use super::server::{AppState, DkgRoundKey, SharedState};
-use super::wire::{self, ChainViewWire, Dkg1Wire, Dkg2Wire, DkgNamespace, Round2Recipient};
+use super::wire::{
+    self, ChainViewWire, Dkg1Wire, Dkg2Wire, DkgNamespace, Round2Recipient, Sign1Wire, Sign2Wire,
+    SignNamespace,
+};
 use crate::cardano::dkg_roster::ChainView;
 use crate::epoch::state::{EpochError, EpochResult, SpoInfo};
 use crate::epoch::traits::{DkgFaultEvidence, PeerNetwork};
 
-/// Pool identifier in the URL space: the u16 the `Identifier` was constructed
-/// from. FROST serializes to 32 big-endian bytes; the final two encode the u16.
-fn identifier_to_pool_id(id: frost_secp256k1_tr::Identifier) -> u16 {
+/// The u16 a FROST `Identifier` was constructed from — its participant index.
+/// FROST serializes to 32 big-endian bytes; the final two encode the u16.
+///
+/// This is the identifier bound into canonical bytes on both the DKG and the
+/// signing rounds. It is NOT a `pool_id` (the 28-byte membership id), despite
+/// what this function was called until WI-038.
+fn identifier_u16(id: frost_secp256k1_tr::Identifier) -> u16 {
     let bytes = id.serialize();
     let n = bytes.len();
     u16::from_be_bytes([bytes[n - 2], bytes[n - 1]])
@@ -284,7 +290,7 @@ fn push_round1_faults_from_payloads(
             ns.epoch,
             ns.threshold,
             ns.attempt,
-            identifier_to_pool_id(peer.identifier),
+            identifier_u16(peer.identifier),
             &wire,
         ) else {
             continue;
@@ -332,7 +338,7 @@ fn push_round2_faults_from_payloads(
             peer_pool,
             &peer.bifrost_id_pk,
             &net.my_pool_id,
-            identifier_to_pool_id(recipient_identifier),
+            identifier_u16(recipient_identifier),
             &net.keypair.secret_key(),
             sender_commitments,
             ns.epoch,
@@ -470,7 +476,7 @@ impl PeerNetwork for HttpPeerNetwork {
             ns.threshold,
             ns.attempt,
             &self.my_pool_id,
-            identifier_to_pool_id(identifier),
+            identifier_u16(identifier),
             package,
             own_view.as_ref(),
         )
@@ -496,7 +502,7 @@ impl PeerNetwork for HttpPeerNetwork {
         for (info, pkg) in recipients {
             recips.push(Round2Recipient {
                 pool_id: pool_id_arr(&info.pool_id)?,
-                identifier: identifier_to_pool_id(info.identifier),
+                identifier: identifier_u16(info.identifier),
                 bifrost_id_pk: &info.bifrost_id_pk,
                 package: pkg,
             });
@@ -523,17 +529,45 @@ impl PeerNetwork for HttpPeerNetwork {
         Ok(())
     }
 
-    async fn publish_sign_round1(&self, payload: Sign1Payload) -> EpochResult<()> {
-        let key = (payload.epoch, payload.input_index);
+    async fn publish_sign_round1(
+        &self,
+        ns: SignNamespace,
+        identifier: frost_secp256k1_tr::Identifier,
+        commitments: frost_secp256k1_tr::round1::SigningCommitments,
+    ) -> EpochResult<()> {
+        let wire = wire::build_sign_round1(
+            &self.secp,
+            &self.keypair,
+            ns,
+            &self.my_pool_id,
+            identifier_u16(identifier),
+            &commitments,
+        )
+        .map_err(peer_err)?;
+        let json = serde_json::to_string(&wire).map_err(peer_err)?;
         let mut s = self.state.write().await;
-        s.sign1.insert(key, payload);
+        s.sign1.insert((ns.epoch, ns.session), json);
         Ok(())
     }
 
-    async fn publish_sign_round2(&self, payload: Sign2Payload) -> EpochResult<()> {
-        let key = (payload.epoch, payload.input_index);
+    async fn publish_sign_round2(
+        &self,
+        ns: SignNamespace,
+        identifier: frost_secp256k1_tr::Identifier,
+        share: frost_secp256k1_tr::round2::SignatureShare,
+    ) -> EpochResult<()> {
+        let wire = wire::build_sign_round2(
+            &self.secp,
+            &self.keypair,
+            ns,
+            &self.my_pool_id,
+            identifier_u16(identifier),
+            &share,
+        )
+        .map_err(peer_err)?;
+        let json = serde_json::to_string(&wire).map_err(peer_err)?;
         let mut s = self.state.write().await;
-        s.sign2.insert(key, payload);
+        s.sign2.insert((ns.epoch, ns.session), json);
         Ok(())
     }
 
@@ -575,7 +609,7 @@ impl PeerNetwork for HttpPeerNetwork {
             ns.epoch,
             ns.threshold,
             ns.attempt,
-            identifier_to_pool_id(peer.identifier),
+            identifier_u16(peer.identifier),
             &wire,
         ) {
             Ok(pkg) => Ok(Some(pkg)),
@@ -624,7 +658,7 @@ impl PeerNetwork for HttpPeerNetwork {
             &peer_pool,
             &peer.bifrost_id_pk,
             &self.my_pool_id,
-            identifier_to_pool_id(recipient_identifier),
+            identifier_u16(recipient_identifier),
             &self.keypair.secret_key(),
             sender_commitments,
             ns.epoch,
@@ -682,30 +716,75 @@ impl PeerNetwork for HttpPeerNetwork {
 
     async fn fetch_sign_round1(
         &self,
-        epoch: u64,
+        ns: SignNamespace,
         peer: &SpoInfo,
-        input_index: u32,
-    ) -> EpochResult<Option<Sign1Payload>> {
-        let pool_id = identifier_to_pool_id(peer.identifier);
+    ) -> EpochResult<Option<frost_secp256k1_tr::round1::SigningCommitments>> {
         let url = format!(
-            "{}/sign/{}/round1/{}/{}",
-            peer.bifrost_url, epoch, input_index, pool_id
+            "{}/sign/{}/round1/{}/{}.json",
+            peer.bifrost_url,
+            ns.epoch,
+            ns.session,
+            hex::encode(&peer.pool_id)
         );
-        fetch_optional::<Sign1Payload>(&self.client, &url, "sign1").await
+        let Some(wire) = fetch_optional::<Sign1Wire>(&self.client, &url, "sign1").await? else {
+            return Ok(None);
+        };
+        let peer_pool = pool_id_arr(&peer.pool_id)?;
+        match wire::verify_sign_round1(
+            &self.secp,
+            &peer_pool,
+            &peer.bifrost_id_pk,
+            ns,
+            identifier_u16(peer.identifier),
+            &wire,
+        ) {
+            Ok(commitments) => Ok(Some(commitments)),
+            // Drop and keep polling — the deadline bounds liveness, not one bad
+            // fetch. The log names the pool, which is what makes a signing fault
+            // attributable at all.
+            Err(e) => {
+                eprintln!(
+                    "dropping unauthenticated sign round1 from {}: {e}",
+                    hex::encode(&peer.pool_id)
+                );
+                Ok(None)
+            }
+        }
     }
 
     async fn fetch_sign_round2(
         &self,
-        epoch: u64,
+        ns: SignNamespace,
         peer: &SpoInfo,
-        input_index: u32,
-    ) -> EpochResult<Option<Sign2Payload>> {
-        let pool_id = identifier_to_pool_id(peer.identifier);
+    ) -> EpochResult<Option<frost_secp256k1_tr::round2::SignatureShare>> {
         let url = format!(
-            "{}/sign/{}/round2/{}/{}",
-            peer.bifrost_url, epoch, input_index, pool_id
+            "{}/sign/{}/round2/{}/{}.json",
+            peer.bifrost_url,
+            ns.epoch,
+            ns.session,
+            hex::encode(&peer.pool_id)
         );
-        fetch_optional::<Sign2Payload>(&self.client, &url, "sign2").await
+        let Some(wire) = fetch_optional::<Sign2Wire>(&self.client, &url, "sign2").await? else {
+            return Ok(None);
+        };
+        let peer_pool = pool_id_arr(&peer.pool_id)?;
+        match wire::verify_sign_round2(
+            &self.secp,
+            &peer_pool,
+            &peer.bifrost_id_pk,
+            ns,
+            identifier_u16(peer.identifier),
+            &wire,
+        ) {
+            Ok(share) => Ok(Some(share)),
+            Err(e) => {
+                eprintln!(
+                    "dropping unauthenticated sign round2 from {}: {e}",
+                    hex::encode(&peer.pool_id)
+                );
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -948,5 +1027,107 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(got.expect("decrypted share"), pkg_for_2);
+    }
+
+    /// WI-038 over the real wire: a signing-round payload is signed on publish,
+    /// served verbatim, and verified on fetch against the publisher's
+    /// registry-bound key — and is rejected when fetched under the wrong key or
+    /// for a session it was not made for.
+    #[tokio::test]
+    async fn sign_rounds_over_http_sign_serve_fetch_verify() {
+        use crate::frost::participant;
+
+        let secp = Secp256k1::new();
+        let (kp1, pool1, pk1) = identity(&secp, 1);
+        let (kp2, pool2, _pk2) = identity(&secp, 2);
+        let net1 = HttpPeerNetwork::new(Secp256k1::new(), kp1, pool1);
+        let net2 = HttpPeerNetwork::new(Secp256k1::new(), kp2, pool2);
+        let url1 = serve(&net1).await;
+
+        // A real key package, so the commitments and share are genuine.
+        let mut rng = rand::thread_rng();
+        let (shares, pkp) = frost_secp256k1_tr::keys::generate_with_dealer(
+            2,
+            2,
+            frost_secp256k1_tr::keys::IdentifierList::Default,
+            &mut rng,
+        )
+        .unwrap();
+        let kp = frost_secp256k1_tr::keys::KeyPackage::try_from(shares[&id(1)].clone()).unwrap();
+        let kp_other =
+            frost_secp256k1_tr::keys::KeyPackage::try_from(shares[&id(2)].clone()).unwrap();
+        let _ = pkp;
+
+        let ns = SignNamespace::new(7, 0, [0x5a; 32]);
+        let (nonces, commitments) = participant::sign_round1(&kp, &mut rng);
+        // The other signer's commitments never leave this test — a 2-of-2 share
+        // can only be computed from a full signing package.
+        let (_, commitments_other) = participant::sign_round1(&kp_other, &mut rng);
+        net1.publish_sign_round1(ns, id(1), commitments)
+            .await
+            .unwrap();
+
+        let peer1 = peer_info(1, &pool1, &url1, &pk1);
+        let mut got = None;
+        for _ in 0..50 {
+            if let Some(c) = net2.fetch_sign_round1(ns, &peer1).await.unwrap() {
+                got = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            got.expect("verified commitments"),
+            commitments,
+            "fetched+verified commitments must equal the published ones"
+        );
+
+        // Wrong expected key → verification fails → None (poll keeps going).
+        let (_kpx, _poolx, wrong_pk) = identity(&secp, 9);
+        let peer1_wrongkey = peer_info(1, &pool1, &url1, &wrong_pk);
+        assert!(
+            net2.fetch_sign_round1(ns, &peer1_wrongkey)
+                .await
+                .unwrap()
+                .is_none(),
+            "a sign payload signed by a different key must not verify"
+        );
+
+        // Same epoch and session, different message — a second TM in the epoch.
+        // The blob is served (the URL is identical) but must not verify.
+        let other_tm = SignNamespace::new(7, 0, [0x5b; 32]);
+        assert!(
+            net2.fetch_sign_round1(other_tm, &peer1)
+                .await
+                .unwrap()
+                .is_none(),
+            "a commitment must not carry over to a different message under the same URL"
+        );
+
+        // Round 2 over the same path.
+        let package = frost_secp256k1_tr::SigningPackage::new(
+            [(id(1), commitments), (id(2), commitments_other)]
+                .into_iter()
+                .collect(),
+            &ns.message,
+        );
+        let share = participant::sign_round2(&package, &nonces, &kp).unwrap();
+        net1.publish_sign_round2(ns, id(1), share).await.unwrap();
+        let mut got2 = None;
+        for _ in 0..50 {
+            if let Some(s) = net2.fetch_sign_round2(ns, &peer1).await.unwrap() {
+                got2 = Some(s);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(got2.expect("verified share"), share);
+        assert!(
+            net2.fetch_sign_round2(other_tm, &peer1)
+                .await
+                .unwrap()
+                .is_none(),
+            "a share must not carry over to a different message under the same URL"
+        );
     }
 }

@@ -65,7 +65,7 @@ use crate::epoch::state::{EpochConfig, EpochError, EpochResult, Roster};
 use crate::epoch::traits::{Clock, PeerNetwork, RngSource, UpdateYPlan};
 use crate::frost::participant;
 use crate::frost::xonly::group_xonly;
-use crate::http::payloads::{Sign1Payload, Sign2Payload};
+use crate::http::wire::SignNamespace;
 
 /// Signing-session index reserved for the Update-Y message.
 ///
@@ -266,19 +266,17 @@ async fn frost_sign_message(
     keys: &crate::epoch::state::GroupKeys,
     msg: &[u8; 32],
 ) -> EpochResult<[u8; 64]> {
+    // The rotation's signing domain: the incoming epoch, the reserved session,
+    // and the Update-Y message itself — so a share from one rotation can never
+    // be replayed into another.
+    let ns = SignNamespace::new(epoch, UPDATE_Y_SESSION, *msg);
+
     let mut sign_rng = rng.rng(format!("update-y:epoch={epoch}").as_bytes());
     let (nonces, commitments) = participant::sign_round1(&keys.key_package, &mut sign_rng);
 
     let mut round1: BTreeMap<Identifier, frost::round1::SigningCommitments> = BTreeMap::new();
     round1.insert(me, commitments);
-    peers
-        .publish_sign_round1(Sign1Payload {
-            epoch,
-            identifier: me,
-            input_index: UPDATE_Y_SESSION,
-            commitments,
-        })
-        .await?;
+    peers.publish_sign_round1(ns, me, commitments).await?;
 
     let peer_infos = roster.peers_of(me);
     crate::epoch_log!(
@@ -287,21 +285,14 @@ async fn frost_sign_message(
         "Update-Y round1: published commitments, waiting for {} outgoing peer(s)",
         peer_infos.len()
     );
-    poll_round1(peers, clock, config, epoch, me, &peer_infos, &mut round1).await?;
+    poll_round1(peers, clock, config, ns, me, &peer_infos, &mut round1).await?;
 
     let package = frost::SigningPackage::new(round1, msg);
     let share = participant::sign_round2(&package, &nonces, &keys.key_package)
         .map_err(|e| EpochError::Frost(format!("update-y sign_round2: {e}")))?;
     let mut round2: BTreeMap<Identifier, frost::round2::SignatureShare> = BTreeMap::new();
     round2.insert(me, share);
-    peers
-        .publish_sign_round2(Sign2Payload {
-            epoch,
-            identifier: me,
-            input_index: UPDATE_Y_SESSION,
-            share,
-        })
-        .await?;
+    peers.publish_sign_round2(ns, me, share).await?;
 
     crate::epoch_log!(
         me,
@@ -309,7 +300,7 @@ async fn frost_sign_message(
         "Update-Y round2: published share, waiting for {} outgoing peer(s)",
         peer_infos.len()
     );
-    poll_round2(peers, clock, config, epoch, me, &peer_infos, &mut round2).await?;
+    poll_round2(peers, clock, config, ns, me, &peer_infos, &mut round2).await?;
 
     let signature = participant::sign_aggregate(&package, &round2, &keys.public_key_package)
         .map_err(|e| EpochError::Frost(format!("update-y aggregate: {e}")))?;
@@ -324,11 +315,12 @@ async fn poll_round1(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
     config: &EpochConfig,
-    epoch: u64,
+    ns: SignNamespace,
     me: Identifier,
     peer_infos: &[&crate::epoch::state::SpoInfo],
     out: &mut BTreeMap<Identifier, frost::round1::SigningCommitments>,
 ) -> EpochResult<()> {
+    let epoch = ns.epoch;
     let need = peer_infos.len() + out.len();
     let deadline = clock.deadline(config.quorum51_timeout);
     while out.len() < need {
@@ -336,19 +328,16 @@ async fn poll_round1(
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            if let Some(p) = peers
-                .fetch_sign_round1(epoch, peer, UPDATE_Y_SESSION)
-                .await?
-            {
+            if let Some(commitments) = peers.fetch_sign_round1(ns, peer).await? {
                 crate::epoch_log!(
                     me,
                     epoch,
                     "  Update-Y round1 commitments from spo={} ({}/{})",
-                    id_short(p.identifier),
+                    id_short(peer.identifier),
                     out.len() + 1,
                     need
                 );
-                out.insert(p.identifier, p.commitments);
+                out.insert(peer.identifier, commitments);
             }
         }
         if out.len() >= need {
@@ -369,11 +358,12 @@ async fn poll_round2(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
     config: &EpochConfig,
-    epoch: u64,
+    ns: SignNamespace,
     me: Identifier,
     peer_infos: &[&crate::epoch::state::SpoInfo],
     out: &mut BTreeMap<Identifier, frost::round2::SignatureShare>,
 ) -> EpochResult<()> {
+    let epoch = ns.epoch;
     let need = peer_infos.len() + out.len();
     let deadline = clock.deadline(config.quorum51_timeout);
     while out.len() < need {
@@ -381,19 +371,16 @@ async fn poll_round2(
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            if let Some(p) = peers
-                .fetch_sign_round2(epoch, peer, UPDATE_Y_SESSION)
-                .await?
-            {
+            if let Some(share) = peers.fetch_sign_round2(ns, peer).await? {
                 crate::epoch_log!(
                     me,
                     epoch,
                     "  Update-Y round2 share from spo={} ({}/{})",
-                    id_short(p.identifier),
+                    id_short(peer.identifier),
                     out.len() + 1,
                     need
                 );
-                out.insert(p.identifier, p.share);
+                out.insert(peer.identifier, share);
             }
         }
         if out.len() >= need {

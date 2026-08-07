@@ -37,8 +37,8 @@ use crate::epoch::traits::{
     CardanoChain, Clock, CycleRng, DkgFaultEvidence, EpochBoundaryEvent, PeerNetwork,
     PegOutRequestUtxo, RngSource, TreasuryUtxo, UpdateYPlan,
 };
-use crate::http::payloads::{Sign1Payload, Sign2Payload};
 use crate::http::wire::DkgNamespace;
+use crate::http::wire::SignNamespace;
 
 /// A stand-in `por_id` for a fixture peg-out.
 ///
@@ -495,8 +495,13 @@ struct PeerSlot {
     dkg1: Option<(DkgNamespace, round1::Package)>,
     /// Round 2 shares this SPO published, keyed by recipient identifier.
     dkg2: BTreeMap<Identifier, (DkgNamespace, round2::Package)>,
-    sign1: BTreeMap<u32, Sign1Payload>,
-    sign2: BTreeMap<u32, Sign2Payload>,
+    /// Signing Round 1 commitments, keyed by the session namespace they were
+    /// published under. Keyed by the WHOLE namespace (not just the session
+    /// index) so the mock enforces the same domain separation the HTTP wire
+    /// gets from the canonical bytes: a payload published for one message is
+    /// never served for another.
+    sign1: BTreeMap<SignNamespace, frost_secp256k1_tr::round1::SigningCommitments>,
+    sign2: BTreeMap<SignNamespace, frost_secp256k1_tr::round2::SignatureShare>,
 }
 
 type MockFaultKey = (u64, u64, u64, u8, Identifier);
@@ -631,19 +636,27 @@ impl PeerNetwork for MockPeerNetwork {
         Ok(())
     }
 
-    async fn publish_sign_round1(&self, payload: Sign1Payload) -> EpochResult<()> {
-        let idx = payload.input_index;
+    async fn publish_sign_round1(
+        &self,
+        ns: SignNamespace,
+        _identifier: Identifier,
+        commitments: frost_secp256k1_tr::round1::SigningCommitments,
+    ) -> EpochResult<()> {
         with_slot(&self.hub, self.me, |s| {
-            s.sign1.insert(idx, payload);
+            s.sign1.insert(ns, commitments);
         });
         self.hub.notify.notify_waiters();
         Ok(())
     }
 
-    async fn publish_sign_round2(&self, payload: Sign2Payload) -> EpochResult<()> {
-        let idx = payload.input_index;
+    async fn publish_sign_round2(
+        &self,
+        ns: SignNamespace,
+        _identifier: Identifier,
+        share: frost_secp256k1_tr::round2::SignatureShare,
+    ) -> EpochResult<()> {
         with_slot(&self.hub, self.me, |s| {
-            s.sign2.insert(idx, payload);
+            s.sign2.insert(ns, share);
         });
         self.hub.notify.notify_waiters();
         Ok(())
@@ -698,29 +711,21 @@ impl PeerNetwork for MockPeerNetwork {
 
     async fn fetch_sign_round1(
         &self,
-        epoch: u64,
+        ns: SignNamespace,
         peer: &SpoInfo,
-        input_index: u32,
-    ) -> EpochResult<Option<Sign1Payload>> {
+    ) -> EpochResult<Option<frost_secp256k1_tr::round1::SigningCommitments>> {
         Ok(with_slot(&self.hub, peer.identifier, |s| {
-            s.sign1
-                .get(&input_index)
-                .filter(|p| p.epoch == epoch)
-                .cloned()
+            s.sign1.get(&ns).copied()
         }))
     }
 
     async fn fetch_sign_round2(
         &self,
-        epoch: u64,
+        ns: SignNamespace,
         peer: &SpoInfo,
-        input_index: u32,
-    ) -> EpochResult<Option<Sign2Payload>> {
+    ) -> EpochResult<Option<frost_secp256k1_tr::round2::SignatureShare>> {
         Ok(with_slot(&self.hub, peer.identifier, |s| {
-            s.sign2
-                .get(&input_index)
-                .filter(|p| p.epoch == epoch)
-                .cloned()
+            s.sign2.get(&ns).copied()
         }))
     }
 }
