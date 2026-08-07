@@ -141,3 +141,8 @@ Coordinator aggregates: `z = sum(zp)`, producing final signature `(R, z)`.
 - DKG and signing are off-chain; only results posted on-chain
 - Treasury handoff transactions must be atomic with epoch transitions
 - Never include "Co-Authored-By" or "Co-authored-by" lines in commit messages
+- Never include agent-session or tool-attribution trailers either — no `Claude-Session:` line,
+  no `https://claude.ai/code/session_...` URL, no "Generated with Claude Code" footer. This
+  applies to commit messages **and** to PR descriptions, in this repo and in the sibling
+  repos worked on from here (ft-bifrost-bridge, binocular, internal-docs). A commit message
+  should read as the change's own rationale, with nothing pointing at how it was produced.
