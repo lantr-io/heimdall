@@ -240,33 +240,18 @@ pub fn spos_registry_script(
     )
 }
 
-/// `treasury_info` parameterized by (registry policy id, TM-NFT policy id). N10b
-/// added the 2nd param: `treasury.ak::FederationReset` authenticates the referenced
-/// Confirmed TM by the TM NFT (`tm_nft_policy_id` = the binocular
-/// TreasuryMovementValidator script hash — derive it with [`script_hash_v3`] over
-/// `cardano.tm_script_cbor`). Every caller MUST pass the same value or they compute
-/// a different treasury_info hash (→ a different address, → the state UTxO is
-/// unfindable).
+/// `treasury_info` parameterized by `registry_policy_id` ALONE – spec [PRE-1].
+/// The N10b `tm_nft_policy_id` 2nd param existed only for the
+/// `treasury.ak::FederationReset` branch; with that branch removed ([UY-5]
+/// replaces it) the validator reads nothing the bridge owns. Every caller MUST
+/// apply the same single parameter or it computes a different treasury_info
+/// hash (→ a different address, → the state UTxO is unfindable).
 pub fn treasury_info_script(
     blueprint_json: &str,
     registry_policy_id: &[u8; 28],
-    tm_nft_policy_id: &[u8; 28],
 ) -> Result<ParameterizedScript, BlueprintError> {
     let code = validator_compiled_code(blueprint_json, TREASURY_INFO_TITLE)?;
-    apply_params(&code, &[bytes(registry_policy_id), bytes(tm_nft_policy_id)])
-}
-
-/// The TM-NFT policy id = the binocular `TreasuryMovementValidator` script hash,
-/// derived from its fully-applied CBOR (`cardano.tm_script_cbor`, the same bytes
-/// `binocular tm-script` prints). This is the 2nd parameter every
-/// [`treasury_info_script`] call needs (N10b), so all callers agree on the
-/// treasury_info address.
-pub fn tm_nft_policy_from_script_cbor(
-    tm_script_cbor_hex: &str,
-) -> Result<[u8; 28], BlueprintError> {
-    let cbor = hex::decode(tm_script_cbor_hex.trim())
-        .map_err(|e| BlueprintError::BadHex(e.to_string()))?;
-    Ok(script_hash_v3(&cbor))
+    apply_params(&code, &[bytes(registry_policy_id)])
 }
 
 /// The blueprint's own `hash` field of the validator titled `title` — final
@@ -489,6 +474,25 @@ mod tests {
         assert_eq!(applied.hash_hex(), TREASURY_INFO_APPLIED_HASH);
     }
 
+    // spec [PRE-1]: `treasury_info` MUST take ONLY `registry_policy_id`. With
+    // FederationReset removed it reads nothing the bridge owns. The pin is
+    // TREASURY_INFO_APPLIED_HASH — aiken's own hash for the ONE-param
+    // application of this compiledCode — so applying a second param (or a
+    // different one) fails here.
+    #[test]
+    fn treasury_info_applies_single_registry_param() {
+        let blueprint = format!(
+            r#"{{"validators":[{{"title":"{TREASURY_INFO_TITLE}","compiledCode":"{}"}}]}}"#,
+            TREASURY_INFO_CODE.trim()
+        );
+        let script = treasury_info_script(&blueprint, &REGISTRY_POLICY_FOR_VECTOR).unwrap();
+        assert_eq!(
+            script.hash_hex(),
+            TREASURY_INFO_APPLIED_HASH,
+            "spec [PRE-1]: treasury_info must be parameterized by registry_policy_id alone"
+        );
+    }
+
     #[test]
     fn enterprise_address_is_script_keyed() {
         let applied = apply_params(
@@ -575,14 +579,17 @@ mod tests {
             registry.hash_hex(),
             "37df878dca019a2806def25f6befb7b0bfba6de84e192bbf68ad60ba"
         );
-        // N10b: treasury_info is 2-param (registry, tm_nft). A fixed synthetic
-        // tm_nft (0x11*28) makes the applied hash reproducible; because the blueprint
-        // is aiken's own output and apply_params matches `aiken blueprint apply`
-        // byte-for-byte, the pinned hash is aiken's 2-param application.
-        let treasury = treasury_info_script(&blueprint, &registry.hash, &[0x11u8; 28]).unwrap();
+        // spec [PRE-1]: treasury_info is single-param (registry_policy_id).
+        // Because the blueprint is aiken's own output and apply_params matches
+        // `aiken blueprint apply` byte-for-byte, the pinned hash is aiken's
+        // single-param application. NOTE: pinned against the pre-[PRE-1]
+        // upstream blueprint (whose treasury_info compiledCode still declares
+        // the vestigial tm_nft_policy_id parameter after it); re-pin when the
+        // bridge-track treasury.ak change regenerates plutus.json.
+        let treasury = treasury_info_script(&blueprint, &registry.hash).unwrap();
         assert_eq!(
             treasury.hash_hex(),
-            "e196f69aff75052cf69a9a9a68e9c58345ca4252f1321b1695a89133"
+            "691f2dd908d5e5dd18d7c8ed526caea8465757011ae20d7e6c308a21"
         );
     }
 }

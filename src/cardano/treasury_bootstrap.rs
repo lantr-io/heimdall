@@ -7,9 +7,10 @@
 //! 2. mint exactly 1 treasury NFT under the parameterized `treasury_info`
 //!    policy with asset name `sha2_256(serialise_data(input_ref))`,
 //! 3. send the NFT to the script's enterprise address with the inline
-//!    `TreasuryDatum { bifrost_identity_root: EMPTY-MPF-ROOT,
-//!    current_treasury_address, current_treasury_utxo_id,
-//!    current_spos_frost_key }`,
+//!    `TreasuryDatum { bifrost_identity_root, current_spos_frost_key,
+//!    y_federation, federation_csv_blocks, last_reset_tm_txid }` –
+//!    `bifrost_identity_root` is operator-supplied (spec [PRE-2]; the empty
+//!    MPF root for a fresh deployment),
 //!
 //! with the `TreasuryMintRedeemer` repeating `input_ref` + the three datum
 //! byte-fields. This sets the *initial* FROST group key (bootstrap
@@ -77,9 +78,11 @@ pub fn output_ref_plutus_data(tx_id: &[u8; 32], output_index: u64) -> PlutusData
 // Bootstrap datum + mint redeemer
 // ---------------------------------------------------------------------------
 
-/// The K1 initial datum: empty MPF identity root + the current frost key +
-/// the federation fields. In Phase 1 `current_spos_frost_key` == `y_federation`
-/// (the federation is the key-path signer until the first DKG).
+/// The K1 initial datum: the empty MPF identity root (the fresh-deployment
+/// default – spec [PRE-2] lets the operator override it, e.g. for a
+/// replacement deployment carrying registered SPOs forward) + the current
+/// frost key + the federation fields. In Phase 1 `current_spos_frost_key` ==
+/// `y_federation` (the federation is the key-path signer until the first DKG).
 #[must_use]
 pub fn bootstrap_datum(
     current_spos_frost_key: Vec<u8>,
@@ -91,7 +94,8 @@ pub fn bootstrap_datum(
         current_spos_frost_key,
         y_federation,
         federation_csv_blocks,
-        // No reset at bootstrap; empty until the first FederationReset consumes a sweep.
+        // Vestigial since the FederationReset branch was removed ([UY-5]);
+        // kept empty to match the deployed datum shape.
         last_reset_tm_txid: vec![],
     }
 }
@@ -151,14 +155,9 @@ pub fn build_treasury_bootstrap_tx(
     // `None` → whisky's built-in Preprod models.
     cost_models: Option<Vec<Vec<i64>>>,
 ) -> EpochResult<TreasuryBootstrapTx> {
-    if datum.bifrost_identity_root != mpf::NULL_HASH {
-        return Err(EpochError::Chain(
-            "bootstrap datum must carry the empty MPF root (the validator pins \
-             mpf.root(mpf.empty))"
-                .into(),
-        ));
-    }
-
+    // spec [PRE-2]: the datum's bifrost_identity_root is forwarded verbatim –
+    // the operator may supply a non-empty root (replacement deployment), so
+    // there is deliberately NO empty-MPF-root pin here.
     let pkh = pub_key_hash_hex(key);
     let network = network_from_address(wallet_address);
     let script_address = treasury_script.enterprise_address(network);
@@ -409,26 +408,38 @@ mod tests {
         assert!(matches!(&c.fields[1], PlutusData::BoundedBytes(b) if **b == [1u8, 2]));
     }
 
-    // The builder refuses a datum whose root is not the empty-MPF root — the
-    // validator pins mpf.root(mpf.empty), so anything else burns fees on a
-    // guaranteed phase-2 failure.
+    // spec [PRE-2]: the bootstrap MUST accept an operator-supplied
+    // `bifrost_identity_root` instead of hard-coding the empty MPF root. A
+    // replacement deployment bootstrapped with the empty root would force
+    // every registered SPO to re-register, so the builder must forward a
+    // non-empty root verbatim into the state output's inline datum.
     #[test]
-    fn build_rejects_non_empty_root() {
+    fn bootstrap_accepts_operator_supplied_identity_root() {
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let key = derive_payment_key(mnemonic).unwrap();
         let wallet_addr = crate::cardano::wallet::wallet_address(&key);
-        let mut datum = bootstrap_datum(vec![1], vec![2], 3);
-        datum.bifrost_identity_root = [9u8; 32];
+        let operator_root = [9u8; 32];
+        let mut datum = bootstrap_datum(vec![0xAB; 32], vec![0xCD; 32], 144);
+        datum.bifrost_identity_root = operator_root;
         let utxos = vec![WalletUtxo {
-            tx_hash: "aa".repeat(32),
-            output_index: 0,
+            tx_hash: "bb".repeat(32),
+            output_index: 3,
             lovelace: 50_000_000,
             pure_ada: true,
         }];
-        let err =
+        let built =
             build_treasury_bootstrap_tx(&test_script(), &wallet_addr, &utxos, &datum, &key, None)
-                .unwrap_err();
-        assert!(err.to_string().contains("empty MPF root"), "{err}");
+                .expect("spec [PRE-2]: a non-empty operator-supplied identity root is accepted");
+        // The state output's inline datum carries the operator's root verbatim.
+        let tx: Tx = minicbor::decode(&hex::decode(&built.signed_tx_hex).unwrap()).unwrap();
+        let PseudoTransactionOutput::PostAlonzo(out) = &tx.transaction_body.outputs[0] else {
+            panic!("expected post-alonzo output");
+        };
+        let Some(DatumOption::Data(wrapped)) = &out.datum_option else {
+            panic!("expected inline datum");
+        };
+        let out_datum = TreasuryInfoDatum::from_plutus_data(&wrapped.0).unwrap();
+        assert_eq!(out_datum.bifrost_identity_root, operator_root);
     }
 
     fn test_script() -> blueprint::ParameterizedScript {

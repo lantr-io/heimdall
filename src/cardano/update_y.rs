@@ -8,8 +8,17 @@
 //!    NFT + its locked ADA travel forward),
 //! 2. the continuing inline datum equal to the spent datum with ONLY
 //!    `current_spos_frost_key` replaced by `new_spos_frost_key`,
-//! 3. a BIP340 signature under the SPENT datum's `current_spos_frost_key` over
-//!    [`crate::cardano::treasury_info::update_y_sig_msg`].
+//! 3. a BIP340 signature over
+//!    [`crate::cardano::treasury_info::update_y_sig_msg`], under the SPENT
+//!    datum's `current_spos_frost_key` (the outgoing roster) OR, per spec
+//!    [UY-5], under the SPENT datum's `y_federation` (the standing federation
+//!    co-authority that replaces the removed `FederationReset` branch).
+//!
+//! The two authorizations build the SAME transaction: same redeemer, same
+//! message, same datum transition. Per the withdrawal of [UY-6] the federation
+//! MAY name any successor key. [`UpdateYAuthorizer`] names the key the caller
+//! signed under; [`build_update_y_tx`] verifies the signature under that key
+//! before building, so a wrong-key signature never reaches the chain.
 //!
 //! Submission is permissionless — the signature is the authorization — so this
 //! tx needs no registry mint and no required signer beyond the fee payer.
@@ -19,13 +28,15 @@
 //! ([`crate::cardano::treasury_spend::find_treasury_state`]), sign the message,
 //! then call [`build_update_y_tx`] with the resulting signature.
 
+use bitcoin::key::Secp256k1;
+use bitcoin::secp256k1::{Message, XOnlyPublicKey, schnorr};
 use pallas_wallet::PrivateKey;
 use whisky::*;
 use whisky_pallas::WhiskyPallas;
 
 use crate::cardano::blueprint::ParameterizedScript;
 use crate::cardano::publish::WalletUtxo;
-use crate::cardano::treasury_info::{TreasuryInfoDatum, update_y_redeemer};
+use crate::cardano::treasury_info::{TreasuryInfoDatum, update_y_redeemer, update_y_sig_msg};
 use crate::cardano::treasury_spend::{TreasuryStateUtxo, treasury_spend_leg};
 use crate::cardano::tx_common::{select_collateral, select_fee, sign_built_tx};
 
@@ -35,6 +46,19 @@ pub enum UpdateYError {
     BadNewKeyLen(usize),
     /// The BIP340 signature is not 64 bytes.
     BadSigLen(usize),
+    /// The spent datum's key named by `UpdateYRequest::authorizer` is not a
+    /// valid x-only point, so nothing could ever authorize under it.
+    BadAuthorizerKey {
+        role: &'static str,
+        reason: String,
+    },
+    /// `epoch` is negative — the signed message encodes it as a u64.
+    NegativeEpoch(i64),
+    /// The signature does not verify over the Update-Y message under the
+    /// spent datum's key named by `UpdateYRequest::authorizer`.
+    SignatureInvalid {
+        role: &'static str,
+    },
     Wallet(String),
     Build(String),
 }
@@ -44,6 +68,20 @@ impl std::fmt::Display for UpdateYError {
         match self {
             Self::BadNewKeyLen(n) => write!(f, "new_spos_frost_key must be 32 bytes, got {n}"),
             Self::BadSigLen(n) => write!(f, "update-y signature must be 64 bytes, got {n}"),
+            Self::BadAuthorizerKey { role, reason } => {
+                write!(
+                    f,
+                    "spent datum's {role} is not a valid x-only key: {reason}"
+                )
+            }
+            Self::NegativeEpoch(e) => write!(f, "epoch must be non-negative, got {e}"),
+            Self::SignatureInvalid { role } => {
+                write!(
+                    f,
+                    "signature does not verify under the spent datum's {role} — \
+                     the key named by the authorizer must sign the Update-Y message"
+                )
+            }
             Self::Wallet(e) => write!(f, "wallet: {e}"),
             Self::Build(e) => write!(f, "build: {e}"),
         }
@@ -51,6 +89,32 @@ impl std::fmt::Display for UpdateYError {
 }
 
 impl std::error::Error for UpdateYError {}
+
+/// Which SPENT-datum key authorized this Update-Y – i.e. which key produced
+/// `UpdateYRequest::signature`. The built transaction is identical either way
+/// (spec [UY-5]: the validator accepts either key over the same message);
+/// [`build_update_y_tx`] verifies the signature under the named key and
+/// rejects the request when it does not verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateYAuthorizer {
+    /// The outgoing roster: the spent datum's `current_spos_frost_key`.
+    Roster,
+    /// The federation: the spent datum's `y_federation` ([UY-5]).
+    Federation,
+}
+
+impl UpdateYAuthorizer {
+    /// The SPENT-datum key the signature must verify under, plus that datum
+    /// field's name for error messages. The single place the authorizer is
+    /// mapped to a key, so the builder and the CLI cannot disagree.
+    #[must_use]
+    pub fn signing_key(self, datum: &TreasuryInfoDatum) -> (&[u8], &'static str) {
+        match self {
+            Self::Roster => (&datum.current_spos_frost_key, "current_spos_frost_key"),
+            Self::Federation => (&datum.y_federation, "y_federation"),
+        }
+    }
+}
 
 /// Inputs to [`build_update_y_tx`]. The treasury state UTxO must already be
 /// located (so the caller could compute + sign the message it commits to).
@@ -61,9 +125,12 @@ pub struct UpdateYRequest<'a> {
     /// The incoming roster's x-only Y_51' (32 bytes).
     pub new_spos_frost_key: &'a [u8],
     pub epoch: i64,
-    /// 64-byte BIP340 signature under the SPENT datum's `current_spos_frost_key`
-    /// over `update_y_sig_msg(state.tx_hash, state.output_index, epoch, new_key)`.
+    /// 64-byte BIP340 signature over `update_y_sig_msg(state.tx_hash,
+    /// state.output_index, epoch, new_key)`, under the SPENT-datum key named
+    /// by `authorizer`.
     pub signature: &'a [u8],
+    /// Which spent-datum key produced `signature` (spec [UY-5]).
+    pub authorizer: UpdateYAuthorizer,
     pub wallet_address: &'a str,
     pub wallet_utxos: &'a [WalletUtxo],
     /// Fee-paying wallet key (any funded key — submission is permissionless).
@@ -84,6 +151,14 @@ pub struct UpdateYTx {
 /// Build + sign the Update-Y tx: spend the treasury state UTxO with the
 /// `UpdateY` redeemer, reproduce it at the same address/value with only
 /// `current_spos_frost_key` rotated, and pay the fee from the wallet.
+///
+/// `req.authorizer` does not change the built bytes: the roster and federation
+/// branches share one redeemer and one signed message ([UY-5] – the validator
+/// verifies the signature against either key). It DOES select the datum key
+/// this builder verifies `req.signature` under, mirroring the on-chain check
+/// (like `register_spo::verify_registration`): a signature made under the
+/// wrong key is rejected here instead of failing phase-2 validation on chain
+/// and forfeiting collateral.
 pub fn build_update_y_tx(req: &UpdateYRequest) -> Result<UpdateYTx, UpdateYError> {
     if req.new_spos_frost_key.len() != 32 {
         return Err(UpdateYError::BadNewKeyLen(req.new_spos_frost_key.len()));
@@ -91,6 +166,36 @@ pub fn build_update_y_tx(req: &UpdateYRequest) -> Result<UpdateYTx, UpdateYError
     if req.signature.len() != 64 {
         return Err(UpdateYError::BadSigLen(req.signature.len()));
     }
+
+    // Verify the BIP340 signature under the spent datum's key named by
+    // `authorizer`, over the same message treasury.ak checks ([UY-5]).
+    let (authorizer_key, role) = req.authorizer.signing_key(&req.state.datum);
+    let xonly =
+        XOnlyPublicKey::from_slice(authorizer_key).map_err(|e| UpdateYError::BadAuthorizerKey {
+            role,
+            reason: e.to_string(),
+        })?;
+    let spent_txid: [u8; 32] = hex::decode(&req.state.tx_hash)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| {
+            UpdateYError::Build(format!(
+                "state tx_hash is not 32-byte hex: {}",
+                req.state.tx_hash
+            ))
+        })?;
+    let epoch = u64::try_from(req.epoch).map_err(|_| UpdateYError::NegativeEpoch(req.epoch))?;
+    let msg = update_y_sig_msg(
+        &spent_txid,
+        req.state.output_index,
+        epoch,
+        req.new_spos_frost_key,
+    );
+    let sig = schnorr::Signature::from_slice(req.signature)
+        .map_err(|_| UpdateYError::BadSigLen(req.signature.len()))?;
+    Secp256k1::verification_only()
+        .verify_schnorr(&sig, &Message::from_digest(msg), &xonly)
+        .map_err(|_| UpdateYError::SignatureInvalid { role })?;
 
     let network = crate::cardano::tx_common::network_from_address(req.wallet_address);
 
@@ -183,9 +288,63 @@ mod tests {
     use crate::cardano::mpf;
     use crate::cardano::treasury_spend::find_treasury_state;
     use crate::cardano::wallet::derive_payment_key;
+    use bitcoin::key::Secp256k1;
+    use bitcoin::secp256k1::{Keypair, Message, SecretKey, XOnlyPublicKey, schnorr};
     use pallas_codec::minicbor;
     use pallas_primitives::PlutusData;
     use pallas_primitives::conway::Tx;
+
+    /// The txid of the fixture treasury state UTxO every test spends
+    /// (`STATE_TXID:0`), as bytes; `state_utxo` reports it in hex.
+    const STATE_TXID: [u8; 32] = [0xdd; 32];
+
+    /// Deterministic secp keypair from a repeated seed byte (valid scalar for
+    /// the bytes used here) plus its 32-byte x-only public key.
+    fn test_keypair(seed: u8) -> (Keypair, [u8; 32]) {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).unwrap();
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        (kp, kp.x_only_public_key().0.serialize())
+    }
+
+    /// The Update-Y message committing to the fixture state outpoint.
+    fn update_y_msg(epoch: u64, new_key: &[u8; 32]) -> [u8; 32] {
+        crate::cardano::treasury_info::update_y_sig_msg(&STATE_TXID, 0, epoch, new_key)
+    }
+
+    /// BIP340-sign the Update-Y message for the fixture state outpoint with `kp`.
+    fn sign_update_y(kp: &Keypair, epoch: u64, new_key: &[u8; 32]) -> [u8; 64] {
+        Secp256k1::new()
+            .sign_schnorr_no_aux_rand(&Message::from_digest(update_y_msg(epoch, new_key)), kp)
+            .serialize()
+    }
+
+    /// Pull the 64-byte signature out of the Spend redeemer of a built tx
+    /// (`UpdateY` = Constr 1 `[new_key, epoch, signature]`).
+    fn redeemer_signature(signed_tx_hex: &str) -> [u8; 64] {
+        let tx: Tx = minicbor::decode(&hex::decode(signed_tx_hex).unwrap()).unwrap();
+        let redeemers = tx.transaction_witness_set.redeemer.as_ref().unwrap();
+        let data = match redeemers {
+            pallas_primitives::conway::Redeemers::List(rs) => rs
+                .iter()
+                .find(|r| matches!(r.tag, pallas_primitives::conway::RedeemerTag::Spend))
+                .map(|r| r.data.clone()),
+            pallas_primitives::conway::Redeemers::Map(kv) => kv
+                .iter()
+                .find(|(k, _)| matches!(k.tag, pallas_primitives::conway::RedeemerTag::Spend))
+                .map(|(_, v)| v.data.clone()),
+        }
+        .expect("spend redeemer attached");
+        let PlutusData::Constr(constr) = data else {
+            panic!("UpdateY redeemer must be a Constr");
+        };
+        let fields: Vec<_> = constr.fields.iter().collect();
+        assert_eq!(fields.len(), 3, "UpdateY carries [new_key, epoch, sig]");
+        let PlutusData::BoundedBytes(sig) = fields[2] else {
+            panic!("third UpdateY field must be the signature bytes");
+        };
+        sig.to_vec().try_into().expect("64-byte signature")
+    }
 
     fn test_script() -> blueprint::ParameterizedScript {
         let code = include_str!("../../tests/fixtures/treasury_info_code.txt");
@@ -198,11 +357,11 @@ mod tests {
         .unwrap()
     }
 
-    fn sample_datum() -> TreasuryInfoDatum {
+    fn sample_datum(current_spos_frost_key: Vec<u8>, y_federation: Vec<u8>) -> TreasuryInfoDatum {
         TreasuryInfoDatum {
             bifrost_identity_root: mpf::NULL_HASH,
-            current_spos_frost_key: vec![0xABu8; 32],
-            y_federation: vec![0xCDu8; 32],
+            current_spos_frost_key,
+            y_federation,
             federation_csv_blocks: 144,
             last_reset_tm_txid: vec![],
         }
@@ -212,9 +371,35 @@ mod tests {
         "ee".repeat(32)
     }
 
+    /// The located, decoded fixture state UTxO holding `datum` at `script`.
+    fn located_state(
+        script: &blueprint::ParameterizedScript,
+        datum: &TreasuryInfoDatum,
+    ) -> TreasuryStateUtxo {
+        find_treasury_state(
+            &[state_utxo(&script.hash_hex(), datum)],
+            &script.hash_hex(),
+            &nft_name(),
+        )
+        .unwrap()
+    }
+
+    /// A funded fee payer: the derived key, its address, and two pure-ADA
+    /// UTxOs (one pays the fee, one is collateral).
+    fn test_wallet() -> (PrivateKey, String, Vec<WalletUtxo>) {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let key = derive_payment_key(mnemonic).unwrap();
+        let addr = crate::cardano::wallet::wallet_address(&key);
+        let utxos = vec![
+            WalletUtxo::from_bf(&ada_bf_utxo(&"aa".repeat(32), 50_000_000)),
+            WalletUtxo::from_bf(&ada_bf_utxo(&"bb".repeat(32), 50_000_000)),
+        ];
+        (key, addr, utxos)
+    }
+
     fn state_utxo(policy_hex: &str, datum: &TreasuryInfoDatum) -> BfUtxo {
         BfUtxo {
-            tx_hash: "dd".repeat(32),
+            tx_hash: hex::encode(STATE_TXID),
             output_index: 0,
             amount: vec![
                 BfAmount {
@@ -251,35 +436,26 @@ mod tests {
     #[test]
     fn builds_a_rotation_tx_with_updatey_redeemer() {
         let script = test_script();
-        let old = sample_datum();
-        let state = find_treasury_state(
-            &[state_utxo(&script.hash_hex(), &old)],
-            &script.hash_hex(),
-            &nft_name(),
-        )
-        .unwrap();
-
-        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let key = derive_payment_key(mnemonic).unwrap();
-        let wallet_addr = crate::cardano::wallet::wallet_address(&key);
-        let wallet_utxos = vec![
-            WalletUtxo::from_bf(&ada_bf_utxo(&"aa".repeat(32), 50_000_000)),
-            WalletUtxo::from_bf(&ada_bf_utxo(&"bb".repeat(32), 50_000_000)),
-        ];
+        let (roster_kp, roster_pk) = test_keypair(0xA1);
+        let old = sample_datum(roster_pk.to_vec(), vec![0xCDu8; 32]);
+        let state = located_state(&script, &old);
+        let (key, wallet_addr, wallet_utxos) = test_wallet();
 
         let new_key = [0xCDu8; 32];
+        let signature = sign_update_y(&roster_kp, 3, &new_key);
         let req = UpdateYRequest {
             treasury_script: &script,
             state: &state,
             new_spos_frost_key: &new_key,
             epoch: 3,
-            signature: &[0x00u8; 64], // structure test — on-chain sig check not simulated
+            signature: &signature,
             wallet_address: &wallet_addr,
             wallet_utxos: &wallet_utxos,
             key: &key,
             invalid_before: None,
             invalid_hereafter: None,
             cost_models: None,
+            authorizer: UpdateYAuthorizer::Roster,
         };
         let built = build_update_y_tx(&req).unwrap();
 
@@ -301,7 +477,7 @@ mod tests {
             tx.transaction_body
                 .inputs
                 .iter()
-                .any(|i| i.transaction_id.as_slice() == [0xdd; 32] && i.index == 0)
+                .any(|i| i.transaction_id.as_slice() == STATE_TXID && i.index == 0)
         );
         // A Spend redeemer is attached (its UpdateY = Constr 1 encoding is
         // unit-tested in treasury_info::update_y_redeemer_is_constr1_three_fields).
@@ -315,5 +491,127 @@ mod tests {
                 .any(|(k, _)| matches!(k.tag, pallas_primitives::conway::RedeemerTag::Spend)),
         };
         assert!(has_spend, "spend redeemer attached");
+    }
+
+    // spec [UY-5]: an Update-Y is equally authorized by a BIP340 signature under
+    // the SPENT datum's `y_federation` — the standing federation co-authority
+    // that replaces the removed FederationReset branch. [UY-6] is withdrawn: the
+    // federation MAY name ANY successor key (here one that is neither the old
+    // roster key nor `y_federation` itself). The signature is made under the
+    // real federation key; the builder accepts it, and the signature carried in
+    // the built UpdateY redeemer BIP340-verifies against the spent datum's
+    // y_federation over the Update-Y message.
+    #[test]
+    fn update_y_accepts_federation_key_authorization() {
+        let script = test_script();
+        let (fed_kp, fed_pk) = test_keypair(0xB2);
+        // Roster key is junk: the federation branch must never consult it.
+        let old = sample_datum(vec![0xABu8; 32], fed_pk.to_vec());
+        let state = located_state(&script, &old);
+        let (key, wallet_addr, wallet_utxos) = test_wallet();
+
+        // Any successor key: distinct from both the roster key and
+        // y_federation ([UY-6] withdrawn — no restriction on the named key).
+        let successor = [0x55u8; 32];
+        let signature = sign_update_y(&fed_kp, 12, &successor);
+        let req = UpdateYRequest {
+            treasury_script: &script,
+            state: &state,
+            new_spos_frost_key: &successor,
+            epoch: 12,
+            signature: &signature,
+            wallet_address: &wallet_addr,
+            wallet_utxos: &wallet_utxos,
+            key: &key,
+            invalid_before: None,
+            invalid_hereafter: None,
+            cost_models: None,
+            authorizer: UpdateYAuthorizer::Federation,
+        };
+        let built = build_update_y_tx(&req).unwrap();
+
+        // The rotation is an ordinary Update-Y: only the key changes, to the
+        // arbitrary successor; y_federation itself is preserved.
+        assert_eq!(built.new_datum.current_spos_frost_key, successor.to_vec());
+        assert_eq!(built.new_datum.y_federation, old.y_federation);
+        assert_eq!(
+            built.new_datum.bifrost_identity_root,
+            old.bifrost_identity_root
+        );
+
+        let tx: Tx = minicbor::decode(&hex::decode(&built.signed_tx_hex).unwrap()).unwrap();
+        // The treasury state UTxO is spent — same shape as the roster rotation.
+        assert!(
+            tx.transaction_body
+                .inputs
+                .iter()
+                .any(|i| i.transaction_id.as_slice() == STATE_TXID && i.index == 0)
+        );
+        // The authorization travelling on-chain IS a BIP340 signature under
+        // y_federation: pull it back out of the Spend redeemer and verify it
+        // against the spent datum's y_federation over the Update-Y message.
+        let carried = redeemer_signature(&built.signed_tx_hex);
+        assert_eq!(carried, signature, "redeemer carries the signature");
+        let msg = update_y_msg(12, &successor);
+        Secp256k1::verification_only()
+            .verify_schnorr(
+                &schnorr::Signature::from_slice(&carried).unwrap(),
+                &Message::from_digest(msg),
+                &XOnlyPublicKey::from_slice(&old.y_federation).unwrap(),
+            )
+            .expect("redeemer signature verifies under y_federation");
+    }
+
+    // The `authorizer` field is load-bearing: the builder verifies the BIP340
+    // signature under the datum key it names, before any fee is spent. A
+    // signature made under the OTHER datum key must be rejected client-side —
+    // on-chain it would fail phase-2 validation and forfeit collateral.
+    #[test]
+    fn rejects_signature_under_the_wrong_datum_key() {
+        let script = test_script();
+        let (roster_kp, roster_pk) = test_keypair(0xA1);
+        let (fed_kp, fed_pk) = test_keypair(0xB2);
+        let old = sample_datum(roster_pk.to_vec(), fed_pk.to_vec());
+        let state = located_state(&script, &old);
+        let (key, wallet_addr, wallet_utxos) = test_wallet();
+
+        let new_key = [0x55u8; 32];
+        let roster_sig = sign_update_y(&roster_kp, 12, &new_key);
+        let fed_sig = sign_update_y(&fed_kp, 12, &new_key);
+
+        let build = |signature: &[u8; 64], authorizer: UpdateYAuthorizer| {
+            build_update_y_tx(&UpdateYRequest {
+                treasury_script: &script,
+                state: &state,
+                new_spos_frost_key: &new_key,
+                epoch: 12,
+                signature,
+                wallet_address: &wallet_addr,
+                wallet_utxos: &wallet_utxos,
+                key: &key,
+                invalid_before: None,
+                invalid_hereafter: None,
+                cost_models: None,
+                authorizer,
+            })
+        };
+
+        // Roster-signed but claimed as federation-authorized: rejected.
+        assert!(matches!(
+            build(&roster_sig, UpdateYAuthorizer::Federation),
+            Err(UpdateYError::SignatureInvalid {
+                role: "y_federation"
+            })
+        ));
+        // Federation-signed but claimed as roster-authorized: rejected.
+        assert!(matches!(
+            build(&fed_sig, UpdateYAuthorizer::Roster),
+            Err(UpdateYError::SignatureInvalid {
+                role: "current_spos_frost_key"
+            })
+        ));
+        // Both verify when the authorizer names the key that actually signed.
+        assert!(build(&fed_sig, UpdateYAuthorizer::Federation).is_ok());
+        assert!(build(&roster_sig, UpdateYAuthorizer::Roster).is_ok());
     }
 }

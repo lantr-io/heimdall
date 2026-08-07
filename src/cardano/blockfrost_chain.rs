@@ -1656,6 +1656,9 @@ impl CardanoChain for BlockfrostCardanoChain {
                 new_spos_frost_key: &plan.new_key.serialize(),
                 epoch: epoch_i64,
                 signature,
+                // The DKG handoff is roster-authorized: `signature` is the
+                // outgoing group key's (spec [UY-3]).
+                authorizer: crate::cardano::update_y::UpdateYAuthorizer::Roster,
                 wallet_address: wallet_addr,
                 wallet_utxos: &wallet_utxos,
                 key,

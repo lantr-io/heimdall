@@ -884,3 +884,76 @@ Rev 5.4 replaces the one-field completed-peg-outs trie datum with a four-field
     belongs with the `cpo_policy_id` -> `bridge_state_policy` config rename, not
     with [OH-4]. They name the right UTxO by the old word; they are not wrong
     about what is read.
+
+---
+
+## DEC-028: FederationReset Removed; the Federation Authorizes Update-Y
+
+**Date:** 2026-08-07
+**Decision:** Delete the FederationReset builder, CLI and evidence readers; a
+federation-signed Update-Y ([UY-5]) replaces them; `treasury_info` is
+parameterized by `registry_policy_id` alone ([PRE-1]); the bootstrap accepts an
+operator-supplied `bifrost_identity_root` ([PRE-2])
+**Status:** Accepted
+**Spec:** ft-bifrost-bridge `docs/superpowers/specs/2026-08-06-bridge-state-singleton-design.md`,
+§Update-Y, federation branch ([UY-5], [UY-6]-[UY-8] withdrawn), §Contracts to
+fix before first deployment ([PRE-1], [PRE-2]), §Federation co-authority
+
+### Context
+
+Rev 5.4 removes `treasury.ak`'s `FederationReset` branch. Its job (dead-roster
+recovery) is covered by [UY-5]: the federation is a standing co-authority that
+can sign an ordinary Update-Y under `y_federation`, naming ANY successor key
+([UY-6] withdrawn). With the branch gone, `treasury.ak` no longer reads the
+Confirmed TM record, so its `tm_nft_policy_id` compile parameter must go before
+first deployment ([PRE-1]), and the bootstrap must not hard-code the empty MPF
+root ([PRE-2]).
+
+### Decision
+
+- `build_update_y_tx` gained an `UpdateYAuthorizer` (`Roster` | `Federation`)
+  on the request. It never changes the built bytes: both authorizations share
+  ONE redeemer (`UpdateY`, Constr 1), ONE signed message
+  (`update_y_sig_msg`, tag `"bifrost-update-y"`) and ONE datum transition. The
+  on-chain branch differs only in which datum key verifies the signature, so
+  the choice lives in the signature.
+  - The builder BIP340-verifies `signature` under the datum key the authorizer
+    names (`current_spos_frost_key` or `y_federation`) before building,
+    mirroring `register_spo::verify_registration`. A wrong-key signature is
+    rejected client-side (`UpdateYError::SignatureInvalid`) instead of failing
+    phase-2 validation on chain and forfeiting collateral. Review round 1
+    flagged the earlier design (a carried-but-unread field) as dead code with
+    an unenforced doc promise; this check is the fix.
+  - Rejected: a separate redeemer constructor or a `"bifrost-update-y-reset"`
+    tag. The spec says every other Update-Y rule is unchanged; a second wire
+    shape would force the validator and every off-chain builder to carry two
+    paths for one transition.
+- **Resolved `TreasuryInfoDatum` shape: all 5 fields stay, including
+  `last_reset_tm_txid`.** The bridge-track `treasury.ak` change owns the datum
+  shape; the current blueprint (upstream `plutus.json` and the
+  `treasury_info_code.txt` fixture) still encodes
+  `[bifrost_identity_root, current_spos_frost_key, y_federation,
+  federation_csv_blocks, last_reset_tm_txid]`, so heimdall keeps the field –
+  documented as vestigial, empty at bootstrap, preserved verbatim – to stay in
+  lockstep. If the bridge track drops the field, the fixture bump carries the
+  matching heimdall change.
+- `treasury_info_script` takes only `registry_policy_id`. The `tm_nft_policy`
+  config helper and `tm_nft_policy_from_script_cbor` were deleted with it:
+  their own docs defined them as "treasury_info's 2nd param", so keeping them
+  would leave a helper that derives a hash nothing accepts.
+- `federation_reset.rs`, the `federation-reset` CLI, `federation_reset_redeemer`,
+  `federation_reset_sig_msg`, `confirmed_tm_spent_via_federation_leaf` and
+  `confirmed_tm_reset_evidence_from_hex` were deleted rather than deprecated –
+  they read a Confirmed TM record that no longer exists in rev 5.4, and their
+  sig-msg vector tests pinned an on-chain branch that is being removed.
+- The bootstrap builder forwards `bifrost_identity_root` verbatim (the
+  empty-root refusal and its test were removed); `bootstrap-treasury-info`
+  gained `--identity-root` (optional, default empty MPF root). The on-chain
+  mint branch still pins `mpf.root(mpf.empty)` until the bridge-track [PRE-2]
+  change lands; until then a non-empty root builds but cannot validate, so
+  `--identity-root` prints a warning when the root is not the empty MPF root.
+- The ignored `registry_then_treasury_chain_matches_aiken` hash was re-pinned
+  to the single-param application against the CURRENT upstream blueprint,
+  whose compiledCode still declares the (now-unapplied) `tm_nft_policy_id`
+  parameter. Re-pin both hashes when the bridge-track treasury.ak change
+  regenerates `plutus.json`.

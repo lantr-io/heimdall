@@ -460,7 +460,6 @@ impl RegistryRosterSource {
         blueprint_path: &str,
         registry_bootstrap: &str,
         treasury_info_asset_name_hex: &str,
-        tm_nft_policy: &[u8; 28],
         mainnet: bool,
     ) -> Result<Self, RosterError> {
         let blueprint_json = std::fs::read_to_string(blueprint_path)
@@ -472,9 +471,9 @@ impl RegistryRosterSource {
         };
         let registry = blueprint::spos_registry_script(&blueprint_json, &tx_id, u64::from(index))
             .map_err(|e| err("spos_registry", e))?;
-        let treasury =
-            blueprint::treasury_info_script(&blueprint_json, &registry.hash, tm_nft_policy)
-                .map_err(|e| err("treasury_info", e))?;
+        // spec [PRE-1]: treasury_info is parameterized by the registry policy alone.
+        let treasury = blueprint::treasury_info_script(&blueprint_json, &registry.hash)
+            .map_err(|e| err("treasury_info", e))?;
         let network = if mainnet {
             pallas_addresses::Network::Mainnet
         } else {
@@ -583,10 +582,9 @@ impl RegistryRosterSource {
             }
         };
         let mainnet = cardano.is_mainnet().map_err(RosterError::Config)?;
-        // N10b: treasury_info is now 2-param — the TM-NFT policy (binocular TM
-        // validator hash), required alongside the registry fields for a real roster.
-        let tm_nft = cardano.tm_nft_policy().map_err(RosterError::Config)?;
-        Self::from_blueprint(blueprint_path, bootstrap, asset_name_hex, &tm_nft, mainnet).map(Some)
+        // PRE-1 (rev 5.4): treasury_info no longer takes the TM-NFT policy;
+        // its only parameter besides the registry fields is gone.
+        Self::from_blueprint(blueprint_path, bootstrap, asset_name_hex, mainnet).map(Some)
     }
 
     /// Resolve the roster source the way every node should: from the bridge

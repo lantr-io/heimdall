@@ -23,7 +23,6 @@ pub mod cpo_history;
 pub mod cpo_trie;
 pub mod dkg_roster;
 pub mod fault_proof;
-pub mod federation_reset;
 pub mod hash;
 pub mod init_scripts;
 pub mod kupo;
