@@ -10,6 +10,10 @@ musl binary:
 - **[Docker image](#docker-image)** — `ghcr.io/lantr-io/heimdall`, config bind-mounted into
   `/etc/heimdall`. Same binary, no systemd; published on each release.
 
+New to heimdall? Read the [operator guide](../docs/operator-guide.md) first — it walks the whole
+path from a clean machine to a registered, running node, and links back here for the details. This
+page is the per-route reference.
+
 They are separate deployments with different unit names and different config paths; do not mix
 their instructions. Running both against one bridge is a mistake — see *One instance per bridge*
 below.
@@ -123,9 +127,11 @@ Notes:
 
 - **`bind_address` must not be loopback.** `127.0.0.1` inside a container is invisible even with
   `-p`, so peers cannot fetch this node's DKG rounds and it drops out of the qualified set
-  contributing nothing. Set `http.bind_address = "0.0.0.0"` and publish the port your registered
-  `bifrost_url` names — `base_port + signer_index`, so a node at index 3 is on 18503, not 18500.
-  The entrypoint warns about this on startup, but it cannot know what you registered.
+  contributing nothing. Set `http.bind_address = "0.0.0.0"`. The entrypoint warns about this on
+  startup, but it cannot know what you registered.
+- **The port comes from your registered `bifrost_url`, not from the config.** The daemon parses
+  that URL and binds its port; `http.base_port` only builds the local fixture demo's roster.
+  Publish the port your registration names.
 - **Name the state volume.** `/var/lib/heimdall` holds the per-epoch DKG signing share and the
   completed-peg-outs trie. A container replaced without a named volume comes back unable to resume
   its epoch and believing every completed peg-out is unpaid. The directory is `0700`, owned by the

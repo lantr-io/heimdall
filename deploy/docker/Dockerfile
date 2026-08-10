@@ -54,11 +54,12 @@ RUN chmod 0755 /usr/bin/heimdall /usr/local/bin/heimdall-entrypoint
 # comes back believing every completed peg-out is unpaid — name a volume.
 VOLUME ["/var/lib/heimdall"]
 
-# The SPO-to-SPO protocol surface. The daemon listens on
-# bind_address:(base_port + signer_index) and publishes that on-chain as its
-# `bifrost_url` at registration, so it is public by construction and peers must
-# reach it. 18500 is the default base_port; a node at signer index 3 listens on
-# 18503, so publish the port your registration actually names.
+# The SPO-to-SPO protocol surface: public by construction, since its URL is on
+# chain and peers must fetch this node's DKG rounds from it.
+#
+# The port is NOT configured here or in heimdall.toml — the daemon binds the port
+# in its own registered `bifrost_url`. 18500 is only a conventional default to
+# declare; publish whatever port your registration actually names.
 EXPOSE 18500
 
 USER heimdall

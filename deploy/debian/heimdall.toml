@@ -115,16 +115,22 @@ stake_source = "blockfrost"
 
 [http]
 # THE SPO-TO-SPO PROTOCOL SURFACE, and the one piece of networking that must be
-# right. This node publishes <bind_address>:<base_port + signer_index> on-chain as
-# its `bifrost_url` at registration, and peers FETCH its DKG and signing rounds
-# from it. The default below is loopback, which is correct for a local trial and
-# wrong for a real SPO: a peer that cannot reach this address cannot get this
-# node's round-1 payload, so the node drops out of the qualified set and
-# contributes nothing to the epoch.
+# right. Peers FETCH this node's DKG and signing rounds from the `bifrost_url` it
+# registered on-chain. A peer that cannot reach it cannot get this node's round-1
+# payload, so the node drops out of the qualified set and contributes nothing to
+# the epoch — silently, from this node's point of view.
 #
-# Set this to an address reachable from the public internet, open the port, and
-# make sure it matches what you registered.
+# bind_address is the LOCAL INTERFACE to bind. The default below is loopback,
+# correct for a local trial and wrong for a real SPO; use 0.0.0.0 (and inside a
+# container, loopback is unreachable even with -p).
+#
+# THE PORT IS NOT SET HERE. The daemon binds the port in its own registered
+# bifrost_url, so that URL is the single source of truth — register one with an
+# explicit :<port> (it refuses to start otherwise) and open that port.
 bind_address = "127.0.0.1"
+
+# base_port only builds the roster for the local no-registry fixture demo. It has
+# no effect on a registered node.
 base_port = 18500
 
 
