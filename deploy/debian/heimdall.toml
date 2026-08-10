@@ -124,6 +124,33 @@ stake_source = "blockfrost"
 #registry_bootstrap = "<tx_hash>:<index>"
 #treasury_info_asset_name = ""
 
+# Ban list. REQUIRED as soon as the registry keys above are set — the daemon
+# refuses to start without it. [will be removed — WI-065 moves these into the
+# Config UTxO, after which none of them are typed here.]
+#
+# Not an operator preference: the eligible roster is the registry MINUS active
+# bans, so a node that does not read the list enumerates a different set of DKG
+# participants, assigns different indices, and cannot converge with the others.
+# Nothing in either node's log would say so. One value, from the bridge's
+# deployment notes; every SPO on a bridge uses the same one.
+#ban_bootstrap = "<tx_hash>:<index>"
+
+# Fault enforcement — publishing a fault proof on chain so misbehaviour costs
+# something. Entirely OPTIONAL and off by default: faults are detected and the
+# offender excluded from the ceremony either way, with or without these.
+#
+# All of them or none. Setting one and omitting another is a startup error
+# rather than a half-working publish path.
+#
+# Do not enable on mainnet yet — the deployed round1/round2 verifiers are
+# generated from a test setup and heimdall will refuse to start. See
+# docs/fault-proof-srs.md in the heimdall repository.
+#spo_bans_ref = "<tx_hash>:<index>"
+#fault_verifier_round1_ref = "<tx_hash>:<index>"
+#fault_verifier_round2_ref = "<tx_hash>:<index>"
+#fault_verifier_equivocation_ref = "<tx_hash>:<index>"
+#fault_proof_srs_path = "/var/lib/heimdall/kzg_params_22"
+
 
 [http]
 # THE SPO-TO-SPO PROTOCOL SURFACE, and the one piece of networking that must be

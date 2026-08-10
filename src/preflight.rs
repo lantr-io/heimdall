@@ -6,7 +6,7 @@
 //! locator keys silently dropped to a wall-clock cadence instead of the protocol's
 //! batch grid, which does not agree with the other SPOs, and nothing said so.
 //!
-//! This module runs six checks in order and reports each one. It is the single
+//! This module runs seven checks in order and reports each one. It is the single
 //! state reader behind the startup gate; `heimdall doctor` (WI-054) and
 //! `heimdall status` (WI-058) are meant to render the same [`Report`] rather than
 //! grow their own opinion of what "healthy" means, because three readers that can
@@ -14,7 +14,7 @@
 //!
 //! ## It never spends
 //!
-//! Steps 5 and 6 discover and *report*. A missing reference script and an
+//! Steps 5 and 7 discover and *report*. A missing reference script and an
 //! unregistered SPO both name the exact command to run and stop. Deploying the
 //! `spos_registry` reference script parks ~55 ADA and registering locks a security
 //! deposit; neither belongs to a service start, however convenient. That rule is
@@ -601,7 +601,58 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         }
     }
 
-    // ── 6. Registration status — report, never register ───────────────────
+    // ── 6. Ban list — consensus-relevant, so its absence is a failure ─────
+    // The eligible roster is the registry MINUS active bans, so two nodes that
+    // disagree about whether the list is read enumerate different participant
+    // sets and their DKG cannot converge — invisible from either node's own
+    // log. `BanListSource::from_config` refuses that combination (WI-060);
+    // surface it here so it is caught before the service is ever enabled,
+    // rather than at the next epoch boundary.
+    match &registry {
+        Ok(None) | Err(_) => b.push(
+            6,
+            "ban list",
+            Status::Skipped,
+            "no on-chain registry configured (fixture roster)",
+        ),
+        Ok(Some(_)) => match crate::cardano::ban_list::BanListSource::from_config(&cfg.cardano) {
+            Ok(Some(src)) => {
+                let enforcing = cfg.cardano.fault_proof_srs_path.is_some();
+                b.push(
+                    6,
+                    "ban list",
+                    Status::Pass,
+                    format!(
+                        "roster is ban-filtered against {} ({})",
+                        src.ban_address,
+                        if enforcing {
+                            "fault enforcement configured"
+                        } else {
+                            "detection only — faults excluded, not published"
+                        }
+                    ),
+                );
+            }
+            Ok(None) => b.push_fix(
+                6,
+                "ban list",
+                Status::Fail,
+                "the registry roster is configured but no ban list resolved".to_string(),
+                "set cardano.ban_bootstrap to the ban-list bootstrap outref",
+            ),
+            Err(e) => b.push_fix(
+                6,
+                "ban list",
+                Status::Fail,
+                format!("cannot derive the ban list: {e}"),
+                "the eligible roster is the registry MINUS active bans — a node that cannot \
+                 read the list computes a different DKG participant set from one that can.\n\
+                 heimdall bootstrap-ban-list --config <file> ... --submit  (once per bridge)",
+            ),
+        },
+    }
+
+    // ── 7. Registration status — report, never register ───────────────────
     let bifrost_pk = {
         let secp = Secp256k1::new();
         cfg.load_bifrost_keypair(&secp)
@@ -610,20 +661,20 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     };
     match (&registry, bifrost_pk) {
         (Ok(None), _) | (Err(_), _) => b.push(
-            6,
+            7,
             "registration status",
             Status::Skipped,
             "no usable on-chain registry (step 5)",
         ),
         (Ok(Some(_)), None) => b.push(
-            6,
+            7,
             "registration status",
             Status::Skipped,
             "no [bifrost].skey_path — cannot tell which registry entry is ours",
         ),
         (Ok(Some(src)), Some(pk)) => match src.fetch_snapshot(&base_url, &project_id).await {
             Err(e) => b.push_fix(
-                6,
+                7,
                 "registration status",
                 Status::Fail,
                 format!("registry unreadable: {e}"),
@@ -633,7 +684,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             Ok(snapshot) => {
                 if snapshot.spos.iter().any(|s| s.bifrost_id_pk == pk) {
                     b.push(
-                        6,
+                        7,
                         "registration status",
                         Status::Pass,
                         format!(
@@ -644,7 +695,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     );
                 } else {
                     b.push_fix(
-                        6,
+                        7,
                         "registration status",
                         Status::Fail,
                         format!(
