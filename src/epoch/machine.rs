@@ -137,20 +137,20 @@ pub async fn run_epoch_loop(
                 // view; the fresher-read nodes don't wait. Otherwise the ordinary
                 // capped exponential.
                 let wait = if peers.is_view_stale().await {
-                    crate::epoch_log!(
+                    crate::epoch_warn!(
                         me,
                         current_epoch(&EpochPhase::Idle),
-                        "error: {e}; STALE chain-view — settling back-off {:?} before re-read \
+                        "chain read failed ({e}); STALE chain-view — settling back-off {:?} before re-read \
                          (reconcile), then re-entering Idle",
                         config.dkg_reconcile_backoff
                     );
                     backoff = RETRY_BACKOFF_MIN; // the settling wait replaces the ramp
                     config.dkg_reconcile_backoff
                 } else {
-                    crate::epoch_log!(
+                    crate::epoch_warn!(
                         me,
                         current_epoch(&EpochPhase::Idle),
-                        "error: {e}; backing off {:?} then re-entering Idle",
+                        "chain read failed ({e}); backing off {:?} then re-entering Idle",
                         backoff
                     );
                     let w = backoff;
@@ -506,7 +506,7 @@ async fn wait_for_roster_health(
             return;
         }
         if tokio::time::Instant::now() >= deadline {
-            crate::epoch_log!(
+            crate::epoch_warn!(
                 me,
                 ctx.epoch,
                 "health gate: proceeding without unreachable peer(s) {:?} after {:?}",
@@ -515,7 +515,10 @@ async fn wait_for_roster_health(
             );
             return;
         }
-        crate::epoch_log!(
+        // Per-poll, and `poll` can be 200ms — at info this drowns the join. Both
+        // ways out of the loop log (reachable → info, deadline → warn), so the
+        // operator still learns the outcome and which peers were missing.
+        crate::epoch_debug!(
             me,
             ctx.epoch,
             "health gate: waiting for peer(s) {:?}...",
@@ -554,7 +557,7 @@ fn try_resume_dkg(
             }))
         }
         Ok(_) => {
-            crate::epoch_log!(
+            crate::epoch_warn!(
                 me,
                 epoch,
                 "persisted DKG for epoch {epoch} is bound to a different identity — ignoring, \
@@ -563,7 +566,7 @@ fn try_resume_dkg(
             Ok(None)
         }
         Err(e) => {
-            crate::epoch_log!(
+            crate::epoch_warn!(
                 me,
                 epoch,
                 "persisted DKG for epoch {epoch} is unreadable ({e}) — running a fresh ceremony"
@@ -632,7 +635,7 @@ async fn publish_keys_phase(
                 hex::encode(new_spk.as_bytes())
             );
         }
-        Err(e) => crate::epoch_log!(
+        Err(e) => crate::epoch_debug!(
             me,
             epoch,
             "  (new treasury address preview unavailable pre-handoff: {e})"
@@ -748,7 +751,7 @@ async fn collect_pegins_phase(
                     accepted.insert(req.cardano_utxo.clone(), parsed);
                 }
                 Err(e) => {
-                    crate::epoch_log!(me, epoch, "  dropped peg-in {:?}: {}", req.cardano_utxo, e);
+                    crate::epoch_warn!(me, epoch, "  dropped peg-in {:?}: {}", req.cardano_utxo, e);
                 }
             }
         }
@@ -861,7 +864,7 @@ fn load_cpo_trie(
 ) -> EpochResult<crate::cardano::cpo_trie::CpoTrie> {
     use crate::cardano::cpo_trie::CpoTrie;
     let Some(dir) = state_dir else {
-        crate::epoch_log!(
+        crate::epoch_warn!(
             me,
             epoch,
             "  completed-peg-outs trie: no protocol.state_dir configured — using the empty \
@@ -881,7 +884,7 @@ fn load_cpo_trie(
             Ok(t)
         }
         None => {
-            crate::epoch_log!(
+            crate::epoch_warn!(
                 me,
                 epoch,
                 "  completed-peg-outs trie: no persisted state at {} — using the empty (genesis) \
@@ -944,10 +947,10 @@ async fn cross_check_cpo_root(
             Ok(CpoTrust::Verified)
         }
         None => {
-            crate::epoch_log!(
+            crate::epoch_warn!(
                 me,
                 epoch,
-                "  completed-peg-outs trie: WARNING: no cpo_policy_id configured — the local root \
+                "  completed-peg-outs trie: no cpo_policy_id configured — the local root \
                  was NOT cross-checked against the on-chain CPO singleton. Set \
                  cardano.cpo_policy_id before trusting this trie to sign with."
             );
@@ -1098,7 +1101,7 @@ async fn build_tm_phase(
         CpoTrust::Verified => pegouts,
         CpoTrust::Unverified if pegouts.is_empty() => pegouts,
         CpoTrust::Unverified => {
-            crate::epoch_log!(
+            crate::epoch_warn!(
                 me,
                 epoch,
                 "  skipping ALL {} open peg-out(s): the completed-peg-outs trie was not \
@@ -1250,7 +1253,7 @@ async fn submit_phase(
         let msg = bitcoin::secp256k1::Message::from_digest(tm.sighashes[i]);
         secp.verify_schnorr(&schnorr, &msg, &xonly)
             .map_err(|e| EpochError::SignatureVerify(i, e.to_string()))?;
-        crate::epoch_log!(
+        crate::epoch_debug!(
             me,
             epoch,
             "  input {i}: schnorr sig verifies under output key"

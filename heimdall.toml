@@ -96,3 +96,20 @@ base_port = 18500
 [demo]
 min_signers = 2
 max_signers = 3
+
+[log]
+# A bare level is scoped to heimdall's own modules and leaves the dependency
+# tree at `warn`, so `debug` does not bury the node under reqwest/hyper chatter.
+# Anything containing `=` or `,` is used verbatim as a RUST_LOG directive, e.g.
+# "warn,heimdall::cardano::blockfrost_chain=debug".
+level = "info"
+# auto | plain | journal | json.
+#   auto    — `journal` when systemd is capturing stdout (JOURNAL_STREAM is set),
+#             else `plain`. There is no reason to set this by hand under systemd.
+#   journal — `<N>`-prefixed lines so journald files each event at its real
+#             priority and `journalctl -p err` shows errors and nothing else.
+#   json    — one object per event, for a log shipper.
+format = "auto"
+# Both are overridden by --log-level / --log-format, and by the RUST_LOG /
+# HEIMDALL_LOG_FORMAT environment variables — so verbosity on a running node
+# changes without editing this file or rebuilding.

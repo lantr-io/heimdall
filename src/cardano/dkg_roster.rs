@@ -47,6 +47,7 @@ use crate::cardano::roster::{
 };
 use crate::cardano::stake::{StakeSource, fetch_pool_stake_src};
 use crate::epoch::state::{Roster, SpoInfo};
+use tracing::{info, warn};
 
 /// Security threshold as a percentage of total eligible stake: any `t`
 /// signers must control STRICTLY MORE than this (spec: Y_51 → 51%).
@@ -606,7 +607,7 @@ pub async fn fetch_eligible_stakes(
                 stakes.insert(pool_id.clone(), stake.active_stake);
             }
             Err(e) if exclude_unstaked => {
-                eprintln!(
+                warn!(
                     "[demo] excluding pool {} from roster: stake unresolved ({e})",
                     pool_id_bech32(&arr)
                 );
@@ -663,7 +664,7 @@ pub async fn fetch_dkg_context(
         let short = |v: &[u8]| hex::encode(&v[..4.min(v.len())]);
         let bans_short: Vec<String> = active_bans.iter().map(|b| short(b)).collect();
         let elig_short: Vec<String> = eligible.iter().map(|e| short(e)).collect();
-        eprintln!(
+        info!(
             "[chain-view] epoch={epoch} attempt={attempt} epoch_start_ms={epoch_start_ms} \
              registered={} active_bans=[{}] eligible=[{}]",
             snapshot.spos.len(),

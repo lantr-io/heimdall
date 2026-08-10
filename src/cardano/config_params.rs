@@ -58,6 +58,7 @@ use crate::bitcoin::tm_builder::TmParams;
 use crate::cardano::bf_http::{self, BfUtxo};
 use crate::cardano::plutus;
 use crate::epoch::batch::{BatchWindow, GridParams};
+use tracing::{info, warn};
 
 /// Field count of a Config datum carrying the operational-parameter append
 /// (#12–#16 on top of upstream's 12 fields, `initial_btc_treasury_utxo` last).
@@ -471,7 +472,7 @@ pub async fn fetch_param_snapshot(
             {
                 Ok(secs) => Some(secs.saturating_mul(1000)),
                 Err(e) => {
-                    eprintln!(
+                    warn!(
                         "[config] WARNING: could not read the Config UTxO's creation time \
                          ({e}) — cannot check it predates this batch's snapshot slot {slot}"
                     );
@@ -487,7 +488,7 @@ pub async fn fetch_param_snapshot(
         };
         match snapshot.config_created_ms {
             Some(created) if created > time_ms => {
-                eprintln!(
+                warn!(
                     "[config] Config UTxO {} was created after this batch's snapshot (created \
                      {created} ms > tip {time_ms} ms) — a governance Update landed mid-read; \
                      retaking the snapshot ({attempt}/{SNAPSHOT_ATTEMPTS})",
@@ -533,7 +534,7 @@ pub async fn batch_at(
     let epoch_start_slot = match epoch_start_slot(bf_base_url, bf_project_id, snapshot).await {
         Ok(slot) => slot,
         Err(e) => {
-            eprintln!(
+            warn!(
                 "[batch] no epoch anchor ({e}) — building without the batch membership cutoff; \
                  peg-out selection falls back to whatever is open at this instant"
             );
@@ -550,7 +551,7 @@ pub async fn batch_at(
     let grid = match GridParams::new(epoch_start_slot, interval, stability, final_cutoff) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("[batch] unusable schedule ({e}) — building without the cutoff");
+            warn!("[batch] unusable schedule ({e}) — building without the cutoff");
             return BatchWindow::NoGrid;
         }
     };
@@ -558,7 +559,7 @@ pub async fn batch_at(
         Some(b) => BatchWindow::Open(b),
         None => {
             let next = grid.next(snapshot.slot);
-            eprintln!(
+            info!(
                 "[batch] slot {} is outside this epoch's batch grid (before B_1, or past \
                  final_tm_cutoff) — the opportunity passes unused; next: {}",
                 snapshot.slot,

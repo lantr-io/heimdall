@@ -117,7 +117,7 @@ pub async fn dkg_phase(
             let pkg_bytes = package
                 .serialize()
                 .map_err(|e| EpochError::Frost(format!("round1 pkg serialize: {e}")))?;
-            crate::epoch_log!(
+            crate::epoch_debug!(
                 me,
                 epoch,
                 "  -> round1 package built ({} bytes): {}",
@@ -126,7 +126,7 @@ pub async fn dkg_phase(
             );
 
             peers.publish_dkg_round1(ns, me, &package).await?;
-            crate::epoch_log!(me, epoch, "  -> round1 package published to local server");
+            crate::epoch_debug!(me, epoch, "  -> round1 package published to local server");
 
             collected.round1_mine = Some(secret);
             collected.round1_peers.insert(me, package);
@@ -145,7 +145,7 @@ pub async fn dkg_phase(
                     &mut equiv_rng,
                 )
                 .map_err(|e| EpochError::Frost(format!("dkg_part1 (equivocation): {e}")))?;
-                crate::epoch_log!(
+                crate::epoch_warn!(
                     me,
                     epoch,
                     "  ⚠ INJECT: equivocating round1 — scheduling a SECOND conflicting package"
@@ -214,7 +214,7 @@ pub async fn dkg_phase(
                 let got = match pkg.commitment().serialize() {
                     Ok(c) => c.len(),
                     Err(e) => {
-                        crate::epoch_log!(
+                        crate::epoch_warn!(
                             me,
                             ctx.epoch,
                             "  dropping round1 from {}: commitment will not serialize ({e})",
@@ -225,7 +225,7 @@ pub async fn dkg_phase(
                 };
                 let keep = got == expected_commitments;
                 if !keep {
-                    crate::epoch_log!(
+                    crate::epoch_warn!(
                         me,
                         ctx.epoch,
                         "  dropping round1 from {}: {got} commitments, we expect {expected_commitments} \
@@ -254,7 +254,7 @@ pub async fn dkg_phase(
                 })
             } else {
                 let absent: Vec<_> = eligible.difference(&l1).map(|id| id_short(*id)).collect();
-                crate::epoch_log!(
+                crate::epoch_warn!(
                     me,
                     epoch,
                     "  round1 incomplete at deadline: {}/{} published; missing/faulty: {:?}",
@@ -299,7 +299,7 @@ pub async fn dkg_phase(
                 round2_packages.len()
             );
             for peer_id in round2_packages.keys() {
-                crate::epoch_log!(
+                crate::epoch_debug!(
                     me,
                     epoch,
                     "     - share addressed to spo={}",
@@ -334,7 +334,7 @@ pub async fn dkg_phase(
             peers
                 .publish_dkg_round2(ns, me, &my_commitments, &recipients)
                 .await?;
-            crate::epoch_log!(me, epoch, "  -> round2 packages published");
+            crate::epoch_debug!(me, epoch, "  -> round2 packages published");
 
             collected.round2_mine = Some(round2_secret);
 
@@ -384,7 +384,7 @@ pub async fn dkg_phase(
                 })
             } else {
                 let absent: Vec<_> = eligible.difference(&q).map(|id| id_short(*id)).collect();
-                crate::epoch_log!(
+                crate::epoch_warn!(
                     me,
                     epoch,
                     "  round2 incomplete at deadline: {}/{} qualified; missing/faulty: {:?}",
@@ -476,16 +476,16 @@ pub async fn dkg_phase(
                 )
                 .and_then(|s| crate::epoch::persist::write_dkg_state(dir, &s))
                 {
-                    Ok(()) => crate::epoch_log!(
+                    Ok(()) => crate::epoch_debug!(
                         me,
                         epoch,
                         "  -> DKG state persisted to {}",
                         crate::epoch::persist::dkg_state_path(dir, epoch).display()
                     ),
-                    Err(e) => crate::epoch_log!(
+                    Err(e) => crate::epoch_warn!(
                         me,
                         epoch,
-                        "  WARNING: could not persist DKG state ({e}); share is in memory only \
+                        "  could not persist DKG state ({e}); share is in memory only \
                          and will not survive a restart this epoch"
                     ),
                 }
@@ -562,7 +562,7 @@ fn rerun_or_abort(
     why: &str,
 ) -> EpochResult<EpochPhase> {
     let evidence = DkgExclusionEvidence::from_round(ctx, round, survivors);
-    crate::epoch_log!(
+    crate::epoch_warn!(
         me,
         ctx.epoch,
         "  DKG exclusions (attempt {}, {:?}): excluded [{}]",
@@ -721,7 +721,7 @@ async fn publish_detected_fault(
     peer: SpoInfo,
     fault: DkgFaultEvidence,
 ) -> EpochResult<()> {
-    crate::epoch_log!(
+    crate::epoch_warn!(
         me,
         epoch,
         "  -> publishing DKG fault: kind={} accused={} spo={}",
@@ -839,7 +839,7 @@ async fn poll_dkg_round1(
                 continue;
             }
             if let Some(pkg) = peers.fetch_dkg_round1(ns, peer).await? {
-                crate::epoch_log!(
+                crate::epoch_debug!(
                     me,
                     ns.epoch,
                     "     received round1 package from spo={} ({}/{})",
@@ -908,7 +908,7 @@ async fn poll_dkg_round2(
                 .fetch_dkg_round2(ns, peer, me, &sender_commitments)
                 .await?
             {
-                crate::epoch_log!(
+                crate::epoch_debug!(
                     me,
                     ns.epoch,
                     "     received round2 share from spo={} ({}/{})",

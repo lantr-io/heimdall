@@ -29,6 +29,7 @@ use crate::cardano::dkg_roster::ChainView;
 use crate::epoch::state::{EpochError, EpochResult, SpoInfo};
 use crate::epoch::traits::{DkgFaultEvidence, PeerNetwork};
 use crate::frost::identifier_u16;
+use tracing::{error, info, warn};
 
 /// Wall-clock bound past which a persistent chain-view disagreement with one
 /// peer is flagged (the reconcile design's "impossible-case" tripwire). Under
@@ -141,7 +142,7 @@ impl HttpPeerNetwork {
         };
         if peer.digest == own.digest {
             if v.divergence_since.remove(peer_pool_id).is_some() {
-                eprintln!(
+                info!(
                     "[chain-view] peer {} reconciled to our view (n={})",
                     hex::encode(peer_pool_id),
                     own.n
@@ -153,7 +154,7 @@ impl HttpPeerNetwork {
         // Genuine cross-view disagreement.
         let older = own.read_time_ms < peer.read_time_ms;
         if !v.divergence_since.contains_key(peer_pool_id) {
-            eprintln!(
+            warn!(
                 "[chain-view] disagreement with peer {}: mine=(n={} digest={} read_time_ms={}) \
                  theirs=(n={} digest={} read_time_ms={}) — we are the {} side",
                 hex::encode(peer_pool_id),
@@ -174,7 +175,7 @@ impl HttpPeerNetwork {
         } else if let Some(since) = v.divergence_since.get(peer_pool_id) {
             let elapsed = since.elapsed();
             if elapsed >= DIVERGENCE_ALARM {
-                eprintln!(
+                error!(
                     "DIVERGENCE: peer {} differs for >{}s — two honest nodes on one chain must \
                      reconcile once the event settles; this tripwire should never fire",
                     hex::encode(peer_pool_id),
@@ -202,7 +203,7 @@ impl HttpPeerNetwork {
         let mut ev = self.evidence.lock().expect("evidence mutex");
         match ev.get_mut(&key) {
             Some(prev) if prev.first.as_slice() != bytes => {
-                eprintln!(
+                error!(
                     "EQUIVOCATION: peer {} published two distinct payloads for \
                      (epoch={}, threshold={}, attempt={}, round={:?})",
                     hex::encode(peer_pool_id),
@@ -603,7 +604,7 @@ impl PeerNetwork for HttpPeerNetwork {
             Err(e) => {
                 // Invalid payload: drop it (evidence already retained) and keep
                 // polling — the deadline, not a single bad fetch, bounds liveness.
-                eprintln!(
+                warn!(
                     "dropping invalid round1 from {}: {e}",
                     hex::encode(&peer.pool_id)
                 );
@@ -655,7 +656,7 @@ impl PeerNetwork for HttpPeerNetwork {
         ) {
             Ok(pkg) => Ok(Some(pkg)),
             Err(e) => {
-                eprintln!(
+                warn!(
                     "dropping invalid round2 from {}: {e}",
                     hex::encode(&peer.pool_id)
                 );
@@ -730,7 +731,7 @@ impl PeerNetwork for HttpPeerNetwork {
             // fetch. The log names the pool, which is what makes a signing fault
             // attributable at all.
             Err(e) => {
-                eprintln!(
+                warn!(
                     "dropping unauthenticated sign round1 from {}: {e}",
                     hex::encode(&peer.pool_id)
                 );
@@ -765,7 +766,7 @@ impl PeerNetwork for HttpPeerNetwork {
         ) {
             Ok(share) => Ok(Some(share)),
             Err(e) => {
-                eprintln!(
+                warn!(
                     "dropping unauthenticated sign round2 from {}: {e}",
                     hex::encode(&peer.pool_id)
                 );

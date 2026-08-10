@@ -10,6 +10,7 @@
 
 use std::future::Future;
 use std::time::Duration;
+use tracing::warn;
 
 /// Default backoff schedule (attempts = delays + 1). Epoch-scale timing
 /// tolerates seconds of latency.
@@ -33,7 +34,7 @@ where
         match op().await {
             Err(e) if is_transient(&e) => match delays.next() {
                 Some(delay) => {
-                    eprintln!("[{label}] transient failure: {e} — retrying in {delay:?}");
+                    warn!("[{label}] transient failure: {e} — retrying in {delay:?}");
                     tokio::time::sleep(*delay).await;
                 }
                 None => return Err(e),

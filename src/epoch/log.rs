@@ -1,9 +1,18 @@
-//! Tiny helpers for the granular `eprintln!` traces in `dkg.rs`,
-//! `signing.rs`, and `machine.rs`.
+//! The state machine's trace macros.
 //!
-//! The state machine logs to stderr in a deliberate, line-based format
-//! so a developer running `heimdall demo` in three terminals can follow
-//! the DKG / signing protocol step by step.
+//! `dkg.rs`, `signing.rs`, `machine.rs` and `rotation.rs` narrate the protocol
+//! through these, in a deliberate line-based format so a developer running
+//! `heimdall demo` in three terminals can follow DKG and signing step by step.
+//!
+//! Each line carries `[spo=N epoch=E]` so interleaved output from concurrent
+//! SPOs stays attributable. That prefix stays in the message text rather than
+//! becoming a tracing field: it is what makes the three-terminal view scannable,
+//! and fields render *after* the message.
+//!
+//! The four variants exist so severity survives the trip to journald — see
+//! [`crate::logging`]. Use `epoch_log!` for protocol progress, `epoch_debug!`
+//! for per-peer and per-packet detail, `epoch_warn!` when the node degrades or
+//! drops something, `epoch_error!` when it gives up.
 
 use frost_secp256k1_tr::Identifier;
 
@@ -29,13 +38,51 @@ pub fn short_hex(data: &[u8], take: usize) -> String {
     }
 }
 
-/// Standard log line prefix used by every state-machine trace print.
-/// Includes this SPO's pool index and the epoch number so concurrent
-/// SPOs are distinguishable in interleaved output.
+/// Protocol progress: the steps an operator expects to see on a healthy node.
 #[macro_export]
 macro_rules! epoch_log {
     ($me:expr, $epoch:expr, $($arg:tt)*) => {{
-        eprintln!(
+        ::tracing::info!(
+            "[spo={} epoch={}] {}",
+            $crate::epoch::log::id_short($me),
+            $epoch,
+            format_args!($($arg)*)
+        );
+    }};
+}
+
+/// Per-peer, per-packet and per-input detail. Off by default.
+#[macro_export]
+macro_rules! epoch_debug {
+    ($me:expr, $epoch:expr, $($arg:tt)*) => {{
+        ::tracing::debug!(
+            "[spo={} epoch={}] {}",
+            $crate::epoch::log::id_short($me),
+            $epoch,
+            format_args!($($arg)*)
+        );
+    }};
+}
+
+/// The node degraded, dropped a peer's contribution, or fell back to a weaker
+/// guarantee — it is still running, but an operator should know.
+#[macro_export]
+macro_rules! epoch_warn {
+    ($me:expr, $epoch:expr, $($arg:tt)*) => {{
+        ::tracing::warn!(
+            "[spo={} epoch={}] {}",
+            $crate::epoch::log::id_short($me),
+            $epoch,
+            format_args!($($arg)*)
+        );
+    }};
+}
+
+/// The node could not do what it set out to do.
+#[macro_export]
+macro_rules! epoch_error {
+    ($me:expr, $epoch:expr, $($arg:tt)*) => {{
+        ::tracing::error!(
             "[spo={} epoch={}] {}",
             $crate::epoch::log::id_short($me),
             $epoch,

@@ -60,6 +60,7 @@ use crate::epoch::state::{EpochError, EpochResult, Roster};
 use crate::epoch::traits::{
     BatchSnapshot, CardanoChain, EpochBoundaryEvent, PegOutRequestUtxo, TreasuryUtxo,
 };
+use tracing::{debug, info, warn};
 
 const FAULT_TOKEN_CONFIRM_POLL_SECS: u64 = 5;
 const FAULT_TOKEN_CONFIRM_TIMEOUT_SECS: u64 = 300;
@@ -586,13 +587,13 @@ impl BlockfrostCardanoChain {
             .await
             {
                 Ok(Some(block_time)) => {
-                    eprintln!(
+                    info!(
                         "[submit] Cardano oracle-update confirmed: tx_hash={tx_hash} block_time={block_time}"
                     );
                     return Ok(());
                 }
                 Ok(None) if started.elapsed() < timeout => {
-                    eprintln!("[submit] Cardano tx {tx_hash} pending; polling again in {poll:?}");
+                    debug!("[submit] Cardano tx {tx_hash} pending; polling again in {poll:?}");
                     tokio::time::sleep(poll).await;
                 }
                 Ok(None) => {
@@ -835,7 +836,7 @@ impl BlockfrostCardanoChain {
     async fn submit_cardano_tx(&self, label: &str, signed_tx_hex: &str) -> EpochResult<String> {
         let cbor = hex::decode(signed_tx_hex)
             .map_err(|e| EpochError::Chain(format!("{label} tx hex decode: {e}")))?;
-        eprintln!(
+        info!(
             "[fault-ban] submitting {label} tx ({} bytes CBOR) via Blockfrost",
             cbor.len()
         );
@@ -844,7 +845,7 @@ impl BlockfrostCardanoChain {
             .transactions_submit(cbor)
             .await
             .map_err(|e| EpochError::Chain(format!("{label} blockfrost tx submit: {e}")))?;
-        eprintln!("[fault-ban] submitted {label}: tx_hash={tx_hash}");
+        info!("[fault-ban] submitted {label}: tx_hash={tx_hash}");
         Ok(tx_hash)
     }
 
@@ -900,7 +901,7 @@ impl BlockfrostCardanoChain {
         let network = crate::cardano::tx_common::network_from_address(wallet_addr);
         let mainnet = matches!(network, pallas_addresses::Network::Mainnet);
 
-        eprintln!(
+        info!(
             "[fault-ban] preparing DKG fault proof using Bifrost blueprint {}",
             flow.blueprint_path
         );
@@ -1021,7 +1022,7 @@ impl BlockfrostCardanoChain {
             },
         )
         .map_err(|e| EpochError::Chain(format!("build fault-proof mint tx: {e}")))?;
-        eprintln!(
+        info!(
             "[fault-ban] built FaultProof mint: policy={} token_name={}",
             mint.policy_id_hex,
             hex::encode(mint.token_name)
@@ -1087,7 +1088,7 @@ impl BlockfrostCardanoChain {
             },
         )
         .map_err(|e| EpochError::Chain(format!("build apply-ban tx: {e}")))?;
-        eprintln!(
+        info!(
             "[fault-ban] built ApplyBan: first_ban={} counter={} until={}",
             apply.first_ban, apply.ban_node.ban_counter, apply.ban_node.ban_until_time
         );
@@ -1248,7 +1249,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             // An unreadable in-flight movement could be spending this outpoint; be
             // conservative and treat it as not-yet-free.
             let btc_confirmed = !in_flight_spends.contains(&cfg_out) && opaque_unconfirmed == 0;
-            eprintln!(
+            info!(
                 "[blockfrost] no Confirmed TM yet — treasury = config anchor {cfg_out} \
                  ({sat} sat, btc_confirmed={btc_confirmed})"
             );
@@ -1315,7 +1316,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         };
         let btc_confirmed =
             !own_pending && !in_flight_spends.contains(&outpoint) && opaque_unconfirmed == 0;
-        eprintln!(
+        info!(
             "[blockfrost] treasury tip {}:{} = {} sat ({} confirmed TM(s), in_flight={}, btc_confirmed={})",
             outpoint.txid,
             outpoint.vout,
@@ -1346,7 +1347,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         new_y_51: bitcoin::key::UntweakedPublicKey,
     ) -> EpochResult<Option<crate::epoch::traits::UpdateYPlan>> {
         let Some(registry) = &self.registry_roster else {
-            eprintln!(
+            warn!(
                 "[update-y] no treasury_info configured (cardano.registry_blueprint / \
                  registry_bootstrap / treasury_info_asset_name) — the derived group key stays \
                  LOCAL to this node and the treasury is NOT handed over"
@@ -1364,7 +1365,7 @@ impl CardanoChain for BlockfrostCardanoChain {
                     ))
                 })?;
         if current_key == new_y_51 {
-            eprintln!(
+            info!(
                 "[update-y] treasury_info already names {} — nothing to rotate",
                 hex::encode(new_y_51.serialize())
             );
@@ -1464,7 +1465,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             .transactions_submit(cbor)
             .await
             .map_err(|e| EpochError::Chain(format!("update-y blockfrost tx submit: {e}")))?;
-        eprintln!(
+        info!(
             "[update-y] rotated treasury_info {} -> {} (cardano tx {tx_id})",
             hex::encode(plan.current_key.serialize()),
             hex::encode(plan.new_key.serialize())
@@ -1509,8 +1510,8 @@ impl CardanoChain for BlockfrostCardanoChain {
     /// until its own cancel deadline), never over-payment.
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>> {
         let Some(src) = &self.pegout_source else {
-            eprintln!(
-                "[pegout] WARNING: no cardano.pegout_script_address / cardano.bridged_token_unit \
+            warn!(
+                "[pegout] no cardano.pegout_script_address / cardano.bridged_token_unit \
                  — this TM pays NO peg-out; every pending withdrawal waits for a later batch"
             );
             return Ok(vec![]);
@@ -1529,8 +1530,8 @@ impl CardanoChain for BlockfrostCardanoChain {
         .map_err(|e| EpochError::Chain(format!("fetch_pegout_requests: {e}")))?;
 
         if scan.malformed > 0 {
-            eprintln!(
-                "[pegout] WARNING: {} UTxO(s) at {} carry the bridged token but no decodable \
+            warn!(
+                "[pegout] {} UTxO(s) at {} carry the bridged token but no decodable \
                  PegOutDatum — they are NOT payable by any TM and are absent from the open count \
                  below; their owners can still Cancel",
                 scan.malformed, src.address,
@@ -1636,7 +1637,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         tx_bytes: &[u8],
         fulfilled_por_outpoints: &[[u8; 36]],
     ) -> EpochResult<()> {
-        eprintln!(
+        info!(
             "[submit] signed BTC tx: {} bytes, hex: {}",
             tx_bytes.len(),
             hex::encode(tx_bytes)
@@ -1646,12 +1647,12 @@ impl CardanoChain for BlockfrostCardanoChain {
         if self.submit_btc {
             match &self.btc_rpc {
                 Some(rpc) => broadcast_btc_tx(rpc, tx_bytes).await?,
-                None => eprintln!(
+                None => warn!(
                     "[submit] bitcoin.submit=true but rpc_url not set — skipping BTC broadcast"
                 ),
             }
         } else {
-            eprintln!("[submit] bitcoin.submit=false — skipping BTC broadcast");
+            info!("[submit] bitcoin.submit=false — skipping BTC broadcast");
         }
 
         // Track our in-flight TM: query_treasury reports btc_confirmed=false until this
@@ -1663,14 +1664,14 @@ impl CardanoChain for BlockfrostCardanoChain {
 
         // Publish the oracle update to Cardano if enabled.
         if !self.submit_oracle {
-            eprintln!("[submit] cardano.submit_oracle=false — skipping Cardano oracle publish");
+            info!("[submit] cardano.submit_oracle=false — skipping Cardano oracle publish");
             return Ok(());
         }
 
         let key = match &self.payment_key {
             Some(k) => k,
             None => {
-                eprintln!(
+                warn!(
                     "[submit] no mnemonic configured — skipping Cardano oracle publish (dry run)"
                 );
                 return Ok(());
@@ -1682,7 +1683,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             .as_deref()
             .ok_or_else(|| EpochError::Chain("no wallet base address".into()))?;
 
-        eprintln!("[submit] querying wallet UTxOs at {wallet_addr}");
+        debug!("[submit] querying wallet UTxOs at {wallet_addr}");
         let wallet_utxos = self.query_wallet_utxos().await?;
         if wallet_utxos.is_empty() {
             return Err(EpochError::Chain(format!(
@@ -1691,12 +1692,12 @@ impl CardanoChain for BlockfrostCardanoChain {
         }
 
         let total_lovelace: u64 = wallet_utxos.iter().map(|u| u.lovelace).sum();
-        eprintln!(
+        debug!(
             "[submit] wallet: {} UTxO(s), {} lovelace total",
             wallet_utxos.len(),
             total_lovelace,
         );
-        eprintln!(
+        debug!(
             "[submit] building Cardano oracle-update tx: treasury={} constructor={} policy={}",
             self.treasury_address, self.oracle_constructor, self.treasury_policy_id
         );
@@ -1707,7 +1708,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             crate::cardano::bf_http::fetch_cost_models(&self.bf_base_url, &self.bf_project_id)
                 .await
                 .map_err(|e| EpochError::Chain(format!("fetch cost models: {e}")))?;
-        eprintln!(
+        debug!(
             "[submit] live cost models: V1={} V2={} V3={} params",
             cost_models[0].len(),
             cost_models[1].len(),
@@ -1770,7 +1771,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         let cardano_tx_cbor = hex::decode(&signed_tx_hex)
             .map_err(|e| EpochError::Chain(format!("tx hex decode: {e}")))?;
 
-        eprintln!(
+        info!(
             "[submit] submitting Cardano oracle-update tx ({} bytes CBOR) via Blockfrost",
             cardano_tx_cbor.len()
         );
@@ -1781,7 +1782,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             .await
             .map_err(|e| EpochError::Chain(format!("blockfrost tx submit: {e}")))?;
 
-        eprintln!("[submit] Cardano oracle-update submitted: tx_hash={tx_hash}");
+        info!("[submit] Cardano oracle-update submitted: tx_hash={tx_hash}");
 
         self.wait_for_cardano_confirmation(&tx_hash).await?;
 
@@ -1880,7 +1881,7 @@ pub async fn scan_tm_utxos(
         let datum_cbor = match hex::decode(datum_hex) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("[tm-scan] marker-token TM datum failed hex decode: {e}");
+                warn!("[tm-scan] marker-token TM datum failed hex decode: {e}");
                 parse_failures += 1;
                 continue;
             }
@@ -1888,7 +1889,7 @@ pub async fn scan_tm_utxos(
         let datum: PlutusData = match minicbor::decode(&datum_cbor) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[tm-scan] marker-token TM datum failed CBOR decode: {e}");
+                warn!("[tm-scan] marker-token TM datum failed CBOR decode: {e}");
                 parse_failures += 1;
                 continue;
             }
@@ -1901,7 +1902,7 @@ pub async fn scan_tm_utxos(
                     unconfirmed.push(tm);
                 }
                 None => {
-                    eprintln!(
+                    warn!(
                         "[tm-scan] Unconfirmed TM datum's BTC tx did not deserialize — \
                          treating as a possible in-flight movement"
                     );
@@ -1909,7 +1910,7 @@ pub async fn scan_tm_utxos(
                 }
             },
             Err(e) => {
-                eprintln!("[tm-scan] marker-token Confirmed TM datum failed to parse: {e}");
+                warn!("[tm-scan] marker-token Confirmed TM datum failed to parse: {e}");
                 parse_failures += 1;
             }
         }
@@ -1933,7 +1934,7 @@ pub async fn scan_tm_utxos(
             match crate::cardano::bf_http::fetch_latest_block_time(base_url, project_id).await {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    eprintln!("[tm-scan] could not read chain time for staleness deadline: {e}");
+                    warn!("[tm-scan] could not read chain time for staleness deadline: {e}");
                     None
                 }
             }
@@ -1958,7 +1959,7 @@ pub async fn scan_tm_utxos(
                     tm.block_time = Some(bt);
                     let age = now.saturating_sub(bt);
                     if age > deadline as i64 {
-                        eprintln!(
+                        warn!(
                             "[tm-scan] Unconfirmed TM {} unconfirmed for {age}s (> {deadline}s \
                              deadline) — treating as dead/stale, ignoring",
                             tm.btc_txid
@@ -1966,7 +1967,7 @@ pub async fn scan_tm_utxos(
                         stale.insert(tm.btc_txid);
                     }
                 }
-                Err(e) => eprintln!(
+                Err(e) => warn!(
                     "[tm-scan] could not read block time for TM {} ({e}) — not applying staleness",
                     tm.btc_txid
                 ),
@@ -2011,7 +2012,7 @@ fn viable_in_flight_spends(
     for tm in unconfirmed {
         let dead = tm.inputs.iter().any(|i| consumed.contains(i));
         if dead {
-            eprintln!(
+            warn!(
                 "[tm-scan] Unconfirmed TM {} spends an already-swept input — dead, ignoring \
                  (will never confirm)",
                 tm.btc_txid

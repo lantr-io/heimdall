@@ -6,6 +6,7 @@ use std::time::Instant;
 use frost::{Identifier, keys::dkg};
 use frost_secp256k1_tr as frost;
 use rayon::prelude::*;
+use tracing::info;
 
 /// Result of a completed DKG for one participant.
 pub struct DkgResult {
@@ -22,7 +23,7 @@ fn run_part1(
     BTreeMap<Identifier, dkg::round1::SecretPackage>,
     BTreeMap<Identifier, dkg::round1::Package>,
 ) {
-    println!(
+    info!(
         "    part1: each SPO generates a random polynomial and publishes commitments + proof-of-knowledge"
     );
     let t0 = Instant::now();
@@ -64,7 +65,7 @@ fn run_part1(
         secrets.insert(id, secret);
         packages.insert(id, package);
     }
-    println!(
+    info!(
         "    part1: {}/{} done ({:.2?}) [parallel]",
         max_signers,
         max_signers,
@@ -84,7 +85,7 @@ fn run_part2(
     BTreeMap<Identifier, dkg::round2::SecretPackage>,
     BTreeMap<Identifier, BTreeMap<Identifier, dkg::round2::Package>>,
 ) {
-    println!(
+    info!(
         "    part2: each SPO evaluates their polynomial at every other SPO's index and sends encrypted secret shares"
     );
     let t1 = Instant::now();
@@ -111,7 +112,7 @@ fn run_part2(
 
             let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
             if c % 50 == 0 || c == n {
-                println!("    part2: {}/{} ({:.2?}) [parallel]", c, n, t1.elapsed());
+                info!("    part2: {}/{} ({:.2?}) [parallel]", c, n, t1.elapsed());
             }
 
             (id, secret2, packages2)
@@ -124,7 +125,7 @@ fn run_part2(
         round2_secrets.insert(id, secret2);
         round2_packages.insert(id, packages2);
     }
-    println!("    part2: done ({:.2?}) [parallel]", t1.elapsed());
+    info!("    part2: done ({:.2?}) [parallel]", t1.elapsed());
     (round2_secrets, round2_packages)
 }
 
@@ -146,7 +147,7 @@ pub fn run_dkg_all_completions(min_signers: u16, max_signers: u16) -> FullDkgRes
         run_part2(&identifiers, round1_secrets, &round1_packages, max_signers);
 
     // Part 3: parallel for all participants
-    println!(
+    info!(
         "    part3: each SPO verifies all received shares against published commitments (Feldman VSS), derives combined signing share and group public key"
     );
     let t2 = Instant::now();
@@ -178,7 +179,7 @@ pub fn run_dkg_all_completions(min_signers: u16, max_signers: u16) -> FullDkgRes
 
             let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
             if c % 50 == 0 || c == n {
-                println!("    part3: {}/{} ({:.2?}) [parallel]", c, n, t2.elapsed());
+                info!("    part3: {}/{} ({:.2?}) [parallel]", c, n, t2.elapsed());
             }
 
             (id, key_package, public_key_package)
@@ -191,7 +192,7 @@ pub fn run_dkg_all_completions(min_signers: u16, max_signers: u16) -> FullDkgRes
         key_packages.insert(id, kp);
         last_pubkey_pkg = Some(pkp);
     }
-    println!("    part3: done ({:.2?}) [parallel]", t2.elapsed());
+    info!("    part3: done ({:.2?}) [parallel]", t2.elapsed());
 
     FullDkgResult {
         key_packages,
@@ -307,7 +308,7 @@ pub fn run_dkg_single_completion(
         &round2_for_me,
     )
     .unwrap();
-    println!("    part3 for SPO #{complete_for}: ({:.2?})", t2.elapsed());
+    info!("    part3 for SPO #{complete_for}: ({:.2?})", t2.elapsed());
 
     (
         DkgResult {
@@ -344,7 +345,7 @@ pub fn run_cheating_dkg(
     let victim_id = Identifier::try_from(victim_idx).unwrap();
 
     // Tamper: generate fresh polynomial for cheater, swap the share to victim
-    println!("    Tampering with SPO #{cheater_idx}'s share to SPO #{victim_idx}...");
+    info!("    Tampering with SPO #{cheater_idx}'s share to SPO #{victim_idx}...");
     let mut rng = rand::thread_rng();
     let (fake_secret, _) = dkg::part1(cheater_id, max_signers, min_signers, &mut rng).unwrap();
     let fake_others: BTreeMap<_, _> = round1_packages

@@ -115,7 +115,7 @@ pub async fn sign_phase(
                 peers
                     .publish_sign_round1(input_namespace(epoch, &tm, i), me, commitments)
                     .await?;
-                crate::epoch_log!(me, epoch, "  -> published commitments for input {i}");
+                crate::epoch_debug!(me, epoch, "  -> published commitments for input {i}");
             }
 
             // Poll peers for round 1 commitments on every input.
@@ -174,7 +174,7 @@ pub async fn sign_phase(
                 let signing_package = frost::SigningPackage::new(commitments, &sighash);
                 let merkle = tm.merkle_root_bytes(i as usize);
                 let merkle_ref = merkle.as_deref();
-                crate::epoch_log!(
+                crate::epoch_debug!(
                     me,
                     epoch,
                     "  input {i}: sighash={} merkle_root={}",
@@ -192,13 +192,13 @@ pub async fn sign_phase(
                     merkle_ref,
                 )
                 .map_err(|e| EpochError::Frost(format!("sign_round2_with_tweak: {e}")))?;
-                crate::epoch_log!(me, epoch, "    -> built tweaked signature share");
+                crate::epoch_debug!(me, epoch, "    -> built tweaked signature share");
 
                 collected.round2.entry(i).or_default().insert(me, share);
 
                 let ns = input_namespace(epoch, &tm, i);
                 peers.publish_sign_round2(ns, me, share).await?;
-                crate::epoch_log!(me, epoch, "    -> published share for input {i}");
+                crate::epoch_debug!(me, epoch, "    -> published share for input {i}");
 
                 // Poll peers.
                 let peer_infos = roster.peers_of(me);
@@ -222,7 +222,7 @@ pub async fn sign_phase(
                 let sig_bytes = signature
                     .serialize()
                     .map_err(|e| EpochError::Frost(format!("sig serialize: {e}")))?;
-                crate::epoch_log!(
+                crate::epoch_debug!(
                     me,
                     epoch,
                     "    <- aggregated input {i} signature: {}",
@@ -373,7 +373,7 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                 continue;
             }
             if let Some(value) = T::fetch(peers, ns, peer).await? {
-                crate::epoch_log!(
+                crate::epoch_debug!(
                     me,
                     ns.epoch,
                     "     received round{} for {} from spo={} ({}/{})",

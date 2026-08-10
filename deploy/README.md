@@ -224,6 +224,34 @@ ssh root@dev.lantr.io 'journalctl -fu heimdall-mover -o cat'
 Each tick prints a `═══ auto-mover tick #N ═══` banner and the treasury scan / peg-in / peg-out
 collection results. Ticks that find nothing pending (or a movement already in flight) skip.
 
+Everything the daemon says carries a level, and journald files it at the matching syslog
+priority — so the two questions worth asking have direct answers:
+
+```bash
+journalctl -u heimdall-mover -p err      # did anything fail?
+journalctl -u heimdall-mover -p warning  # ...and what degraded before it did?
+```
+
+That works because heimdall prefixes each line with `<N>` when systemd is capturing its stdout
+(it detects `JOURNAL_STREAM`); without the prefix systemd files *both* stdout and stderr at
+priority 6, and `-p err` finds nothing on a broken node. Nothing in the unit configures this.
+
+To turn up the detail on a running node, without a rebuild and without editing the config:
+
+```bash
+systemctl edit heimdall-mover     # [Service] Environment=RUST_LOG=debug
+systemctl restart heimdall-mover
+```
+
+A bare level is scoped to heimdall and leaves reqwest/hyper at `warn`; pass a full directive
+(`RUST_LOG=warn,heimdall::cardano::blockfrost_chain=debug`) to aim at one module. `--log-format
+json` emits one object per event for a shipper. Interactively, `heimdall --log-level debug …`
+does the same thing for a single run.
+
+Note what is *not* a log: `show-treasury`, `show-roster`, `show-config-params` and the signed-tx
+output of the one-shot commands are reports printed on stdout, untimestamped and never silenced
+by a log level, so they stay parseable by a script.
+
 ## Notes
 
 - **Config is secret.** `heimdall-bip322.toml` holds the Blockfrost project id and the wallet
