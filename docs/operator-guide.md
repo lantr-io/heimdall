@@ -108,9 +108,13 @@ that has already paid peg-outs the node would treat them as unpaid.
 
 **About the bridge.** Copy these from the bridge's deployment notes. The Config UTxO is the
 discovery root — `config_address`, `config_nft_policy_id` and `config_nft_asset_name` are what let
-the daemon find the bridge's operational parameters and its batch schedule. Without all three it
-falls back to a wall-clock cadence that does **not** agree with the other SPOs, so step 4 refuses
-to start without them.
+the daemon find the bridge's operational parameters and its batch schedule.
+
+**The daemon will not start without them.** Step 3 of the next check is a hard failure, not a
+warning. That is deliberate: a node that cannot see the batch grid would fall back to a wall-clock
+cadence, and two SPOs ticking on wall clocks scan different chain states and build different
+Treasury Movement bytes — so no co-signer can reproduce them. Refusing to start is the only safe
+behaviour, and it is why these three cannot be left blank.
 
 **[will be removed — WI-055, WI-056]** Most of the remaining ~20 values (`pegin_script_address`,
 `pegout_script_address`, `bridged_token_unit`, the treasury and registry identifiers) are things
