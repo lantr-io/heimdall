@@ -248,9 +248,22 @@ impl BitcoinConfig {
 #[serde(default)]
 pub struct CardanoConfig {
     pub blockfrost_project_id: Option<String>,
-    /// Custom Blockfrost-compatible API base URL (e.g. yaci-devkit's
-    /// http://localhost:8080/api/v1). None → public blockfrost.io.
+    /// Custom Blockfrost-compatible API base URL — a local Dolos or a
+    /// yaci-devkit devnet (`http://localhost:8080/api/v1`). None → public
+    /// blockfrost.io.
+    ///
+    /// The intended production shape is heimdall → Dolos → your own node, so
+    /// an SPO's bridge duties do not depend on a third-party API. Setting
+    /// this makes [`CardanoConfig::network`] mandatory: see
+    /// [`CardanoConfig::is_mainnet`].
     pub blockfrost_url: Option<String>,
+    /// Which Cardano network this node is on: `"mainnet"`, `"preprod"`,
+    /// `"preview"` or `"testnet"`.
+    ///
+    /// Optional only when talking to hosted blockfrost.io, where the
+    /// project-id prefix already identifies the network. Required alongside
+    /// [`CardanoConfig::blockfrost_url`] — see [`CardanoConfig::is_mainnet`].
+    pub network: Option<String>,
     /// Kupo base URL, e.g. `http://localhost:1442`. OPTIONAL.
     ///
     /// Used ONLY to rebuild the completed-peg-outs trie from chain history
@@ -398,6 +411,7 @@ impl Default for CardanoConfig {
         Self {
             blockfrost_project_id: None,
             blockfrost_url: None,
+            network: None,
             kupo_url: None,
             cpo_policy_id: None,
             socket_path: None,
@@ -438,6 +452,46 @@ impl Default for CardanoConfig {
 }
 
 impl CardanoConfig {
+    /// Whether this node is on Cardano mainnet.
+    ///
+    /// Explicit `cardano.network` is authoritative. Without it the network is
+    /// inferred from the Blockfrost project-id prefix — which identifies the
+    /// network only because a hosted blockfrost.io key encodes it.
+    ///
+    /// That inference breaks against a local Blockfrost-compatible backend
+    /// (Dolos, yaci-devkit), where the project id is a placeholder the backend
+    /// may ignore entirely. Inferring there would silently answer "testnet" on
+    /// a mainnet node: every derived script address would carry a testnet
+    /// bech32 prefix, and the fault-proof SRS gate would fail open. So when
+    /// `cardano.blockfrost_url` is set, `cardano.network` is required rather
+    /// than guessed.
+    pub fn is_mainnet(&self) -> Result<bool, String> {
+        if let Some(network) = self.network.as_deref() {
+            return match network {
+                "mainnet" => Ok(true),
+                "preprod" | "preview" | "testnet" => Ok(false),
+                other => Err(format!(
+                    "unknown cardano.network {other:?} — expected \"mainnet\", \
+                     \"preprod\", \"preview\" or \"testnet\""
+                )),
+            };
+        }
+        if self.blockfrost_url.is_some() {
+            return Err(
+                "cardano.network is required when cardano.blockfrost_url is set: the \
+                 project-id prefix identifies the network only for hosted blockfrost.io, \
+                 and a local backend (Dolos, yaci-devkit) may ignore the project id \
+                 entirely. Set cardano.network = \"mainnet\" | \"preprod\" | \"preview\" \
+                 | \"testnet\"."
+                    .to_string(),
+            );
+        }
+        Ok(self
+            .blockfrost_project_id
+            .as_deref()
+            .is_some_and(|p| p.starts_with("mainnet")))
+    }
+
     /// The TM NFT policy id (28 bytes) = the binocular `TreasuryMovementValidator`
     /// script hash. It is the **2nd parameter** of the `treasury_info` validator
     /// (N10b: `treasury.ak::FederationReset` authenticates the referenced Confirmed
@@ -704,6 +758,40 @@ fee_rate_sat_per_vb = 5
         assert_eq!(cfg.bitcoin.fee_rate_sat_per_vb, 5);
         // Other bitcoin fields keep defaults.
         assert_eq!(cfg.bitcoin.per_pegout_fee_sat, 1000);
+    }
+
+    #[test]
+    fn cardano_network_explicit_wins_and_is_required_with_a_custom_backend() {
+        // Hosted blockfrost.io: the project-id prefix still decides.
+        let mut cfg = CardanoConfig {
+            blockfrost_project_id: Some("mainnetAbC123".to_string()),
+            ..Default::default()
+        };
+        assert!(cfg.is_mainnet().expect("prefix inference"));
+        cfg.blockfrost_project_id = Some("preprodAbC123".to_string());
+        assert!(!cfg.is_mainnet().expect("prefix inference"));
+
+        // An explicit network overrides a misleading prefix.
+        cfg.network = Some("mainnet".to_string());
+        assert!(cfg.is_mainnet().expect("explicit network"));
+
+        // A local Dolos / yaci backend must not be guessed at: without an
+        // explicit network this is the case that would silently answer
+        // "testnet" on a mainnet node.
+        let mut local = CardanoConfig {
+            blockfrost_project_id: Some("dolos".to_string()),
+            blockfrost_url: Some("http://localhost:3000/api/v0".to_string()),
+            ..Default::default()
+        };
+        let err = local.is_mainnet().expect_err("must refuse to guess");
+        assert!(err.contains("cardano.network is required"), "{err}");
+
+        local.network = Some("mainnet".to_string());
+        assert!(local.is_mainnet().expect("explicit network"));
+
+        local.network = Some("nonsense".to_string());
+        let err = local.is_mainnet().expect_err("unknown network");
+        assert!(err.contains("unknown cardano.network"), "{err}");
     }
 
     #[test]

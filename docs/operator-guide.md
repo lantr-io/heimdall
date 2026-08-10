@@ -135,6 +135,44 @@ seed out of the file dpkg tracks and diffs on upgrade.
 The Blockfrost project id is also a credential. It lives in the TOML, which is why the package
 installs that file `0640 root:heimdall` rather than world-readable.
 
+### Running next to your own node
+
+You already run a Cardano node. Heimdall should read from *it*, not from a third-party API — the
+bridge's safety rests on what each SPO independently observes on chain, and routing that through a
+hosted service makes your bridge duties depend on someone else's uptime, rate limits, and view of
+the chain.
+
+Heimdall speaks the Blockfrost HTTP API, so the way to do this is a Blockfrost-compatible server in
+front of your node. [Dolos](https://github.com/txpipe/dolos) is the one to reach for: a local data
+node that follows your node and serves that API. The shape is:
+
+```
+heimdall  →  Dolos  →  your cardano-node
+```
+
+Point heimdall at it with two keys:
+
+```toml
+[cardano]
+blockfrost_url = "http://localhost:3000/api/v0"   # your Dolos
+network        = "mainnet"                        # or preprod / preview / testnet
+```
+
+`blockfrost_url` covers every call heimdall makes, reads and transaction submission alike.
+`blockfrost_project_id` is still required by the config, but a local backend generally ignores its
+value — put whatever Dolos expects, or a placeholder.
+
+**`network` is mandatory as soon as `blockfrost_url` is set, and heimdall refuses to start
+without it.** Against hosted blockfrost.io the network can be read off the project-id prefix,
+because the key itself encodes it. A local backend has no such prefix to read, so the old inference
+would quietly conclude "testnet" on a mainnet machine — every derived script address would come out
+with a testnet bech32 prefix, and the fault-proof safety gate described in
+[the fault-proof trusted setup](fault-proof-srs.md) would fail open. Refusing to guess is the only
+safe behaviour.
+
+Verify your backend serves what heimdall needs before switching over: step 4 below exercises the
+read paths against whatever you configured, so run it after the change and read every line.
+
 ---
 
 ## 4. Check it before going further
@@ -388,6 +426,9 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 | peers seem not to see you | step 5 — is the registered port open and reachable *from outside*? |
 | `[4/6] verify the contract set FAIL` | your config disagrees with the chain; the check prints both values for each mismatch |
 | a transaction is refused | read the whole message: the min-stake gate and the preflight both refuse loudly rather than submitting something wrong |
+| it refuses to start over `cardano.fault_proof_srs_path` | you have DKG fault enforcement configured on mainnet against a setup that is not trustworthy — see [the fault-proof trusted setup](fault-proof-srs.md) |
 
 For building heimdall or cutting a release, see [CONTRIBUTING.md](../CONTRIBUTING.md). For the
-per-route deployment reference, see [deploy/README.md](../deploy/README.md).
+per-route deployment reference, see [deploy/README.md](../deploy/README.md). If you configure the
+DKG fault verifiers — the packaged config does not, and most operators never will — read
+[the fault-proof trusted setup](fault-proof-srs.md) first.

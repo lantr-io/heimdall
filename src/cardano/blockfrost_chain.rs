@@ -118,6 +118,19 @@ impl DkgFaultBanFlow {
             "fault_verifier_equivocation_ref",
         )?)?;
 
+        // The round 1 / round 2 verifiers are generated from this SRS, so an
+        // untrustworthy setup is a forged-ban vector, not a slow proof. Check
+        // it here rather than at fault time: a mainnet node that could mint
+        // forgeable fault proofs must refuse to start, not discover it months
+        // later when the first fault happens. Costs two small reads — see
+        // `read_srs_header`.
+        let mainnet = cardano.is_mainnet()?;
+        crate::circuits::srs_provenance::check_fault_srs(
+            &srs_path,
+            crate::circuits::fault_evidence::round1_params().degree,
+            mainnet,
+        )?;
+
         let blueprint_json = std::fs::read_to_string(blueprint_path)
             .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
         let (reg_tx_id, reg_index) = crate::cardano::roster::parse_outref(registry_bootstrap)
