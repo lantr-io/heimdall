@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
     env, fs,
+    fs::File,
+    io::BufReader,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -10,6 +12,7 @@ use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
 use halo2_base::halo2_proofs::{
+    SerdeFormat,
     halo2curves::{
         bls12_381::{Bls12, Fr as BlsFr, G1Affine},
         ff::PrimeField,
@@ -17,7 +20,7 @@ use halo2_base::halo2_proofs::{
     },
     plonk::{Circuit, ProvingKey, create_proof, keygen_pk, keygen_vk, verify_proof},
     poly::{
-        commitment::ParamsProver,
+        commitment::{Params, ParamsProver},
         kzg::{
             commitment::{KZGCommitmentScheme, ParamsKZG},
             multiopen::{ProverSHPLONK, VerifierSHPLONK},
@@ -79,6 +82,9 @@ const BENCH_MAX_FAULTS_BEFORE_PERMANENT: i64 = 3;
 const BENCH_MAX_VALIDITY_WINDOW_MS: i64 = 600_000;
 const TARGET_ROOT: &str = "target/dkg_fault_onchain";
 const GENERATE_ONLY_ENV: &str = "DKG_FAULT_ONCHAIN_GENERATE_ONLY";
+/// Path to the KZG SRS the verifiers are generated from. Unset means the
+/// insecure deterministic setup — see [`setup`].
+const SRS_ENV: &str = "DKG_FAULT_SRS";
 const MAX_TX_SIZE_BYTES_ENV: &str = "DKG_FAULT_MAX_TX_SIZE_BYTES";
 const DEFAULT_MAX_TX_SIZE_BYTES: usize = 16_384;
 const TEST_MNEMONIC: &str =
@@ -991,8 +997,61 @@ fn tx_shape(tx_hex: &str) -> TxShape {
     }
 }
 
+/// Load the SRS the verifiers are generated from.
+///
+/// This is the trusted setup: the Aiken verifier this bench emits embeds
+/// `s_g2` and the fixed/permutation column commitments derived from it, so
+/// whoever knows its tau can forge a proof the deployed policy accepts. Set
+/// `DKG_FAULT_SRS` to generate against a real ceremony's parameters.
+///
+/// With it unset the setup is deterministic (`StdRng::seed_from_u64(2)`) and
+/// its tau is recoverable by anyone reading this line — fine for benchmarking
+/// and for a testnet, never for anything holding value. See
+/// `docs/fault-proof-srs.md`.
 fn setup(params: AxiomDkgCircuitParams) -> ParamsKZG<Bls12> {
-    ParamsKZG::<Bls12>::setup(params.degree, StdRng::seed_from_u64(2))
+    let Some(path) = env::var_os(SRS_ENV) else {
+        eprintln!(
+            "{SRS_ENV} unset — generating against the INSECURE deterministic SRS \
+             (seed 2). Verifiers emitted from this run are forgeable and must not \
+             be deployed to mainnet."
+        );
+        return ParamsKZG::<Bls12>::setup(params.degree, StdRng::seed_from_u64(2));
+    };
+
+    let path = PathBuf::from(path);
+    let file =
+        File::open(&path).unwrap_or_else(|e| panic!("open {SRS_ENV}={}: {e}", path.display()));
+    let mut srs =
+        ParamsKZG::<Bls12>::read_custom(&mut BufReader::new(file), SerdeFormat::Processed)
+            .unwrap_or_else(|e| panic!("read {SRS_ENV}={}: {e}", path.display()));
+    assert!(
+        srs.k() >= params.degree,
+        "{SRS_ENV}={} has k={} but this circuit needs k={}",
+        path.display(),
+        srs.k(),
+        params.degree
+    );
+    if srs.k() > params.degree {
+        srs.downsize(params.degree);
+    }
+
+    let header = heimdall::circuits::srs_provenance::read_srs_header(&path)
+        .unwrap_or_else(|e| panic!("inspect {SRS_ENV}: {e}"));
+    if header.is_insecure_seed2() {
+        eprintln!(
+            "{SRS_ENV}={} carries the known-insecure deterministic tau — verifiers \
+             emitted from this run are forgeable and must not be deployed to mainnet.",
+            path.display()
+        );
+    } else {
+        eprintln!(
+            "{SRS_ENV}={} (k={}), s_g2={}",
+            path.display(),
+            header.k,
+            header.s_g2
+        );
+    }
+    srs
 }
 
 fn keygen(

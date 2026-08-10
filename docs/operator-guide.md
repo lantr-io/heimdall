@@ -388,6 +388,9 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 | peers seem not to see you | step 5 — is the registered port open and reachable *from outside*? |
 | `[4/6] verify the contract set FAIL` | your config disagrees with the chain; the check prints both values for each mismatch |
 | a transaction is refused | read the whole message: the min-stake gate and the preflight both refuse loudly rather than submitting something wrong |
+| it refuses to start over `cardano.fault_proof_srs_path` | you have DKG fault enforcement configured on mainnet against a setup that is not trustworthy — see [the fault-proof trusted setup](fault-proof-srs.md) |
 
 For building heimdall or cutting a release, see [CONTRIBUTING.md](../CONTRIBUTING.md). For the
-per-route deployment reference, see [deploy/README.md](../deploy/README.md).
+per-route deployment reference, see [deploy/README.md](../deploy/README.md). If you configure the
+DKG fault verifiers — the packaged config does not, and most operators never will — read
+[the fault-proof trusted setup](fault-proof-srs.md) first.
