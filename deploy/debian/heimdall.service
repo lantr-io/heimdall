@@ -1,0 +1,46 @@
+[Unit]
+Description=Heimdall — Bifrost bridge SPO daemon (treasury movement loop)
+Documentation=https://github.com/lantr-io/heimdall
+# No bitcoind dependency. heimdall posts Treasury Movements to Cardano and the
+# watchtowers relay them to Bitcoin; `bitcoin.rpc_url` is unset by default and the
+# daemon needs no Bitcoin node. (The NixOS module orders after a local
+# bitcoind-watchtower.service because that particular host runs one — that is a
+# property of that deployment, not of heimdall.)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=heimdall
+Group=heimdall
+
+# /var/lib/heimdall. Holds the per-epoch DKG signing share (written 0600) and the
+# completed-peg-outs trie, so it must be private: systemd's StateDirectoryMode
+# default is 0755, which is not good enough here.
+StateDirectory=heimdall
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/heimdall
+
+# Operator knobs and secrets that should not sit in a dpkg-tracked conffile —
+# notably $HEIMDALL_MNEMONIC. Leading '-': start even if the file is absent.
+EnvironmentFile=-/etc/default/heimdall
+
+# $HEIMDALL_ARGS is unquoted on purpose: systemd word-splits a bare $VAR, so the
+# operator can add flags (e.g. --broadcast) from /etc/default/heimdall without
+# editing this unit. ${VAR} would NOT split and would pass one giant argument.
+ExecStart=/usr/bin/heimdall run-mover --config /etc/heimdall/heimdall.toml $HEIMDALL_ARGS
+
+Restart=always
+RestartSec=10
+
+# Hardening — mirrors deploy/nixos/heimdall-mover.nix rather than inventing a
+# second shape. ProtectSystem=strict makes the whole filesystem read-only except
+# ReadWritePaths, so the state directory is the only thing the daemon can write.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/heimdall
+
+[Install]
+WantedBy=multi-user.target
