@@ -1,0 +1,89 @@
+#!/bin/sh
+# heimdall postinst — create the service account, tighten the conffiles, and
+# register the unit WITHOUT enabling or starting it.
+set -e
+
+SVC_USER=heimdall
+SVC_GROUP=heimdall
+STATE_DIR=/var/lib/heimdall
+
+systemd_available() {
+    [ -d /run/systemd/system ]
+}
+
+case "$1" in
+configure)
+    if ! getent group "$SVC_GROUP" >/dev/null; then
+        addgroup --system "$SVC_GROUP"
+    fi
+    if ! getent passwd "$SVC_USER" >/dev/null; then
+        adduser --system --ingroup "$SVC_GROUP" --home "$STATE_DIR" \
+            --no-create-home --gecos "Heimdall Bifrost bridge SPO daemon" \
+            --disabled-password --shell /usr/sbin/nologin "$SVC_USER"
+    fi
+
+    # A .deb cannot ship files owned by a group that does not exist until this
+    # script runs, so both conffiles arrive root:root. Narrow them now — either
+    # can hold a wallet mnemonic or a Blockfrost project id, and the daemon reads
+    # them as the heimdall user.
+    for f in /etc/heimdall/heimdall.toml /etc/default/heimdall; do
+        if [ -e "$f" ]; then
+            chown root:"$SVC_GROUP" "$f"
+            chmod 0640 "$f"
+        fi
+    done
+
+    # systemd's StateDirectory= would create this at first start, but the operator
+    # needs somewhere to put the bifrost identity key BEFORE that, so create it here.
+    # 0700: it holds the per-epoch DKG signing share.
+    mkdir -p "$STATE_DIR"
+    chown "$SVC_USER":"$SVC_GROUP" "$STATE_DIR"
+    chmod 0700 "$STATE_DIR"
+
+    if systemd_available; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+
+        # THE SERVICE IS DELIBERATELY NOT ENABLED AND NOT STARTED on a fresh
+        # install. heimdall cannot run before it has a bridge config and key
+        # material, so starting here would guarantee a failed unit on every new
+        # machine and train operators to ignore it.
+        #
+        # On an UPGRADE ($2 = the previously configured version) restart only if
+        # the operator already had it running — try-restart is a no-op otherwise.
+        if [ -n "$2" ]; then
+            if [ -x /usr/bin/deb-systemd-invoke ]; then
+                deb-systemd-invoke try-restart heimdall.service >/dev/null 2>&1 || true
+            else
+                systemctl try-restart heimdall.service >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+
+    # First install only: say what the next step is, since nothing is running.
+    if [ -z "$2" ]; then
+        cat <<'EOF'
+
+heimdall is installed but NOT enabled — it needs a bridge configuration first.
+
+  1. edit  /etc/heimdall/heimdall.toml   (bridge identifiers, Blockfrost id)
+  2. edit  /etc/default/heimdall         (wallet mnemonic, extra CLI args)
+  3. dry run, as the service user — the config is 0640 root:heimdall and the
+     state directory is the heimdall user's:
+       sudo -u heimdall heimdall run-mover --config /etc/heimdall/heimdall.toml --once
+  4. register this SPO, then:  systemctl enable --now heimdall
+
+Logs go to journald:  journalctl -u heimdall -f
+
+EOF
+    fi
+    ;;
+
+abort-upgrade | abort-remove | abort-deconfigure) ;;
+
+*)
+    echo "postinst called with unknown argument \`$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

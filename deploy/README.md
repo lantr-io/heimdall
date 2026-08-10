@@ -1,4 +1,81 @@
-# Deploying the Heimdall auto-mover to a NixOS box
+# Deploying Heimdall
+
+Two supported shapes, both running `heimdall run-mover` as a systemd service off the same static
+musl binary:
+
+- **[Debian package](#debian-package)** — `heimdall.service`, config in `/etc/heimdall`. The
+  general-purpose route, published on each release.
+- **[NixOS module](#deploying-the-heimdall-auto-mover-to-a-nixos-box)** — `heimdall-mover.service`,
+  binary and config in `/var/lib/heimdall`. What `dev.lantr.io` runs.
+
+They are separate deployments with different unit names and different config paths; do not mix
+their instructions. Running both against one bridge is a mistake — see *One instance per bridge*
+below.
+
+---
+
+## Debian package
+
+```bash
+sudo apt install ./heimdall_<version>_amd64.deb    # or: sudo dpkg -i … && sudo apt -f install
+```
+
+Grab the `.deb` from the release page (alongside `heimdall` and the checksums), or build one from
+a binary you already have:
+
+```bash
+deploy/build-linux.sh                # → deploy/out/heimdall (static musl)
+sh deploy/debian/build-deb.sh        # → deploy/out/heimdall_<version>_amd64.deb
+```
+
+`build-deb.sh` never compiles: it wraps an existing binary, so the package and the loose release
+asset are the same file. The release workflow calls it with `VERSION` set to the dispatched
+version; locally the version defaults to the `Cargo.toml` version plus the commit
+(`0.1.0+8a60fd3-1`).
+
+What it installs:
+
+| Path | Contents |
+|---|---|
+| `/usr/bin/heimdall` | the static binary — no dependency chain |
+| `/lib/systemd/system/heimdall.service` | the unit |
+| `/etc/heimdall/heimdall.toml` | bridge config, dpkg conffile, `0640 root:heimdall` |
+| `/etc/default/heimdall` | `$HEIMDALL_ARGS` + `$HEIMDALL_MNEMONIC`, conffile, `0640` |
+| `/var/lib/heimdall` | state (`state_dir`), `0700 heimdall` |
+
+**The service is installed disabled, and that is deliberate.** heimdall cannot run before it has a
+bridge configuration and key material, so enabling it on install would guarantee a failed unit on
+every fresh machine. After configuring:
+
+```bash
+# One dry-run tick, AS THE SERVICE USER: the config is 0640 root:heimdall and
+# /var/lib/heimdall is 0700 heimdall, so running this as yourself cannot read the
+# config, and running it as root would leave root-owned files in the state dir.
+sudo -u heimdall heimdall run-mover --config /etc/heimdall/heimdall.toml --once
+
+sudo systemctl enable --now heimdall
+journalctl -u heimdall -f
+```
+
+Notes:
+
+- **Secrets belong in `/etc/default/heimdall`,** not in the TOML. heimdall reads
+  `$HEIMDALL_MNEMONIC` only when `cardano.mnemonic` is absent from the config file, so leaving that
+  key commented out is what activates the environment variable — and keeps the seed out of a file
+  dpkg tracks and diffs on upgrade.
+- **Extra CLI flags go in `$HEIMDALL_ARGS`,** so `--broadcast` and `--interval-secs` can change
+  without editing the unit. A fresh install runs *without* `--broadcast`: every tick is a dry run
+  until you add it.
+- **No Bitcoin node is needed.** The unit orders after `network-online.target` only. heimdall posts
+  Treasury Movements to Cardano; the watchtowers relay them to Bitcoin.
+- **`apt purge` leaves `/var/lib/heimdall` and the `heimdall` user alone** — the directory holds the
+  bifrost identity key and the current epoch's DKG share, neither of which a package manager should
+  delete without being asked. `postrm` prints a reminder; remove it by hand.
+- Upgrades restart the service only if it was already running, and keep your edited conffiles.
+
+---
+
+## Deploying the Heimdall auto-mover to a NixOS box
 
 Runs the WI-028 treasury auto-mover (`heimdall run-mover`) as a systemd service
 (`heimdall-mover`) against the preprod BIP-322 bridge. The static binary and config live in

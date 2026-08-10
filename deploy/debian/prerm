@@ -1,0 +1,27 @@
+#!/bin/sh
+# heimdall prerm — stop the daemon before the files go away.
+set -e
+
+case "$1" in
+remove | deconfigure)
+    # Not on `upgrade`: dpkg replaces the binary underneath a running unit and
+    # postinst try-restarts it, which keeps the downtime to one restart instead
+    # of a stop/start straddling the whole unpack.
+    if [ -d /run/systemd/system ]; then
+        if [ -x /usr/bin/deb-systemd-invoke ]; then
+            deb-systemd-invoke stop heimdall.service >/dev/null 2>&1 || true
+        else
+            systemctl stop heimdall.service >/dev/null 2>&1 || true
+        fi
+    fi
+    ;;
+
+upgrade | failed-upgrade) ;;
+
+*)
+    echo "prerm called with unknown argument \`$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

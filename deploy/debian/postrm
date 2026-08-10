@@ -1,0 +1,49 @@
+#!/bin/sh
+# heimdall postrm — disable the unit, and on purge clean up /etc without touching
+# key material.
+set -e
+
+STATE_DIR=/var/lib/heimdall
+
+case "$1" in
+remove)
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    ;;
+
+purge)
+    # dpkg removes the conffiles themselves; only the now-empty directory is ours.
+    rmdir /etc/heimdall 2>/dev/null || true
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed heimdall.service >/dev/null 2>&1 || true
+    fi
+
+    # DELIBERATE DEVIATION FROM THE USUAL PURGE BEHAVIOUR: the state directory and
+    # the service account are left in place.
+    #
+    # /var/lib/heimdall holds this SPO's bifrost identity key and the current
+    # epoch's DKG signing share. Deleting the identity key means re-registering
+    # on-chain (a new deposit); deleting the share means this SPO cannot sign for
+    # the epoch in progress. Neither is a thing a package manager should do
+    # silently on `apt purge`, and neither is recoverable afterwards.
+    if [ -d "$STATE_DIR" ]; then
+        echo "heimdall: leaving $STATE_DIR in place — it holds the bifrost identity" >&2
+        echo "heimdall: key and the current DKG share. Remove it by hand once you are" >&2
+        echo "heimdall: certain this SPO will not rejoin the bridge." >&2
+    fi
+    # The 'heimdall' system user is kept for the same reason (and because Debian
+    # policy discourages removing accounts that may still own files).
+    ;;
+
+upgrade | failed-upgrade | abort-install | abort-upgrade | disappear) ;;
+
+*)
+    echo "postrm called with unknown argument \`$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

@@ -49,6 +49,22 @@ jobs:
       - name: Report embedded version
         run: ./dist/heimdall --version
 
+      # Wraps the artifact built above rather than rebuilding, so the binary in the
+      # .deb and the loose binary on the release page are the same file.
+      - name: Build Debian package
+        env:
+          BIN: dist/heimdall
+          OUT_DIR: dist
+          VERSION: ${{ inputs.version }}
+          DEB_MAINTAINER: "Lantr <https://github.com/lantr-io/heimdall>"
+        run: |
+          apk add --no-cache dpkg
+          sh deploy/debian/build-deb.sh
+          # A separate checksum file: deploy.sh runs `shasum -c heimdall.sha256`
+          # having downloaded only the bare binary, so an extra line in there
+          # would make that verification fail on a missing file.
+          cd dist && sha256sum ./*.deb > heimdall.deb.sha256 && cat heimdall.deb.sha256
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -57,9 +73,9 @@ jobs:
             --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
             --title "v${{ inputs.version }}" \
-            --notes "Static x86_64-linux (musl) build of heimdall, from ${{ github.sha }}." \
+            --notes "Static x86_64-linux (musl) build of heimdall, from ${{ github.sha }}. Ships as a bare binary and as a Debian package (installs disabled; see deploy/README.md)." \
             ${{ inputs.prerelease && '--prerelease' || '' }} \
-            dist/heimdall dist/heimdall.sha256
+            dist/heimdall dist/heimdall.sha256 dist/*.deb dist/heimdall.deb.sha256
 
   notify:
     name: discord

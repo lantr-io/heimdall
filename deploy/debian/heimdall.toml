@@ -1,0 +1,137 @@
+# /etc/heimdall/heimdall.toml — heimdall SPO daemon configuration.
+#
+# Installed 0640 root:heimdall and tracked by dpkg as a conffile: your edits
+# survive package upgrades, and a changed shipped default is offered as a merge
+# rather than applied silently.
+#
+# Everything that identifies THIS BRIDGE is commented out below, because there is
+# no sane default for it — the values come from whoever deployed the bridge you
+# are joining. The daemon exits with a message naming the missing key rather than
+# guessing, so uncomment as you go.
+#
+# SECRETS: keep the wallet mnemonic OUT of this file and in
+# /etc/default/heimdall as $HEIMDALL_MNEMONIC (see cardano.mnemonic below).
+#
+# After editing:  heimdall run-mover --config /etc/heimdall/heimdall.toml --once
+# to watch one dry-run tick, then `systemctl enable --now heimdall`.
+
+
+[protocol]
+# REQUIRED IN ANY REAL DEPLOYMENT. Holds the per-epoch DKG signing share (0600)
+# so it survives a restart, and the completed-peg-outs trie (cpo-trie.json).
+# Left unset the trie is rebuilt EMPTY on every start, which is correct only on a
+# bridge that has never completed a peg-out — on any other, the daemon would
+# treat already-paid peg-outs as unpaid. The package creates this directory 0700.
+state_dir = "/var/lib/heimdall"
+
+# Poll cadence for the chain-watching loops (ms).
+poll_interval_ms = 5000
+
+# A peg-out is payable only while at least this far from its 30-day cancel
+# deadline. MUST be identical on every SPO: it is a TM selection rule, and a
+# divergent rule produces divergent TM bytes, so the FROST round cannot converge.
+# Do not change this unilaterally. Default 7 days.
+pegout_freshness_margin_ms = 604800000
+
+
+[bitcoin]
+# The Bitcoin network this bridge settles on: "mainnet", "testnet4", "signet",
+# "regtest". Must match the bridge you are joining.
+#network = "testnet4"
+
+# Federation fallback key seed (32 bytes hex) and the CSV delay of the federation
+# leaf in the treasury taproot tree. Both are BRIDGE-WIDE CONSTANTS: they feed the
+# treasury address every SPO must derive identically. Copy them from the bridge's
+# deployment notes; do not generate your own.
+#y_fed_seed_hex = ""
+#federation_csv_blocks = 144
+
+# NO BITCOIN NODE IS REQUIRED. heimdall posts Treasury Movements to Cardano and
+# the watchtowers relay them to Bitcoin. Leave `submit` false and rpc_url unset:
+# a second broadcaster is not redundancy here, it is a way to publish a movement
+# the Cardano side has not recorded.
+submit = false
+#rpc_url = "http://127.0.0.1:8332"
+#rpc_user = ""
+#rpc_pass = ""
+
+
+[cardano]
+# ── Operator identity — these are about YOU, not the bridge ──────────────────
+
+# Blockfrost project id for the network above. Required: it is how the daemon
+# reads Cardano.
+#blockfrost_project_id = ""
+
+# Self-hosted Blockfrost-compatible endpoint. Leave unset for hosted Blockfrost.
+#blockfrost_url = ""
+
+# Cardano wallet mnemonic — the wallet that pays fees and holds this SPO's
+# registration deposit.
+#
+# PREFER /etc/default/heimdall: heimdall falls back to $HEIMDALL_MNEMONIC only
+# when this key is absent, so uncommenting it here DISABLES the environment
+# variable. Left commented, the seed never enters a dpkg-tracked file.
+#mnemonic = ""
+
+# Where the treasury movement is posted. Keep true: posting to the Cardano oracle
+# is how a movement reaches the watchtowers. 0 = post as Unconfirmed (a watchtower
+# marks it Confirmed later, after Bitcoin confirmations and oracle aging).
+submit_oracle = true
+oracle_constructor = 0
+
+# How this node learns each pool's active stake for the stake-weighted DKG.
+stake_source = "blockfrost"
+
+# ── The bridge — copy from the bridge's deployment notes ─────────────────────
+#
+# The Config UTxO is the discovery root: the daemon derives the config address
+# from the policy id, finds the single UTxO holding that token, and reads the
+# operational parameters (fee rate, batch schedule, selection floors) from its
+# datum. Without all three of these the daemon cannot see the batch grid and
+# falls back to a wall-clock cadence, which does NOT agree with the other SPOs.
+#config_address = ""
+#config_nft_policy_id = ""
+#config_nft_asset_name = ""
+
+# The treasury movement validator (PlutusV3 CBOR hex) and the TM state token.
+#tm_script_cbor = ""
+#treasury_address = ""
+#treasury_policy_id = ""
+#treasury_asset_name = ""
+
+# Peg-in / peg-out contracts and the bridged token (policy id ++ asset name hex).
+#pegin_script_address = ""
+#pegin_policy_id = ""
+#pegout_script_address = ""
+#bridged_token_unit = ""
+
+# On-chain SPO registry. Set all three to derive the signing roster from the
+# registry (the real path); leave unset only for the demo fixture roster.
+#registry_blueprint = "/var/lib/heimdall/plutus.json"
+#registry_bootstrap = "<tx_hash>:<index>"
+#treasury_info_asset_name = ""
+
+
+[http]
+# THE SPO-TO-SPO PROTOCOL SURFACE, and the one piece of networking that must be
+# right. This node publishes <bind_address>:<base_port + signer_index> on-chain as
+# its `bifrost_url` at registration, and peers FETCH its DKG and signing rounds
+# from it. The default below is loopback, which is correct for a local trial and
+# wrong for a real SPO: a peer that cannot reach this address cannot get this
+# node's round-1 payload, so the node drops out of the qualified set and
+# contributes nothing to the epoch.
+#
+# Set this to an address reachable from the public internet, open the port, and
+# make sure it matches what you registered.
+bind_address = "127.0.0.1"
+base_port = 18500
+
+
+[bifrost]
+# This SPO's long-lived secp256k1 bifrost identity secret key: a 0600 file holding
+# 32 bytes as hex. It is bound on-chain at registration, and the daemon signs every
+# published DKG and signing payload with it — losing it means re-registering,
+# leaking it means someone else can sign as you. Keep it inside state_dir, owned
+# by the heimdall user, and back it up somewhere the daemon cannot reach.
+#skey_path = "/var/lib/heimdall/bifrost.skey"
