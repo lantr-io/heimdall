@@ -618,10 +618,10 @@ pub fn confirmed_payments(tm: &ConfirmedTm) -> Vec<(Vec<u8>, u64)> {
 /// The rev-5.1 data-availability hint from an Unconfirmed TM datum: field 5,
 /// `fulfilled_por_outpoints`.
 ///
-/// Tolerates the OLD 5-field shape (returns an empty hint) — those records confirm
-/// fine on-chain, so real history contains them, and reconstruction must fall back
-/// to matching rather than refuse to read the chain. A present-but-malformed entry
-/// (not 36 bytes) is dropped: the hint is UNVERIFIED attacker-supplied data.
+/// Tolerates a record whose field 3 is missing or not a list (returns an empty
+/// hint) — reconstruction then falls back to matching rather than refusing to
+/// read the chain. A present-but-malformed entry (not 36 bytes) is dropped: the
+/// hint is UNVERIFIED attacker-supplied data.
 ///
 /// Constructor 0 is accepted in BOTH plutus-core encodings — the compact tag 121
 /// form and the general tag-102 + `any_constructor` form — matching
@@ -641,7 +641,12 @@ pub fn unconfirmed_hint(data: &PlutusData) -> Vec<[u8; 36]> {
     if constructor != 0 {
         return Vec::new();
     }
-    let Some(PlutusData::Array(items)) = fields.get(5) else {
+    // Rev 5.4: the hint is field 3 of the 4-field UnconfirmedTm
+    // `[signed_btc_tx, creator, created, fulfilled_por_outpoints]`. A record whose
+    // field 3 is not a list (the retired 6-field shape carried `epoch` there)
+    // yields an empty hint — safe, because a hint is only ever ACCEPTED after it
+    // reproduces the attested root.
+    let Some(PlutusData::Array(items)) = fields.get(3) else {
         return Vec::new();
     };
     items
@@ -1463,7 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn hint_reads_field_5_of_a_six_field_unconfirmed_datum() {
+    fn hint_reads_field_3_of_a_four_field_unconfirmed_datum() {
         use crate::cardano::plutus::{array, bytes, int};
         let op1 = hint_bytes(&[0xaa; 32], 1);
         let op2 = hint_bytes(&[0xbb; 32], 0);
@@ -1471,25 +1476,24 @@ mod tests {
             bytes(&[0x02, 0x00]),
             bytes(&[0x7a; 28]),
             int(1),
-            int(2),
-            int(3),
             array(vec![bytes(&op1), bytes(&op2)]),
         ]);
         assert_eq!(unconfirmed_hint(&d), vec![op1, op2]);
     }
 
-    // Old 5-field records really are in history (they confirm fine on-chain), so
-    // reading one must yield an empty hint, not an error — reconstruction then
-    // falls back to matching.
+    // A retired 6-field record carries `epoch` (an Int) at index 3, so reading it
+    // must yield an empty hint, not an error — reconstruction then falls back to
+    // matching.
     #[test]
-    fn hint_of_an_old_five_field_datum_is_empty() {
-        use crate::cardano::plutus::{bytes, int};
+    fn hint_of_a_retired_six_field_datum_is_empty() {
+        use crate::cardano::plutus::{array, bytes, int};
         let d = unconfirmed_datum(vec![
             bytes(&[0x02, 0x00]),
             bytes(&[0x7a; 28]),
             int(1),
             int(2),
             int(3),
+            array(vec![bytes(&hint_bytes(&[0xaa; 32], 1))]),
         ]);
         assert!(unconfirmed_hint(&d).is_empty());
     }
@@ -1503,8 +1507,6 @@ mod tests {
             bytes(&[0x02]),
             bytes(&[0x7a; 28]),
             int(1),
-            int(2),
-            int(3),
             array(vec![bytes(&[0xde, 0xad]), bytes(&good), bytes(&[0u8; 40])]),
         ]);
         assert_eq!(unconfirmed_hint(&d), vec![good]);
@@ -1526,16 +1528,14 @@ mod tests {
                 bytes(&[0x02]),
                 bytes(&[0x7a; 28]),
                 int(1),
-                int(2),
-                int(3),
                 array(vec![bytes(&op)]),
             ]),
         });
         assert_eq!(unconfirmed_hint(&d), vec![op]);
     }
 
-    // A Confirmed record (constructor 1) has no hint field, and its field 5 is
-    // `created` — reading it as a hint would be nonsense.
+    // A legacy Confirmed record (constructor 1) has no hint field — reading one
+    // as a hint would be nonsense.
     #[test]
     fn hint_of_a_non_zero_constructor_is_empty() {
         use crate::cardano::plutus::{bytes, constr, int};

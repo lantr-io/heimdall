@@ -957,3 +957,38 @@ root ([PRE-2]).
   whose compiledCode still declares the (now-unapplied) `tm_nft_policy_id`
   parameter. Re-pin both hashes when the bridge-track treasury.ak change
   regenerates `plutus.json`.
+
+## 2026-08-10 - rev-5.4 Config + treasury sourcing (bridge-state singleton)
+
+**DEC-030: the treasury is the singleton's head, end of chain walks.**
+`query_treasury`, the CLI sweep and `tm-status` read the current treasury
+outpoint AND its satoshi amount from the BridgeState datum, located through the
+Config's `bridge_state_policy` ([PAR-1]). The Confirmed-chain walk (`tm_chain::
+walk_chain`) is deleted: Confirm burns the TM record, so no Confirmed records
+exist to follow. The taproot-tree selection that used to read the Confirmed
+datum's outputs now reconstructs the candidate trees and checks them against
+bitcoind `gettxout` on the head - the daemon therefore requires a Bitcoin RPC
+for treasury resolution (it already did for genesis pricing).
+
+**DEC-031: config_params reads the eight-field rev-5.4 layout.**
+`bridge_state_policy` (#3) and `tm_script_hash` (#4) by position, the tunables
+nested at #7 (always present; fewer than 8 fields is refused, more are
+tolerated - appends stay the legal evolution). `min_stake`, the treasury
+anchor and `leader_reward` left the datum; the register-spo R2 gate reads the
+local `cardano.min_stake_lovelace` again (the field never had an on-chain
+reader), and the posted TM datum is the 4-field `UnconfirmedTm`
+`[signed_btc_tx, creator, created, fulfilled_por_outpoints]`.
+
+**DEC-032: the mint redeemer names the singleton reference input.**
+`publish.rs` posts with `TmMintRedeemer(bss_ref_index)` = Constr 0 [i], the
+Config UTxO and the singleton both as reference inputs, and the index computed
+against the SORTED (tx_hash, index) order the ledger presents to the script
+(`MintRefs::sorted`). The Genesis/Chain split is retired ([PTM-5] withdrawn).
+
+**DEC-033: "already swept" comes from the SPI trie.**
+The sweep's auto-skip used `TmScan.consumed` (outpoints swept per Confirmed
+records). Those records no longer exist; the swept set is the SPI trie the
+node already maintains for the BTMR1 commitment, plus the live in-flight
+spends. `TmScan` keeps its legacy Confirmed parsing (empty on a fresh
+deployment) - removing it is a wider cleanup than this migration needs.
+

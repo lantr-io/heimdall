@@ -53,7 +53,7 @@ use crate::cardano::fault_proof::FaultProofKind;
 use crate::cardano::publish::{WalletUtxo, build_oracle_update_tx};
 use crate::cardano::treasury_datum::{
     ConfirmedTm, TreasuryConfig, TreasuryDatumError, UnconfirmedTm, parse_confirmed_tm_datum,
-    parse_unconfirmed_tm, select_spendable_tip,
+    parse_unconfirmed_tm,
 };
 use crate::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 use crate::epoch::state::{EpochError, EpochResult, Roster};
@@ -547,6 +547,106 @@ pub struct BlockfrostCardanoChain {
     pegout_source: Option<PegOutSource>,
 }
 
+/// The bridge-state singleton as the post/build paths need it: the decoded
+/// [`BridgeState`](crate::cardano::bridge_state::BridgeState) and the Cardano
+/// UTxO holding it — the [PTM-7] mint reference input.
+#[derive(Debug, Clone)]
+pub struct SingletonView {
+    pub state: crate::cardano::bridge_state::BridgeState,
+    /// `(tx_hash, output_index)` of the singleton UTxO.
+    pub utxo: (String, u32),
+}
+
+/// Enterprise (no stake part) bech32 address of a script hash. The bridge-state
+/// singleton lives at exactly this shape: both bootstrap paths pay it to
+/// `Address { payment: Script(policy), stake: None }`.
+fn script_enterprise_address(hash: &[u8; 28], mainnet: bool) -> String {
+    use pallas_addresses::{
+        Address, Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
+    };
+    let network = if mainnet {
+        Network::Mainnet
+    } else {
+        Network::Testnet
+    };
+    let shelley = ShelleyAddress::new(
+        network,
+        ShelleyPaymentPart::script_hash((*hash).into()),
+        ShelleyDelegationPart::Null,
+    );
+    Address::Shelley(shelley)
+        .to_bech32()
+        .expect("bech32 encode script address")
+}
+
+/// Read the Config UTxO, then locate + decode the bridge-state singleton it
+/// names ([PAR-1]): derive the enterprise address of `bridge_state_policy`
+/// (Config field 3 — both deploy paths create the singleton there, stake part
+/// `None`) and find the one UTxO holding the `(policy, "BSS")` NFT.
+///
+/// Returns the Config view (its UTxO is one mint reference input) and the
+/// singleton view: the decoded BridgeState plus the Cardano UTxO holding it
+/// (the [PTM-7] mint reference input). Shared by the epoch daemon and the CLI
+/// sweep, so both resolve the treasury head the same way.
+pub async fn fetch_config_singleton(
+    bf_base_url: &str,
+    bf_project_id: &str,
+    config_address: &str,
+    config_nft_unit: &str,
+    mainnet: bool,
+) -> Result<(config_params::ConfigView, SingletonView), String> {
+    let view =
+        config_params::fetch_config(bf_base_url, bf_project_id, config_address, config_nft_unit)
+            .await?;
+    let policy = view.params.bridge_state_policy;
+    let policy_hex = hex::encode(policy);
+    let address = script_enterprise_address(&policy, mainnet);
+    let utxos = crate::cardano::bf_http::fetch_address_utxos(bf_base_url, bf_project_id, &address)
+        .await
+        .map_err(|e| format!("bridge-state singleton query: {e}"))?;
+    let unit = format!(
+        "{policy_hex}{}",
+        crate::cardano::bridge_state::BSS_ASSET_NAME_HEX
+    );
+    let held: Vec<_> = utxos
+        .iter()
+        .filter(|u| u.amount.iter().any(|a| a.unit == unit && a.quantity == "1"))
+        .collect();
+    let u = match held.as_slice() {
+        [only] => *only,
+        [] => {
+            return Err(format!(
+                "no UTxO at {address} holds the bridge-state NFT {unit} — the singleton is not \
+                 bootstrapped under Config field 3's policy, or the backend is not indexing it"
+            ));
+        }
+        many => {
+            return Err(format!(
+                "{} UTxOs hold the bridge-state NFT {unit} — not a singleton, no state is \
+                 authoritative",
+                many.len()
+            ));
+        }
+    };
+    let inline = u.inline_datum.as_deref().ok_or_else(|| {
+        format!(
+            "the bridge-state singleton {}#{} carries no inline datum",
+            u.tx_hash, u.output_index
+        )
+    })?;
+    let cbor = hex::decode(inline).map_err(|e| format!("singleton datum hex decode: {e}"))?;
+    let datum: PlutusData =
+        minicbor::decode(&cbor).map_err(|e| format!("singleton datum CBOR decode: {e}"))?;
+    let state = crate::cardano::bridge_state::parse_bridge_state(&datum)?;
+    Ok((
+        view,
+        SingletonView {
+            state,
+            utxo: (u.tx_hash.clone(), u.output_index as u32),
+        },
+    ))
+}
+
 /// The two values `pegout_datum::fetch_pegout_requests` needs. The `sweep-pegins` CLI takes
 /// them as arguments; the daemon has no argv, so the chain carries them.
 #[derive(Debug, Clone)]
@@ -913,82 +1013,44 @@ impl BlockfrostCardanoChain {
     }
 
     /// Read + decode the bridge Config UTxO (`cardano::config_params`).
-    async fn query_config(&self) -> EpochResult<config_params::ConfigView> {
-        let (addr, unit) = match (&self.config_address, &self.config_nft_unit) {
-            (Some(a), Some(u)) => (a.as_str(), u.as_str()),
-            _ => {
-                return Err(EpochError::Chain(
-                    "cardano.config_address / config_nft_policy_id not set — required to read \
-                     the bridge Config UTxO (the treasury anchor and the operational parameters)"
-                        .into(),
-                ));
-            }
-        };
-        config_params::fetch_config(&self.bf_base_url, &self.bf_project_id, addr, unit)
-            .await
-            .map_err(EpochError::Chain)
+    fn config_locator(&self) -> EpochResult<(String, String)> {
+        match (&self.config_address, &self.config_nft_unit) {
+            (Some(a), Some(u)) => Ok((a.clone(), u.clone())),
+            _ => Err(EpochError::Chain(
+                "cardano.config_address / config_nft_policy_id not set — required to read \
+                 the bridge Config UTxO (the singleton locator and the operational parameters)"
+                    .into(),
+            )),
+        }
     }
 
-    /// The Config UTxO's field #11 (initial_btc_treasury_utxo). Returns the 36-byte
-    /// anchor outpoint, the config UTxO's Cardano outpoint (the Genesis mint
-    /// reference), and field #15 (leader_reward, carried into the posted TM datum;
-    /// its on-chain pin against this field lands with N9 — zero on a Config that
-    /// predates the operational-parameter fields).
-    async fn query_config_anchor(&self) -> EpochResult<([u8; 36], (String, u32), u64)> {
-        let view = self.query_config().await?;
-        let anchor = view.params.initial_btc_treasury_utxo.ok_or_else(|| {
-            EpochError::Chain(format!(
-                "config datum has {} fields — no treasury anchor (field 11); run \
-                 `binocular update-config` to migrate the deployed config",
-                view.params.field_count
-            ))
-        })?;
-        let leader_reward = view.params.tunables.map_or(0, |t| t.leader_reward);
-        Ok((anchor, (view.utxo.tx_hash, view.utxo.index), leader_reward))
-    }
-
-    /// All Confirmed TM records at the treasury address carrying the TM NFT, parsed for
-    /// the chain walk. Unconfirmed records and garbage datums are skipped.
-    async fn query_confirmed_records(
+    /// Locate the bridge-state singleton through the Config ([PAR-1]): read
+    /// `bridge_state_policy` (Config field 3), derive the policy's enterprise
+    /// address (both deploy paths create the singleton there, stake part `None`),
+    /// and find the one UTxO holding the `(policy, "BSS")` NFT.
+    ///
+    /// Returns the Config view (its UTxO is the second mint reference input) and
+    /// the singleton view: the decoded [`BridgeState`] plus the Cardano UTxO
+    /// holding it (the [PTM-7] mint reference input).
+    async fn query_config_singleton(
         &self,
-    ) -> EpochResult<Vec<crate::cardano::tm_chain::ConfirmedTm>> {
-        let utxos = crate::cardano::bf_http::fetch_address_utxos(
+    ) -> EpochResult<(config_params::ConfigView, SingletonView)> {
+        let (address, unit) = self.config_locator()?;
+        fetch_config_singleton(
             &self.bf_base_url,
             &self.bf_project_id,
-            &self.treasury_address,
+            &address,
+            &unit,
+            self.is_mainnet(),
         )
         .await
-        .map_err(|e| EpochError::Chain(format!("blockfrost treasury query: {e}")))?;
-        let nft_unit = format!(
-            "{}{}",
-            self.treasury_policy_id, self.treasury_asset_name_hex
-        );
-        let mut records = Vec::new();
-        for u in &utxos {
-            let Some(datum_hex) = u.inline_datum.as_deref() else {
-                continue;
-            };
-            if !u.amount.iter().any(|a| a.unit == nft_unit) {
-                continue;
-            }
-            let Ok(cbor) = hex::decode(datum_hex) else {
-                continue;
-            };
-            let Ok(datum) = minicbor::decode::<PlutusData>(&cbor) else {
-                continue;
-            };
-            if let Some((btc_txid, spent_outpoint, treasury_value_sat)) =
-                crate::cardano::tm_chain::parse_confirmed_datum(&datum)
-            {
-                records.push(crate::cardano::tm_chain::ConfirmedTm {
-                    btc_txid,
-                    spent_outpoint,
-                    treasury_value_sat,
-                    cardano_utxo: (u.tx_hash.clone(), u.output_index as u32),
-                });
-            }
-        }
-        Ok(records)
+        .map_err(EpochError::Chain)
+    }
+
+    /// Whether this chain's addresses are mainnet (bech32 `addr1…`) — decided by
+    /// the configured TM address, which every deployment sets.
+    fn is_mainnet(&self) -> bool {
+        self.treasury_address.starts_with("addr1")
     }
 
     /// Fetch all UTxOs at the wallet base address.
@@ -1376,15 +1438,27 @@ impl CardanoChain for BlockfrostCardanoChain {
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {
+        // Rev 5.4: the current treasury is the bridge-state singleton's head — outpoint AND
+        // satoshi amount straight from the BridgeState datum. There is no Confirmed chain to
+        // walk: Confirm burns the TM record and advances the singleton instead.
+        let (_config, singleton) = self.query_config_singleton().await?;
+        let state = &singleton.state;
+        use bitcoin::hashes::Hash;
+        let txid_bytes: [u8; 32] = state.treasury_utxo_id[..32].try_into().unwrap();
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array(txid_bytes),
+            vout: u32::from_le_bytes(state.treasury_utxo_id[32..].try_into().unwrap()),
+        };
+        let value = bitcoin::Amount::from_sat(state.treasury_amount);
+
+        // Scan the Unconfirmed records at the TM address (fresh HTTP client per call — the
+        // pooled keep-alive goes stale across the DKG wait). A record whose embedded BTC tx
+        // spends the head is a movement already in flight; a record we cannot read might be.
         let asset_unit = format!(
             "{}{}",
             self.treasury_policy_id, self.treasury_asset_name_hex
         );
-
-        // Scan every marker-token TM UTxO at the validator address (fresh HTTP
-        // client per call — the pooled keep-alive goes stale across the DKG wait).
         let TmScan {
-            confirmed,
             in_flight_spends,
             parse_failures,
             opaque_unconfirmed,
@@ -1401,119 +1475,73 @@ impl CardanoChain for BlockfrostCardanoChain {
         .await
         .map_err(EpochError::Chain)?;
 
-        // A marker-token TM UTxO is NFT-mint-gated, so a datum we cannot parse is a
-        // REAL TM we dropped — chain-following an incomplete set can promote an
-        // already-spent parent to a false tip. Refuse rather than mis-root/misdirect.
-        if parse_failures > 0 {
-            return Err(EpochError::Chain(format!(
-                "{parse_failures} marker-token TM datum(s) failed to parse — refusing to \
-                 chain-source the treasury (would risk mis-rooting the movement chain)"
-            )));
-        }
-
         // The treasury's Taproot internal key (Y_51). After DKG, publish_group_key
         // stores the FROST group key here; at bootstrap it is the config Y_51.
         let maybe_key = *self.treasury_y_51.lock().unwrap();
         let y_51 = maybe_key.unwrap_or(self.treasury_config.y_51);
         let csv = self.treasury_config.federation_csv_blocks;
 
-        // Bootstrap: before the first TM confirms there is no Confirmed datum to
-        // follow. The treasury is the anchor outpoint from the bridge Config UTxO's
-        // field 11 (initial_btc_treasury_utxo, located by the config NFT) — the same
-        // outpoint the TM validator's Genesis mint redeemer checks. Its value is not
-        // on Cardano, so price it via bitcoind gettxout (DEC-022).
-        if confirmed.is_empty() {
-            use bitcoin::hashes::Hash;
-            let (anchor, _config_ref, _leader_reward) = self.query_config_anchor().await?;
-            let txid_bytes: [u8; 32] = anchor[..32].try_into().unwrap();
-            let txid = bitcoin::Txid::from_byte_array(txid_bytes);
-            let vout = u32::from_le_bytes(anchor[32..].try_into().unwrap());
-            let cfg_out = bitcoin::OutPoint { txid, vout };
-            let rpc = self.btc_rpc.as_ref().ok_or_else(|| {
-                EpochError::Chain(
-                    "genesis treasury resolution needs bitcoin.rpc_url (gettxout on the \
-                     config anchor outpoint)"
-                        .into(),
-                )
-            })?;
-            let sat =
-                crate::cardano::btc_rpc::get_txout_value_sat(rpc, &txid.to_string(), vout).await?;
-            // An unreadable in-flight movement could be spending this outpoint; be
-            // conservative and treat it as not-yet-free.
-            let btc_confirmed = !in_flight_spends.contains(&cfg_out) && opaque_unconfirmed == 0;
-            info!(
-                "[blockfrost] no Confirmed TM yet — treasury = config anchor {cfg_out} \
-                 ({sat} sat, btc_confirmed={btc_confirmed})"
-            );
-            return Ok(TreasuryUtxo {
-                outpoint: cfg_out,
-                value: bitcoin::Amount::from_sat(sat),
-                y_51,
-                y_fed: self.treasury_config.y_fed,
-                federation_csv_blocks: csv,
-                btc_confirmed,
-            });
-        }
-
-        // Chain-follow to the tip we can spend. The treasury tree's key-path key is
-        // Y_51; the script-path (federation-CSV) leaf is the federation key, which
-        // does NOT rotate with DKG. Try each candidate leaf — the federation seed
-        // (production) and, defensively, Y_51 itself (the demo's collapsed
-        // Y_fed=Y_51 convention) — through the SAME `select_spendable_tip` the CLI /
-        // mover path uses, keeping whichever matched so the input spend rebuilds the
-        // exact tree. No candidate matches -> hard error (never sign an outpoint whose
-        // on-chain scriptPubKey we cannot reconstruct).
+        // Which taproot tree is the head locked under? The singleton records the outpoint and
+        // amount but not the scriptPubKey, so the candidate trees — the federation seed
+        // (production) and, defensively, Y_51 itself (the demo's collapsed Y_fed=Y_51
+        // convention) — are reconstructed and checked against bitcoind's gettxout on the head.
+        // Never sign an outpoint whose on-chain scriptPubKey we cannot reconstruct.
+        let rpc = self.btc_rpc.as_ref().ok_or_else(|| {
+            EpochError::Chain(
+                "treasury resolution needs bitcoin.rpc_url (gettxout on the singleton's head \
+                 selects the taproot tree to spend under)"
+                    .into(),
+            )
+        })?;
+        let actual_spk_hex = crate::cardano::btc_rpc::get_txout_script_pub_key_hex(
+            rpc,
+            &outpoint.txid.to_string(),
+            outpoint.vout,
+        )
+        .await?;
         let secp = bitcoin::key::Secp256k1::new();
         let csv_u16 = csv_to_u16(csv)?;
         let mut leaf_candidates = vec![self.treasury_config.y_fed];
         if y_51 != self.treasury_config.y_fed {
             leaf_candidates.push(y_51);
         }
-        let mut selected: Option<(&ConfirmedTm, bitcoin::key::UntweakedPublicKey)> = None;
-        let mut last_err: Option<String> = None;
-        for &y_fed in &leaf_candidates {
-            let spk = bitcoin::ScriptBuf::new_p2tr_tweaked(
-                treasury_spend_info(&secp, y_51, y_fed, csv_u16).output_key(),
-            );
-            match select_spendable_tip(&confirmed, spk.as_bytes()) {
-                Ok(tip) => {
-                    selected = Some((tip, y_fed));
-                    break;
-                }
-                Err(e) => last_err = Some(e.to_string()),
-            }
-        }
-        let (tip, y_fed) = selected.ok_or_else(|| {
-            EpochError::Chain(format!(
-                "no Confirmed TM tip is spendable under the current treasury keys \
-                 ({} confirmed TM(s)): {}",
-                confirmed.len(),
-                last_err.unwrap_or_else(|| "no candidate keys".into()),
-            ))
-        })?;
+        let y_fed = leaf_candidates
+            .iter()
+            .copied()
+            .find(|&cand| {
+                let spk = bitcoin::ScriptBuf::new_p2tr_tweaked(
+                    treasury_spend_info(&secp, y_51, cand, csv_u16).output_key(),
+                );
+                hex::encode(spk.as_bytes()) == actual_spk_hex
+            })
+            .ok_or_else(|| {
+                EpochError::Chain(format!(
+                    "the singleton's head {outpoint} is locked under a scriptPubKey \
+                     ({actual_spk_hex}) that no candidate treasury tree reproduces — \
+                     y_51/y_fed/csv configuration is out of step with the chain"
+                ))
+            })?;
 
-        let outpoint = tip.treasury_outpoint();
-        let value = tip
-            .treasury_value()
-            .ok_or_else(|| EpochError::Chain("treasury tip datum has no outputs".into()))?;
-        // A movement already in flight against this tip — or an in-flight movement we
-        // could not read — means it is not yet safe to build the next TM; report
-        // btc_confirmed=false so BuildTm waits for confirmation. Additionally, a TM
-        // this process submitted must have become the tip before the next one builds
-        // (DEC-022: restart-safe against a lost Cardano post — the in-flight scan
-        // catches cross-process movements, this catches our own).
+        // A movement already in flight against this head — or an in-flight movement we could
+        // not read — means it is not yet safe to build the next TM; report btc_confirmed=false
+        // so BuildTm waits for confirmation. Additionally, a TM this process submitted must
+        // have become the head before the next one builds (DEC-022: restart-safe against a lost
+        // Cardano post — the in-flight scan catches cross-process movements, this catches our
+        // own). An unreadable datum at the NFT-gated TM address counts as possibly-in-flight
+        // (fail closed, never double-post).
         let own_pending = match *self.last_submitted_txid.lock().unwrap() {
             None => false,
             Some(t) => outpoint.txid != t,
         };
-        let btc_confirmed =
-            !own_pending && !in_flight_spends.contains(&outpoint) && opaque_unconfirmed == 0;
+        let btc_confirmed = !own_pending
+            && !in_flight_spends.contains(&outpoint)
+            && opaque_unconfirmed == 0
+            && parse_failures == 0;
         info!(
-            "[blockfrost] treasury tip {}:{} = {} sat ({} confirmed TM(s), in_flight={}, btc_confirmed={})",
+            "[blockfrost] treasury head {}:{} = {} sat (singleton, in_flight={}, btc_confirmed={})",
             outpoint.txid,
             outpoint.vout,
             value.to_sat(),
-            confirmed.len(),
             !btc_confirmed,
             btc_confirmed,
         );
@@ -1923,23 +1951,20 @@ impl CardanoChain for BlockfrostCardanoChain {
             cost_models[2].len()
         );
 
-        // The chain-linkage mint reference: the tip Confirmed record (Chain redeemer) or,
-        // before the first TM confirms, the Config UTxO (Genesis redeemer). Only needed when
-        // minting under the real TM validator.
-        // Also capture the N7 `leader_reward` (Config field 15) here — the real path already reads
-        // the Config UTxO for the anchor; the scaffold path has no Config, so 0.
-        let (mint_ref, leader_reward): (Option<(String, u32, bool)>, u64) =
-            if self.tm_script_cbor.is_some() {
-                let (anchor, config_ref, cfg_leader_reward) = self.query_config_anchor().await?;
-                let records = self.query_confirmed_records().await?;
-                let r = match crate::cardano::tm_chain::walk_chain(anchor, &records) {
-                    Some(tip) => Some((tip.cardano_utxo.0.clone(), tip.cardano_utxo.1, false)),
-                    None => Some((config_ref.0, config_ref.1, true)),
-                };
-                (r, cfg_leader_reward)
-            } else {
-                (None, 0)
-            };
+        // The chain-linkage mint references: the Config UTxO (the validator reads
+        // `bridge_state_policy` from it, [PAR-1]) and the bridge-state singleton whose head the
+        // posted TM must spend ([PTM-6]/[PTM-7]). Only needed when minting under the real TM
+        // validator.
+        let mint_refs: Option<crate::cardano::publish::MintRefs> = if self.tm_script_cbor.is_some()
+        {
+            let (config, singleton) = self.query_config_singleton().await?;
+            Some(crate::cardano::publish::MintRefs {
+                config: (config.utxo.tx_hash, config.utxo.index),
+                singleton: singleton.utxo,
+            })
+        } else {
+            None
+        };
 
         // Latest chain slot + time: seeds the datum's `created` and the finite
         // `invalid_hereafter` the TM mint policy requires (created-anchoring check).
@@ -1949,13 +1974,6 @@ impl CardanoChain for BlockfrostCardanoChain {
         )
         .await
         .map_err(|e| EpochError::Chain(format!("fetch latest block slot/time: {e}")))?;
-
-        // N7: the Cardano epoch this TM belongs to — carried in the posted datum (not yet enforced
-        // on-chain; the leader_reward pin + payout land with N9).
-        let epoch =
-            crate::cardano::bf_http::fetch_current_epoch(&self.bf_base_url, &self.bf_project_id)
-                .await
-                .map_err(|e| EpochError::Chain(format!("fetch current epoch: {e}")))?;
 
         let signed_tx_hex = build_oracle_update_tx(
             &self.treasury_address,
@@ -1967,12 +1985,10 @@ impl CardanoChain for BlockfrostCardanoChain {
             &wallet_utxos,
             key,
             self.tm_script_cbor.as_deref(),
-            mint_ref.as_ref().map(|(h, i, g)| (h.as_str(), *i, *g)),
+            mint_refs,
             Some(cost_models),
             latest_slot_time,
             self.validity_window_secs,
-            epoch,
-            leader_reward,
             fulfilled_por_outpoints,
         )?;
 

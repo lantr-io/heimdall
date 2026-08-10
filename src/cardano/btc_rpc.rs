@@ -63,6 +63,35 @@ pub async fn broadcast_btc_tx(rpc: &BtcRpcConfig, tx_bytes: &[u8]) -> EpochResul
 /// Errors when the outpoint is unknown or already spent — used only to price
 /// the genesis treasury anchor, which must be unspent until the first TM.
 pub async fn get_txout_value_sat(rpc: &BtcRpcConfig, txid: &str, vout: u32) -> EpochResult<u64> {
+    let result = get_txout(rpc, txid, vout).await?;
+    let btc = result
+        .get("value")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| EpochError::Chain("gettxout result has no numeric value".into()))?;
+    bitcoin::Amount::from_btc(btc)
+        .map(bitcoin::Amount::to_sat)
+        .map_err(|e| EpochError::Chain(format!("gettxout value parse: {e}")))
+}
+
+/// Hex scriptPubKey of an unspent outpoint via `gettxout` (mempool included).
+/// Used to select which candidate taproot tree the singleton's head is locked
+/// under — the BridgeState datum records outpoint and amount, not the script.
+pub async fn get_txout_script_pub_key_hex(
+    rpc: &BtcRpcConfig,
+    txid: &str,
+    vout: u32,
+) -> EpochResult<String> {
+    let result = get_txout(rpc, txid, vout).await?;
+    result
+        .get("scriptPubKey")
+        .and_then(|s| s.get("hex"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| EpochError::Chain("gettxout result has no scriptPubKey.hex".into()))
+}
+
+/// The non-null `gettxout` result for an UNSPENT outpoint (mempool included).
+async fn get_txout(rpc: &BtcRpcConfig, txid: &str, vout: u32) -> EpochResult<serde_json::Value> {
     let body = serde_json::json!({
         "jsonrpc": "1.0",
         "id": "heimdall",
@@ -88,16 +117,12 @@ pub async fn get_txout_value_sat(rpc: &BtcRpcConfig, txid: &str, vout: u32) -> E
         return Err(EpochError::Chain(format!("btc rpc error: {err}")));
     }
 
-    let result = json.get("result").filter(|r| !r.is_null()).ok_or_else(|| {
-        EpochError::Chain(format!(
-            "gettxout {txid}:{vout} returned null — outpoint unknown or already spent"
-        ))
-    })?;
-    let btc = result
-        .get("value")
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| EpochError::Chain("gettxout result has no numeric value".into()))?;
-    bitcoin::Amount::from_btc(btc)
-        .map(bitcoin::Amount::to_sat)
-        .map_err(|e| EpochError::Chain(format!("gettxout value parse: {e}")))
+    json.get("result")
+        .filter(|r| !r.is_null())
+        .cloned()
+        .ok_or_else(|| {
+            EpochError::Chain(format!(
+                "gettxout {txid}:{vout} returned null — outpoint unknown or already spent"
+            ))
+        })
 }

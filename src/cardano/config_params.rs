@@ -1,22 +1,21 @@
 //! The bridge **Config** UTxO, read off-chain (spec §Operational parameters).
 //!
 //! The Config UTxO is the NFT-authenticated singleton at `config.ak` that carries
-//! the bridge's wiring (script hashes, token identities) and — appended after
-//! upstream's field #11 — the **operational parameters**: the tunables that no
-//! Aiken validator reads and every off-chain consumer must agree on. They are
-//! governance-updatable through an authorized Config `Update` (field #10,
-//! `update_auth`).
+//! the bridge's wiring (script hashes, token identities) and — nested as field #7
+//! — the **operational parameters**: the tunables that no Aiken validator reads
+//! and every off-chain consumer must agree on. They are governance-updatable
+//! through an authorized Config `Update` (field #0, `update_auth`).
 //!
 //! ## Why heimdall reads them here and not from `heimdall.toml`
 //!
 //! FROST aggregation requires every SPO to build **byte-identical** TM bytes. The
-//! fee rate decides the treasury change amount, and the two floors (#13/#14) decide
-//! the skip set — so a value that differs per operator makes the co-signers sign
+//! fee rate decides the treasury change amount, and the two floors decide the
+//! skip set — so a value that differs per operator makes the co-signers sign
 //! different messages and the round simply cannot converge. Sourcing them from a
 //! single on-chain UTxO is what makes them a consensus input rather than a local
-//! opinion. The `bitcoin.fee_rate_sat_per_vb` / `bitcoin.per_pegout_fee_sat` config
-//! keys survive only as the dev/offline override for the paths that have no
-//! co-signers at all (see [`resolve_tm_params`]).
+//! opinion. The `bitcoin.fee_rate_sat_per_vb` / `bitcoin.per_pegout_fee_sat`
+//! config keys survive only as the dev/offline override for the paths that have
+//! no co-signers at all (see [`resolve_tm_params`]).
 //!
 //! ## The snapshot rule
 //!
@@ -29,43 +28,26 @@
 //! the old datum and another the new one — so the snapshot is retaken rather than
 //! guessed.
 //!
-//! The snapshot is currently the chain tip at the moment the batch is frozen. When
-//! the batch grid lands (plan N19) the slot becomes a grid point and every SPO
-//! reads the *same* slot; the seam is [`ParamSnapshot::slot`], not this decoder.
+//! ## Field numbering (rev 5.4, spec §Config datum — eight fields)
 //!
-//! ## Field numbering
-//!
-//! Indexes are the ones `bifrost/types/config.ak` pins with its
-//! `config_getters_match_datum_fields` test. Positions are a frozen contract —
-//! the datum evolves by APPENDING only — so a reader may safely decode a prefix
-//! and ignore what it does not know:
+//! Positions are a frozen contract — the datum evolves by APPENDING only — so a
+//! reader may safely decode the eight fields it knows and ignore trailing ones:
 //!
 //! | # | field | read here |
 //! |---|-------|-----------|
-//! | 9 | `min_stake` (lovelace) | register-spo's R2 gate |
-//! | 11 | `initial_btc_treasury_utxo` (36 bytes) | the TM chain's genesis anchor |
-//! | 12 | `fee_rate_sat_per_vb` | TM miner fee |
-//! | 13 | `per_pegout_fee` (floor) | TM skip rule |
-//! | 14 | `min_peg_out_fbtc` | TM skip rule |
-//! | 15 | `leader_reward` (lovelace) | pinned into the posted TM datum |
-//! | 16 | `schedule` (`ScheduleParams`) | surfaced; consumed by the N19 batch grid |
-//! | 17 | `spo_bans_policy_id` | the ban script address the roster is filtered against |
-//! | 18–20 | ban schedule (`base_ban_duration_ms`, `max_faults_before_permanent`, `max_validity_window_ms`) | the ApplyBan builder |
-//! | 21–23 | `spos_registry_policy_id`, `treasury_info_policy_id`, `treasury_info_asset_name` | the roster addresses |
+//! | 0 | `update_auth` | no |
+//! | 1 | `bridged_token_policy` | no (heimdall.toml carries it) |
+//! | 2 | `completed_peg_ins_policy` | no |
+//! | 3 | `bridge_state_policy` | locate the bridge-state singleton ([PAR-1]) |
+//! | 4 | `tm_script_hash` | the TM validator hash = TM address ([CFG-2]) |
+//! | 5 | `peg_in_script_hash` | no |
+//! | 6 | `peg_out_script_hash` | no |
+//! | 7 | `params` (nested [`Tunables`]) | TM fee rate + skip floors + schedule |
 //!
-//! ## Why the policy ids are PUBLISHED rather than derived (#17, #21–#23)
-//!
-//! Every other ban value an operator could type — the three schedule numbers, the
-//! fault-verifier policy set, the bootstrap outref — is an *input* to the
-//! `spo_bans` policy id, not an output of it. So a node cannot derive the address
-//! it would read them from without already having them, and getting any one wrong
-//! derives a ban address no deployment has: a silently EMPTY ban list, and banned
-//! SPOs back in the roster with nothing in any log. Publishing the finished policy
-//! id breaks that cycle — a reader trusts the authenticated Config exactly as it
-//! already trusts the contract identifiers #0–#5, and needs no ban configuration
-//! whatsoever. A node that *does* still carry the local keys (for enforcement)
-//! cross-checks what it derives against #17 instead, so a stale copy is a startup
-//! error rather than an empty list. |
+//! Gone from rev 5.1: `min_stake` (the register-spo R2 gate reads the local
+//! `cardano.min_stake_lovelace` now — it never had an on-chain reader),
+//! `initial_btc_treasury_utxo` (the treasury head lives in the bridge-state
+//! singleton) and `leader_reward` (spec §Leader reward: DEFERRED).
 
 use bitcoin::Amount;
 use pallas_codec::minicbor;
@@ -77,22 +59,11 @@ use crate::cardano::plutus;
 use crate::epoch::batch::{BatchWindow, GridParams};
 use tracing::{info, warn};
 
-/// Field count of a Config datum carrying the operational-parameter append
-/// (#12–#16 on top of upstream's 12 fields, `initial_btc_treasury_utxo` last).
-pub const CONFIG_FIELDS_WITH_TUNABLES: usize = 17;
+/// Field count of the rev-5.4 Config datum (spec §Config datum). Appends are the
+/// legal evolution, so a reader accepts MORE fields and refuses fewer.
+pub const CONFIG_FIELDS: usize = 8;
 
-/// Field count of a Config datum carrying the ban-policy append (#17–#20) on top
-/// of the tunables.
-pub const CONFIG_FIELDS_WITH_BANS: usize = 21;
-
-/// Field count of a Config datum that also carries the registry identity
-/// (#21–#23) — the shape a bridge deployed at or after WI-068 genesis has.
-pub const CONFIG_FIELDS_WITH_REGISTRY: usize = 24;
-
-/// Field count of the upstream Config before the tunables were appended.
-const CONFIG_FIELDS_UPSTREAM: usize = 12;
-
-/// Config #16 — the tunable protocol schedule, E-relative slot values (spec
+/// `params[3]` — the tunable protocol schedule, E-relative slot values (spec
 /// §TM batches and the protocol schedule).
 ///
 /// Off-chain readers only, and unlike every other tunable it takes effect from the
@@ -113,66 +84,26 @@ pub struct ScheduleParams {
     pub stability_window: i64,
 }
 
-/// Config #12–#16 — the operational parameters, present together or not at all.
+/// Config #7 — the nested operational-parameter record, positional:
+/// `[fee_rate_sat_per_vb, per_pegout_fee, min_peg_out_fbtc, schedule]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tunables {
-    /// #12, sat/vB. The EXACT miner fee rate, not an estimate.
+    /// params[0], sat/vB. The EXACT miner fee rate, not an estimate.
     pub fee_rate_sat_per_vb: u64,
-    /// #13, satoshi. Floor for a request's own datum-pinned `per_pegout_fee`.
+    /// params[1], satoshi. Floor for a request's own datum-pinned `per_pegout_fee`.
     pub per_pegout_fee_floor: u64,
-    /// #14, satoshi. Minimum fBTC a PegOut request may lock.
+    /// params[2], satoshi. Minimum fBTC a PegOut request may lock.
     pub min_peg_out_fbtc: u64,
-    /// #15, lovelace. Copied into the TM record datum at post time.
-    pub leader_reward: u64,
-    /// #16.
+    /// params[3].
     pub schedule: ScheduleParams,
 }
 
-/// Config #17–#20 — the ban policy, published so no SPO has to configure one.
-///
-/// Split by who needs what: #17 alone serves the MANDATORY read half (the roster
-/// is the registry minus active bans, so every node must read the same list), and
-/// #18–#20 serve the optional enforcement half — `apply_ban` computes a ban's end
-/// time from #18/#19 and bounds the ApplyBan validity interval by #20.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BanParams {
-    /// #17. The `spo_bans` policy id; the ban script address follows from it, so
-    /// this one field is the whole read half.
-    pub spo_bans_policy_id: [u8; 28],
-    /// #18, milliseconds. `base_ban_duration_ms * 2^(n-1)` is the nth ban's length.
-    pub base_ban_duration_ms: i64,
-    /// #19. A pool is banned permanently at this many faults.
-    pub max_faults_before_permanent: i64,
-    /// #20, milliseconds. Upper bound on an ApplyBan tx's validity interval.
-    pub max_validity_window_ms: i64,
-}
+/// The bridged token's asset name — the [CFG-1] protocol constant, not a Config
+/// field (rev 5.4 removed the field: one token is one satoshi, so the name is a
+/// property of the protocol, not of a deployment).
+pub const BRIDGED_TOKEN_ASSET_NAME: &[u8] = b"fSAT";
 
-/// Config #21–#23 — the SPO registry's identity, published for the same reason
-/// as the ban policy: these are the values an SPO would otherwise hand-copy to
-/// locate the roster, and a wrong one yields a well-formed address holding
-/// nothing rather than an error.
-///
-/// Same read/spend split as the ban policy. READING the roster needs only what
-/// is here — no blueprint, no bootstrap outref, no TM-NFT policy. SPENDING the
-/// `treasury_info` state UTxO (the Update-Y key handoff) still needs the
-/// compiled script, so a node that performs handoffs also needs the blueprint;
-/// #22 becomes the cross-check on what it derives.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegistryParams {
-    /// #21. The `spos_registry` policy id; the registry address follows from it.
-    pub spos_registry_policy_id: [u8; 28],
-    /// #22. The `treasury_info` policy id. A pure function of (#21, TM-NFT
-    /// policy), but published anyway: every reader must apply BOTH parameters
-    /// identically or it computes a different hash, a different address and an
-    /// unfindable state UTxO.
-    pub treasury_info_policy_id: [u8; 28],
-    /// #23. Asset name of the `treasury_info` state NFT — chosen at bootstrap
-    /// and derivable from nothing at all, so publishing it is the only way an
-    /// SPO can avoid typing it.
-    pub treasury_info_asset_name: Vec<u8>,
-}
-
-/// Config #0–#5 — the bridge's contract identifiers.
+/// Config #1–#6 — the bridge's contract identifiers.
 ///
 /// These are the AUTHORITATIVE copies. Everything heimdall carries in its own
 /// `[cardano]` section — `bridged_token_unit`, `pegin_policy_id`,
@@ -181,60 +112,53 @@ pub struct RegistryParams {
 /// that goes stale after a redeploy and is discovered at transaction time. The
 /// startup gate (WI-053 step 4) cross-checks the duplicates against these, so a
 /// wrong one is caught on first run instead.
-///
-/// Present in every Config version: they are upstream fields #0–#5, and the datum
-/// only ever grows by appending.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contracts {
-    /// #0
-    pub bridged_token_policy_id: Vec<u8>,
     /// #1
-    pub bridged_token_asset_name: Vec<u8>,
+    pub bridged_token_policy_id: Vec<u8>,
     /// #2
     pub completed_peg_ins_policy_id: Vec<u8>,
-    /// #3
-    pub completed_peg_outs_policy_id: Vec<u8>,
-    /// #4. One Aiken validator serves `mint`, `withdraw` and `spend`, so this
+    /// #3 — the bridge-state singleton's NFT policy. heimdall's
+    /// `cardano.cpo_policy_id` names this policy since rev 5.4.
+    pub bridge_state_policy_id: Vec<u8>,
+    /// #5. One Aiken validator serves `mint`, `withdraw` and `spend`, so this
     /// single hash is both heimdall's `pegin_policy_id` and the payment
     /// credential of `pegin_script_address`.
     pub peg_in_script_hash: Vec<u8>,
-    /// #5. Likewise the payment credential of `pegout_script_address`.
+    /// #6. Likewise the payment credential of `pegout_script_address`.
     pub peg_out_script_hash: Vec<u8>,
 }
 
 impl Contracts {
-    /// The bridged token's `unit` as Blockfrost spells it: policy id ‖ asset name.
+    /// The bridged token's `unit` as Blockfrost spells it: policy id ‖ asset
+    /// name. The name is the [CFG-1] constant, not a datum field.
     #[must_use]
     pub fn bridged_token_unit(&self) -> String {
         format!(
             "{}{}",
             hex::encode(&self.bridged_token_policy_id),
-            hex::encode(&self.bridged_token_asset_name)
+            hex::encode(BRIDGED_TOKEN_ASSET_NAME)
         )
     }
 }
 
 /// The Config datum as heimdall reads it: the fields it consumes, plus the raw
-/// field count that decided whether the tunables were there to consume.
+/// field count (the append-only version marker).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigParams {
-    /// Number of fields in the deployed datum (the append-only version marker).
+    /// Number of fields in the deployed datum (>= [`CONFIG_FIELDS`]).
     pub field_count: usize,
-    /// #0–#5 — the contract identifiers the operator's config duplicates.
+    /// #1–#6 — the contract identifiers the operator's config duplicates.
     pub contracts: Contracts,
-    /// #9 — the DKG candidate-set stake threshold (lovelace).
-    pub min_stake: u64,
-    /// #11 — the anchor outpoint the first TM must spend: txid (internal byte
-    /// order) ‖ vout (4-byte LE). `None` on a Config older than the anchor field.
-    pub initial_btc_treasury_utxo: Option<[u8; 36]>,
-    /// #12–#16, or `None` on a Config that predates the append.
-    pub tunables: Option<Tunables>,
-    /// #17–#20, or `None` on a Config that predates the ban append — on which a
-    /// node falls back to its local `[cardano]` ban keys.
-    pub bans: Option<BanParams>,
-    /// #21–#23, or `None` on a Config that predates the registry append — on
-    /// which a node falls back to its local `[cardano]` registry keys.
-    pub registry: Option<RegistryParams>,
+    /// #3 — the NFT policy of the bridge-state singleton. Every reader locates
+    /// the singleton through this at runtime ([PAR-1]), never a pinned constant.
+    pub bridge_state_policy: [u8; 28],
+    /// #4 — the TM validator script hash = the TM NFT policy = the TM address
+    /// payment credential ([CFG-2]: published so off-chain readers stop pinning
+    /// a build-time constant; no on-chain reader).
+    pub tm_script_hash: [u8; 28],
+    /// #7 — always present in the rev-5.4 layout.
+    pub tunables: Tunables,
 }
 
 /// Which Config UTxO a [`ConfigParams`] was read from.
@@ -307,8 +231,9 @@ pub fn resolve_tm_params(
     local_fee_rate_sat_per_vb: u64,
 ) -> (TmParams, ParamSource) {
     match snapshot {
-        Some(s) => match &s.config.params.tunables {
-            Some(t) => (
+        Some(s) => {
+            let t = &s.config.params.tunables;
+            (
                 TmParams {
                     fee_rate_sat_per_vb: t.fee_rate_sat_per_vb,
                     per_pegout_fee_floor: Amount::from_sat(t.per_pegout_fee_floor),
@@ -318,14 +243,8 @@ pub fn resolve_tm_params(
                     utxo: s.config.utxo.clone(),
                     slot: s.slot,
                 },
-            ),
-            None => (
-                TmParams::fee_rate_only(local_fee_rate_sat_per_vb),
-                ParamSource::LocalOverride(
-                    "the deployed Config predates the operational-parameter fields",
-                ),
-            ),
-        },
+            )
+        }
         None => (
             TmParams::fee_rate_only(local_fee_rate_sat_per_vb),
             ParamSource::LocalOverride("no Config UTxO configured"),
@@ -337,201 +256,86 @@ pub fn resolve_tm_params(
 // Decoding
 // ---------------------------------------------------------------------------
 
-/// Decode a Config datum.
+/// Decode a Config datum (rev 5.4, eight fields).
 ///
-/// Reads a PREFIX of the fields and tolerates unknown trailing ones — the datum
+/// Reads the fields it knows and tolerates unknown TRAILING ones — the datum
 /// evolves by appending, and a reader that insisted on an exact arity would have
-/// to be redeployed for every governance addition (the same reasoning that keeps
-/// the Aiken side on positional getters instead of a full `expect` cast).
+/// to be redeployed for every governance addition. Fewer than [`CONFIG_FIELDS`]
+/// fields is a different (older or foreign) datum and is refused.
 pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
     let fields = plutus::constr_fields(datum, 0).map_err(|e| format!("config datum: {e}"))?;
     let field_count = fields.len();
+    if field_count < CONFIG_FIELDS {
+        return Err(format!(
+            "config datum has {field_count} fields, expected >= {CONFIG_FIELDS} (rev 5.4) — \
+             this deployment predates the bridge-state singleton layout"
+        ));
+    }
 
     let contract_field = |i: usize, name: &str| -> Result<Vec<u8>, String> {
         plutus::field_bytes(fields, i).map_err(|e| format!("config #{i} ({name}): {e}"))
     };
     let contracts = Contracts {
-        bridged_token_policy_id: contract_field(0, "bridged_token_policy_id")?,
-        bridged_token_asset_name: contract_field(1, "bridged_token_asset_name")?,
-        completed_peg_ins_policy_id: contract_field(2, "completed_peg_ins_merkle_tree_policy_id")?,
-        completed_peg_outs_policy_id: contract_field(
-            3,
-            "completed_peg_outs_merkle_tree_policy_id",
+        bridged_token_policy_id: contract_field(1, "bridged_token_policy")?,
+        completed_peg_ins_policy_id: contract_field(2, "completed_peg_ins_policy")?,
+        bridge_state_policy_id: contract_field(3, "bridge_state_policy")?,
+        peg_in_script_hash: contract_field(5, "peg_in_script_hash")?,
+        peg_out_script_hash: contract_field(6, "peg_out_script_hash")?,
+    };
+
+    let bridge_state_policy = field_hash28(fields, 3, "bridge_state_policy")?;
+    let tm_script_hash = field_hash28(fields, 4, "tm_script_hash")?;
+
+    let params =
+        plutus::constr_fields(&fields[7], 0).map_err(|e| format!("config #7 (params): {e}"))?;
+    if params.len() != 4 {
+        return Err(format!(
+            "config #7 (params) has {} slots, expected 4 \
+             [fee_rate, per_pegout_fee, min_peg_out_fbtc, schedule]",
+            params.len()
+        ));
+    }
+    let tunables = Tunables {
+        fee_rate_sat_per_vb: positive(
+            plutus::field_int(params, 0)
+                .map_err(|e| format!("config params[0] (fee_rate_sat_per_vb): {e}"))?,
+            "config params[0] (fee_rate_sat_per_vb)",
         )?,
-        peg_in_script_hash: contract_field(4, "peg_in_withdraw_script_hash")?,
-        peg_out_script_hash: contract_field(5, "peg_out_withdraw_script_hash")?,
-    };
-
-    let min_stake = nonneg(
-        plutus::field_int(fields, 9).map_err(|e| format!("config #9 (min_stake): {e}"))?,
-        "config #9 (min_stake)",
-    )?;
-
-    let initial_btc_treasury_utxo = if field_count > 11 {
-        let raw = plutus::field_bytes(fields, 11)
-            .map_err(|e| format!("config #11 (initial_btc_treasury_utxo): {e}"))?;
-        let len = raw.len();
-        Some(<[u8; 36]>::try_from(raw).map_err(|_| {
-            format!("config #11 (initial_btc_treasury_utxo) must be 36 bytes, got {len}")
-        })?)
-    } else {
-        None
-    };
-
-    // All five tunables landed in one append, so a datum stopping inside them is a
-    // botched governance Update, not a version this reader should interpret. Fail
-    // loudly instead of silently substituting local values for the missing half.
-    let tunables = if field_count >= CONFIG_FIELDS_WITH_TUNABLES {
-        Some(Tunables {
-            fee_rate_sat_per_vb: positive(
-                plutus::field_int(fields, 12)
-                    .map_err(|e| format!("config #12 (fee_rate_sat_per_vb): {e}"))?,
-                "config #12 (fee_rate_sat_per_vb)",
-            )?,
-            per_pegout_fee_floor: nonneg(
-                plutus::field_int(fields, 13)
-                    .map_err(|e| format!("config #13 (per_pegout_fee): {e}"))?,
-                "config #13 (per_pegout_fee)",
-            )?,
-            min_peg_out_fbtc: nonneg(
-                plutus::field_int(fields, 14)
-                    .map_err(|e| format!("config #14 (min_peg_out_fbtc): {e}"))?,
-                "config #14 (min_peg_out_fbtc)",
-            )?,
-            leader_reward: nonneg(
-                plutus::field_int(fields, 15)
-                    .map_err(|e| format!("config #15 (leader_reward): {e}"))?,
-                "config #15 (leader_reward)",
-            )?,
-            schedule: parse_schedule(&fields[16])?,
-        })
-    } else if field_count > CONFIG_FIELDS_UPSTREAM {
-        return Err(format!(
-            "config datum has {field_count} fields — the operational parameters are fields \
-             #12-#16, so a datum between {} and {} fields is a partially-applied governance \
-             Update. Refusing to guess which half is missing",
-            CONFIG_FIELDS_UPSTREAM + 1,
-            CONFIG_FIELDS_WITH_TUNABLES - 1,
-        ));
-    } else {
-        None
-    };
-
-    // Same rule one append later: #17-#20 landed together, so a datum stopping
-    // inside them is a botched Update. Refusing beats deriving a ban address from
-    // half a record — the failure that would produce is an empty ban list, which
-    // looks exactly like a bridge with no bans.
-    let bans = if field_count >= CONFIG_FIELDS_WITH_BANS {
-        Some(parse_bans(fields)?)
-    } else if field_count > CONFIG_FIELDS_WITH_TUNABLES {
-        return Err(format!(
-            "config datum has {field_count} fields — the ban policy is fields #17-#20, so a \
-             datum between {} and {} fields is a partially-applied governance Update. Refusing \
-             to guess which half is missing",
-            CONFIG_FIELDS_WITH_TUNABLES + 1,
-            CONFIG_FIELDS_WITH_BANS - 1,
-        ));
-    } else {
-        None
-    };
-
-    // Same all-or-nothing rule once more: #21-#23 landed as one append.
-    let registry = if field_count >= CONFIG_FIELDS_WITH_REGISTRY {
-        Some(parse_registry(fields)?)
-    } else if field_count > CONFIG_FIELDS_WITH_BANS {
-        return Err(format!(
-            "config datum has {field_count} fields — the registry identity is fields #21-#23, \
-             so a datum between {} and {} fields is a partially-applied governance Update. \
-             Refusing to guess which half is missing",
-            CONFIG_FIELDS_WITH_BANS + 1,
-            CONFIG_FIELDS_WITH_REGISTRY - 1,
-        ));
-    } else {
-        None
+        per_pegout_fee_floor: nonneg(
+            plutus::field_int(params, 1)
+                .map_err(|e| format!("config params[1] (per_pegout_fee): {e}"))?,
+            "config params[1] (per_pegout_fee)",
+        )?,
+        min_peg_out_fbtc: nonneg(
+            plutus::field_int(params, 2)
+                .map_err(|e| format!("config params[2] (min_peg_out_fbtc): {e}"))?,
+            "config params[2] (min_peg_out_fbtc)",
+        )?,
+        schedule: parse_schedule(&params[3])?,
     };
 
     Ok(ConfigParams {
         field_count,
         contracts,
-        min_stake,
-        initial_btc_treasury_utxo,
+        bridge_state_policy,
+        tm_script_hash,
         tunables,
-        bans,
-        registry,
     })
 }
 
-/// Decode #21–#23.
-fn parse_registry(fields: &[PlutusData]) -> Result<RegistryParams, String> {
-    let policy = |i: usize, name: &str| -> Result<[u8; 28], String> {
-        let raw =
-            plutus::field_bytes(fields, i).map_err(|e| format!("config #{i} ({name}): {e}"))?;
-        let len = raw.len();
-        <[u8; 28]>::try_from(raw).map_err(|_| {
-            format!("config #{i} ({name}) must be a 28-byte policy id, got {len} bytes")
-        })
-    };
-    let treasury_info_asset_name = plutus::field_bytes(fields, 23)
-        .map_err(|e| format!("config #23 (treasury_info_asset_name): {e}"))?;
-    // An empty asset name would match the policy's every token, so the state
-    // UTxO scan could not tell the singleton from anything else minted under it.
-    if treasury_info_asset_name.is_empty() {
-        return Err("config #23 (treasury_info_asset_name) is empty".to_string());
-    }
-    Ok(RegistryParams {
-        spos_registry_policy_id: policy(21, "spos_registry_policy_id")?,
-        treasury_info_policy_id: policy(22, "treasury_info_policy_id")?,
-        treasury_info_asset_name,
-    })
-}
-
-/// Decode #17–#20.
-///
-/// The bounds are `spo_bans`' own `ban_config_ok` bounds, checked here for the
-/// same reason the decoder rejects a zero fee rate: governance sanity is
-/// upstream's job, and refusing to act on a value the contract could not have
-/// been deployed with is ours. A zero `base_ban_duration_ms` would apply bans
-/// that expire the instant they start.
-fn parse_bans(fields: &[PlutusData]) -> Result<BanParams, String> {
-    let raw = plutus::field_bytes(fields, 17)
-        .map_err(|e| format!("config #17 (spo_bans_policy_id): {e}"))?;
+/// The `ByteArray` field at index `i`, required to be a 28-byte script hash.
+fn field_hash28(fields: &[PlutusData], i: usize, name: &str) -> Result<[u8; 28], String> {
+    let raw = plutus::field_bytes(fields, i).map_err(|e| format!("config #{i} ({name}): {e}"))?;
     let len = raw.len();
-    let spo_bans_policy_id = <[u8; 28]>::try_from(raw).map_err(|_| {
-        format!("config #17 (spo_bans_policy_id) must be a 28-byte policy id, got {len} bytes")
-    })?;
-    let at = |i: usize, name: &str| -> Result<i64, String> {
-        plutus::field_int(fields, i).map_err(|e| format!("config #{i} ({name}): {e}"))
-    };
-    let base_ban_duration_ms = at(18, "base_ban_duration_ms")?;
-    let max_faults_before_permanent = at(19, "max_faults_before_permanent")?;
-    let max_validity_window_ms = at(20, "max_validity_window_ms")?;
-    if base_ban_duration_ms <= 0 {
-        return Err(format!(
-            "config #18 (base_ban_duration_ms) must be > 0, got {base_ban_duration_ms}"
-        ));
-    }
-    if max_faults_before_permanent <= 0 {
-        return Err(format!(
-            "config #19 (max_faults_before_permanent) must be > 0, got {max_faults_before_permanent}"
-        ));
-    }
-    if max_validity_window_ms < 0 {
-        return Err(format!(
-            "config #20 (max_validity_window_ms) must be >= 0, got {max_validity_window_ms}"
-        ));
-    }
-    Ok(BanParams {
-        spo_bans_policy_id,
-        base_ban_duration_ms,
-        max_faults_before_permanent,
-        max_validity_window_ms,
-    })
+    <[u8; 28]>::try_from(raw)
+        .map_err(|_| format!("config #{i} ({name}) must be a 28-byte script hash, got {len}"))
 }
 
 fn parse_schedule(data: &PlutusData) -> Result<ScheduleParams, String> {
-    let f = plutus::constr_fields(data, 0).map_err(|e| format!("config #16 (schedule): {e}"))?;
+    let f =
+        plutus::constr_fields(data, 0).map_err(|e| format!("config params[3] (schedule): {e}"))?;
     let at = |i: usize, name: &str| -> Result<i64, String> {
-        plutus::field_int(f, i).map_err(|e| format!("config #16 (schedule.{name}): {e}"))
+        plutus::field_int(f, i).map_err(|e| format!("config params[3] (schedule.{name}): {e}"))
     };
     Ok(ScheduleParams {
         dkg_r1_deadline: at(0, "dkg_r1_deadline")?,
@@ -650,7 +454,7 @@ pub async fn fetch_param_snapshot(
                 Ok(secs) => Some(secs.saturating_mul(1000)),
                 Err(e) => {
                     warn!(
-                        "[config] WARNING: could not read the Config UTxO's creation time \
+                        "[config] could not read the Config UTxO's creation time \
                          ({e}) — cannot check it predates this batch's snapshot slot {slot}"
                     );
                     None
@@ -699,15 +503,7 @@ pub async fn batch_at(
     bf_project_id: &str,
     snapshot: &ParamSnapshot,
 ) -> BatchWindow {
-    let Some(schedule) = snapshot
-        .config
-        .params
-        .tunables
-        .as_ref()
-        .map(|t| &t.schedule)
-    else {
-        return BatchWindow::NoGrid;
-    };
+    let schedule = &snapshot.config.params.tunables.schedule;
     let epoch_start_slot = match epoch_start_slot(bf_base_url, bf_project_id, snapshot).await {
         Ok(slot) => slot,
         Err(e) => {
@@ -772,7 +568,7 @@ async fn epoch_start_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cardano::plutus::{bytes, constr, int, int_from_u64};
+    use crate::cardano::plutus::{bytes, constr, int};
 
     fn schedule_data() -> PlutusData {
         constr(
@@ -792,52 +588,24 @@ mod tests {
         )
     }
 
-    /// The deployed 17-field shape (upstream #0-#11 + the tunables append).
+    /// The deployed rev-5.4 eight-field shape (spec §Config datum).
     fn config_datum(fee_rate: i64, floor: i64, min_peg_out: i64) -> PlutusData {
-        let mut fields = vec![
-            bytes(&[0xaa, 0x00]), // #0  bridged_token_policy_id
-            bytes(&[0xaa, 0x01]), // #1  bridged_token_asset_name
-            bytes(&[0xaa, 0x02]), // #2  completed_peg_ins policy
-            bytes(&[0xaa, 0x03]), // #3  completed_peg_outs policy
-            bytes(&[0xaa, 0x04]), // #4  peg_in withdraw script hash
-            bytes(&[0xaa, 0x05]), // #5  peg_out withdraw script hash
-            bytes(&[0xaa, 0x06]), // #6  peg_in close verifier
-            bytes(&[0xaa, 0x07]), // #7  TM + peg-out produced verifier
-            bytes(&[0xaa, 0x08]), // #8  TM + peg-out NOT produced verifier
-            int(60_000_000),      // #9  min_stake
-            constr(1, vec![]),    // #10 update_auth = None
-            bytes(&[0x11; 36]),   // #11 initial_btc_treasury_utxo
-        ];
-        fields.push(int(fee_rate)); // #12
-        fields.push(int(floor)); // #13
-        fields.push(int(min_peg_out)); // #14
-        fields.push(int_from_u64(2_000_000)); // #15 leader_reward
-        fields.push(schedule_data()); // #16
-        constr(0, fields)
-    }
-
-    /// The 17-field shape plus the ban append (#17-#20).
-    fn config_datum_with_bans(policy: [u8; 28]) -> PlutusData {
-        let mut fields = plutus::constr_fields(&config_datum(7, 1_000, 100_000), 0)
-            .unwrap()
-            .to_vec();
-        fields.push(bytes(&policy)); // #17 spo_bans_policy_id
-        fields.push(int(600_000)); // #18 base_ban_duration_ms
-        fields.push(int(3)); // #19 max_faults_before_permanent
-        fields.push(int(3_600_000)); // #20 max_validity_window_ms
-        constr(0, fields)
-    }
-
-    /// The full genesis shape a WI-068 `deploy-bridge` writes: the ban policy
-    /// plus the registry identity.
-    fn config_datum_full() -> PlutusData {
-        let mut fields = plutus::constr_fields(&config_datum_with_bans([0xbb; 28]), 0)
-            .unwrap()
-            .to_vec();
-        fields.push(bytes(&[0xc1; 28])); // #21 spos_registry_policy_id
-        fields.push(bytes(&[0xc2; 28])); // #22 treasury_info_policy_id
-        fields.push(bytes(b"TMTx")); // #23 treasury_info_asset_name
-        constr(0, fields)
+        constr(
+            0,
+            vec![
+                constr(1, vec![]),  // #0 update_auth = None
+                bytes(&[0xaa; 28]), // #1 bridged_token_policy
+                bytes(&[0xab; 28]), // #2 completed_peg_ins_policy
+                bytes(&[0xb5; 28]), // #3 bridge_state_policy
+                bytes(&[0xac; 28]), // #4 tm_script_hash
+                bytes(&[0xad; 28]), // #5 peg_in_script_hash
+                bytes(&[0xae; 28]), // #6 peg_out_script_hash
+                constr(
+                    0,
+                    vec![int(fee_rate), int(floor), int(min_peg_out), schedule_data()],
+                ), // #7 params
+            ],
+        )
     }
 
     fn snapshot_of(datum: &PlutusData) -> ParamSnapshot {
@@ -859,223 +627,82 @@ mod tests {
     fn decodes_the_contract_identifiers() {
         let p = parse_config_datum(&config_datum(7, 1_000, 100_000)).unwrap();
         let c = &p.contracts;
-        assert_eq!(c.bridged_token_policy_id, vec![0xaa, 0x00]);
-        assert_eq!(c.bridged_token_asset_name, vec![0xaa, 0x01]);
-        assert_eq!(c.completed_peg_ins_policy_id, vec![0xaa, 0x02]);
-        assert_eq!(c.completed_peg_outs_policy_id, vec![0xaa, 0x03]);
-        assert_eq!(c.peg_in_script_hash, vec![0xaa, 0x04]);
-        assert_eq!(c.peg_out_script_hash, vec![0xaa, 0x05]);
-        // The unit is the concatenation Blockfrost uses, not a tuple.
-        assert_eq!(c.bridged_token_unit(), "aa00aa01");
+        assert_eq!(c.bridged_token_policy_id, vec![0xaa; 28]);
+        assert_eq!(c.completed_peg_ins_policy_id, vec![0xab; 28]);
+        assert_eq!(c.bridge_state_policy_id, vec![0xb5; 28]);
+        assert_eq!(c.peg_in_script_hash, vec![0xad; 28]);
+        assert_eq!(c.peg_out_script_hash, vec![0xae; 28]);
+        // The unit is the Blockfrost concatenation, with the [CFG-1] constant name.
+        assert_eq!(
+            c.bridged_token_unit(),
+            format!("{}{}", "aa".repeat(28), hex::encode(b"fSAT"))
+        );
     }
 
     #[test]
-    fn contract_identifiers_decode_on_a_pre_tunables_config_too() {
-        // They are upstream fields #0-#5, so every Config version has them —
-        // the startup cross-check must work against an older bridge as well.
-        let mut fields = match config_datum(1, 0, 0) {
-            PlutusData::Constr(c) => c.fields.to_vec(),
-            _ => unreachable!(),
-        };
-        fields.truncate(CONFIG_FIELDS_UPSTREAM);
-        let p = parse_config_datum(&constr(0, fields)).unwrap();
-        assert_eq!(p.field_count, CONFIG_FIELDS_UPSTREAM);
-        assert!(p.tunables.is_none());
-        assert_eq!(p.contracts.peg_in_script_hash, vec![0xaa, 0x04]);
-    }
-
-    #[test]
-    fn decodes_the_deployed_17_field_config() {
+    fn decodes_the_deployed_8_field_config() {
         let p = parse_config_datum(&config_datum(7, 1_000, 100_000)).unwrap();
-        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_TUNABLES);
-        assert_eq!(p.min_stake, 60_000_000);
-        assert_eq!(p.initial_btc_treasury_utxo, Some([0x11; 36]));
-        let t = p.tunables.unwrap();
+        assert_eq!(p.field_count, CONFIG_FIELDS);
+        assert_eq!(p.bridge_state_policy, [0xb5; 28]);
+        assert_eq!(p.tm_script_hash, [0xac; 28]);
+        let t = &p.tunables;
         assert_eq!(t.fee_rate_sat_per_vb, 7);
         assert_eq!(t.per_pegout_fee_floor, 1_000);
         assert_eq!(t.min_peg_out_fbtc, 100_000);
-        assert_eq!(t.leader_reward, 2_000_000);
         assert_eq!(t.schedule.tm_batch_interval, 21_600);
         assert_eq!(t.schedule.stability_window, 129_601);
     }
 
-    /// A Config deployed before the append still resolves — it just has no
-    /// tunables, which is what makes the local override legitimate there.
+    /// Appending is the legal evolution: unknown trailing fields are ignored.
     #[test]
-    fn a_pre_append_config_has_no_tunables() {
+    fn a_config_grown_past_8_fields_still_decodes() {
         let full = config_datum(7, 1_000, 100_000);
-        let fields = plutus::constr_fields(&full, 0).unwrap()[..12].to_vec();
+        let mut fields = plutus::constr_fields(&full, 0).unwrap().to_vec();
+        fields.push(int(99));
         let p = parse_config_datum(&constr(0, fields)).unwrap();
-        assert_eq!(p.field_count, 12);
-        assert_eq!(p.initial_btc_treasury_utxo, Some([0x11; 36]));
-        assert!(p.tunables.is_none());
+        assert_eq!(p.field_count, 9);
+        assert_eq!(p.tunables.fee_rate_sat_per_vb, 7);
     }
 
-    /// Half an append is a botched governance Update, not a datum version.
+    /// A shorter datum is an OLDER layout, not a version this reader guesses at.
     #[test]
-    fn a_partial_tunables_append_is_rejected() {
+    fn a_pre_rev_5_4_config_is_refused() {
         let full = config_datum(7, 1_000, 100_000);
-        let fields = plutus::constr_fields(&full, 0).unwrap()[..15].to_vec();
+        let fields = plutus::constr_fields(&full, 0).unwrap()[..7].to_vec();
         let err = parse_config_datum(&constr(0, fields)).unwrap_err();
-        assert!(err.contains("partially-applied"), "{err}");
+        assert!(err.contains("predates"), "{err}");
     }
 
+    /// The nested params record's arity is exact: a fifth slot is a layout this
+    /// reader does not know, and half a record is a botched Update.
     #[test]
-    fn decodes_the_published_ban_policy() {
-        let p = parse_config_datum(&config_datum_with_bans([0xbb; 28])).unwrap();
-        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_BANS);
-        let b = p.bans.unwrap();
-        assert_eq!(b.spo_bans_policy_id, [0xbb; 28]);
-        assert_eq!(b.base_ban_duration_ms, 600_000);
-        assert_eq!(b.max_faults_before_permanent, 3);
-        assert_eq!(b.max_validity_window_ms, 3_600_000);
-        // …and the tunables below it still decode: the ban fields are an append,
-        // not a replacement.
-        assert_eq!(p.tunables.unwrap().fee_rate_sat_per_vb, 7);
+    fn a_params_record_with_the_wrong_arity_is_rejected() {
+        let err = parse_config_datum(&constr(
+            0,
+            vec![
+                constr(1, vec![]),
+                bytes(&[0xaa; 28]),
+                bytes(&[0xab; 28]),
+                bytes(&[0xb5; 28]),
+                bytes(&[0xac; 28]),
+                bytes(&[0xad; 28]),
+                bytes(&[0xae; 28]),
+                constr(0, vec![int(7), int(1_000), int(100_000)]),
+            ],
+        ))
+        .unwrap_err();
+        assert!(err.contains("expected 4"), "{err}");
     }
 
-    /// The deployed preprod shape, until the migrating Update lands. It must keep
-    /// working — a reader that required #17 would brick every node on the bridge
-    /// the moment it shipped.
+    /// A wrong-width script hash at #3/#4 is a wrong VALUE, not a shorter one.
     #[test]
-    fn the_17_field_config_has_no_published_bans() {
-        let p = parse_config_datum(&config_datum(7, 1_000, 100_000)).unwrap();
-        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_TUNABLES);
-        assert!(p.bans.is_none());
-    }
-
-    /// Half the ban append is a botched Update. Guessing would derive a ban
-    /// address from a partial record — a valid-looking address holding no bans,
-    /// which reads exactly like a bridge that has never banned anyone.
-    #[test]
-    fn a_partial_ban_append_is_rejected() {
-        let full = config_datum_with_bans([0xbb; 28]);
-        for n in [18usize, 19, 20] {
-            let fields = plutus::constr_fields(&full, 0).unwrap()[..n].to_vec();
-            let err = parse_config_datum(&constr(0, fields)).unwrap_err();
-            assert!(err.contains("partially-applied"), "{n} fields: {err}");
-        }
-    }
-
-    #[test]
-    fn a_ban_policy_id_of_the_wrong_length_is_rejected() {
-        let mut fields = plutus::constr_fields(&config_datum_with_bans([0xbb; 28]), 0)
+    fn a_short_bridge_state_policy_is_rejected() {
+        let mut fields = plutus::constr_fields(&config_datum(7, 1, 2), 0)
             .unwrap()
             .to_vec();
-        fields[17] = bytes(&[0xbb; 27]);
+        fields[3] = bytes(&[0xb5; 27]);
         let err = parse_config_datum(&constr(0, fields)).unwrap_err();
-        assert!(err.contains("28-byte policy id"), "{err}");
-    }
-
-    /// `ban_config_ok`'s own bounds: a value the contract could not have been
-    /// deployed with means the reader is looking at the wrong thing.
-    #[test]
-    fn out_of_range_ban_schedule_values_are_rejected() {
-        let bad = |i: usize, v: i64| {
-            let mut fields = plutus::constr_fields(&config_datum_with_bans([0xbb; 28]), 0)
-                .unwrap()
-                .to_vec();
-            fields[i] = int(v);
-            parse_config_datum(&constr(0, fields)).unwrap_err()
-        };
-        assert!(bad(18, 0).contains("base_ban_duration_ms"));
-        assert!(bad(19, 0).contains("max_faults_before_permanent"));
-        assert!(bad(20, -1).contains("max_validity_window_ms"));
-    }
-
-    /// The cross-repo check: this is the datum `binocular update-config` actually
-    /// produces when it appends the ban policy to a 17-field Config, emitted from
-    /// `UpdateConfigCommand.rewriteFields` and serialised with Scalus. Two
-    /// independent encoders of one datum is exactly where a positional record
-    /// goes wrong, and the failure mode — a reader that mis-decodes #17 — is a
-    /// wrong ban address holding no bans.
-    #[test]
-    fn decodes_the_datum_binocular_update_config_writes() {
-        const VECTOR: &str = concat!(
-            "d8799f4100410141024103410441054106410741081a03938700410a58241111111111111111",
-            "11111111111111111111111111111111111111111111111111111111021903e81927101a001e",
-            "8480d8799f190e10191c20192a301954601907081907081902581a0001fa401a000546001a00",
-            "01fa40ff581cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1a000927",
-            "c0031a0036ee80ff",
-        );
-        let cbor = hex::decode(VECTOR).unwrap();
-        let datum: PlutusData = minicbor::decode(&cbor).unwrap();
-        let p = parse_config_datum(&datum).unwrap();
-
-        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_BANS);
-        let b = p.bans.expect("the appended ban policy");
-        assert_eq!(b.spo_bans_policy_id, [0xbb; 28]);
-        assert_eq!(b.base_ban_duration_ms, 600_000);
-        assert_eq!(b.max_faults_before_permanent, 3);
-        assert_eq!(b.max_validity_window_ms, 3_600_000);
-        // The append did not disturb what was already there.
-        assert_eq!(p.min_stake, 60_000_000);
-        assert_eq!(p.initial_btc_treasury_utxo, Some([0x11; 36]));
-        let t = p.tunables.expect("the tunables survive the append");
-        assert_eq!(t.fee_rate_sat_per_vb, 2);
-        assert_eq!(t.leader_reward, 2_000_000);
-        assert_eq!(t.schedule.tm_batch_interval, 21_600);
-    }
-
-    #[test]
-    fn decodes_the_published_registry_identity() {
-        let p = parse_config_datum(&config_datum_full()).unwrap();
-        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_REGISTRY);
-        let r = p.registry.unwrap();
-        assert_eq!(r.spos_registry_policy_id, [0xc1; 28]);
-        assert_eq!(r.treasury_info_policy_id, [0xc2; 28]);
-        assert_eq!(r.treasury_info_asset_name, b"TMTx");
-        // The appends below it are untouched.
-        assert_eq!(p.bans.unwrap().spo_bans_policy_id, [0xbb; 28]);
-        assert_eq!(p.tunables.unwrap().fee_rate_sat_per_vb, 7);
-    }
-
-    /// Both earlier shapes keep working: a bridge with the ban append but not the
-    /// registry one, and the deployed 17-field bridge with neither.
-    #[test]
-    fn the_earlier_config_shapes_have_no_published_registry() {
-        for (datum, bans) in [
-            (config_datum_with_bans([0xbb; 28]), true),
-            (config_datum(7, 1_000, 100_000), false),
-        ] {
-            let p = parse_config_datum(&datum).unwrap();
-            assert!(p.registry.is_none());
-            assert_eq!(p.bans.is_some(), bans);
-        }
-    }
-
-    #[test]
-    fn a_partial_registry_append_is_rejected() {
-        let full = config_datum_full();
-        for n in [22usize, 23] {
-            let fields = plutus::constr_fields(&full, 0).unwrap()[..n].to_vec();
-            let err = parse_config_datum(&constr(0, fields)).unwrap_err();
-            assert!(err.contains("partially-applied"), "{n} fields: {err}");
-        }
-    }
-
-    /// An empty asset name matches every token of the policy, so the state-UTxO
-    /// scan could not tell the singleton from anything else minted under it.
-    #[test]
-    fn an_empty_treasury_info_asset_name_is_rejected() {
-        let mut fields = plutus::constr_fields(&config_datum_full(), 0)
-            .unwrap()
-            .to_vec();
-        fields[23] = bytes(&[]);
-        let err = parse_config_datum(&constr(0, fields)).unwrap_err();
-        assert!(err.contains("treasury_info_asset_name"), "{err}");
-    }
-
-    #[test]
-    fn a_registry_policy_id_of_the_wrong_length_is_rejected() {
-        for i in [21usize, 22] {
-            let mut fields = plutus::constr_fields(&config_datum_full(), 0)
-                .unwrap()
-                .to_vec();
-            fields[i] = bytes(&[0xc1; 27]);
-            let err = parse_config_datum(&constr(0, fields)).unwrap_err();
-            assert!(err.contains("28-byte policy id"), "#{i}: {err}");
-        }
+        assert!(err.contains("bridge_state_policy"), "{err}");
     }
 
     #[test]
@@ -1107,16 +734,6 @@ mod tests {
         assert_eq!(p, TmParams::fee_rate_only(3));
         assert!(matches!(src, ParamSource::LocalOverride(_)));
         assert!(src.to_string().contains("LOCAL"));
-    }
-
-    #[test]
-    fn a_pre_append_config_falls_back_to_the_local_override() {
-        let full = config_datum(7, 1_000, 100_000);
-        let fields = plutus::constr_fields(&full, 0).unwrap()[..12].to_vec();
-        let snap = snapshot_of(&constr(0, fields));
-        let (p, src) = resolve_tm_params(Some(&snap), 3);
-        assert_eq!(p, TmParams::fee_rate_only(3), "local fee rate, zero floors");
-        assert!(matches!(src, ParamSource::LocalOverride(_)));
     }
 
     /// The acceptance criterion end to end: two nodes whose `heimdall.toml` fee

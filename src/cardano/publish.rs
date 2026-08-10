@@ -7,22 +7,23 @@
 //! signed BTC tx as an inline datum:
 //!
 //! ```text
-//! Constr(0, [BoundedBytes(signed_btc_tx), BoundedBytes(creator_pkh), BigInt(created_ms)])
+//! Constr(0, [signed_btc_tx, creator_pkh, created_ms, fulfilled_por_outpoints])
 //! ```
 //!
-//! Constructor 0 = unconfirmed TM tx (confirmed = constructor 1, set
-//! by Binocular after Bitcoin inclusion proof). The new UTxO also
-//! carries 1 freshly-minted TM NFT: under the real
+//! Constructor 0 = the `UnconfirmedTm` record — rev 5.4's ONLY TM datum
+//! (Confirm burns the record; no Constr-1 `Confirmed` exists). The new
+//! UTxO also carries 1 freshly-minted TM NFT: under the real
 //! TreasuryMovementValidator policy the mint is permissionless but
-//! gated by chain linkage — the redeemer names the Config UTxO
-//! (Genesis) or the predecessor Confirmed record (Chain) as a
-//! reference input and the validator checks the embedded BTC tx
-//! spends that treasury outpoint. The always-ok scaffold policy
-//! (`ALWAYS_OK_PLUTUS_CBOR_HEX`) remains the no-script fallback.
+//! gated by chain linkage — the redeemer carries the reference-input
+//! index of the bridge-state singleton ([PTM-6]/[PTM-7]), the Config
+//! UTxO rides along as a second reference input (the validator reads
+//! `bridge_state_policy` from it, [PAR-1]), and the validator checks
+//! the embedded BTC tx spends the singleton's `treasury_utxo_id`. The
+//! always-ok scaffold policy (`ALWAYS_OK_PLUTUS_CBOR_HEX`) remains the
+//! no-script fallback.
 //!
-//! The old oracle UTxO is NOT spent — old confirmed UTxOs are needed
-//! for minting fBTC proofs. The current treasury is resolved by
-//! walking the Confirmed TM chain (see `cardano::tm_chain`).
+//! The current treasury is the singleton's head — no Confirmed chain
+//! walk exists any more.
 
 use pallas_codec::minicbor;
 use pallas_codec::utils::{Bytes, NonEmptySet};
@@ -75,19 +76,51 @@ impl WalletUtxo {
     }
 }
 
-/// Encode the treasury oracle datum:
+/// The two reference inputs a real-validator TM post carries: the Config UTxO
+/// and the bridge-state singleton, each as `(tx_hash_hex, output_index)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintRefs {
+    pub config: (String, u32),
+    pub singleton: (String, u32),
+}
+
+impl MintRefs {
+    /// The reference inputs in the order the LEDGER presents them to the script:
+    /// sorted by (tx_hash bytes, index). The redeemer's singleton index must be
+    /// computed against exactly this order, or `.at(i)` on-chain reads the wrong
+    /// reference input.
+    #[must_use]
+    pub fn sorted(&self) -> Vec<(String, u32)> {
+        let mut refs = vec![self.config.clone(), self.singleton.clone()];
+        refs.sort();
+        refs
+    }
+
+    /// 0-based position of the singleton among [`Self::sorted`].
+    #[must_use]
+    pub fn singleton_sorted_index(&self) -> u32 {
+        u32::try_from(
+            self.sorted()
+                .iter()
+                .position(|r| *r == self.singleton)
+                .expect("singleton is in its own sorted set"),
+        )
+        .expect("two refs")
+    }
+}
+
+/// Encode the `UnconfirmedTm` datum:
 /// `Constr(constructor, [BoundedBytes(btc_tx), BoundedBytes(creator_pkh), BigInt(created_ms),
-/// BigInt(epoch), BigInt(leader_reward), [BoundedBytes(outpoint_36) ..]])`.
+/// [BoundedBytes(outpoint_36) ..]])`.
 ///
-/// Constructor 0 = unconfirmed TM tx; 1 = confirmed (set by Binocular after a
-/// Bitcoin proof). `creator` is the poster's payment key hash (it may GC the
-/// Confirmed record after the on-chain grace period); `created` is POSIX ms,
-/// anchored by the TM mint policy to the tx's validity upper bound. `epoch` /
-/// `leader_reward` are the N7 fields (Cardano epoch; a copy of the Config
-/// `leader_reward` tunable) — carried through Confirm, not yet enforced on-chain
-/// (pin + payout land with N9).
+/// Constructor 0 = the record's only shape (rev 5.4: no `Confirmed` variant;
+/// the scaffold path may pass another tag). `creator` is the poster's payment
+/// key hash (it may GC the record after the on-chain grace period); `created`
+/// is POSIX ms, anchored by the TM mint policy to the tx's validity upper
+/// bound. The rev-5.3 `epoch`/`leader_reward` fields LEFT the datum (spec
+/// §Leader reward: DEFERRED).
 ///
-/// Field 5 `fulfilled_por_outpoints` is the rev-5.1 data-availability HINT: the
+/// Field 3 `fulfilled_por_outpoints` is the rev-5.1 data-availability HINT: the
 /// Cardano outpoints (36 bytes each, tx hash ‖ output index LE) of the peg-out
 /// requests this TM fulfils. Nothing on-chain reads it — neither the TM mint
 /// branch nor the Confirm spend — because the FROST-signed BTMR1 root
@@ -96,8 +129,7 @@ impl WalletUtxo {
 /// the Unconfirmed record's inline datum survives in Cardano history forever and
 /// is indexable by address, which transaction metadata is not.
 ///
-/// The list is always written, empty included: a zero-peg-out TM writes `[]`, and
-/// the field's PRESENCE is what tells a reader the record is the 6-field shape.
+/// The list is always written, empty included: a zero-peg-out TM writes `[]`.
 ///
 /// Canonical encoding via `cardano::plutus::constr`.
 fn encode_datum_hex(
@@ -105,8 +137,6 @@ fn encode_datum_hex(
     constructor: u8,
     creator_pkh: &[u8],
     created_ms: i64,
-    epoch: i64,
-    leader_reward: i64,
     fulfilled_por_outpoints: &[[u8; 36]],
 ) -> String {
     let datum = crate::cardano::plutus::constr(
@@ -115,8 +145,6 @@ fn encode_datum_hex(
             crate::cardano::plutus::bytes(btc_tx),
             crate::cardano::plutus::bytes(creator_pkh),
             crate::cardano::plutus::int(created_ms),
-            crate::cardano::plutus::int(epoch),
-            crate::cardano::plutus::int(leader_reward),
             crate::cardano::plutus::array(
                 fulfilled_por_outpoints
                     .iter()
@@ -151,11 +179,11 @@ pub fn build_oracle_update_tx(
     // and `treasury_asset_name_hex` empty (the validator counts the empty-name token). When `None`,
     // falls back to the always-ok scaffold policy (legacy).
     tm_script_cbor: Option<&str>,
-    // The chain-linkage mint reference `(tx_hash, index, is_genesis)`: the Config UTxO
-    // (Genesis redeemer, before the first TM confirms) or the tip Confirmed TM record
-    // (Chain redeemer). Required alongside `tm_script_cbor`. The tx has exactly ONE
-    // reference input, so the Chain redeemer's reference-input index is always 0.
-    mint_ref: Option<(&str, u32, bool)>,
+    // The chain-linkage mint references `(config_utxo, singleton_utxo)` as `(tx_hash, index)`
+    // pairs: the validator reads `bridge_state_policy` from the Config reference ([PAR-1]) and
+    // checks the embedded BTC tx spends the singleton's head ([PTM-6]), authenticating the
+    // singleton reference by its "BSS" NFT ([PTM-7]). Required alongside `tm_script_cbor`.
+    mint_refs: Option<MintRefs>,
     // When `Some`, the network's live Plutus cost models `[V1, V2, V3]` (from Blockfrost). Used via
     // `Network::Custom` so the script-integrity hash matches the ledger's even when whisky's
     // hardcoded per-network cost models are stale. `None` → whisky's built-in Preprod models.
@@ -172,11 +200,6 @@ pub fn build_oracle_update_tx(
     // short-epoch devnet, whose era-forecast horizon is only ~tens-to-hundreds of slots ahead —
     // a large window lands past it (TimeTranslationPastHorizon at submit).
     validity_window_secs: u64,
-    // N7 datum fields carried through to the Confirmed record: `epoch` (the Cardano epoch this TM
-    // belongs to) and `leader_reward` (a copy of the Config `leader_reward` tunable at post). Not
-    // yet enforced on-chain — the pin + payout land with N9.
-    epoch: u64,
-    leader_reward: u64,
     // The rev-5.1 data-availability hint: the Cardano outpoints (36 bytes each) of the peg-out
     // requests this TM fulfils, straight from `UnsignedTm::fulfilled`. Pass an empty slice for a
     // TM that fulfils none — the field is written either way.
@@ -192,8 +215,6 @@ pub fn build_oracle_update_tx(
         constructor,
         &creator_pkh,
         created_ms,
-        epoch as i64,
-        leader_reward as i64,
         fulfilled_por_outpoints,
     );
     let asset_unit = format!("{treasury_policy_id}{treasury_asset_name_hex}");
@@ -255,16 +276,21 @@ pub fn build_oracle_update_tx(
         change_address: wallet_address.to_string(),
         signing_key: vec![],
         network: Some(whisky_network(&cost_models)),
-        // Reference the chain-linkage anchor so the validator's mint branch can verify the
-        // embedded BTC tx spends the current treasury outpoint: the Config UTxO (Genesis)
-        // or the predecessor Confirmed TM record (Chain).
-        reference_inputs: mint_ref
-            .map(|(h, i, _)| {
-                vec![RefTxIn {
-                    tx_hash: h.to_string(),
-                    tx_index: i,
-                    script_size: None,
-                }]
+        // Reference the Config UTxO and the bridge-state singleton so the validator's mint
+        // branch can verify the embedded BTC tx spends the singleton's head. The order here is
+        // the SORTED order (see `MintRefs::sorted`) — the ledger presents reference inputs to
+        // the script sorted by (tx_hash, index), and the redeemer's index points into that view.
+        reference_inputs: mint_refs
+            .as_ref()
+            .map(|r| {
+                r.sorted()
+                    .into_iter()
+                    .map(|(h, i)| RefTxIn {
+                        tx_hash: h,
+                        tx_index: i,
+                        script_size: None,
+                    })
+                    .collect()
             })
             .unwrap_or_default(),
         withdrawals: vec![],
@@ -275,22 +301,17 @@ pub fn build_oracle_update_tx(
                 amount: 1,
             },
             redeemer: Some(Redeemer {
-                // Real validator: TmMintRedeemer — Genesis(configRefInputIdx) = Constr(0, [0]),
-                // Chain(prevTmRefInputIdx) = Constr(1, [0]). Both carry the 0-based
-                // reference-input index of their anchor; the tx has exactly ONE reference
-                // input, so the sorted index is always 0. Scaffold: unit.
-                data: match (tm_script_cbor, mint_ref) {
-                    (Some(_), Some((_, _, true))) => hex::encode(
+                // Real validator: TmMintRedeemer(bridgeStateRefInputIndex) = Constr(0, [i]),
+                // where `i` is the singleton's position among the SORTED reference inputs
+                // ([PTM-7] then authenticates it by the "BSS" NFT, so a wrong index fails
+                // rather than misleads). Scaffold: unit.
+                data: match (tm_script_cbor, mint_refs.as_ref()) {
+                    (Some(_), Some(r)) => hex::encode(
                         minicbor::to_vec(&crate::cardano::plutus::constr(
                             0,
-                            vec![crate::cardano::plutus::int(0)],
-                        ))
-                        .expect("redeemer CBOR encode"),
-                    ),
-                    (Some(_), Some((_, _, false))) => hex::encode(
-                        minicbor::to_vec(&crate::cardano::plutus::constr(
-                            1,
-                            vec![crate::cardano::plutus::int(0)],
+                            vec![crate::cardano::plutus::int(i64::from(
+                                r.singleton_sorted_index(),
+                            ))],
                         ))
                         .expect("redeemer CBOR encode"),
                     ),
@@ -375,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_datum_is_constr_0_with_the_six_unconfirmed_fields() {
+    fn encode_datum_is_constr_0_with_the_four_unconfirmed_fields() {
         let btc_tx = vec![0x02, 0x00, 0x00, 0x00];
         let creator = vec![0x7a; 28];
         let op1 = crate::cardano::cpo_trie::hint_bytes(&[0xaa; 32], 1);
@@ -385,14 +406,12 @@ mod tests {
             0,
             &creator,
             1_700_000_000_000,
-            42,
-            2_000_000,
             &[op1, op2],
         ));
-        assert_eq!(c.tag, 121, "should be constructor 0 (unconfirmed)");
-        // rev 5.1: [signed_btc_tx, creator, created, epoch, leader_reward,
-        //           fulfilled_por_outpoints]
-        assert_eq!(c.fields.len(), 6);
+        assert_eq!(c.tag, 121, "should be constructor 0 (UnconfirmedTm)");
+        // rev 5.4: [signed_btc_tx, creator, created, fulfilled_por_outpoints] —
+        // epoch/leader_reward LEFT the datum (spec §Leader reward: DEFERRED).
+        assert_eq!(c.fields.len(), 4);
         match &c.fields[0] {
             PlutusData::BoundedBytes(b) => {
                 let v: Vec<u8> = b.clone().into();
@@ -408,15 +427,35 @@ mod tests {
             _ => panic!("expected BoundedBytes creator"),
         }
         assert!(matches!(&c.fields[2], PlutusData::BigInt(_)), "created");
-        assert!(matches!(&c.fields[3], PlutusData::BigInt(_)), "epoch");
-        assert!(
-            matches!(&c.fields[4], PlutusData::BigInt(_)),
-            "leader_reward"
-        );
-        match &c.fields[5] {
+        match &c.fields[3] {
             PlutusData::Array(items) => assert_eq!(items.len(), 2),
             other => panic!("expected an Array of outpoints, got {other:?}"),
         }
+    }
+
+    // The redeemer's index must follow the LEDGER's sorted view of the reference
+    // inputs, whichever way round the two UTxOs hash.
+    #[test]
+    fn the_singleton_index_follows_the_sorted_reference_inputs() {
+        let config = ("aa".repeat(32), 0);
+        let singleton = ("bb".repeat(32), 1);
+        let r1 = MintRefs {
+            config: config.clone(),
+            singleton: singleton.clone(),
+        };
+        assert_eq!(r1.sorted(), vec![config.clone(), singleton.clone()]);
+        assert_eq!(r1.singleton_sorted_index(), 1);
+        let r2 = MintRefs {
+            config: singleton.clone(),
+            singleton: config.clone(),
+        };
+        assert_eq!(r2.singleton_sorted_index(), 0);
+        // Same tx hash, different index: the index breaks the tie.
+        let r3 = MintRefs {
+            config: ("cc".repeat(32), 5),
+            singleton: ("cc".repeat(32), 2),
+        };
+        assert_eq!(r3.singleton_sorted_index(), 0);
     }
 
     // The hint round-trips through the reader reconstruction uses, so what heimdall
@@ -425,7 +464,7 @@ mod tests {
     fn the_written_hint_is_what_the_reconstruction_reader_parses() {
         let op1 = crate::cardano::cpo_trie::hint_bytes(&[0xaa; 32], 1);
         let op2 = crate::cardano::cpo_trie::hint_bytes(&[0xbb; 32], 7);
-        let hex_str = encode_datum_hex(&[0x02], 0, &[0x7a; 28], 1, 2, 3, &[op1, op2]);
+        let hex_str = encode_datum_hex(&[0x02], 0, &[0x7a; 28], 1, &[op1, op2]);
         let cbor = hex::decode(&hex_str).unwrap();
         let pd: PlutusData = pallas_codec::minicbor::decode(&cbor).unwrap();
         assert_eq!(
@@ -434,13 +473,12 @@ mod tests {
         );
     }
 
-    // A zero-peg-out TM still writes the field — as an empty list, which is what
-    // distinguishes "fulfilled nothing" from the retired 5-field shape.
+    // A zero-peg-out TM still writes the field — as an empty list.
     #[test]
     fn a_zero_pegout_tm_writes_an_empty_hint_list() {
-        let c = decode(&encode_datum_hex(&[0x02], 0, &[0x7a; 28], 1, 2, 3, &[]));
-        assert_eq!(c.fields.len(), 6);
-        match &c.fields[5] {
+        let c = decode(&encode_datum_hex(&[0x02], 0, &[0x7a; 28], 1, &[]));
+        assert_eq!(c.fields.len(), 4);
+        match &c.fields[3] {
             PlutusData::Array(items) => assert!(items.is_empty()),
             other => panic!("expected an empty Array, got {other:?}"),
         }

@@ -80,8 +80,8 @@ treasury_asset_name = "544d5478"
 # Setting mnemonic here would override the env var.
 submit_oracle = true   # publish oracle-update UTxO to Cardano after signing
 oracle_constructor = 0 # 0 = unconfirmed TM tx (Binocular sets 1 on BTC confirmation)
-# Bridge Config UTxO locator: its field 11 (initial_btc_treasury_utxo) anchors the Treasury
-# Movement chain that query_treasury walks. Values from `binocular deploy-bridge` output.
+# Bridge Config UTxO locator: its field 3 (bridge_state_policy) locates the bridge-state
+# singleton whose head is the current treasury outpoint. Values from `binocular deploy-bridge`.
 # config_address = "addr_test1..."                    # the config script address
 # config_nft_policy_id = "<config NFT policy, 56 hex>"
 # config_nft_asset_name = "424946434647"              # "BIFCFG" hex
@@ -89,8 +89,8 @@ oracle_constructor = 0 # 0 = unconfirmed TM tx (Binocular sets 1 on BTC confirma
 # scaffold), set tm_script_cbor (from `binocular tm-script`) alongside the config_* fields above,
 # AND change treasury_policy_id above to the validator's script hash (the `policy_id` tm-script
 # prints, == treasury_address credential) and treasury_asset_name to "" (the validator counts the
-# empty-name token). Minting is permissionless: the redeemer proves the posted TM spends the
-# current treasury outpoint (config anchor or previous Confirmed TM record's output 0).
+# empty-name token). Minting is permissionless: the redeemer names the bridge-state singleton
+# reference input, and the validator checks the posted TM spends the singleton's head.
 # tm_script_cbor = "<cbor from `binocular tm-script`>"
 
 [http]
