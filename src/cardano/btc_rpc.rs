@@ -4,6 +4,7 @@
 //! can send signed BTC transactions directly to a regtest/testnet node.
 
 use crate::epoch::state::{EpochError, EpochResult};
+use tracing::info;
 
 #[derive(Clone)]
 pub struct BtcRpcConfig {
@@ -16,7 +17,7 @@ pub struct BtcRpcConfig {
 /// (`sendrawtransaction`).
 pub async fn broadcast_btc_tx(rpc: &BtcRpcConfig, tx_bytes: &[u8]) -> EpochResult<()> {
     let tx_hex = hex::encode(tx_bytes);
-    eprintln!(
+    info!(
         "[btc-rpc] broadcasting tx ({} bytes) to {}",
         tx_bytes.len(),
         rpc.url
@@ -54,7 +55,7 @@ pub async fn broadcast_btc_tx(rpc: &BtcRpcConfig, tx_bytes: &[u8]) -> EpochResul
     }
 
     let txid = json.get("result").and_then(|r| r.as_str()).unwrap_or("?");
-    eprintln!("[btc-rpc] broadcast accepted: txid = {txid}");
+    info!("[btc-rpc] broadcast accepted: txid = {txid}");
     Ok(())
 }
 

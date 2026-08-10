@@ -18,6 +18,7 @@ use heimdall::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use heimdall::frost::xonly::group_xonly;
 use heimdall::http::peer_network::HttpPeerNetwork;
 use heimdall::http::server::router;
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(
@@ -26,6 +27,18 @@ use heimdall::http::server::router;
     version = env!("HEIMDALL_VERSION")
 )]
 struct Cli {
+    /// Log verbosity: `error`, `warn`, `info` (default), `debug`, `trace`, or a
+    /// full `RUST_LOG` directive like `warn,heimdall::cardano=debug`. Outranks
+    /// `RUST_LOG` and `[log] level` in the config file.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log_level: Option<String>,
+
+    /// Log format: `auto` (default — `journal` under systemd, else `plain`),
+    /// `plain`, `journal`, or `json`. Outranks `HEIMDALL_LOG_FORMAT` and
+    /// `[log] format` in the config file.
+    #[arg(long, global = true, value_name = "FORMAT")]
+    log_format: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -720,14 +733,22 @@ enum Commands {
     },
 }
 
+/// Load the config file and, as the same step, install the log subscriber.
+///
+/// Every subcommand funnels through here, and the level can come from the file,
+/// so this is the earliest point at which the subscriber can be configured. The
+/// one diagnostic below it is the unreadable-config error itself, which has to
+/// stay a bare `eprintln!` — there is nothing to log through yet.
 fn load_config(path: Option<&str>) -> HeimdallConfig {
-    match path {
+    let cfg = match path {
         Some(p) => HeimdallConfig::from_file(std::path::Path::new(p)).unwrap_or_else(|e| {
             eprintln!("Error: {e}");
             std::process::exit(1);
         }),
         None => HeimdallConfig::default(),
-    }
+    };
+    heimdall::logging::init(&cfg.log);
+    cfg
 }
 
 /// Run the WI-053 startup checks and refuse to start if any of them failed.
@@ -754,13 +775,17 @@ fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
 /// with a message that names both the `--flag` and the `cardano.<key>` it can come from.
 fn resolve_arg(cli: Option<String>, cfg_val: Option<&String>, flag: &str, cfg_key: &str) -> String {
     cli.or_else(|| cfg_val.cloned()).unwrap_or_else(|| {
-        eprintln!("Error: pass --{flag} or set cardano.{cfg_key} in the config");
+        error!("Error: pass --{flag} or set cardano.{cfg_key} in the config");
         std::process::exit(1);
     })
 }
 
 fn main() {
     let cli = Cli::parse();
+    // Stashed before the match because `load_config` — which installs the
+    // subscriber, since the level can come from the file — cannot see the
+    // globals from where it is called.
+    heimdall::logging::set_cli_overrides(cli.log_level, cli.log_format);
     match cli.command {
         Commands::Demo {
             config,
@@ -863,7 +888,7 @@ fn main() {
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_treasury_self_send(&cfg, &outpoint, amount_sat, broadcast) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -878,14 +903,14 @@ fn main() {
             if let Err(e) =
                 run_federation_spend(&cfg, &outpoint, amount_sat, y51.as_deref(), broadcast)
             {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Commands::WalletAddress { config } => {
             let cfg = load_config(config.as_deref());
             let mnemonic = resolve_mnemonic(&cfg).unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             });
             match (
@@ -900,7 +925,7 @@ fn main() {
                     );
                 }
                 (Err(e), _) | (_, Err(e)) => {
-                    eprintln!("Error: {e}");
+                    error!("Error: {e}");
                     std::process::exit(1);
                 }
             }
@@ -924,7 +949,7 @@ fn main() {
                 federation_csv_blocks,
                 submit,
             ) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -936,7 +961,7 @@ fn main() {
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_bootstrap_registry(&cfg, &blueprint, &registry_bootstrap, submit) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -948,7 +973,7 @@ fn main() {
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_deploy_registry_ref(&cfg, &blueprint, &registry_bootstrap, submit) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -963,7 +988,7 @@ fn main() {
             if let Err(e) =
                 run_deploy_fault_ref(&cfg, &blueprint, &registry_bootstrap, &kind, submit)
             {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -988,7 +1013,7 @@ fn main() {
                 max_validity_window_ms,
                 submit,
             ) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -1015,7 +1040,7 @@ fn main() {
                 key_deposit,
                 submit,
             ) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -1050,7 +1075,7 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_register_spo(&cfg, &args) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -1077,7 +1102,7 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_update_y(&cfg, &args) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -1104,7 +1129,7 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_federation_reset(&cfg, &args) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -1123,7 +1148,7 @@ fn main() {
                 &ban_bootstrap,
                 submit,
             ) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -1148,7 +1173,7 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_apply_ban(&cfg, &args) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -1167,7 +1192,7 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_fault_proof_mint(&cfg, &args) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -1180,7 +1205,7 @@ fn main() {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_show_roster(&cfg, blueprint, registry_bootstrap, treasury_nft_name)
             {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -1240,7 +1265,7 @@ fn main() {
                 &exclude_pegin,
                 false, // auto_mode
             ) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -1268,7 +1293,7 @@ fn main() {
             // useless: that exits the process on the first unset key, so the
             // operator would get one bare line instead of the whole picture.
             if let Err(e) = run_preflight_gate(&cfg) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
             // CLI flags override; otherwise fall back to the [cardano] config.
@@ -1310,28 +1335,28 @@ fn main() {
                 broadcast,
                 &exclude_pegin,
             ) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Commands::ShowTreasury { config } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_show_treasury(&cfg) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Commands::ShowConfigParams { config } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_show_config_params(&cfg) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Commands::ReconstructCpoTrie { config, dry_run } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_reconstruct_cpo_trie(&cfg, dry_run) {
-                eprintln!("Error: {e}");
+                error!("Error: {e}");
                 std::process::exit(1);
             }
         }
@@ -1458,16 +1483,16 @@ async fn run_demo(
                 .filter(|s| !s.is_empty()),
         ) {
             (Some(addr), Some(unit)) => {
-                println!("peg-out requests:     {addr}");
+                info!("peg-out requests:     {addr}");
                 bf_chain = bf_chain.with_pegout_source(addr, unit);
             }
-            (None, None) => eprintln!(
-                "warning: no cardano.pegout_script_address / cardano.bridged_token_unit — this \
+            (None, None) => warn!(
+                "no cardano.pegout_script_address / cardano.bridged_token_unit — this \
                  daemon builds peg-in-only TMs and pays NO pending withdrawal"
             ),
             _ => {
-                eprintln!(
-                    "fatal: set BOTH cardano.pegout_script_address and \
+                error!(
+                    "set BOTH cardano.pegout_script_address and \
                      cardano.bridged_token_unit, or NEITHER"
                 );
                 std::process::exit(1);
@@ -1477,7 +1502,7 @@ async fn run_demo(
         if let Some(mnemonic) = &cfg.cardano.mnemonic {
             let wallet_addr = heimdall::cardano::wallet::wallet_address_from_mnemonic(mnemonic)
                 .expect("cardano.mnemonic must be a valid BIP-39 mnemonic");
-            println!("Cardano wallet address: {wallet_addr}");
+            info!("Cardano wallet address: {wallet_addr}");
             bf_chain = bf_chain
                 .with_mnemonic(mnemonic)
                 .expect("cardano.mnemonic must be a valid BIP-39 mnemonic");
@@ -1510,36 +1535,36 @@ async fn run_demo(
         // Without it query_roster serves the fixture roster.
         match heimdall::cardano::roster::RegistryRosterSource::from_config(&cfg.cardano) {
             Ok(Some(source)) => {
-                println!("on-chain SPO registry: {}", source.registry_address);
-                println!(
+                info!("on-chain SPO registry: {}", source.registry_address);
+                info!(
                     "note: eligible roster = registry − active bans; FROST threshold is \
                      stake-weighted (WI-012) — demo.min_signers is ignored on this path"
                 );
                 // N10c: the same treasury_info the roster is verified against is
                 // the one a completed DKG rotates (Update-Y), so configuring the
                 // registry roster enables the handoff by construction.
-                println!("on-chain key handoff:  enabled (Update-Y after each DKG)");
+                info!("on-chain key handoff:  enabled (Update-Y after each DKG)");
                 bf_chain = bf_chain.with_registry_roster(source);
                 // Ban filtering (WI-011/012): only if cardano.ban_bootstrap is set.
                 match heimdall::cardano::ban_list::BanListSource::from_config(&cfg.cardano) {
                     Ok(Some(bans)) => {
-                        println!("on-chain ban list:     {}", bans.ban_address);
+                        info!("on-chain ban list:     {}", bans.ban_address);
                         bf_chain = bf_chain.with_ban_source(bans);
                         match heimdall::cardano::blockfrost_chain::DkgFaultBanFlow::from_config(
                             &cfg.cardano,
                         ) {
                             Ok(Some(flow)) => {
-                                println!("automatic DKG fault banning: enabled");
+                                info!("automatic DKG fault banning: enabled");
                                 bf_chain = bf_chain.with_dkg_fault_ban_flow(flow);
                             }
                             Ok(None) => unreachable!("ban list is configured"),
                             Err(e) => {
-                                eprintln!("fatal: DKG fault-ban flow config: {e}");
+                                error!("DKG fault-ban flow config: {e}");
                                 std::process::exit(1);
                             }
                         }
                     }
-                    Ok(None) => println!(
+                    Ok(None) => info!(
                         "note: no ban list configured (cardano.ban_bootstrap) — roster not \
                          ban-filtered"
                     ),
@@ -1549,14 +1574,14 @@ async fn run_demo(
                     // ban-schedule params missing) must stop startup, not silently
                     // disable ban filtering.
                     Err(e) => {
-                        eprintln!("fatal: ban list config: {e}");
+                        error!("ban list config: {e}");
                         std::process::exit(1);
                     }
                 }
             }
             Ok(None) => {}
             Err(e) => {
-                eprintln!("fatal: registry roster config: {e}");
+                error!("registry roster config: {e}");
                 std::process::exit(1);
             }
         }
@@ -1638,8 +1663,8 @@ async fn run_demo(
                         .get(&id)
                         .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
                         .clone();
-                    eprintln!(
-                        "[demo] WARNING: bifrost_id_pk not found in roster; falling back to \
+                    warn!(
+                        "[demo] bifrost_id_pk not found in roster; falling back to \
                          --index {ix} (fixture/legacy demo only)"
                     );
                     (id, info, kp)
@@ -1691,12 +1716,12 @@ async fn run_demo(
         axum::serve(listener, app).await.unwrap();
     });
 
-    println!(
+    info!(
         "=== Heimdall SPO {spo_label} ({}-of-{}) ===",
         roster.min_signers, roster.max_signers
     );
-    println!("Listening on {bind_addr}:{port}");
-    println!(
+    info!("Listening on {bind_addr}:{port}");
+    info!(
         "Waiting for the other {} SPOs to come online...",
         roster.max_signers - 1
     );
@@ -1721,13 +1746,13 @@ async fn run_demo(
         Some(s) => match s.parse::<heimdall::epoch::state::InjectFault>() {
             Ok(k) => Some(k),
             Err(e) => {
-                eprintln!("[demo] {e}");
+                error!("[demo] {e}");
                 std::process::exit(2);
             }
         },
     };
     if let Some(k) = config.inject_fault {
-        eprintln!("[demo] ⚠ FAULT INJECTION ENABLED: {k:?} — this node will misbehave in DKG");
+        warn!("[demo] ⚠ FAULT INJECTION ENABLED: {k:?} — this node will misbehave in DKG");
     }
 
     let t0 = Instant::now();
@@ -1741,17 +1766,17 @@ async fn run_demo(
     let tm = match run_epoch_loop(chain, pegin_source, peers, clock, rng, &config).await {
         Ok(tm) => tm,
         Err(e) => {
-            eprintln!("[demo] epoch loop returned unexpectedly: {e}");
-            eprintln!("[demo] this should not happen — the loop is meant to retry indefinitely.");
+            error!("[demo] epoch loop returned unexpectedly: {e}");
+            error!("[demo] this should not happen — the loop is meant to retry indefinitely.");
             std::process::exit(1);
         }
     };
-    println!("Cycle complete ({:.2?})", t0.elapsed());
+    info!("Cycle complete ({:.2?})", t0.elapsed());
 
     // ── Bitcoin TM transaction summary ──────────────────────────────────────
-    println!("\n── Bitcoin Treasury Movement ──");
-    println!("  txid:    {}", tm.txid);
-    println!("  inputs:  {}", tm.unsigned_tx.input.len());
+    info!("── Bitcoin Treasury Movement ──");
+    info!("  txid:    {}", tm.txid);
+    info!("  inputs:  {}", tm.unsigned_tx.input.len());
     for (i, (inp, prevout)) in tm
         .unsigned_tx
         .input
@@ -1759,7 +1784,7 @@ async fn run_demo(
         .zip(tm.prevouts.iter())
         .enumerate()
     {
-        println!(
+        info!(
             "    [{}] {}:{} — {} sat  script={}",
             i,
             inp.previous_output.txid,
@@ -1768,9 +1793,9 @@ async fn run_demo(
             hex::encode(prevout.script_pubkey.as_bytes()),
         );
     }
-    println!("  outputs: {}", tm.unsigned_tx.output.len());
+    info!("  outputs: {}", tm.unsigned_tx.output.len());
     for (i, out) in tm.unsigned_tx.output.iter().enumerate() {
-        println!(
+        info!(
             "    [{}] {} sat  script={}",
             i,
             out.value.to_sat(),
@@ -1778,12 +1803,12 @@ async fn run_demo(
         );
     }
     let signed_bytes = bitcoin::consensus::encode::serialize(&tm.unsigned_tx);
-    println!("  size:    {} bytes", signed_bytes.len());
-    println!("  hex:     {}", hex::encode(&signed_bytes));
+    info!("  size:    {} bytes", signed_bytes.len());
+    info!("  hex:     {}", hex::encode(&signed_bytes));
 
-    println!("\n=== SPO {spo_label} cycle complete ===");
+    info!("=== SPO {spo_label} cycle complete ===");
 
-    println!("Server still running on {bind_addr}:{port}; press Ctrl-C to exit.");
+    info!("Server still running on {bind_addr}:{port}; press Ctrl-C to exit.");
     tokio::signal::ctrl_c().await.ok();
 }
 
@@ -1929,7 +1954,7 @@ fn batch_params(
         &loc.nft_unit,
     ))?;
     if let (true, Some(t)) = (verbose, &snapshot.config.params.tunables) {
-        println!(
+        info!(
             "  operational params (Config {} @ slot {}): fee_rate={} sat/vB, \
              per_pegout_fee floor={} sat, min_peg_out_fbtc={} sat, leader_reward={} lovelace",
             snapshot.config.utxo,
@@ -1943,8 +1968,8 @@ fn batch_params(
     let time_ms = snapshot.time_ms;
     let (p, src) = resolve_tm_params(Some(&snapshot), local);
     if let ParamSource::LocalOverride(why) = &src {
-        eprintln!(
-            "[params] WARNING: building on the LOCAL bitcoin.fee_rate_sat_per_vb ({local} \
+        warn!(
+            "[params] building on the LOCAL bitcoin.fee_rate_sat_per_vb ({local} \
              sat/vB) — {why}. Co-signers reading a different value build different TM bytes."
         );
     }
@@ -1954,7 +1979,7 @@ fn batch_params(
         &snapshot,
     ));
     if let (true, Some(b)) = (verbose, batch.open()) {
-        println!(
+        info!(
             "  batch B_{} at slot {} (membership cutoff: created at or before slot {})",
             b.index, b.slot, b.cutoff_slot
         );
@@ -2057,7 +2082,7 @@ fn freeze_sweep_pegouts(
 
     let frozen = freeze(requests, batch, cap, key);
     if frozen.deferred() > 0 {
-        println!(
+        info!(
             "  batch freeze: {} peg-out(s) in, {} created after the cutoff (slot {}), {} over \
              the {cap}-peg-out capacity — deferred to a later batch",
             frozen.selected.len(),
@@ -2077,15 +2102,13 @@ fn freeze_sweep_pegouts(
 fn cpo_trie_from_cfg(cfg: &HeimdallConfig) -> Result<heimdall::cardano::cpo_trie::CpoTrie, String> {
     use heimdall::cardano::cpo_trie::CpoTrie;
     let Some(dir) = cfg.protocol.state_dir.as_deref() else {
-        eprintln!(
-            "[cpo] no protocol.state_dir — using the empty (genesis) completed-peg-outs trie"
-        );
+        warn!("[cpo] no protocol.state_dir — using the empty (genesis) completed-peg-outs trie");
         return Ok(CpoTrie::empty());
     };
     let dir = std::path::Path::new(dir);
     match CpoTrie::load(dir).map_err(|e| e.to_string())? {
         Some(t) => {
-            eprintln!(
+            info!(
                 "[cpo] completed-peg-outs trie: {} entr(y|ies), root {}",
                 t.len(),
                 hex::encode(t.root())
@@ -2093,7 +2116,7 @@ fn cpo_trie_from_cfg(cfg: &HeimdallConfig) -> Result<heimdall::cardano::cpo_trie
             Ok(t)
         }
         None => {
-            eprintln!(
+            warn!(
                 "[cpo] no completed-peg-outs trie at {} — using the empty (genesis) trie; run \
                  `reconstruct-cpo-trie` if this bridge already has history",
                 dir.display()
@@ -2123,8 +2146,8 @@ fn cross_check_cpo_trie_from_cfg(
     use heimdall::cardano::cpo_history::{BlockfrostHistory, CpoHistorySource, KupoHistory};
 
     let Some(policy) = cfg.cardano.cpo_policy_id.as_deref() else {
-        eprintln!(
-            "[cpo] WARNING: no cardano.cpo_policy_id — the local root was NOT cross-checked \
+        warn!(
+            "[cpo] no cardano.cpo_policy_id — the local root was NOT cross-checked \
              against the on-chain completed-peg-outs singleton. Set it before signing a TM on a \
              live bridge."
         );
@@ -2166,7 +2189,7 @@ fn cross_check_cpo_trie_from_cfg(
                 .unwrap_or("<protocol.state_dir>"),
         ));
     }
-    eprintln!(
+    info!(
         "[cpo] local root matches the on-chain completed-peg-outs singleton ({})",
         hex::encode(on_chain)
     );
@@ -2558,7 +2581,7 @@ fn fetch_one_shot_ref_script_size(
     let size = rt
         .block_on(bf_http::fetch_script_size(base_url, pid, h))
         .map_err(|e| format!("one-shot ref script size: {e}"))?;
-    eprintln!(
+    info!(
         "[{label}] note: the one-shot outref carries reference script {h} ({size} bytes) — \
          adding the Conway ref-script fee"
     );
@@ -3735,14 +3758,14 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
             if let Some(local) = cfg.cardano.min_stake_lovelace
                 && local != on_chain
             {
-                eprintln!(
-                    "[register-spo] NOTE: cardano.min_stake_lovelace ({local}) differs from the \
+                warn!(
+                    "[register-spo] cardano.min_stake_lovelace ({local}) differs from the \
                      on-chain Config #9 ({on_chain}); the chain value wins"
                 );
             }
             if on_chain == 0 {
-                eprintln!(
-                    "[register-spo] WARNING: the deployed Config's min_stake is 0 — the R2 gate \
+                warn!(
+                    "[register-spo] the deployed Config's min_stake is 0 — the R2 gate \
                      admits any pool. That is what governance published; raise it with a Config \
                      Update, not by editing this node's config"
                 );
@@ -3782,8 +3805,8 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
                         "min-stake gate failed (R2) — refusing to submit register_spo".into(),
                     );
                 }
-                eprintln!(
-                    "[register-spo] WARNING: min-stake gate failed; printing the dry-run tx, \
+                warn!(
+                    "[register-spo] min-stake gate failed; printing the dry-run tx, \
                      but submission would be refused"
                 );
             }
@@ -3797,8 +3820,8 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
                         .into(),
                 );
             }
-            eprintln!(
-                "[register-spo] WARNING: no min_stake threshold (no Config UTxO configured and \
+            warn!(
+                "[register-spo] no min_stake threshold (no Config UTxO configured and \
                  no cardano.min_stake_lovelace); dry run only — submission would be refused"
             );
         }
@@ -4839,7 +4862,7 @@ fn run_mover(
         let probe = match batch_params(&rt, cfg, false) {
             Ok(p) => Some(p),
             Err(e) => {
-                eprintln!("[mover] grid probe failed ({e}) — retrying after the poll interval");
+                warn!("[mover] grid probe failed ({e}) — retrying after the poll interval");
                 None
             }
         };
@@ -4850,15 +4873,15 @@ fn run_mover(
             BatchWindow::Open(b) if built_batch != Some(b.index) => {
                 built_batch = Some(b.index);
                 tick += 1;
-                println!(
-                    "\n═══ batch B_{} @ slot {} (cutoff {}), tick #{tick}, broadcast={broadcast} ═══",
+                info!(
+                    "═══ batch B_{} @ slot {} (cutoff {}), tick #{tick}, broadcast={broadcast} ═══",
                     b.index, b.slot, b.cutoff_slot
                 );
             }
             // Already built for this opportunity: the grid says wait for the next one.
             BatchWindow::Open(b) => {
                 if once {
-                    println!("[mover] batch B_{} already built — nothing to do", b.index);
+                    info!("[mover] batch B_{} already built — nothing to do", b.index);
                     return Ok(());
                 }
                 std::thread::sleep(poll_ceiling);
@@ -4870,7 +4893,7 @@ fn run_mover(
             // on, which no co-signer would reproduce.
             BatchWindow::Closed { .. } => {
                 if once {
-                    println!("[mover] no batch opportunity is open — nothing to do");
+                    info!("[mover] no batch opportunity is open — nothing to do");
                     return Ok(());
                 }
                 std::thread::sleep(poll_ceiling);
@@ -4879,8 +4902,8 @@ fn run_mover(
             // No grid (or the probe failed): fall back to the interval cadence.
             BatchWindow::NoGrid => {
                 tick += 1;
-                println!(
-                    "\n═══ auto-mover tick #{tick} (no batch grid; interval {interval_secs}s, \
+                info!(
+                    "═══ auto-mover tick #{tick} (no batch grid; interval {interval_secs}s, \
                      broadcast={broadcast}) ═══"
                 );
             }
@@ -4907,7 +4930,7 @@ fn run_mover(
             return result;
         }
         if let Err(e) = result {
-            eprintln!("[mover] tick #{tick} error (continuing): {e}");
+            error!("[mover] tick #{tick} error (continuing): {e}");
             // A failed build must not consume its opportunity: clear the marker so the
             // next poll retries the same batch rather than waiting for the next one.
             built_batch = None;
@@ -5465,7 +5488,7 @@ fn run_sweep_pegins(
         cfg.demo.max_signers,
     );
     let y_51 = group_xonly(dkg.public_key_package.verifying_key())?.xonly;
-    println!("  FROST group key Y_51: {}", hex::encode(y_51.serialize()));
+    info!("  FROST group key Y_51: {}", hex::encode(y_51.serialize()));
     let csv = csv_blocks_u16(cfg)?;
     let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
 
@@ -5499,7 +5522,7 @@ fn run_sweep_pegins(
     let reqs = rt
         .block_on(source.query_pegin_requests(&policy_id))
         .map_err(|e| format!("query_pegin_requests: {e}"))?;
-    println!(
+    info!(
         "scanned {} peg-in request(s) at {pegin_script_address}",
         reqs.len()
     );
@@ -5537,7 +5560,7 @@ fn run_sweep_pegins(
                     )) {
                         Ok(scan) => Some(scan),
                         Err(e) => {
-                            eprintln!("[sweep] could not scan TM UTxOs: {e}");
+                            warn!("[sweep] could not scan TM UTxOs: {e}");
                             None
                         }
                     }
@@ -5572,7 +5595,7 @@ fn run_sweep_pegins(
         let parsed = match parse_pegin_request(req, y_51, refund_timeout) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("  dropped peg-in {:?}: {e}", req.cardano_utxo);
+                warn!("  dropped peg-in {:?}: {e}", req.cardano_utxo);
                 continue;
             }
         };
@@ -5581,7 +5604,7 @@ fn run_sweep_pegins(
             vout: parsed.btc_vout,
         };
         if excluded.contains(&outpoint) {
-            println!(
+            info!(
                 "  excluded peg-in {}:{} — {} sat (--exclude-pegin: already in treasury)",
                 parsed.btc_txid,
                 parsed.btc_vout,
@@ -5590,7 +5613,7 @@ fn run_sweep_pegins(
             continue;
         }
         if auto_consumed.contains(&outpoint) {
-            println!(
+            info!(
                 "  auto-skip peg-in {}:{} — {} sat (already swept into a Confirmed TM or committed \
                  to a live in-flight TM per Cardano; its PIR just isn't minted yet)",
                 parsed.btc_txid,
@@ -5599,7 +5622,7 @@ fn run_sweep_pegins(
             );
             continue;
         }
-        println!(
+        info!(
             "  peg-in {}:{} — {} sat (depositor {})",
             parsed.btc_txid,
             parsed.btc_vout,
@@ -5633,7 +5656,7 @@ fn run_sweep_pegins(
             .map_err(|e| format!("fetch_pegout_requests: {e}"))?
         }
         None => {
-            eprintln!(
+            warn!(
                 "[sweep] no cardano.blockfrost_project_id — peg-out collection is Blockfrost-only \
                  (N2C is peg-in only); building TM without peg-outs"
             );
@@ -5644,13 +5667,13 @@ fn run_sweep_pegins(
     // parse is payable by no TM and would otherwise vanish from this count with no signal
     // (WI-031 item 8).
     if pegout_data.malformed > 0 {
-        println!(
-            "  WARNING: {} UTxO(s) at {pegout_script_address} carry the bridged token but no \
+        warn!(
+            "  {} UTxO(s) at {pegout_script_address} carry the bridged token but no \
              decodable PegOutDatum — no TM can pay them (their owners can still Cancel)",
             pegout_data.malformed
         );
     }
-    println!(
+    info!(
         "scanned {} open peg-out request(s) at {pegout_script_address}",
         pegout_data.requests.len()
     );
@@ -5659,7 +5682,7 @@ fn run_sweep_pegins(
     // (it would just burn fee) — skip this tick. (Re-checked after the batch freeze below,
     // which can empty the peg-out set.)
     if auto_mode && pegin_inputs.is_empty() && pegout_data.requests.is_empty() {
-        println!("[mover] nothing to sweep (0 peg-ins, 0 peg-outs) — skipping tick");
+        info!("[mover] nothing to sweep (0 peg-ins, 0 peg-outs) — skipping tick");
         return Ok(());
     }
 
@@ -5671,7 +5694,7 @@ fn run_sweep_pegins(
     // (WI-028) so no manual config edit is needed after each movement.
     let (treasury_outpoint, treasury_amount_sat) = match (treasury_outpoint, treasury_amount_sat) {
         (Some(o), Some(a)) => {
-            println!("  treasury (CLI override): {o} — {a} sat");
+            info!("  treasury (CLI override): {o} — {a} sat");
             (parse_outpoint(o)?, a)
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -5694,12 +5717,12 @@ fn run_sweep_pegins(
                     tip.outpoint
                 );
                 if auto_mode {
-                    println!("[mover] {msg} (skipping tick)");
+                    info!("[mover] {msg} (skipping tick)");
                     return Ok(());
                 }
                 return Err(format!("{msg} (or override with --treasury-outpoint)"));
             }
-            println!(
+            info!(
                 "  treasury (Cardano tip Confirmed-TM): {} — {} sat",
                 tip.outpoint,
                 tip.value.to_sat()
@@ -5763,7 +5786,7 @@ fn run_sweep_pegins(
         // cannot vouch for means "pay no peg-out", never "pay unchecked" — unchecked, every
         // open request is re-paid on every sweep, draining the treasury irrecoverably.
         // Peg-ins still sweep.
-        eprintln!(
+        warn!(
             "[pegout] skipping ALL {} open peg-out(s): the completed-peg-outs trie was not \
              cross-checked against the chain (no cardano.cpo_policy_id), and it is the only \
              record of what an earlier TM already paid. Set cardano.cpo_policy_id (and \
@@ -5772,7 +5795,7 @@ fn run_sweep_pegins(
         );
     } else if !pegout_data.requests.is_empty() {
         for po in &pegout_data.requests {
-            println!(
+            info!(
                 "  peg-out → {} — {} sat ({}#{})",
                 hex::encode(&po.destination_script_pubkey),
                 po.amount_sat,
@@ -5793,7 +5816,7 @@ fn run_sweep_pegins(
     // Nothing left once the filters ran (every peg-out already paid): don't burn a fee on a
     // treasury→treasury self-move.
     if auto_mode && pegin_inputs.is_empty() && pegout_requests.is_empty() {
-        println!("[mover] nothing to sweep (0 peg-ins, 0 unpaid peg-outs) — skipping tick");
+        info!("[mover] nothing to sweep (0 peg-ins, 0 unpaid peg-outs) — skipping tick");
         return Ok(());
     }
 
@@ -5832,7 +5855,7 @@ fn run_sweep_pegins(
     )
     .map_err(|e| format!("build sweep: {e}"))?;
 
-    println!(
+    info!(
         "  completed-peg-outs root committed: {} ({} fulfilled peg-out(s))",
         hex::encode(unsigned.cpo_root),
         unsigned.fulfilled.len(),
@@ -5842,7 +5865,7 @@ fn run_sweep_pegins(
     // or sub-dust after fee) so the operator sees them — the TM still pays the
     // rest rather than aborting.
     for s in &unsigned.skipped_pegouts {
-        eprintln!(
+        info!(
             "[sweep] skipped peg-out → {} ({} sat): {}",
             hex::encode(s.script_pubkey.as_bytes()),
             s.amount.to_sat(),
@@ -5877,7 +5900,7 @@ fn run_sweep_pegins(
             // Slice into `trimmed` (not the un-trimmed `hex_str`) — otherwise leading/trailing
             // whitespace makes `hex_str.len()` bigger than `trimmed.len()` and the slice panics.
             let preview_end = trimmed.len().min(20);
-            println!(
+            info!(
                 "  [override] using existing TM bytes ({} bytes hex={}…)",
                 bytes.len(),
                 &trimmed[..preview_end]
@@ -5902,8 +5925,8 @@ fn run_sweep_pegins(
             .collect();
         for out in unsigned.tx.output.iter().skip(1) {
             if !override_out_spks.contains(out.script_pubkey.as_bytes()) {
-                eprintln!(
-                    "[override] WARNING: supplied TM does not pay pending peg-out → {} ({} sat) \
+                warn!(
+                    "[override] supplied TM does not pay pending peg-out → {} ({} sat) \
                      — likely recorded after the supplied TM was built; it will NOT be fulfilled \
                      by this movement",
                     hex::encode(out.script_pubkey.as_bytes()),
@@ -5913,15 +5936,15 @@ fn run_sweep_pegins(
         }
     }
 
-    println!("\n── Treasury Movement (sweep peg-ins) ──");
-    println!("  txid:    {}", effective_tx.compute_txid());
-    println!("  inputs:  {}", effective_tx.input.len());
+    info!("── Treasury Movement (sweep peg-ins) ──");
+    info!("  txid:    {}", effective_tx.compute_txid());
+    info!("  inputs:  {}", effective_tx.input.len());
     if override_in_effect {
         // The override is a different tx than the local build, so its inputs do NOT correspond
         // to the locally-computed `unsigned.prevouts` — print outpoints only (we don't have the
         // override's prevout values/scripts) rather than mispair them.
         for (i, inp) in effective_tx.input.iter().enumerate() {
-            println!(
+            info!(
                 "    [{}] {}:{}",
                 i, inp.previous_output.txid, inp.previous_output.vout
             );
@@ -5933,7 +5956,7 @@ fn run_sweep_pegins(
             .zip(unsigned.prevouts.iter())
             .enumerate()
         {
-            println!(
+            info!(
                 "    [{}] {}:{} — {} sat  script={}",
                 i,
                 inp.previous_output.txid,
@@ -5943,26 +5966,26 @@ fn run_sweep_pegins(
             );
         }
     }
-    println!("  outputs: {}", effective_tx.output.len());
+    info!("  outputs: {}", effective_tx.output.len());
     for (i, out) in effective_tx.output.iter().enumerate() {
-        println!(
+        info!(
             "    [{}] {} sat  script={}",
             i,
             out.value.to_sat(),
             hex::encode(out.script_pubkey.as_bytes()),
         );
     }
-    println!(
+    info!(
         "  output[0] (new treasury): {} sat",
         effective_tx.output[0].value.to_sat()
     );
-    println!("  size:    {} bytes", raw.len());
-    println!("  hex:     {}", hex::encode(&raw));
+    info!("  size:    {} bytes", raw.len());
+    info!("  hex:     {}", hex::encode(&raw));
 
     // `--broadcast` is the master "execute side effects" gate. Without it, sweep-pegins only
     // builds, signs, and prints the TM (no Cardano post, no Bitcoin broadcast) — a safe dry run.
     if !broadcast {
-        println!("\n(not broadcast — pass --broadcast to post the TM / send)");
+        info!("(not broadcast — pass --broadcast to post the TM / send)");
         return Ok(());
     }
 
@@ -6046,7 +6069,7 @@ fn run_sweep_pegins(
         // from the tx's own payment outputs against the attested root, so the only
         // cost is a slower rebuild.
         let hint: Vec<[u8; 36]> = if override_in_effect {
-            println!(
+            warn!(
                 "  [override] posting an EMPTY fulfilled_por_outpoints hint: the overriding tx \
                  is not the locally built TM, so the local peg-out set does not describe it. \
                  Reconstruction falls back to matching payments against the committed root."
@@ -6065,7 +6088,7 @@ fn run_sweep_pegins(
     let rpc = btc_rpc_config(cfg)?;
     rt.block_on(broadcast_btc_tx(&rpc, &raw))
         .map_err(|e| format!("broadcast: {e}"))?;
-    println!("broadcast OK");
+    info!("broadcast OK");
     Ok(())
 }
 

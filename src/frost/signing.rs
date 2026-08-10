@@ -10,6 +10,7 @@ use std::time::Instant;
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
 use rayon::prelude::*;
+use tracing::info;
 
 /// Result of a successful signing session.
 pub struct SigningResult {
@@ -33,9 +34,7 @@ pub fn run_signing(
         .collect();
 
     // Round 1: commitments (parallel)
-    println!(
-        "    Round 1: each signer generates a nonce pair (d,e) and publishes curve points (D,E)"
-    );
+    info!("    Round 1: each signer generates a nonce pair (d,e) and publishes curve points (D,E)");
     let t0 = Instant::now();
     let round1_results: Vec<_> = signer_ids
         .par_iter()
@@ -53,7 +52,7 @@ pub fn run_signing(
         nonces_map.insert(id, nonces);
         commitments_map.insert(id, commitments);
     }
-    println!(
+    info!(
         "    Round 1: {num_signers} signers done ({:.2?}) [parallel]",
         t0.elapsed()
     );
@@ -62,7 +61,7 @@ pub fn run_signing(
     let signing_package = frost::SigningPackage::new(commitments_map, message);
 
     // Round 2: signature shares (parallel)
-    println!(
+    info!(
         "    Round 2: each signer computes z_p = d_p + rho_p*e_p + lambda_p*s_p*c (signature share)"
     );
     let t1 = Instant::now();
@@ -80,22 +79,22 @@ pub fn run_signing(
     for (id, share) in sign_results {
         signature_shares.insert(id, share);
     }
-    println!(
+    info!(
         "    Round 2: {num_signers} signers done ({:.2?}) [parallel]",
         t1.elapsed()
     );
 
     // Aggregate
-    println!(
+    info!(
         "    Aggregate: coordinator sums z = Σz_p, verifies each share against verification shares Y_p"
     );
     let t2 = Instant::now();
     let signature =
         frost::aggregate(&signing_package, &signature_shares, public_key_package).unwrap();
-    println!("    Aggregate: done ({:.2?})", t2.elapsed());
+    info!("    Aggregate: done ({:.2?})", t2.elapsed());
 
     // Verify
-    println!(
+    info!(
         "    Verify: check (R, z) is a valid Schnorr/BIP-340 signature under the group public key"
     );
     let t3 = Instant::now();
@@ -103,7 +102,7 @@ pub fn run_signing(
         .verifying_key()
         .verify(message, &signature)
         .unwrap();
-    println!("    Verify: done ({:.2?})", t3.elapsed());
+    info!("    Verify: done ({:.2?})", t3.elapsed());
 
     SigningResult {
         signature,
@@ -159,7 +158,7 @@ pub fn run_cheating_signing(
         nonces_map.insert(id, nonces);
         commitments_map.insert(id, commitments);
     }
-    println!(
+    info!(
         "    Round 1 (commitments): {num_signers} signers ({:.2?}) [parallel]",
         t0.elapsed()
     );
@@ -182,7 +181,7 @@ pub fn run_cheating_signing(
     for (id, share) in sign_results {
         signature_shares.insert(id, share);
     }
-    println!(
+    info!(
         "    Round 2 (sign shares): {num_signers} signers ({:.2?}) [parallel]",
         t1.elapsed()
     );
@@ -210,15 +209,15 @@ pub fn run_cheating_signing(
         frost::round2::SignatureShare::deserialize(&corrupted_share_bytes).unwrap();
     signature_shares.insert(cheater_id, corrupted_share);
 
-    println!("    Corrupted SPO #{cheater_idx}'s signature share");
-    println!("      honest:    {}", hex::encode(honest_share_bytes));
-    println!("      corrupted: {}", hex::encode(corrupted_share_bytes));
+    info!("    Corrupted SPO #{cheater_idx}'s signature share");
+    info!("      honest:    {}", hex::encode(honest_share_bytes));
+    info!("      corrupted: {}", hex::encode(corrupted_share_bytes));
 
     // Try to aggregate — should fail
     let t2 = Instant::now();
     match frost::aggregate(&signing_package, &signature_shares, public_key_package) {
-        Ok(_) => println!("    Aggregation unexpectedly succeeded"),
-        Err(e) => println!(
+        Ok(_) => info!("    Aggregation unexpectedly succeeded"),
+        Err(e) => info!(
             "    Aggregation detected misbehavior: {e} ({:.2?})",
             t2.elapsed()
         ),

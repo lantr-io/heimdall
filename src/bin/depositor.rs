@@ -49,6 +49,7 @@ use clap::Parser;
 use heimdall::bitcoin::taproot::pegin_spend_info;
 use heimdall::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
 use heimdall::config::HeimdallConfig;
+use tracing::{error, info, warn};
 
 /// Extra fee allowance per additional P2WPKH input (sats).
 const EXTRA_INPUT_FEE_SAT: u64 = 200;
@@ -112,8 +113,10 @@ struct Utxo {
 }
 
 fn main() {
+    // Before anything else: the config-load failure below has to be levelled too.
+    heimdall::logging::init_tool();
     if let Err(e) = run() {
-        eprintln!("error: {e}");
+        error!("{e}");
         std::process::exit(1);
     }
 }
@@ -147,16 +150,16 @@ fn run() -> Result<(), String> {
     let depositor_p2wpkh = Address::p2wpkh(&depositor_compressed, network);
 
     let pegin_addr = pegin_address(&secp, y_fed, depositor_xonly, refund_timeout, network);
-    eprintln!("peg-in P2TR address: {pegin_addr}");
-    eprintln!(
+    info!("peg-in P2TR address: {pegin_addr}");
+    info!(
         "depositor x-only:    {}",
         hex::encode(depositor_xonly.serialize())
     );
-    eprintln!(
+    info!(
         "depositor auth P2TR: {}  (sign the BIP-322 completion here)",
         Address::p2tr(&secp, depositor_xonly, None, network)
     );
-    eprintln!("depositor P2WPKH:    {depositor_p2wpkh}");
+    info!("depositor P2WPKH:    {depositor_p2wpkh}");
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
 
@@ -183,7 +186,7 @@ fn run() -> Result<(), String> {
                         .expect("clap requires_all guarantees this"),
                 ),
             };
-            eprintln!(
+            info!(
                 "manual UTXO: {}:{} ({} sat)",
                 utxo.txid,
                 utxo.vout,
@@ -209,7 +212,7 @@ fn run() -> Result<(), String> {
             let extra = selected.len().saturating_sub(1) as u64;
             let fee = Amount::from_sat(cli.fee_sat + extra * EXTRA_INPUT_FEE_SAT);
             for u in &selected {
-                eprintln!(
+                info!(
                     "selected UTXO: {}:{} ({} sat)",
                     u.txid,
                     u.vout,
@@ -217,7 +220,7 @@ fn run() -> Result<(), String> {
                 );
             }
             if extra > 0 {
-                eprintln!(
+                info!(
                     "multi-input ({} inputs): fee bumped to {} sat",
                     selected.len(),
                     fee.to_sat()
@@ -311,14 +314,14 @@ fn run() -> Result<(), String> {
 
     let raw = bitcoin::consensus::encode::serialize(&tx);
     println!("{}", hex::encode(&raw));
-    eprintln!("txid: {}", tx.compute_txid());
+    info!("txid: {}", tx.compute_txid());
 
     if cli.submit {
         let rpc = build_rpc(&cfg)?;
         rt.block_on(broadcast_btc_tx(&rpc, &raw))
             .map_err(|e| format!("broadcast failed: {e}"))?;
     } else {
-        eprintln!("(dry run — pass --submit to broadcast)");
+        info!("(dry run — pass --submit to broadcast)");
     }
 
     Ok(())
@@ -435,12 +438,12 @@ async fn discover_utxos(
 ) -> Result<Vec<Utxo>, String> {
     let via_wallet = list_unspent(client, rpc, address).await?;
     if !via_wallet.is_empty() {
-        eprintln!("discovered {} UTXO(s) via listunspent", via_wallet.len());
+        info!("discovered {} UTXO(s) via listunspent", via_wallet.len());
         return Ok(via_wallet);
     }
-    eprintln!("listunspent unavailable or empty; falling back to scantxoutset (slower)");
+    warn!("listunspent unavailable or empty; falling back to scantxoutset (slower)");
     let via_scan = scan_utxos(client, rpc, address).await?;
-    eprintln!("discovered {} UTXO(s) via scantxoutset", via_scan.len());
+    info!("discovered {} UTXO(s) via scantxoutset", via_scan.len());
     Ok(via_scan)
 }
 
@@ -472,7 +475,7 @@ async fn list_unspent(
     // caller fall back. Other error codes still surface as failures.
     if let Some(code) = rpc_error_code(&json) {
         if code == -18 || code == -19 {
-            eprintln!(
+            warn!(
                 "listunspent: rpc error {code} ({}); skipping wallet path",
                 json["error"]
                     .get("message")

@@ -21,6 +21,7 @@ pub struct HeimdallConfig {
     pub http: HttpConfig,
     pub demo: DemoConfig,
     pub bifrost: BifrostConfig,
+    pub log: LogConfig,
 }
 
 impl Default for HeimdallConfig {
@@ -32,6 +33,32 @@ impl Default for HeimdallConfig {
             http: HttpConfig::default(),
             demo: DemoConfig::default(),
             bifrost: BifrostConfig::default(),
+            log: LogConfig::default(),
+        }
+    }
+}
+
+// ── [log] ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LogConfig {
+    /// A bare level (`error`/`warn`/`info`/`debug`/`trace`), which is scoped to
+    /// heimdall's own modules, or a full `RUST_LOG` directive such as
+    /// `warn,heimdall::cardano=debug` — anything containing `=` or `,` is used
+    /// verbatim. Overridden by `--log-level` and `RUST_LOG`.
+    pub level: String,
+    /// `auto` (journal when systemd captures stdout, else plain), `plain`,
+    /// `journal`, or `json`. Overridden by `--log-format` and
+    /// `HEIMDALL_LOG_FORMAT`.
+    pub format: String,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+            format: "auto".to_string(),
         }
     }
 }

@@ -106,6 +106,7 @@ use crate::bitcoin::tm_builder::{
 use crate::cardano::cpo_history::{CpoHistorySource, DatumState};
 use crate::cardano::mpf;
 use crate::cardano::treasury_datum::{ConfirmedTm, TreasuryDatumError, parse_confirmed_tm_datum};
+use tracing::{info, warn};
 
 /// Asset name of the completed-peg-outs trie NFT — Aiken
 /// `bifrost/constants.ak::completed_peg_outs_root_asset_name`, the 3 ASCII bytes
@@ -779,7 +780,7 @@ pub async fn reconstruct(
     source: &dyn CpoHistorySource,
     cfg: &ReconstructConfig,
 ) -> Result<CpoTrie, CpoTrieError> {
-    eprintln!(
+    info!(
         "[cpo] reconstruction backend: {} ({})",
         source.backend(),
         source.endpoint()
@@ -878,12 +879,12 @@ pub async fn reconstruct(
                     entries: trie.len(),
                 });
             }
-            eprintln!(
+            info!(
                 "[cpo] reconstructed root matches the on-chain CPO singleton ({})",
                 hex::encode(on_chain)
             );
         }
-        None => eprintln!(
+        None => warn!(
             "[cpo] WARNING: no cpo_policy_id configured — the reconstructed root was NOT \
              cross-checked against the on-chain CPO singleton. Set cardano.cpo_policy_id \
              before trusting this trie to sign with."

@@ -37,6 +37,7 @@ use pallas_primitives::PlutusData;
 
 use crate::cardano::bf_http;
 use crate::cardano::plutus;
+use tracing::warn;
 
 /// A peg-out the SPO must fulfil in the TM: pay `destination_script_pubkey` the GROSS
 /// `amount_sat` minus this request's OWN `per_pegout_fee` (the deduction happens in
@@ -209,7 +210,7 @@ pub async fn fetch_pegout_requests(
             Ok(req) => out.push(req),
             Err(why) => {
                 malformed += 1;
-                eprintln!(
+                warn!(
                     "[pegout] skipping malformed peg-out UTxO {}#{}: {why}",
                     utxo.tx_hash, utxo.output_index
                 );
@@ -265,7 +266,7 @@ pub async fn resolve_created_slots(
                         })
                     }),
                     Err(e) => {
-                        eprintln!(
+                        warn!(
                             "[pegout] could not resolve the creation slot of {tx_hash} ({e}) \
                                  — deferring that request to a later batch"
                         );

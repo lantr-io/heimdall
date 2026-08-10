@@ -3,6 +3,7 @@
 //! `AddressUtxo` requires (notably `tx_index`). Only the fields heimdall actually uses are parsed.
 
 use serde::Deserialize;
+use tracing::warn;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BfAmount {
@@ -456,8 +457,8 @@ pub async fn fetch_key_deposit(base_url: &str, project_id: &str) -> Result<u64, 
         .await
         .map_err(|e| format!("parameters json: {e}"))?;
     let Some(d) = v.get("key_deposit").or_else(|| v.get("keyDeposit")) else {
-        eprintln!(
-            "warning: /epochs/latest/parameters carries no key_deposit — \
+        warn!(
+            "/epochs/latest/parameters carries no key_deposit — \
              assuming the protocol-standard {DEFAULT_KEY_DEPOSIT} lovelace \
              (override with --key-deposit)"
         );

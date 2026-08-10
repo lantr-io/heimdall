@@ -29,6 +29,7 @@ use heimdall::cardano::register_pool::{
 use heimdall::cardano::tx_common::network_from_address;
 use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 use heimdall::config::HeimdallConfig;
+use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(
@@ -215,18 +216,18 @@ fn run() -> Result<(), String> {
     let built: BuiltRegisterPoolTx =
         build_register_pool_tx(req).map_err(|e| format!("build register-pool tx: {e}"))?;
 
-    eprintln!("fee wallet:        {wallet_addr}");
-    eprintln!("pool id (hex):     {}", built.pool_id_hex);
-    eprintln!("pool id (bech32):  {}", built.pool_id_bech32);
-    eprintln!("stake address:     {}", built.stake_address);
-    eprintln!(
+    info!("fee wallet:        {wallet_addr}");
+    info!("pool id (hex):     {}", built.pool_id_hex);
+    info!("pool id (bech32):  {}", built.pool_id_bech32);
+    info!("stake address:     {}", built.stake_address);
+    info!(
         "delegated stake:   {} lovelace at {}",
         cli.delegated_stake_lovelace, built.stake_base_address
     );
     println!("{}", built.signed_tx_hex);
 
     if !cli.submit {
-        eprintln!("(dry run — pass --submit to broadcast via Blockfrost)");
+        info!("(dry run — pass --submit to broadcast via Blockfrost)");
         return Ok(());
     }
     let cbor = hex::decode(&built.signed_tx_hex).map_err(|e| e.to_string())?;
@@ -238,13 +239,15 @@ fn run() -> Result<(), String> {
     let tx_hash = rt
         .block_on(api.transactions_submit(cbor))
         .map_err(|e| format!("blockfrost submit: {e}"))?;
-    eprintln!("submitted: tx_hash={tx_hash}");
+    info!("submitted: tx_hash={tx_hash}");
     Ok(())
 }
 
 fn main() {
+    // Before anything else: the config-load failure below has to be levelled too.
+    heimdall::logging::init_tool();
     if let Err(e) = run() {
-        eprintln!("Error: {e}");
+        error!("{e}");
         std::process::exit(1);
     }
 }
