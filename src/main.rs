@@ -730,6 +730,26 @@ fn load_config(path: Option<&str>) -> HeimdallConfig {
     }
 }
 
+/// Run the WI-053 startup checks and refuse to start if any of them failed.
+///
+/// Prints the whole report either way — an operator watching a fresh install needs
+/// to see WHICH bridge and WHICH contracts this node resolved, not merely that it
+/// started. Nothing here spends: steps 5 and 6 name the command and stop.
+fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let report = rt.block_on(heimdall::preflight::preflight(cfg));
+    print!("{}", report.render());
+    match report.first_failure() {
+        None => Ok(()),
+        Some(f) => Err(format!(
+            "startup preflight failed at step {} ({}) — refusing to start. \
+             Fix what is listed above and re-check with \
+             `heimdall run-mover --config <file> --once`.",
+            f.n, f.title
+        )),
+    }
+}
+
 /// Resolve a per-bridge value from the CLI flag (override) else the config, exiting
 /// with a message that names both the `--flag` and the `cardano.<key>` it can come from.
 fn resolve_arg(cli: Option<String>, cfg_val: Option<&String>, flag: &str, cfg_key: &str) -> String {
@@ -1238,6 +1258,19 @@ fn main() {
             exclude_pegin,
         } => {
             let cfg = load_config(config.as_deref());
+
+            // WI-053: the startup gate runs BEFORE the per-value resolution below.
+            // Order matters twice over. It is what this item exists to fix — the
+            // first sign of a misconfiguration used to be a failed transaction,
+            // and the worst case produced no sign at all (a node missing a Config
+            // locator key ran the wall-clock fallback, which does not agree with
+            // the other SPOs). And running it AFTER `resolve_arg` would be nearly
+            // useless: that exits the process on the first unset key, so the
+            // operator would get one bare line instead of the whole picture.
+            if let Err(e) = run_preflight_gate(&cfg) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
             // CLI flags override; otherwise fall back to the [cardano] config.
             let c = &cfg.cardano;
             let pegin_script_address = resolve_arg(
