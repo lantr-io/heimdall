@@ -135,3 +135,24 @@ base_port = 18500
 # leaking it means someone else can sign as you. Keep it inside state_dir, owned
 # by the heimdall user, and back it up somewhere the daemon cannot reach.
 #skey_path = "/var/lib/heimdall/bifrost.skey"
+
+
+[log]
+# Verbosity. A bare level — error / warn / info / debug / trace — applies to
+# heimdall's own modules and leaves its dependencies at "warn", so `debug` shows
+# you the daemon rather than reqwest's TLS handshakes. Anything containing "=" or
+# "," is used verbatim as a RUST_LOG directive, e.g.
+# "warn,heimdall::cardano::blockfrost_chain=debug" to follow one subsystem.
+#
+# You rarely need to edit this file to change it: RUST_LOG in
+# /etc/default/heimdall overrides it and survives package upgrades.
+level = "info"
+
+# auto | plain | journal | json. LEAVE THIS ALONE under systemd.
+#
+# "auto" detects that journald is capturing stdout and switches to "journal",
+# which prefixes each line with the syslog priority systemd strips. That is what
+# makes `journalctl -u heimdall -p err` show errors and nothing else — without
+# it systemd files EVERY line at priority 6 (info), including the errors, and a
+# broken node looks silent. Set "json" only if a log shipper is reading this.
+format = "auto"

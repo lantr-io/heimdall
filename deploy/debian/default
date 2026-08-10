@@ -21,3 +21,13 @@ HEIMDALL_ARGS="--interval-secs 900"
 # stays commented out in /etc/heimdall/heimdall.toml. That is the intended
 # arrangement: the seed lives here, not in the file dpkg tracks.
 #HEIMDALL_MNEMONIC="word word word ..."
+
+# Log verbosity, overriding [log].level in /etc/heimdall/heimdall.toml. This is
+# the better place to turn detail up on a running node: it is not a conffile, so
+# dpkg will not diff it against a shipped version on the next upgrade, and
+# `systemctl edit heimdall` can override it per-host without touching either file.
+#
+# A bare level is scoped to heimdall and leaves its dependencies at "warn". Use a
+# full directive to aim at one subsystem, e.g.
+# RUST_LOG="warn,heimdall::cardano::blockfrost_chain=debug"
+#RUST_LOG="debug"
