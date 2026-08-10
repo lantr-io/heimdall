@@ -9,6 +9,17 @@ Documentation=https://github.com/lantr-io/heimdall
 After=network-online.target
 Wants=network-online.target
 
+# Give up after 5 failures inside 5 minutes and leave the unit in `failed`.
+#
+# Without this a misconfigured node restarts silently forever: RestartSec=10 is
+# not shorter than systemd's default 10 s rate-limit window, so the default
+# limiter never trips, `systemctl is-active` alternates activating/active, and
+# `systemctl --failed` stays empty while the daemon is doing nothing at all.
+# Measured: NRestarts just climbs. At RestartSec=10 a persistent fault trips this
+# in under a minute, while a transient crash an hour apart never does.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=heimdall
@@ -30,7 +41,10 @@ EnvironmentFile=-/etc/default/heimdall
 # editing this unit. ${VAR} would NOT split and would pass one giant argument.
 ExecStart=/usr/bin/heimdall run-mover --config /etc/heimdall/heimdall.toml $HEIMDALL_ARGS
 
-Restart=always
+# on-failure, not always: run-mover only exits 0 when it was asked to stop (an
+# operator putting --once in $HEIMDALL_ARGS), and restarting after a deliberate
+# clean exit would fight the operator. Crashes still restart.
+Restart=on-failure
 RestartSec=10
 
 # Hardening — mirrors deploy/nixos/heimdall-mover.nix rather than inventing a
