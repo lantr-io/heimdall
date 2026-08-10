@@ -27,3 +27,8 @@ heimdall-bip322.toml
 heimdall-spo*.toml
 .spo*.bifrost.skey
 .b814cca.plutus.json
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~
