@@ -53,14 +53,51 @@ jobs:
     env:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
     steps:
+      # `github.event.head_commit` exists only on PUSH events. On a pull_request run
+      # both halves of the old single-line template resolved to empty and Discord got
+      # a literal "[]()"; on push it held the WHOLE commit message, whose newlines
+      # break a [label](url) anyway. Build the line here instead, per event, and keep
+      # it to one line.
+      - name: Describe what was built
+        id: what
+        # Reached through the environment, never interpolated into the script text:
+        # a commit message and a PR title are attacker-controlled on a fork PR.
+        env:
+          EVENT: ${{ github.event_name }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          SHA_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          branch="$GITHUB_REF_NAME"
+          case "$EVENT" in
+            push)
+              text="[${COMMIT_MSG%%$'\n'*}]($COMMIT_URL)" ;;
+            pull_request)
+              # github.ref_name is "24/merge" on a PR run; the head branch is the
+              # thing a human recognises.
+              branch="$GITHUB_HEAD_REF"
+              text="[#${PR_NUM}: ${PR_TITLE}]($PR_URL)" ;;
+            *)
+              text="[${GITHUB_SHA::7} on ${branch}]($SHA_URL)" ;;
+          esac
+          text="${text//$'\n'/ }"
+          echo "description: $text"
+          {
+            printf 'text=%s\n' "$text"
+            printf 'branch=%s\n' "$branch"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Report build status
         if: env.DISCORD_WEBHOOK != ''
         uses: sarisia/actions-status-discord@v1
         with:
           webhook: ${{ env.DISCORD_WEBHOOK }}
           status: ${{ (needs.lint.result == 'success' && needs.test.result == 'success') && 'success' || 'failure' }}
-          title: "[${{ github.event.repository.name }}] ${{ (needs.lint.result == 'success' && needs.test.result == 'success') && '✅' || '❌' }} CI - ${{ github.actor }} on ${{ github.ref_name }}"
-          description: "[${{ github.event.head_commit.message }}](${{ github.event.head_commit.url }})"
+          title: "[${{ github.event.repository.name }}] ${{ (needs.lint.result == 'success' && needs.test.result == 'success') && '✅' || '❌' }} CI - ${{ github.actor }} on ${{ steps.what.outputs.branch }}"
+          description: ${{ steps.what.outputs.text }}
           url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           username: "GitHub Actions"
           avatar_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png"
