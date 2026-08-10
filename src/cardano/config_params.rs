@@ -102,12 +102,56 @@ pub struct Tunables {
     pub schedule: ScheduleParams,
 }
 
+/// Config #0–#5 — the bridge's contract identifiers.
+///
+/// These are the AUTHORITATIVE copies. Everything heimdall carries in its own
+/// `[cardano]` section — `bridged_token_unit`, `pegin_policy_id`,
+/// `pegin_script_address`, `pegout_script_address`, `cpo_policy_id` — is an
+/// operator-typed duplicate of one of them, which is exactly the kind of copy
+/// that goes stale after a redeploy and is discovered at transaction time. The
+/// startup gate (WI-053 step 4) cross-checks the duplicates against these, so a
+/// wrong one is caught on first run instead.
+///
+/// Present in every Config version: they are upstream fields #0–#5, and the datum
+/// only ever grows by appending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contracts {
+    /// #0
+    pub bridged_token_policy_id: Vec<u8>,
+    /// #1
+    pub bridged_token_asset_name: Vec<u8>,
+    /// #2
+    pub completed_peg_ins_policy_id: Vec<u8>,
+    /// #3
+    pub completed_peg_outs_policy_id: Vec<u8>,
+    /// #4. One Aiken validator serves `mint`, `withdraw` and `spend`, so this
+    /// single hash is both heimdall's `pegin_policy_id` and the payment
+    /// credential of `pegin_script_address`.
+    pub peg_in_script_hash: Vec<u8>,
+    /// #5. Likewise the payment credential of `pegout_script_address`.
+    pub peg_out_script_hash: Vec<u8>,
+}
+
+impl Contracts {
+    /// The bridged token's `unit` as Blockfrost spells it: policy id ‖ asset name.
+    #[must_use]
+    pub fn bridged_token_unit(&self) -> String {
+        format!(
+            "{}{}",
+            hex::encode(&self.bridged_token_policy_id),
+            hex::encode(&self.bridged_token_asset_name)
+        )
+    }
+}
+
 /// The Config datum as heimdall reads it: the fields it consumes, plus the raw
 /// field count that decided whether the tunables were there to consume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigParams {
     /// Number of fields in the deployed datum (the append-only version marker).
     pub field_count: usize,
+    /// #0–#5 — the contract identifiers the operator's config duplicates.
+    pub contracts: Contracts,
     /// #9 — the DKG candidate-set stake threshold (lovelace).
     pub min_stake: u64,
     /// #11 — the anchor outpoint the first TM must spend: txid (internal byte
@@ -227,6 +271,21 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
     let fields = plutus::constr_fields(datum, 0).map_err(|e| format!("config datum: {e}"))?;
     let field_count = fields.len();
 
+    let contract_field = |i: usize, name: &str| -> Result<Vec<u8>, String> {
+        plutus::field_bytes(fields, i).map_err(|e| format!("config #{i} ({name}): {e}"))
+    };
+    let contracts = Contracts {
+        bridged_token_policy_id: contract_field(0, "bridged_token_policy_id")?,
+        bridged_token_asset_name: contract_field(1, "bridged_token_asset_name")?,
+        completed_peg_ins_policy_id: contract_field(2, "completed_peg_ins_merkle_tree_policy_id")?,
+        completed_peg_outs_policy_id: contract_field(
+            3,
+            "completed_peg_outs_merkle_tree_policy_id",
+        )?,
+        peg_in_script_hash: contract_field(4, "peg_in_withdraw_script_hash")?,
+        peg_out_script_hash: contract_field(5, "peg_out_withdraw_script_hash")?,
+    };
+
     let min_stake = nonneg(
         plutus::field_int(fields, 9).map_err(|e| format!("config #9 (min_stake): {e}"))?,
         "config #9 (min_stake)",
@@ -284,6 +343,7 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
 
     Ok(ConfigParams {
         field_count,
+        contracts,
         min_stake,
         initial_btc_treasury_utxo,
         tunables,
@@ -591,6 +651,35 @@ mod tests {
             },
             config_created_ms: Some(1_699_000_000_000),
         }
+    }
+
+    #[test]
+    fn decodes_the_contract_identifiers() {
+        let p = parse_config_datum(&config_datum(7, 1_000, 100_000)).unwrap();
+        let c = &p.contracts;
+        assert_eq!(c.bridged_token_policy_id, vec![0xaa, 0x00]);
+        assert_eq!(c.bridged_token_asset_name, vec![0xaa, 0x01]);
+        assert_eq!(c.completed_peg_ins_policy_id, vec![0xaa, 0x02]);
+        assert_eq!(c.completed_peg_outs_policy_id, vec![0xaa, 0x03]);
+        assert_eq!(c.peg_in_script_hash, vec![0xaa, 0x04]);
+        assert_eq!(c.peg_out_script_hash, vec![0xaa, 0x05]);
+        // The unit is the concatenation Blockfrost uses, not a tuple.
+        assert_eq!(c.bridged_token_unit(), "aa00aa01");
+    }
+
+    #[test]
+    fn contract_identifiers_decode_on_a_pre_tunables_config_too() {
+        // They are upstream fields #0-#5, so every Config version has them —
+        // the startup cross-check must work against an older bridge as well.
+        let mut fields = match config_datum(1, 0, 0) {
+            PlutusData::Constr(c) => c.fields.to_vec(),
+            _ => unreachable!(),
+        };
+        fields.truncate(CONFIG_FIELDS_UPSTREAM);
+        let p = parse_config_datum(&constr(0, fields)).unwrap();
+        assert_eq!(p.field_count, CONFIG_FIELDS_UPSTREAM);
+        assert!(p.tunables.is_none());
+        assert_eq!(p.contracts.peg_in_script_hash, vec![0xaa, 0x04]);
     }
 
     #[test]
