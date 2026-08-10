@@ -174,7 +174,7 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
     let mut bifrost_keypairs = BTreeMap::new();
     for i in 1..=cfg.demo.max_signers {
         let id = Identifier::try_from(i).unwrap();
-        let port = cfg.http.base_port + (i - 1);
+        let port = cfg.demo.base_port + (i - 1);
         let mut seed = [0x11u8; 32];
         seed[31] = i as u8;
         let keypair = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&seed).unwrap());

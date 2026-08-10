@@ -129,9 +129,9 @@ Notes:
   `-p`, so peers cannot fetch this node's DKG rounds and it drops out of the qualified set
   contributing nothing. Set `http.bind_address = "0.0.0.0"`. The entrypoint warns about this on
   startup, but it cannot know what you registered.
-- **The port comes from your registered `bifrost_url`, not from the config.** The daemon parses
-  that URL and binds its port; `http.base_port` only builds the local fixture demo's roster.
-  Publish the port your registration names.
+- **The port comes from your registered `bifrost_url` unless you set `http.listen_port`.** By
+  default the daemon binds the port inside that URL; `listen_port` decouples the two, which is what
+  you want when the published container port differs from the one heimdall listens on.
 - **Name the state volume.** `/var/lib/heimdall` holds the per-epoch DKG signing share and the
   completed-peg-outs trie. A container replaced without a named volume comes back unable to resume
   its epoch and believing every completed peg-out is unpaid. The directory is `0700`, owned by the

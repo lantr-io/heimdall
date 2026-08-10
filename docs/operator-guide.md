@@ -176,9 +176,22 @@ Two settings, and they are not what the names suggest:
 - **`http.bind_address`** — the local interface to bind. `0.0.0.0` for a real node. The shipped
   default is `127.0.0.1`, which is right for a local trial and wrong for an SPO. Inside a container
   loopback is unreachable *even with `-p`*.
-- **The port comes from your registered `bifrost_url`, not from the config.** The daemon parses the
-  URL you registered in step 6 and binds that port. `http.base_port` does **not** control this — it
-  only builds the roster for the local fixture demo.
+- **The advertised address is the `bifrost_url` you register**, not a config setting. Peers fetch
+  from it, so it must be reachable and it must be right.
+- **Where the process listens is separate.** By default it listens on the port inside that URL,
+  which is what you want when the node is exposed directly. Behind a reverse proxy or a container
+  port map, set **`http.listen_port`**: the advertised URL stays as registered, only the local port
+  changes. That also lets you register a clean `https://spo.example.com` and terminate TLS at
+  nginx — without `listen_port` the URL must carry an explicit `:<port>`, because it is the only
+  place the daemon can learn one.
+
+```toml
+# nginx owns :443 in front; heimdall listens privately.
+[http]
+bind_address = "127.0.0.1"
+listen_port  = 18500
+# and you registered --bifrost-url https://spo.example.com
+```
 
 So the URL you register in step 6 is the single source of truth for your port. Register a URL with
 an explicit `:<port>` — the daemon refuses to start without one, because it cannot guess which

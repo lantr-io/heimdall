@@ -472,15 +472,25 @@ impl CardanoConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct HttpConfig {
+    /// Local interface to bind. `0.0.0.0` for a node peers must reach.
     pub bind_address: String,
-    pub base_port: u16,
+    /// Local port to bind, when it must differ from the one in this node's
+    /// registered `bifrost_url`.
+    ///
+    /// The registered URL is the ADVERTISED address — it is on chain and peers
+    /// fetch from it. Unset, the node also listens on the port inside that URL,
+    /// which forces the public and local ports to be the same number and leaves
+    /// no room for a reverse proxy. Set this and the two become independent:
+    /// register `https://spo.example.com`, terminate TLS at nginx, and have
+    /// heimdall listen on `127.0.0.1:18500`.
+    pub listen_port: Option<u16>,
 }
 
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             bind_address: "127.0.0.1".to_string(),
-            base_port: 18500,
+            listen_port: None,
         }
     }
 }
@@ -492,6 +502,11 @@ impl Default for HttpConfig {
 pub struct DemoConfig {
     pub min_signers: u16,
     pub max_signers: u16,
+    /// The local fixture roster hands simulated SPO `i` the port
+    /// `base_port + i - 1`, so several can share one machine. Demo only — a
+    /// registered node takes its port from `http.listen_port` or from the port
+    /// in its own registered `bifrost_url`.
+    pub base_port: u16,
 }
 
 impl Default for DemoConfig {
@@ -499,6 +514,7 @@ impl Default for DemoConfig {
         Self {
             min_signers: 2,
             max_signers: 3,
+            base_port: 18500,
         }
     }
 }
@@ -662,7 +678,7 @@ mod tests {
         assert_eq!(cfg.protocol.poll_interval_ms, 5000);
         assert_eq!(cfg.bitcoin.network, "regtest");
         assert_eq!(cfg.bitcoin.federation_csv_blocks, 144);
-        assert_eq!(cfg.http.base_port, 18500);
+        assert_eq!(cfg.demo.base_port, 18500);
         assert_eq!(cfg.demo.min_signers, 2);
         assert_eq!(cfg.demo.max_signers, 3);
     }

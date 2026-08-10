@@ -124,14 +124,17 @@ stake_source = "blockfrost"
 # correct for a local trial and wrong for a real SPO; use 0.0.0.0 (and inside a
 # container, loopback is unreachable even with -p).
 #
-# THE PORT IS NOT SET HERE. The daemon binds the port in its own registered
-# bifrost_url, so that URL is the single source of truth — register one with an
-# explicit :<port> (it refuses to start otherwise) and open that port.
+# THE ADVERTISED ADDRESS IS NOT SET HERE — it is the bifrost_url you registered
+# on-chain, and peers fetch from that. Left alone, this node also LISTENS on the
+# port inside that URL, which is right when it is exposed directly.
+#
+# Set listen_port when the local port must differ from the public one — a reverse
+# proxy owning :443, a container port mapping, anything in front. The advertised
+# URL stays whatever you registered; only where this process listens changes. It
+# also lifts the explicit-:<port> requirement on the URL, so you can register a
+# clean https://spo.example.com and terminate TLS at nginx.
 bind_address = "127.0.0.1"
-
-# base_port only builds the roster for the local no-registry fixture demo. It has
-# no effect on a registered node.
-base_port = 18500
+#listen_port = 18500
 
 
 [bifrost]
