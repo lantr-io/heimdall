@@ -817,7 +817,7 @@ fn main() {
                 cfg.demo.max_signers = v;
             }
             if let Some(v) = base_port {
-                cfg.http.base_port = v;
+                cfg.demo.base_port = v;
             }
             if let Some(ref v) = blockfrost_project_id {
                 cfg.cardano.blockfrost_project_id = Some(v.clone());
@@ -1697,7 +1697,22 @@ async fn run_demo(
             (id, info, kp)
         }
     };
-    let port = port_from_url(&me.bifrost_url).unwrap_or_else(|e| panic!("{e}"));
+    // The registered `bifrost_url` is what peers FETCH from; it is not necessarily
+    // where this process should listen. Unset, the two are the same number — which
+    // is fine on a directly-exposed node and impossible behind a reverse proxy that
+    // wants the public port for itself. `http.listen_port` separates them, and also
+    // lifts the explicit-`:port` requirement on the URL, so a node can advertise a
+    // clean `https://spo.example.com` and terminate TLS upstream.
+    let port = match cfg.http.listen_port {
+        Some(p) => {
+            info!(
+                "listening on {}:{p} (http.listen_port); peers are directed to {}",
+                cfg.http.bind_address, me.bifrost_url
+            );
+            p
+        }
+        None => port_from_url(&me.bifrost_url).unwrap_or_else(|e| panic!("{e}")),
+    };
     let my_pool_id: [u8; 28] = me.pool_id.as_slice().try_into().unwrap_or_else(|_| {
         panic!(
             "this node's roster entry has no 28-byte pool_id (got {} bytes) — the \

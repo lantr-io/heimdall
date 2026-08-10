@@ -39,8 +39,8 @@ submit = false           # never broadcast — this is an offline demo
 
 [http]
 bind_address = "127.0.0.1"
-base_port = 18500        # SPO i listens on base_port + (i - 1)
 
 [demo]
+base_port = 18500   # SPO i listens on base_port + (i - 1)
 min_signers = 2          # threshold t
 max_signers = 3          # total SPOs n

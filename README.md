@@ -94,8 +94,12 @@ RUSTC_BOOTSTRAP=1 RUSTFLAGS='-D warnings' cargo check --all-targets
 Without Nix, use a local Rust toolchain that can build the pinned dependencies.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the check-and-test loop CI runs, the commit conventions,
-and how a release is cut. To *deploy* heimdall rather than build it — Debian package, container, or
-the NixOS module — see [deploy/README.md](deploy/README.md).
+and how a release is cut.
+
+To *run* heimdall rather than build it, start with the
+[operator guide](docs/operator-guide.md) — clean machine to a registered, running, monitored node.
+[deploy/README.md](deploy/README.md) is the per-route reference behind it (Debian package,
+container, NixOS module).
 
 ## DKG Fault Benchmarks
 

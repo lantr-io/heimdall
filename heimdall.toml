@@ -90,10 +90,16 @@ oracle_constructor = 0 # 0 = unconfirmed TM tx (Binocular sets 1 on BTC confirma
 # tm_script_cbor = "<cbor from `binocular tm-script`>"
 
 [http]
-bind_address = "127.0.0.1"
-base_port = 18500
+# bind_address is the local interface; 0.0.0.0 by default, because peers must
+# reach this endpoint. Narrow it when something in front should. The PORT comes from the
+# bifrost_url this node registered on-chain; set listen_port only when the local
+# port must differ from the advertised one (a reverse proxy, a container port
+# map). base_port lives under [demo] — it only feeds the local fixture roster.
+bind_address = "0.0.0.0"
+#listen_port = 18500
 
 [demo]
+base_port = 18500
 min_signers = 2
 max_signers = 3
 
