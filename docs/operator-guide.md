@@ -121,6 +121,15 @@ behaviour, and it is why these three cannot be left blank.
 the Config UTxO already knows. Step 4 checks what you typed against the chain, so a mistake is
 caught at startup rather than by a failed transaction — but you still have to type them.
 
+**[will be removed — WI-065]** The ban-list values are the same story, with a sharper edge.
+`ban_bootstrap`, `fault_proof_policies` and the three `*_ban_*` schedule numbers are required
+alongside the registry keys — the daemon refuses to start without them, because the eligible roster
+is the registry *minus* active bans and a node that cannot read that list computes a different DKG
+participant set from everyone else. They cannot be derived locally: they are inputs to the ban
+policy's own identifier, so you would need them to compute the address you would read them from.
+Copy them exactly; a wrong value yields a valid-looking address holding an empty list. WI-065 moves
+them into the Config UTxO, after which none of them are typed at all.
+
 **Secrets.** Two, and neither belongs in the TOML if you can avoid it:
 
 | secret | where to put it |
@@ -184,21 +193,24 @@ sudo -u heimdall heimdall run-mover --config /etc/heimdall/heimdall.toml --once
 Run it as the `heimdall` user: the config is `0640 root:heimdall` so you cannot read it as
 yourself, and running as root would leave root-owned files in the state directory.
 
-This runs six startup checks and prints all of them, then refuses to start if any failed. It is a
+This runs seven startup checks and prints all of them, then refuses to start if any failed. It is a
 dry run — it reads the chain and builds nothing.
 
 ```
-[1/6] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
-[2/6] cardano connectivity         PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
-[3/6] resolve the Config           PASS  2dce4027…#0 (17 fields, min_stake 0)
-[4/6] verify the contract set      PASS  6 identifier(s) agree with the Config
-[5/6] reference script             …
-[6/6] registration status          …
+[1/7] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
+[2/7] cardano connectivity         PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
+[3/7] resolve the Config           PASS  2dce4027…#0 (17 fields, min_stake 0)
+[4/7] verify the contract set      PASS  6 identifier(s) agree with the Config
+[5/7] reference script             …
+[6/7] ban list                     PASS  roster is ban-filtered against addr_test1… (detection only)
+[7/7] registration status          …
 ```
 
 Step 4 is the one that earns its keep: it compares every contract identifier you typed against the
-Config UTxO on chain and names any that disagree, with both values. Steps 5 and 6 tell you what is
-still missing for registration — they never spend; they name the command and stop.
+Config UTxO on chain and names any that disagree, with both values. Step 6 confirms your roster is
+ban-filtered — it fails if the registry is configured without a ban list, since that node could not
+agree with its peers on who is in the DKG. Steps 5 and 7 tell you what is still missing for
+registration — they never spend; they name the command and stop.
 
 Only `FAIL` blocks startup. A `WARN` is worth reading: `protocol.state_dir is unset` in particular
 is the one that silently costs money later.

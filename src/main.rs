@@ -1557,17 +1557,34 @@ async fn run_demo(
                                 info!("automatic DKG fault banning: enabled");
                                 bf_chain = bf_chain.with_dkg_fault_ban_flow(flow);
                             }
-                            Ok(None) => unreachable!("ban list is configured"),
+                            // Reading the ban list and enforcing faults are
+                            // separate (WI-060): the roster is filtered either
+                            // way, and detection already excludes a cheater
+                            // from the ceremony. Without the enforcement keys
+                            // the cheating simply costs nothing on chain.
+                            Ok(None) => info!(
+                                "automatic DKG fault banning: disabled (no fault-enforcement \
+                                 keys) — roster IS ban-filtered; faults are detected and \
+                                 excluded but not published on chain"
+                            ),
                             Err(e) => {
                                 error!("DKG fault-ban flow config: {e}");
                                 std::process::exit(1);
                             }
                         }
                     }
-                    Ok(None) => info!(
-                        "note: no ban list configured (cardano.ban_bootstrap) — roster not \
-                         ban-filtered"
-                    ),
+                    // Unreachable on this arm since WI-060: the registry roster
+                    // is configured here, and `from_config` now refuses rather
+                    // than returning None in that case. Kept as a loud failure
+                    // rather than a silent unfiltered roster.
+                    Ok(None) => {
+                        error!(
+                            "ban list config: the registry roster is configured but \
+                             BanListSource resolved to none — refusing to run an \
+                             unfiltered roster"
+                        );
+                        std::process::exit(1);
+                    }
                     // Fail fast with a clear message — NOT a degrade-to-unfiltered:
                     // an unread ban list would admit banned SPOs to the roster. A
                     // misconfig (e.g. ban_bootstrap set but the fault-policy set /

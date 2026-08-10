@@ -841,6 +841,27 @@ impl BanListSource {
         cardano: &crate::config::CardanoConfig,
     ) -> Result<Option<Self>, BanListError> {
         let Some(ban_bootstrap) = cardano.ban_bootstrap.as_deref() else {
+            // Ban filtering is consensus-relevant, not an operator preference
+            // (WI-060). `dkg_roster::filter_eligible` drops banned pools from
+            // the ELIGIBLE SET, so a node that cannot read the ban list
+            // enumerates a different candidate set from one that can: different
+            // participants, different lexicographic indices, and a DKG that
+            // cannot converge. Neither node's own log would show anything
+            // wrong. So once a real registry roster is configured, the ban list
+            // is required — refusing here beats diverging at ceremony time.
+            //
+            // The fixture-roster deployment has no registry and legitimately
+            // has no ban list, which is the `Ok(None)` below.
+            if cardano.registry_blueprint.is_some() || cardano.registry_bootstrap.is_some() {
+                return Err(BanListError::Config(
+                    "cardano.ban_bootstrap is required once the on-chain registry roster is \
+                     configured: the eligible roster is the registry MINUS active bans, so a \
+                     node that does not read the ban list computes a different participant \
+                     set — and a different DKG — from one that does. Set it to the ban-list \
+                     bootstrap outref, or remove the registry keys to run the fixture roster."
+                        .into(),
+                ));
+            }
             return Ok(None);
         };
         let (Some(blueprint_path), Some(registry_bootstrap)) = (
@@ -1355,6 +1376,41 @@ mod tests {
             BanListSource::from_config(&cardano),
             Err(BanListError::Config(_))
         ));
+    }
+
+    /// WI-060: the eligible roster is the registry MINUS active bans, so a node
+    /// that does not read the ban list computes a different DKG participant set
+    /// from one that does. Once the registry roster is configured, the ban list
+    /// is not optional.
+    #[test]
+    fn source_from_config_refuses_a_registry_roster_without_a_ban_list() {
+        let cardano = crate::config::CardanoConfig {
+            registry_blueprint: Some("plutus.json".to_string()),
+            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            ..Default::default()
+        };
+
+        let err = BanListSource::from_config(&cardano)
+            .expect_err("a registry roster without a ban list must not start");
+        let BanListError::Config(msg) = err else {
+            panic!("expected a config error");
+        };
+        assert!(msg.contains("cardano.ban_bootstrap is required"), "{msg}");
+
+        // Either registry key alone is enough to trip it — a half-configured
+        // registry is a fault, not a fixture.
+        let half = crate::config::CardanoConfig {
+            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            ..Default::default()
+        };
+        assert!(matches!(
+            BanListSource::from_config(&half),
+            Err(BanListError::Config(_))
+        ));
+
+        // The fixture roster has no registry and legitimately has no ban list.
+        let fixture = crate::config::CardanoConfig::default();
+        assert!(BanListSource::from_config(&fixture).unwrap().is_none());
     }
 
     #[test]

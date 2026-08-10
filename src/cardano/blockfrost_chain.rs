@@ -88,13 +88,38 @@ pub struct DkgFaultBanFlow {
 }
 
 impl DkgFaultBanFlow {
-    /// Build the automatic DKG fault-ban configuration. When `ban_bootstrap` is
-    /// unset, the ban list itself is disabled and the automatic flow is absent.
-    /// When it is set, every field needed to publish and apply a ban is required
-    /// so the node fails at startup instead of after detecting a fault.
+    /// Build the automatic DKG fault-ban configuration — the *enforcement*
+    /// half: proving a fault on chain and applying the ban.
+    ///
+    /// This is deliberately separate from reading the ban list (WI-060).
+    /// Reading it is consensus-relevant and mandatory once the registry roster
+    /// is configured, because it decides who is in the DKG; enforcement only
+    /// decides whether cheating costs anything, and detection already works
+    /// without it — `dkg_part3` verifies every share against the published
+    /// commitments, so a bad round 1 package is dropped and the offender
+    /// excluded whether or not this flow exists.
+    ///
+    /// So: absent the whole enforcement key set, this returns `None` and the
+    /// node still filters its roster. Present *any* of it, every field is
+    /// required — a half-configured publish path must fail at startup, not
+    /// after a fault is detected.
     pub fn from_config(cardano: &crate::config::CardanoConfig) -> Result<Option<Self>, String> {
-        let Some(ban_bootstrap) = cardano.ban_bootstrap.as_deref() else {
+        let enforcement_keys = [
+            &cardano.fault_proof_srs_path,
+            &cardano.spo_bans_ref,
+            &cardano.fault_verifier_round1_ref,
+            &cardano.fault_verifier_round2_ref,
+            &cardano.fault_verifier_equivocation_ref,
+        ];
+        if enforcement_keys.iter().all(|k| k.is_none()) {
             return Ok(None);
+        }
+        let Some(ban_bootstrap) = cardano.ban_bootstrap.as_deref() else {
+            return Err(
+                "cardano.ban_bootstrap is required to publish a fault proof and apply a ban: \
+                 the spo_bans policy is parameterized by its bootstrap outref"
+                    .to_string(),
+            );
         };
         let blueprint_path = req_fault_config(&cardano.registry_blueprint, "registry_blueprint")?;
         let registry_bootstrap =
@@ -225,8 +250,10 @@ impl DkgFaultBanFlow {
 fn req_fault_config<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {
     value.as_deref().ok_or_else(|| {
         format!(
-            "cardano.{name} is required when cardano.ban_bootstrap is set; automatic DKG \
-             fault banning needs the full publish-and-apply path"
+            "cardano.{name} is required once any DKG fault-enforcement key is set; automatic \
+             fault banning needs the full publish-and-apply path. Set it, or remove every \
+             enforcement key (fault_proof_srs_path, spo_bans_ref, fault_verifier_*_ref) to \
+             read and filter the ban list without publishing fault proofs"
         )
     })
 }
@@ -2039,11 +2066,48 @@ fn viable_in_flight_spends(
 
 #[cfg(test)]
 mod tests {
-    use super::viable_in_flight_spends;
+    use super::{DkgFaultBanFlow, viable_in_flight_spends};
     use crate::cardano::treasury_datum::UnconfirmedTm;
     use bitcoin::hashes::Hash as _;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
     use std::collections::HashSet;
+
+    /// WI-060: reading the ban list and enforcing faults are separate. A node
+    /// may filter its roster without being able to publish a fault proof, so
+    /// the absence of the whole enforcement key set is `None`, not an error —
+    /// but any one of them present demands all of them.
+    #[test]
+    fn fault_flow_is_optional_as_a_whole_and_mandatory_in_part() {
+        let outref = format!("{}:0", "cc".repeat(32));
+
+        // Ban list configured, no enforcement keys → enforcement simply off.
+        let mut cardano = crate::config::CardanoConfig {
+            ban_bootstrap: Some(outref.clone()),
+            registry_blueprint: Some("plutus.json".to_string()),
+            registry_bootstrap: Some(outref.clone()),
+            ..Default::default()
+        };
+        assert!(
+            DkgFaultBanFlow::from_config(&cardano)
+                .expect("no enforcement keys is a valid configuration")
+                .is_none()
+        );
+
+        // One enforcement key present → every one of them is now required, and
+        // the error names the missing key rather than degrading.
+        cardano.fault_proof_srs_path = Some("/nonexistent/srs".to_string());
+        let err = DkgFaultBanFlow::from_config(&cardano)
+            .expect_err("a half-configured publish path must fail at startup");
+        assert!(err.contains("cardano.spo_bans_ref is required"), "{err}");
+
+        // Enforcement keys without a ban list bootstrap → named explicitly.
+        let orphan = crate::config::CardanoConfig {
+            fault_proof_srs_path: Some("/nonexistent/srs".to_string()),
+            ..Default::default()
+        };
+        let err = DkgFaultBanFlow::from_config(&orphan).expect_err("no ban bootstrap");
+        assert!(err.contains("cardano.ban_bootstrap is required"), "{err}");
+    }
 
     fn op(txid: u8, vout: u32) -> OutPoint {
         OutPoint {
