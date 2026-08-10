@@ -190,10 +190,10 @@ for changes to the service definition.
 
 ## Deploying a published release (no local build)
 
-Cut a release from the **Release** GitHub Action (Actions tab → Release → Run workflow, enter a
-version like `0.2.0`). It builds the same static musl binary in `rust:alpine` — via the shared
-`deploy/build-musl.sh` recipe — and publishes it as `heimdall` (+ `heimdall.sha256`) on a
-`v0.2.0` release. Then ship that exact artifact to the box:
+Cut a release from the **Release** GitHub Action — see
+[CONTRIBUTING.md](../CONTRIBUTING.md#cutting-a-release) for what it produces and the one-time GHCR
+step. It publishes the same static musl binary this page builds locally, so you can ship that exact
+artifact to the box:
 
 ```bash
 deploy/deploy.sh root@dev.lantr.io --release v0.2.0
