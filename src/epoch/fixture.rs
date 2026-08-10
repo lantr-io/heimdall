@@ -184,7 +184,14 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
             SpoInfo {
                 identifier: id,
                 pool_id: vec![i as u8; 28],
-                bifrost_url: format!("http://{}:{}", cfg.http.bind_address, port),
+                // A wildcard bind address says where to LISTEN; it is not somewhere a
+                // peer can connect TO. The fixture's URLs are fetched, so map it back
+                // to loopback — every process in this demo is on one machine anyway.
+                bifrost_url: format!(
+                    "http://{}:{}",
+                    fixture_url_host(&cfg.http.bind_address),
+                    port
+                ),
                 bifrost_id_pk,
             },
         );
@@ -219,5 +226,36 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
         // ignores them and loads each node's key from its own
         // [bifrost].skey_path (matched to the registered bifrost_id_pk).
         bifrost_keypairs,
+    }
+}
+
+/// Host to put in a fixture peer URL for a given bind address. `0.0.0.0` and `::`
+/// mean "every interface" to `bind(2)` and nothing at all to a client.
+fn fixture_url_host(bind_address: &str) -> &str {
+    match bind_address {
+        "0.0.0.0" | "::" | "[::]" | "" => "127.0.0.1",
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod url_host_tests {
+    use super::fixture_url_host;
+
+    #[test]
+    fn wildcard_bind_addresses_are_not_used_as_url_hosts() {
+        // `bind_address` defaults to 0.0.0.0 so a real SPO is reachable; the demo
+        // reads the same key to build URLs its peers FETCH, and no client can
+        // connect to a wildcard.
+        assert_eq!(fixture_url_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(fixture_url_host("::"), "127.0.0.1");
+        assert_eq!(fixture_url_host("[::]"), "127.0.0.1");
+        assert_eq!(fixture_url_host(""), "127.0.0.1");
+    }
+
+    #[test]
+    fn a_specific_address_is_left_alone() {
+        assert_eq!(fixture_url_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(fixture_url_host("10.0.0.5"), "10.0.0.5");
     }
 }

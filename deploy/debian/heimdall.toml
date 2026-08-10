@@ -120,9 +120,11 @@ stake_source = "blockfrost"
 # payload, so the node drops out of the qualified set and contributes nothing to
 # the epoch — silently, from this node's point of view.
 #
-# bind_address is the LOCAL INTERFACE to bind. The default below is loopback,
-# correct for a local trial and wrong for a real SPO; use 0.0.0.0 (and inside a
-# container, loopback is unreachable even with -p).
+# bind_address is the LOCAL INTERFACE to bind. 0.0.0.0 (every interface) is the
+# default because this endpoint has to be reachable; narrow it to a specific NIC,
+# or to 127.0.0.1 when a reverse proxy in front is the only thing that should
+# reach it. Do NOT use loopback on a directly-exposed node — inside a container
+# it is unreachable even with -p.
 #
 # THE ADVERTISED ADDRESS IS NOT SET HERE — it is the bifrost_url you registered
 # on-chain, and peers fetch from that. Left alone, this node also LISTENS on the
@@ -133,7 +135,7 @@ stake_source = "blockfrost"
 # URL stays whatever you registered; only where this process listens changes. It
 # also lifts the explicit-:<port> requirement on the URL, so you can register a
 # clean https://spo.example.com and terminate TLS at nginx.
-bind_address = "127.0.0.1"
+bind_address = "0.0.0.0"
 #listen_port = 18500
 
 

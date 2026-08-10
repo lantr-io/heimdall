@@ -173,8 +173,10 @@ epoch's qualified set: the ceremony proceeds without you, and nothing in your ow
 
 Two settings, and they are not what the names suggest:
 
-- **`http.bind_address`** — the local interface to bind. `0.0.0.0` for a real node. The shipped
-  default is `127.0.0.1`, which is right for a local trial and wrong for an SPO. Inside a container
+- **`http.bind_address`** — the local interface to bind. It defaults to `0.0.0.0` (every
+  interface), because this endpoint has to be reachable for the node to be useful. Narrow it to a
+  specific NIC, or to `127.0.0.1` when a reverse proxy in front is the only thing that should reach
+  heimdall directly. Do not set loopback on a directly-exposed node — and inside a container
   loopback is unreachable *even with `-p`*.
 - **The advertised address is the `bifrost_url` you register**, not a config setting. Peers fetch
   from it, so it must be reachable and it must be right.

@@ -472,7 +472,10 @@ impl CardanoConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct HttpConfig {
-    /// Local interface to bind. `0.0.0.0` for a node peers must reach.
+    /// Local interface to bind. Defaults to `0.0.0.0`, because the peer endpoint
+    /// is public by construction — its URL is on chain and every other SPO has to
+    /// fetch this node's DKG rounds from it. Narrow it (to a specific NIC, or to
+    /// loopback behind a reverse proxy) when you have a reason to.
     pub bind_address: String,
     /// Local port to bind, when it must differ from the one in this node's
     /// registered `bifrost_url`.
@@ -489,7 +492,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            bind_address: "127.0.0.1".to_string(),
+            bind_address: "0.0.0.0".to_string(),
             listen_port: None,
         }
     }

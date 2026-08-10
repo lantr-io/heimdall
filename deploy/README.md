@@ -125,10 +125,10 @@ docker exec -it heimdall sh          # a shell, for when it misbehaves
 
 Notes:
 
-- **`bind_address` must not be loopback.** `127.0.0.1` inside a container is invisible even with
-  `-p`, so peers cannot fetch this node's DKG rounds and it drops out of the qualified set
-  contributing nothing. Set `http.bind_address = "0.0.0.0"`. The entrypoint warns about this on
-  startup, but it cannot know what you registered.
+- **Do not narrow `bind_address` to loopback in a container.** It defaults to `0.0.0.0`, which is
+  what you want here: `127.0.0.1` inside a container is invisible even with `-p`, so peers cannot
+  fetch this node's DKG rounds and it drops out of the qualified set contributing nothing. The
+  entrypoint warns if it finds loopback, but it cannot know what you registered.
 - **The port comes from your registered `bifrost_url` unless you set `http.listen_port`.** By
   default the daemon binds the port inside that URL; `listen_port` decouples the two, which is what
   you want when the published container port differs from the one heimdall listens on.
