@@ -7,6 +7,8 @@ musl binary:
   general-purpose route, published on each release.
 - **[NixOS module](#deploying-the-heimdall-auto-mover-to-a-nixos-box)** — `heimdall-mover.service`,
   binary and config in `/var/lib/heimdall`. What `dev.lantr.io` runs.
+- **[Docker image](#docker-image)** — `ghcr.io/lantr-io/heimdall`, config bind-mounted into
+  `/etc/heimdall`. Same binary, no systemd; published on each release.
 
 They are separate deployments with different unit names and different config paths; do not mix
 their instructions. Running both against one bridge is a mistake — see *One instance per bridge*
@@ -72,6 +74,75 @@ Notes:
   bifrost identity key and the current epoch's DKG share, neither of which a package manager should
   delete without being asked. `postrm` prints a reminder; remove it by hand.
 - Upgrades restart the service only if it was already running, and keep your edited conffiles.
+
+---
+
+## Docker image
+
+Same static binary as the `.deb`, wrapped for hosts that run containers instead of systemd units.
+The release workflow builds it from the binary it just *published* and verifies the checksum, so
+the image, the package and the release asset are provably one file.
+
+```bash
+docker pull ghcr.io/lantr-io/heimdall:<version>
+
+# Start from the commented template shipped inside the image.
+docker run --rm ghcr.io/lantr-io/heimdall:<version> \
+    cat /usr/share/heimdall/heimdall.toml.example > heimdall.toml
+$EDITOR heimdall.toml
+
+docker run -d --name heimdall \
+    -v "$PWD/heimdall.toml:/etc/heimdall/heimdall.toml:ro" \
+    -v heimdall-state:/var/lib/heimdall \
+    -e HEIMDALL_MNEMONIC="word word word ..." \
+    -p 18500:18500 \
+    --restart unless-stopped \
+    ghcr.io/lantr-io/heimdall:<version>
+
+docker logs -f heimdall
+```
+
+`docker run` with no config exits 78 immediately, printing the commands above rather than
+crash-looping with a stack of unexplained failures. Note that a restart policy still restarts it —
+it just restarts printing a legible reason.
+
+The image is the same CLI, so anything else is a subcommand:
+
+```bash
+docker run --rm ghcr.io/lantr-io/heimdall:<version> --version
+docker run --rm -v "$PWD/heimdall.toml:/etc/heimdall/heimdall.toml:ro" \
+    ghcr.io/lantr-io/heimdall:<version> show-treasury --config /etc/heimdall/heimdall.toml
+docker exec -it heimdall sh          # a shell, for when it misbehaves
+```
+
+Notes:
+
+- **`bind_address` must not be loopback.** `127.0.0.1` inside a container is invisible even with
+  `-p`, so peers cannot fetch this node's DKG rounds and it drops out of the qualified set
+  contributing nothing. Set `http.bind_address = "0.0.0.0"` and publish the port your registered
+  `bifrost_url` names — `base_port + signer_index`, so a node at index 3 is on 18503, not 18500.
+  The entrypoint warns about this on startup, but it cannot know what you registered.
+- **Name the state volume.** `/var/lib/heimdall` holds the per-epoch DKG signing share and the
+  completed-peg-outs trie. A container replaced without a named volume comes back unable to resume
+  its epoch and believing every completed peg-out is unpaid. The directory is `0700`, owned by the
+  in-image `heimdall` user (uid 950).
+- **Mount the config read-only, and never bake it into an image.** It carries a wallet mnemonic and
+  a Blockfrost project id; an image that contains it will push them to a registry. Prefer
+  `-e HEIMDALL_MNEMONIC` and leave `cardano.mnemonic` commented out — heimdall reads the
+  environment only when the config key is absent.
+- **The image runs as non-root** and contains no config and no secrets: `/etc/heimdall` ships empty.
+- **The base is alpine, not `scratch`.** heimdall reads Cardano over HTTPS and OpenSSL loads its
+  trust store from `/etc/ssl/certs`, which `scratch` does not have — measured: a `scratch` image
+  prints `--version` correctly and then fails preflight step 2 on every Blockfrost request. Since a
+  CA bundle has to be copied in either way, the remaining difference is a shell for diagnosing a
+  daemon in production, which is worth ~8 MB on top of a 26 MB binary.
+
+Building it locally (consumes an already-built binary; it never runs cargo):
+
+```bash
+deploy/build-linux.sh                  # produces deploy/out/heimdall
+sh deploy/docker/build-image.sh        # wraps it as heimdall:<version>
+```
 
 ---
 

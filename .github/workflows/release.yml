@@ -77,9 +77,61 @@ jobs:
             ${{ inputs.prerelease && '--prerelease' || '' }} \
             dist/heimdall dist/heimdall.sha256 dist/*.deb dist/heimdall.deb.sha256
 
+  image:
+    name: ghcr image
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the image from the binary the release job already PUBLISHED, not
+      # from a fresh compile. That is what stops the three artifacts drifting: the
+      # image, the .deb and the release asset are then provably one file, and the
+      # checksum below is the proof. It is a separate job because the release job
+      # runs inside rust:alpine, which has no docker daemon.
+      - name: Download the published binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p deploy/out
+          gh release download "v${{ inputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --pattern heimdall --pattern heimdall.sha256 \
+            --dir deploy/out
+          cd deploy/out && sha256sum -c heimdall.sha256 && chmod +x heimdall
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push
+        env:
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          IMAGE="ghcr.io/${{ github.repository }}"
+          docker build \
+            --build-arg BIN=deploy/out/heimdall \
+            --build-arg "VERSION=$VERSION" \
+            -f deploy/docker/Dockerfile \
+            -t "$IMAGE:$VERSION" \
+            .
+          docker run --rm "$IMAGE:$VERSION" --version
+          docker push "$IMAGE:$VERSION"
+          # A prerelease must not move `latest`: `docker pull heimdall` is what an
+          # operator following the guide types, and it has to land on a release.
+          if [ "$PRERELEASE" != "true" ]; then
+            docker tag "$IMAGE:$VERSION" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
+
   notify:
     name: discord
-    needs: release
+    needs: [release, image]
     if: always()
     runs-on: ubuntu-latest
     env:
@@ -90,9 +142,9 @@ jobs:
         uses: sarisia/actions-status-discord@v1
         with:
           webhook: ${{ env.DISCORD_WEBHOOK }}
-          status: ${{ needs.release.result }}
-          title: "[${{ github.event.repository.name }}] ${{ needs.release.result == 'success' && '🚀' || '❌' }} Release v${{ inputs.version }} - ${{ github.actor }}"
-          description: "${{ needs.release.result == 'success' && format('Published [v{0}]({1}/{2}/releases/tag/v{0})', inputs.version, github.server_url, github.repository) || 'Release build failed' }}"
+          status: ${{ (needs.release.result == 'success' && needs.image.result == 'success') && 'success' || 'failure' }}
+          title: "[${{ github.event.repository.name }}] ${{ (needs.release.result == 'success' && needs.image.result == 'success') && '🚀' || '❌' }} Release v${{ inputs.version }} - ${{ github.actor }}"
+          description: "${{ (needs.release.result == 'success' && needs.image.result == 'success') && format('Published [v{0}]({1}/{2}/releases/tag/v{0})', inputs.version, github.server_url, github.repository) || 'Release build failed' }}"
           url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           username: "GitHub Actions"
           avatar_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png"
