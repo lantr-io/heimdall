@@ -63,8 +63,20 @@ submit = false
 # reads Cardano.
 #blockfrost_project_id = ""
 
-# Self-hosted Blockfrost-compatible endpoint. Leave unset for hosted Blockfrost.
-#blockfrost_url = ""
+# Self-hosted Blockfrost-compatible endpoint — a Dolos in front of your own
+# cardano-node, which is the shape an SPO should prefer: heimdall -> Dolos ->
+# your node, with no third party between you and the chain. Covers reads and
+# transaction submission alike. Leave unset for hosted Blockfrost.
+#blockfrost_url = "http://localhost:3000/api/v0"
+
+# Which Cardano network this node is on: mainnet | preprod | preview | testnet.
+#
+# REQUIRED once blockfrost_url is set, and the daemon refuses to start without
+# it. Hosted Blockfrost encodes the network in the project id, so it can be
+# inferred there; a local backend has no such prefix, and guessing "testnet" on
+# a mainnet machine would derive every script address with the wrong bech32
+# prefix and let the fault-proof safety gate fail open.
+#network = "mainnet"
 
 # Cardano wallet mnemonic — the wallet that pays fees and holds this SPO's
 # registration deposit.

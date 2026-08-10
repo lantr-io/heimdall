@@ -124,10 +124,7 @@ impl DkgFaultBanFlow {
         // forgeable fault proofs must refuse to start, not discover it months
         // later when the first fault happens. Costs two small reads — see
         // `read_srs_header`.
-        let mainnet = cardano
-            .blockfrost_project_id
-            .as_deref()
-            .is_some_and(|p| p.starts_with("mainnet"));
+        let mainnet = cardano.is_mainnet()?;
         crate::circuits::srs_provenance::check_fault_srs(
             &srs_path,
             crate::circuits::fault_evidence::round1_params().degree,

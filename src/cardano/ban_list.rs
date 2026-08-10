@@ -855,10 +855,7 @@ impl BanListSource {
             ));
         };
         let params = BanPolicyParams::from_config(cardano)?;
-        let mainnet = cardano
-            .blockfrost_project_id
-            .as_deref()
-            .is_some_and(|p| p.starts_with("mainnet"));
+        let mainnet = cardano.is_mainnet().map_err(BanListError::Config)?;
         Self::from_blueprint(
             blueprint_path,
             registry_bootstrap,

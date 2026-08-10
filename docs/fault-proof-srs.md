@@ -73,9 +73,11 @@ two small pieces of the SRS file rather than parsing it — `k` from the first f
 bytes, `s_g2` from the last 96 — so the check costs nothing even for a ~400 MiB
 `k = 22` file.
 
-It fails the startup on **mainnet** — determined, as elsewhere in the codebase,
-by `cardano.blockfrost_project_id` starting with `mainnet` — when the SRS is
-missing, is not a `ParamsKZG` file in `Processed` format, has `k < 22`, or
+It fails the startup on **mainnet** — `cardano.network`, or the Blockfrost
+project-id prefix when you are on hosted blockfrost.io and have not set it (see
+[Running next to your own node](operator-guide.md#running-next-to-your-own-node),
+which is why `cardano.network` is mandatory against a local backend) — when the
+SRS is missing, is not a `ParamsKZG` file in `Processed` format, has `k < 22`, or
 carries the known-insecure `tau`. On every other network the same conditions log
 a warning and continue: those deployments exercise equivocation, which needs no
 SRS, and the Round 1 / Round 2 path still fails closed at proving time.

@@ -490,10 +490,7 @@ impl RegistryRosterSource {
                 ));
             }
         };
-        let mainnet = cardano
-            .blockfrost_project_id
-            .as_deref()
-            .is_some_and(|p| p.starts_with("mainnet"));
+        let mainnet = cardano.is_mainnet().map_err(RosterError::Config)?;
         // N10b: treasury_info is now 2-param — the TM-NFT policy (binocular TM
         // validator hash), required alongside the registry fields for a real roster.
         let tm_nft = cardano.tm_nft_policy().map_err(RosterError::Config)?;

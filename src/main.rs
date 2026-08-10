@@ -4661,7 +4661,7 @@ fn run_show_roster(
         &bootstrap,
         &nft_name,
         &tm_nft,
-        pid.starts_with("mainnet"),
+        cfg.cardano.is_mainnet()?,
     )
     .map_err(|e| e.to_string())?;
     println!("registry policy:   {}", source.registry_policy_hex);
@@ -4719,7 +4719,7 @@ fn run_show_roster(
                 &bootstrap,
                 ban_bootstrap,
                 &ban_params,
-                pid.starts_with("mainnet"),
+                cfg.cardano.is_mainnet()?,
             )
             .map_err(|e| e.to_string())?;
             println!("ban policy:        {}", source.ban_policy_hex);
