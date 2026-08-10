@@ -61,6 +61,10 @@ journalctl -u heimdall -f
 
 Notes:
 
+- **Errors are greppable.** Every line carries a level and journald files it at the matching
+  priority, so `journalctl -u heimdall -p err` shows what failed and `-p warning` what degraded
+  first. Turn detail up without editing a conffile by setting `RUST_LOG` in
+  `/etc/default/heimdall` (or `systemctl edit heimdall`) and restarting.
 - **Secrets belong in `/etc/default/heimdall`,** not in the TOML. heimdall reads
   `$HEIMDALL_MNEMONIC` only when `cardano.mnemonic` is absent from the config file, so leaving that
   key commented out is what activates the environment variable — and keeps the seed out of a file
