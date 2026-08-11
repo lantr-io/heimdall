@@ -46,10 +46,15 @@ pegout_freshness_margin_ms = 604800000
 #y_fed_seed_hex = ""
 #federation_csv_blocks = 144
 
-# NO BITCOIN NODE IS REQUIRED. heimdall posts Treasury Movements to Cardano and
-# the watchtowers relay them to Bitcoin. Leave `submit` false and rpc_url unset:
-# a second broadcaster is not redundancy here, it is a way to publish a movement
-# the Cardano side has not recorded.
+# NO BITCOIN NODE IS REQUIRED, and as of WI-055 that is true on every path rather
+# than merely usually. heimdall posts Treasury Movements to Cardano and the
+# watchtowers relay them to Bitcoin; the one remaining Bitcoin read — pricing the
+# genesis Treasury Movement — now comes from Config #24, which the deploying tool
+# fills in from its own node. `submit` also defaults to false now: it used to
+# default to TRUE and was harmless only because rpc_url was unset, so anyone who
+# set rpc_url for any reason got broadcasting they never asked for. A second
+# broadcaster is not redundancy here, it is a way to publish a movement the
+# Cardano side has not recorded.
 submit = false
 #rpc_url = "http://127.0.0.1:8332"
 #rpc_user = ""

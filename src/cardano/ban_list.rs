@@ -1745,6 +1745,7 @@ mod tests {
             },
             min_stake: 0,
             initial_btc_treasury_utxo: None,
+            initial_btc_treasury_value_sat: None,
             tunables: None,
             bans: Some(BanParams {
                 spo_bans_policy_id: policy,

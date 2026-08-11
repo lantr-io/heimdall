@@ -1323,7 +1323,22 @@ mod tests {
         let (_s, pkg) =
             participant::dkg_part1(Identifier::try_from(1u16).unwrap(), 3, 2, &mut rng).unwrap();
         let (commitments, sigma_i) = frost_bridge::round1_fields(&pkg).unwrap();
-        let bytes = canonical::round1(EPOCH, THRESHOLD, attempt, &POOL, &commitments, &sigma_i);
+        // The evidence hash is part of the canonical payload, and it is derived from
+        // the very fields above — so a payload built without it is not the payload
+        // any node signs. (This call lost the argument in the merge of two branches
+        // that each passed CI alone: one added the parameter, the other added this
+        // caller.)
+        let evidence_hash =
+            round1_evidence_hash_from_fields(&POOL, 1, &commitments, &sigma_i).unwrap();
+        let bytes = canonical::round1(
+            EPOCH,
+            THRESHOLD,
+            attempt,
+            &POOL,
+            &commitments,
+            &sigma_i,
+            &evidence_hash,
+        );
         let sig = auth::sign_payload(secp, kp, &bytes);
         (bytes, sig)
     }
@@ -1393,15 +1408,32 @@ mod tests {
         assert_eq!(&ev.payload_a[..66], &ev.payload_b[..66]);
         assert_eq!(&ev.payload_a[38..66], &POOL[..]);
         assert_ne!(ev.payload_a, ev.payload_b);
-        // (3) evidence_hash = blake2b_256(min(a,b) ‖ max(a,b)) — lock the formula.
+        // (3) Lock the formula:
+        //       blake2b_256(DOMAIN ‖ be64(len lo) ‖ lo ‖ be64(len hi) ‖ hi),
+        //     ordered so (a,b) and (b,a) hash alike. The domain tag and the length
+        //     prefixes are load-bearing, not decoration: without the lengths, two
+        //     different payload PAIRS whose concatenations coincide would share an
+        //     evidence_hash, and that hash names the FaultProof token an SPO is
+        //     banned by. This assertion previously omitted both — it described a
+        //     formula the code has not used since the ban flow landed, and it never
+        //     ran because the enclosing module did not compile.
         let (lo, hi) = if ev.payload_a <= ev.payload_b {
             (&ev.payload_a, &ev.payload_b)
         } else {
             (&ev.payload_b, &ev.payload_a)
         };
-        let mut preimage = lo.clone();
+        let mut preimage = EQUIVOCATION_DOMAIN.to_vec();
+        preimage.extend_from_slice(&(lo.len() as u64).to_be_bytes());
+        preimage.extend_from_slice(lo);
+        preimage.extend_from_slice(&(hi.len() as u64).to_be_bytes());
         preimage.extend_from_slice(hi);
         assert_eq!(ev.evidence_hash(), blake2b_256(&preimage));
+        // Order-independence is the property that makes the hash a stable name for
+        // "these two payloads", whichever way round a reporter submits them.
+        let mut swapped = ev.clone();
+        std::mem::swap(&mut swapped.payload_a, &mut swapped.payload_b);
+        std::mem::swap(&mut swapped.signature_a, &mut swapped.signature_b);
+        assert_eq!(swapped.evidence_hash(), ev.evidence_hash());
         // (4) reject cases fail in Rust exactly as the validator rejects them.
         let mut bad_sig = ev.clone();
         bad_sig.signature_b = signature_b_tampered;

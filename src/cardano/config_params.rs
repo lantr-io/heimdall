@@ -52,6 +52,7 @@
 //! | 17 | `spo_bans_policy_id` | the ban script address the roster is filtered against |
 //! | 18–20 | ban schedule (`base_ban_duration_ms`, `max_faults_before_permanent`, `max_validity_window_ms`) | the ApplyBan builder |
 //! | 21–23 | `spos_registry_policy_id`, `treasury_info_policy_id`, `treasury_info_asset_name` | the roster addresses |
+//! | 24 | `initial_btc_treasury_value_sat` | pricing the genesis TM — the last thing that needed a Bitcoin node |
 //!
 //! ## Why the policy ids are PUBLISHED rather than derived (#17, #21–#23)
 //!
@@ -88,6 +89,11 @@ pub const CONFIG_FIELDS_WITH_BANS: usize = 21;
 /// Field count of a Config datum that also carries the registry identity
 /// (#21–#23) — the shape a bridge deployed at or after WI-068 genesis has.
 pub const CONFIG_FIELDS_WITH_REGISTRY: usize = 24;
+
+/// Field count of a Config datum that also carries #24, the genesis anchor's
+/// value in satoshi — the shape a bridge deployed at or after WI-055 has, and
+/// the one that lets a node run with no Bitcoin RPC at all.
+pub const CONFIG_FIELDS_WITH_ANCHOR_VALUE: usize = 25;
 
 /// Field count of the upstream Config before the tunables were appended.
 const CONFIG_FIELDS_UPSTREAM: usize = 12;
@@ -227,6 +233,11 @@ pub struct ConfigParams {
     /// #11 — the anchor outpoint the first TM must spend: txid (internal byte
     /// order) ‖ vout (4-byte LE). `None` on a Config older than the anchor field.
     pub initial_btc_treasury_utxo: Option<[u8; 36]>,
+    /// #24 — what that outpoint is worth, in satoshi. Publishing it is what lets
+    /// a node price the genesis TM with no Bitcoin node of its own; every later TM
+    /// takes the treasury value from the previous Confirmed TM's own record.
+    /// `None` on a Config predating the field.
+    pub initial_btc_treasury_value_sat: Option<u64>,
     /// #12–#16, or `None` on a Config that predates the append.
     pub tunables: Option<Tunables>,
     /// #17–#20, or `None` on a Config that predates the ban append — on which a
@@ -450,11 +461,25 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
         None
     };
 
+    // #24 — the anchor's value in satoshi. A single field, so there is no half-append
+    // to refuse; `None` simply means a Config predating it, and the caller must then
+    // find the value elsewhere (`--treasury-amount-sat`).
+    let initial_btc_treasury_value_sat = if field_count >= CONFIG_FIELDS_WITH_ANCHOR_VALUE {
+        Some(positive(
+            plutus::field_int(fields, 24)
+                .map_err(|e| format!("config #24 (initial_btc_treasury_value_sat): {e}"))?,
+            "config #24 (initial_btc_treasury_value_sat)",
+        )?)
+    } else {
+        None
+    };
+
     Ok(ConfigParams {
         field_count,
         contracts,
         min_stake,
         initial_btc_treasury_utxo,
+        initial_btc_treasury_value_sat,
         tunables,
         bans,
         registry,
@@ -840,6 +865,15 @@ mod tests {
         constr(0, fields)
     }
 
+    /// The WI-055 shape: the WI-068 datum plus #24, the genesis anchor's value.
+    fn config_datum_with_anchor_value(sat: i64) -> PlutusData {
+        let mut fields = plutus::constr_fields(&config_datum_full(), 0)
+            .unwrap()
+            .to_vec();
+        fields.push(int(sat)); // #24 initial_btc_treasury_value_sat
+        constr(0, fields)
+    }
+
     fn snapshot_of(datum: &PlutusData) -> ParamSnapshot {
         ParamSnapshot {
             slot: 12_345,
@@ -1028,6 +1062,45 @@ mod tests {
         // The appends below it are untouched.
         assert_eq!(p.bans.unwrap().spo_bans_policy_id, [0xbb; 28]);
         assert_eq!(p.tunables.unwrap().fee_rate_sat_per_vb, 7);
+    }
+
+    /// WI-055: the genesis anchor's value in satoshi, published beside the anchor
+    /// itself. Reading it here is what lets a daemon price the FIRST Treasury
+    /// Movement with no Bitcoin node — the one thing it previously could not get
+    /// from Cardano, and the entire reason heimdall had a `gettxout` call.
+    #[test]
+    fn decodes_the_published_genesis_treasury_value() {
+        let p = parse_config_datum(&config_datum_with_anchor_value(5_000_000)).unwrap();
+        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_ANCHOR_VALUE);
+        assert_eq!(p.initial_btc_treasury_value_sat, Some(5_000_000));
+        // The pair it belongs to, and the appends under it, are undisturbed.
+        assert_eq!(p.initial_btc_treasury_utxo, Some([0x11; 36]));
+        assert_eq!(p.registry.unwrap().treasury_info_asset_name, b"TMTx");
+        assert_eq!(p.bans.unwrap().spo_bans_policy_id, [0xbb; 28]);
+    }
+
+    /// A bridge predating the field reads `None` rather than a guess. The caller
+    /// must then be told to supply the value, because there is no safe default: a
+    /// wrong genesis treasury value builds a TM that cannot spend the anchor.
+    #[test]
+    fn a_config_predating_the_anchor_value_reads_none() {
+        let p = parse_config_datum(&config_datum_full()).unwrap();
+        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_REGISTRY);
+        assert_eq!(p.initial_btc_treasury_value_sat, None);
+        // …and it still carries the anchor OUTPOINT, which is what makes the
+        // missing value a real gap rather than an absent bridge.
+        assert_eq!(p.initial_btc_treasury_utxo, Some([0x11; 36]));
+    }
+
+    /// Zero or negative satoshi is not a value a Bitcoin output can hold, so it is
+    /// a mis-encode or a placeholder — either way not something to price a
+    /// treasury movement with.
+    #[test]
+    fn a_nonpositive_anchor_value_is_rejected() {
+        for bad in [0, -1] {
+            let err = parse_config_datum(&config_datum_with_anchor_value(bad)).unwrap_err();
+            assert!(err.contains("initial_btc_treasury_value_sat"), "{err}");
+        }
     }
 
     /// Both earlier shapes keep working: a bridge with the ban append but not the

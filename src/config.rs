@@ -196,7 +196,14 @@ pub struct BitcoinConfig {
     pub rpc_user: Option<String>,
     pub rpc_pass: Option<String>,
     /// Whether to broadcast the signed BTC tx to the Bitcoin node via
-    /// `sendrawtransaction`. Requires `rpc_url`. Default: true (when rpc_url set).
+    /// `sendrawtransaction`. Requires `rpc_url`.
+    ///
+    /// **Default: false.** Heimdall posts Treasury Movements to Cardano and the
+    /// watchtowers relay them to Bitcoin — a second broadcaster is not redundancy,
+    /// it is a way to publish a movement the Cardano side has not recorded. This
+    /// used to default to true, and was harmless only because `rpc_url` defaults to
+    /// `None`: an operator who set `rpc_url` for any reason got broadcasting they
+    /// never asked for. Opting in is the honest shape (WI-055).
     pub submit: bool,
     /// Depositor refund timelock (BTC blocks) in the peg-in Taproot's
     /// refund leaf. Spec default 4320 (~30 days); override for
@@ -223,7 +230,7 @@ impl Default for BitcoinConfig {
             rpc_url: None,
             rpc_user: None,
             rpc_pass: None,
-            submit: true,
+            submit: false,
             pegin_refund_timeout_blocks: 4320,
             inflight_deadline_secs: None,
         }
@@ -869,6 +876,35 @@ fee_rate_sat_per_vb = 5
             .is_mainnet()
             .unwrap()
         );
+    }
+
+    /// WI-055's acceptance, as a test: a config with NO `[bitcoin]` section loads,
+    /// and nothing in it is left in a state that would reach for a Bitcoin node.
+    ///
+    /// heimdall's only mandatory Bitcoin call was pricing the genesis Treasury
+    /// Movement with `gettxout`; the value now comes from Config #24. What remains
+    /// is `sendrawtransaction`, which is opt-in — and `submit` defaults to FALSE
+    /// rather than true, so "no Bitcoin node" no longer rests on `rpc_url` merely
+    /// happening to be unset.
+    #[test]
+    fn a_config_with_no_bitcoin_section_needs_no_bitcoin_node() {
+        let cfg: HeimdallConfig = toml::from_str(
+            r#"
+            [cardano]
+            network = "preprod"
+            "#,
+        )
+        .expect("a config with no [bitcoin] section must load");
+
+        assert!(cfg.bitcoin.rpc_url.is_none());
+        assert!(
+            !cfg.bitcoin.submit,
+            "broadcasting must be opted INTO, not out of"
+        );
+        // The bridge-wide constants still have defaults, so the section's absence
+        // is a valid deployment rather than a half-configured one.
+        assert_eq!(cfg.bitcoin.federation_csv_blocks, 144);
+        assert!(!cfg.bitcoin.y_fed_seed_hex.is_empty());
     }
 
     #[test]

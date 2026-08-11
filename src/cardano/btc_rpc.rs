@@ -2,6 +2,17 @@
 //!
 //! Shared by `MockCardanoChain` and `BlockfrostCardanoChain` so both
 //! can send signed BTC transactions directly to a regtest/testnet node.
+//!
+//! **Broadcast only, and opt-in.** Heimdall posts Treasury Movements to Cardano
+//! and the watchtowers relay them to Bitcoin; a second broadcaster is not
+//! redundancy, it is a way to publish a movement the Cardano side has not
+//! recorded. This exists for regtest and demos, which is why `bitcoin.submit`
+//! defaults to false.
+//!
+//! It used to carry a `gettxout` read as well — the genesis treasury anchor's
+//! value, which was the ONE thing a daemon could not obtain from Cardano. WI-055
+//! moved that read to the deploying tool, which publishes the answer in Config
+//! #24, so nothing on a daemon path calls Bitcoin any more.
 
 use crate::epoch::state::{EpochError, EpochResult};
 use tracing::info;
@@ -57,47 +68,4 @@ pub async fn broadcast_btc_tx(rpc: &BtcRpcConfig, tx_bytes: &[u8]) -> EpochResul
     let txid = json.get("result").and_then(|r| r.as_str()).unwrap_or("?");
     info!("[btc-rpc] broadcast accepted: txid = {txid}");
     Ok(())
-}
-
-/// Value in satoshis of an unspent outpoint via `gettxout` (mempool included).
-/// Errors when the outpoint is unknown or already spent — used only to price
-/// the genesis treasury anchor, which must be unspent until the first TM.
-pub async fn get_txout_value_sat(rpc: &BtcRpcConfig, txid: &str, vout: u32) -> EpochResult<u64> {
-    let body = serde_json::json!({
-        "jsonrpc": "1.0",
-        "id": "heimdall",
-        "method": "gettxout",
-        "params": [txid, vout, true]
-    });
-
-    let mut req = reqwest::Client::new().post(&rpc.url).json(&body);
-    if let (Some(user), Some(pass)) = (&rpc.user, &rpc.pass) {
-        req = req.basic_auth(user, Some(pass));
-    }
-
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| EpochError::Chain(format!("btc rpc request: {e}")))?;
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| EpochError::Chain(format!("btc rpc response parse: {e}")))?;
-
-    if let Some(err) = json.get("error").filter(|e| !e.is_null()) {
-        return Err(EpochError::Chain(format!("btc rpc error: {err}")));
-    }
-
-    let result = json.get("result").filter(|r| !r.is_null()).ok_or_else(|| {
-        EpochError::Chain(format!(
-            "gettxout {txid}:{vout} returned null — outpoint unknown or already spent"
-        ))
-    })?;
-    let btc = result
-        .get("value")
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| EpochError::Chain("gettxout result has no numeric value".into()))?;
-    bitcoin::Amount::from_btc(btc)
-        .map(bitcoin::Amount::to_sat)
-        .map_err(|e| EpochError::Chain(format!("gettxout value parse: {e}")))
 }

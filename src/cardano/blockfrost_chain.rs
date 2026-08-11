@@ -933,7 +933,15 @@ impl BlockfrostCardanoChain {
     /// reference), and field #15 (leader_reward, carried into the posted TM datum;
     /// its on-chain pin against this field lands with N9 — zero on a Config that
     /// predates the operational-parameter fields).
-    async fn query_config_anchor(&self) -> EpochResult<([u8; 36], (String, u32), u64)> {
+    /// The genesis anchor: the outpoint the first TM must spend (#11), WHAT IT IS
+    /// WORTH (#24), the Config UTxO ref, and the leader reward.
+    ///
+    /// The value comes back with the outpoint because the two are one fact and a
+    /// node cannot check either against Bitcoin. Reading it here is what removes
+    /// heimdall's last Bitcoin RPC dependency: before WI-055 this branch priced the
+    /// anchor with `gettxout`, so a daemon needed a Bitcoin node for exactly one
+    /// branch on exactly one bridge state.
+    async fn query_config_anchor(&self) -> EpochResult<([u8; 36], u64, (String, u32), u64)> {
         let view = self.query_config().await?;
         let anchor = view.params.initial_btc_treasury_utxo.ok_or_else(|| {
             EpochError::Chain(format!(
@@ -942,8 +950,22 @@ impl BlockfrostCardanoChain {
                 view.params.field_count
             ))
         })?;
+        let value_sat = view.params.initial_btc_treasury_value_sat.ok_or_else(|| {
+            EpochError::Chain(format!(
+                "config datum has {} fields — the anchor's value is field #24, and this bridge \
+                 predates it. The genesis Treasury Movement cannot be priced without it: pass \
+                 --treasury-outpoint/--treasury-amount-sat for a one-shot build, or redeploy the \
+                 bridge with a binocular that writes #24",
+                view.params.field_count
+            ))
+        })?;
         let leader_reward = view.params.tunables.map_or(0, |t| t.leader_reward);
-        Ok((anchor, (view.utxo.tx_hash, view.utxo.index), leader_reward))
+        Ok((
+            anchor,
+            value_sat,
+            (view.utxo.tx_hash, view.utxo.index),
+            leader_reward,
+        ))
     }
 
     /// All Confirmed TM records at the treasury address carrying the TM NFT, parsed for
@@ -1419,24 +1441,21 @@ impl CardanoChain for BlockfrostCardanoChain {
         // Bootstrap: before the first TM confirms there is no Confirmed datum to
         // follow. The treasury is the anchor outpoint from the bridge Config UTxO's
         // field 11 (initial_btc_treasury_utxo, located by the config NFT) — the same
-        // outpoint the TM validator's Genesis mint redeemer checks. Its value is not
-        // on Cardano, so price it via bitcoind gettxout (DEC-022).
+        // outpoint the TM validator's Genesis mint redeemer checks — priced by field
+        // #24 beside it.
+        //
+        // Field #24 is why this branch no longer calls Bitcoin (WI-055). The value is
+        // immutable once the output exists, so it is a fact about the bridge that the
+        // deploying tool reads once from its own node and publishes, rather than one
+        // every SPO reads for itself. Nothing else on any daemon path talks to
+        // Bitcoin, which is what lets a node run with no bitcoin config at all.
         if confirmed.is_empty() {
             use bitcoin::hashes::Hash;
-            let (anchor, _config_ref, _leader_reward) = self.query_config_anchor().await?;
+            let (anchor, sat, _config_ref, _leader_reward) = self.query_config_anchor().await?;
             let txid_bytes: [u8; 32] = anchor[..32].try_into().unwrap();
             let txid = bitcoin::Txid::from_byte_array(txid_bytes);
             let vout = u32::from_le_bytes(anchor[32..].try_into().unwrap());
             let cfg_out = bitcoin::OutPoint { txid, vout };
-            let rpc = self.btc_rpc.as_ref().ok_or_else(|| {
-                EpochError::Chain(
-                    "genesis treasury resolution needs bitcoin.rpc_url (gettxout on the \
-                     config anchor outpoint)"
-                        .into(),
-                )
-            })?;
-            let sat =
-                crate::cardano::btc_rpc::get_txout_value_sat(rpc, &txid.to_string(), vout).await?;
             // An unreadable in-flight movement could be spending this outpoint; be
             // conservative and treat it as not-yet-free.
             let btc_confirmed = !in_flight_spends.contains(&cfg_out) && opaque_unconfirmed == 0;
@@ -1929,7 +1948,8 @@ impl CardanoChain for BlockfrostCardanoChain {
         // the Config UTxO for the anchor; the scaffold path has no Config, so 0.
         let (mint_ref, leader_reward): (Option<(String, u32, bool)>, u64) =
             if self.tm_script_cbor.is_some() {
-                let (anchor, config_ref, cfg_leader_reward) = self.query_config_anchor().await?;
+                let (anchor, _value_sat, config_ref, cfg_leader_reward) =
+                    self.query_config_anchor().await?;
                 let records = self.query_confirmed_records().await?;
                 let r = match crate::cardano::tm_chain::walk_chain(anchor, &records) {
                     Some(tip) => Some((tip.cardano_utxo.0.clone(), tip.cardano_utxo.1, false)),
