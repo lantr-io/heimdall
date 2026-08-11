@@ -229,21 +229,21 @@ pub fn contract_mismatches(cfg: &HeimdallConfig, on_chain: &Contracts) -> Vec<Mi
 
     check(
         "cardano.bridged_token_unit",
-        "#0‖#1 (bridged_token)",
+        "#1 ‖ fSAT (bridged_token)",
         c.bridged_token_unit.clone(),
         on_chain.bridged_token_unit(),
     );
     check(
         "cardano.pegin_policy_id",
-        "#4 (peg_in_withdraw_script_hash)",
+        "#5 (peg_in_script_hash)",
         c.pegin_policy_id.clone(),
         hex::encode(&on_chain.peg_in_script_hash),
     );
     check(
         "cardano.cpo_policy_id",
-        "#3 (completed_peg_outs_merkle_tree_policy_id)",
+        "#3 (bridge_state_policy)",
         c.cpo_policy_id.clone(),
-        hex::encode(&on_chain.completed_peg_outs_policy_id),
+        hex::encode(&on_chain.bridge_state_policy_id),
     );
     // Addresses carry the script hash in their payment credential. An address we
     // cannot decode is left alone rather than reported as a mismatch — that is a
@@ -251,7 +251,7 @@ pub fn contract_mismatches(cfg: &HeimdallConfig, on_chain: &Contracts) -> Vec<Mi
     // turn it into a confusing one.
     check(
         "cardano.pegin_script_address",
-        "#4 (peg_in_withdraw_script_hash)",
+        "#5 (peg_in_script_hash)",
         c.pegin_script_address
             .as_deref()
             .and_then(address_script_hash),
@@ -259,7 +259,7 @@ pub fn contract_mismatches(cfg: &HeimdallConfig, on_chain: &Contracts) -> Vec<Mi
     );
     check(
         "cardano.pegout_script_address",
-        "#5 (peg_out_withdraw_script_hash)",
+        "#6 (peg_out_script_hash)",
         c.pegout_script_address
             .as_deref()
             .and_then(address_script_hash),
@@ -506,8 +506,10 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             "resolve the Config",
                             Status::Pass,
                             format!(
-                                "{} ({} fields, min_stake {})",
-                                view.utxo, view.params.field_count, view.params.min_stake
+                                "{} ({} fields, fee_rate {} sat/vB)",
+                                view.utxo,
+                                view.params.field_count,
+                                view.params.tunables.fee_rate_sat_per_vb
                             ),
                         );
                         Some(view)
@@ -824,9 +826,8 @@ mod tests {
     fn contracts() -> Contracts {
         Contracts {
             bridged_token_policy_id: vec![0xAA; 28],
-            bridged_token_asset_name: b"fBTC".to_vec(),
             completed_peg_ins_policy_id: vec![0xBB; 28],
-            completed_peg_outs_policy_id: vec![0xCC; 28],
+            bridge_state_policy_id: vec![0xCC; 28],
             peg_in_script_hash: vec![0xDD; 28],
             peg_out_script_hash: vec![0xEE; 28],
         }

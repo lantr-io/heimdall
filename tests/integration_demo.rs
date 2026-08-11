@@ -84,6 +84,14 @@ async fn full_cycle_3_spos_over_http() {
             });
             config.pegin_collection_window = Duration::from_millis(100);
             config.pegin_poll_interval = Duration::from_millis(20);
+            // BuildTm requires a state_dir: both tries are cumulative, and a
+            // node that cannot persist them would commit roots covering only
+            // its own movement. One directory per NODE per process, so the
+            // three loops here never share a trie.
+            config.state_dir = Some(std::env::temp_dir().join(format!(
+                "heimdall-integration-demo-{}-{port}",
+                std::process::id(),
+            )));
             run_epoch_loop(chain, pegin_source, peers, clock, rng, &config).await
         }));
     }

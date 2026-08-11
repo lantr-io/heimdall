@@ -171,7 +171,7 @@ pub struct BitcoinConfig {
     /// UTxO is unset or predates the operational-parameter fields.
     ///
     /// A production TM does NOT read this. Since WI-040 the fee rate is Config
-    /// datum field #12, read from the Config UTxO at the batch snapshot slot
+    /// datum params record (field 7), read from the Config UTxO at the batch snapshot slot
     /// (`cardano::config_params`): it multiplies into the treasury change output, so
     /// two SPOs holding different values sign different bytes and the FROST round
     /// cannot converge. `show-config-params` reports which of the two is in force.
@@ -191,12 +191,20 @@ pub struct BitcoinConfig {
     pub federation_csv_blocks: u32,
     /// 32-byte hex seed for the Y_federation key.
     pub y_fed_seed_hex: String,
-    /// Optional bitcoind JSON-RPC endpoint for direct tx broadcast.
+    /// Optional bitcoind JSON-RPC endpoint. DEV / FEDERATION-OPS ONLY: the SPO
+    /// runtime never requires a Bitcoin node — every Bitcoin fact reaches
+    /// heimdall through Cardano (PIR datums carry the raw deposit txs,
+    /// UnconfirmedTm records carry the raw TMs, the bridge-state singleton
+    /// carries the treasury head). This endpoint serves only the opt-in dev
+    /// broadcast below and the federation ops tools (treasury-self-send,
+    /// federation-spend).
     pub rpc_url: Option<String>,
     pub rpc_user: Option<String>,
     pub rpc_pass: Option<String>,
-    /// Whether to broadcast the signed BTC tx to the Bitcoin node via
-    /// `sendrawtransaction`. Requires `rpc_url`. Default: true (when rpc_url set).
+    /// DEV-ONLY: broadcast the signed BTC tx to `rpc_url` via
+    /// `sendrawtransaction`. Default FALSE — in production the SPO never
+    /// broadcasts; watchtowers relay `signed_btc_tx` from the UnconfirmedTm
+    /// record (that is what the record is for).
     pub submit: bool,
     /// Depositor refund timelock (BTC blocks) in the peg-in Taproot's
     /// refund leaf. Spec default 4320 (~30 days); override for
@@ -223,7 +231,7 @@ impl Default for BitcoinConfig {
             rpc_url: None,
             rpc_user: None,
             rpc_pass: None,
-            submit: true,
+            submit: false,
             pegin_refund_timeout_blocks: 4320,
             inflight_deadline_secs: None,
         }
@@ -280,13 +288,20 @@ pub struct CardanoConfig {
     /// request per transaction that ever touched the address. See
     /// `cardano::cpo_history`.
     pub kupo_url: Option<String>,
-    /// Policy id (script hash) of the completed-peg-outs trie validator — Config
-    /// field 3. It identifies the on-chain CPO singleton (asset name `"CPO"`).
+    /// Policy id (script hash) of the bridge state singleton validator — Config
+    /// field 3, `bridge_state_policy`. With asset name `"BSS"` (hex `425353`) it
+    /// identifies the on-chain BridgeState UTxO, whose datum field 1 is the
+    /// completed-peg-outs root.
+    ///
+    /// The KEY keeps its old `cpo_policy_id` name for config compatibility, but the
+    /// VALUE is the bridge state policy. It is not a separate completed-peg-outs
+    /// policy, and heimdall no longer looks up asset name `"CPO"` (hex `43504f`).
     ///
     /// `reconstruct-cpo-trie` cross-checks its finished trie against that
-    /// singleton's root and refuses to write on a mismatch. That is the only check
-    /// covering the trie as a WHOLE — the per-movement assertions cannot notice a
-    /// replay that stopped one movement early — so the command requires this.
+    /// singleton's `cpo_root` and refuses to write on a mismatch. That is the only
+    /// check covering the trie as a WHOLE — the per-movement assertions cannot
+    /// notice a replay that stopped one movement early — so the command requires
+    /// this.
     pub cpo_policy_id: Option<String>,
     pub socket_path: Option<String>,
     pub network_magic: Option<u64>,
@@ -303,16 +318,13 @@ pub struct CardanoConfig {
     pub treasury_policy_id: Option<String>,
     pub treasury_asset_name: Option<String>,
     pub mnemonic: Option<String>,
-    /// **FALLBACK.** register_spo R2 min-stake threshold (lovelace). A registering
-    /// pool's `active_stake` must be `>=` this to build register_spo / join the DKG
-    /// candidate set.
+    /// register_spo R2 min-stake threshold (lovelace). A registering pool's
+    /// `active_stake` must be `>=` this to build register_spo / join the DKG
+    /// candidate set. `None` → no gate configured.
     ///
-    /// Canonically the on-chain `ConfigDatum.min_stake` (field #9), which
-    /// `register-spo` reads whenever [`Self::config_address`] +
-    /// [`Self::config_nft_policy_id`] are set — the chain value wins, and a
-    /// divergent local one is reported. This key remains for a node with no Config
-    /// locator. `None` with no Config → no gate configured (the caller must error
-    /// rather than admit unconditionally).
+    /// A LOCAL operational policy: rev 5.4 removed `min_stake` from the Config
+    /// datum (it never had an on-chain reader — it gated this registration
+    /// off-chain only), so there is no chain value to defer to any more.
     pub min_stake_lovelace: Option<u64>,
     /// Where the DKG roster threshold + R2 gate read per-pool active stake.
     /// `None`/`"blockfrost"` (default) → Blockfrost `/pools/{id}.active_stake`
@@ -330,14 +342,10 @@ pub struct CardanoConfig {
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
     pub submit_oracle: bool,
-    /// Constructor tag to use in the oracle datum.
-    /// 0 = unconfirmed TM tx (Binocular will update to 1 on Bitcoin confirmation).
-    /// Default: 0.
-    pub oracle_constructor: u8,
-    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). When set (with the
-    /// `config_*` fields below), the TM NFT is minted under the real validator policy — then
-    /// `treasury_policy_id` must be the validator's script hash and `treasury_asset_name` empty.
-    /// When unset, the always-ok scaffold policy is used.
+    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). REQUIRED for posting a
+    /// TM (with the `config_*` fields below): the TM NFT is only ever minted under the real
+    /// validator policy — `treasury_policy_id` must be the validator's script hash and
+    /// `treasury_asset_name` empty. The always-ok scaffold fallback is gone.
     pub tm_script_cbor: Option<String>,
     /// Validity window (seconds) for posted TM txs (`invalid_hereafter`/`created` = latest +
     /// window). `None` → 1800 (preprod/mainnet). MUST be small (e.g. 90) on a short-epoch
@@ -345,12 +353,13 @@ pub struct CardanoConfig {
     /// window lands past it (TimeTranslationPastHorizon at submit).
     pub tm_validity_window_secs: Option<u64>,
     /// Bech32 address of the bridge Config UTxO (the config script address, from
-    /// `binocular deploy-bridge`). The Config UTxO's field 11 (initial_btc_treasury_utxo)
-    /// anchors the Treasury Movement chain; the first TM mint references it.
+    /// `binocular deploy-bridge`). The Config UTxO's field 3 (bridge_state_policy)
+    /// locates the bridge-state singleton whose head is the current treasury
+    /// outpoint; every TM mint references both UTxOs.
     ///
-    /// It also carries the **operational parameters** (fields #12-#16) every TM is
-    /// built from, so setting this + [`Self::config_nft_policy_id`] is what moves a
-    /// node off its local `bitcoin.fee_rate_sat_per_vb` and onto the value its
+    /// It also carries the **operational parameters** (the nested field-7 record)
+    /// every TM is built from, so setting this + [`Self::config_nft_policy_id`]
+    /// is what moves a node off its local `bitcoin.fee_rate_sat_per_vb` and onto the value its
     /// co-signers use — see `cardano::config_params` and `show-config-params`.
     pub config_address: Option<String>,
     /// Config NFT policy id (56 hex chars) locating the Config UTxO. Required alongside
@@ -436,7 +445,6 @@ impl Default for CardanoConfig {
             stake_source: None,
             demo_exclude_unstaked: false,
             submit_oracle: true,
-            oracle_constructor: 0,
             tm_script_cbor: None,
             tm_validity_window_secs: None,
             config_address: None,
@@ -525,34 +533,6 @@ impl CardanoConfig {
             .blockfrost_project_id
             .as_deref()
             .is_some_and(|p| p.starts_with("mainnet")))
-    }
-
-    /// The TM NFT policy id (28 bytes) = the binocular `TreasuryMovementValidator`
-    /// script hash. It is the **2nd parameter** of the `treasury_info` validator
-    /// (N10b: `treasury.ak::FederationReset` authenticates the referenced Confirmed
-    /// TM by this policy), so every command that parameterizes `treasury_info` must
-    /// supply the SAME value or it derives a different script hash/address.
-    ///
-    /// Prefers the explicit `treasury_policy_id` (the TM NFT policy is exactly that —
-    /// see publish.rs); falls back to deriving it from the configured TM validator
-    /// CBOR (`tm_script_cbor`, what `binocular tm-script` prints), so either config
-    /// style works.
-    pub fn tm_nft_policy(&self) -> Result<[u8; 28], String> {
-        if let Some(hex_str) = self.treasury_policy_id.as_deref() {
-            return hex::decode(hex_str)
-                .map_err(|e| format!("cardano.treasury_policy_id hex: {e}"))?
-                .try_into()
-                .map_err(|_| "cardano.treasury_policy_id must be 28 bytes".to_string());
-        }
-        if let Some(cbor) = self.tm_script_cbor.as_deref() {
-            return crate::cardano::blueprint::tm_nft_policy_from_script_cbor(cbor)
-                .map_err(|e| e.to_string());
-        }
-        Err(
-            "set cardano.treasury_policy_id (or cardano.tm_script_cbor) — the TM NFT policy \
-             is treasury_info's 2nd param"
-                .to_string(),
-        )
     }
 }
 

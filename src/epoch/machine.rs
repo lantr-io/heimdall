@@ -269,6 +269,7 @@ async fn await_confirm_phase(
                 tm.txid
             );
             advance_cpo_trie(config, epoch, tm)?;
+            advance_spi_trie(config, epoch, tm)?;
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -299,6 +300,16 @@ fn advance_cpo_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> 
 
     let me = config.identity.identifier;
     let Some(dir) = config.state_dir.as_deref() else {
+        // BuildTm refuses without a state_dir, so this node never PROPOSES a
+        // root. It can still observe someone else's Confirm, and skipping the
+        // advance leaves its trie behind the chain — say so rather than pass
+        // silently, because the divergence surfaces much later.
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  swept peg-ins trie NOT advanced: protocol.state_dir is not configured, so this \
+             node is not tracking the trie and cannot build or co-sign a Treasury Movement"
+        );
         return Ok(());
     };
     let mut trie = CpoTrie::load(dir)
@@ -326,6 +337,63 @@ fn advance_cpo_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> 
         me,
         epoch,
         "  completed-peg-outs trie advanced to root {} ({} entr(y|ies))",
+        hex::encode(new_root),
+        trie.len(),
+    );
+    Ok(())
+}
+
+/// Fold a CONFIRMED TM's swept deposits into this node's persisted swept
+/// peg-ins trie: every tx input except input 0 becomes an entry [SPI-1], all
+/// valued with the TM's own input-0 outpoint [SPI-3].
+///
+/// Same discipline as [`advance_cpo_trie`], for the same reasons: only after
+/// confirmation, and only if the post-insert root equals `tm.spi_root` – on a
+/// divergence the file is NOT written, because a wrong trie signs confidently
+/// wrong roots while a stale one fails loudly at the next [SPI-2] gate.
+///
+/// A node without `state_dir` keeps no trie, so there is nothing to advance.
+fn advance_spi_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> EpochResult<()> {
+    use crate::cardano::spi_trie::SpiTrie;
+
+    let me = config.identity.identifier;
+    let Some(dir) = config.state_dir.as_deref() else {
+        // BuildTm refuses without a state_dir, so this node never PROPOSES a
+        // root. It can still observe someone else's Confirm, and skipping the
+        // advance leaves its trie behind the chain — say so rather than pass
+        // silently, because the divergence surfaces much later.
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  swept peg-ins trie NOT advanced: protocol.state_dir is not configured, so this \
+             node is not tracking the trie and cannot build or co-sign a Treasury Movement"
+        );
+        return Ok(());
+    };
+    let mut trie = SpiTrie::load(dir)
+        .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?
+        .unwrap_or_default();
+
+    let inputs = tm.input_outpoints();
+    let new_root = trie
+        .insert_for_confirmed_tm(&inputs)
+        .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?;
+    if new_root != tm.spi_root {
+        return Err(EpochError::TmBuild(format!(
+            "swept peg-ins trie diverged: TM {} carries root {} but this node's trie reaches \
+             {} after inserting its {} swept input(s) – NOT persisting",
+            tm.txid,
+            hex::encode(tm.spi_root),
+            hex::encode(new_root),
+            inputs.len().saturating_sub(1),
+        )));
+    }
+    trie.save(dir)
+        .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?;
+    crate::epoch_log!(
+        me,
+        epoch,
+        "  swept peg-ins trie advanced to root {} ({} entr(y|ies))",
         hex::encode(new_root),
         trie.len(),
     );
@@ -915,34 +983,59 @@ fn load_cpo_trie(
 /// returns [`CpoTrust::Unverified`] in that case — since WI-031 the trie is the SOLE
 /// already-paid authority, so "not cross-checked" has to be a value the caller can act
 /// on, not just a log line.
-async fn cross_check_cpo_root(
+async fn cross_check_bridge_roots(
     chain: &Arc<dyn CardanoChain>,
     cpo_trie: &crate::cardano::cpo_trie::CpoTrie,
+    spi_trie: &crate::cardano::spi_trie::SpiTrie,
     state_dir: Option<&std::path::Path>,
     me: frost::Identifier,
     epoch: u64,
 ) -> EpochResult<CpoTrust> {
-    let local = cpo_trie.root();
-    match chain.query_cpo_root().await? {
-        Some(on_chain) if on_chain != local => Err(EpochError::TmBuild(format!(
+    let local_cpo = cpo_trie.root();
+    let local_spi = spi_trie.root();
+    let dir = || {
+        state_dir.map_or_else(
+            || "<protocol.state_dir>".to_string(),
+            |d| d.display().to_string(),
+        )
+    };
+    match chain.query_bridge_roots().await? {
+        Some(roots) if roots.cpo_root != local_cpo => Err(EpochError::TmBuild(format!(
             "completed-peg-outs trie is out of sync with the chain: local root {} ({} entries) \
-             != on-chain CPO singleton root {}. Refusing to attest — a TM built on a stale trie \
-             commits a root the chain does not hold. Rebuild with `reconstruct-cpo-trie` (and \
-             delete the stale {}/cpo-trie.json if the bridge was re-bootstrapped).",
-            hex::encode(local),
+             != the bridge state singleton's cpo_root {}. Refusing to attest — a TM built on a \
+             stale trie commits a root the chain does not hold. Rebuild with \
+             `reconstruct-cpo-trie` (and delete the stale {}/cpo-trie.json if the bridge was \
+             re-bootstrapped).",
+            hex::encode(local_cpo),
             cpo_trie.len(),
-            hex::encode(on_chain),
-            state_dir.map_or_else(
-                || "<protocol.state_dir>".to_string(),
-                |d| d.display().to_string()
-            ),
+            hex::encode(roots.cpo_root),
+            dir(),
         ))),
-        Some(on_chain) => {
+        // The SPI twin of the check above, and the ONLY whole-trie guard the SPI
+        // side has: [SPI-2]'s peer recomputation cannot catch a roster-wide
+        // stale trie (every co-signer recomputes from the SAME restored state),
+        // and a TM confirmed with a truncated spi_root strands every
+        // swept-but-unminted depositor ([CPI-9] has no proof against it) and
+        // makes binocular's [SPI-6] reconciliation refuse to serve at all.
+        Some(roots) if roots.spi_root != local_spi => Err(EpochError::TmBuild(format!(
+            "swept peg-ins trie is out of sync with the chain: local root {} ({} entries) != \
+             the bridge state singleton's spi_root {}. Refusing to attest — a TM built on a \
+             stale trie commits a root the chain does not hold, and a confirmed truncated \
+             spi_root strands swept-but-unminted depositors. Rebuild with \
+             `reconstruct-spi-trie` (and delete the stale {}/spi-trie.json if the bridge was \
+             re-bootstrapped).",
+            hex::encode(local_spi),
+            spi_trie.len(),
+            hex::encode(roots.spi_root),
+            dir(),
+        ))),
+        Some(roots) => {
             crate::epoch_log!(
                 me,
                 epoch,
-                "  completed-peg-outs trie: root matches the on-chain CPO singleton ({})",
-                hex::encode(on_chain)
+                "  local tries match the bridge state singleton (cpo_root {}, spi_root {})",
+                hex::encode(roots.cpo_root),
+                hex::encode(roots.spi_root),
             );
             Ok(CpoTrust::Verified)
         }
@@ -950,9 +1043,9 @@ async fn cross_check_cpo_root(
             crate::epoch_warn!(
                 me,
                 epoch,
-                "  completed-peg-outs trie: no cpo_policy_id configured — the local root \
-                 was NOT cross-checked against the on-chain CPO singleton. Set \
-                 cardano.cpo_policy_id before trusting this trie to sign with."
+                "  no cpo_policy_id configured — neither local trie root was cross-checked \
+                 against the bridge state singleton. Set cardano.cpo_policy_id before trusting \
+                 these tries to sign with."
             );
             Ok(CpoTrust::Unverified)
         }
@@ -990,6 +1083,30 @@ async fn build_tm_phase(
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
     crate::epoch_log!(me, epoch, "BuildTm: querying chain for treasury / pegouts");
+
+    // Both tries are CUMULATIVE state, and a TM commits the root that holds
+    // AFTER it. Without somewhere to persist them, every build reloads an empty
+    // trie and commits a root covering only its own movement — and neither
+    // guard catches it: [SPI-2]'s peer recomputation reloads the same empty
+    // trie and agrees, and `cross_check_bridge_roots` is skipped when
+    // `cardano.cpo_policy_id` is unset (both keys are commented out in the
+    // shipped heimdall.toml, so this is the DEFAULT configuration).
+    //
+    // Once such a TM confirms, the singleton's spi_root permanently omits every
+    // earlier sweep: binocular's [SPI-6] replay then fails and no depositor can
+    // obtain a [CPI-9] proof again. That is unrecoverable, so refuse to build
+    // rather than degrade — a node that cannot track the tries must not be the
+    // one proposing roots.
+    if config.state_dir.is_none() {
+        return Err(EpochError::TmBuild(
+            "protocol.state_dir is not configured, so the completed-peg-outs and swept-peg-ins \
+             tries cannot be persisted. A TM built without them commits roots covering only \
+             this movement, which strands every earlier peg-in permanently once it confirms. \
+             Set protocol.state_dir (and cardano.cpo_policy_id) before building Treasury \
+             Movements."
+                .to_string(),
+        ));
+    }
 
     // Poll until the previous treasury movement is confirmed on Bitcoin.
     let treasury = loop {
@@ -1086,8 +1203,23 @@ async fn build_tm_phase(
     // The completed-peg-outs trie: this node's own copy, which decides both which
     // requests are still owed a payment and the root this TM will commit.
     let cpo_trie = load_cpo_trie(config.state_dir.as_deref(), me, epoch)?;
-    let cpo_trust =
-        cross_check_cpo_root(chain, &cpo_trie, config.state_dir.as_deref(), me, epoch).await?;
+    // This node's persisted SPI trie: `build_tm` advances it by every tx input
+    // except input 0 ([SPI-1]) to compute the spi_root its BTMR1 commitment
+    // carries. Every co-signer recomputes that root from its own trie before
+    // signing ([SPI-2], `verify_spi_root`) — but that gate cannot catch a
+    // roster-wide stale trie, which is what the on-chain cross-check below is
+    // for.
+    let spi_trie = crate::cardano::spi_trie::SpiTrie::load_or_empty(config.state_dir.as_deref())
+        .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?;
+    let cpo_trust = cross_check_bridge_roots(
+        chain,
+        &cpo_trie,
+        &spi_trie,
+        config.state_dir.as_deref(),
+        me,
+        epoch,
+    )
+    .await?;
 
     // The trie is the ONLY already-paid record (WI-031), so a trie this node cannot vouch
     // for must mean "pay no peg-out", not "pay unchecked". Unchecked payment is not a
@@ -1154,6 +1286,7 @@ async fn build_tm_phase(
             margin_ms: pegout_freshness_margin_ms,
         },
         &cpo_trie,
+        &spi_trie,
     )
     .map_err(|e| EpochError::TmBuild(e.to_string()))?;
 
@@ -1185,6 +1318,9 @@ async fn build_tm_phase(
         signatures: vec![None; num_inputs],
         fulfilled: unsigned.fulfilled,
         cpo_root: unsigned.cpo_root,
+        // Computed by `build_tm` from the same trie and committed inside the
+        // tx's BTMR1 output — the two agree by construction.
+        spi_root: unsigned.spi_root,
     };
 
     crate::epoch_log!(
@@ -1375,6 +1511,22 @@ mod tests {
         config.pegin_collection_window = Duration::from_millis(40);
         config.pegin_poll_interval = Duration::from_millis(10);
         config.quorum51_timeout = Duration::from_millis(500);
+        // BuildTm REQUIRES a state_dir: both tries are cumulative, and a node
+        // that cannot persist them would commit roots covering only its own
+        // movement.
+        //
+        // The path must be unique per CALL, not per identifier: every test
+        // numbers its nodes from 1, so keying on the identifier alone makes
+        // `full_cycle_2_of_2` and `full_cycle_3_of_3` share node 1's trie and
+        // clobber each other under the default parallel test runner. The
+        // counter gives each node in each test its own directory.
+        static NEXT_STATE_DIR: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let seq = NEXT_STATE_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        config.state_dir = Some(std::env::temp_dir().join(format!(
+            "heimdall-epoch-test-{}-{seq}",
+            std::process::id(),
+        )));
         config
     }
 
@@ -1627,7 +1779,7 @@ mod tests {
         }
 
         let outputs = &tms[0].unsigned_tx.output;
-        // Treasury continuation, the one payable peg-out, and the CPOR1 root commitment.
+        // Treasury continuation, the one payable peg-out, and the BTMR1 root commitment.
         let payments: Vec<_> = outputs
             .iter()
             .filter(|o| !o.script_pubkey.is_op_return() && !o.script_pubkey.is_p2tr())
@@ -2151,11 +2303,49 @@ mod tests {
     #[tokio::test]
     async fn cpo_cross_check_accepts_a_matching_root() {
         let trie = crate::cardano::cpo_trie::CpoTrie::empty();
+        let spi = crate::cardano::spi_trie::SpiTrie::empty();
         let chain = cpo_check_chain(Some(trie.root()));
         let id = Identifier::try_from(1u16).unwrap();
-        cross_check_cpo_root(&chain, &trie, None, id, 0)
+        cross_check_bridge_roots(&chain, &trie, &spi, None, id, 0)
             .await
             .expect("a root the chain holds must be attestable");
+    }
+
+    /// The SPI twin of the stale-root refusal: a roster-wide restored (empty)
+    /// spi-trie.json against a singleton whose spi_root records earlier sweeps.
+    /// [SPI-2] cannot catch this (every co-signer recomputes from the SAME
+    /// stale trie); only the on-chain cross-check can.
+    #[tokio::test]
+    async fn spi_cross_check_refuses_a_stale_root() {
+        let trie = crate::cardano::cpo_trie::CpoTrie::empty();
+        let spi = crate::cardano::spi_trie::SpiTrie::empty();
+        let mock = MockCardanoChain::new(demo_static_fixture(2, 2, 18_900))
+            .with_bridge_roots([0x22u8; 32], trie.root());
+        let chain: Arc<dyn CardanoChain> = Arc::new(mock);
+        let id = Identifier::try_from(1u16).unwrap();
+        let err = cross_check_bridge_roots(
+            &chain,
+            &trie,
+            &spi,
+            Some(std::path::Path::new("/var/lib/hd")),
+            id,
+            0,
+        )
+        .await
+        .expect_err("a spi_root the chain does not hold must not be attestable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reconstruct-spi-trie"),
+            "the refusal must name the command that fixes it: {msg}"
+        );
+        assert!(
+            msg.contains(&hex::encode([0x22u8; 32])),
+            "the refusal must show the on-chain spi_root: {msg}"
+        );
+        assert!(
+            msg.contains("/var/lib/hd/spi-trie.json"),
+            "the refusal must name the stale file: {msg}"
+        );
     }
 
     /// The re-bootstrap case: a leftover populated trie against a fresh
@@ -2166,9 +2356,11 @@ mod tests {
         let trie = crate::cardano::cpo_trie::CpoTrie::empty();
         let chain = cpo_check_chain(Some([0x11u8; 32]));
         let id = Identifier::try_from(1u16).unwrap();
-        let err = cross_check_cpo_root(
+        let spi = crate::cardano::spi_trie::SpiTrie::empty();
+        let err = cross_check_bridge_roots(
             &chain,
             &trie,
+            &spi,
             Some(std::path::Path::new("/var/lib/hd")),
             id,
             0,
@@ -2204,8 +2396,98 @@ mod tests {
         .unwrap();
         let chain = cpo_check_chain(None);
         let id = Identifier::try_from(1u16).unwrap();
-        cross_check_cpo_root(&chain, &trie, None, id, 0)
+        let spi = crate::cardano::spi_trie::SpiTrie::empty();
+        cross_check_bridge_roots(&chain, &trie, &spi, None, id, 0)
             .await
             .expect("an unchecked root must still be attestable");
+    }
+
+    // --- swept peg-ins trie wiring [SPI-1] [SPI-3] -------------------------
+
+    /// A 36-byte outpoint: txid internal order (32 bytes of `b`) ++ vout LE.
+    fn spi_op(b: u8, vout: u32) -> [u8; 36] {
+        let mut o = [b; 36];
+        o[32..].copy_from_slice(&vout.to_le_bytes());
+        o
+    }
+
+    fn outpoint(bytes: [u8; 36]) -> bitcoin::OutPoint {
+        use bitcoin::hashes::Hash;
+        bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array(bytes[..32].try_into().unwrap()),
+            vout: u32::from_le_bytes(bytes[32..].try_into().unwrap()),
+        }
+    }
+
+    /// A minimal TM whose only meaningful content is its inputs and `spi_root`
+    /// – exactly what the swept peg-ins wiring reads.
+    fn spi_tm(inputs: &[[u8; 36]], spi_root: [u8; 32]) -> TreasuryMovement {
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|op| bitcoin::TxIn {
+                    previous_output: outpoint(*op),
+                    ..Default::default()
+                })
+                .collect(),
+            output: vec![],
+        };
+        TreasuryMovement {
+            txid: tx.compute_txid(),
+            unsigned_tx: tx,
+            prevouts: vec![],
+            input_spend_info: vec![],
+            sighashes: vec![],
+            signatures: vec![],
+            fulfilled: vec![],
+            cpo_root: [0u8; 32],
+            spi_root,
+        }
+    }
+
+    /// A CONFIRMED TM advances the persisted swept peg-ins trie: every input
+    /// except input 0 becomes an entry [SPI-1], all valued with the TM's own
+    /// input-0 outpoint [SPI-3]. A TM whose `spi_root` disagrees with what this
+    /// node's trie reaches is refused and the trie file is NOT touched.
+    #[test]
+    fn a_confirmed_tm_advances_the_persisted_spi_trie() {
+        use crate::cardano::spi_trie::SpiTrie;
+
+        let dir = std::env::temp_dir().join(format!("spi-advance-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = fast_config(Identifier::try_from(1u16).unwrap());
+        config.state_dir = Some(dir.clone());
+
+        let t = spi_op(0xaa, 0);
+        let a = spi_op(0x01, 0);
+        let b = spi_op(0x02, 3);
+        let root = SpiTrie::empty().root_after(&[t, a, b]).unwrap();
+        let tm = spi_tm(&[t, a, b], root);
+        advance_spi_trie(&config, 0, &tm).expect("a matching root advances the trie");
+
+        let trie = SpiTrie::load(&dir).unwrap().expect("trie persisted");
+        assert_eq!(trie.root(), root);
+        assert!(trie.contains(&a));
+        assert!(trie.contains(&b));
+        assert!(!trie.contains(&t), "input 0 must not become an entry");
+        assert_eq!(trie.get(&a), Some(t.as_slice()));
+
+        // A divergent spi_root is refused, and the persisted trie stays put.
+        let tm_bad = spi_tm(&[spi_op(0xbb, 0), spi_op(0x03, 1)], [9u8; 32]);
+        advance_spi_trie(&config, 0, &tm_bad).expect_err("a divergent root must be refused");
+        let untouched = SpiTrie::load(&dir).unwrap().expect("trie still present");
+        assert_eq!(
+            untouched.root(),
+            root,
+            "a refused TM must not change the file"
+        );
+
+        // No state_dir → nothing to advance, and no error.
+        config.state_dir = None;
+        advance_spi_trie(&config, 0, &tm).expect("no state_dir keeps no trie");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

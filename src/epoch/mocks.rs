@@ -159,10 +159,10 @@ pub struct MockCardanoChain {
     /// default) keeps the mock on relative per-round timeouts.
     schedule_anchor_ms: Option<i64>,
     tm_confirmed: Arc<AtomicBool>,
-    /// The root the mock reports as the on-chain completed-peg-outs singleton's.
+    /// The roots the mock reports as the on-chain bridge state singleton's.
     /// `None` (the default) is the unconfigured chain: `BuildTm` skips the
-    /// cross-check instead of treating it as the empty trie.
-    cpo_root: Option<[u8; 32]>,
+    /// cross-check instead of treating it as the empty tries.
+    bridge_roots: Option<crate::epoch::traits::BridgeRoots>,
     /// The TM batch opportunity the mock reports (N19). `None` (the default) is a
     /// chain with no grid, so `BuildTm` applies no membership cutoff — the behaviour
     /// of a deployment whose Config carries no `schedule`.
@@ -203,7 +203,7 @@ impl MockCardanoChain {
             schedule_anchor_ms: None,
             batch: crate::epoch::batch::BatchWindow::NoGrid,
             tm_confirmed: Arc::new(AtomicBool::new(true)),
-            cpo_root: None,
+            bridge_roots: None,
             treasury_info: None,
         }
     }
@@ -230,10 +230,16 @@ impl MockCardanoChain {
         self
     }
 
-    /// Report `root` as the on-chain completed-peg-outs singleton's root, so a
-    /// test can drive `BuildTm`'s stale-trie refusal from both sides.
-    pub fn with_cpo_root(mut self, root: [u8; 32]) -> Self {
-        self.cpo_root = Some(root);
+    /// Report `root` as the singleton's `cpo_root` (with an EMPTY `spi_root`),
+    /// so a test can drive `BuildTm`'s stale-trie refusal from both sides.
+    pub fn with_cpo_root(self, root: [u8; 32]) -> Self {
+        let spi = crate::cardano::spi_trie::SpiTrie::empty().root();
+        self.with_bridge_roots(spi, root)
+    }
+
+    /// Report both attested roots of the on-chain bridge state singleton.
+    pub fn with_bridge_roots(mut self, spi_root: [u8; 32], cpo_root: [u8; 32]) -> Self {
+        self.bridge_roots = Some(crate::epoch::traits::BridgeRoots { spi_root, cpo_root });
         self
     }
 
@@ -375,8 +381,8 @@ impl CardanoChain for MockCardanoChain {
         Ok(self.tm_confirmed.load(Ordering::Acquire))
     }
 
-    async fn query_cpo_root(&self) -> EpochResult<Option<[u8; 32]>> {
-        Ok(self.cpo_root)
+    async fn query_bridge_roots(&self) -> EpochResult<Option<crate::epoch::traits::BridgeRoots>> {
+        Ok(self.bridge_roots)
     }
 
     async fn plan_update_y(

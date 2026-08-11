@@ -642,3 +642,439 @@ Unconfirmed records, and a fake tip would deadlock the `btc_confirmed` polling l
 - Design doc: `../ft-bifrost-bridge/docs/superpowers/specs/2026-07-20-tm-confirmed-chain-design.md`
 - Driver: `../ft-bifrost-bridge/documentation/technical_documentation.md` ("Post signed TM",
   "The TM chain").
+
+---
+
+## DEC-023: SPI Proof Endpoint Wire Format
+
+**Date:** 2026-08-07
+**Decision:** Serve swept peg-ins proofs as JSON with hex-encoded byte fields at `GET /spi/proof/{peg_in_utxo_id}`
+**Status:** Accepted
+
+### Context
+
+Spec 2026-08-06-bridge-state-singleton-design rule [SPI-4] requires an unauthenticated
+GET route that serves a swept peg-ins membership (or non-membership) proof for a given
+`peg_in_utxo_id`. The spec does not fix the wire format, so this entry does.
+
+### Decision
+
+- Route: `GET /spi/proof/{peg_in_utxo_id}`. The path segment is the 36-byte
+  `peg_in_utxo_id` (txid internal order ++ vout LE, the `tm_chain::outpoint_bytes`
+  encoding), hex-encoded. Anything that is not exactly 36 bytes of hex is a 400.
+- Response, membership (the outpoint is in the trie):
+
+  ```json
+  {
+    "member": true,
+    "peg_in_utxo_id": "<hex, 36 bytes>",
+    "root": "<hex, 32 bytes>",
+    "value": "<hex, 36 bytes>",
+    "proof": [ ...steps ]
+  }
+  ```
+
+  `value` is the sweeping TM's input-0 outpoint ([SPI-3]).
+- Response, non-membership: same shape with `"member": false` and no `value`.
+- `proof` is a JSON array of MPF proof steps, one object per step, all byte fields
+  hex-encoded (implemented by `spi_trie::proof_to_json`):
+  - `{"type":"branch","skip":n,"neighbors":"<hex, 128 bytes>"}`
+  - `{"type":"fork","skip":n,"neighbor":{"nibble":n,"prefix":"<hex>","root":"<hex>"}}`
+  - `{"type":"leaf","skip":n,"key":"<hex>","value":"<hex>"}`
+- The proof verifies against `root` via `mpf::verify_inclusion` (membership) or
+  `mpf::verify_exclusion` (non-membership).
+
+### Rationale
+
+- Hex strings keep the payload greppable and language-neutral; every field is a plain
+  byte string with a fixed meaning, so no client needs a CBOR decoder.
+- The step objects mirror `mpf::ProofStep` one-to-one, so the mapping is mechanical in
+  both directions and cannot lose information.
+- Returning `root` in the body lets a client verify the proof offline and compare the
+  root against the on-chain singleton on its own schedule.
+- Non-membership answers 200 with `member: false` (not 404): the trie answers the
+  question either way, and the exclusion proof is the useful payload.
+
+## DEC-024: SPI Trie Production Wiring
+
+**Date:** 2026-08-07
+**Decision:** Serve /spi/proof from the persisted trie loaded per request; advance the trie on TM confirmation; enforce the [SPI-2] gate before signing
+**Status:** Accepted
+
+### Context
+
+The first SPI trie cut (DEC-023) shipped the module and the proof route, but the
+route read an `AppState.spi` field nothing ever populated: a deployed node would
+have answered every query with a valid-looking exclusion proof against the empty
+trie, presenting "was never swept" as authoritative for deposits that WERE swept.
+`SpiTrie::verify_proposed` likewise had no caller, so [SPI-2] was not enforced.
+
+### Decision
+
+- `GET /spi/proof/{peg_in_utxo_id}` loads `spi-trie.json` from
+  `protocol.state_dir` at the point of use, the same idiom `verify_cpo_root`
+  and `advance_cpo_trie` use for `cpo-trie.json`. No in-memory trie snapshot.
+  - `state_dir` unset: 503. The node keeps no trie, so it must not answer.
+  - File absent: the genesis state (empty trie, nothing swept yet). The route
+    answers honestly with exclusion proofs against the zero root.
+  - File corrupt: 500 (`SpiTrie::load` refuses a root that fails its self-check).
+- `advance_spi_trie` (epoch machine, next to `advance_cpo_trie`) folds every
+  CONFIRMED TM's inputs except input 0 into the persisted trie [SPI-1] [SPI-3].
+  It refuses to persist when the post-insert root disagrees with `tm.spi_root`.
+- `TreasuryMovement` carries `spi_root`: the builder's trie advanced by the tx
+  inputs, computed in `build_tm_phase`. The TM does not yet COMMIT this root on
+  Bitcoin; the spec's `BTMR1` commitment output (replacing `CPOR1`) is a
+  separate task, and when it lands the proposed root should be read back out of
+  the tx like `committed_cpo_root` does today.
+- `verify_spi_root` (sign_phase Round1, next to `verify_cpo_root`) reloads the
+  trie and runs `SpiTrie::verify_proposed(&tm.spi_root, inputs)` before any
+  signing material leaves the node [SPI-2]. Same honesty note as the CPO gate:
+  the TM is self-built today, so what this catches is the on-disk trie moving
+  between build and sign; the shape becomes a real co-signer gate unchanged
+  once a leader-proposed TM wire format exists.
+
+### Rationale
+
+- Loading at the point of use cannot drift: whatever the last confirmed TM
+  persisted is what the route serves and what the gate verifies.
+- 503 without `state_dir` beats a technically-valid exclusion proof that is
+  operationally a lie.
+- Refusing to persist or sign on a root mismatch is the safe direction: a stale
+  trie fails loudly at the next gate, a wrong one signs confidently wrong roots.
+
+## DEC-025: SPI Trie Storage Discipline and Duplicate-Key Semantics
+
+**Date:** 2026-08-07
+**Decision:** Share one atomic-write helper between the trie state files; treat a repeated peg-in outpoint as a no-op only when the value is identical
+**Status:** Accepted
+
+### Context
+
+`spi-trie.json` needs the same on-disk handling `cpo-trie.json` already had, and
+`insert_for_confirmed_tm` can be reached twice for the same confirmed TM (a
+restart replays the tail of the TM chain).
+
+### Decision
+
+- The 0700-directory / 0600-file / temp+rename write moved out of `cpo_trie.rs`
+  into `src/cardano/state_file.rs`, and both tries call it. `epoch::persist`
+  deliberately keeps its own copy: it force-chmods a pre-existing temp file and
+  tolerates a failed `sync_all`, which the shared helper does not.
+  - Rejected: a second copy of the helper inside `spi_trie.rs`. Two copies of a
+    security-relevant write path drift, and only one of them gets the fix.
+- Re-inserting a `peg_in_utxo_id` with the SAME value is a no-op. The same key
+  with a DIFFERENT value is `SpiTrieError::Conflict`.
+  - Rejected: last-write-wins. A Bitcoin outpoint is spent once, so two
+    sweeping TMs for one deposit means one input is wrong; either choice yields
+    a root no TM ever committed, and the [SPI-2] gate would then refuse every
+    later TM with no way to tell which source lied.
+- Persisted entries are hex strings and the file records its own root. `load`
+  recomputes the root from the entries and refuses the file on a mismatch, so a
+  hand-edited or truncated file cannot silently change what this node signs.
+
+## DEC-026: BTMR1 Two-Root Commitment via a Builder-Side SpiTrieView
+
+**Date:** 2026-08-07
+**Decision:** `build_tm` computes and embeds both roots itself; the spi trie reaches it through a new `SpiTrieView` trait; test-pinned CPO names keep their spelling
+**Status:** Accepted
+**Spec:** ft-bifrost-bridge `docs/superpowers/specs/2026-08-06-bridge-state-singleton-design.md`,
+§Root commitment output, §Checks/Confirm TM ([CTM-26]), §Off-chain: heimdall ([OH-3]),
+§Off-chain rules ([SPI-1] to [SPI-3])
+
+### Context
+
+Rev 5.4 replaces the 39-byte "CPOR1" commitment with the 71-byte "BTMR1"
+output: `OP_RETURN OP_PUSHBYTES_69 "BTMR1" ++ spi_root ++ cpo_root`. Before
+this change the spi_root was computed in `build_tm_phase` AFTER `build_tm`
+returned, which cannot work once the root lives inside the transaction bytes.
+
+### Decision
+
+- `build_tm` gains an eighth parameter, `spi: &dyn SpiTrieView`, mirroring
+  `CpoTrieView`: the trait lives in `tm_builder.rs` and `SpiTrie` implements it
+  in `spi_trie.rs`, so the `bitcoin` modules still never depend on `cardano`.
+  - Rejected: patching the commitment output after `build_tm`. The txid,
+    sighashes and `UnsignedTm` invariants are all fixed at build time.
+- `verify_spi_root` ([SPI-2]) now also compares the root the transaction ITSELF
+  commits (script bytes [7, 39)) against the locally recomputed one. A TM with
+  NO commitment output is not its problem: `verify_cpo_root` runs first and
+  refuses zero-or-many commitments, so the spi gate only cross-checks a present
+  one. This keeps the gate callable on synthetic no-output TMs in tests.
+- Names pinned by the task's tests keep their old spelling even where "cpo" is
+  now half the story: `is_cpo_commitment`, `committed_cpo_root`,
+  `CPO_COMMITMENT_EXTRA_VBYTES` (now 37 per [OH-3]). New names are BTMR1-scoped:
+  `BTMR1_COMMITMENT_PREFIX`, `BTMR1_COMMITMENT_SCRIPT_LEN`,
+  `btmr1_commitment_script`, `committed_roots` / `committed_spi_root`.
+- `cpo_trie::confirmed_committed_root` reads the cpo half at [39, 71) and gains
+  the sibling `confirmed_committed_spi_root` at [7, 39) (shared scanner
+  `confirmed_committed_roots`). The mover and the two dev CLI paths load the
+  spi trie via a new `spi_trie_from_cfg`, mirroring `cpo_trie_from_cfg`.
+- The commitment byte offsets live in exactly one function, `tm_builder::
+  btmr1_roots(spk) -> Option<(spi_root, cpo_root)>`, with `is_btmr1_commitment`
+  as its length-and-prefix half. Both readers go through it — the Bitcoin one
+  over `TxOut::script_pubkey` and the Cardano one over the Confirmed datum's
+  output bytes — so 7 / 39 / 71 can never drift apart between the two.
+
+---
+
+## DEC-027: The BridgeState Singleton Decoder Replaces the One-Field CPO Reader
+
+**Date:** 2026-08-07
+**Decision:** A strict four-field `BridgeState` decoder in `cardano::bridge_state`; the
+singleton is fetched by the `"BSS"` NFT; every caller takes `cpo_root` by name
+**Status:** Accepted
+**Spec:** ft-bifrost-bridge `docs/superpowers/specs/2026-08-06-bridge-state-singleton-design.md`,
+§BridgeState, the singleton datum ([LIB-1] to [LIB-3]), §Off-chain: heimdall ([OH-4])
+
+### Context
+
+Rev 5.4 replaces the one-field completed-peg-outs trie datum with a four-field
+`BridgeState` under a new NFT asset name, `"BSS"` (hex `425353`), not `"CPO"`
+(hex `43504f`). Field 0 of the new datum is `spi_root`, not `cpo_root`.
+
+### Decision
+
+- `parse_bridge_state` pins the constructor tag AND the arity. The old
+  `parse_cpo_trie_datum` took the head of the field list and checked neither, so
+  against a `BridgeState` datum it would have returned `spi_root` where the
+  caller wanted `cpo_root`. That failure is silent and asymmetric: a wrong root
+  makes an MPF membership proof fail harmlessly, but it makes a non-membership
+  proof succeed, which cancels a peg-out already paid in BTC.
+  - Rejected: keeping the old reader with an index argument. That is one
+    character away from the bug it fixes, which is why [LIB-1] requires access
+    by name.
+- Byte lengths are part of the decode: 32 for each root, 36 for
+  `treasury_utxo_id` (`btc_txid ‖ vout`). A short value is a wrong value.
+- `treasury_amount` is rejected when negative rather than cast. A satoshi amount
+  has no negative reading, and `u64::try_from` on a decoded `i64` is the only
+  place the sign can be caught before it becomes a huge unsigned value.
+- `fetch_onchain_cpo_root` became `fetch_bridge_state`, returning the typed
+  state. Its zero-holder and several-holder errors stay distinct, as before:
+  zero means not deployed or not indexed, several mean the NFT is not a
+  singleton. All three callers (`reconstruct`, `BlockfrostChain::query_cpo_root`,
+  the `build-tm` preflight in `main.rs`) now read `state.cpo_root` by name.
+- `CPO_ASSET_NAME` / `CPO_ASSET_NAME_HEX` and `parse_cpo_trie_datum` were
+  removed with their tests, rather than left as dead exports. Nothing in
+  heimdall reads a one-field singleton datum any more, and a leftover `"CPO"`
+  asset-name constant is exactly the thing a future lookup would reach for.
+  The Aiken `utils.get_mpf_from_output` helper still exists on-chain for the CPI
+  trie ([LIB-2]); heimdall has no CPI trie reader today.
+  - Their bytes-to-hex pin test came WITH them, as
+    `the_bss_asset_name_hex_matches_the_bytes`. `BSS_ASSET_NAME` (the Aiken byte
+    form) and `BSS_ASSET_NAME_HEX` (the asset-unit form) are two spellings of one
+    fact, and only a test that ties them together stops the hex from drifting
+    back to `43504f` on its own.
+- The `cpo_policy_id` config key keeps its name. Renaming it to
+  `bridge_state_policy` is a config-compatibility change, not part of [OH-4].
+  Because the name now lies, the DOCS carry the truth: `config.rs` and
+  `heimdall.toml` both say the value is Config field 3 `bridge_state_policy`,
+  looked up with asset name `"BSS"` (hex `425353`), and that `"CPO"` (`43504f`)
+  is gone. An operator reads only those two places.
+- The zero-holder error of `fetch_bridge_state` names `cardano.cpo_policy_id`
+  first. A wrong policy id and a sick indexer produce the SAME empty result, and
+  the wrong policy id is far likelier right after this rename, so the message
+  must not point only at the backend.
+- The prose sweep from "CPO singleton" to "bridge state singleton" covers the
+  modules this change touches (`cpo_trie`, `cpo_history`, `blockfrost_chain`,
+  `config`, `main`, `heimdall.toml`). `epoch::machine`, `epoch::traits` and
+  `epoch::mocks` still say "CPO singleton" in doc comments and in operator
+  messages.
+  - Rejected: sweeping them here. Their operator strings are the ones a live SPO
+    reads on a mismatch, and changing message text is a behaviour change that
+    belongs with the `cpo_policy_id` -> `bridge_state_policy` config rename, not
+    with [OH-4]. They name the right UTxO by the old word; they are not wrong
+    about what is read.
+
+---
+
+## DEC-028: FederationReset Removed; the Federation Authorizes Update-Y
+
+**Date:** 2026-08-07
+**Decision:** Delete the FederationReset builder, CLI and evidence readers; a
+federation-signed Update-Y ([UY-5]) replaces them; `treasury_info` is
+parameterized by `registry_policy_id` alone ([PRE-1]); the bootstrap accepts an
+operator-supplied `bifrost_identity_root` ([PRE-2])
+**Status:** Accepted
+**Spec:** ft-bifrost-bridge `docs/superpowers/specs/2026-08-06-bridge-state-singleton-design.md`,
+§Update-Y, federation branch ([UY-5], [UY-6]-[UY-8] withdrawn), §Contracts to
+fix before first deployment ([PRE-1], [PRE-2]), §Federation co-authority
+
+### Context
+
+Rev 5.4 removes `treasury.ak`'s `FederationReset` branch. Its job (dead-roster
+recovery) is covered by [UY-5]: the federation is a standing co-authority that
+can sign an ordinary Update-Y under `y_federation`, naming ANY successor key
+([UY-6] withdrawn). With the branch gone, `treasury.ak` no longer reads the
+Confirmed TM record, so its `tm_nft_policy_id` compile parameter must go before
+first deployment ([PRE-1]), and the bootstrap must not hard-code the empty MPF
+root ([PRE-2]).
+
+### Decision
+
+- `build_update_y_tx` gained an `UpdateYAuthorizer` (`Roster` | `Federation`)
+  on the request. It never changes the built bytes: both authorizations share
+  ONE redeemer (`UpdateY`, Constr 1), ONE signed message
+  (`update_y_sig_msg`, tag `"bifrost-update-y"`) and ONE datum transition. The
+  on-chain branch differs only in which datum key verifies the signature, so
+  the choice lives in the signature.
+  - The builder BIP340-verifies `signature` under the datum key the authorizer
+    names (`current_spos_frost_key` or `y_federation`) before building,
+    mirroring `register_spo::verify_registration`. A wrong-key signature is
+    rejected client-side (`UpdateYError::SignatureInvalid`) instead of failing
+    phase-2 validation on chain and forfeiting collateral. Review round 1
+    flagged the earlier design (a carried-but-unread field) as dead code with
+    an unenforced doc promise; this check is the fix.
+  - Rejected: a separate redeemer constructor or a `"bifrost-update-y-reset"`
+    tag. The spec says every other Update-Y rule is unchanged; a second wire
+    shape would force the validator and every off-chain builder to carry two
+    paths for one transition.
+- **Resolved `TreasuryInfoDatum` shape: all 5 fields stay, including
+  `last_reset_tm_txid`.** The bridge-track `treasury.ak` change owns the datum
+  shape; the current blueprint (upstream `plutus.json` and the
+  `treasury_info_code.txt` fixture) still encodes
+  `[bifrost_identity_root, current_spos_frost_key, y_federation,
+  federation_csv_blocks, last_reset_tm_txid]`, so heimdall keeps the field –
+  documented as vestigial, empty at bootstrap, preserved verbatim – to stay in
+  lockstep. If the bridge track drops the field, the fixture bump carries the
+  matching heimdall change.
+- `treasury_info_script` takes only `registry_policy_id`. The `tm_nft_policy`
+  config helper and `tm_nft_policy_from_script_cbor` were deleted with it:
+  their own docs defined them as "treasury_info's 2nd param", so keeping them
+  would leave a helper that derives a hash nothing accepts.
+- `federation_reset.rs`, the `federation-reset` CLI, `federation_reset_redeemer`,
+  `federation_reset_sig_msg`, `confirmed_tm_spent_via_federation_leaf` and
+  `confirmed_tm_reset_evidence_from_hex` were deleted rather than deprecated –
+  they read a Confirmed TM record that no longer exists in rev 5.4, and their
+  sig-msg vector tests pinned an on-chain branch that is being removed.
+- The bootstrap builder forwards `bifrost_identity_root` verbatim (the
+  empty-root refusal and its test were removed); `bootstrap-treasury-info`
+  gained `--identity-root` (optional, default empty MPF root). The on-chain
+  mint branch still pins `mpf.root(mpf.empty)` until the bridge-track [PRE-2]
+  change lands; until then a non-empty root builds but cannot validate, so
+  `--identity-root` prints a warning when the root is not the empty MPF root.
+- The ignored `registry_then_treasury_chain_matches_aiken` hash was re-pinned
+  to the single-param application against the CURRENT upstream blueprint,
+  whose compiledCode still declares the (now-unapplied) `tm_nft_policy_id`
+  parameter. Re-pin both hashes when the bridge-track treasury.ak change
+  regenerates `plutus.json`.
+
+## 2026-08-10 - rev-5.4 Config + treasury sourcing (bridge-state singleton)
+
+**DEC-030: the treasury is the singleton's head, end of chain walks.**
+`query_treasury`, the CLI sweep and `tm-status` read the current treasury
+outpoint AND its satoshi amount from the BridgeState datum, located through the
+Config's `bridge_state_policy` ([PAR-1]). The Confirmed-chain walk (`tm_chain::
+walk_chain`) is deleted: Confirm burns the TM record, so no Confirmed records
+exist to follow. The taproot-tree selection that used to read the Confirmed
+datum's outputs now reconstructs the candidate trees and checks them against
+bitcoind `gettxout` on the head - the daemon therefore requires a Bitcoin RPC
+for treasury resolution (it already did for genesis pricing).
+
+**DEC-031: config_params reads the eight-field rev-5.4 layout.**
+`bridge_state_policy` (#3) and `tm_script_hash` (#4) by position, the tunables
+nested at #7 (always present; fewer than 8 fields is refused, more are
+tolerated - appends stay the legal evolution). `min_stake`, the treasury
+anchor and `leader_reward` left the datum; the register-spo R2 gate reads the
+local `cardano.min_stake_lovelace` again (the field never had an on-chain
+reader), and the posted TM datum is the 4-field `UnconfirmedTm`
+`[signed_btc_tx, creator, created, fulfilled_por_outpoints]`.
+
+**DEC-032: the mint redeemer names the singleton reference input.**
+`publish.rs` posts with `TmMintRedeemer(bss_ref_index)` = Constr 0 [i], the
+Config UTxO and the singleton both as reference inputs, and the index computed
+against the SORTED (tx_hash, index) order the ledger presents to the script
+(`MintRefs::sorted`). The Genesis/Chain split is retired ([PTM-5] withdrawn).
+
+**DEC-033: "already swept" comes from the SPI trie.**
+The sweep's auto-skip used `TmScan.consumed` (outpoints swept per Confirmed
+records). Those records no longer exist; the swept set is the SPI trie the
+node already maintains for the BTMR1 commitment, plus the live in-flight
+spends. `TmScan` keeps its legacy Confirmed parsing (empty on a fresh
+deployment) - removing it is a wider cleanup than this migration needs.
+
+## 2026-08-11 - Cardano-only Bitcoin data on the SPO runtime
+
+**DEC-034: treasury tree selection is Cardano-sourced; supersedes DEC-030's
+"requires a Bitcoin RPC" clause.** The head's scriptPubKey comes from the TM
+that CREATED the head: output 0 of the signed bytes in the (spent)
+UnconfirmedTm record at the TM address, found by the txid RECOMPUTED from the
+record's own bytes (the [SPI-7] discipline - a hostile record can only occupy
+its own hash's slot). Backend selection matches `query_cpo_root` (Kupo, else
+Blockfrost), and the result is cached per head (it only moves at Confirm).
+The BOOTSTRAP anchor was created by the funding tx, not a TM, so no record
+exists: the tree is then constructed from the configured keys WITHOUT
+verification, logged loudly. Self-limiting per the spec's bootstrap trust
+model - under wrong keys the FROST signatures simply do not verify.
+
+**DEC-035: BTC broadcast is a dev flag, default off.** `bitcoin.submit` and
+the sweep's `--broadcast` default to false and are documented DEV-ONLY:
+production SPOs run no Bitcoin node, and the binocular watchtower relays
+`signed_btc_tx` from the posted UnconfirmedTm record (that is what the record
+is for). `bitcoin.rpc_url` serves only that opt-in path and the federation
+ops tools (`treasury-self-send`, `federation-spend`), which are not SPO
+runtime. The `gettxout` helpers are deleted; `broadcast_btc_tx` remains.
+
+**DEC-036: the always-ok posting scaffold is gone; `tm_script_cbor` is
+required.** binocular deleted TmtxScript (its salted always-ok stand-in) and
+the create-tmtx/spend-tmtx commands, so a post minted under anything but the
+real TreasuryMovementValidator lands at an address nothing scans. `publish.rs`
+therefore refuses to build without `cardano.tm_script_cbor`, the
+`oracle_constructor` knob is deleted (the UnconfirmedTm record is the only
+datum shape - always Constr 0), and the `"TMTx"` asset-name defaults become
+`""` (the real validator counts the empty-name token). `always_ok.rs` survives
+as a TEST FIXTURE ONLY for the tx-composition tests.
+
+
+**DEC-037: rev-5.4 reconstruction walks the singleton's spend history; the SPI
+trie gets the same pre-signing guard as the CPO trie.** `cpo_trie::reconstruct`
+replayed Constr-1 `Confirmed` records, which rev 5.4 never mints ([CTM-24]/
+[CTM-25] burn the NFT and forbid a TM-address output), so on any live rev-5.4
+chain it replayed an empty set and always failed the singleton cross-check.
+It now harvests the spent `UnconfirmedTm` records (keyed by the txid RECOMPUTED
+from `signed_btc_tx`, [OB-9]/[SPI-7]) and walks the treasury chain BACKWARD
+from the singleton's head via input-0 ancestry ([OB-2]) - the same walk
+binocular's SPI proof server uses, so a mined-but-unconfirmed TM is never
+replayed. `cpo_policy_id` became REQUIRED: the singleton supplies both the
+walk's start and the final check. The same harvest powers the new
+`reconstruct-spi-trie` command (`cpo_trie::reconstruct_spi`), and `BuildTm`'s
+pre-signing cross-check now covers BOTH tries (`query_bridge_roots`, one
+singleton fetch): [SPI-2]'s peer recomputation cannot catch a roster-wide
+stale spi-trie.json - every co-signer recomputes from the SAME restored state -
+and a confirmed truncated spi_root strands every swept-but-unminted depositor.
+
+**DEC-038: heimdall serves no SPI proofs.** The unauthenticated
+`GET /spi/proof/{peg_in_utxo_id}` route (DEC-023) is removed: [SPI-4] (revised)
+names binocular as the proof server and forbids heimdall the role, and the
+route served proofs from the locally persisted trie without reconciling its
+root against the singleton's attested spi_root - a lagging node would answer
+`member=false` with an exclusion proof against a stale root, which reads as
+"was never swept". This node's trie is quorum-internal state for the [SPI-2]
+gate; depositors and tools ask a watchtower.
+
+**DEC-039: BuildTm requires `protocol.state_dir`; the walk stops at a
+non-TM.** Two defects with one shape - state the node cannot reconstruct is
+state it must not attest.
+
+`advance_spi_trie` returned `Ok(())` when `state_dir` was unset, while
+`build_tm_phase` reloaded `SpiTrie::load_or_empty(None)`, so every TM
+committed a `spi_root` covering only its own sweeps. Neither guard could see
+it: [SPI-2]'s `verify_spi_root` recomputes from the same empty trie and agrees,
+and `cross_check_bridge_roots` is skipped when `cardano.cpo_policy_id` is unset
+- and BOTH keys are commented out in the shipped heimdall.toml, so this was the
+DEFAULT configuration. Once such a TM confirms, the singleton's spi_root omits
+every earlier sweep permanently, binocular's [SPI-6] replay fails, and no
+depositor can obtain a [CPI-9] proof again. `load_cpo_trie` had the same hole on
+the CPO side. BuildTm now refuses without a state_dir rather than degrading:
+a node that cannot track the tries must not be the one proposing roots.
+
+`walk_confirmed_chain` also lacked binocular's rule of stopping, WITHOUT
+harvesting, at the first ancestor carrying no BTMR1 commitment output. The TM
+address is permissionlessly payable and the harvest cannot require the TM NFT
+(Confirm has burned it), so anyone could park a Constr-0 datum wrapping the
+public genesis funding transaction and send the walk past the chain's origin
+into unrelated Bitcoin history. The two implementations of [SPI-6] must agree;
+they now do.
+
+Test note: `fast_config` gives every node a temp state_dir, unique per CALL.
+Keying it on the identifier alone made `full_cycle_2_of_2` and
+`full_cycle_3_of_3` share node 1's trie under the parallel runner.

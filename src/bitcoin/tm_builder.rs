@@ -141,63 +141,110 @@ pub struct Freshness {
 pub const PEG_OUT_CANCEL_TIMEOUT_MS: i64 = 2_592_000_000;
 
 // ---------------------------------------------------------------------------
-// Completed-peg-outs root commitment ("CPOR1")
+// BTMR1 two-root commitment (spi_root ++ cpo_root)
+//
+// Spec: ft-bifrost-bridge `docs/superpowers/specs/
+// 2026-08-06-bridge-state-singleton-design.md`, §Root commitment output, with
+// [CTM-26] (exactly one such output per TM) and [OH-3] (the fee constant).
+// The tag is "BTMR1", not a "BFR"-prefixed one, BECAUSE watchtowers detect
+// peg-in deposits by scanning for "BFR" and a TM pays the treasury address —
+// a "BFR" tag here would be read back as a deposit to the treasury.
 // ---------------------------------------------------------------------------
 
-/// First 7 bytes of a completed-peg-outs root commitment scriptPubKey:
-/// `OP_RETURN`(0x6a) `OP_PUSHBYTES_37`(0x25) `"CPOR1"`. Mirrors
-/// `TreasuryMovementValidator.RootCommitmentPrefix`.
-pub const CPO_COMMITMENT_PREFIX: [u8; 7] = [0x6a, 0x25, 0x43, 0x50, 0x4f, 0x52, 0x31];
+/// First 7 bytes of the BTMR1 two-root commitment scriptPubKey:
+/// `OP_RETURN`(0x6a) `OP_PUSHBYTES_69`(0x45) `"BTMR1"`. Mirrors
+/// `TreasuryMovementValidator.RootCommitmentPrefix` (rev 5.4).
+pub const BTMR1_COMMITMENT_PREFIX: [u8; 7] = [0x6a, 0x45, 0x42, 0x54, 0x4d, 0x52, 0x31];
 
-/// Length of a well-formed commitment scriptPubKey: prefix(7) + root(32) = 39.
-pub const CPO_COMMITMENT_SCRIPT_LEN: usize = 39;
+/// Length of a well-formed commitment scriptPubKey:
+/// prefix(7) + spi_root(32) + cpo_root(32) = 71.
+pub const BTMR1_COMMITMENT_SCRIPT_LEN: usize = 71;
 
-/// Extra vsize the commitment output costs over the 34-byte-scriptPubKey output
-/// [`estimate_vsize`] budgets for: its scriptPubKey is 39 bytes, so 5 bytes more
-/// of non-witness data (weight 4·5, vsize +5).
-const CPO_COMMITMENT_EXTRA_VBYTES: u64 = 5;
+/// Offset of `spi_root` in the commitment scriptPubKey: bytes `[7, 39)`.
+const BTMR1_SPI_ROOT_OFFSET: usize = 7;
 
-/// The commitment output's scriptPubKey for `root`.
+/// Offset of `cpo_root` in the commitment scriptPubKey: bytes `[39, 71)`.
+const BTMR1_CPO_ROOT_OFFSET: usize = 39;
+
+/// [OH-3]: extra vsize the commitment output costs over the 34-byte-scriptPubKey
+/// output [`estimate_vsize`] budgets for: its scriptPubKey is 71 bytes, so 37
+/// bytes more of non-witness data (weight 4·37, vsize +37).
+const CPO_COMMITMENT_EXTRA_VBYTES: u64 = 37;
+
+/// The commitment output's scriptPubKey: prefix ++ `spi_root` ++ `cpo_root`.
 #[must_use]
-pub fn cpo_commitment_script(root: &[u8; 32]) -> ScriptBuf {
-    let mut v = Vec::with_capacity(CPO_COMMITMENT_SCRIPT_LEN);
-    v.extend_from_slice(&CPO_COMMITMENT_PREFIX);
-    v.extend_from_slice(root);
+pub fn btmr1_commitment_script(spi_root: &[u8; 32], cpo_root: &[u8; 32]) -> ScriptBuf {
+    let mut v = Vec::with_capacity(BTMR1_COMMITMENT_SCRIPT_LEN);
+    v.extend_from_slice(&BTMR1_COMMITMENT_PREFIX);
+    v.extend_from_slice(spi_root);
+    v.extend_from_slice(cpo_root);
     ScriptBuf::from_bytes(v)
 }
 
-/// True iff `spk` is a completed-peg-outs root commitment. Length AND prefix, so
-/// a short script cannot be sliced past its end and a 39-byte payment script
-/// cannot masquerade as one.
+/// True iff the raw scriptPubKey bytes `spk` are a BTMR1 two-root commitment.
+/// Length AND prefix, so a short script cannot be sliced past its end and a
+/// 71-byte payment script cannot masquerade as one.
 #[must_use]
-pub fn is_cpo_commitment(spk: &bitcoin::Script) -> bool {
-    let b = spk.as_bytes();
-    b.len() == CPO_COMMITMENT_SCRIPT_LEN
-        && b[..CPO_COMMITMENT_PREFIX.len()] == CPO_COMMITMENT_PREFIX
+pub fn is_btmr1_commitment(spk: &[u8]) -> bool {
+    spk.len() == BTMR1_COMMITMENT_SCRIPT_LEN
+        && spk[..BTMR1_COMMITMENT_PREFIX.len()] == BTMR1_COMMITMENT_PREFIX
 }
 
-/// The completed-peg-outs root a TM attests, read from its outputs.
+/// The `(spi_root, cpo_root)` pair a BTMR1 scriptPubKey carries, or `None` when
+/// `spk` is not one. The single place the byte offsets live: every reader of a
+/// commitment, on Bitcoin bytes or on Cardano datum bytes, goes through here.
+#[must_use]
+pub fn btmr1_roots(spk: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+    if !is_btmr1_commitment(spk) {
+        return None;
+    }
+    let mut spi_root = [0u8; 32];
+    let mut cpo_root = [0u8; 32];
+    spi_root.copy_from_slice(&spk[BTMR1_SPI_ROOT_OFFSET..BTMR1_CPO_ROOT_OFFSET]);
+    cpo_root.copy_from_slice(&spk[BTMR1_CPO_ROOT_OFFSET..BTMR1_COMMITMENT_SCRIPT_LEN]);
+    Some((spi_root, cpo_root))
+}
+
+/// True iff `spk` is a BTMR1 two-root commitment — the `Script`-typed spelling
+/// of [`is_btmr1_commitment`].
+#[must_use]
+pub fn is_cpo_commitment(spk: &bitcoin::Script) -> bool {
+    is_btmr1_commitment(spk.as_bytes())
+}
+
+/// Both roots a TM attests, read from its outputs: `(spi_root, cpo_root)`.
 ///
 /// Byte-identical rule to `TreasuryMovementValidator.committedRoot`: scan the FULL
-/// output list, EXACTLY ONE commitment must be present (at any position), and the
-/// root is script bytes `[7, 39)`. Zero fails and two or more fail — the on-chain
-/// validator rejects both, so a TM built or received with either is unconfirmable.
-pub fn committed_cpo_root(tx: &Transaction) -> Result<[u8; 32], String> {
-    let mut found: Option<[u8; 32]> = None;
+/// output list, EXACTLY ONE commitment must be present (at any position);
+/// `spi_root` is script bytes `[7, 39)` and `cpo_root` is script bytes `[39, 71)`.
+/// Zero fails and two or more fail — the on-chain validator rejects both, so a TM
+/// built or received with either is unconfirmable.
+pub fn committed_roots(tx: &Transaction) -> Result<([u8; 32], [u8; 32]), String> {
+    let mut found: Option<([u8; 32], [u8; 32])> = None;
     let mut count = 0usize;
     for out in &tx.output {
-        if is_cpo_commitment(&out.script_pubkey) {
+        if let Some(roots) = btmr1_roots(out.script_pubkey.as_bytes()) {
             count += 1;
-            let mut root = [0u8; 32];
-            root.copy_from_slice(&out.script_pubkey.as_bytes()[CPO_COMMITMENT_PREFIX.len()..]);
-            found = Some(root);
+            found = Some(roots);
         }
     }
     match count {
         1 => Ok(found.expect("count == 1")),
-        0 => Err("missing root commitment (no \"CPOR1\" OP_RETURN output)".to_string()),
-        n => Err(format!("multiple root commitments ({n} \"CPOR1\" outputs)")),
+        0 => Err("missing root commitment (no \"BTMR1\" OP_RETURN output)".to_string()),
+        n => Err(format!("multiple root commitments ({n} \"BTMR1\" outputs)")),
     }
+}
+
+/// The swept peg-ins root a TM attests — script bytes `[7, 39)` of its single
+/// BTMR1 commitment output. See [`committed_roots`] for the rule.
+pub fn committed_spi_root(tx: &Transaction) -> Result<[u8; 32], String> {
+    committed_roots(tx).map(|(spi, _)| spi)
+}
+
+/// The completed-peg-outs root a TM attests — script bytes `[39, 71)` of its
+/// single BTMR1 commitment output. See [`committed_roots`] for the rule.
+pub fn committed_cpo_root(tx: &Transaction) -> Result<[u8; 32], String> {
+    committed_roots(tx).map(|(_, cpo)| cpo)
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +307,28 @@ impl CpoTrieView for FixedCpoRoot {
     }
 }
 
+/// The swept peg-ins trie, as much of it as the builder needs. Same
+/// dependency-direction story as [`CpoTrieView`]: declared here rather than
+/// taking `cardano::spi_trie::SpiTrie` directly so the `bitcoin` modules keep no
+/// dependency on the `cardano` ones.
+pub trait SpiTrieView {
+    /// The root that holds after this TM's `inputs` are recorded, per [SPI-1]:
+    /// `inputs` is EVERY input in tx order (input 0 first, in the 36-byte
+    /// `txid ‖ vout_le` encoding); every input EXCEPT input 0 becomes an entry.
+    fn root_after_inputs(&self, inputs: &[[u8; 36]]) -> Result<[u8; 32], String>;
+}
+
+/// A swept peg-ins view for callers that have no trie yet: the root never moves
+/// off `root`. Test/bootstrap use only — a TM built against this commits a root
+/// that ignores the deposits it sweeps, which co-signers reject.
+pub struct FixedSpiRoot(pub [u8; 32]);
+
+impl SpiTrieView for FixedSpiRoot {
+    fn root_after_inputs(&self, _inputs: &[[u8; 36]]) -> Result<[u8; 32], String> {
+        Ok(self.0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Output type
 // ---------------------------------------------------------------------------
@@ -284,6 +353,11 @@ pub struct UnsignedTm {
     /// after [`Self::fulfilled`] is inserted. Also readable back out of the tx
     /// with [`committed_cpo_root`] — the two agree by construction.
     pub cpo_root: [u8; 32],
+    /// The swept peg-ins MPF root this TM commits: the builder's SPI trie
+    /// advanced by every tx input except input 0 ([SPI-1], [SPI-3]). Also
+    /// readable back out of the tx with [`committed_spi_root`] — the two agree
+    /// by construction.
+    pub spi_root: [u8; 32],
 }
 
 /// A peg-out request excluded from a TM (see [`UnsignedTm::skipped_pegouts`]).
@@ -373,9 +447,13 @@ pub enum TmBuildError {
     /// does not belong to this tree).
     FederationLeafSpend(String),
     /// The completed-peg-outs trie could not produce the post-TM root (duplicate
-    /// `por_id`, corrupt local state). Fatal: a TM without a correct `"CPOR1"`
+    /// `por_id`, corrupt local state). Fatal: a TM without a correct BTMR1
     /// commitment can never confirm on Cardano.
     CpoRoot(String),
+    /// The swept peg-ins trie could not produce the post-TM root (conflicting
+    /// entry, corrupt local state). Fatal for the same reason as
+    /// [`Self::CpoRoot`]: the BTMR1 commitment needs both roots.
+    SpiRoot(String),
 }
 
 impl fmt::Display for TmBuildError {
@@ -401,6 +479,7 @@ impl fmt::Display for TmBuildError {
             ),
             Self::FederationLeafSpend(m) => write!(f, "federation leaf spend: {m}"),
             Self::CpoRoot(m) => write!(f, "completed-peg-outs root: {m}"),
+            Self::SpiRoot(m) => write!(f, "swept peg-ins root: {m}"),
         }
     }
 }
@@ -504,8 +583,8 @@ fn is_standard_payable(spk: &bitcoin::Script) -> bool {
 /// - **Locktime:** 0
 /// - **Inputs:** `[0]` = treasury, `[1..k]` = peg-ins sorted by `(txid || vout_le)`
 /// - **Outputs:** `[0]` = treasury change, `[1..m]` = peg-out payments sorted
-///   by `(script_pubkey, amount, por_id)`, `[m+1]` = the `"CPOR1"` commitment,
-///   always LAST and always present
+///   by `(script_pubkey, amount, por_id)`, `[m+1]` = the BTMR1 two-root
+///   commitment, always LAST and always present
 /// - **Fee:** `vsize * fee_rate_sat_per_vb`
 /// - **Change:** `sum(inputs) - sum(peg_out_outputs) - miner_fee`
 ///
@@ -519,6 +598,7 @@ pub fn build_tm(
     params: &TmParams,
     freshness: &Freshness,
     cpo: &dyn CpoTrieView,
+    spi: &dyn SpiTrieView,
 ) -> Result<UnsignedTm, TmBuildError> {
     // --- Drop unpayable peg-outs (skip, don't abort) ---
     // The peg-out destination + amount come from attacker-controllable on-chain
@@ -536,7 +616,7 @@ pub fn build_tm(
     //      batched peg-ins with it). Accepting only P2PKH/P2SH/P2WPKH/P2WSH/P2TR
     //      also caps every peg-out spk at 34 bytes, so estimate_vsize's
     //      per-output assumption stays a safe upper bound — and rules out a
-    //      payment that could be mistaken for the 39-byte "CPOR1" commitment.
+    //      payment that could be mistaken for the 71-byte BTMR1 commitment.
     //  (2) Net (gross − the request's OWN per_pegout_fee) below the dust
     //      threshold — no valid output exists.
     //  (3) Already in the local completed-peg-outs trie. The trie is the record
@@ -642,7 +722,7 @@ pub fn build_tm(
     // --- Build inputs ---
     let num_inputs = 1 + pegins.len();
     let num_pegout_outputs = pegouts.len();
-    // +1 change, +1 the mandatory "CPOR1" commitment.
+    // +1 change, +1 the mandatory BTMR1 commitment.
     let num_outputs = num_pegout_outputs + 2;
 
     let mut inputs = Vec::with_capacity(num_inputs);
@@ -711,9 +791,21 @@ pub fn build_tm(
     // every SPO applies. A zero-peg-out TM re-commits the unchanged root.
     let cpo_root = cpo.root_after(&fulfilled).map_err(TmBuildError::CpoRoot)?;
 
+    // --- The attested swept peg-ins root ---
+    // The SPI trie advanced by every input except input 0 ([SPI-1]): the inputs
+    // ARE the swept set, so the root is a function of the same input list every
+    // SPO builds. A peg-in-free TM re-commits the unchanged root.
+    let input_outpoints: Vec<[u8; 36]> = inputs
+        .iter()
+        .map(|i| outpoint_sort_key(&i.previous_output))
+        .collect();
+    let spi_root = spi
+        .root_after_inputs(&input_outpoints)
+        .map_err(TmBuildError::SpiRoot)?;
+
     // --- Estimate fee ---
-    // The commitment output's scriptPubKey is 39 bytes, 5 more than the 34-byte
-    // budget `estimate_vsize` assumes per output.
+    // [OH-3]: the commitment output's scriptPubKey is 71 bytes, 37 more than the
+    // 34-byte budget `estimate_vsize` assumes per output.
     let vsize = estimate_vsize(num_inputs, num_outputs) + CPO_COMMITMENT_EXTRA_VBYTES;
     let miner_fee = Amount::from_sat(vsize * params.fee_rate_sat_per_vb);
 
@@ -751,7 +843,7 @@ pub fn build_tm(
     // is provably unspendable, so a zero value is standard and burns nothing.
     outputs.push(TxOut {
         value: Amount::ZERO,
-        script_pubkey: cpo_commitment_script(&cpo_root),
+        script_pubkey: btmr1_commitment_script(&spi_root, &cpo_root),
     });
 
     // --- Assemble transaction ---
@@ -785,6 +877,7 @@ pub fn build_tm(
         skipped_pegouts,
         fulfilled,
         cpo_root,
+        spi_root,
     })
 }
 
@@ -798,8 +891,10 @@ pub fn build_tm(
 /// with the verifier's, and signing would attest a root the verifier cannot
 /// justify — so the caller MUST refuse to sign.
 ///
-/// This also catches a TM with zero or several `"CPOR1"` outputs, which the
-/// on-chain Confirm branch rejects outright.
+/// This also catches a TM with zero or several BTMR1 outputs, which the
+/// on-chain Confirm branch rejects outright. The commitment's OTHER root, the
+/// swept peg-ins `spi_root` at script bytes `[7, 39)`, has its own gate:
+/// `signing.rs::verify_spi_root` recomputes it and refuses on a mismatch.
 pub fn verify_committed_root(
     tx: &Transaction,
     fulfilled: &[FulfilledPegOut],
@@ -1138,7 +1233,12 @@ mod tests {
         crate::cardano::cpo_trie::CpoTrie::empty()
     }
 
-    /// `build_tm` with the default freshness window and an empty trie — the
+    /// An empty swept peg-ins trie: nothing swept yet, genesis root.
+    fn empty_spi() -> crate::cardano::spi_trie::SpiTrie {
+        crate::cardano::spi_trie::SpiTrie::empty()
+    }
+
+    /// `build_tm` with the default freshness window and empty tries — the
     /// shape almost every test wants.
     fn build_tm_t(
         treasury: TreasuryInput,
@@ -1155,6 +1255,7 @@ mod tests {
             params,
             &fresh(),
             &empty_cpo(),
+            &empty_spi(),
         )
     }
 
@@ -1427,8 +1528,8 @@ mod tests {
 
         let total_in: u64 = tm.prevouts.iter().map(|p| p.value.to_sat()).sum();
         let total_out: u64 = tm.tx.output.iter().map(|o| o.value.to_sat()).sum();
-        // The commitment output is budgeted as a normal output PLUS the 5 extra
-        // bytes its 39-byte scriptPubKey costs over the 34-byte assumption.
+        // The commitment output is budgeted as a normal output PLUS the 37 extra
+        // bytes its 71-byte scriptPubKey costs over the 34-byte assumption.
         let vsize =
             estimate_vsize(tm.tx.input.len(), tm.tx.output.len()) + CPO_COMMITMENT_EXTRA_VBYTES;
         let expected_fee = vsize * params.fee_rate_sat_per_vb;
@@ -1578,22 +1679,89 @@ mod tests {
         assert!(tm.fulfilled.is_empty());
     }
 
-    // --- CPOR1 root commitment ---
+    // --- BTMR1 two-root commitment ---
 
-    // Byte-exact shape: the on-chain reader slices bytes [7, 39) of a 39-byte
-    // scriptPubKey whose first 7 bytes are OP_RETURN OP_PUSHBYTES_37 "CPOR1".
+    // Byte-exact shape per rev 5.4: a 71-byte scriptPubKey whose first 7 bytes
+    // are OP_RETURN OP_PUSHBYTES_69 "BTMR1", then spi_root, then cpo_root.
     #[test]
-    fn commitment_script_is_the_39_byte_cpor1_layout() {
-        let root = [0x5a; 32];
-        let spk = cpo_commitment_script(&root);
-        assert_eq!(spk.len(), CPO_COMMITMENT_SCRIPT_LEN);
+    fn commitment_script_is_71_bytes_with_btmr1_prefix() {
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![],
+            change_address(),
+            &default_params(),
+        )
+        .unwrap();
+        let spk = tm.tx.output.last().unwrap().script_pubkey.clone();
+        assert_eq!(
+            spk.len(),
+            71,
+            "OP_RETURN(1) + OP_PUSHBYTES_69(1) + \"BTMR1\"(5) + spi_root(32) + cpo_root(32)"
+        );
         assert_eq!(
             hex::encode(&spk.as_bytes()[..7]),
-            "6a2543504f5231",
-            "OP_RETURN OP_PUSHBYTES_37 \"CPOR1\""
+            "6a4542544d5231",
+            "OP_RETURN OP_PUSHBYTES_69 \"BTMR1\""
         );
-        assert_eq!(&spk.as_bytes()[7..], &root);
+        assert_eq!(
+            &spk.as_bytes()[7..39],
+            &tm.spi_root,
+            "spi_root sits at script bytes [7, 39)"
+        );
+        assert_eq!(
+            &spk.as_bytes()[39..71],
+            &tm.cpo_root,
+            "cpo_root sits at script bytes [39, 71)"
+        );
         assert!(is_cpo_commitment(&spk));
+    }
+
+    // Extraction offsets: spi_root is script bytes [7, 39), cpo_root is
+    // script bytes [39, 71).
+    #[test]
+    fn roots_extracted_at_offsets_7_39_and_39_71() {
+        let spi_root = [0x11u8; 32];
+        let cpo_root = [0x22u8; 32];
+        let mut v = Vec::with_capacity(71);
+        v.push(0x6a); // OP_RETURN
+        v.push(0x45); // OP_PUSHBYTES_69
+        v.extend_from_slice(b"BTMR1");
+        v.extend_from_slice(&spi_root);
+        v.extend_from_slice(&cpo_root);
+        let spk = ScriptBuf::from_bytes(v);
+        assert!(
+            is_cpo_commitment(&spk),
+            "a 71-byte BTMR1 script is the root commitment"
+        );
+
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: spk,
+            }],
+        };
+        assert_eq!(
+            committed_spi_root(&tx).expect("exactly one BTMR1 output"),
+            spi_root,
+            "spi_root is read from bytes [7, 39), not [39, 71)"
+        );
+        assert_eq!(
+            committed_cpo_root(&tx).expect("exactly one BTMR1 output"),
+            cpo_root,
+            "cpo_root is read from bytes [39, 71), not [7, 39)"
+        );
+    }
+
+    // [OH-3]: the 71-byte commitment scriptPubKey costs 37 vbytes over the
+    // 34-byte per-output budget `estimate_vsize` assumes. A stale constant
+    // underpays every TM's miner fee and sticks the transaction.
+    #[test]
+    fn extra_vbytes_constant_is_37() {
+        assert_eq!(CPO_COMMITMENT_EXTRA_VBYTES, 37);
     }
 
     // Every TM commits, in the LAST output, at value 0 — including one that
@@ -1642,6 +1810,7 @@ mod tests {
             &default_params(),
             &fresh(),
             &trie,
+            &empty_spi(),
         )
         .unwrap();
         assert_eq!(tm.cpo_root, before);
@@ -1762,7 +1931,7 @@ mod tests {
     #[test]
     fn a_pegout_cannot_masquerade_as_the_commitment() {
         let hostile = PegOutRequest {
-            script_pubkey: cpo_commitment_script(&[0xde; 32]),
+            script_pubkey: btmr1_commitment_script(&[0xde; 32], &[0xde; 32]),
             ..make_pegout(0x10, 100_000)
         };
         let tm = build_tm_t(
@@ -1791,7 +1960,7 @@ mod tests {
         // Two commitments — what the on-chain validator refuses to choose between.
         tm.tx.output.push(TxOut {
             value: Amount::ZERO,
-            script_pubkey: cpo_commitment_script(&[0x11; 32]),
+            script_pubkey: btmr1_commitment_script(&[0x11; 32], &[0x11; 32]),
         });
         assert!(committed_cpo_root(&tm.tx).is_err());
         // None at all.
@@ -1942,6 +2111,7 @@ mod tests {
             &default_params(),
             &fresh(),
             &trie,
+            &empty_spi(),
         )
         .unwrap();
 
@@ -2025,6 +2195,7 @@ mod tests {
             &params,
             &fresh(),
             &empty_cpo(),
+            &empty_spi(),
         )
         .unwrap();
 
@@ -2091,6 +2262,7 @@ mod tests {
             &default_params(),
             &fresh(),
             &trie,
+            &empty_spi(),
         )
         .unwrap();
         let root = verify_committed_root(&tm.tx, &tm.fulfilled, &trie).unwrap();
@@ -2114,6 +2286,7 @@ mod tests {
             &default_params(),
             &fresh(),
             &leader_trie,
+            &empty_spi(),
         )
         .unwrap();
         let err = verify_committed_root(&tm.tx, &tm.fulfilled, &CpoTrie::empty()).unwrap_err();
@@ -2134,11 +2307,12 @@ mod tests {
             &default_params(),
             &fresh(),
             &trie,
+            &empty_spi(),
         )
         .unwrap();
         // Rewrite the commitment to the pre-payment (empty) root.
         let last = tm.tx.output.len() - 1;
-        tm.tx.output[last].script_pubkey = cpo_commitment_script(&trie.root());
+        tm.tx.output[last].script_pubkey = btmr1_commitment_script(&tm.spi_root, &trie.root());
         assert!(verify_committed_root(&tm.tx, &tm.fulfilled, &trie).is_err());
     }
 

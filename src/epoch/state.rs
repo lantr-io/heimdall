@@ -128,17 +128,37 @@ pub struct TreasuryMovement {
     /// Final aggregated Schnorr signature per input, populated after Sign.
     pub signatures: Vec<Option<frost::Signature>>,
     /// The peg-outs this TM fulfils, in payment-output order. Drives three
-    /// things: the `"CPOR1"` root the tx commits, the co-signer's pre-signing
-    /// root check, and the `fulfilled_por_outpoints` hint `publish.rs` writes.
+    /// things: the cpo_root the tx's BTMR1 output commits, the co-signer's
+    /// pre-signing root check, and the `fulfilled_por_outpoints` hint
+    /// `publish.rs` writes.
     pub fulfilled: Vec<crate::bitcoin::tm_builder::FulfilledPegOut>,
     /// The completed-peg-outs root this TM commits — the same 32 bytes
-    /// `committed_cpo_root(&unsigned_tx)` reads back out of the commitment output.
+    /// `committed_cpo_root(&unsigned_tx)` reads back out of the BTMR1
+    /// commitment output (script bytes [39, 71)).
     pub cpo_root: [u8; 32],
+    /// The swept peg-ins root this TM commits: the builder's SPI trie advanced
+    /// by every tx input except input 0 ([SPI-1], [SPI-3]). The same 32 bytes
+    /// `committed_spi_root(&unsigned_tx)` reads back out of the BTMR1
+    /// commitment output (script bytes [7, 39)); carried here so sign_phase
+    /// can enforce the [SPI-2] co-signer gate and `advance_spi_trie` can
+    /// cross-check before persisting.
+    pub spi_root: [u8; 32],
 }
 
 impl TreasuryMovement {
     pub fn num_inputs(&self) -> usize {
         self.unsigned_tx.input.len()
+    }
+
+    /// Every tx input's previous outpoint, input order, in the 36-byte
+    /// `tm_chain::outpoint_bytes` encoding – the exact `inputs` argument the
+    /// swept peg-ins trie ([SPI-1], [SPI-2]) takes.
+    pub fn input_outpoints(&self) -> Vec<[u8; 36]> {
+        self.unsigned_tx
+            .input
+            .iter()
+            .map(|i| crate::cardano::tm_chain::outpoint_bytes(&i.previous_output))
+            .collect()
     }
 
     /// Per-input Taproot merkle root, encoded as `Option<Vec<u8>>` for the

@@ -113,16 +113,16 @@ enum Commands {
         /// collection window.
         #[arg(long)]
         pegin_poll_ms: Option<u64>,
-        /// Bech32 address holding the treasury oracle UTxO. Defaults
-        /// to the always-OK testnet address.
+        /// Bech32 address of the TM validator (where TM records are posted).
+        /// Defaults to `cardano.treasury_address`.
         #[arg(long)]
         treasury_address: Option<String>,
-        /// Treasury marker token policy ID (56 hex chars). Defaults to
-        /// the always-OK script hash.
+        /// TM NFT policy ID (56 hex chars) = the TreasuryMovementValidator
+        /// script hash.
         #[arg(long)]
         treasury_policy_id: Option<String>,
-        /// Treasury marker token asset name as hex. Defaults to "TMTx"
-        /// (`544d5478`).
+        /// TM NFT asset name as hex. Defaults to "" — the real validator
+        /// counts the empty-name token.
         #[arg(long)]
         treasury_asset_name: Option<String>,
         /// BIP-39 mnemonic (12/15/24 words, space-separated) for the
@@ -203,8 +203,8 @@ enum Commands {
         config: Option<String>,
     },
     /// Bootstrap (K1 / init) the Cardano `treasury_info` state UTxO: one-shot mint
-    /// of the treasury NFT plus the initial TreasuryDatum (empty MPF identity root,
-    /// BTC treasury P2TR scriptPubKey, BTC treasury outpoint, FROST group key).
+    /// of the treasury NFT plus the initial TreasuryDatum (bifrost identity root –
+    /// empty unless --identity-root, FROST group key, federation fields).
     /// Spends a wallet UTxO as the one-shot; prints the signed tx, submits only
     /// with --submit. (Cardano side; bootstrap-treasury prints the BTC-side
     /// Taproot address.)
@@ -234,6 +234,11 @@ enum Commands {
         /// The timeout_federation CSV value baked into the federation leaves.
         #[arg(long)]
         federation_csv_blocks: i64,
+        /// 32-byte hex bifrost identity root seeded into the datum (spec
+        /// [PRE-2] – e.g. a replacement deployment carrying registered SPOs
+        /// forward). Omit for the empty MPF root (fresh deployment).
+        #[arg(long)]
+        identity_root: Option<String>,
         /// Actually submit via Blockfrost (default: build + print only).
         #[arg(long)]
         submit: bool,
@@ -421,9 +426,11 @@ enum Commands {
     /// Update-Y: rotate `current_spos_frost_key` in the treasury_info state UTxO
     /// to the incoming roster's Y_51' (the DKG key handoff — §Update-Y). The
     /// OUTGOING key signs (BIP340) a domain-tagged message committing to the
-    /// spent outpoint, epoch and new key; submission is permissionless. Prints
-    /// the signed tx, submits only with --submit. In Phase 1 the outgoing key is
-    /// Y_federation, so the y_fed seed signs by default.
+    /// spent outpoint, epoch and new key; with --federation the FEDERATION key
+    /// (y_federation) signs instead (spec [UY-5], e.g. dead-roster recovery).
+    /// Submission is permissionless. Prints the signed tx, submits only with
+    /// --submit. In Phase 1 the outgoing key is Y_federation, so the y_fed seed
+    /// signs by default.
     UpdateY {
         #[arg(long)]
         config: Option<String>,
@@ -443,50 +450,20 @@ enum Commands {
         /// Epoch number bound into the signed message (8-byte BE).
         #[arg(long)]
         epoch: u64,
-        /// Sign with this 32-byte hex secret key (the OUTGOING key). Omit to sign
-        /// with the config y_fed seed (Phase 1), or use --signature (air-gapped).
+        /// Sign with this 32-byte hex secret key (the OUTGOING key; with
+        /// --federation, the FEDERATION key). Omit to sign with the config
+        /// y_fed seed (Phase 1), or use --signature (air-gapped).
         #[arg(long)]
         signer_skey: Option<String>,
         /// Air-gapped: 64-byte BIP340 signature (hex) over the update-y message.
         /// Run without it first to print the exact 32-byte message to sign.
         #[arg(long)]
         signature: Option<String>,
-        /// Actually submit via Blockfrost (default: build + print only).
+        /// Authorize as the FEDERATION (spec [UY-5]): the signature is checked
+        /// against the spent datum's y_federation instead of
+        /// current_spos_frost_key. The federation may name any successor key.
         #[arg(long)]
-        submit: bool,
-    },
-    /// Emergency dead-roster recovery (N10b): rotate `current_spos_frost_key` back
-    /// to `y_federation`, gated on a Confirmed federation-sweep TM
-    /// (spent_via_federation_leaf) and a BIP340 signature under y_federation.
-    /// Submission is permissionless; the y_fed seed signs by default.
-    FederationReset {
-        #[arg(long)]
-        config: Option<String>,
-        /// Path to the bifrost Aiken blueprint (plutus.json).
-        #[arg(long)]
-        blueprint: String,
-        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
-        /// that parameterizes the registry policy (and through it treasury_info).
-        #[arg(long)]
-        registry_bootstrap: String,
-        /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
-        #[arg(long)]
-        treasury_nft_name: String,
-        /// Epoch number bound into the signed message (8-byte BE).
-        #[arg(long)]
-        epoch: u64,
-        /// Optional explicit Confirmed federation-sweep TM (<tx_hash>:<index>) to
-        /// reference; omit to auto-discover a flagged, fresh one at the TM address.
-        #[arg(long)]
-        tm_ref: Option<String>,
-        /// Sign with this 32-byte hex secret key (the FEDERATION key). Omit to sign
-        /// with the config y_fed seed (Phase 1), or use --signature (air-gapped).
-        #[arg(long)]
-        signer_skey: Option<String>,
-        /// Air-gapped: 64-byte BIP340 signature (hex) over the reset message.
-        /// Run without it first to print the exact 32-byte message to sign.
-        #[arg(long)]
-        signature: Option<String>,
+        federation: bool,
         /// Actually submit via Blockfrost (default: build + print only).
         #[arg(long)]
         submit: bool,
@@ -628,7 +605,9 @@ enum Commands {
         /// UTxO's locked amount. Falls back to `cardano.bridged_token_unit` if omitted.
         #[arg(long)]
         bridged_token_unit: Option<String>,
-        /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
+        /// DEV-ONLY: broadcast directly via bitcoin.rpc_url (default: build + print
+        /// only). Production SPOs run no Bitcoin node — the binocular watchtower
+        /// relays the signed TM from the posted UnconfirmedTm record.
         #[arg(long)]
         broadcast: bool,
         /// Override the locally-built signed TM with these raw BTC tx bytes (hex). Use when
@@ -669,9 +648,22 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Rebuild the swept peg-ins (SPI) trie from Cardano history — the SPI twin
+    /// of `reconstruct-cpo-trie`. Walks the treasury chain backward from the
+    /// bridge state singleton's head over the spent UnconfirmedTm records,
+    /// records every confirmed TM's inputs per [SPI-1]/[SPI-3], and refuses to
+    /// persist a root the singleton's attested spi_root disagrees with.
+    ReconstructSpiTrie {
+        #[arg(long)]
+        config: Option<String>,
+        /// Print the reconstructed root and entry count without writing
+        /// `spi-trie.json`.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Read-only: chain-source the current Bitcoin treasury from Cardano state
-    /// (WI-028). Scans the TM validator address (`cardano.treasury_address`),
-    /// chain-follows the Confirmed TMs to the unspent tip, and prints its
+    /// (rev 5.4). Reads the bridge-state singleton's head and amount, checks the
+    /// head's scriptPubKey against the candidate treasury trees, and prints its
     /// outpoint / value / scriptPubKey, whether it matches the demo Y_51 treasury
     /// keys, and whether a movement is already in flight against it. Posts
     /// nothing — the same read the auto-mover and `sweep-pegins` use to source
@@ -680,13 +672,13 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
-    /// Read-only: print the bridge Config UTxO's operational parameters (WI-040) —
-    /// the values every SPO must agree on to build byte-identical Treasury
-    /// Movements. Reads `cardano.config_address` + `cardano.config_nft_policy_id`
-    /// at the current chain tip and reports the fee rate (#12), the per-peg-out fee
-    /// floor (#13), `min_peg_out_fbtc` (#14), `leader_reward` (#15), the schedule
-    /// (#16) and `min_stake` (#9) — plus whether this node would instead fall back
-    /// to its local `bitcoin.fee_rate_sat_per_vb`. Posts nothing.
+    /// Read-only: print the bridge Config UTxO's operational parameters (WI-040,
+    /// rev-5.4 layout) — the values every SPO must agree on to build
+    /// byte-identical Treasury Movements. Reads `cardano.config_address` +
+    /// `cardano.config_nft_policy_id` at the current chain tip and reports the
+    /// nested `params` record (#7): the fee rate, the per-peg-out fee floor,
+    /// `min_peg_out_fbtc` and the schedule — plus whether this node would instead
+    /// fall back to its local `bitcoin.fee_rate_sat_per_vb`. Posts nothing.
     ShowConfigParams {
         #[arg(long)]
         config: Option<String>,
@@ -946,6 +938,7 @@ fn main() {
             frost_key,
             y_federation,
             federation_csv_blocks,
+            identity_root,
             submit,
         } => {
             let cfg = load_config(config.as_deref());
@@ -956,6 +949,7 @@ fn main() {
                 &frost_key,
                 &y_federation,
                 federation_csv_blocks,
+                identity_root.as_deref(),
                 submit,
             ) {
                 error!("Error: {e}");
@@ -1097,6 +1091,7 @@ fn main() {
             epoch,
             signer_skey,
             signature,
+            federation,
             submit,
         } => {
             let cfg = load_config(config.as_deref());
@@ -1108,36 +1103,10 @@ fn main() {
                 epoch,
                 signer_skey,
                 signature,
+                federation,
                 submit,
             };
             if let Err(e) = run_update_y(&cfg, &args) {
-                error!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Commands::FederationReset {
-            config,
-            blueprint,
-            registry_bootstrap,
-            treasury_nft_name,
-            epoch,
-            tm_ref,
-            signer_skey,
-            signature,
-            submit,
-        } => {
-            let cfg = load_config(config.as_deref());
-            let args = FederationResetArgs {
-                blueprint,
-                registry_bootstrap,
-                treasury_nft_name,
-                epoch,
-                tm_ref,
-                signer_skey,
-                signature,
-                submit,
-            };
-            if let Err(e) = run_federation_reset(&cfg, &args) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1369,19 +1338,26 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::ReconstructSpiTrie { config, dry_run } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_reconstruct_spi_trie(&cfg, dry_run) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
-/// Apply the real TM-NFT minting policy and the Config-UTxO locator to the chain. Requires
+/// Apply the TM-NFT minting policy and the Config-UTxO locator to the chain. Requires
 /// `cardano.tm_script_cbor`, `cardano.config_address` and `cardano.config_nft_policy_id` to be
-/// configured together (else leave the always-ok scaffold; the Config UTxO anchors the TM chain
-/// the mint redeemer links against). Errors on a half-configured set.
+/// configured together — posting has no scaffold fallback, and the Config UTxO locates the
+/// bridge-state singleton the mint redeemer links against. Errors on a half-configured set.
 fn apply_tm_policy(
     chain: BlockfrostCardanoChain,
     cfg: &HeimdallConfig,
 ) -> Result<BlockfrostCardanoChain, String> {
-    // The Config-UTxO locator is needed by query_treasury (chain walk) even when minting
-    // stays on the scaffold, so apply it whenever configured.
+    // The Config-UTxO locator is needed by query_treasury (the singleton read)
+    // independently of posting, so apply it whenever configured.
     let chain = match (
         &cfg.cardano.config_address,
         &cfg.cardano.config_nft_policy_id,
@@ -1430,11 +1406,9 @@ async fn run_demo(
     let script_address: String = cfg.cardano.pegin_script_address.clone().unwrap_or_default();
     let treasury_address: String = cfg.cardano.treasury_address.clone().unwrap_or_default();
     let treasury_policy_id: String = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
-    let treasury_asset_name_hex: String = cfg
-        .cardano
-        .treasury_asset_name
-        .clone()
-        .unwrap_or_else(|| hex::encode("TMTx"));
+    // Default "" — the real TM validator counts the empty-name token.
+    let treasury_asset_name_hex: String =
+        cfg.cardano.treasury_asset_name.clone().unwrap_or_default();
 
     // Chain + pegin source selection:
     // blockfrost_project_id → Blockfrost for both chain + pegin source
@@ -1525,11 +1499,7 @@ async fn run_demo(
             );
         }
 
-        bf_chain = bf_chain.with_submit_config(
-            cfg.bitcoin.submit,
-            cfg.cardano.submit_oracle,
-            cfg.cardano.oracle_constructor,
-        );
+        bf_chain = bf_chain.with_submit_config(cfg.bitcoin.submit, cfg.cardano.submit_oracle);
 
         // Per-pool stake source for the DKG threshold (default Blockfrost;
         // "yaci_store" for a local yaci-devkit devnet).
@@ -1810,6 +1780,13 @@ async fn run_demo(
     });
     let spo_label = hex::encode(&my_pool_id[..4]);
     let net = Arc::new(HttpPeerNetwork::new(secp, keypair, my_pool_id));
+    // The [SPI-4] proof route loads the swept peg-ins trie from
+    // `protocol.state_dir` per request; without it the route answers 503.
+    net.shared_state().write().await.state_dir = cfg
+        .protocol
+        .state_dir
+        .as_deref()
+        .map(std::path::PathBuf::from);
     let app = router(net.shared_state());
     let bind_addr = &cfg.http.bind_address;
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
@@ -2056,16 +2033,16 @@ fn batch_params(
         &loc.address,
         &loc.nft_unit,
     ))?;
-    if let (true, Some(t)) = (verbose, &snapshot.config.params.tunables) {
+    if verbose {
+        let t = &snapshot.config.params.tunables;
         info!(
             "  operational params (Config {} @ slot {}): fee_rate={} sat/vB, \
-             per_pegout_fee floor={} sat, min_peg_out_fbtc={} sat, leader_reward={} lovelace",
+             per_pegout_fee floor={} sat, min_peg_out_fbtc={} sat",
             snapshot.config.utxo,
             snapshot.slot,
             t.fee_rate_sat_per_vb,
             t.per_pegout_fee_floor,
             t.min_peg_out_fbtc,
-            t.leader_reward,
         );
     }
     let time_ms = snapshot.time_ms;
@@ -2123,11 +2100,11 @@ fn config_locator(cfg: &HeimdallConfig) -> Option<ConfigLocator> {
     })
 }
 
-/// Read the bridge Config UTxO, when this node is configured to locate it.
+/// Read the bridge Config UTxO, when this node is pointed at one.
 ///
-/// `Ok(None)` means "not configured", never "empty" — callers fall back to their
-/// local config key. A configured-but-unreadable Config is an error: silently
-/// dropping to a local value is how nodes end up disagreeing.
+/// `Ok(None)` means no Config is configured at all — not that the read failed.
+/// Callers that resolve a published identity fall back to their local keys on
+/// `None` and propagate a genuine read error.
 fn config_view(
     rt: &tokio::runtime::Runtime,
     cfg: &HeimdallConfig,
@@ -2142,14 +2119,6 @@ fn config_view(
         &loc.nft_unit,
     ))
     .map(Some)
-}
-
-/// The protocol `min_stake` (Config #9) when the Config UTxO is reachable.
-fn config_min_stake(
-    rt: &tokio::runtime::Runtime,
-    cfg: &HeimdallConfig,
-) -> Result<Option<u64>, String> {
-    Ok(config_view(rt, cfg)?.map(|v| v.params.min_stake))
 }
 
 /// Freeze the scanned peg-outs against `batch` — the CLI sweep's half of the rule
@@ -2229,11 +2198,42 @@ fn cpo_trie_from_cfg(cfg: &HeimdallConfig) -> Result<heimdall::cardano::cpo_trie
     }
 }
 
+/// Load this node's swept peg-ins trie from `protocol.state_dir`.
+///
+/// No `state_dir`, or no file yet, means the genesis (empty) trie — correct on a
+/// bridge whose treasury has swept no deposit, and loud everywhere else: the
+/// spi_root this node then commits is refused by peers whose trie is populated.
+fn spi_trie_from_cfg(cfg: &HeimdallConfig) -> Result<heimdall::cardano::spi_trie::SpiTrie, String> {
+    use heimdall::cardano::spi_trie::SpiTrie;
+    let Some(dir) = cfg.protocol.state_dir.as_deref() else {
+        eprintln!("[spi] no protocol.state_dir — using the empty (genesis) swept peg-ins trie");
+        return Ok(SpiTrie::empty());
+    };
+    let dir = std::path::Path::new(dir);
+    match SpiTrie::load(dir).map_err(|e| e.to_string())? {
+        Some(t) => {
+            eprintln!(
+                "[spi] swept peg-ins trie: {} entr(y|ies), root {}",
+                t.len(),
+                hex::encode(t.root())
+            );
+            Ok(t)
+        }
+        None => {
+            eprintln!(
+                "[spi] no swept peg-ins trie at {} — using the empty (genesis) trie",
+                dir.display()
+            );
+            Ok(SpiTrie::empty())
+        }
+    }
+}
+
 /// Refuse to build a TM off a trie the chain does not hold — the CLI mirror of
 /// `epoch::machine::cross_check_cpo_root`.
 ///
 /// [`cpo_trie_from_cfg`] trusts `cpo-trie.json` verbatim, so a re-bootstrap that
-/// mints a FRESH zero-root CPO singleton while this box still holds the previous
+/// mints a FRESH zero-root bridge state singleton while this box still holds the previous
 /// deployment's trie leaves `sweep-pegins` / `run-mover` ready to commit a root
 /// the chain no longer has. Confirm then copies that root into the singleton's
 /// datum, and every membership proof built against the real payment history is
@@ -2251,7 +2251,7 @@ fn cross_check_cpo_trie_from_cfg(
     let Some(policy) = cfg.cardano.cpo_policy_id.as_deref() else {
         warn!(
             "[cpo] no cardano.cpo_policy_id — the local root was NOT cross-checked \
-             against the on-chain completed-peg-outs singleton. Set it before signing a TM on a \
+             against the on-chain bridge state singleton. Set it before signing a TM on a \
              live bridge."
         );
         return Ok(CpoTrust::Unverified);
@@ -2262,7 +2262,7 @@ fn cross_check_cpo_trie_from_cfg(
         None => {
             let project_id = cfg.cardano.blockfrost_project_id.as_deref().ok_or(
                 "set cardano.kupo_url or cardano.blockfrost_project_id — cardano.cpo_policy_id \
-                 is set, so the completed-peg-outs singleton must be readable to cross-check \
+                 is set, so the bridge state singleton must be readable to cross-check \
                  the local trie",
             )?;
             Box::new(BlockfrostHistory::new(
@@ -2271,17 +2271,20 @@ fn cross_check_cpo_trie_from_cfg(
             ))
         }
     };
+    // `cpo_root` BY NAME, per [LIB-1]: field 0 of the singleton is `spi_root`.
     let on_chain = rt
-        .block_on(heimdall::cardano::cpo_trie::fetch_onchain_cpo_root(
+        .block_on(heimdall::cardano::bridge_state::fetch_bridge_state(
             source.as_ref(),
             policy.trim(),
         ))
-        .map_err(|e| format!("read the on-chain completed-peg-outs singleton: {e}"))?;
+        .map_err(|e| format!("read the bridge state singleton: {e}"))?
+        .cpo_root;
     if on_chain != trie.root() {
         return Err(format!(
             "completed-peg-outs trie is out of sync with the chain: local root {} ({} entries) \
-             != on-chain CPO singleton root {}. Refusing to build — a TM built on a stale trie \
-             commits a root the chain does not hold. Rebuild with `reconstruct-cpo-trie` (and \
+             != the bridge state singleton's cpo_root {}. Refusing to build — a TM built on a \
+             stale trie commits a root the chain does not hold. Rebuild with \
+             `reconstruct-cpo-trie` (and \
              delete the stale {}/cpo-trie.json if the bridge was re-bootstrapped).",
             hex::encode(trie.root()),
             trie.len(),
@@ -2293,7 +2296,7 @@ fn cross_check_cpo_trie_from_cfg(
         ));
     }
     info!(
-        "[cpo] local root matches the on-chain completed-peg-outs singleton ({})",
+        "[cpo] local root matches the bridge state singleton's cpo_root ({})",
         hex::encode(on_chain)
     );
     Ok(CpoTrust::Verified)
@@ -2304,7 +2307,7 @@ fn cross_check_cpo_trie_from_cfg(
 /// trie is the sole already-paid record, so "not cross-checked" has to be actionable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CpoTrust {
-    /// Cross-checked against the on-chain CPO singleton.
+    /// Cross-checked against the on-chain bridge state singleton's `cpo_root`.
     Verified,
     /// No `cardano.cpo_policy_id` — the local root was never checked against the chain.
     Unverified,
@@ -2378,6 +2381,8 @@ fn run_treasury_self_send(
         },
         // A self-send fulfils nothing, so it re-commits the trie's current root.
         &cpo_trie_from_cfg(cfg)?,
+        // …and sweeps nothing, so the spi_root is unchanged too.
+        &spi_trie_from_cfg(cfg)?,
     )
     .map_err(|e| format!("build self-send: {e}"))?;
 
@@ -2461,6 +2466,7 @@ fn run_federation_spend(
             margin_ms: 0,
         },
         &cpo_trie_from_cfg(cfg)?,
+        &spi_trie_from_cfg(cfg)?,
     )
     .map_err(|e| format!("build federation spend: {e}"))?;
 
@@ -2525,6 +2531,7 @@ fn parse_cardano_outref(s: &str) -> Result<([u8; 32], u32), String> {
 
 /// Build (and with `submit`, broadcast) the K1 `treasury_info` bootstrap mint.
 /// See `heimdall::cardano::treasury_bootstrap` for the on-chain contract.
+#[allow(clippy::too_many_arguments)]
 fn run_bootstrap_treasury_info(
     cfg: &HeimdallConfig,
     blueprint_path: &str,
@@ -2532,6 +2539,7 @@ fn run_bootstrap_treasury_info(
     frost_key: &str,
     y_federation: &str,
     federation_csv_blocks: i64,
+    identity_root: Option<&str>,
     submit: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
@@ -2549,8 +2557,7 @@ fn run_bootstrap_treasury_info(
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let tm_nft = cfg.cardano.tm_nft_policy()?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("parameterize treasury_info: {e}"))?;
     println!("registry policy id:   {}", registry.hash_hex());
     println!("treasury_info policy: {}", treasury.hash_hex());
@@ -2564,7 +2571,22 @@ fn run_bootstrap_treasury_info(
     if federation_csv_blocks <= 0 {
         return Err("--federation-csv-blocks must be positive".into());
     }
-    let datum = bootstrap_datum(frost, y_fed, federation_csv_blocks);
+    let mut datum = bootstrap_datum(frost, y_fed, federation_csv_blocks);
+    // spec [PRE-2]: the operator may seed a non-empty identity root (e.g. a
+    // replacement deployment carrying registered SPOs forward).
+    if let Some(root_hex) = identity_root {
+        datum.bifrost_identity_root = hex::decode(root_hex)
+            .map_err(|e| format!("--identity-root: {e}"))?
+            .try_into()
+            .map_err(|_| "--identity-root must be 32 bytes".to_string())?;
+        if datum.bifrost_identity_root != heimdall::cardano::mpf::NULL_HASH {
+            eprintln!(
+                "warning: --identity-root is not the empty MPF root — treasury.ak's mint branch \
+                 still pins mpf.root(mpf.empty) until the [PRE-2] on-chain change is deployed, \
+                 so this tx fails phase-2 validation against an older validator"
+            );
+        }
+    }
 
     let pid = cfg
         .cardano
@@ -2852,7 +2874,7 @@ fn run_bootstrap_ban_list(
     // A bridge whose Config already names a ban policy already HAS a ban list.
     // Minting ban-root under a different policy would create a second list at an
     // address no SPO reads, so refuse rather than produce it.
-    if let Some(published) = bridge_config.as_ref().and_then(|v| v.params.bans.as_ref())
+    if let Some(published) = bridge_config.as_ref().map(|v| &v.params.bans)
         && published.spo_bans_policy_id != spo_bans.hash
     {
         return Err(format!(
@@ -3753,8 +3775,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let tm_nft = cfg.cardano.tm_nft_policy()?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("parameterize treasury_info: {e}"))?;
 
     // ── identities: local secret keys, or the air-gapped halves ──
@@ -3868,33 +3889,12 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
 
     // ── R2 min-stake gate: gates submission; a dry run only warns ──
     //
-    // The threshold is the protocol's, i.e. Config #9 — read from the chain when a
-    // Config UTxO is configured, so every SPO gates on the same number and a
-    // governance change takes effect without a config edit. `cardano.min_stake_lovelace`
-    // is the fallback for a node with no Config locator (WI-040).
+    // The threshold is `cardano.min_stake_lovelace`. Rev 5.4 removed `min_stake` from
+    // the Config datum (spec §Config datum: the table is exhaustive, and the field
+    // never had an on-chain reader — it gated this registration off-chain only), so
+    // the gate is a local operational policy again. `None` skips the gate.
     let stake_source = StakeSource::from_config(cfg.cardano.stake_source.as_deref())?;
-    let min_stake = match config_min_stake(&rt, cfg)? {
-        Some(on_chain) => {
-            println!("min-stake source:  Config #9 (on-chain) = {on_chain}");
-            if let Some(local) = cfg.cardano.min_stake_lovelace
-                && local != on_chain
-            {
-                warn!(
-                    "[register-spo] cardano.min_stake_lovelace ({local}) differs from the \
-                     on-chain Config #9 ({on_chain}); the chain value wins"
-                );
-            }
-            if on_chain == 0 {
-                warn!(
-                    "[register-spo] the deployed Config's min_stake is 0 — the R2 gate \
-                     admits any pool. That is what governance published; raise it with a Config \
-                     Update, not by editing this node's config"
-                );
-            }
-            Some(on_chain)
-        }
-        None => cfg.cardano.min_stake_lovelace,
-    };
+    let min_stake = cfg.cardano.min_stake_lovelace;
     match min_stake {
         Some(threshold) => {
             // yaci-store reads stake per-epoch; Blockfrost ignores the epoch.
@@ -4032,27 +4032,19 @@ struct UpdateYArgs {
     epoch: u64,
     signer_skey: Option<String>,
     signature: Option<String>,
-    submit: bool,
-}
-
-struct FederationResetArgs {
-    blueprint: String,
-    registry_bootstrap: String,
-    treasury_nft_name: String,
-    epoch: u64,
-    /// Optional explicit Confirmed federation-sweep TM to reference (TXID:VOUT);
-    /// omit to auto-discover a flagged, fresh Confirmed TM at the TM address.
-    tm_ref: Option<String>,
-    signer_skey: Option<String>,
-    signature: Option<String>,
+    /// spec [UY-5]: authorize as the federation – the signature is made (and
+    /// checked) under the spent datum's `y_federation`.
+    federation: bool,
     submit: bool,
 }
 
 /// Build (and with `--submit`, broadcast) the Update-Y key-rotation tx: spend the
 /// treasury_info state UTxO with the `UpdateY` redeemer, rotating
 /// `current_spos_frost_key` to `--new-key`. The OUTGOING key signs the
-/// domain-tagged message (Phase 1: the y_fed seed; else `--signer-skey`, or an
-/// air-gapped `--signature`). Submission is permissionless.
+/// domain-tagged message – or, with `--federation`, the FEDERATION key signs it
+/// (spec [UY-5]; same tx, same message, different datum key). Phase 1 default
+/// signer: the y_fed seed; else `--signer-skey`, or an air-gapped
+/// `--signature`. Submission is permissionless.
 fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> {
     use bitcoin::key::Secp256k1;
     use bitcoin::secp256k1::{Keypair, Message};
@@ -4061,7 +4053,7 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     use heimdall::cardano::publish::WalletUtxo;
     use heimdall::cardano::treasury_info::update_y_sig_msg;
     use heimdall::cardano::treasury_spend::find_treasury_state;
-    use heimdall::cardano::update_y::{UpdateYRequest, build_update_y_tx};
+    use heimdall::cardano::update_y::{UpdateYAuthorizer, UpdateYRequest, build_update_y_tx};
     use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
     let mnemonic = resolve_mnemonic(cfg)?;
@@ -4073,8 +4065,7 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let tm_nft = cfg.cardano.tm_nft_policy()?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("parameterize treasury_info: {e}"))?;
 
     let new_key = parse_hex_n::<32>(&args.new_key, "--new-key")?;
@@ -4118,6 +4109,16 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
         .map_err(|_| "state txid must be 32 bytes".to_string())?;
     let sig_msg = update_y_sig_msg(&spent_txid, state.output_index, args.epoch, &new_key);
 
+    // spec [UY-5]: with --federation the signature is made under the spent
+    // datum's y_federation; otherwise under its current_spos_frost_key. The
+    // built tx is identical either way.
+    let authorizer = if args.federation {
+        UpdateYAuthorizer::Federation
+    } else {
+        UpdateYAuthorizer::Roster
+    };
+    let (expected_signer, signer_role) = authorizer.signing_key(&state.datum);
+
     println!("treasury policy:   {}", treasury.hash_hex());
     println!(
         "state UTxO:        {}:{}",
@@ -4127,11 +4128,17 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
         "current key:       {}",
         hex::encode(&state.datum.current_spos_frost_key)
     );
+    if args.federation {
+        println!(
+            "y_federation:      {}",
+            hex::encode(&state.datum.y_federation)
+        );
+    }
     println!("new key:           {}", hex::encode(new_key));
     println!("epoch:             {}", args.epoch);
     println!("sign message:      {}", hex::encode(sig_msg));
 
-    // Resolve the 64-byte BIP340 signature under the OUTGOING key.
+    // Resolve the 64-byte BIP340 signature under the authorizing key.
     let secp = Secp256k1::new();
     let signature: [u8; 64] = if let Some(sig_hex) = args.signature.as_deref() {
         parse_hex_n::<64>(sig_hex, "--signature")?
@@ -4141,18 +4148,19 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
                 bitcoin::secp256k1::SecretKey::from_slice(&parse_key32(hex_sk, "--signer-skey")?)
                     .map_err(|e| format!("--signer-skey: {e}"))?
             }
-            // Phase 1 default: the outgoing key is Y_federation.
+            // Phase 1 default: both the outgoing key and the federation key
+            // are the config y_fed seed.
             None => y_fed_keypair(&secp, cfg)?.0,
         };
         let kp = Keypair::from_secret_key(&secp, &sk);
         let signer_xonly = kp.x_only_public_key().0.serialize();
-        if signer_xonly.as_slice() != state.datum.current_spos_frost_key.as_slice() {
+        if signer_xonly.as_slice() != expected_signer {
             return Err(format!(
-                "signer key {} does not match the treasury's current_spos_frost_key {} — the \
-                 OUTGOING key must sign Update-Y (Phase 1: y_fed; else pass --signer-skey, or \
-                 BIP340-sign the printed message and pass --signature)",
+                "signer key {} does not match the treasury's {signer_role} {} – that key must \
+                 sign Update-Y (Phase 1: y_fed; else pass --signer-skey, or BIP340-sign the \
+                 printed message and pass --signature)",
                 hex::encode(signer_xonly),
-                hex::encode(&state.datum.current_spos_frost_key)
+                hex::encode(expected_signer)
             ));
         }
         secp.sign_schnorr_no_aux_rand(&Message::from_digest(sig_msg), &kp)
@@ -4165,6 +4173,7 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
         new_spos_frost_key: &new_key,
         epoch: epoch_i64,
         signature: &signature,
+        authorizer,
         wallet_address: &wallet_addr,
         wallet_utxos: &wallet_utxos,
         key: &key,
@@ -4176,219 +4185,6 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     println!(
         "rotated key ->:    {}",
         hex::encode(&built.new_datum.current_spos_frost_key)
-    );
-    println!("signed tx hex:\n{}", built.signed_tx_hex);
-
-    finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex)
-}
-
-/// Build (and with `--submit`, broadcast) the emergency FederationReset tx: spend
-/// the treasury_info state UTxO with the `FederationReset` redeemer, referencing a
-/// Confirmed federation-sweep TM (dead-roster evidence), rotating
-/// `current_spos_frost_key` to `y_federation` and advancing `last_reset_tm_txid`.
-/// The FEDERATION signs (Phase 1: the y_fed seed; else `--signer-skey`, or an
-/// air-gapped `--signature`). Submission is permissionless.
-fn run_federation_reset(cfg: &HeimdallConfig, args: &FederationResetArgs) -> Result<(), String> {
-    use bitcoin::key::Secp256k1;
-    use bitcoin::secp256k1::{Keypair, Message};
-    use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
-    use heimdall::cardano::federation_reset::{
-        ConfirmedTmRef, FederationResetRequest, build_federation_reset_tx,
-    };
-    use heimdall::cardano::publish::WalletUtxo;
-    use heimdall::cardano::treasury_datum::confirmed_tm_reset_evidence_from_hex;
-    use heimdall::cardano::treasury_info::federation_reset_sig_msg;
-    use heimdall::cardano::treasury_spend::find_treasury_state;
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
-    use pallas_addresses::{Address, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
-
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
-
-    let blueprint_json = std::fs::read_to_string(&args.blueprint)
-        .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let tm_nft = cfg.cardano.tm_nft_policy()?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash, &tm_nft)
-        .map_err(|e| format!("parameterize treasury_info: {e}"))?;
-
-    let epoch_i64 =
-        i64::try_from(args.epoch).map_err(|_| "epoch too large for Plutus Int".to_string())?;
-
-    let pid = cfg
-        .cardano
-        .blockfrost_project_id
-        .as_deref()
-        .ok_or("cardano.blockfrost_project_id required")?;
-    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
-    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-
-    let network = network_of(&wallet_addr);
-    let treasury_addr = treasury.enterprise_address(network);
-    // The TM validator address = enterprise script address of the TM NFT policy
-    // (binocular's TreasuryMovementValidator hash).
-    let tm_addr = Address::Shelley(ShelleyAddress::new(
-        network,
-        ShelleyPaymentPart::script_hash(tm_nft.into()),
-        ShelleyDelegationPart::Null,
-    ))
-    .to_bech32()
-    .map_err(|e| format!("TM address: {e}"))?;
-
-    let wallet_raw = rt
-        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
-        .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
-    let treasury_utxos = rt
-        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &treasury_addr))
-        .map_err(|e| format!("treasury UTxO query: {e}"))?;
-    let tm_utxos = rt
-        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &tm_addr))
-        .map_err(|e| format!("TM UTxO query: {e}"))?;
-    let cost_models = rt
-        .block_on(bf_http::fetch_cost_models(&base_url, pid))
-        .map_err(|e| format!("fetch cost models: {e}"))?;
-    let window = rt
-        .block_on(bf_http::fetch_epoch_window(&base_url, pid))
-        .map_err(|e| format!("epoch window: {e}"))?;
-
-    let state = find_treasury_state(
-        &treasury_utxos,
-        &treasury.hash_hex(),
-        &args.treasury_nft_name,
-    )
-    .map_err(|e| format!("locate treasury state: {e}"))?;
-
-    // Locate the Confirmed federation-sweep TM to reference: a UTxO at the TM
-    // address carrying the TM NFT (policy `tm_nft`, empty asset name → unit is the
-    // policy hex), whose Confirmed datum has spent_via_federation_leaf == true and
-    // btc_txid != the state's last_reset_tm_txid (freshness).
-    let tm_nft_unit = hex::encode(tm_nft);
-    let explicit = args
-        .tm_ref
-        .as_deref()
-        .map(parse_cardano_outref)
-        .transpose()?;
-    let mut chosen: Option<ConfirmedTmRef> = None;
-    for u in &tm_utxos {
-        if !u.amount.iter().any(|a| a.unit == tm_nft_unit) {
-            continue;
-        }
-        if let Some((want_txid, want_vout)) = explicit {
-            if !(u.tx_hash == hex::encode(want_txid) && u.output_index == want_vout) {
-                continue;
-            }
-        }
-        let Some(datum_hex) = u.inline_datum.as_deref() else {
-            continue;
-        };
-        let Some((btc_txid, flag)) = confirmed_tm_reset_evidence_from_hex(datum_hex) else {
-            continue; // not a Confirmed TM
-        };
-        let fresh = btc_txid.to_vec() != state.datum.last_reset_tm_txid;
-        if flag && fresh {
-            chosen = Some(ConfirmedTmRef {
-                tx_hash: u.tx_hash.clone(),
-                output_index: u.output_index,
-                btc_txid: btc_txid.to_vec(),
-            });
-            break;
-        }
-        if explicit.is_some() {
-            return Err(format!(
-                "TM {}:{} is not a usable sweep: spent_via_federation_leaf={flag}, fresh={fresh}",
-                u.tx_hash, u.output_index
-            ));
-        }
-    }
-    let tm_ref = chosen.ok_or_else(|| {
-        "no Confirmed TM at the TM address is a fresh federation-leaf sweep \
-         (spent_via_federation_leaf=true and btc_txid != last_reset_tm_txid) — post + confirm \
-         the federation-sweep TM first"
-            .to_string()
-    })?;
-
-    let spent_txid: [u8; 32] = hex::decode(&state.tx_hash)
-        .map_err(|e| format!("state txid hex: {e}"))?
-        .try_into()
-        .map_err(|_| "state txid must be 32 bytes".to_string())?;
-    let y_federation = state.datum.y_federation.clone();
-    let sig_msg =
-        federation_reset_sig_msg(&spent_txid, state.output_index, args.epoch, &y_federation);
-
-    println!("treasury policy:   {}", treasury.hash_hex());
-    println!(
-        "state UTxO:        {}:{}",
-        state.tx_hash, state.output_index
-    );
-    println!(
-        "current key:       {}",
-        hex::encode(&state.datum.current_spos_frost_key)
-    );
-    println!("y_federation:      {}", hex::encode(&y_federation));
-    println!(
-        "reference TM:      {}:{}  (btc_txid {})",
-        tm_ref.tx_hash,
-        tm_ref.output_index,
-        hex::encode(&tm_ref.btc_txid)
-    );
-    println!("epoch:             {}", args.epoch);
-    println!("sign message:      {}", hex::encode(sig_msg));
-
-    // Resolve the 64-byte BIP340 signature under y_federation (the FEDERATION signs).
-    let secp = Secp256k1::new();
-    let signature: [u8; 64] = if let Some(sig_hex) = args.signature.as_deref() {
-        parse_hex_n::<64>(sig_hex, "--signature")?
-    } else {
-        let sk = match args.signer_skey.as_deref() {
-            Some(hex_sk) => {
-                bitcoin::secp256k1::SecretKey::from_slice(&parse_key32(hex_sk, "--signer-skey")?)
-                    .map_err(|e| format!("--signer-skey: {e}"))?
-            }
-            // Phase 1 default: y_federation is the config y_fed seed.
-            None => y_fed_keypair(&secp, cfg)?.0,
-        };
-        let kp = Keypair::from_secret_key(&secp, &sk);
-        let signer_xonly = kp.x_only_public_key().0.serialize();
-        if signer_xonly.as_slice() != y_federation.as_slice() {
-            return Err(format!(
-                "signer key {} does not match the treasury's y_federation {} — the FEDERATION \
-                 key must sign the reset (Phase 1: y_fed seed; else pass --signer-skey, or \
-                 BIP340-sign the printed message and pass --signature)",
-                hex::encode(signer_xonly),
-                hex::encode(&y_federation)
-            ));
-        }
-        secp.sign_schnorr_no_aux_rand(&Message::from_digest(sig_msg), &kp)
-            .serialize()
-    };
-
-    let req = FederationResetRequest {
-        treasury_script: &treasury,
-        state: &state,
-        tm_ref: &tm_ref,
-        epoch: epoch_i64,
-        signature: &signature,
-        wallet_address: &wallet_addr,
-        wallet_utxos: &wallet_utxos,
-        key: &key,
-        invalid_before: Some(window.current_slot),
-        invalid_hereafter: Some(window.epoch_end_slot),
-        cost_models: Some(cost_models),
-    };
-    let built =
-        build_federation_reset_tx(&req).map_err(|e| format!("build federation-reset tx: {e}"))?;
-    println!(
-        "reset key ->:      {}",
-        hex::encode(&built.new_datum.current_spos_frost_key)
-    );
-    println!(
-        "last_reset ->:     {}",
-        hex::encode(&built.new_datum.last_reset_tm_txid)
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
@@ -4448,7 +4244,7 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
         u64::from(ban_index),
     )
     .map_err(|e| format!("parameterize spo_bans: {e}"))?;
-    if let Some(published) = bridge_config.as_ref().and_then(|v| v.params.bans.as_ref())
+    if let Some(published) = bridge_config.as_ref().map(|v| &v.params.bans)
         && published.spo_bans_policy_id != spo_bans.hash
     {
         return Err(format!(
@@ -4799,11 +4595,8 @@ fn run_show_roster(
     println!("treasury_info:     {}", source.treasury_info_address);
     println!(
         "registry source:   {}",
-        if bridge_config
-            .as_ref()
-            .is_some_and(|v| v.params.registry.is_some())
-        {
-            "bridge Config #21-#23"
+        if bridge_config.is_some() {
+            "bridge Config #11-#13"
         } else {
             "LOCAL heimdall.toml registry keys"
         }
@@ -5181,7 +4974,7 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
         pegout_address: pegout_address.to_string(),
         fbtc_policy_id: fbtc_policy_id.to_string(),
         fbtc_asset_name_hex: fbtc_asset_name_hex.to_string(),
-        cpo_policy_id: Some(cpo_policy_id),
+        cpo_policy_id,
     };
     // `reconstruct` itself logs the active backend and its endpoint before its
     // first read, so every caller reports it identically and this command does not
@@ -5218,6 +5011,81 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
     Ok(())
 }
 
+/// `reconstruct-spi-trie`: rebuild the swept peg-ins trie from Cardano history,
+/// then persist it to `protocol.state_dir` — the recovery `BuildTm`'s spi_root
+/// cross-check points an operator at.
+///
+/// Same backend selection and the same harvest/walk as `reconstruct-cpo-trie`;
+/// the entries are each confirmed TM's inputs per [SPI-1]/[SPI-3], and the
+/// finished root must equal the singleton's attested `spi_root`.
+fn run_reconstruct_spi_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), String> {
+    use heimdall::cardano::cpo_history::{BlockfrostHistory, CpoHistorySource, KupoHistory};
+    use heimdall::cardano::cpo_trie::reconstruct_spi;
+
+    let tm_address = cfg
+        .cardano
+        .treasury_address
+        .as_deref()
+        .ok_or("set cardano.treasury_address (the TM validator address)")?;
+    let policy = cfg
+        .cardano
+        .cpo_policy_id
+        .as_deref()
+        .ok_or(
+            "set cardano.cpo_policy_id (the bridge_state_policy, Config field 3) — the singleton \
+             supplies the walk's head and the attested spi_root",
+        )?
+        .trim()
+        .to_ascii_lowercase();
+
+    let source: Box<dyn CpoHistorySource> = match cfg.cardano.kupo_url.as_deref() {
+        Some(url) => Box::new(KupoHistory::new(url)),
+        None => {
+            let project_id = cfg.cardano.blockfrost_project_id.as_deref().ok_or(
+                "set cardano.kupo_url (recommended for SPOs) or cardano.blockfrost_project_id \
+                 — reconstruction reads the datums of SPENT outputs, which needs either a Kupo \
+                 index or a Blockfrost-compatible transaction-history API",
+            )?;
+            Box::new(BlockfrostHistory::new(
+                project_id,
+                cfg.cardano.blockfrost_url.as_deref(),
+            ))
+        }
+    };
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    println!("reconstructing the swept peg-ins trie");
+    let trie = rt
+        .block_on(reconstruct_spi(source.as_ref(), tm_address, &policy))
+        .map_err(|e| e.to_string())?;
+
+    println!(
+        "  reconstructed root : {} ({} entr(y|ies))",
+        hex::encode(trie.root()),
+        trie.len()
+    );
+    for (peg_in, value) in trie.entries() {
+        println!("    {} -> {}", hex::encode(peg_in), hex::encode(value));
+    }
+
+    if dry_run {
+        println!("  --dry-run: not written");
+        return Ok(());
+    }
+    let dir = cfg
+        .protocol
+        .state_dir
+        .as_deref()
+        .ok_or("set protocol.state_dir to persist the trie (or pass --dry-run)")?;
+    let dir = std::path::Path::new(dir);
+    trie.save(dir).map_err(|e| e.to_string())?;
+    println!(
+        "  written            : {}",
+        heimdall::cardano::spi_trie::SpiTrie::state_path(dir).display()
+    );
+    Ok(())
+}
+
 /// Read-only `show-config-params`: print the Config UTxO's operational parameters
 /// as of the current tip — the snapshot a TM batch built now would use (WI-040).
 ///
@@ -5249,102 +5117,81 @@ fn run_show_config_params(cfg: &HeimdallConfig) -> Result<(), String> {
         snapshot.config.params.field_count
     );
     println!(
-        "#9  min_stake      : {} lovelace",
-        snapshot.config.params.min_stake
+        "#3  bridge_state   : {}",
+        hex::encode(snapshot.config.params.bridge_state_policy)
     );
-    match &snapshot.config.params.initial_btc_treasury_utxo {
-        Some(a) => println!("#11 treasury anchor: {}", hex::encode(a)),
-        None => println!("#11 treasury anchor: (absent)"),
+    println!(
+        "#4  tm_script_hash : {}",
+        hex::encode(snapshot.config.params.tm_script_hash)
+    );
+    {
+        let t = &snapshot.config.params.tunables;
+        println!("#7  params:");
+        println!("      fee_rate       : {} sat/vB", t.fee_rate_sat_per_vb);
+        println!(
+            "      per_pegout_fee : {} sat (floor)",
+            t.per_pegout_fee_floor
+        );
+        println!("      min_peg_out    : {} sat", t.min_peg_out_fbtc);
+        let s = &t.schedule;
+        println!("      schedule (slots, E-relative):");
+        println!(
+            "        dkg_r1_deadline={} dkg_r2_deadline={} update_y_deadline={}",
+            s.dkg_r1_deadline, s.dkg_r2_deadline, s.update_y_deadline
+        );
+        println!(
+            "        tm_batch_interval={} sign_r1_window={} sign_r2_window={}",
+            s.tm_batch_interval, s.sign_r1_window, s.sign_r2_window
+        );
+        println!(
+            "        leader_slot_t={} tm_recovery_window={} final_tm_cutoff={} \
+             stability_window={}",
+            s.leader_slot_t, s.tm_recovery_window, s.final_tm_cutoff, s.stability_window
+        );
     }
-    match &snapshot.config.params.tunables {
-        Some(t) => {
-            println!("#12 fee_rate       : {} sat/vB", t.fee_rate_sat_per_vb);
-            println!(
-                "#13 per_pegout_fee : {} sat (floor)",
-                t.per_pegout_fee_floor
-            );
-            println!("#14 min_peg_out    : {} sat", t.min_peg_out_fbtc);
-            println!("#15 leader_reward  : {} lovelace", t.leader_reward);
-            let s = &t.schedule;
-            println!("#16 schedule (slots, E-relative):");
-            println!(
-                "      dkg_r1_deadline={} dkg_r2_deadline={} update_y_deadline={}",
-                s.dkg_r1_deadline, s.dkg_r2_deadline, s.update_y_deadline
-            );
-            println!(
-                "      tm_batch_interval={} sign_r1_window={} sign_r2_window={}",
-                s.tm_batch_interval, s.sign_r1_window, s.sign_r2_window
-            );
-            println!(
-                "      leader_slot_t={} tm_recovery_window={} final_tm_cutoff={} \
-                 stability_window={}",
-                s.leader_slot_t, s.tm_recovery_window, s.final_tm_cutoff, s.stability_window
-            );
-            println!(
-                "      (decoded and reported; the batch grid that consumes it is plan N19 — \
-                 run-mover still ticks on --interval-secs)"
-            );
-        }
-        None => println!(
-            "#12-#16            : ABSENT — this Config predates the operational-parameter \
-             append; TMs fall back to the local bitcoin.fee_rate_sat_per_vb"
-        ),
+    {
+        let b = &snapshot.config.params.bans;
+        let mainnet = cfg.cardano.is_mainnet()?;
+        let source =
+            heimdall::cardano::ban_list::BanListSource::from_policy_id(&b.spo_bans_policy_id, mainnet);
+        println!("#7  spo_bans policy: {}", source.ban_policy_hex);
+        println!("      ban address  : {}", source.ban_address);
+        println!("#8  base_ban_duration_ms      : {}", b.base_ban_duration_ms);
+        println!(
+            "#9  max_faults_before_permanent: {}",
+            b.max_faults_before_permanent
+        );
+        println!(
+            "#10 max_validity_window_ms     : {}",
+            b.max_validity_window_ms
+        );
+        println!(
+            "      (the roster is filtered against this address; no ban keys are needed \
+             in [cardano])"
+        );
     }
-    match &snapshot.config.params.bans {
-        Some(b) => {
-            let mainnet = cfg.cardano.is_mainnet()?;
-            let source = heimdall::cardano::ban_list::BanListSource::from_policy_id(
-                &b.spo_bans_policy_id,
-                mainnet,
-            );
-            println!("#17 spo_bans policy: {}", source.ban_policy_hex);
-            println!("      ban address  : {}", source.ban_address);
-            println!("#18 base_ban_duration_ms      : {}", b.base_ban_duration_ms);
-            println!(
-                "#19 max_faults_before_permanent: {}",
-                b.max_faults_before_permanent
-            );
-            println!(
-                "#20 max_validity_window_ms     : {}",
-                b.max_validity_window_ms
-            );
-            println!(
-                "      (the roster is filtered against this address; no ban keys are needed \
-                 in [cardano])"
-            );
-        }
-        None => println!(
-            "#17-#20            : ABSENT — this Config predates the ban-policy append; the \
-             roster is filtered against the LOCAL cardano.ban_bootstrap keys"
-        ),
-    }
-    match &snapshot.config.params.registry {
-        Some(r) => {
-            let source = heimdall::cardano::roster::RegistryRosterSource::from_policy_ids(
-                &r.spos_registry_policy_id,
-                &r.treasury_info_policy_id,
-                &r.treasury_info_asset_name,
-                cfg.cardano.is_mainnet()?,
-            );
-            println!("#21 registry policy: {}", source.registry_policy_hex);
-            println!("      registry addr: {}", source.registry_address);
-            println!("#22 treasury_info  : {}", source.treasury_info_policy_hex);
-            println!("      state addr   : {}", source.treasury_info_address);
-            println!(
-                "#23 treasury_info NFT name: {} ({})",
-                source.treasury_info_asset_name_hex,
-                String::from_utf8_lossy(&r.treasury_info_asset_name)
-            );
-            println!(
-                "      (the roster is read from these; no registry keys are needed in \
-                 [cardano]. The Update-Y handoff additionally needs a blueprint to compile \
-                 treasury_info, checked against #22)"
-            );
-        }
-        None => println!(
-            "#21-#23            : ABSENT — this Config predates the registry append; the \
-             roster is located from the LOCAL cardano.registry_* keys"
-        ),
+    {
+        let r = &snapshot.config.params.registry;
+        let source = heimdall::cardano::roster::RegistryRosterSource::from_policy_ids(
+            &r.spos_registry_policy_id,
+            &r.treasury_info_policy_id,
+            &r.treasury_info_asset_name,
+            cfg.cardano.is_mainnet()?,
+        );
+        println!("#11 registry policy: {}", source.registry_policy_hex);
+        println!("      registry addr: {}", source.registry_address);
+        println!("#12 treasury_info  : {}", source.treasury_info_policy_hex);
+        println!("      state addr   : {}", source.treasury_info_address);
+        println!(
+            "#13 treasury_info NFT name: {} ({})",
+            source.treasury_info_asset_name_hex,
+            String::from_utf8_lossy(&r.treasury_info_asset_name)
+        );
+        println!(
+            "      (the roster is read from these; no registry keys are needed in \
+             [cardano]. The Update-Y handoff additionally needs a blueprint to compile \
+             treasury_info, checked against #12)"
+        );
     }
 
     let (params, source) = resolve_tm_params(Some(&snapshot), cfg.bitcoin.fee_rate_sat_per_vb);
@@ -5377,7 +5224,6 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
     use bitcoin::key::Secp256k1;
     use heimdall::bitcoin::taproot::treasury_spend_info;
     use heimdall::cardano::blockfrost_chain::scan_tm_utxos;
-    use heimdall::cardano::treasury_datum::unspent_tips;
     use heimdall::frost::dkg::run_demo_dkg;
 
     let address = cfg
@@ -5405,7 +5251,6 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
 
     println!("TM validator address: {address}");
     println!("marker unit:          {asset_unit}");
-    println!("confirmed TMs:        {}", scan.confirmed.len());
     println!("in-flight spends:     {}", scan.in_flight_spends.len());
     println!("parse failures:       {}", scan.parse_failures);
     println!("opaque unconfirmed:   {}", scan.opaque_unconfirmed);
@@ -5435,55 +5280,32 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
         hex::encode(expected_spk.as_bytes())
     );
 
-    let tips = unspent_tips(&scan.confirmed);
-    println!("\nunspent tips: {}", tips.len());
-    let mut current = None;
-    for t in &tips {
-        let op = t.treasury_outpoint();
-        let val = t.treasury_value().map(|v| v.to_sat()).unwrap_or(0);
-        let spk = t.treasury_spk().map(hex::encode).unwrap_or_default();
-        let is_ours = t.treasury_spk() == Some(expected_spk.as_bytes());
-        let in_flight = scan.in_flight_spends.contains(&op);
-        println!(
-            "  {op}  {val} sat  spk={spk}{}{}",
-            if is_ours {
-                "  ← MATCHES our keys (current treasury)"
-            } else {
-                ""
-            },
-            if in_flight {
-                "  [movement IN FLIGHT]"
-            } else {
-                ""
-            },
-        );
-        if is_ours {
-            current = Some((op, val, in_flight));
-        }
-    }
-
-    match current {
-        Some((op, val, in_flight)) => {
-            println!("\nCURRENT TREASURY: {op} — {val} sat");
-            if in_flight {
+    // The current treasury is the bridge-state singleton's head (rev 5.4: there
+    // is no Confirmed chain to follow).
+    let current = match singleton_chain_tip(&rt, cfg, Some(&scan)) {
+        Ok(tip) => {
+            println!(
+                "\nCURRENT TREASURY (singleton head): {} — {} sat",
+                tip.outpoint,
+                tip.value.to_sat()
+            );
+            if tip.in_flight {
                 println!(
-                    "  a movement is already in flight against it — NOT free to move \
-                     (wait for confirm-tmtx)"
+                    "  a movement is already in flight against it (or an unreadable record might \
+                     be) — NOT free to move (wait for confirm-tmtx)"
                 );
             } else {
                 println!(
                     "  free to move — the auto-mover / sweep-pegins would build the next TM off this"
                 );
             }
+            Some((tip.outpoint, tip.value.to_sat(), tip.in_flight))
         }
-        None if tips.is_empty() => {
-            println!("\nno unspent tip — bootstrap (config) treasury would be used")
+        Err(e) => {
+            println!("\nno singleton head: {e}");
+            None
         }
-        None => println!(
-            "\nno unspent tip matches our keys ({} tip(s)) — check keys/config",
-            tips.len()
-        ),
-    }
+    };
 
     // Diagnose "why can't the mover advance": list the in-flight (Unconfirmed)
     // movements and flag the one(s) that spend the current tip — those block the
@@ -5495,14 +5317,14 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
             scan.unconfirmed.len()
         );
         for u in &scan.unconfirmed {
-            // Dead = spends an input a Confirmed TM already swept (oracle-verified
-            // spent) → can never confirm → auto-ignored, no longer blocks the tip.
-            let dead = u.inputs.iter().any(|i| scan.consumed.contains(i));
-            let spends_tip = tip_op.is_some_and(|t| u.inputs.contains(&t));
-            let tag = if dead {
-                "   ← DEAD (spends an already-swept input; can never confirm — auto-ignored)"
-            } else if spends_tip {
-                "   ← SPENDS THE CURRENT TIP (blocks the mover)"
+            // [CTM-18]: only a TM whose input 0 spends the CURRENT head can ever
+            // confirm. Anything else is a dead post awaiting its creator's GC.
+            let spends_tip = tip_op.is_some_and(|t| u.inputs.first() == Some(&t));
+            let dead = tip_op.is_some() && !spends_tip;
+            let tag = if spends_tip {
+                "   ← SPENDS THE CURRENT HEAD (blocks the mover)"
+            } else if dead {
+                "   ← DEAD (input 0 is not the current head; can never confirm — [CTM-18])"
             } else {
                 ""
             };
@@ -5514,13 +5336,11 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
                 tag,
             );
             for inp in &u.inputs {
-                let mut mark = String::new();
-                if tip_op == Some(*inp) {
-                    mark.push_str("   (= current treasury tip)");
-                }
-                if scan.consumed.contains(inp) {
-                    mark.push_str("   (ALREADY SWEPT — spent per a Confirmed TM)");
-                }
+                let mark = if tip_op == Some(*inp) {
+                    "   (= current treasury head)"
+                } else {
+                    ""
+                };
                 println!("      in  {}:{}{}", inp.txid, inp.vout, mark);
             }
             for (val, spk) in &u.outputs {
@@ -5542,27 +5362,12 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
             let viable_blockers = scan
                 .unconfirmed
                 .iter()
-                .filter(|u| {
-                    u.inputs.contains(&t) && !u.inputs.iter().any(|i| scan.consumed.contains(i))
-                })
-                .count();
-            let dead_blockers = scan
-                .unconfirmed
-                .iter()
-                .filter(|u| {
-                    u.inputs.contains(&t) && u.inputs.iter().any(|i| scan.consumed.contains(i))
-                })
+                .filter(|u| u.inputs.first() == Some(&t))
                 .count();
             if viable_blockers > 0 || scan.opaque_unconfirmed > 0 {
                 println!(
-                    "\nBLOCKED: {viable_blockers} live in-flight movement(s) spend the current tip \
-                     {t} — the mover waits for one to confirm."
-                );
-            } else if dead_blockers > 0 {
-                println!(
-                    "\nNOT BLOCKED: the {dead_blockers} in-flight movement(s) on the tip are DEAD \
-                     (they spend an already-swept input) — auto-ignored, so the mover treats the tip \
-                     as free and will build a fresh TM."
+                    "\nBLOCKED: {viable_blockers} live in-flight movement(s) spend the current \
+                     head {t} — the mover waits for one to confirm."
                 );
             }
         }
@@ -5578,66 +5383,60 @@ struct ChainTip {
     in_flight: bool,
 }
 
-/// The treasury marker-token asset name (hex). Shared by every treasury-sourcing
-/// path so they scan the SAME token unit; the real TM validator uses an empty
-/// asset name, the always-ok scaffold uses "TMTx".
+/// The TM NFT asset name (hex). Shared by every treasury-sourcing path so they
+/// scan the SAME token unit. Defaults to "" — the real TM validator counts the
+/// empty-name token (there is no scaffold asset name any more).
 fn treasury_asset_name_hex(cfg: &HeimdallConfig) -> String {
-    cfg.cardano
-        .treasury_asset_name
-        .clone()
-        .unwrap_or_else(|| hex::encode("TMTx"))
+    cfg.cardano.treasury_asset_name.clone().unwrap_or_default()
 }
 
-/// Chain-source the current Bitcoin treasury UTxO from a pre-fetched TM-UTxO
-/// scan (WI-028): chain-follow the Confirmed datums to the tip whose scriptPubKey
-/// matches `expected_spk`, and return its outpoint + value. `in_flight` is set
-/// when a VIABLE Unconfirmed TM already spends the tip (or an unreadable one) —
-/// the caller decides whether to wait (auto-mover) or error (one-shot sweep), so
-/// we never build a second TM off an unconfirmed treasury. Before the first TM
-/// confirms, falls back to the bootstrap `bitcoin.treasury_txid/vout/amount`.
+/// The current treasury for the CLI sweep: the bridge-state singleton's head.
+///
+/// Rev 5.4 removed the Confirmed TM chain — the head outpoint AND its satoshi
+/// amount come straight from the singleton's `BridgeState` datum, located
+/// through the Config's `bridge_state_policy` (field 3, [PAR-1]). The scan of
+/// the TM address is still consulted for the in-flight guard: an `UnconfirmedTm`
+/// record whose embedded BTC tx spends the head is a movement in flight, and a
+/// record we could not read might be — either way the sweep must wait for
+/// confirm-tmtx rather than double-spend the head.
 ///
 /// Takes the scan by ref so the sweep path scans the validator address ONCE and
 /// reuses it for both the peg-in guard and this tip selection.
-fn select_chain_tip(
-    expected_spk: &[u8],
-    scan: &heimdall::cardano::blockfrost_chain::TmScan,
+fn singleton_chain_tip(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+    scan: Option<&heimdall::cardano::blockfrost_chain::TmScan>,
 ) -> Result<ChainTip, String> {
-    use heimdall::cardano::treasury_datum::{TipSelectError, select_spendable_tip};
-
-    // A marker-token datum we could not read is a real TM we dropped; chain-follow
-    // on an incomplete set can promote an already-spent parent to a false tip.
-    if scan.parse_failures > 0 {
-        return Err(format!(
-            "{} marker-token TM datum(s) failed to parse — refusing to chain-source the \
-             treasury (would risk re-spending an already-moved UTxO); pass --treasury-outpoint \
-             to override",
-            scan.parse_failures
-        ));
-    }
-
-    let tip = match select_spendable_tip(&scan.confirmed, expected_spk) {
-        Ok(t) => t,
-        // Fresh bridge: no Confirmed TM yet. The local bootstrap config is gone
-        // (DEC-022) — the anchor lives on-chain in the Config UTxO's field 11, which
-        // the epoch daemon resolves automatically; this CLI path takes it explicitly.
-        Err(TipSelectError::NoConfirmedTms) => {
-            return Err(
-                "no Confirmed TM on-chain yet — pass --treasury-outpoint TXID:VOUT and \
-                 --treasury-amount-sat with the bridge's initial treasury anchor (the Config \
-                 UTxO's initial_btc_treasury_utxo, field 11) for the first movement"
-                    .to_string(),
-            );
-        }
-        Err(e) => return Err(format!("treasury tip selection: {e}")),
+    use bitcoin::hashes::Hash;
+    let loc = config_locator(cfg).ok_or(
+        "chain-sourced treasury requires a Config locator (cardano.config_address + \
+         config_nft_policy_id) — or pass --treasury-outpoint and --treasury-amount-sat",
+    )?;
+    let mainnet = cfg
+        .cardano
+        .treasury_address
+        .as_deref()
+        .is_some_and(|a| a.starts_with("addr1"));
+    let (_config, singleton) =
+        rt.block_on(heimdall::cardano::blockfrost_chain::fetch_config_singleton(
+            &loc.base_url,
+            &loc.project_id,
+            &loc.address,
+            &loc.nft_unit,
+            mainnet,
+        ))?;
+    let state = &singleton.state;
+    let txid_bytes: [u8; 32] = state.treasury_utxo_id[..32].try_into().unwrap();
+    let outpoint = bitcoin::OutPoint {
+        txid: bitcoin::Txid::from_byte_array(txid_bytes),
+        vout: u32::from_le_bytes(state.treasury_utxo_id[32..].try_into().unwrap()),
     };
-    let outpoint = tip.treasury_outpoint();
-    let in_flight = scan.in_flight_spends.contains(&outpoint) || scan.opaque_unconfirmed > 0;
-    let value = tip
-        .treasury_value()
-        .ok_or("treasury tip datum has no outputs")?;
+    let in_flight = scan.is_some_and(|s| {
+        s.in_flight_spends.contains(&outpoint) || s.opaque_unconfirmed > 0 || s.parse_failures > 0
+    });
     Ok(ChainTip {
         outpoint,
-        value,
+        value: bitcoin::Amount::from_sat(state.treasury_amount),
         in_flight,
     })
 }
@@ -5650,8 +5449,8 @@ fn select_chain_tip(
 /// validated by `parse_pegin_request`, which reconstructs the peg-in P2TR from
 /// `(y_fed, depositor_xonly, refund_timeout)` and requires a matching output —
 /// so a successful parse is itself proof the spend-info matches the on-chain
-/// scriptPubKey. The treasury input is chain-sourced from the Cardano tip
-/// Confirmed-TM (WI-028) unless overridden by `--treasury-outpoint`.
+/// scriptPubKey. The treasury input is chain-sourced from the bridge-state
+/// singleton's head unless overridden by `--treasury-outpoint`.
 #[allow(clippy::too_many_arguments)]
 fn run_sweep_pegins(
     cfg: &HeimdallConfig,
@@ -5780,20 +5579,26 @@ fn run_sweep_pegins(
             None => None,
         };
 
+    // The swept peg-ins trie: the source of "this deposit already reached the
+    // treasury" (rev 5.4 — there are no Confirmed records to read it from), and
+    // the state this TM's BTMR1 commitment advances.
+    let spi_trie = spi_trie_from_cfg(cfg)?;
+
     // Auto-skip peg-ins Cardano already shows as handled — WITHOUT querying Bitcoin.
-    // A peg-in whose deposit is in a Confirmed TM's swept inputs (oracle-verified
-    // spent) or committed to a viable in-flight TM would build an invalid/duplicate
-    // TM. Because `pegin-complete` (fBTC mint) is the depositor's choice and may
-    // never happen, the on-chain PIR can linger forever after its deposit is swept;
-    // we detect that from the Confirmed/Unconfirmed TM datums, not the open PIR.
-    let auto_consumed: std::collections::HashSet<bitcoin::OutPoint> = tm_scan
+    // A peg-in already in the swept peg-ins trie, or committed to a viable
+    // in-flight TM, would build an invalid/duplicate TM. Because `pegin-complete`
+    // (fBTC mint) is the depositor's choice and may never happen, the on-chain PIR
+    // can linger forever after its deposit is swept; we detect that from the SPI
+    // trie and the Unconfirmed TM datums, not the open PIR.
+    let mut auto_consumed: std::collections::HashSet<bitcoin::OutPoint> = tm_scan
         .as_ref()
-        .map(|s| {
-            let mut c = s.consumed.clone();
-            c.extend(s.in_flight_spends.iter().copied());
-            c
-        })
+        .map(|s| s.in_flight_spends.iter().copied().collect())
         .unwrap_or_default();
+    for (key, _) in spi_trie.entries() {
+        if let Some(op) = heimdall::cardano::treasury_datum::outpoint_from_swept_key(key) {
+            auto_consumed.insert(op);
+        }
+    }
 
     // Each parse reconstructs and matches the peg-in P2TR, so the returned
     // `spend_info` is itself proof the spend info matches the on-chain
@@ -5824,9 +5629,9 @@ fn run_sweep_pegins(
             continue;
         }
         if auto_consumed.contains(&outpoint) {
-            info!(
-                "  auto-skip peg-in {}:{} — {} sat (already swept into a Confirmed TM or committed \
-                 to a live in-flight TM per Cardano; its PIR just isn't minted yet)",
+            println!(
+                "  auto-skip peg-in {}:{} — {} sat (already in the swept peg-ins trie or \
+                 committed to a live in-flight TM; its PIR just lingers unminted)",
                 parsed.btc_txid,
                 parsed.btc_vout,
                 parsed.value.to_sat(),
@@ -5911,16 +5716,12 @@ fn run_sweep_pegins(
         (Some(_), None) | (None, Some(_)) => {
             return Err(
                 "pass BOTH --treasury-outpoint and --treasury-amount-sat, or NEITHER \
-                        (to chain-source the treasury from the Cardano tip Confirmed-TM)"
+                        (to chain-source the treasury from the bridge-state singleton)"
                     .to_string(),
             );
         }
         (None, None) => {
-            let scan = tm_scan.as_ref().ok_or(
-                "chain-sourced treasury requires cardano.blockfrost_project_id + \
-                 cardano.treasury_address (or pass --treasury-outpoint and --treasury-amount-sat)",
-            )?;
-            let tip = select_chain_tip(treasury_spk.as_bytes(), scan)?;
+            let tip = singleton_chain_tip(&rt, cfg, tm_scan.as_ref())?;
             if tip.in_flight {
                 let msg = format!(
                     "a treasury movement is already in flight spending tip {} — wait for \
@@ -5933,8 +5734,8 @@ fn run_sweep_pegins(
                 }
                 return Err(format!("{msg} (or override with --treasury-outpoint)"));
             }
-            info!(
-                "  treasury (Cardano tip Confirmed-TM): {} — {} sat",
+            println!(
+                "  treasury (bridge-state singleton head): {} — {} sat",
                 tip.outpoint,
                 tip.value.to_sat()
             );
@@ -6050,7 +5851,7 @@ fn run_sweep_pegins(
 
     // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee; outputs[1..m] = one
     // payment per peg-out (sorted by (scriptPubKey, net amount, por_id) inside build_tm); the LAST
-    // output is the mandatory "CPOR1" completed-peg-outs root commitment.
+    // output is the mandatory BTMR1 two-root commitment (spi_root ++ cpo_root).
     let unsigned = build_tm(
         TreasuryInput {
             outpoint: treasury_outpoint,
@@ -6063,6 +5864,7 @@ fn run_sweep_pegins(
         &tm_params,
         &freshness_from_cfg(cfg, chain_now_ms),
         &cpo_trie,
+        &spi_trie,
     )
     .map_err(|e| format!("build sweep: {e}"))?;
 
@@ -6070,6 +5872,11 @@ fn run_sweep_pegins(
         "  completed-peg-outs root committed: {} ({} fulfilled peg-out(s))",
         hex::encode(unsigned.cpo_root),
         unsigned.fulfilled.len(),
+    );
+    println!(
+        "  swept peg-ins root committed: {} ({} swept input(s))",
+        hex::encode(unsigned.spi_root),
+        unsigned.tx.input.len().saturating_sub(1),
     );
 
     // Surface any peg-outs the TM dropped as unpayable (non-standard destination
@@ -6218,11 +6025,7 @@ fn run_sweep_pegins(
                 "cardano.treasury_address must be set (the TM validator address)".to_string()
             })?;
         let treasury_policy_id = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
-        let treasury_asset_name_hex = cfg
-            .cardano
-            .treasury_asset_name
-            .clone()
-            .unwrap_or_else(|| hex::encode("TMTx"));
+        let treasury_asset_name_hex = cfg.cardano.treasury_asset_name.clone().unwrap_or_default();
         let treasury_config = TreasuryConfig {
             y_51: fixture.y_51,
             y_fed: fixture.y_fed,
@@ -6264,11 +6067,7 @@ fn run_sweep_pegins(
         } else {
             cfg.bitcoin.submit
         };
-        chain = chain.with_submit_config(
-            bitcoin_submit,
-            cfg.cardano.submit_oracle,
-            cfg.cardano.oracle_constructor,
-        );
+        chain = chain.with_submit_config(bitcoin_submit, cfg.cardano.submit_oracle);
         chain = chain.with_validity_window(cfg.cardano.tm_validity_window_secs.unwrap_or(1800));
         let chain = apply_tm_policy(chain, cfg)?;
         // The data-availability hint describes the peg-outs of the tx being posted.

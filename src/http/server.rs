@@ -43,6 +43,13 @@ pub struct AppState {
     /// payloads are: the publisher signs canonical bytes, and the server must
     /// hand back exactly what was signed, not a re-serialization of it.
     pub sign: BTreeMap<(u64, u32, RoundKey), String>,
+    /// `protocol.state_dir` – where the epoch machine persists this node's
+    /// swept peg-ins trie (`spi-trie.json`). The [SPI-4] proof route loads the
+    /// trie from here at the point of use (the CpoTrie idiom), so it always
+    /// serves the state the last confirmed TM left behind, never a stale
+    /// in-memory snapshot. `None` means this node keeps no trie, and the route
+    /// answers 503 rather than serving proofs against a trie nothing maintains.
+    pub state_dir: Option<std::path::PathBuf>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;

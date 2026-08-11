@@ -751,7 +751,7 @@ impl BanPolicyParams {
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
     ) -> Result<Self, BanListError> {
-        let Some(published) = config.and_then(|c| c.bans.as_ref()) else {
+        let Some(published) = config.map(|c| &c.bans) else {
             return Self::from_config(cardano);
         };
         // A local schedule that disagrees with the published one is dead config,
@@ -1051,14 +1051,16 @@ impl BanListSource {
     /// node deriving from its own TOML must agree or one of them is filtering a
     /// roster nobody else has.
     ///
-    /// Both routes must therefore stay reachable for a while: preprod's Config
-    /// predates the ban append and is migrated by a governance Update, so the
-    /// deployed datum will exist in both shapes.
+    /// Both routes stay reachable because a node may legitimately have no Config
+    /// to read at all (the fixture roster, and the dev/offline paths). Since rev
+    /// 5.4 a Config that IS readable always publishes the ban policy — the datum
+    /// makes #7-#10 mandatory — so `None` here means "no Config", never "an older
+    /// Config".
     pub fn resolve(
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
     ) -> Result<Option<Self>, BanListError> {
-        let Some(published) = config.and_then(|c| c.bans.as_ref()) else {
+        let Some(published) = config.map(|c| &c.bans) else {
             return Self::from_config(cardano);
         };
         let mainnet = cardano.is_mainnet().map_err(BanListError::Config)?;
@@ -1717,8 +1719,8 @@ mod tests {
 
     // -- WI-065: the ban policy the bridge publishes -------------------------
 
-    /// A Config carrying the ban append (#17-#20) and nothing else this module
-    /// reads.
+    /// A Config carrying the ban policy (#7-#10). Since rev 5.4 every Config
+    /// carries it — the parser refuses a datum that does not.
     fn config_publishing(policy: [u8; 28]) -> crate::cardano::config_params::ConfigParams {
         config_publishing_schedule(policy, 600_000, 3, 3_600_000)
     }
@@ -1732,28 +1734,15 @@ mod tests {
         max_faults_before_permanent: i64,
         max_validity_window_ms: i64,
     ) -> crate::cardano::config_params::ConfigParams {
-        use crate::cardano::config_params::{BanParams, ConfigParams, Contracts};
-        ConfigParams {
-            field_count: 21,
-            contracts: Contracts {
-                bridged_token_policy_id: vec![],
-                bridged_token_asset_name: vec![],
-                completed_peg_ins_policy_id: vec![],
-                completed_peg_outs_policy_id: vec![],
-                peg_in_script_hash: vec![],
-                peg_out_script_hash: vec![],
-            },
-            min_stake: 0,
-            initial_btc_treasury_utxo: None,
-            tunables: None,
-            bans: Some(BanParams {
-                spo_bans_policy_id: policy,
-                base_ban_duration_ms,
-                max_faults_before_permanent,
-                max_validity_window_ms,
-            }),
-            registry: None,
-        }
+        use crate::cardano::config_params::BanParams;
+        let mut c = crate::cardano::config_params::test_config_params();
+        c.bans = BanParams {
+            spo_bans_policy_id: policy,
+            base_ban_duration_ms,
+            max_faults_before_permanent,
+            max_validity_window_ms,
+        };
+        c
     }
 
     /// A node whose registry roster is configured and whose `[cardano]` section
@@ -1816,36 +1805,31 @@ mod tests {
         assert_eq!(b.origin, BanSourceOrigin::Config);
     }
 
-    /// A Config predating the append keeps the old behaviour exactly — including
-    /// WI-060's refusal, since on that bridge the local keys are still the only
-    /// way to read the list.
+    /// A node with NO Config to read keeps the old behaviour exactly — including
+    /// WI-060's refusal, since without one the local keys are the only way to
+    /// read the list.
+    ///
+    /// Rev 5.4 removed the second case this once covered — a Config predating the
+    /// ban append. The datum now carries the ban policy mandatorily, so
+    /// `parse_config_datum` refuses such a Config and no `ConfigParams` can
+    /// express it.
     #[test]
-    fn a_config_predating_the_append_falls_back_to_the_local_keys() {
+    fn no_config_falls_back_to_the_local_keys() {
         let cardano = crate::config::CardanoConfig {
             registry_blueprint: Some("plutus.json".to_string()),
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
             ..Default::default()
         };
-        let mut pre_append = config_publishing([0xbb; 28]);
-        pre_append.bans = None;
-        pre_append.field_count = 17;
-        for config in [None, Some(&pre_append)] {
-            let err = BanListSource::resolve(&cardano, config)
-                .expect_err("no published policy and no local keys");
-            let BanListError::Config(msg) = err else {
-                panic!("expected a config error");
-            };
-            assert!(msg.contains("cardano.ban_bootstrap is required"), "{msg}");
-        }
+        let err = BanListSource::resolve(&cardano, None)
+            .expect_err("no published policy and no local keys");
+        let BanListError::Config(msg) = err else {
+            panic!("expected a config error");
+        };
+        assert!(msg.contains("cardano.ban_bootstrap is required"), "{msg}");
 
-        // …and the fixture roster still has no ban list on either route.
+        // …and the fixture roster still has no ban list.
         let fixture = crate::config::CardanoConfig::default();
         assert!(BanListSource::resolve(&fixture, None).unwrap().is_none());
-        assert!(
-            BanListSource::resolve(&fixture, Some(&pre_append))
-                .unwrap()
-                .is_none()
-        );
     }
 
     /// Local keys that DERIVE a different policy than the bridge publishes are
