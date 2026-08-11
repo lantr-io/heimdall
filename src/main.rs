@@ -605,7 +605,9 @@ enum Commands {
         /// UTxO's locked amount. Falls back to `cardano.bridged_token_unit` if omitted.
         #[arg(long)]
         bridged_token_unit: Option<String>,
-        /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
+        /// DEV-ONLY: broadcast directly via bitcoin.rpc_url (default: build + print
+        /// only). Production SPOs run no Bitcoin node — the binocular watchtower
+        /// relays the signed TM from the posted UnconfirmedTm record.
         #[arg(long)]
         broadcast: bool,
         /// Override the locally-built signed TM with these raw BTC tx bytes (hex). Use when

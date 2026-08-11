@@ -35,7 +35,7 @@ y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 rpc_url = "http://127.0.0.1:48332"   # testnet4 RPC (bitcoind -testnet4)
 rpc_user = "bitcoin"
 rpc_pass = "bitcoin"
-submit = false          # broadcast signed BTC tx to rpc_url (false: binocular relay does it)
+submit = false          # DEV-ONLY direct broadcast; production: the binocular watchtower relays
 # The FROST treasury UTXO is no longer configured locally. The initial (anchor) outpoint lives
 # on-chain in the bridge Config UTxO (field 11, set by `binocular deploy-bridge` /
 # `binocular update-config`), and the current treasury is resolved by walking the Confirmed

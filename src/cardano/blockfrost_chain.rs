@@ -504,7 +504,9 @@ pub struct BlockfrostCardanoChain {
     treasury_y_51: Mutex<Option<bitcoin::key::UntweakedPublicKey>>,
     /// Optional bitcoind JSON-RPC config for direct BTC tx broadcast.
     btc_rpc: Option<BtcRpcConfig>,
-    /// Whether to broadcast the signed BTC tx to Bitcoin (requires btc_rpc).
+    /// DEV-ONLY: whether to broadcast the signed BTC tx to Bitcoin (requires
+    /// btc_rpc). Default false — production SPOs never broadcast; watchtowers
+    /// relay `signed_btc_tx` from the UnconfirmedTm record.
     submit_btc: bool,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     submit_oracle: bool,
@@ -530,6 +532,11 @@ pub struct BlockfrostCardanoChain {
     /// `btc_confirmed = false` until that txid becomes the Confirmed chain tip, so the
     /// epoch machine waits for its own in-flight TM instead of double-spending the tip.
     last_submitted_txid: Mutex<Option<bitcoin::Txid>>,
+    /// `(head outpoint → its scriptPubKey)`, resolved from the head-creating TM's
+    /// bytes in Cardano history. Cached because the head only moves at Confirm and
+    /// `address_history` is O(chain length) on Blockfrost. `Ok(None)` (the bootstrap
+    /// anchor, which no TM created) is cached too.
+    head_spk_cache: Mutex<Option<(bitcoin::OutPoint, Option<bitcoin::ScriptBuf>)>>,
     /// Optional automatic DKG fault proof mint + ApplyBan configuration.
     fault_ban_flow: Option<DkgFaultBanFlow>,
     /// Policy id of the bridge state singleton validator (Config field 3,
@@ -647,6 +654,45 @@ pub async fn fetch_config_singleton(
     ))
 }
 
+/// The scriptPubKey of `head`, read from the TM that created it: scan the TM
+/// address's history (spent outputs INCLUDED — the head-creating record was
+/// consumed by its own Confirm), parse each UnconfirmedTm datum, and take output
+/// `head.vout` of the record whose btc txid equals the head's.
+///
+/// TRUSTLESS despite the address being permissionlessly payable:
+/// `parse_unconfirmed_tm` RECOMPUTES the txid from the record's own embedded
+/// bytes (`compute_txid()`), so a hostile record can only ever occupy the slot
+/// of its own hash — which this lookup never asks for unless the singleton's
+/// attested head leads there. `Ok(None)` = no record creates this head (the
+/// bootstrap anchor). An output whose datum EXISTS but cannot be resolved is
+/// skipped: if it hid the head-creating TM, the result degrades to the
+/// bootstrap fallback, never to a wrong script.
+pub async fn head_spk_from_history(
+    source: &dyn crate::cardano::cpo_history::CpoHistorySource,
+    tm_address: &str,
+    head: &bitcoin::OutPoint,
+) -> Result<Option<bitcoin::ScriptBuf>, String> {
+    let outputs = source
+        .address_history(tm_address)
+        .await
+        .map_err(|e| format!("TM address history ({}): {e}", source.backend()))?;
+    for out in &outputs {
+        let Some(datum) = out.datum.resolved() else {
+            continue;
+        };
+        let Some(tm) = parse_unconfirmed_tm(datum) else {
+            continue;
+        };
+        if tm.btc_txid == head.txid {
+            return Ok(tm
+                .outputs
+                .get(head.vout as usize)
+                .map(|(_, spk)| spk.clone()));
+        }
+    }
+    Ok(None)
+}
+
 /// The two values `pegout_datum::fetch_pegout_requests` needs. The `sweep-pegins` CLI takes
 /// them as arguments; the daemon has no argv, so the chain carries them.
 #[derive(Debug, Clone)]
@@ -694,7 +740,7 @@ impl BlockfrostCardanoChain {
             wallet_base_address: None,
             treasury_y_51: Mutex::new(None),
             btc_rpc: None,
-            submit_btc: true,
+            submit_btc: false,
             submit_oracle: true,
             oracle_constructor: 0,
             tm_script_cbor: None,
@@ -702,6 +748,7 @@ impl BlockfrostCardanoChain {
             config_address: None,
             config_nft_unit: None,
             last_submitted_txid: Mutex::new(None),
+            head_spk_cache: Mutex::new(None),
             fault_ban_flow: None,
             cpo_policy_id: None,
             kupo_url: None,
@@ -1051,6 +1098,33 @@ impl BlockfrostCardanoChain {
     /// the configured TM address, which every deployment sets.
     fn is_mainnet(&self) -> bool {
         self.treasury_address.starts_with("addr1")
+    }
+
+    /// The scriptPubKey the treasury head is locked under, sourced from CARDANO:
+    /// output `head.vout` of the TM whose signed bytes the (spent) UnconfirmedTm
+    /// record carries. `Ok(None)` = no TM created this head — the bootstrap
+    /// anchor. Cached per head (it only moves at Confirm).
+    async fn head_spk(&self, head: &bitcoin::OutPoint) -> EpochResult<Option<bitcoin::ScriptBuf>> {
+        if let Some((cached_head, spk)) = &*self.head_spk_cache.lock().unwrap() {
+            if cached_head == head {
+                return Ok(spk.clone());
+            }
+        }
+        // Same backend selection as `query_cpo_root`: Kupo when configured, else the
+        // Blockfrost-compatible API. Both serve spent outputs with datums resolved.
+        let source: Box<dyn crate::cardano::cpo_history::CpoHistorySource> =
+            match self.kupo_url.as_deref() {
+                Some(url) => Box::new(crate::cardano::cpo_history::KupoHistory::new(url)),
+                None => Box::new(crate::cardano::cpo_history::BlockfrostHistory::new(
+                    &self.bf_project_id,
+                    Some(&self.bf_base_url),
+                )),
+            };
+        let spk = head_spk_from_history(source.as_ref(), &self.treasury_address, head)
+            .await
+            .map_err(EpochError::Chain)?;
+        *self.head_spk_cache.lock().unwrap() = Some((*head, spk.clone()));
+        Ok(spk)
     }
 
     /// Fetch all UTxOs at the wallet base address.
@@ -1482,45 +1556,55 @@ impl CardanoChain for BlockfrostCardanoChain {
         let csv = self.treasury_config.federation_csv_blocks;
 
         // Which taproot tree is the head locked under? The singleton records the outpoint and
-        // amount but not the scriptPubKey, so the candidate trees — the federation seed
-        // (production) and, defensively, Y_51 itself (the demo's collapsed Y_fed=Y_51
-        // convention) — are reconstructed and checked against bitcoind's gettxout on the head.
-        // Never sign an outpoint whose on-chain scriptPubKey we cannot reconstruct.
-        let rpc = self.btc_rpc.as_ref().ok_or_else(|| {
-            EpochError::Chain(
-                "treasury resolution needs bitcoin.rpc_url (gettxout on the singleton's head \
-                 selects the taproot tree to spend under)"
-                    .into(),
-            )
-        })?;
-        let actual_spk_hex = crate::cardano::btc_rpc::get_txout_script_pub_key_hex(
-            rpc,
-            &outpoint.txid.to_string(),
-            outpoint.vout,
-        )
-        .await?;
+        // amount but not the scriptPubKey — and SPOs run no Bitcoin node, so the script is
+        // sourced from CARDANO: the head was created as output 0 of a TM whose full signed
+        // bytes live in the (spent) UnconfirmedTm record at the TM address. The candidate
+        // trees — the federation seed (production) and, defensively, Y_51 itself (the demo's
+        // collapsed Y_fed=Y_51 convention) — are reconstructed and checked against that
+        // script. Never sign an outpoint whose on-chain scriptPubKey we cannot reconstruct.
+        //
+        // The BOOTSTRAP head is the funding tx, not a TM, so no record exists for it: the spk
+        // is then constructed from the configured keys WITHOUT verification. That is the
+        // spec's bootstrap trust model (operator-supplied, observer-verified) and it is
+        // self-limiting — under wrong keys the FROST signatures simply do not verify, so
+        // nothing can be signed away, let alone lost.
         let secp = bitcoin::key::Secp256k1::new();
         let csv_u16 = csv_to_u16(csv)?;
         let mut leaf_candidates = vec![self.treasury_config.y_fed];
         if y_51 != self.treasury_config.y_fed {
             leaf_candidates.push(y_51);
         }
-        let y_fed = leaf_candidates
-            .iter()
-            .copied()
-            .find(|&cand| {
-                let spk = bitcoin::ScriptBuf::new_p2tr_tweaked(
-                    treasury_spend_info(&secp, y_51, cand, csv_u16).output_key(),
+        let head_spk = self.head_spk(&outpoint).await?;
+        let y_fed = match &head_spk {
+            Some(actual_spk) => leaf_candidates
+                .iter()
+                .copied()
+                .find(|&cand| {
+                    let spk = bitcoin::ScriptBuf::new_p2tr_tweaked(
+                        treasury_spend_info(&secp, y_51, cand, csv_u16).output_key(),
+                    );
+                    spk == *actual_spk
+                })
+                .ok_or_else(|| {
+                    EpochError::Chain(format!(
+                        "the singleton's head {outpoint} is locked under a scriptPubKey \
+                         ({}) that no candidate treasury tree reproduces — y_51/y_fed/csv \
+                         configuration is out of step with the chain",
+                        hex::encode(actual_spk.as_bytes())
+                    ))
+                })?,
+            None => {
+                let y_fed = leaf_candidates[0];
+                eprintln!(
+                    "[blockfrost] no TM record creates head {outpoint} — treating it as the \
+                     BOOTSTRAP anchor and trusting the configured keys (y_fed {}) for the \
+                     treasury tree. A wrong key set is self-limiting: FROST signatures over \
+                     it simply fail",
+                    hex::encode(y_fed.serialize()),
                 );
-                hex::encode(spk.as_bytes()) == actual_spk_hex
-            })
-            .ok_or_else(|| {
-                EpochError::Chain(format!(
-                    "the singleton's head {outpoint} is locked under a scriptPubKey \
-                     ({actual_spk_hex}) that no candidate treasury tree reproduces — \
-                     y_51/y_fed/csv configuration is out of step with the chain"
-                ))
-            })?;
+                y_fed
+            }
+        };
 
         // A movement already in flight against this head — or an in-flight movement we could
         // not read — means it is not yet safe to build the next TM; report btc_confirmed=false
@@ -1879,8 +1963,13 @@ impl CardanoChain for BlockfrostCardanoChain {
             hex::encode(tx_bytes)
         );
 
-        // Broadcast the signed BTC tx to Bitcoin if configured and enabled.
+        // DEV-ONLY broadcast. Production SPOs run no Bitcoin node: the watchtower
+        // relays `signed_btc_tx` from the UnconfirmedTm record posted below.
         if self.submit_btc {
+            eprintln!(
+                "[submit] DEV-ONLY bitcoin.submit=true — broadcasting directly; production \
+                 SPOs leave this false (watchtowers relay from the UnconfirmedTm record)"
+            );
             match &self.btc_rpc {
                 Some(rpc) => broadcast_btc_tx(rpc, tx_bytes).await?,
                 None => warn!(
@@ -1888,7 +1977,7 @@ impl CardanoChain for BlockfrostCardanoChain {
                 ),
             }
         } else {
-            info!("[submit] bitcoin.submit=false — skipping BTC broadcast");
+            info!("[submit] no BTC broadcast (bitcoin.submit=false) — the watchtower relays it");
         }
 
         // Track our in-flight TM: query_treasury reports btc_confirmed=false until this
@@ -2421,5 +2510,149 @@ mod tests {
         let spends = viable_in_flight_spends(&consumed, &[dead, viable]);
         assert_eq!(spends, HashSet::from([fresh_deposit]));
         assert!(!spends.contains(&tip));
+    }
+
+    // --- head_spk_from_history ------------------------------------------------
+
+    mod head_spk {
+        use crate::cardano::cpo_history::{CpoHistorySource, DatumState, HistoricalOutput};
+        use async_trait::async_trait;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::serialize;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid};
+        use pallas_primitives::conway::{Constr, PlutusData};
+        use pallas_primitives::{BoundedBytes, MaybeIndefArray};
+
+        struct FakeHistory(Vec<HistoricalOutput>);
+
+        #[async_trait]
+        impl CpoHistorySource for FakeHistory {
+            fn backend(&self) -> &'static str {
+                "fake"
+            }
+            fn endpoint(&self) -> &str {
+                "fake://"
+            }
+            fn datum_gap_advice(&self) -> &'static str {
+                ""
+            }
+            async fn address_history(
+                &self,
+                _address: &str,
+            ) -> Result<Vec<HistoricalOutput>, String> {
+                Ok(self.0.clone())
+            }
+            async fn unspent_with_asset(
+                &self,
+                _policy_hex: &str,
+                _asset_name_hex: &str,
+            ) -> Result<Vec<HistoricalOutput>, String> {
+                Ok(vec![])
+            }
+        }
+
+        /// A tiny 1-in/1-out BTC tx whose output 0 pays `spk`.
+        fn btc_tx(prev: u8, spk: &ScriptBuf) -> Transaction {
+            Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array([prev; 32]),
+                        vout: 0,
+                    },
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(9_000),
+                    script_pubkey: spk.clone(),
+                }],
+            }
+        }
+
+        /// An UnconfirmedTm datum (Constr 0) embedding `tx`'s signed bytes.
+        fn record(tx: &Transaction) -> HistoricalOutput {
+            let datum = PlutusData::Constr(Constr {
+                tag: 121,
+                any_constructor: None,
+                fields: MaybeIndefArray::Def(vec![
+                    PlutusData::BoundedBytes(BoundedBytes::from(serialize(tx))),
+                    PlutusData::BoundedBytes(BoundedBytes::from(vec![0x7a; 28])),
+                    crate::cardano::plutus::int(1),
+                    crate::cardano::plutus::array(vec![]),
+                ]),
+            });
+            HistoricalOutput {
+                tx_hash: "ab".repeat(32),
+                output_index: 0,
+                assets: Default::default(),
+                datum: DatumState::Resolved(datum),
+                datum_note: "inline".into(),
+            }
+        }
+
+        fn junk() -> HistoricalOutput {
+            HistoricalOutput {
+                tx_hash: "cd".repeat(32),
+                output_index: 1,
+                assets: Default::default(),
+                datum: DatumState::Absent,
+                datum_note: "no datum".into(),
+            }
+        }
+
+        // The head-creating TM is found among SPENT records by the txid RECOMPUTED
+        // from its own bytes, and its output-0 script is returned.
+        #[tokio::test]
+        async fn finds_the_head_creating_tm_and_returns_its_spk() {
+            let spk = ScriptBuf::from_bytes(vec![0x51, 0x20]);
+            let tx = btc_tx(0x01, &spk);
+            let head = OutPoint {
+                txid: tx.compute_txid(),
+                vout: 0,
+            };
+            let other = btc_tx(0x02, &ScriptBuf::from_bytes(vec![0x52]));
+            let source = FakeHistory(vec![junk(), record(&other), record(&tx)]);
+            let got = super::super::head_spk_from_history(&source, "addr_test", &head)
+                .await
+                .unwrap();
+            assert_eq!(got, Some(spk));
+        }
+
+        // No record hashes to the head's txid: the BOOTSTRAP anchor case. The
+        // caller then constructs the tree from the configured keys.
+        #[tokio::test]
+        async fn an_unknown_head_is_the_bootstrap_anchor() {
+            let source = FakeHistory(vec![junk(), record(&btc_tx(0x02, &ScriptBuf::new()))]);
+            let head = OutPoint {
+                txid: Txid::from_byte_array([0xee; 32]),
+                vout: 0,
+            };
+            let got = super::super::head_spk_from_history(&source, "addr_test", &head)
+                .await
+                .unwrap();
+            assert_eq!(got, None);
+        }
+
+        // A hostile record cannot claim the head's slot: the lookup keys on the
+        // txid recomputed from the record's OWN bytes, so a record embedding a
+        // DIFFERENT transaction never matches the head, whatever its datum says.
+        #[tokio::test]
+        async fn a_record_with_foreign_bytes_never_matches_the_head() {
+            let spk = ScriptBuf::from_bytes(vec![0x51, 0x20]);
+            let tx = btc_tx(0x01, &spk);
+            let head = OutPoint {
+                txid: tx.compute_txid(),
+                vout: 0,
+            };
+            // Only a record embedding some OTHER tx exists.
+            let source = FakeHistory(vec![record(&btc_tx(0x03, &ScriptBuf::new()))]);
+            let got = super::super::head_spk_from_history(&source, "addr_test", &head)
+                .await
+                .unwrap();
+            assert_eq!(got, None, "foreign bytes must not occupy the head's slot");
+        }
     }
 }

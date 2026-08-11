@@ -191,12 +191,20 @@ pub struct BitcoinConfig {
     pub federation_csv_blocks: u32,
     /// 32-byte hex seed for the Y_federation key.
     pub y_fed_seed_hex: String,
-    /// Optional bitcoind JSON-RPC endpoint for direct tx broadcast.
+    /// Optional bitcoind JSON-RPC endpoint. DEV / FEDERATION-OPS ONLY: the SPO
+    /// runtime never requires a Bitcoin node — every Bitcoin fact reaches
+    /// heimdall through Cardano (PIR datums carry the raw deposit txs,
+    /// UnconfirmedTm records carry the raw TMs, the bridge-state singleton
+    /// carries the treasury head). This endpoint serves only the opt-in dev
+    /// broadcast below and the federation ops tools (treasury-self-send,
+    /// federation-spend).
     pub rpc_url: Option<String>,
     pub rpc_user: Option<String>,
     pub rpc_pass: Option<String>,
-    /// Whether to broadcast the signed BTC tx to the Bitcoin node via
-    /// `sendrawtransaction`. Requires `rpc_url`. Default: true (when rpc_url set).
+    /// DEV-ONLY: broadcast the signed BTC tx to `rpc_url` via
+    /// `sendrawtransaction`. Default FALSE — in production the SPO never
+    /// broadcasts; watchtowers relay `signed_btc_tx` from the UnconfirmedTm
+    /// record (that is what the record is for).
     pub submit: bool,
     /// Depositor refund timelock (BTC blocks) in the peg-in Taproot's
     /// refund leaf. Spec default 4320 (~30 days); override for
@@ -223,7 +231,7 @@ impl Default for BitcoinConfig {
             rpc_url: None,
             rpc_user: None,
             rpc_pass: None,
-            submit: true,
+            submit: false,
             pegin_refund_timeout_blocks: 4320,
             inflight_deadline_secs: None,
         }

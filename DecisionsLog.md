@@ -992,3 +992,25 @@ node already maintains for the BTMR1 commitment, plus the live in-flight
 spends. `TmScan` keeps its legacy Confirmed parsing (empty on a fresh
 deployment) - removing it is a wider cleanup than this migration needs.
 
+## 2026-08-11 - Cardano-only Bitcoin data on the SPO runtime
+
+**DEC-034: treasury tree selection is Cardano-sourced; supersedes DEC-030's
+"requires a Bitcoin RPC" clause.** The head's scriptPubKey comes from the TM
+that CREATED the head: output 0 of the signed bytes in the (spent)
+UnconfirmedTm record at the TM address, found by the txid RECOMPUTED from the
+record's own bytes (the [SPI-7] discipline - a hostile record can only occupy
+its own hash's slot). Backend selection matches `query_cpo_root` (Kupo, else
+Blockfrost), and the result is cached per head (it only moves at Confirm).
+The BOOTSTRAP anchor was created by the funding tx, not a TM, so no record
+exists: the tree is then constructed from the configured keys WITHOUT
+verification, logged loudly. Self-limiting per the spec's bootstrap trust
+model - under wrong keys the FROST signatures simply do not verify.
+
+**DEC-035: BTC broadcast is a dev flag, default off.** `bitcoin.submit` and
+the sweep's `--broadcast` default to false and are documented DEV-ONLY:
+production SPOs run no Bitcoin node, and the binocular watchtower relays
+`signed_btc_tx` from the posted UnconfirmedTm record (that is what the record
+is for). `bitcoin.rpc_url` serves only that opt-in path and the federation
+ops tools (`treasury-self-send`, `federation-spend`), which are not SPO
+runtime. The `gettxout` helpers are deleted; `broadcast_btc_tx` remains.
+
