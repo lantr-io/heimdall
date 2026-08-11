@@ -648,9 +648,22 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Rebuild the swept peg-ins (SPI) trie from Cardano history — the SPI twin
+    /// of `reconstruct-cpo-trie`. Walks the treasury chain backward from the
+    /// bridge state singleton's head over the spent UnconfirmedTm records,
+    /// records every confirmed TM's inputs per [SPI-1]/[SPI-3], and refuses to
+    /// persist a root the singleton's attested spi_root disagrees with.
+    ReconstructSpiTrie {
+        #[arg(long)]
+        config: Option<String>,
+        /// Print the reconstructed root and entry count without writing
+        /// `spi-trie.json`.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Read-only: chain-source the current Bitcoin treasury from Cardano state
-    /// (WI-028). Scans the TM validator address (`cardano.treasury_address`),
-    /// chain-follows the Confirmed TMs to the unspent tip, and prints its
+    /// (rev 5.4). Reads the bridge-state singleton's head and amount, checks the
+    /// head's scriptPubKey against the candidate treasury trees, and prints its
     /// outpoint / value / scriptPubKey, whether it matches the demo Y_51 treasury
     /// keys, and whether a movement is already in flight against it. Posts
     /// nothing — the same read the auto-mover and `sweep-pegins` use to source
@@ -659,13 +672,13 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
-    /// Read-only: print the bridge Config UTxO's operational parameters (WI-040) —
-    /// the values every SPO must agree on to build byte-identical Treasury
-    /// Movements. Reads `cardano.config_address` + `cardano.config_nft_policy_id`
-    /// at the current chain tip and reports the fee rate (#12), the per-peg-out fee
-    /// floor (#13), `min_peg_out_fbtc` (#14), `leader_reward` (#15), the schedule
-    /// (#16) and `min_stake` (#9) — plus whether this node would instead fall back
-    /// to its local `bitcoin.fee_rate_sat_per_vb`. Posts nothing.
+    /// Read-only: print the bridge Config UTxO's operational parameters (WI-040,
+    /// rev-5.4 layout) — the values every SPO must agree on to build
+    /// byte-identical Treasury Movements. Reads `cardano.config_address` +
+    /// `cardano.config_nft_policy_id` at the current chain tip and reports the
+    /// nested `params` record (#7): the fee rate, the per-peg-out fee floor,
+    /// `min_peg_out_fbtc` and the schedule — plus whether this node would instead
+    /// fall back to its local `bitcoin.fee_rate_sat_per_vb`. Posts nothing.
     ShowConfigParams {
         #[arg(long)]
         config: Option<String>,
@@ -1325,6 +1338,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::ReconstructSpiTrie { config, dry_run } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_reconstruct_spi_trie(&cfg, dry_run) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -1336,8 +1356,8 @@ fn apply_tm_policy(
     chain: BlockfrostCardanoChain,
     cfg: &HeimdallConfig,
 ) -> Result<BlockfrostCardanoChain, String> {
-    // The Config-UTxO locator is needed by query_treasury (chain walk) even when minting
-    // stays on the scaffold, so apply it whenever configured.
+    // The Config-UTxO locator is needed by query_treasury (the singleton read)
+    // independently of posting, so apply it whenever configured.
     let chain = match (
         &cfg.cardano.config_address,
         &cfg.cardano.config_nft_policy_id,
@@ -4936,7 +4956,7 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
         pegout_address: pegout_address.to_string(),
         fbtc_policy_id: fbtc_policy_id.to_string(),
         fbtc_asset_name_hex: fbtc_asset_name_hex.to_string(),
-        cpo_policy_id: Some(cpo_policy_id),
+        cpo_policy_id,
     };
     // `reconstruct` itself logs the active backend and its endpoint before its
     // first read, so every caller reports it identically and this command does not
@@ -4969,6 +4989,81 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
     println!(
         "  written            : {}",
         heimdall::cardano::cpo_trie::CpoTrie::state_path(dir).display()
+    );
+    Ok(())
+}
+
+/// `reconstruct-spi-trie`: rebuild the swept peg-ins trie from Cardano history,
+/// then persist it to `protocol.state_dir` — the recovery `BuildTm`'s spi_root
+/// cross-check points an operator at.
+///
+/// Same backend selection and the same harvest/walk as `reconstruct-cpo-trie`;
+/// the entries are each confirmed TM's inputs per [SPI-1]/[SPI-3], and the
+/// finished root must equal the singleton's attested `spi_root`.
+fn run_reconstruct_spi_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), String> {
+    use heimdall::cardano::cpo_history::{BlockfrostHistory, CpoHistorySource, KupoHistory};
+    use heimdall::cardano::cpo_trie::reconstruct_spi;
+
+    let tm_address = cfg
+        .cardano
+        .treasury_address
+        .as_deref()
+        .ok_or("set cardano.treasury_address (the TM validator address)")?;
+    let policy = cfg
+        .cardano
+        .cpo_policy_id
+        .as_deref()
+        .ok_or(
+            "set cardano.cpo_policy_id (the bridge_state_policy, Config field 3) — the singleton \
+             supplies the walk's head and the attested spi_root",
+        )?
+        .trim()
+        .to_ascii_lowercase();
+
+    let source: Box<dyn CpoHistorySource> = match cfg.cardano.kupo_url.as_deref() {
+        Some(url) => Box::new(KupoHistory::new(url)),
+        None => {
+            let project_id = cfg.cardano.blockfrost_project_id.as_deref().ok_or(
+                "set cardano.kupo_url (recommended for SPOs) or cardano.blockfrost_project_id \
+                 — reconstruction reads the datums of SPENT outputs, which needs either a Kupo \
+                 index or a Blockfrost-compatible transaction-history API",
+            )?;
+            Box::new(BlockfrostHistory::new(
+                project_id,
+                cfg.cardano.blockfrost_url.as_deref(),
+            ))
+        }
+    };
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    println!("reconstructing the swept peg-ins trie");
+    let trie = rt
+        .block_on(reconstruct_spi(source.as_ref(), tm_address, &policy))
+        .map_err(|e| e.to_string())?;
+
+    println!(
+        "  reconstructed root : {} ({} entr(y|ies))",
+        hex::encode(trie.root()),
+        trie.len()
+    );
+    for (peg_in, value) in trie.entries() {
+        println!("    {} -> {}", hex::encode(peg_in), hex::encode(value));
+    }
+
+    if dry_run {
+        println!("  --dry-run: not written");
+        return Ok(());
+    }
+    let dir = cfg
+        .protocol
+        .state_dir
+        .as_deref()
+        .ok_or("set protocol.state_dir to persist the trie (or pass --dry-run)")?;
+    let dir = std::path::Path::new(dir);
+    trie.save(dir).map_err(|e| e.to_string())?;
+    println!(
+        "  written            : {}",
+        heimdall::cardano::spi_trie::SpiTrie::state_path(dir).display()
     );
     Ok(())
 }

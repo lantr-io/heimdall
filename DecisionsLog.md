@@ -1024,3 +1024,29 @@ datum shape - always Constr 0), and the `"TMTx"` asset-name defaults become
 `""` (the real validator counts the empty-name token). `always_ok.rs` survives
 as a TEST FIXTURE ONLY for the tx-composition tests.
 
+
+**DEC-037: rev-5.4 reconstruction walks the singleton's spend history; the SPI
+trie gets the same pre-signing guard as the CPO trie.** `cpo_trie::reconstruct`
+replayed Constr-1 `Confirmed` records, which rev 5.4 never mints ([CTM-24]/
+[CTM-25] burn the NFT and forbid a TM-address output), so on any live rev-5.4
+chain it replayed an empty set and always failed the singleton cross-check.
+It now harvests the spent `UnconfirmedTm` records (keyed by the txid RECOMPUTED
+from `signed_btc_tx`, [OB-9]/[SPI-7]) and walks the treasury chain BACKWARD
+from the singleton's head via input-0 ancestry ([OB-2]) - the same walk
+binocular's SPI proof server uses, so a mined-but-unconfirmed TM is never
+replayed. `cpo_policy_id` became REQUIRED: the singleton supplies both the
+walk's start and the final check. The same harvest powers the new
+`reconstruct-spi-trie` command (`cpo_trie::reconstruct_spi`), and `BuildTm`'s
+pre-signing cross-check now covers BOTH tries (`query_bridge_roots`, one
+singleton fetch): [SPI-2]'s peer recomputation cannot catch a roster-wide
+stale spi-trie.json - every co-signer recomputes from the SAME restored state -
+and a confirmed truncated spi_root strands every swept-but-unminted depositor.
+
+**DEC-038: heimdall serves no SPI proofs.** The unauthenticated
+`GET /spi/proof/{peg_in_utxo_id}` route (DEC-023) is removed: [SPI-4] (revised)
+names binocular as the proof server and forbids heimdall the role, and the
+route served proofs from the locally persisted trie without reconciling its
+root against the singleton's attested spi_root - a lagging node would answer
+`member=false` with an exclusion proof against a stale root, which reads as
+"was never swept". This node's trie is quorum-internal state for the [SPI-2]
+gate; depositors and tools ask a watchtower.

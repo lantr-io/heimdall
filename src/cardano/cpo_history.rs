@@ -1200,14 +1200,13 @@ mod tests {
                 int(1_700_000_000_000),
             ],
         );
+        // The rev-5.4 4-field UnconfirmedTm shape: the hint sits at field 3.
         let unconfirmed = constr(
             0,
             vec![
                 bytes(&btc_tx_bytes),
                 bytes(&[0x7a; 28]),
                 int(1_700_000_000_000),
-                int(0),
-                int(0),
                 array(vec![
                     bytes(&hint_bytes(&por_tx_a, 0)),
                     bytes(&hint_bytes(&por_tx_b, 1)),
@@ -1226,13 +1225,19 @@ mod tests {
             )
         };
         // The bridge state singleton. `spi_root` is a distinct placeholder, so a
-        // positional read of field 0 cannot pass for `cpo_root`.
+        // positional read of field 0 cannot pass for `cpo_root`; the head names
+        // the TM's treasury output, where the reconstruction walk starts.
+        let head = {
+            let mut h = btc_txid.to_vec();
+            h.extend_from_slice(&0u32.to_le_bytes());
+            h
+        };
         let cpo_datum = constr(
             0,
             vec![
                 bytes(&[0x5b; 32]),
                 bytes(&root),
-                bytes(&[0x7c; 36]),
+                bytes(&head),
                 int_from_u64(1_000_000),
             ],
         );
@@ -1251,12 +1256,14 @@ mod tests {
                 Some(pd_hex(&unconfirmed)),
                 true,
             ),
-            // The Confirmed record, deliberately NOT inline.
+            // A LEGACY Confirmed record (rev 5.4 mints none), deliberately NOT
+            // inline.
             //
             // On the Blockfrost path this is the only output whose datum the walk
             // cannot read from `/txs/{hash}/utxos`; it must go to
             // `/scripts/datum/{hash}/cbor`. Reconstruction hard-errors on an
-            // unresolvable datum at the TM address, so this fixture succeeding is
+            // unresolvable datum at the TM address (only a RESOLVED non-record is
+            // skippable junk), so this fixture succeeding is
             // proof the hash-only path resolved — and the equivalence test then
             // proves it resolved to the same bytes Kupo serves.
             FxOut {
@@ -1328,7 +1335,7 @@ mod tests {
             pegout_address: PEGOUT_ADDR.into(),
             fbtc_policy_id: FBTC_POLICY.into(),
             fbtc_asset_name_hex: FBTC_NAME.into(),
-            cpo_policy_id: Some(CPO_POLICY.into()),
+            cpo_policy_id: CPO_POLICY.into(),
         }
     }
 

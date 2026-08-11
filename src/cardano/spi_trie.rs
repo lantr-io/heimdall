@@ -17,9 +17,12 @@
 //!   the root that must hold after a proposed TM from this node's own trie and
 //!   refuses a mismatch. `sign_phase` runs it before any signing material
 //!   leaves the node (`verify_spi_root`).
-//! - [`SpiTrie::prove_membership`] / [`SpiTrie::prove_non_membership`] back the
-//!   unauthenticated `GET /spi/proof/{peg_in_utxo_id}` route [SPI-4]; the
-//!   proofs verify via [`mpf::verify_inclusion`] / [`mpf::verify_exclusion`].
+//! - [`SpiTrie::prove_membership`] / [`SpiTrie::prove_non_membership`] verify
+//!   via [`mpf::verify_inclusion`] / [`mpf::verify_exclusion`]. heimdall does
+//!   NOT serve them over HTTP: [SPI-4] names binocular as the proof server and
+//!   forbids heimdall the role — this node's trie is quorum-internal state for
+//!   the [SPI-2] gate, and serving proofs from it would hand out roots the
+//!   singleton may not hold.
 //! - Persisted as `spi-trie.json` in `state_dir` ([`SpiTrie::load`] /
 //!   [`SpiTrie::save`]): atomic temp+rename, 0600, with a load-time root
 //!   self-check that refuses corrupt state.
@@ -374,43 +377,6 @@ impl crate::bitcoin::tm_builder::SpiTrieView for SpiTrie {
     fn root_after_inputs(&self, inputs: &[[u8; 36]]) -> Result<[u8; 32], String> {
         self.root_after(inputs).map_err(|e| e.to_string())
     }
-}
-
-/// A proof in the HTTP wire shape served by `GET /spi/proof/<hex>` (see
-/// DecisionsLog.md DEC-023): a JSON array of steps, all byte fields
-/// hex-encoded:
-///
-/// - `{"type":"branch","skip":n,"neighbors":"<hex, 128 bytes>"}`
-/// - `{"type":"fork","skip":n,"neighbor":{"nibble":n,"prefix":"<hex>","root":"<hex>"}}`
-/// - `{"type":"leaf","skip":n,"key":"<hex>","value":"<hex>"}`
-#[must_use]
-pub fn proof_to_json(proof: &mpf::Proof) -> serde_json::Value {
-    let steps: Vec<serde_json::Value> = proof
-        .iter()
-        .map(|step| match step {
-            mpf::ProofStep::Branch { skip, neighbors } => serde_json::json!({
-                "type": "branch",
-                "skip": skip,
-                "neighbors": hex::encode(neighbors),
-            }),
-            mpf::ProofStep::Fork { skip, neighbor } => serde_json::json!({
-                "type": "fork",
-                "skip": skip,
-                "neighbor": {
-                    "nibble": neighbor.nibble,
-                    "prefix": hex::encode(&neighbor.prefix),
-                    "root": hex::encode(&neighbor.root),
-                },
-            }),
-            mpf::ProofStep::Leaf { skip, key, value } => serde_json::json!({
-                "type": "leaf",
-                "skip": skip,
-                "key": hex::encode(key),
-                "value": hex::encode(value),
-            }),
-        })
-        .collect();
-    serde_json::Value::Array(steps)
 }
 
 fn outpoint_from_hex(s: &str) -> Result<Outpoint, SpiTrieError> {

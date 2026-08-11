@@ -106,8 +106,8 @@ use crate::cardano::bridge_state::fetch_bridge_state;
 use crate::cardano::cpo_history::{CpoHistorySource, DatumState};
 use crate::cardano::mpf;
 use crate::cardano::state_file;
-use crate::cardano::treasury_datum::{ConfirmedTm, TreasuryDatumError, parse_confirmed_tm_datum};
-use tracing::{info, warn};
+use crate::cardano::treasury_datum::{ConfirmedTm, TmOutput};
+use tracing::info;
 
 /// The genesis root: 32 zero bytes.
 ///
@@ -678,18 +678,14 @@ pub struct ReconstructConfig {
     pub fbtc_asset_name_hex: String,
     /// Policy id (script hash) of the bridge state singleton validator, hex —
     /// Config field 3, `bridge_state_policy`. With asset name `"BSS"` it
-    /// identifies the on-chain BridgeState UTxO, whose `cpo_root` is the root the
-    /// chain currently believes.
+    /// identifies the on-chain BridgeState UTxO.
     ///
-    /// `Some` turns on the final safety net: the reconstructed root MUST equal the
-    /// singleton's `cpo_root`. Every step of the replay is already checked against a
-    /// quorum-attested root, but only this compares the FINISHED trie against the
-    /// value peg-out completions will actually be proven against — it is what
-    /// catches a replay that stopped early or skipped the last movement.
-    ///
-    /// `None` skips the check and logs loudly. Only for a bridge whose trie
-    /// singleton is not deployed yet, and for tests.
-    pub cpo_policy_id: Option<String>,
+    /// REQUIRED (rev 5.4): the singleton supplies both ENDS of a reconstruction —
+    /// its `treasury_utxo_id` is the head the backward walk starts from ([OB-2]),
+    /// and its `cpo_root` is the final safety net the finished trie MUST equal.
+    /// Without a singleton no Confirm has ever happened, so there is nothing to
+    /// reconstruct.
+    pub cpo_policy_id: String,
 }
 
 /// A peg-out request as chain history remembers it — open or long since spent.
@@ -708,25 +704,32 @@ impl HistoricalPor {
     }
 }
 
-/// Rebuild the completed-peg-outs trie from chain history alone.
+/// Rebuild the completed-peg-outs trie from chain history alone ([OB-2], [OB-9]).
 ///
-/// The algorithm, per the rev-5.1 design:
+/// Rev 5.4 produces NO `Confirmed` record — Confirm burns the TM NFT and leaves
+/// nothing at the TM address ([CTM-24], [CTM-25]) — so the confirmed chain is
+/// recovered from the spent `UnconfirmedTm` records and the singleton's head:
 ///
-/// 1. Read EVERY output ever created at the TM address (spent included — the
-///    Confirm transition spends the `Unconfirmed` record) and split them into
-///    Confirmed records and Unconfirmed records.
-/// 2. Order the Confirmed records by treasury linkage: TM *B* follows TM *A* iff
-///    *B* spends *A*'s treasury output `(A.btc_txid, 0)`.
-/// 3. Read every peg-out request ever created (spent included — a completed
+/// 1. Read the bridge state singleton: its `treasury_utxo_id` is the walk's
+///    start, its `cpo_root` the final check.
+/// 2. Read EVERY output ever created at the TM address (spent included — the
+///    Confirm transition spends the `UnconfirmedTm` record). Each record's
+///    `signed_btc_tx` is parsed and keyed by the txid RECOMPUTED from the bytes
+///    ([SPI-7]/[OB-9]); its `fulfilled_por_outpoints` hint is collected per txid.
+/// 3. Walk the treasury spend chain BACKWARD from the head via input-0 ancestry
+///    ([`walk_confirmed_chain`]). A TM mined but not yet confirmed SPENDS the
+///    head, so the walk never visits it — the walk's result is exactly the set
+///    the singleton's attested roots cover ([SPI-6]).
+/// 4. Read every peg-out request ever created (spent included — a completed
 ///    request's UTxO is gone) and index it by outpoint.
-/// 4. Replay the chain. For each Confirmed TM: take the root it committed (from
-///    its own BTMR1 output), resolve its data-availability hint through the
-///    matching Unconfirmed record, insert those entries, and ASSERT the running
-///    root equals the committed root.
-/// 5. If a hint is absent, garbled, or produces the wrong root, fall back to
+/// 5. Replay the chain oldest first. For each confirmed TM: take the `cpo_root`
+///    it committed (from its own BTMR1 output), resolve its data-availability
+///    hint, insert those entries, and ASSERT the running root equals the
+///    committed root.
+/// 6. If a hint is absent, garbled, or produces the wrong root, fall back to
 ///    matching the TM's payment outputs against the peg-out requests that were
 ///    open at that point, and search assignments until the running root matches.
-/// 6. Cross-check the FINISHED trie against the bridge state singleton's `cpo_root`.
+/// 7. Cross-check the FINISHED trie against the singleton's `cpo_root`.
 ///
 /// The committed root turns every step from trust into search-and-check: a hostile
 /// hint cannot corrupt the result, only make reconstruction slower.
@@ -738,17 +741,104 @@ pub async fn reconstruct(
     source: &dyn CpoHistorySource,
     cfg: &ReconstructConfig,
 ) -> Result<CpoTrie, CpoTrieError> {
+    let chain = harvest_confirmed_chain(source, &cfg.tm_address, &cfg.cpo_policy_id).await?;
+    let history = fetch_pegout_history(source, cfg).await?;
+
+    let trie = replay(&chain.ordered, &chain.hints, &history)?;
+
+    // --- the final safety net ---
+    //
+    // `cpo_root` BY NAME, per [LIB-1]: the singleton's field 0 is `spi_root`, so
+    // a positional read here would compare the wrong root.
+    if chain.state.cpo_root != trie.root() {
+        return Err(CpoTrieError::RootMismatch {
+            reconstructed: trie.root(),
+            on_chain: chain.state.cpo_root,
+            entries: trie.len(),
+        });
+    }
+    info!(
+        "[cpo] reconstructed root matches the bridge state singleton's cpo_root ({})",
+        hex::encode(chain.state.cpo_root)
+    );
+    Ok(trie)
+}
+
+/// Rebuild the swept peg-ins trie from chain history alone — the SPI twin of
+/// [`reconstruct`]. Same harvest, same walk; the entries are each confirmed
+/// TM's inputs per [SPI-1]/[SPI-3], and the finished root MUST equal the
+/// singleton's attested `spi_root`.
+pub async fn reconstruct_spi(
+    source: &dyn CpoHistorySource,
+    tm_address: &str,
+    bridge_state_policy: &str,
+) -> Result<crate::cardano::spi_trie::SpiTrie, CpoTrieError> {
+    use crate::cardano::spi_trie::{Outpoint, SpiTrie};
+    let chain = harvest_confirmed_chain(source, tm_address, bridge_state_policy).await?;
+    let mut trie = SpiTrie::empty();
+    for tm in &chain.ordered {
+        let inputs: Vec<Outpoint> = tm
+            .swept_inputs
+            .iter()
+            .map(|i| {
+                <Outpoint>::try_from(i.as_slice()).map_err(|_| {
+                    CpoTrieError::Source(format!(
+                        "TM {} has a malformed input outpoint ({} bytes)",
+                        hex::encode(tm.btc_txid),
+                        i.len()
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        trie.insert_for_confirmed_tm(&inputs)
+            .map_err(|e| CpoTrieError::Source(format!("swept peg-ins replay: {e}")))?;
+    }
+    if chain.state.spi_root != trie.root() {
+        return Err(CpoTrieError::Source(format!(
+            "reconstruction produced spi_root {} over {} entr(y|ies), but the on-chain bridge \
+             state singleton holds {} — refusing to persist a trie the chain disagrees with",
+            hex::encode(trie.root()),
+            trie.len(),
+            hex::encode(chain.state.spi_root),
+        )));
+    }
+    info!(
+        "[spi] reconstructed root matches the bridge state singleton's spi_root ({})",
+        hex::encode(chain.state.spi_root)
+    );
+    Ok(trie)
+}
+
+/// The confirmed chain and everything harvested alongside it: the singleton's
+/// state, the confirmed TMs oldest first, and every published hint.
+struct HarvestedChain {
+    state: crate::cardano::bridge_state::BridgeState,
+    ordered: Vec<ConfirmedTm>,
+    hints: HashMap<[u8; 32], Vec<Vec<[u8; 36]>>>,
+}
+
+/// Steps 1–3 of [`reconstruct`]'s algorithm, shared with [`reconstruct_spi`]:
+/// read the singleton, harvest the `UnconfirmedTm` records, walk the treasury
+/// chain backward from the head.
+async fn harvest_confirmed_chain(
+    source: &dyn CpoHistorySource,
+    tm_address: &str,
+    bridge_state_policy: &str,
+) -> Result<HarvestedChain, CpoTrieError> {
     info!(
         "[cpo] reconstruction backend: {} ({})",
         source.backend(),
         source.endpoint()
     );
     let tm_matches = source
-        .address_history(&cfg.tm_address)
+        .address_history(tm_address)
         .await
         .map_err(CpoTrieError::Source)?;
 
-    let mut confirmed: Vec<ConfirmedTm> = Vec::new();
+    // btc_txid -> the TM as its own signed bytes describe it. First record in
+    // wins losslessly: the key is recomputed from the bytes, so the same key
+    // means a byte-identical transaction.
+    let mut by_txid: HashMap<[u8; 32], ConfirmedTm> = HashMap::new();
     // btc_txid -> EVERY hint published for that tx.
     //
     // A Vec, not one entry: posting a TM record is PERMISSIONLESS, so anyone can
@@ -763,21 +853,16 @@ pub async fn reconstruct(
     for m in &tm_matches {
         // A THREE-way read, not a two-way one (see the module doc).
         let datum = match &m.datum {
-            // No datum AT ALL: provably not a TM record. Every TM record —
-            // Unconfirmed and Confirmed alike — is created with an inline datum,
-            // so a bare payment to the permissionlessly-payable TM address is
-            // ordinary junk, and skipping it costs nothing. Conflating this with
-            // the unresolvable case below let ONE junk UTxO block every
-            // reconstruction forever.
+            // No datum AT ALL: provably not a TM record — every TM record is
+            // created with an inline datum, so a bare payment to the
+            // permissionlessly-payable TM address is ordinary junk, and skipping
+            // it costs nothing. Conflating this with the unresolvable case below
+            // let ONE junk UTxO block every reconstruction forever.
             DatumState::Absent => continue,
             // A datum EXISTS and could not be read. This is a HARD ERROR, never a
-            // skip: we cannot tell an unresolvable Confirmed record from
-            // unresolvable junk, and silently dropping a Confirmed record produces
-            // a trie that is missing a whole movement's entries while looking
-            // complete. If the dropped record is the chain tip, nothing
-            // downstream notices — the running-root assertion has no later TM to
-            // fail against. That is precisely the confidently-wrong trie this
-            // function exists to make impossible.
+            // skip: if it hides the `UnconfirmedTm` record of a confirmed TM, the
+            // treasury-chain walk stops short of that movement and the replay
+            // fails with an unexplained gap — better to name the output.
             //
             // The operational cause is an index that did not witness the datum
             // preimage (a Kupo run with `--prune-utxo`, or an index started after
@@ -787,129 +872,97 @@ pub async fn reconstruct(
             DatumState::Unresolved { datum_hash } => {
                 return Err(CpoTrieError::Source(format!(
                     "cannot resolve the datum (hash {datum_hash}) of {}#{} at the TM address {} \
-                     ({}) — refusing to reconstruct with an unexplained gap: if that output is a \
-                     Confirmed TM record, skipping it yields a trie that silently omits a \
-                     movement. {}",
+                     ({}) — refusing to reconstruct with an unexplained gap: if that output is \
+                     the record of a confirmed TM, the walk would silently stop short of it. {}",
                     m.tx_hash,
                     m.output_index,
-                    cfg.tm_address,
+                    tm_address,
                     m.datum_note,
                     source.datum_gap_advice(),
                 )));
             }
             DatumState::Resolved(d) => d,
         };
-        match parse_confirmed_tm_datum(datum) {
-            Ok(tm) => confirmed.push(tm),
-            Err(TreasuryDatumError::NotConfirmed) => {
-                // Unconfirmed record: the hint's home. Its txid is recomputed from
-                // the embedded signed tx, never taken on trust.
-                if let Some(u) = crate::cardano::treasury_datum::parse_unconfirmed_tm(datum) {
-                    use bitcoin::hashes::Hash as _;
-                    let hint = unconfirmed_hint(datum);
-                    if !hint.is_empty() {
-                        hints
-                            .entry(u.btc_txid.to_byte_array())
-                            .or_default()
-                            .push(hint);
-                    }
-                }
+        // An `UnconfirmedTm` record is the byte carrier ([OB-9]). Anything else —
+        // junk, or a legacy rev-5.1 `Confirmed` Constr-1 shape — resolved but is
+        // not one, and is skipped.
+        if let Some(u) = crate::cardano::treasury_datum::parse_unconfirmed_tm(datum) {
+            use bitcoin::hashes::Hash as _;
+            let txid = u.btc_txid.to_byte_array();
+            by_txid.entry(txid).or_insert_with(|| ConfirmedTm {
+                btc_txid: txid,
+                swept_inputs: u
+                    .inputs
+                    .iter()
+                    .map(|op| crate::cardano::tm_chain::outpoint_bytes(op).to_vec())
+                    .collect(),
+                outputs: u
+                    .outputs
+                    .iter()
+                    .map(|(amount, spk)| TmOutput {
+                        script_pub_key: spk.to_bytes(),
+                        amount: amount.to_sat(),
+                    })
+                    .collect(),
+            });
+            let hint = unconfirmed_hint(datum);
+            if !hint.is_empty() {
+                hints.entry(txid).or_default().push(hint);
             }
-            // A junk UTxO at a permissionlessly-payable address is not an error —
-            // its datum RESOLVED, it just is not a TM record.
-            Err(_) => {}
         }
     }
 
-    let ordered = chain_order(confirmed);
-    let history = fetch_pegout_history(source, cfg).await?;
+    // The singleton supplies the walk's start and the final check. Read AFTER
+    // the TM-address scan, so a datum gap there — the more actionable failure —
+    // is reported first.
+    let state = fetch_bridge_state(source, bridge_state_policy).await?;
 
-    let trie = replay(&ordered, &hints, &history)?;
-
-    // --- the final safety net ---
-    match cfg.cpo_policy_id.as_deref() {
-        Some(policy) => {
-            // `cpo_root` BY NAME, per [LIB-1]: the singleton's field 0 is
-            // `spi_root`, so a positional read here would compare the wrong root.
-            let on_chain = fetch_bridge_state(source, policy).await?.cpo_root;
-            if on_chain != trie.root() {
-                return Err(CpoTrieError::RootMismatch {
-                    reconstructed: trie.root(),
-                    on_chain,
-                    entries: trie.len(),
-                });
-            }
-            info!(
-                "[cpo] reconstructed root matches the bridge state singleton's cpo_root ({})",
-                hex::encode(on_chain)
-            );
-        }
-        None => warn!(
-            "[cpo] WARNING: no cpo_policy_id configured — the reconstructed root was NOT \
-             cross-checked against the bridge state singleton. Set cardano.cpo_policy_id \
-             before trusting this trie to sign with."
-        ),
-    }
-    Ok(trie)
+    let ordered = walk_confirmed_chain(&state.treasury_utxo_id, &by_txid);
+    info!(
+        "[cpo] {} confirmed TM(s) on the walk from the head {}",
+        ordered.len(),
+        hex::encode(state.treasury_utxo_id),
+    );
+    Ok(HarvestedChain {
+        state,
+        ordered,
+        hints,
+    })
 }
 
-/// Order Confirmed TM records by treasury linkage.
+/// Walk the treasury spend chain BACKWARD from the singleton's head, returning
+/// the confirmed TMs OLDEST FIRST ([OB-2], the CPO twin of binocular's
+/// `SweptPegInsProofService.walkConfirmedChain`).
 ///
-/// TM *B* follows TM *A* iff *B*'s inputs contain `(A.btc_txid, 0)`. Records that
-/// do not link into the main chain (a re-confirmation of the same txid, a
-/// divergent lineage) are appended after it in `btc_txid` order so the replay is
-/// still deterministic and still sees them.
-fn chain_order(confirmed: Vec<ConfirmedTm>) -> Vec<ConfirmedTm> {
-    // Deduplicate on btc_txid: the same TM can be confirmed into two UTxOs.
-    let mut by_txid: BTreeMap<[u8; 32], ConfirmedTm> = BTreeMap::new();
-    for tm in confirmed {
-        by_txid.entry(tm.btc_txid).or_insert(tm);
-    }
-
-    // successor[A.btc_txid] = B, where B spends (A, 0).
-    let mut successor: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
-    let mut has_predecessor: HashSet<[u8; 32]> = HashSet::new();
-    for (txid, tm) in &by_txid {
-        for input in &tm.swept_inputs {
-            let Some((prev_tx, vout)) = parse_hint(input) else {
-                continue;
-            };
-            if vout != 0 || !by_txid.contains_key(&prev_tx) {
-                continue;
-            }
-            successor.entry(prev_tx).or_insert(*txid);
-            has_predecessor.insert(*txid);
+/// `head_utxo_id` is the singleton's `treasury_utxo_id` (`btc_txid ‖ vout LE`).
+/// The walk stops at the first txid `by_txid` has no record for: for a complete
+/// history that is the genesis funding transaction, which is not a TM and has no
+/// `UnconfirmedTm` record. A HISTORY GAP — a confirmed TM whose record's datum is
+/// missing — stops the walk the same way, and is caught downstream: the oldest
+/// kept TM's committed root then includes the dropped entries, so the replay
+/// fails its per-TM assertion (and the final singleton cross-check backstops a
+/// gap that swept nothing).
+fn walk_confirmed_chain(
+    head_utxo_id: &[u8; 36],
+    by_txid: &HashMap<[u8; 32], ConfirmedTm>,
+) -> Vec<ConfirmedTm> {
+    let mut cursor: [u8; 32] = head_utxo_id[..32]
+        .try_into()
+        .expect("a 36-byte outpoint always has a 32-byte txid prefix");
+    let mut acc: Vec<ConfirmedTm> = Vec::new();
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    while let Some(tm) = by_txid.get(&cursor) {
+        if !seen.insert(cursor) {
+            break; // a cycle cannot happen on Bitcoin, but never loop forever
         }
+        acc.push(tm.clone());
+        let Some((prev_tx, _vout)) = tm.swept_inputs.first().and_then(|i| parse_hint(i)) else {
+            break; // no inputs / malformed input 0 — nothing further to follow
+        };
+        cursor = prev_tx;
     }
-
-    let mut ordered = Vec::with_capacity(by_txid.len());
-    let mut placed: HashSet<[u8; 32]> = HashSet::new();
-    // Roots (no predecessor) in txid order, so a forked history is still ordered
-    // identically on every node.
-    let roots: Vec<[u8; 32]> = by_txid
-        .keys()
-        .copied()
-        .filter(|t| !has_predecessor.contains(t))
-        .collect();
-    for root in roots {
-        let mut cur = Some(root);
-        while let Some(txid) = cur {
-            if !placed.insert(txid) {
-                break; // a cycle cannot happen on Bitcoin, but never loop forever
-            }
-            if let Some(tm) = by_txid.get(&txid) {
-                ordered.push(tm.clone());
-            }
-            cur = successor.get(&txid).copied();
-        }
-    }
-    // Anything left (only reachable from a cycle) still gets replayed.
-    for (txid, tm) in &by_txid {
-        if !placed.contains(txid) {
-            ordered.push(tm.clone());
-        }
-    }
-    ordered
+    acc.reverse();
+    acc
 }
 
 /// Every peg-out request ever created at `pegout_address`, indexed by its 36-byte
@@ -1567,22 +1620,39 @@ mod tests {
 
     // --- chain ordering ----------------------------------------------------
 
+    fn by_txid_of(tms: Vec<ConfirmedTm>) -> HashMap<[u8; 32], ConfirmedTm> {
+        tms.into_iter().map(|t| (t.btc_txid, t)).collect()
+    }
+
     #[test]
-    fn chain_order_follows_the_treasury_linkage() {
-        // C spends B's treasury, B spends A's. Fed in reverse.
+    fn walk_orders_the_chain_backward_from_the_head() {
+        // C spends B's treasury, B spends A's; the head is C's treasury output.
         let a = confirmed(0xa1, vec![hint_bytes(&[0x00; 32], 0)], vec![]);
         let b = confirmed(0xb2, vec![hint_bytes(&[0xa1; 32], 0)], vec![]);
         let c = confirmed(0xc3, vec![hint_bytes(&[0xb2; 32], 0)], vec![]);
-        let ordered = chain_order(vec![c, b, a]);
+        let head = hint_bytes(&[0xc3; 32], 0);
+        let ordered = walk_confirmed_chain(&head, &by_txid_of(vec![c, b, a]));
         let txids: Vec<u8> = ordered.iter().map(|t| t.btc_txid[0]).collect();
         assert_eq!(txids, vec![0xa1, 0xb2, 0xc3]);
     }
 
     #[test]
-    fn chain_order_deduplicates_reconfirmations() {
-        let a = confirmed(0xa1, vec![], vec![]);
-        let a2 = confirmed(0xa1, vec![], vec![]);
-        assert_eq!(chain_order(vec![a, a2]).len(), 1);
+    fn walk_never_visits_a_tm_past_the_head() {
+        // D spends C's treasury (mined but not yet confirmed on Cardano): the
+        // head still names C's output, so the backward walk cannot reach D.
+        let c = confirmed(0xc3, vec![hint_bytes(&[0x00; 32], 0)], vec![]);
+        let d = confirmed(0xd4, vec![hint_bytes(&[0xc3; 32], 0)], vec![]);
+        let head = hint_bytes(&[0xc3; 32], 0);
+        let ordered = walk_confirmed_chain(&head, &by_txid_of(vec![c, d]));
+        let txids: Vec<u8> = ordered.iter().map(|t| t.btc_txid[0]).collect();
+        assert_eq!(txids, vec![0xc3]);
+    }
+
+    #[test]
+    fn walk_stops_at_an_unresolvable_origin() {
+        // The head's txid has no record at all — an empty walk, not a panic.
+        let head = hint_bytes(&[0xee; 32], 0);
+        assert!(walk_confirmed_chain(&head, &HashMap::new()).is_empty());
     }
 
     // --- replay ------------------------------------------------------------
@@ -1734,7 +1804,9 @@ mod tests {
             ([0xa1u8; 32], vec![vec![p1.outpoint]]),
             ([0xb2u8; 32], vec![vec![p2.outpoint]]),
         ]);
-        let trie = replay(&chain_order(vec![tm2, tm1]), &hints, &history).unwrap();
+        let head = hint_bytes(&[0xb2; 32], 0);
+        let ordered = walk_confirmed_chain(&head, &by_txid_of(vec![tm2, tm1]));
+        let trie = replay(&ordered, &hints, &history).unwrap();
         assert_eq!(trie.root(), root2);
         assert_eq!(trie.len(), 2);
     }
@@ -1923,8 +1995,62 @@ mod tests {
         }
     }
 
-    /// A Confirmed TM datum paying `(spk, net)` and committing `root` (as the
-    /// cpo half of the BTMR1 commitment; the spi half is a placeholder).
+    /// A real serialized Bitcoin TM: output 0 the treasury continuation, then
+    /// the payments, then the BTMR1 commitment (spi half a placeholder).
+    fn raw_tm(
+        prev: bitcoin::OutPoint,
+        payments: &[(Vec<u8>, u64)],
+        root: [u8; 32],
+    ) -> bitcoin::Transaction {
+        use bitcoin::{
+            Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute::LockTime,
+            transaction::Version,
+        };
+        let mut spk = BTMR1_COMMITMENT_PREFIX.to_vec();
+        spk.extend_from_slice(&[0x99u8; 32]);
+        spk.extend_from_slice(&root);
+        let mut output = vec![TxOut {
+            value: Amount::from_sat(900_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; 34]),
+        }];
+        output.extend(payments.iter().map(|(s, a)| TxOut {
+            value: Amount::from_sat(*a),
+            script_pubkey: ScriptBuf::from_bytes(s.clone()),
+        }));
+        output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        });
+        bitcoin::Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output,
+        }
+    }
+
+    /// A rev-5.4 `UnconfirmedTm` record datum (Constr 0) carrying `tx`'s bytes
+    /// and the given data-availability hint.
+    fn unconfirmed_record_datum(tx: &bitcoin::Transaction, hint: &[[u8; 36]]) -> PlutusData {
+        use crate::cardano::plutus::{array, bytes, constr, int};
+        constr(
+            0,
+            vec![
+                bytes(&bitcoin::consensus::serialize(tx)),
+                bytes(&[0x7a; 28]),
+                int(1_700_000_000_000),
+                array(hint.iter().map(|h| bytes(h)).collect()),
+            ],
+        )
+    }
+
+    /// A LEGACY rev-5.1 Confirmed TM datum (Constr 1). Rev 5.4 never mints one;
+    /// reconstruction must SKIP it — it is not a byte carrier for the walk.
     fn confirmed_datum(txid: [u8; 32], payments: &[(Vec<u8>, u64)], root: [u8; 32]) -> PlutusData {
         use crate::cardano::plutus::{array, bool_data, bytes, constr, int, int_from_u64};
         let mut spk = BTMR1_COMMITMENT_PREFIX.to_vec();
@@ -1970,14 +2096,14 @@ mod tests {
         )
     }
 
-    fn bss_datum(cpo_root: [u8; 32]) -> PlutusData {
+    fn bss_datum(cpo_root: [u8; 32], head: [u8; 36]) -> PlutusData {
         use crate::cardano::plutus::{bytes, constr, int_from_u64};
         constr(
             0,
             vec![
                 bytes(&[0x5b; 32]),
                 bytes(&cpo_root),
-                bytes(&[0x7c; 36]),
+                bytes(&head),
                 int_from_u64(1_000_000),
             ],
         )
@@ -1989,30 +2115,37 @@ mod tests {
             pegout_address: P_ADDR.into(),
             fbtc_policy_id: FBTC.into(),
             fbtc_asset_name_hex: "66425443".into(),
-            cpo_policy_id: Some(POLICY.into()),
+            cpo_policy_id: POLICY.into(),
         }
     }
 
-    /// One TM, one request, no hint — the fallback matcher does the work, and the
-    /// finished trie matches the singleton.
-    fn one_movement_world() -> (FakeSource, [u8; 32]) {
+    /// One TM (a spent `UnconfirmedTm` record), one request, no hint — the
+    /// fallback matcher does the work, the walk starts at the singleton's head,
+    /// and the finished trie matches the singleton's `cpo_root`.
+    fn one_movement_world() -> (FakeSource, [u8; 32], [u8; 36]) {
+        use bitcoin::hashes::Hash as _;
         let por_tx = [0x11u8; 32];
         let spk = vec![0xaau8; 22];
         let (gross, fee) = (100_000u64, 1_000u64);
         let entry = CpoEntry::new(por_id(&por_tx, 0), &spk, gross - fee);
         let root = CpoTrie::from_entries(&[entry]).unwrap().root();
         let fbtc_unit = format!("{FBTC}66425443");
+        let genesis = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x00; 32]),
+            vout: 0,
+        };
+        let tm = raw_tm(genesis, &[(spk.clone(), gross - fee)], root);
+        let head = crate::cardano::tm_chain::outpoint_bytes(&bitcoin::OutPoint {
+            txid: tm.compute_txid(),
+            vout: 0,
+        });
         (
             FakeSource {
                 tm: vec![fake_out(
                     [0xb2; 32],
                     0,
                     &[],
-                    Some(confirmed_datum(
-                        [0xa1; 32],
-                        &[(spk.clone(), gross - fee)],
-                        root,
-                    )),
+                    Some(unconfirmed_record_datum(&tm, &[])),
                 )],
                 pegout: vec![fake_out(
                     por_tx,
@@ -2024,16 +2157,37 @@ mod tests {
                     [0xcf; 32],
                     0,
                     &[(bss_unit(), 1)],
-                    Some(bss_datum(root)),
+                    Some(bss_datum(root, head)),
                 )],
             },
             root,
+            head,
         )
     }
 
     #[tokio::test]
     async fn reconstruct_rebuilds_the_trie_and_cross_checks_the_singleton() {
-        let (world, root) = one_movement_world();
+        let (world, root, _) = one_movement_world();
+        let trie = reconstruct(&world, &fake_cfg()).await.unwrap();
+        assert_eq!(trie.root(), root);
+        assert_eq!(trie.len(), 1);
+    }
+
+    // A legacy rev-5.1 Confirmed record in old history resolves but is not a
+    // byte carrier — it must be skipped, never replayed.
+    #[tokio::test]
+    async fn reconstruct_skips_a_legacy_confirmed_record() {
+        let (mut world, root, _) = one_movement_world();
+        world.tm.push(fake_out(
+            [0xb9; 32],
+            0,
+            &[],
+            Some(confirmed_datum(
+                [0xa1; 32],
+                &[(vec![0xbb; 22], 5_000)],
+                [0x66; 32],
+            )),
+        ));
         let trie = reconstruct(&world, &fake_cfg()).await.unwrap();
         assert_eq!(trie.root(), root);
         assert_eq!(trie.len(), 1);
@@ -2046,7 +2200,7 @@ mod tests {
     // which output to re-index.
     #[tokio::test]
     async fn reconstruct_hard_errors_on_an_unresolvable_tm_datum() {
-        let (mut world, _) = one_movement_world();
+        let (mut world, _, _) = one_movement_world();
         let hash = "ab".repeat(32);
         world
             .tm
@@ -2070,7 +2224,7 @@ mod tests {
     // reconstruction forever.
     #[tokio::test]
     async fn reconstruct_skips_a_datum_less_output_at_the_tm_address() {
-        let (mut world, root) = one_movement_world();
+        let (mut world, root, _) = one_movement_world();
         world.tm.push(fake_out([0xee; 32], 3, &[], None));
         let trie = reconstruct(&world, &fake_cfg())
             .await
@@ -2086,7 +2240,7 @@ mod tests {
     // trie, it only makes some TM fail its own assertion.
     #[tokio::test]
     async fn reconstruct_skips_an_unresolvable_pegout_datum() {
-        let (mut world, root) = one_movement_world();
+        let (mut world, root, _) = one_movement_world();
         world.pegout.push(fake_out(
             [0xee; 32],
             0,
@@ -2099,7 +2253,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconstruct_skips_a_hash_only_unresolvable_pegout_datum() {
-        let (mut world, root) = one_movement_world();
+        let (mut world, root, _) = one_movement_world();
         world.pegout.push(fake_out_unresolved(
             [0xef; 32],
             0,
@@ -2114,12 +2268,13 @@ mod tests {
     // assertion and still yields a short trie. Only the singleton catches it.
     #[tokio::test]
     async fn reconstruct_refuses_a_trie_the_singleton_disagrees_with() {
-        let (mut world, _) = one_movement_world();
+        // Same head (the walk works), wrong cpo_root: only the final check fails.
+        let (mut world, _, head) = one_movement_world();
         world.singleton = vec![fake_out(
             [0xcf; 32],
             0,
             &[(bss_unit(), 1)],
-            Some(bss_datum([0x5a; 32])),
+            Some(bss_datum([0x5a; 32], head)),
         )];
         let err = reconstruct(&world, &fake_cfg()).await.unwrap_err();
         assert!(matches!(err, CpoTrieError::RootMismatch { .. }), "{err}");
@@ -2129,7 +2284,7 @@ mod tests {
     // indexed; several mean it is not a singleton. Neither may pass as "checked".
     #[tokio::test]
     async fn reconstruct_reports_a_missing_or_duplicated_singleton() {
-        let (mut world, _) = one_movement_world();
+        let (mut world, _, _) = one_movement_world();
         world.singleton = vec![];
         let err = reconstruct(&world, &fake_cfg()).await.unwrap_err();
         assert!(
@@ -2137,11 +2292,16 @@ mod tests {
             "{err}"
         );
 
-        let (mut world, root) = one_movement_world();
+        let (mut world, root, head) = one_movement_world();
         let unit = bss_unit();
         world.singleton = vec![
-            fake_out([0xcf; 32], 0, &[(unit.clone(), 1)], Some(bss_datum(root))),
-            fake_out([0xdf; 32], 0, &[(unit, 1)], Some(bss_datum(root))),
+            fake_out(
+                [0xcf; 32],
+                0,
+                &[(unit.clone(), 1)],
+                Some(bss_datum(root, head)),
+            ),
+            fake_out([0xdf; 32], 0, &[(unit, 1)], Some(bss_datum(root, head))),
         ];
         let err = reconstruct(&world, &fake_cfg()).await.unwrap_err();
         assert!(format!("{err}").contains("not a singleton"), "{err}");

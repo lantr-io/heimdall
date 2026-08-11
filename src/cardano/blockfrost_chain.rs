@@ -1,24 +1,21 @@
 //! `CardanoChain` backed by Blockfrost.
 //!
-//! Derives the current Bitcoin treasury UTxO from Cardano chain state (WI-028 +
-//! DEC-022): `query_treasury` scans every TM UTxO at the treasury address,
-//! parses the Confirmed (Constr 1) datums, and chain-follows them to the tip —
-//! the TM whose own treasury output nobody has swept. Outpoint `(btc_txid, 0)`,
-//! value, and scriptPubKey all come from the tip datum; the tip's SPK must match
-//! the current treasury keys (both selecting among divergent lineages and
-//! proving we can sign it). Before the first TM confirms, the treasury is the
-//! anchor outpoint from the bridge Config UTxO's field 11
-//! (`initial_btc_treasury_utxo`, located by the config NFT), priced via bitcoind
-//! `gettxout` — there is no local treasury configuration. Unconfirmed (Constr 0)
-//! datums are inspected only to detect a movement already in flight against the
-//! tip, so heimdall waits instead of double-posting.
+//! Derives the current Bitcoin treasury UTxO from Cardano chain state (rev 5.4,
+//! DEC-030/DEC-034): `query_treasury` reads the bridge-state singleton — the
+//! head outpoint (`treasury_utxo_id`) and satoshi amount come straight from its
+//! `BridgeState` datum, bootstrap anchor included. The head's scriptPubKey is
+//! reconstructed from the candidate treasury trees and checked against the
+//! spent `UnconfirmedTm` record whose RECOMPUTED txid equals the head's (the
+//! [SPI-7] discipline), so no Bitcoin node is needed. Unconfirmed (Constr 0)
+//! datums are also inspected to detect a movement already in flight against the
+//! head, so heimdall waits instead of double-posting.
 //!
 //! `submit_signed_tm` builds a Cardano transaction that **creates a new
 //! UTxO** at the treasury address with the signed BTC tx as an inline datum,
-//! minting the TM NFT with the chain-linkage redeemer (Genesis when no TM has
-//! confirmed yet, Chain(0) referencing the tip Confirmed record otherwise).
-//! The old oracle UTxO is NOT spent — old confirmed UTxOs are kept on-chain
-//! for minting proofs.
+//! minting the TM NFT with the `TmMintRedeemer(bss_ref_index)` redeemer, which
+//! names the bridge-state singleton reference input the mint's head check
+//! ([PTM-6]/[PTM-7]) reads. The singleton is NOT spent by posting — only the
+//! Confirm transition advances it.
 
 use std::{
     collections::HashSet,
@@ -1912,7 +1909,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         })
     }
 
-    async fn query_cpo_root(&self) -> EpochResult<Option<[u8; 32]>> {
+    async fn query_bridge_roots(&self) -> EpochResult<Option<crate::epoch::traits::BridgeRoots>> {
         let Some(policy) = self.cpo_policy_id.as_deref() else {
             return Ok(None);
         };
@@ -1927,10 +1924,15 @@ impl CardanoChain for BlockfrostCardanoChain {
                     Some(&self.bf_base_url),
                 )),
             };
-        // `cpo_root` BY NAME, per [LIB-1]: field 0 of the singleton is `spi_root`.
+        // Both roots BY NAME, per [LIB-1]: a positional read would swap them.
         crate::cardano::bridge_state::fetch_bridge_state(source.as_ref(), policy)
             .await
-            .map(|state| Some(state.cpo_root))
+            .map(|state| {
+                Some(crate::epoch::traits::BridgeRoots {
+                    spi_root: state.spi_root,
+                    cpo_root: state.cpo_root,
+                })
+            })
             .map_err(|e| EpochError::Chain(format!("read the bridge state singleton: {e}")))
     }
 
@@ -2114,7 +2116,9 @@ pub fn csv_to_u16(csv: u32) -> EpochResult<u16> {
 
 /// Result of scanning the TM validator address for treasury movements.
 pub struct TmScan {
-    /// Every Confirmed (Constr 1) TM datum found — the chain-follow input.
+    /// Every LEGACY Confirmed (Constr 1) TM datum found. Rev 5.4 mints none —
+    /// this stays only so a scan of pre-migration history decodes (DEC-033);
+    /// nothing chain-follows it any more.
     pub confirmed: Vec<ConfirmedTm>,
     /// Outpoints spent by Unconfirmed (Constr 0) TMs — a movement already in
     /// flight. If the selected tip's outpoint is in here, a new TM must NOT be

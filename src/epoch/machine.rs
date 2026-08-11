@@ -963,34 +963,59 @@ fn load_cpo_trie(
 /// returns [`CpoTrust::Unverified`] in that case — since WI-031 the trie is the SOLE
 /// already-paid authority, so "not cross-checked" has to be a value the caller can act
 /// on, not just a log line.
-async fn cross_check_cpo_root(
+async fn cross_check_bridge_roots(
     chain: &Arc<dyn CardanoChain>,
     cpo_trie: &crate::cardano::cpo_trie::CpoTrie,
+    spi_trie: &crate::cardano::spi_trie::SpiTrie,
     state_dir: Option<&std::path::Path>,
     me: frost::Identifier,
     epoch: u64,
 ) -> EpochResult<CpoTrust> {
-    let local = cpo_trie.root();
-    match chain.query_cpo_root().await? {
-        Some(on_chain) if on_chain != local => Err(EpochError::TmBuild(format!(
+    let local_cpo = cpo_trie.root();
+    let local_spi = spi_trie.root();
+    let dir = || {
+        state_dir.map_or_else(
+            || "<protocol.state_dir>".to_string(),
+            |d| d.display().to_string(),
+        )
+    };
+    match chain.query_bridge_roots().await? {
+        Some(roots) if roots.cpo_root != local_cpo => Err(EpochError::TmBuild(format!(
             "completed-peg-outs trie is out of sync with the chain: local root {} ({} entries) \
-             != on-chain CPO singleton root {}. Refusing to attest — a TM built on a stale trie \
-             commits a root the chain does not hold. Rebuild with `reconstruct-cpo-trie` (and \
-             delete the stale {}/cpo-trie.json if the bridge was re-bootstrapped).",
-            hex::encode(local),
+             != the bridge state singleton's cpo_root {}. Refusing to attest — a TM built on a \
+             stale trie commits a root the chain does not hold. Rebuild with \
+             `reconstruct-cpo-trie` (and delete the stale {}/cpo-trie.json if the bridge was \
+             re-bootstrapped).",
+            hex::encode(local_cpo),
             cpo_trie.len(),
-            hex::encode(on_chain),
-            state_dir.map_or_else(
-                || "<protocol.state_dir>".to_string(),
-                |d| d.display().to_string()
-            ),
+            hex::encode(roots.cpo_root),
+            dir(),
         ))),
-        Some(on_chain) => {
+        // The SPI twin of the check above, and the ONLY whole-trie guard the SPI
+        // side has: [SPI-2]'s peer recomputation cannot catch a roster-wide
+        // stale trie (every co-signer recomputes from the SAME restored state),
+        // and a TM confirmed with a truncated spi_root strands every
+        // swept-but-unminted depositor ([CPI-9] has no proof against it) and
+        // makes binocular's [SPI-6] reconciliation refuse to serve at all.
+        Some(roots) if roots.spi_root != local_spi => Err(EpochError::TmBuild(format!(
+            "swept peg-ins trie is out of sync with the chain: local root {} ({} entries) != \
+             the bridge state singleton's spi_root {}. Refusing to attest — a TM built on a \
+             stale trie commits a root the chain does not hold, and a confirmed truncated \
+             spi_root strands swept-but-unminted depositors. Rebuild with \
+             `reconstruct-spi-trie` (and delete the stale {}/spi-trie.json if the bridge was \
+             re-bootstrapped).",
+            hex::encode(local_spi),
+            spi_trie.len(),
+            hex::encode(roots.spi_root),
+            dir(),
+        ))),
+        Some(roots) => {
             crate::epoch_log!(
                 me,
                 epoch,
-                "  completed-peg-outs trie: root matches the on-chain CPO singleton ({})",
-                hex::encode(on_chain)
+                "  local tries match the bridge state singleton (cpo_root {}, spi_root {})",
+                hex::encode(roots.cpo_root),
+                hex::encode(roots.spi_root),
             );
             Ok(CpoTrust::Verified)
         }
@@ -998,9 +1023,9 @@ async fn cross_check_cpo_root(
             crate::epoch_warn!(
                 me,
                 epoch,
-                "  completed-peg-outs trie: no cpo_policy_id configured — the local root \
-                 was NOT cross-checked against the on-chain CPO singleton. Set \
-                 cardano.cpo_policy_id before trusting this trie to sign with."
+                "  no cpo_policy_id configured — neither local trie root was cross-checked \
+                 against the bridge state singleton. Set cardano.cpo_policy_id before trusting \
+                 these tries to sign with."
             );
             Ok(CpoTrust::Unverified)
         }
@@ -1134,8 +1159,23 @@ async fn build_tm_phase(
     // The completed-peg-outs trie: this node's own copy, which decides both which
     // requests are still owed a payment and the root this TM will commit.
     let cpo_trie = load_cpo_trie(config.state_dir.as_deref(), me, epoch)?;
-    let cpo_trust =
-        cross_check_cpo_root(chain, &cpo_trie, config.state_dir.as_deref(), me, epoch).await?;
+    // This node's persisted SPI trie: `build_tm` advances it by every tx input
+    // except input 0 ([SPI-1]) to compute the spi_root its BTMR1 commitment
+    // carries. Every co-signer recomputes that root from its own trie before
+    // signing ([SPI-2], `verify_spi_root`) — but that gate cannot catch a
+    // roster-wide stale trie, which is what the on-chain cross-check below is
+    // for.
+    let spi_trie = crate::cardano::spi_trie::SpiTrie::load_or_empty(config.state_dir.as_deref())
+        .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?;
+    let cpo_trust = cross_check_bridge_roots(
+        chain,
+        &cpo_trie,
+        &spi_trie,
+        config.state_dir.as_deref(),
+        me,
+        epoch,
+    )
+    .await?;
 
     // The trie is the ONLY already-paid record (WI-031), so a trie this node cannot vouch
     // for must mean "pay no peg-out", not "pay unchecked". Unchecked payment is not a
@@ -1186,13 +1226,6 @@ async fn build_tm_phase(
     // spec makes it heimdall's own bound on the signed-but-unconfirmed race, not a
     // Config tunable. `now_ms` it compares against is the snapshot's chain time.
     let pegout_freshness_margin_ms = config.pegout_freshness_margin.as_millis() as i64;
-
-    // This node's persisted SPI trie: `build_tm` advances it by every tx input
-    // except input 0 ([SPI-1]) to compute the spi_root its BTMR1 commitment
-    // carries. Every co-signer recomputes that root from its own trie before
-    // signing ([SPI-2], `verify_spi_root`).
-    let spi_trie = crate::cardano::spi_trie::SpiTrie::load_or_empty(config.state_dir.as_deref())
-        .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?;
 
     let unsigned = build_tm(
         TreasuryInput {
@@ -2210,11 +2243,49 @@ mod tests {
     #[tokio::test]
     async fn cpo_cross_check_accepts_a_matching_root() {
         let trie = crate::cardano::cpo_trie::CpoTrie::empty();
+        let spi = crate::cardano::spi_trie::SpiTrie::empty();
         let chain = cpo_check_chain(Some(trie.root()));
         let id = Identifier::try_from(1u16).unwrap();
-        cross_check_cpo_root(&chain, &trie, None, id, 0)
+        cross_check_bridge_roots(&chain, &trie, &spi, None, id, 0)
             .await
             .expect("a root the chain holds must be attestable");
+    }
+
+    /// The SPI twin of the stale-root refusal: a roster-wide restored (empty)
+    /// spi-trie.json against a singleton whose spi_root records earlier sweeps.
+    /// [SPI-2] cannot catch this (every co-signer recomputes from the SAME
+    /// stale trie); only the on-chain cross-check can.
+    #[tokio::test]
+    async fn spi_cross_check_refuses_a_stale_root() {
+        let trie = crate::cardano::cpo_trie::CpoTrie::empty();
+        let spi = crate::cardano::spi_trie::SpiTrie::empty();
+        let mock = MockCardanoChain::new(demo_static_fixture(2, 2, 18_900))
+            .with_bridge_roots([0x22u8; 32], trie.root());
+        let chain: Arc<dyn CardanoChain> = Arc::new(mock);
+        let id = Identifier::try_from(1u16).unwrap();
+        let err = cross_check_bridge_roots(
+            &chain,
+            &trie,
+            &spi,
+            Some(std::path::Path::new("/var/lib/hd")),
+            id,
+            0,
+        )
+        .await
+        .expect_err("a spi_root the chain does not hold must not be attestable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reconstruct-spi-trie"),
+            "the refusal must name the command that fixes it: {msg}"
+        );
+        assert!(
+            msg.contains(&hex::encode([0x22u8; 32])),
+            "the refusal must show the on-chain spi_root: {msg}"
+        );
+        assert!(
+            msg.contains("/var/lib/hd/spi-trie.json"),
+            "the refusal must name the stale file: {msg}"
+        );
     }
 
     /// The re-bootstrap case: a leftover populated trie against a fresh
@@ -2225,9 +2296,11 @@ mod tests {
         let trie = crate::cardano::cpo_trie::CpoTrie::empty();
         let chain = cpo_check_chain(Some([0x11u8; 32]));
         let id = Identifier::try_from(1u16).unwrap();
-        let err = cross_check_cpo_root(
+        let spi = crate::cardano::spi_trie::SpiTrie::empty();
+        let err = cross_check_bridge_roots(
             &chain,
             &trie,
+            &spi,
             Some(std::path::Path::new("/var/lib/hd")),
             id,
             0,
@@ -2263,7 +2336,8 @@ mod tests {
         .unwrap();
         let chain = cpo_check_chain(None);
         let id = Identifier::try_from(1u16).unwrap();
-        cross_check_cpo_root(&chain, &trie, None, id, 0)
+        let spi = crate::cardano::spi_trie::SpiTrie::empty();
+        cross_check_bridge_roots(&chain, &trie, &spi, None, id, 0)
             .await
             .expect("an unchecked root must still be attestable");
     }

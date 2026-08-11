@@ -204,6 +204,14 @@ impl DkgFaultEvidence {
     }
 }
 
+/// Both attested roots read from the bridge state singleton in ONE fetch, by
+/// name per [LIB-1] (field 0 is `spi_root`, field 1 `cpo_root`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeRoots {
+    pub spi_root: [u8; 32],
+    pub cpo_root: [u8; 32],
+}
+
 #[async_trait]
 pub trait CardanoChain: Send + Sync {
     /// Block until the next epoch boundary is observed. The mock returns
@@ -269,21 +277,25 @@ pub trait CardanoChain: Send + Sync {
         ))
     }
 
-    /// The root held by the on-chain completed-peg-outs singleton, when this
-    /// node is configured to locate it (`cardano.cpo_policy_id`).
+    /// Both attested roots held by the on-chain bridge state singleton, when
+    /// this node is configured to locate it (`cardano.cpo_policy_id` — the
+    /// `bridge_state_policy`, Config field 3).
     ///
-    /// This is the tripwire for a persisted `cpo-trie.json` that has fallen out
-    /// of sync with the chain — most sharply after a re-bootstrap, which mints a
-    /// FRESH zero-root CPO singleton while the node's state directory still holds
-    /// the previous deployment's populated trie. `BuildTm` compares this against
-    /// its local root and refuses to attest on a mismatch: a TM built on a stale
-    /// trie commits a root the chain does not hold, so every honest peer rejects
-    /// it, and a quorum of equally stale nodes would attest it anyway.
+    /// This is the tripwire for a persisted `cpo-trie.json` OR `spi-trie.json`
+    /// that has fallen out of sync with the chain — most sharply after a
+    /// re-bootstrap, which mints a FRESH zero-root singleton while the node's
+    /// state directory still holds the previous deployment's populated tries,
+    /// and after a roster-wide state restore, where [SPI-2]'s peer recomputation
+    /// passes because every co-signer recomputes from the SAME stale trie.
+    /// `BuildTm` compares these against its local roots and refuses to attest on
+    /// a mismatch: a TM built on a stale trie commits a root the chain does not
+    /// hold.
     ///
-    /// `None` means "not configured / cannot be checked", never "empty trie". The
-    /// empty trie has a real root (32 zero bytes), and reporting it here would
-    /// turn an unconfigured node into one that rejects every non-genesis trie.
-    async fn query_cpo_root(&self) -> EpochResult<Option<[u8; 32]>> {
+    /// `None` means "not configured / cannot be checked", never "empty tries".
+    /// The empty trie has a real root (32 zero bytes), and reporting it here
+    /// would turn an unconfigured node into one that rejects every non-genesis
+    /// trie.
+    async fn query_bridge_roots(&self) -> EpochResult<Option<BridgeRoots>> {
         Ok(None)
     }
 
