@@ -121,7 +121,20 @@ behaviour, and it is why these three cannot be left blank.
 the Config UTxO already knows. Step 4 checks what you typed against the chain, so a mistake is
 caught at startup rather than by a failed transaction — but you still have to type them.
 
-**The ban list: usually nothing to type.** The eligible roster is the registry *minus* active bans,
+**The registry and the ban list: usually nothing to type.** On a bridge deployed by
+`binocular deploy-bridge` at or after WI-068, the Config publishes the registry policy, the
+`treasury_info` policy and its state-NFT name (fields #21-#23) alongside the ban policy — so
+`registry_blueprint`, `registry_bootstrap` and `treasury_info_asset_name` are not needed either.
+Genesis mints both linked-list roots *before* the Config exists, so a bridge cannot exist without
+them; `heimdall bootstrap-registry` and `bootstrap-ban-list` are legacy, for bridges that predate
+that and for recovering a genesis that failed part-way.
+
+One thing the published ids do NOT cover: performing the DKG **key handoff** (Update-Y) spends the
+`treasury_info` state UTxO, and spending needs the compiled script rather than its hash. A node
+that does handoffs still needs a blueprint; what it derives is checked against the published #22,
+so a mismatch is a startup error instead of a handoff written where no one reads it.
+
+**The ban list specifically.** The eligible roster is the registry *minus* active bans,
 so a node that cannot read that list computes a different DKG participant set from everyone else —
 which is why the daemon refuses to start without one. But on a bridge whose Config publishes the
 ban policy (field #17), there is nothing to configure: the node reads the policy id from the

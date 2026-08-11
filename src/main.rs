@@ -242,6 +242,11 @@ enum Commands {
     /// parameterizes the registry policy and mint the "reg-root" anchor NFT to
     /// the registry script address. Prints the signed tx, submits only with
     /// --submit. Must confirm before any register-spo can be built.
+    ///
+    /// LEGACY. `binocular deploy-bridge` mints this root as the first genesis
+    /// transaction, so a bridge deployed at or after WI-068 already has one and
+    /// its one-shot is spent. Kept for a bridge that predates that, and for
+    /// recovering a genesis that failed between its two transactions.
     BootstrapRegistry {
         #[arg(long)]
         config: Option<String>,
@@ -491,6 +496,10 @@ enum Commands {
     /// ban script address (WI-015). Prints the signed tx, submits only with
     /// --submit. Precondition for any apply-ban. The fault-policy set +
     /// ban-schedule params come from [cardano] config.
+    ///
+    /// LEGACY, for the same reason as `bootstrap-registry`: genesis mints this
+    /// root before the Config exists, which is what makes a bridge unable to
+    /// exist without a ban list. Kept for a pre-WI-068 bridge and for recovery.
     BootstrapBanList {
         #[arg(long)]
         config: Option<String>,
