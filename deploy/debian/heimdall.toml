@@ -124,15 +124,20 @@ stake_source = "blockfrost"
 #registry_bootstrap = "<tx_hash>:<index>"
 #treasury_info_asset_name = ""
 
-# Ban list. REQUIRED as soon as the registry keys above are set — the daemon
-# refuses to start without it. [will be removed — WI-065 moves these into the
-# Config UTxO, after which none of them are typed here.]
+# Ban list. LEAVE THIS UNSET on any bridge whose Config publishes the ban policy
+# (field #17) — the node reads it from there and there is nothing here to get
+# wrong. `heimdall show-config-params` prints the ban address it resolved.
 #
-# Not an operator preference: the eligible roster is the registry MINUS active
-# bans, so a node that does not read the list enumerates a different set of DKG
-# participants, assigns different indices, and cannot converge with the others.
-# Nothing in either node's log would say so. One value, from the bridge's
-# deployment notes; every SPO on a bridge uses the same one.
+# It is not an operator preference either way: the eligible roster is the
+# registry MINUS active bans, so a node that does not read the list enumerates a
+# different set of DKG participants, assigns different indices, and cannot
+# converge with the others. Nothing in either node's log would say so — which is
+# why the daemon refuses to start with the registry keys set and no ban list from
+# either source.
+#
+# Set this ONLY for a bridge deployed before #17 existed, and then copy it
+# exactly from the deployment notes: it is an input to the ban policy's own
+# identifier, so a wrong value derives a valid-looking address holding no bans.
 #ban_bootstrap = "<tx_hash>:<index>"
 
 # Fault enforcement — publishing a fault proof on chain so misbehaviour costs

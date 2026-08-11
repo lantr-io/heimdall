@@ -121,14 +121,19 @@ behaviour, and it is why these three cannot be left blank.
 the Config UTxO already knows. Step 4 checks what you typed against the chain, so a mistake is
 caught at startup rather than by a failed transaction — but you still have to type them.
 
-**[will be removed — WI-065]** The ban-list values are the same story, with a sharper edge.
-`ban_bootstrap`, `fault_proof_policies` and the three `*_ban_*` schedule numbers are required
-alongside the registry keys — the daemon refuses to start without them, because the eligible roster
-is the registry *minus* active bans and a node that cannot read that list computes a different DKG
-participant set from everyone else. They cannot be derived locally: they are inputs to the ban
-policy's own identifier, so you would need them to compute the address you would read them from.
-Copy them exactly; a wrong value yields a valid-looking address holding an empty list. WI-065 moves
-them into the Config UTxO, after which none of them are typed at all.
+**The ban list: usually nothing to type.** The eligible roster is the registry *minus* active bans,
+so a node that cannot read that list computes a different DKG participant set from everyone else —
+which is why the daemon refuses to start without one. But on a bridge whose Config publishes the
+ban policy (field #17), there is nothing to configure: the node reads the policy id from the
+Config, and the ban script address follows from it. `show-config-params` prints the address it
+resolved, and startup step 6 names the source.
+
+Only on a bridge whose Config *predates* that field do you still copy `ban_bootstrap`,
+`fault_proof_policies` and the three `*_ban_*` schedule numbers from the deployment notes. Copy them
+exactly: they are inputs to the ban policy's own identifier, so a wrong value yields a valid-looking
+address holding an empty list — banned SPOs back in your roster with nothing in any log. On a bridge
+that *does* publish #17, leftover local keys are simply unused; if they happen to derive a different
+policy the daemon says so and stops rather than picking one.
 
 **Secrets.** Two, and neither belongs in the TOML if you can avoid it:
 

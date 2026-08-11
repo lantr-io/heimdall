@@ -373,7 +373,13 @@ pub struct CardanoConfig {
     /// The spo_bans one-shot bootstrap outref `<tx_hash>:<index>` that
     /// parameterizes the ban-list policy (the policy is also parameterized
     /// by the registry policy, so `registry_blueprint` + `registry_bootstrap`
-    /// must be set alongside). Unset → the ban list is not read.
+    /// must be set alongside).
+    ///
+    /// **Only for a bridge whose Config predates the ban-policy append.** Where
+    /// the Config publishes the finished policy id (#17) that value wins and this
+    /// key is not needed at all — see [`crate::cardano::ban_list::BanListSource::resolve`].
+    /// Left set on such a bridge it is unused, and a startup error if it derives
+    /// a different policy than the one published.
     pub ban_bootstrap: Option<String>,
     /// The authorized fault-verifier policy ids (hex), in the exact order the
     /// deployed `spo_bans` was parameterized with. The contract's
@@ -387,6 +393,8 @@ pub struct CardanoConfig {
     /// ban's length; a pool becomes permanently banned at
     /// `max_faults_before_permanent`; `max_validity_window_ms` bounds an
     /// ApplyBan tx's validity interval. All required alongside `ban_bootstrap`.
+    ///
+    /// Superseded by Config #18–#20 wherever the bridge publishes them.
     pub base_ban_duration_ms: Option<i64>,
     pub max_faults_before_permanent: Option<i64>,
     pub max_validity_window_ms: Option<i64>,

@@ -103,7 +103,14 @@ impl DkgFaultBanFlow {
     /// node still filters its roster. Present *any* of it, every field is
     /// required — a half-configured publish path must fail at startup, not
     /// after a fault is detected.
-    pub fn from_config(cardano: &crate::config::CardanoConfig) -> Result<Option<Self>, String> {
+    ///
+    /// `config` is the decoded bridge Config: it supplies the ban schedule
+    /// (#18–#20) when the bridge publishes one, and its ban policy id (#17) is
+    /// what the locally derived `spo_bans` is checked against (WI-065).
+    pub fn from_config(
+        cardano: &crate::config::CardanoConfig,
+        config: Option<&crate::cardano::config_params::ConfigParams>,
+    ) -> Result<Option<Self>, String> {
         let enforcement_keys = [
             &cardano.fault_proof_srs_path,
             &cardano.spo_bans_ref,
@@ -183,7 +190,7 @@ impl DkgFaultBanFlow {
             &registry.hash,
         )
         .map_err(|e| format!("parameterize fault_verifier_equivocation: {e}"))?;
-        let ban_params = crate::cardano::ban_list::BanPolicyParams::from_config(cardano)
+        let ban_params = crate::cardano::ban_list::BanPolicyParams::resolve(cardano, config)
             .map_err(|e| e.to_string())?;
         let own_fault_policies = [
             round1_fault.hash,
@@ -213,6 +220,23 @@ impl DkgFaultBanFlow {
             u64::from(ban_index),
         )
         .map_err(|e| format!("parameterize spo_bans: {e}"))?;
+
+        // The enforcement half derives the policy from seven local parameters,
+        // so it can land on an address the bridge does not use — an ApplyBan
+        // that confirms into a list nobody reads. Where the Config publishes the
+        // policy id there is a right answer to compare against, so compare.
+        if let Some(published) = config.and_then(|c| c.bans.as_ref())
+            && published.spo_bans_policy_id != spo_bans.hash
+        {
+            return Err(format!(
+                "the fault-enforcement keys derive spo_bans policy {} but the bridge Config \
+                 publishes {} (field #17) — an ApplyBan built here would confirm into a ban \
+                 list no other SPO reads. Check cardano.ban_bootstrap, \
+                 cardano.fault_proof_policies and the ban-schedule keys against this bridge",
+                spo_bans.hash_hex(),
+                hex::encode(published.spo_bans_policy_id),
+            ));
+        }
 
         Ok(Some(Self {
             blueprint_path: blueprint_path.to_string(),
@@ -2088,7 +2112,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            DkgFaultBanFlow::from_config(&cardano)
+            DkgFaultBanFlow::from_config(&cardano, None)
                 .expect("no enforcement keys is a valid configuration")
                 .is_none()
         );
@@ -2096,7 +2120,7 @@ mod tests {
         // One enforcement key present → every one of them is now required, and
         // the error names the missing key rather than degrading.
         cardano.fault_proof_srs_path = Some("/nonexistent/srs".to_string());
-        let err = DkgFaultBanFlow::from_config(&cardano)
+        let err = DkgFaultBanFlow::from_config(&cardano, None)
             .expect_err("a half-configured publish path must fail at startup");
         assert!(err.contains("cardano.spo_bans_ref is required"), "{err}");
 
@@ -2105,7 +2129,7 @@ mod tests {
             fault_proof_srs_path: Some("/nonexistent/srs".to_string()),
             ..Default::default()
         };
-        let err = DkgFaultBanFlow::from_config(&orphan).expect_err("no ban bootstrap");
+        let err = DkgFaultBanFlow::from_config(&orphan, None).expect_err("no ban bootstrap");
         assert!(err.contains("cardano.ban_bootstrap is required"), "{err}");
     }
 

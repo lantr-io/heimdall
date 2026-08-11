@@ -1530,6 +1530,30 @@ async fn run_demo(
         bf_chain = bf_chain.with_stake_source(stake_source);
         bf_chain = bf_chain.with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked);
 
+        // The bridge Config, read once at startup. It publishes the ban policy
+        // (#17-#20), so a node needs no ban keys of its own — and an unreadable
+        // one is fatal rather than a quiet fall back to whatever this operator
+        // typed, which is how two nodes end up filtering different rosters.
+        let bridge_config = match config_locator(&cfg) {
+            None => None,
+            Some(loc) => {
+                match heimdall::cardano::config_params::fetch_config(
+                    &loc.base_url,
+                    &loc.project_id,
+                    &loc.address,
+                    &loc.nft_unit,
+                )
+                .await
+                {
+                    Ok(view) => Some(view),
+                    Err(e) => {
+                        error!("bridge Config: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        };
+
         // On-chain SPO registry roster (WI-010): configured via
         // cardano.{registry_blueprint, registry_bootstrap, treasury_info_asset_name}.
         // Without it query_roster serves the fixture roster.
@@ -1545,13 +1569,21 @@ async fn run_demo(
                 // registry roster enables the handoff by construction.
                 info!("on-chain key handoff:  enabled (Update-Y after each DKG)");
                 bf_chain = bf_chain.with_registry_roster(source);
-                // Ban filtering (WI-011/012): only if cardano.ban_bootstrap is set.
-                match heimdall::cardano::ban_list::BanListSource::from_config(&cfg.cardano) {
+                // Ban filtering (WI-011/012): from the Config's published ban
+                // policy (#17) where the bridge has one, else the local keys.
+                match heimdall::cardano::ban_list::BanListSource::resolve(
+                    &cfg.cardano,
+                    bridge_config.as_ref().map(|v| &v.params),
+                ) {
                     Ok(Some(bans)) => {
-                        info!("on-chain ban list:     {}", bans.ban_address);
-                        bf_chain = bf_chain.with_ban_source(bans);
+                        info!(
+                            "on-chain ban list:     {} ({})",
+                            bans.source.ban_address, bans.origin
+                        );
+                        bf_chain = bf_chain.with_ban_source(bans.source);
                         match heimdall::cardano::blockfrost_chain::DkgFaultBanFlow::from_config(
                             &cfg.cardano,
+                            bridge_config.as_ref().map(|v| &v.params),
                         ) {
                             Ok(Some(flow)) => {
                                 info!("automatic DKG fault banning: enabled");
@@ -2761,7 +2793,12 @@ fn run_bootstrap_ban_list(
             ));
         }
     }
-    let params = BanPolicyParams::from_config(&cfg.cardano).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    // The ban schedule is a property of the deployment, not of this operator, so
+    // take it from the bridge Config wherever that publishes one (#18-#20).
+    let bridge_config = config_view(&rt, cfg)?;
+    let params = BanPolicyParams::resolve(&cfg.cardano, bridge_config.as_ref().map(|v| &v.params))
+        .map_err(|e| e.to_string())?;
     let spo_bans = spo_bans_script(
         &blueprint_json,
         &registry.hash,
@@ -2773,6 +2810,20 @@ fn run_bootstrap_ban_list(
         u64::from(ban_index),
     )
     .map_err(|e| format!("parameterize spo_bans: {e}"))?;
+    // A bridge whose Config already names a ban policy already HAS a ban list.
+    // Minting ban-root under a different policy would create a second list at an
+    // address no SPO reads, so refuse rather than produce it.
+    if let Some(published) = bridge_config.as_ref().and_then(|v| v.params.bans.as_ref())
+        && published.spo_bans_policy_id != spo_bans.hash
+    {
+        return Err(format!(
+            "these parameters derive ban policy {} but the bridge Config publishes {} \
+             (field #17) — that bridge's ban list is already bootstrapped, and a root minted \
+             here would sit at an address no SPO reads",
+            spo_bans.hash_hex(),
+            hex::encode(published.spo_bans_policy_id),
+        ));
+    }
 
     let pid = cfg
         .cardano
@@ -2780,7 +2831,6 @@ fn run_bootstrap_ban_list(
         .as_deref()
         .ok_or("cardano.blockfrost_project_id required")?;
     let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
-    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
@@ -4340,7 +4390,14 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
         .as_deref()
         .ok_or("cardano.ban_bootstrap required")?;
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
-    let params = BanPolicyParams::from_config(&cfg.cardano).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    // The ban a tx applies is computed from the SCHEDULE — its end time from
+    // #18/#19 and the validity interval from #20 — so those numbers must be the
+    // deployment's, not this operator's. Read them from the Config where the
+    // bridge publishes them; the derived policy is then checked against #17.
+    let bridge_config = config_view(&rt, cfg)?;
+    let params = BanPolicyParams::resolve(&cfg.cardano, bridge_config.as_ref().map(|v| &v.params))
+        .map_err(|e| e.to_string())?;
     let spo_bans = spo_bans_script(
         &blueprint_json,
         &registry.hash,
@@ -4352,6 +4409,17 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
         u64::from(ban_index),
     )
     .map_err(|e| format!("parameterize spo_bans: {e}"))?;
+    if let Some(published) = bridge_config.as_ref().and_then(|v| v.params.bans.as_ref())
+        && published.spo_bans_policy_id != spo_bans.hash
+    {
+        return Err(format!(
+            "this ban would be applied to policy {} but the bridge Config publishes {} \
+             (field #17) — it would confirm into a ban list no other SPO reads. Check \
+             cardano.ban_bootstrap and cardano.fault_proof_policies against this bridge",
+            spo_bans.hash_hex(),
+            hex::encode(published.spo_bans_policy_id),
+        ));
+    }
 
     let accused_pool_id: [u8; 28] = parse_hex_n(&args.accused_pool_id, "--accused-pool-id")?;
     let evidence_hash: [u8; 32] = parse_hex_n(&args.evidence_hash, "--evidence-hash")?;
@@ -4363,7 +4431,6 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
         .as_deref()
         .ok_or("cardano.blockfrost_project_id required")?;
     let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
-    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
     let network = network_of(&wallet_addr);
     let mainnet = matches!(network, pallas_addresses::Network::Mainnet);
@@ -4721,24 +4788,41 @@ fn run_show_roster(
     // config-only.
     use heimdall::cardano::ban_list::{BanListError, BanListSource, BanPolicyParams};
     let mut active_bans: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
-    match cfg.cardano.ban_bootstrap.as_deref() {
-        None => {
-            println!("ban list:          (not configured — set cardano.ban_bootstrap)");
+    let bridge_config = config_view(&rt, cfg)?;
+    let published_bans = bridge_config.as_ref().and_then(|v| v.params.bans.as_ref());
+    match (published_bans, cfg.cardano.ban_bootstrap.as_deref()) {
+        (None, None) => {
+            println!(
+                "ban list:          (not configured — this bridge's Config publishes no ban \
+                 policy, and cardano.ban_bootstrap is unset)"
+            );
         }
-        Some(ban_bootstrap) => {
-            // The fault-policy set + ban-schedule params are config-only (they
-            // are baked into the ban policy id), unlike --blueprint/--registry-
-            // bootstrap which may be CLI overrides.
-            let ban_params =
-                BanPolicyParams::from_config(&cfg.cardano).map_err(|e| e.to_string())?;
-            let source = BanListSource::from_blueprint(
-                &blueprint,
-                &bootstrap,
-                ban_bootstrap,
-                &ban_params,
-                cfg.cardano.is_mainnet()?,
-            )
-            .map_err(|e| e.to_string())?;
+        (published, ban_bootstrap) => {
+            // The published policy id wins: it is what the daemon reads, so a
+            // report derived any other way would describe a roster this node
+            // does not actually filter.
+            let source = match published {
+                Some(b) => {
+                    println!("ban policy source: bridge Config #17");
+                    BanListSource::from_policy_id(&b.spo_bans_policy_id, cfg.cardano.is_mainnet()?)
+                }
+                // The fault-policy set + ban-schedule params are config-only
+                // (they are baked into the ban policy id), unlike --blueprint /
+                // --registry-bootstrap which may be CLI overrides.
+                None => {
+                    let ban_params =
+                        BanPolicyParams::resolve(&cfg.cardano, None).map_err(|e| e.to_string())?;
+                    println!("ban policy source: LOCAL heimdall.toml ban keys");
+                    BanListSource::from_blueprint(
+                        &blueprint,
+                        &bootstrap,
+                        ban_bootstrap.expect("the (None, None) arm above covers the other case"),
+                        &ban_params,
+                        cfg.cardano.is_mainnet()?,
+                    )
+                    .map_err(|e| e.to_string())?
+                }
+            };
             println!("ban policy:        {}", source.ban_policy_hex);
             println!("ban address:       {}", source.ban_address);
             // Ban activity is evaluated at the epoch boundary (chain-derived),
@@ -5165,6 +5249,34 @@ fn run_show_config_params(cfg: &HeimdallConfig) -> Result<(), String> {
         None => println!(
             "#12-#16            : ABSENT — this Config predates the operational-parameter \
              append; TMs fall back to the local bitcoin.fee_rate_sat_per_vb"
+        ),
+    }
+    match &snapshot.config.params.bans {
+        Some(b) => {
+            let mainnet = cfg.cardano.is_mainnet()?;
+            let source = heimdall::cardano::ban_list::BanListSource::from_policy_id(
+                &b.spo_bans_policy_id,
+                mainnet,
+            );
+            println!("#17 spo_bans policy: {}", source.ban_policy_hex);
+            println!("      ban address  : {}", source.ban_address);
+            println!("#18 base_ban_duration_ms      : {}", b.base_ban_duration_ms);
+            println!(
+                "#19 max_faults_before_permanent: {}",
+                b.max_faults_before_permanent
+            );
+            println!(
+                "#20 max_validity_window_ms     : {}",
+                b.max_validity_window_ms
+            );
+            println!(
+                "      (the roster is filtered against this address; no ban keys are needed \
+                 in [cardano])"
+            );
+        }
+        None => println!(
+            "#17-#20            : ABSENT — this Config predates the ban-policy append; the \
+             roster is filtered against the LOCAL cardano.ban_bootstrap keys"
         ),
     }
 

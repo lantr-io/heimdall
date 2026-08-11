@@ -615,16 +615,20 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             Status::Skipped,
             "no on-chain registry configured (fixture roster)",
         ),
-        Ok(Some(_)) => match crate::cardano::ban_list::BanListSource::from_config(&cfg.cardano) {
-            Ok(Some(src)) => {
+        Ok(Some(_)) => match crate::cardano::ban_list::BanListSource::resolve(
+            &cfg.cardano,
+            config.as_ref().map(|v| &v.params),
+        ) {
+            Ok(Some(res)) => {
                 let enforcing = cfg.cardano.fault_proof_srs_path.is_some();
                 b.push(
                     6,
                     "ban list",
                     Status::Pass,
                     format!(
-                        "roster is ban-filtered against {} ({})",
-                        src.ban_address,
+                        "roster is ban-filtered against {} — {} ({})",
+                        res.source.ban_address,
+                        res.origin,
                         if enforcing {
                             "fault enforcement configured"
                         } else {
@@ -647,6 +651,8 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 format!("cannot derive the ban list: {e}"),
                 "the eligible roster is the registry MINUS active bans — a node that cannot \
                  read the list computes a different DKG participant set from one that can.\n\
+                 A bridge whose Config publishes the ban policy (#17) needs NO ban keys here; \
+                 otherwise:\n\
                  heimdall bootstrap-ban-list --config <file> ... --submit  (once per bridge)",
             ),
         },

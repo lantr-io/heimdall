@@ -49,6 +49,22 @@
 //! | 14 | `min_peg_out_fbtc` | TM skip rule |
 //! | 15 | `leader_reward` (lovelace) | pinned into the posted TM datum |
 //! | 16 | `schedule` (`ScheduleParams`) | surfaced; consumed by the N19 batch grid |
+//! | 17 | `spo_bans_policy_id` | the ban script address the roster is filtered against |
+//! | 18–20 | ban schedule (`base_ban_duration_ms`, `max_faults_before_permanent`, `max_validity_window_ms`) | the ApplyBan builder |
+//!
+//! ## Why the ban policy id is PUBLISHED rather than derived (#17)
+//!
+//! Every other ban value an operator could type — the three schedule numbers, the
+//! fault-verifier policy set, the bootstrap outref — is an *input* to the
+//! `spo_bans` policy id, not an output of it. So a node cannot derive the address
+//! it would read them from without already having them, and getting any one wrong
+//! derives a ban address no deployment has: a silently EMPTY ban list, and banned
+//! SPOs back in the roster with nothing in any log. Publishing the finished policy
+//! id breaks that cycle — a reader trusts the authenticated Config exactly as it
+//! already trusts the contract identifiers #0–#5, and needs no ban configuration
+//! whatsoever. A node that *does* still carry the local keys (for enforcement)
+//! cross-checks what it derives against #17 instead, so a stale copy is a startup
+//! error rather than an empty list. |
 
 use bitcoin::Amount;
 use pallas_codec::minicbor;
@@ -63,6 +79,10 @@ use tracing::{info, warn};
 /// Field count of a Config datum carrying the operational-parameter append
 /// (#12–#16 on top of upstream's 12 fields, `initial_btc_treasury_utxo` last).
 pub const CONFIG_FIELDS_WITH_TUNABLES: usize = 17;
+
+/// Field count of a Config datum carrying the ban-policy append (#17–#20) on top
+/// of the tunables.
+pub const CONFIG_FIELDS_WITH_BANS: usize = 21;
 
 /// Field count of the upstream Config before the tunables were appended.
 const CONFIG_FIELDS_UPSTREAM: usize = 12;
@@ -101,6 +121,25 @@ pub struct Tunables {
     pub leader_reward: u64,
     /// #16.
     pub schedule: ScheduleParams,
+}
+
+/// Config #17–#20 — the ban policy, published so no SPO has to configure one.
+///
+/// Split by who needs what: #17 alone serves the MANDATORY read half (the roster
+/// is the registry minus active bans, so every node must read the same list), and
+/// #18–#20 serve the optional enforcement half — `apply_ban` computes a ban's end
+/// time from #18/#19 and bounds the ApplyBan validity interval by #20.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanParams {
+    /// #17. The `spo_bans` policy id; the ban script address follows from it, so
+    /// this one field is the whole read half.
+    pub spo_bans_policy_id: [u8; 28],
+    /// #18, milliseconds. `base_ban_duration_ms * 2^(n-1)` is the nth ban's length.
+    pub base_ban_duration_ms: i64,
+    /// #19. A pool is banned permanently at this many faults.
+    pub max_faults_before_permanent: i64,
+    /// #20, milliseconds. Upper bound on an ApplyBan tx's validity interval.
+    pub max_validity_window_ms: i64,
 }
 
 /// Config #0–#5 — the bridge's contract identifiers.
@@ -160,6 +199,9 @@ pub struct ConfigParams {
     pub initial_btc_treasury_utxo: Option<[u8; 36]>,
     /// #12–#16, or `None` on a Config that predates the append.
     pub tunables: Option<Tunables>,
+    /// #17–#20, or `None` on a Config that predates the ban append — on which a
+    /// node falls back to its local `[cardano]` ban keys.
+    pub bans: Option<BanParams>,
 }
 
 /// Which Config UTxO a [`ConfigParams`] was read from.
@@ -342,12 +384,74 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
         None
     };
 
+    // Same rule one append later: #17-#20 landed together, so a datum stopping
+    // inside them is a botched Update. Refusing beats deriving a ban address from
+    // half a record — the failure that would produce is an empty ban list, which
+    // looks exactly like a bridge with no bans.
+    let bans = if field_count >= CONFIG_FIELDS_WITH_BANS {
+        Some(parse_bans(fields)?)
+    } else if field_count > CONFIG_FIELDS_WITH_TUNABLES {
+        return Err(format!(
+            "config datum has {field_count} fields — the ban policy is fields #17-#20, so a \
+             datum between {} and {} fields is a partially-applied governance Update. Refusing \
+             to guess which half is missing",
+            CONFIG_FIELDS_WITH_TUNABLES + 1,
+            CONFIG_FIELDS_WITH_BANS - 1,
+        ));
+    } else {
+        None
+    };
+
     Ok(ConfigParams {
         field_count,
         contracts,
         min_stake,
         initial_btc_treasury_utxo,
         tunables,
+        bans,
+    })
+}
+
+/// Decode #17–#20.
+///
+/// The bounds are `spo_bans`' own `ban_config_ok` bounds, checked here for the
+/// same reason the decoder rejects a zero fee rate: governance sanity is
+/// upstream's job, and refusing to act on a value the contract could not have
+/// been deployed with is ours. A zero `base_ban_duration_ms` would apply bans
+/// that expire the instant they start.
+fn parse_bans(fields: &[PlutusData]) -> Result<BanParams, String> {
+    let raw = plutus::field_bytes(fields, 17)
+        .map_err(|e| format!("config #17 (spo_bans_policy_id): {e}"))?;
+    let len = raw.len();
+    let spo_bans_policy_id = <[u8; 28]>::try_from(raw).map_err(|_| {
+        format!("config #17 (spo_bans_policy_id) must be a 28-byte policy id, got {len} bytes")
+    })?;
+    let at = |i: usize, name: &str| -> Result<i64, String> {
+        plutus::field_int(fields, i).map_err(|e| format!("config #{i} ({name}): {e}"))
+    };
+    let base_ban_duration_ms = at(18, "base_ban_duration_ms")?;
+    let max_faults_before_permanent = at(19, "max_faults_before_permanent")?;
+    let max_validity_window_ms = at(20, "max_validity_window_ms")?;
+    if base_ban_duration_ms <= 0 {
+        return Err(format!(
+            "config #18 (base_ban_duration_ms) must be > 0, got {base_ban_duration_ms}"
+        ));
+    }
+    if max_faults_before_permanent <= 0 {
+        return Err(format!(
+            "config #19 (max_faults_before_permanent) must be > 0, got {max_faults_before_permanent}"
+        ));
+    }
+    if max_validity_window_ms < 0 {
+        return Err(format!(
+            "config #20 (max_validity_window_ms) must be >= 0, got {max_validity_window_ms}"
+        ));
+    }
+    Ok(BanParams {
+        spo_bans_policy_id,
+        base_ban_duration_ms,
+        max_faults_before_permanent,
+        max_validity_window_ms,
     })
 }
 
@@ -639,6 +743,18 @@ mod tests {
         constr(0, fields)
     }
 
+    /// The 17-field shape plus the ban append (#17-#20).
+    fn config_datum_with_bans(policy: [u8; 28]) -> PlutusData {
+        let mut fields = plutus::constr_fields(&config_datum(7, 1_000, 100_000), 0)
+            .unwrap()
+            .to_vec();
+        fields.push(bytes(&policy)); // #17 spo_bans_policy_id
+        fields.push(int(600_000)); // #18 base_ban_duration_ms
+        fields.push(int(3)); // #19 max_faults_before_permanent
+        fields.push(int(3_600_000)); // #20 max_validity_window_ms
+        constr(0, fields)
+    }
+
     fn snapshot_of(datum: &PlutusData) -> ParamSnapshot {
         ParamSnapshot {
             slot: 12_345,
@@ -717,6 +833,69 @@ mod tests {
         let fields = plutus::constr_fields(&full, 0).unwrap()[..15].to_vec();
         let err = parse_config_datum(&constr(0, fields)).unwrap_err();
         assert!(err.contains("partially-applied"), "{err}");
+    }
+
+    #[test]
+    fn decodes_the_published_ban_policy() {
+        let p = parse_config_datum(&config_datum_with_bans([0xbb; 28])).unwrap();
+        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_BANS);
+        let b = p.bans.unwrap();
+        assert_eq!(b.spo_bans_policy_id, [0xbb; 28]);
+        assert_eq!(b.base_ban_duration_ms, 600_000);
+        assert_eq!(b.max_faults_before_permanent, 3);
+        assert_eq!(b.max_validity_window_ms, 3_600_000);
+        // …and the tunables below it still decode: the ban fields are an append,
+        // not a replacement.
+        assert_eq!(p.tunables.unwrap().fee_rate_sat_per_vb, 7);
+    }
+
+    /// The deployed preprod shape, until the migrating Update lands. It must keep
+    /// working — a reader that required #17 would brick every node on the bridge
+    /// the moment it shipped.
+    #[test]
+    fn the_17_field_config_has_no_published_bans() {
+        let p = parse_config_datum(&config_datum(7, 1_000, 100_000)).unwrap();
+        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_TUNABLES);
+        assert!(p.bans.is_none());
+    }
+
+    /// Half the ban append is a botched Update. Guessing would derive a ban
+    /// address from a partial record — a valid-looking address holding no bans,
+    /// which reads exactly like a bridge that has never banned anyone.
+    #[test]
+    fn a_partial_ban_append_is_rejected() {
+        let full = config_datum_with_bans([0xbb; 28]);
+        for n in [18usize, 19, 20] {
+            let fields = plutus::constr_fields(&full, 0).unwrap()[..n].to_vec();
+            let err = parse_config_datum(&constr(0, fields)).unwrap_err();
+            assert!(err.contains("partially-applied"), "{n} fields: {err}");
+        }
+    }
+
+    #[test]
+    fn a_ban_policy_id_of_the_wrong_length_is_rejected() {
+        let mut fields = plutus::constr_fields(&config_datum_with_bans([0xbb; 28]), 0)
+            .unwrap()
+            .to_vec();
+        fields[17] = bytes(&[0xbb; 27]);
+        let err = parse_config_datum(&constr(0, fields)).unwrap_err();
+        assert!(err.contains("28-byte policy id"), "{err}");
+    }
+
+    /// `ban_config_ok`'s own bounds: a value the contract could not have been
+    /// deployed with means the reader is looking at the wrong thing.
+    #[test]
+    fn out_of_range_ban_schedule_values_are_rejected() {
+        let bad = |i: usize, v: i64| {
+            let mut fields = plutus::constr_fields(&config_datum_with_bans([0xbb; 28]), 0)
+                .unwrap()
+                .to_vec();
+            fields[i] = int(v);
+            parse_config_datum(&constr(0, fields)).unwrap_err()
+        };
+        assert!(bad(18, 0).contains("base_ban_duration_ms"));
+        assert!(bad(19, 0).contains("max_faults_before_permanent"));
+        assert!(bad(20, -1).contains("max_validity_window_ms"));
     }
 
     #[test]
