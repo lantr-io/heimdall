@@ -211,27 +211,36 @@ sudo -u heimdall heimdall run-mover --config /etc/heimdall/heimdall.toml --once
 Run it as the `heimdall` user: the config is `0640 root:heimdall` so you cannot read it as
 yourself, and running as root would leave root-owned files in the state directory.
 
-This runs seven startup checks and prints all of them, then refuses to start if any failed. It is a
+This runs eight startup checks and prints all of them, then refuses to start if any failed. It is a
 dry run — it reads the chain and builds nothing.
 
 ```
-[1/7] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
-[2/7] cardano connectivity         PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
-[3/7] resolve the Config           PASS  2dce4027…#0 (17 fields, min_stake 0)
-[4/7] verify the contract set      PASS  6 identifier(s) agree with the Config
-[5/7] reference script             …
-[6/7] ban list                     PASS  roster is ban-filtered against addr_test1… (detection only)
-[7/7] registration status          …
+[1/8] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
+[2/8] cardano connectivity         PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
+[3/8] resolve the Config           PASS  2dce4027…#0 (24 fields, min_stake 0)
+[4/8] verify the contract set      PASS  every configured contract identifier matches the Config UTxO
+[5/8] reference script             …
+[6/8] ban list                     PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (#17) (detection only)
+[7/8] registration status          …
+[8/8] key handoff (Update-Y)       …
 ```
 
 Step 4 is the one that earns its keep: it compares every contract identifier you typed against the
 Config UTxO on chain and names any that disagree, with both values. Step 6 confirms your roster is
 ban-filtered — it fails if the registry is configured without a ban list, since that node could not
-agree with its peers on who is in the DKG. Steps 5 and 7 tell you what is still missing for
-registration — they never spend; they name the command and stop.
+agree with its peers on who is in the DKG. Step 7 tells you whether this node is registered; it
+never spends — it names the command and stops.
 
-Only `FAIL` blocks startup. A `WARN` is worth reading: `protocol.state_dir is unset` in particular
-is the one that silently costs money later.
+Only `FAIL` blocks startup. A `WARN` is worth reading, and steps 5 and 8 are the two you will most
+often see one on:
+
+- **Step 5 (`reference script`)** warns when the registry reference script is not deployed at your
+  wallet. That script is only needed to *register*; a running daemon reads the roster without it.
+- **Step 8 (`key handoff`)** warns when this node has no compiled `treasury_info` script. It still
+  runs DKG and signs — but if it is elected leader for an epoch, the Update-Y that hands the
+  treasury to the new group key fails, and the handoff does not happen. Set
+  `cardano.registry_blueprint` and `cardano.treasury_policy_id` to clear it.
+- `protocol.state_dir is unset` is the one that silently costs money later.
 
 Do not continue until this passes.
 
@@ -346,7 +355,7 @@ sudo -u heimdall heimdall show-roster --config /etc/heimdall/heimdall.toml
 ```
 
 Read-only. Your pool id and `bifrost_url` should appear. Re-running the step-4 check now should
-show `[6/6] registration status` satisfied.
+show `[7/8] registration status` satisfied.
 
 ---
 
@@ -454,7 +463,7 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 | the service will not start | `journalctl -u heimdall -p err`, then re-run the step-4 check — it names the failing check and what to fix |
 | starts, then nothing happens for days | expected; see *Quiet is normal* |
 | peers seem not to see you | step 5 — is the registered port open and reachable *from outside*? |
-| `[4/6] verify the contract set FAIL` | your config disagrees with the chain; the check prints both values for each mismatch |
+| `[4/8] verify the contract set FAIL` | your config disagrees with the chain; the check prints both values for each mismatch |
 | a transaction is refused | read the whole message: the min-stake gate and the preflight both refuse loudly rather than submitting something wrong |
 | it refuses to start over `cardano.fault_proof_srs_path` | you have DKG fault enforcement configured on mainnet against a setup that is not trustworthy — see [the fault-proof trusted setup](fault-proof-srs.md) |
 

@@ -473,6 +473,17 @@ pub struct BlockfrostCardanoChain {
     /// computing the threshold (WI-012). `None` → no ban filtering (e.g.
     /// before the ban list is bootstrapped, WI-015).
     ban_source: Option<crate::cardano::ban_list::BanListSource>,
+    /// `[cardano]`, kept so the federation identity can be RE-RESOLVED from the
+    /// bridge Config on every roster read rather than pinned at startup.
+    ///
+    /// The two fields above are what startup happened to see. Config #17 and
+    /// #21–#23 are chain state a governance Update can move, exactly like the
+    /// #12–#16 the batch snapshot re-reads every batch — so pinning them makes
+    /// two honest nodes disagree according to when each was last restarted, which
+    /// is the divergence publishing them was supposed to end. `None` → nothing to
+    /// refresh from (the fixture roster, or a Config predating the appends), and
+    /// the pinned values stand.
+    federation_refresh: Option<crate::config::CardanoConfig>,
     /// Where per-pool active stake is read for the DKG threshold. Defaults to
     /// Blockfrost (`/pools/{id}`); set to `YaciStore` for a local devnet.
     stake_source: crate::cardano::stake::StakeSource,
@@ -575,6 +586,7 @@ impl BlockfrostCardanoChain {
             fallback_roster,
             registry_roster: None,
             ban_source: None,
+            federation_refresh: None,
             stake_source: crate::cardano::stake::StakeSource::Blockfrost,
             demo_exclude_unstaked: false,
             payment_key: None,
@@ -733,6 +745,113 @@ impl BlockfrostCardanoChain {
     pub fn with_ban_source(mut self, source: crate::cardano::ban_list::BanListSource) -> Self {
         self.ban_source = Some(source);
         self
+    }
+
+    /// Re-resolve the federation identity (Config #17, #21–#23) from the chain on
+    /// every roster read, instead of running forever on whatever startup saw.
+    pub fn with_federation_refresh(mut self, cardano: crate::config::CardanoConfig) -> Self {
+        self.federation_refresh = Some(cardano);
+        self
+    }
+
+    /// The registry + ban sources AS OF NOW, re-read from the bridge Config.
+    ///
+    /// The startup-resolved pair is the fallback, not the answer: #17 and #21–#23
+    /// are chain state, and a node that pinned them at boot filters a different
+    /// roster from a node booted after a governance Update — a divergence keyed on
+    /// restart time, which no operator can see and no log records. The batch
+    /// snapshot already re-reads #12–#16 on the same reasoning.
+    ///
+    /// Refreshing is skipped (and the pinned pair returned) when there is nothing
+    /// to refresh from: no Config locator, or a Config that publishes neither
+    /// append, in which case `resolve` would fall back to the same local keys
+    /// startup used anyway.
+    async fn current_federation(
+        &self,
+    ) -> EpochResult<(
+        Option<crate::cardano::roster::RegistryRosterSource>,
+        Option<crate::cardano::ban_list::BanListSource>,
+    )> {
+        let pinned = || (self.registry_roster.clone(), self.ban_source.clone());
+        let (Some(cardano), Some(addr), Some(unit)) = (
+            self.federation_refresh.as_ref(),
+            self.config_address.as_deref(),
+            self.config_nft_unit.as_deref(),
+        ) else {
+            return Ok(pinned());
+        };
+        // A Config read that fails must NOT quietly leave the node on its pinned
+        // copy — that is the divergence again, just triggered by a network blip
+        // instead of a restart. So absorb the blip instead: every other
+        // consensus-relevant read on this path retries (`fetch_snapshot`,
+        // `fetch_ban_list`), and a read this one depends on should not be the one
+        // that kills a ceremony over a 502.
+        //
+        // Retried unconditionally rather than on a classified error: `fetch_config`
+        // reports as a plain string, and a permanent failure (a datum this build
+        // cannot decode) repeats identically — so the cost of not classifying is
+        // seven seconds before it surfaces, at epoch scale.
+        let view = crate::cardano::retry::retry_transient(
+            &crate::cardano::retry::DEFAULT_DELAYS,
+            "federation-config",
+            |_: &String| true,
+            || {
+                crate::cardano::config_params::fetch_config(
+                    &self.bf_base_url,
+                    &self.bf_project_id,
+                    addr,
+                    unit,
+                )
+            },
+        )
+        .await
+        .map_err(|e| {
+            EpochError::Chain(format!(
+                "bridge Config (federation identity #17/#21-#23): {e}"
+            ))
+        })?;
+
+        let registry =
+            crate::cardano::roster::RegistryRosterSource::resolve(cardano, Some(&view.params))
+                .map_err(|e| EpochError::Chain(format!("registry identity: {e}")))?;
+        let bans = crate::cardano::ban_list::BanListSource::resolve(cardano, Some(&view.params))
+            .map_err(|e| EpochError::Chain(format!("ban policy: {e}")))?;
+
+        // Say so when the chain moved under us. A federation identity change is a
+        // governance event, not a parameter tweak, and it must not be something an
+        // operator only discovers by diffing two nodes' logs.
+        for (what, was, now) in [
+            (
+                "registry",
+                self.registry_roster
+                    .as_ref()
+                    .map(|r| &r.registry_policy_hex),
+                registry.as_ref().map(|r| &r.registry_policy_hex),
+            ),
+            (
+                "treasury_info",
+                self.registry_roster
+                    .as_ref()
+                    .map(|r| &r.treasury_info_policy_hex),
+                registry.as_ref().map(|r| &r.treasury_info_policy_hex),
+            ),
+            (
+                "ban policy",
+                self.ban_source.as_ref().map(|b| &b.ban_policy_hex),
+                bans.as_ref().map(|b| &b.ban_policy_hex),
+            ),
+        ] {
+            if was != now {
+                warn!(
+                    "[federation] the bridge Config now publishes a different {what}: {} -> {} \
+                     (Config UTxO {}). This node follows the chain, not its startup snapshot",
+                    was.map_or("<none>", String::as_str),
+                    now.map_or("<none>", String::as_str),
+                    view.utxo
+                );
+            }
+        }
+        Ok((registry, bans))
     }
 
     /// Select where per-pool active stake is read (Blockfrost vs a local
@@ -1193,7 +1312,9 @@ impl CardanoChain for BlockfrostCardanoChain {
     }
 
     async fn query_roster(&self, epoch: u64) -> EpochResult<Roster> {
-        let Some(registry) = &self.registry_roster else {
+        // Re-read the federation identity — see `query_dkg_context`.
+        let (registry, bans) = self.current_federation().await?;
+        let Some(registry) = registry else {
             return Ok(self.fallback_roster.clone());
         };
         // WI-012: eligible roster = registry − active bans, FROST threshold
@@ -1202,8 +1323,8 @@ impl CardanoChain for BlockfrostCardanoChain {
         // `attempt` is 0 here; the orchestration layer (WI-014) bumps it on
         // a failed ceremony.
         let ctx = crate::cardano::dkg_roster::fetch_dkg_context(
-            registry,
-            self.ban_source.as_ref(),
+            &registry,
+            bans.as_ref(),
             &self.bf_base_url,
             &self.bf_project_id,
             self.stake_source,
@@ -1221,11 +1342,17 @@ impl CardanoChain for BlockfrostCardanoChain {
         epoch: u64,
         attempt: u32,
     ) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
-        match &self.registry_roster {
-            // Real eligible set + chain stake (registry − active bans).
+        // Re-read #17/#21-#23 rather than trusting the startup snapshot: this is
+        // the derivation whose inputs must be identical on every node, so it is
+        // the last one that should run on a per-node copy of chain state.
+        let (registry, bans) = self.current_federation().await?;
+        match &registry {
+            // WI-012: eligible roster = registry − active bans, FROST threshold
+            // stake-weighted. Any failure is hard — never silently fall back to
+            // the fixture, which would let SPOs run DKG on divergent rosters.
             Some(registry) => crate::cardano::dkg_roster::fetch_dkg_context(
                 registry,
-                self.ban_source.as_ref(),
+                bans.as_ref(),
                 &self.bf_base_url,
                 &self.bf_project_id,
                 self.stake_source,
@@ -1410,15 +1537,19 @@ impl CardanoChain for BlockfrostCardanoChain {
         epoch: u64,
         new_y_51: bitcoin::key::UntweakedPublicKey,
     ) -> EpochResult<Option<crate::epoch::traits::UpdateYPlan>> {
-        let Some(registry) = &self.registry_roster else {
+        // The treasury_info identity comes from the same re-read as the roster:
+        // this is the address a completed ceremony writes the new group key to,
+        // so a stale copy hands the treasury to a script nobody else watches.
+        let Some(registry) = self.current_federation().await?.0 else {
             warn!(
                 "[update-y] no treasury_info configured (cardano.registry_blueprint / \
-                 registry_bootstrap / treasury_info_asset_name) — the derived group key stays \
-                 LOCAL to this node and the treasury is NOT handed over"
+                 registry_bootstrap / treasury_info_asset_name, or the Config's published \
+                 identity at #21-#23) — the derived group key stays LOCAL to this node and \
+                 the treasury is NOT handed over"
             );
             return Ok(None);
         };
-        let state = self.find_treasury_info_state(registry).await?;
+        let state = self.find_treasury_info_state(&registry).await?;
 
         let current_key =
             bitcoin::key::UntweakedPublicKey::from_slice(&state.datum.current_spos_frost_key)
@@ -1459,7 +1590,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         plan: &crate::epoch::traits::UpdateYPlan,
         signature: &[u8; 64],
     ) -> EpochResult<String> {
-        let registry = self.registry_roster.as_ref().ok_or_else(|| {
+        let registry = self.current_federation().await?.0.ok_or_else(|| {
             EpochError::Chain("no treasury_info configured — cannot submit Update-Y".into())
         })?;
         let key = self.payment_key.as_ref().ok_or_else(|| {
@@ -1476,7 +1607,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         // been spent (a peer's rotation, a registration). The signature is
         // pinned to the outpoint it was made for, so a moved state must fail
         // loudly rather than build a transaction that cannot validate.
-        let state = self.find_treasury_info_state(registry).await?;
+        let state = self.find_treasury_info_state(&registry).await?;
         let outpoint = format!("{}:{}", state.tx_hash, state.output_index);
         if outpoint != plan.state_outpoint {
             return Err(EpochError::Chain(format!(
@@ -2102,11 +2233,82 @@ fn viable_in_flight_spends(
 
 #[cfg(test)]
 mod tests {
-    use super::{DkgFaultBanFlow, viable_in_flight_spends};
+    use super::{BlockfrostCardanoChain, DkgFaultBanFlow, viable_in_flight_spends};
     use crate::cardano::treasury_datum::UnconfirmedTm;
     use bitcoin::hashes::Hash as _;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
     use std::collections::HashSet;
+
+    /// A chain with no Bitcoin/Cardano state worth speaking of — enough to reach
+    /// the pure branches of `current_federation`, which is the only thing these
+    /// tests touch.
+    fn bare_chain() -> BlockfrostCardanoChain {
+        let key = bitcoin::key::UntweakedPublicKey::from_slice(&[
+            0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+            0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b,
+            0x16, 0xf8, 0x17, 0x98,
+        ])
+        .unwrap();
+        BlockfrostCardanoChain::new(
+            "preprodxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "addr_test1_treasury",
+            "aa".repeat(28),
+            String::new(),
+            crate::cardano::treasury_datum::TreasuryConfig {
+                y_51: key,
+                y_fed: key,
+                federation_csv_blocks: 144,
+                treasury_outpoint: op(0x11, 0),
+                treasury_value: Amount::from_sat(100_000),
+            },
+            crate::epoch::state::Roster {
+                epoch: 0,
+                min_signers: 2,
+                max_signers: 2,
+                participants: std::collections::BTreeMap::new(),
+            },
+            None,
+        )
+    }
+
+    /// The refresh has nowhere to read from unless the Config locator is set, and
+    /// in that state the startup-resolved pair must stand unchanged — that is the
+    /// fixture-roster deployment and every bridge whose Config predates the
+    /// federation appends. Without this, making the identity chain-live would
+    /// silently drop the local-keys route.
+    #[tokio::test]
+    async fn without_a_config_locator_the_pinned_federation_stands() {
+        let ban = crate::cardano::ban_list::BanListSource::from_policy_id(&[0xbb; 28], false);
+        let registry = crate::cardano::roster::RegistryRosterSource::from_policy_ids(
+            &[0xc1; 28],
+            &[0xc2; 28],
+            b"TMTx",
+            false,
+        );
+
+        // No refresh config at all — the pre-WI-068 shape.
+        let chain = bare_chain()
+            .with_registry_roster(registry.clone())
+            .with_ban_source(ban.clone());
+        let (r, b) = chain.current_federation().await.unwrap();
+        assert_eq!(r.unwrap().registry_policy_hex, "c1".repeat(28));
+        assert_eq!(b.unwrap().ban_policy_hex, "bb".repeat(28));
+
+        // Refresh config present but no Config UTxO to read it from: still the
+        // pinned pair, and crucially NOT a fetch against an unset address.
+        let chain = bare_chain()
+            .with_registry_roster(registry)
+            .with_ban_source(ban)
+            .with_federation_refresh(crate::config::CardanoConfig::default());
+        let (r, b) = chain.current_federation().await.unwrap();
+        assert_eq!(r.unwrap().treasury_info_policy_hex, "c2".repeat(28));
+        assert!(b.is_some());
+
+        // And with nothing pinned either, there is simply no registry — the
+        // fallback fixture roster, not an error.
+        let chain = bare_chain().with_federation_refresh(crate::config::CardanoConfig::default());
+        assert!(chain.current_federation().await.unwrap().0.is_none());
+    }
 
     /// WI-060: reading the ban list and enforcing faults are separate. A node
     /// may filter its roster without being able to publish a fault proof, so

@@ -1577,9 +1577,26 @@ async fn run_demo(
                      stake-weighted (WI-012) — demo.min_signers is ignored on this path"
                 );
                 // N10c: the same treasury_info the roster is verified against is
-                // the one a completed DKG rotates (Update-Y), so configuring the
-                // registry roster enables the handoff by construction.
-                info!("on-chain key handoff:  enabled (Update-Y after each DKG)");
+                // the one a completed DKG rotates (Update-Y). READING that roster
+                // needs only the published ids, but SPENDING the state UTxO needs
+                // the compiled script — so the handoff is a capability to report,
+                // not one the registry roster implies. Claiming it either way is
+                // the expensive mistake: an elected leader that cannot submit
+                // fails AFTER a full DKG and a distributed FROST authorization,
+                // then repeats that every cycle with nothing in this log to
+                // explain it.
+                if source.can_hand_off_key() {
+                    info!("on-chain key handoff:  enabled (Update-Y after each DKG)");
+                } else {
+                    warn!(
+                        "on-chain key handoff:  NOT possible on this node — the roster comes \
+                         from the Config's published identity (#21-#23) and there is no \
+                         compiled treasury_info script to spend the state UTxO with. DKG runs \
+                         and the group key is derived, but if this node is elected leader the \
+                         Update-Y FAILS and the treasury is not handed over. Set \
+                         cardano.registry_blueprint + cardano.treasury_policy_id to enable it"
+                    );
+                }
                 bf_chain = bf_chain.with_registry_roster(source);
                 // Ban filtering (WI-011/012): from the Config's published ban
                 // policy (#17) where the bridge has one, else the local keys.
@@ -1590,9 +1607,9 @@ async fn run_demo(
                     Ok(Some(bans)) => {
                         info!(
                             "on-chain ban list:     {} ({})",
-                            bans.source.ban_address, bans.origin
+                            bans.ban_address, bans.origin
                         );
-                        bf_chain = bf_chain.with_ban_source(bans.source);
+                        bf_chain = bf_chain.with_ban_source(bans);
                         match heimdall::cardano::blockfrost_chain::DkgFaultBanFlow::from_config(
                             &cfg.cardano,
                             bridge_config.as_ref().map(|v| &v.params),
@@ -1648,6 +1665,16 @@ async fn run_demo(
         }
 
         let bf_chain = apply_tm_policy(bf_chain, &cfg).expect("invalid TM policy config");
+
+        // Everything resolved above is what THIS PROCESS SAW AT BOOT. The
+        // federation identity is chain state a governance Update can move, so
+        // hand the chain the config it needs to re-resolve #17/#21-#23 on every
+        // roster read — otherwise two honest nodes filter different rosters
+        // according to when each was last restarted, which is the divergence
+        // publishing those fields was meant to end. Startup keeps resolving them
+        // anyway: it is what makes the report above real, and it is the only
+        // moment a misconfiguration can still be refused before the node runs.
+        let bf_chain = bf_chain.with_federation_refresh(cfg.cardano.clone());
 
         chain = Arc::new(bf_chain);
         pegin_source = Arc::new(BlockfrostPegInSource::new(
@@ -4736,36 +4763,52 @@ fn run_show_roster(
     use heimdall::cardano::bf_http;
     use heimdall::cardano::roster::RegistryRosterSource;
 
-    let blueprint = blueprint
-        .or_else(|| cfg.cardano.registry_blueprint.clone())
-        .ok_or("--blueprint (or cardano.registry_blueprint) required")?;
-    let bootstrap = registry_bootstrap
-        .or_else(|| cfg.cardano.registry_bootstrap.clone())
-        .ok_or("--registry-bootstrap (or cardano.registry_bootstrap) required")?;
-    let nft_name = treasury_nft_name
-        .or_else(|| cfg.cardano.treasury_info_asset_name.clone())
-        .ok_or("--treasury-nft-name (or cardano.treasury_info_asset_name) required")?;
     let pid = cfg
         .cardano
         .blockfrost_project_id
         .as_deref()
         .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
-    let tm_nft = cfg.cardano.tm_nft_policy()?;
-    let source = RegistryRosterSource::from_blueprint(
-        &blueprint,
-        &bootstrap,
-        &nft_name,
-        &tm_nft,
-        cfg.cardano.is_mainnet()?,
-    )
-    .map_err(|e| e.to_string())?;
+    // Resolve the registry the way the daemon does — published identity (#21-#23)
+    // first, local keys only otherwise. This report is what the operator guide
+    // sends people to in order to check their own registration, so it has to work
+    // on a bridge where the guide has already told them to delete those keys.
+    // The CLI flags stay as overrides, layered onto `[cardano]` before resolving
+    // so both halves of the report describe ONE deployment.
+    let bridge_config = config_view(&rt, cfg)?;
+    let cardano = heimdall::config::CardanoConfig {
+        registry_blueprint: blueprint.or_else(|| cfg.cardano.registry_blueprint.clone()),
+        registry_bootstrap: registry_bootstrap.or_else(|| cfg.cardano.registry_bootstrap.clone()),
+        treasury_info_asset_name: treasury_nft_name
+            .or_else(|| cfg.cardano.treasury_info_asset_name.clone()),
+        ..cfg.cardano.clone()
+    };
+    let source = RegistryRosterSource::resolve(&cardano, bridge_config.as_ref().map(|v| &v.params))
+        .map_err(|e| e.to_string())?
+        .ok_or(
+            "no registry to show: this bridge's Config publishes no registry identity \
+             (#21-#23), and cardano.registry_blueprint / registry_bootstrap / \
+             treasury_info_asset_name are unset. Pass --blueprint, --registry-bootstrap and \
+             --treasury-nft-name, or point cardano.config_address at a bridge that \
+             publishes them",
+        )?;
     println!("registry policy:   {}", source.registry_policy_hex);
     println!("registry address:  {}", source.registry_address);
     println!("treasury_info:     {}", source.treasury_info_address);
+    println!(
+        "registry source:   {}",
+        if bridge_config
+            .as_ref()
+            .is_some_and(|v| v.params.registry.is_some())
+        {
+            "bridge Config #21-#23"
+        } else {
+            "LOCAL heimdall.toml registry keys"
+        }
+    );
 
-    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
-    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let epoch = rt.block_on(bf_http::fetch_current_epoch(&base_url, pid))?;
     let snapshot = rt
         .block_on(source.fetch_snapshot(&base_url, pid))
@@ -4793,61 +4836,41 @@ fn run_show_roster(
     }
 
     // ── ban list (WI-011) ── list entries AND capture the active-ban set the
-    // Round-0 derivation below subtracts. Derive from the SAME resolved
-    // blueprint/registry-bootstrap (the ban policy is parameterized by the
-    // registry policy) so a --blueprint/--registry-bootstrap override can't
-    // make the sections describe different deployments. ban_bootstrap is
-    // config-only.
-    use heimdall::cardano::ban_list::{BanListError, BanListSource, BanPolicyParams};
+    // Round-0 derivation below subtracts. Resolved through the SAME call the
+    // daemon uses, over the same CLI-overridden `[cardano]` the registry half
+    // resolved from — so a --blueprint/--registry-bootstrap override cannot make
+    // the two sections describe different deployments, and this report cannot
+    // disagree with what the running node filters.
+    use heimdall::cardano::ban_list::{BanListError, BanListSource};
     let mut active_bans: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
-    let bridge_config = config_view(&rt, cfg)?;
-    let published_bans = bridge_config.as_ref().and_then(|v| v.params.bans.as_ref());
-    match (published_bans, cfg.cardano.ban_bootstrap.as_deref()) {
-        (None, None) => {
-            println!(
-                "ban list:          (not configured — this bridge's Config publishes no ban \
-                 policy, and cardano.ban_bootstrap is unset)"
-            );
-        }
-        (published, ban_bootstrap) => {
-            // The published policy id wins: it is what the daemon reads, so a
-            // report derived any other way would describe a roster this node
-            // does not actually filter.
-            let source = match published {
-                Some(b) => {
-                    println!("ban policy source: bridge Config #17");
-                    BanListSource::from_policy_id(&b.spo_bans_policy_id, cfg.cardano.is_mainnet()?)
-                }
-                // The fault-policy set + ban-schedule params are config-only
-                // (they are baked into the ban policy id), unlike --blueprint /
-                // --registry-bootstrap which may be CLI overrides.
-                None => {
-                    let ban_params =
-                        BanPolicyParams::resolve(&cfg.cardano, None).map_err(|e| e.to_string())?;
-                    println!("ban policy source: LOCAL heimdall.toml ban keys");
-                    BanListSource::from_blueprint(
-                        &blueprint,
-                        &bootstrap,
-                        ban_bootstrap.expect("the (None, None) arm above covers the other case"),
-                        &ban_params,
-                        cfg.cardano.is_mainnet()?,
-                    )
-                    .map_err(|e| e.to_string())?
-                }
-            };
+    match BanListSource::resolve(&cardano, bridge_config.as_ref().map(|v| &v.params)) {
+        Ok(None) => println!(
+            "ban list:          (not configured — this bridge's Config publishes no ban \
+             policy, and cardano.ban_bootstrap is unset)"
+        ),
+        // A report, so a bad ban configuration is printed rather than aborting
+        // the registry half above it — which is the half an operator ran this for.
+        Err(e) => println!("ban list:          UNRESOLVABLE — {e}"),
+        Ok(Some(source)) => {
+            println!("ban policy source: {}", source.origin);
             println!("ban policy:        {}", source.ban_policy_hex);
             println!("ban address:       {}", source.ban_address);
             // Ban activity is evaluated at the epoch boundary (chain-derived),
             // the same deterministic time the live roster path uses.
             let epoch_start_ms =
                 rt.block_on(bf_http::fetch_epoch_start_ms(&base_url, pid, epoch))?;
-            match rt.block_on(source.fetch_ban_list(&base_url, pid)) {
+            let read = rt.block_on(source.fetch_ban_list(&base_url, pid));
+            // Report the entries from the raw read, but take the ACTIVE SET
+            // through the same interpretation the daemon uses: an
+            // unbootstrapped list is "no bans" only where that reading is
+            // legitimate. Otherwise the eligible roster printed below would be
+            // the unfiltered one, presented as if it were the real one.
+            match &read {
                 Ok(bans) => {
-                    active_bans = bans.active_bans(epoch_start_ms);
                     println!(
                         "ban entries:       {} ({} active at epoch {epoch} boundary)",
                         bans.len(),
-                        active_bans.len()
+                        bans.active_bans(epoch_start_ms).len()
                     );
                     for (pool_id, data) in bans.iter() {
                         let state = if data.active_at(epoch_start_ms) {
@@ -4864,11 +4887,15 @@ fn run_show_roster(
                         );
                     }
                 }
-                // Expected until the ban root is minted (WI-015) — report,
-                // don't fail the read-only diagnostic.
+                // Expected on a bridge predating the ban infrastructure, and
+                // absorbed just below into "no bans". Where it is NOT expected
+                // `active_bans_from` re-raises it and this report stops.
                 Err(e @ BanListError::NotBootstrapped) => println!("ban list:          {e}"),
-                Err(e) => return Err(format!("ban list: {e}")),
+                Err(_) => {}
             }
+            active_bans = source
+                .active_bans_from(read, epoch_start_ms)
+                .map_err(|e| format!("ban list: {e}"))?;
         }
     }
 

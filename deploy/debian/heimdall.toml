@@ -118,8 +118,23 @@ stake_source = "blockfrost"
 #pegout_script_address = ""
 #bridged_token_unit = ""
 
-# On-chain SPO registry. Set all three to derive the signing roster from the
-# registry (the real path); leave unset only for the demo fixture roster.
+# On-chain SPO registry. LEAVE ALL THREE UNSET on any bridge whose Config
+# publishes the registry identity (fields #21-#23) — the node reads the registry
+# policy, the treasury_info policy and its state-NFT name from there, and there
+# is nothing here to get wrong. `heimdall show-config-params` prints what it
+# resolved; startup step 5 names the source.
+#
+# Set all three ONLY for a bridge deployed before those fields existed (or for
+# the demo fixture roster, which sets none of them). Half-set is a startup error,
+# not a fixture.
+#
+# One exception, and only if this node should perform the DKG key handoff:
+# spending the treasury_info state UTxO (Update-Y) needs the COMPILED script, not
+# just the policy id the Config publishes, so a handoff-capable node still sets
+# registry_blueprint (with treasury_policy_id above). What it derives is checked
+# against the published #22, so a wrong blueprint is refused rather than used.
+# Startup step 8 says which of the two you are. Without it this node still runs
+# DKG and signs; it just cannot be the one that rotates the key.
 #registry_blueprint = "/var/lib/heimdall/plutus.json"
 #registry_bootstrap = "<tx_hash>:<index>"
 #treasury_info_asset_name = ""
@@ -135,10 +150,16 @@ stake_source = "blockfrost"
 # why the daemon refuses to start with the registry keys set and no ban list from
 # either source.
 #
-# Set this ONLY for a bridge deployed before #17 existed, and then copy it
-# exactly from the deployment notes: it is an input to the ban policy's own
-# identifier, so a wrong value derives a valid-looking address holding no bans.
+# Set these ONLY for a bridge deployed before #17 existed, and then copy all
+# five exactly from the deployment notes: each is an input to the ban policy's
+# own identifier, so one wrong value derives a valid-looking address holding no
+# bans at all. On that route the registry keys above are required too — the ban
+# policy is parameterized by the registry policy.
 #ban_bootstrap = "<tx_hash>:<index>"
+#fault_proof_policies = ["<28-byte hex>", "<28-byte hex>", "<28-byte hex>"]
+#base_ban_duration_ms = 0
+#max_faults_before_permanent = 0
+#max_validity_window_ms = 0
 
 # Fault enforcement — publishing a fault proof on chain so misbehaviour costs
 # something. Entirely OPTIONAL and off by default: faults are detected and the
