@@ -1323,7 +1323,17 @@ mod tests {
         let (_s, pkg) =
             participant::dkg_part1(Identifier::try_from(1u16).unwrap(), 3, 2, &mut rng).unwrap();
         let (commitments, sigma_i) = frost_bridge::round1_fields(&pkg).unwrap();
-        let bytes = canonical::round1(EPOCH, THRESHOLD, attempt, &POOL, &commitments, &sigma_i);
+        let evidence_hash =
+            round1_evidence_hash_from_fields(&POOL, 1, &commitments, &sigma_i).unwrap();
+        let bytes = canonical::round1(
+            EPOCH,
+            THRESHOLD,
+            attempt,
+            &POOL,
+            &commitments,
+            &sigma_i,
+            &evidence_hash,
+        );
         let sig = auth::sign_payload(secp, kp, &bytes);
         (bytes, sig)
     }
@@ -1393,13 +1403,20 @@ mod tests {
         assert_eq!(&ev.payload_a[..66], &ev.payload_b[..66]);
         assert_eq!(&ev.payload_a[38..66], &POOL[..]);
         assert_ne!(ev.payload_a, ev.payload_b);
-        // (3) evidence_hash = blake2b_256(min(a,b) ‖ max(a,b)) — lock the formula.
+        // (3) evidence_hash = blake2b_256(DOMAIN ‖ len(lo) ‖ lo ‖ len(hi) ‖ hi),
+        //     over the payloads sorted — lock the formula, length prefixes and
+        //     all. Without them two payloads could be re-split at a different
+        //     boundary and hash the same; the domain keeps the digest from
+        //     colliding with any other blake2b use in the protocol.
         let (lo, hi) = if ev.payload_a <= ev.payload_b {
             (&ev.payload_a, &ev.payload_b)
         } else {
             (&ev.payload_b, &ev.payload_a)
         };
-        let mut preimage = lo.clone();
+        let mut preimage = EQUIVOCATION_DOMAIN.to_vec();
+        preimage.extend_from_slice(&(lo.len() as u64).to_be_bytes());
+        preimage.extend_from_slice(lo);
+        preimage.extend_from_slice(&(hi.len() as u64).to_be_bytes());
         preimage.extend_from_slice(hi);
         assert_eq!(ev.evidence_hash(), blake2b_256(&preimage));
         // (4) reject cases fail in Rust exactly as the validator rejects them.

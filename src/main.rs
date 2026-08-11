@@ -2100,6 +2100,27 @@ fn config_locator(cfg: &HeimdallConfig) -> Option<ConfigLocator> {
     })
 }
 
+/// Read the bridge Config UTxO, when this node is pointed at one.
+///
+/// `Ok(None)` means no Config is configured at all — not that the read failed.
+/// Callers that resolve a published identity fall back to their local keys on
+/// `None` and propagate a genuine read error.
+fn config_view(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+) -> Result<Option<heimdall::cardano::config_params::ConfigView>, String> {
+    let Some(loc) = config_locator(cfg) else {
+        return Ok(None);
+    };
+    rt.block_on(heimdall::cardano::config_params::fetch_config(
+        &loc.base_url,
+        &loc.project_id,
+        &loc.address,
+        &loc.nft_unit,
+    ))
+    .map(Some)
+}
+
 /// Freeze the scanned peg-outs against `batch` — the CLI sweep's half of the rule
 /// the epoch machine applies in `freeze_pegouts` (spec §TM batches; plan N19).
 ///
@@ -2853,7 +2874,7 @@ fn run_bootstrap_ban_list(
     // A bridge whose Config already names a ban policy already HAS a ban list.
     // Minting ban-root under a different policy would create a second list at an
     // address no SPO reads, so refuse rather than produce it.
-    if let Some(published) = bridge_config.as_ref().and_then(|v| v.params.bans.as_ref())
+    if let Some(published) = bridge_config.as_ref().map(|v| &v.params.bans)
         && published.spo_bans_policy_id != spo_bans.hash
     {
         return Err(format!(
@@ -4223,7 +4244,7 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
         u64::from(ban_index),
     )
     .map_err(|e| format!("parameterize spo_bans: {e}"))?;
-    if let Some(published) = bridge_config.as_ref().and_then(|v| v.params.bans.as_ref())
+    if let Some(published) = bridge_config.as_ref().map(|v| &v.params.bans)
         && published.spo_bans_policy_id != spo_bans.hash
     {
         return Err(format!(
@@ -4574,11 +4595,8 @@ fn run_show_roster(
     println!("treasury_info:     {}", source.treasury_info_address);
     println!(
         "registry source:   {}",
-        if bridge_config
-            .as_ref()
-            .is_some_and(|v| v.params.registry.is_some())
-        {
-            "bridge Config #21-#23"
+        if bridge_config.is_some() {
+            "bridge Config #11-#13"
         } else {
             "LOCAL heimdall.toml registry keys"
         }
@@ -5131,61 +5149,49 @@ fn run_show_config_params(cfg: &HeimdallConfig) -> Result<(), String> {
             s.leader_slot_t, s.tm_recovery_window, s.final_tm_cutoff, s.stability_window
         );
     }
-    match &snapshot.config.params.bans {
-        Some(b) => {
-            let mainnet = cfg.cardano.is_mainnet()?;
-            let source = heimdall::cardano::ban_list::BanListSource::from_policy_id(
-                &b.spo_bans_policy_id,
-                mainnet,
-            );
-            println!("#17 spo_bans policy: {}", source.ban_policy_hex);
-            println!("      ban address  : {}", source.ban_address);
-            println!("#18 base_ban_duration_ms      : {}", b.base_ban_duration_ms);
-            println!(
-                "#19 max_faults_before_permanent: {}",
-                b.max_faults_before_permanent
-            );
-            println!(
-                "#20 max_validity_window_ms     : {}",
-                b.max_validity_window_ms
-            );
-            println!(
-                "      (the roster is filtered against this address; no ban keys are needed \
-                 in [cardano])"
-            );
-        }
-        None => println!(
-            "#17-#20            : ABSENT — this Config predates the ban-policy append; the \
-             roster is filtered against the LOCAL cardano.ban_bootstrap keys"
-        ),
+    {
+        let b = &snapshot.config.params.bans;
+        let mainnet = cfg.cardano.is_mainnet()?;
+        let source =
+            heimdall::cardano::ban_list::BanListSource::from_policy_id(&b.spo_bans_policy_id, mainnet);
+        println!("#7  spo_bans policy: {}", source.ban_policy_hex);
+        println!("      ban address  : {}", source.ban_address);
+        println!("#8  base_ban_duration_ms      : {}", b.base_ban_duration_ms);
+        println!(
+            "#9  max_faults_before_permanent: {}",
+            b.max_faults_before_permanent
+        );
+        println!(
+            "#10 max_validity_window_ms     : {}",
+            b.max_validity_window_ms
+        );
+        println!(
+            "      (the roster is filtered against this address; no ban keys are needed \
+             in [cardano])"
+        );
     }
-    match &snapshot.config.params.registry {
-        Some(r) => {
-            let source = heimdall::cardano::roster::RegistryRosterSource::from_policy_ids(
-                &r.spos_registry_policy_id,
-                &r.treasury_info_policy_id,
-                &r.treasury_info_asset_name,
-                cfg.cardano.is_mainnet()?,
-            );
-            println!("#21 registry policy: {}", source.registry_policy_hex);
-            println!("      registry addr: {}", source.registry_address);
-            println!("#22 treasury_info  : {}", source.treasury_info_policy_hex);
-            println!("      state addr   : {}", source.treasury_info_address);
-            println!(
-                "#23 treasury_info NFT name: {} ({})",
-                source.treasury_info_asset_name_hex,
-                String::from_utf8_lossy(&r.treasury_info_asset_name)
-            );
-            println!(
-                "      (the roster is read from these; no registry keys are needed in \
-                 [cardano]. The Update-Y handoff additionally needs a blueprint to compile \
-                 treasury_info, checked against #22)"
-            );
-        }
-        None => println!(
-            "#21-#23            : ABSENT — this Config predates the registry append; the \
-             roster is located from the LOCAL cardano.registry_* keys"
-        ),
+    {
+        let r = &snapshot.config.params.registry;
+        let source = heimdall::cardano::roster::RegistryRosterSource::from_policy_ids(
+            &r.spos_registry_policy_id,
+            &r.treasury_info_policy_id,
+            &r.treasury_info_asset_name,
+            cfg.cardano.is_mainnet()?,
+        );
+        println!("#11 registry policy: {}", source.registry_policy_hex);
+        println!("      registry addr: {}", source.registry_address);
+        println!("#12 treasury_info  : {}", source.treasury_info_policy_hex);
+        println!("      state addr   : {}", source.treasury_info_address);
+        println!(
+            "#13 treasury_info NFT name: {} ({})",
+            source.treasury_info_asset_name_hex,
+            String::from_utf8_lossy(&r.treasury_info_asset_name)
+        );
+        println!(
+            "      (the roster is read from these; no registry keys are needed in \
+             [cardano]. The Update-Y handoff additionally needs a blueprint to compile \
+             treasury_info, checked against #12)"
+        );
     }
 
     let (params, source) = resolve_tm_params(Some(&snapshot), cfg.bitcoin.fee_rate_sat_per_vb);

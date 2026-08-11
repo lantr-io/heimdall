@@ -222,7 +222,7 @@ impl DkgFaultBanFlow {
         // so it can land on an address the bridge does not use — an ApplyBan
         // that confirms into a list nobody reads. Where the Config publishes the
         // policy id there is a right answer to compare against, so compare.
-        if let Some(published) = config.and_then(|c| c.bans.as_ref())
+        if let Some(published) = config.map(|c| &c.bans)
             && published.spo_bans_policy_id != spo_bans.hash
         {
             return Err(format!(
