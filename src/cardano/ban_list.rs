@@ -1643,6 +1643,7 @@ mod tests {
                 max_faults_before_permanent: 3,
                 max_validity_window_ms: 3_600_000,
             }),
+            registry: None,
         }
     }
 

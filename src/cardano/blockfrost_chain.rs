@@ -1505,9 +1505,21 @@ impl CardanoChain for BlockfrostCardanoChain {
 
         let epoch_i64 = i64::try_from(plan.epoch)
             .map_err(|_| EpochError::Chain("epoch too large for Plutus Int".into()))?;
+        // Spending the state UTxO needs the compiled script, not just the policy
+        // id the Config publishes (#22). A node reading the roster from the
+        // published identity alone can still run every other phase, so say which
+        // key is missing rather than failing at witness assembly.
+        let treasury_script = registry.treasury_info_script.as_ref().ok_or_else(|| {
+            EpochError::Chain(
+                "the key handoff (Update-Y) spends the treasury_info state UTxO, which needs the \
+                 compiled script — this node resolved the roster from the Config's published \
+                 identity and has no cardano.registry_blueprint to compile it from"
+                    .into(),
+            )
+        })?;
         let built = crate::cardano::update_y::build_update_y_tx(
             &crate::cardano::update_y::UpdateYRequest {
-                treasury_script: &registry.treasury_info_script,
+                treasury_script,
                 state: &state,
                 new_spos_frost_key: &plan.new_key.serialize(),
                 epoch: epoch_i64,

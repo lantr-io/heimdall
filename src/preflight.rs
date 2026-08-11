@@ -562,7 +562,10 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     // fixture-roster deployment, which legitimately has no reference script), and
     // an error when only some are — that half-configured state is a fault, not a
     // fixture.
-    let registry = crate::cardano::roster::RegistryRosterSource::from_config(&cfg.cardano);
+    let registry = crate::cardano::roster::RegistryRosterSource::resolve(
+        &cfg.cardano,
+        config.as_ref().map(|v| &v.params),
+    );
     match &registry {
         Ok(None) => b.push(
             5,

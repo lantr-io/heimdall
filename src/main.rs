@@ -1557,7 +1557,10 @@ async fn run_demo(
         // On-chain SPO registry roster (WI-010): configured via
         // cardano.{registry_blueprint, registry_bootstrap, treasury_info_asset_name}.
         // Without it query_roster serves the fixture roster.
-        match heimdall::cardano::roster::RegistryRosterSource::from_config(&cfg.cardano) {
+        match heimdall::cardano::roster::RegistryRosterSource::resolve(
+            &cfg.cardano,
+            bridge_config.as_ref().map(|v| &v.params),
+        ) {
             Ok(Some(source)) => {
                 info!("on-chain SPO registry: {}", source.registry_address);
                 info!(
@@ -5277,6 +5280,34 @@ fn run_show_config_params(cfg: &HeimdallConfig) -> Result<(), String> {
         None => println!(
             "#17-#20            : ABSENT — this Config predates the ban-policy append; the \
              roster is filtered against the LOCAL cardano.ban_bootstrap keys"
+        ),
+    }
+    match &snapshot.config.params.registry {
+        Some(r) => {
+            let source = heimdall::cardano::roster::RegistryRosterSource::from_policy_ids(
+                &r.spos_registry_policy_id,
+                &r.treasury_info_policy_id,
+                &r.treasury_info_asset_name,
+                cfg.cardano.is_mainnet()?,
+            );
+            println!("#21 registry policy: {}", source.registry_policy_hex);
+            println!("      registry addr: {}", source.registry_address);
+            println!("#22 treasury_info  : {}", source.treasury_info_policy_hex);
+            println!("      state addr   : {}", source.treasury_info_address);
+            println!(
+                "#23 treasury_info NFT name: {} ({})",
+                source.treasury_info_asset_name_hex,
+                String::from_utf8_lossy(&r.treasury_info_asset_name)
+            );
+            println!(
+                "      (the roster is read from these; no registry keys are needed in \
+                 [cardano]. The Update-Y handoff additionally needs a blueprint to compile \
+                 treasury_info, checked against #22)"
+            );
+        }
+        None => println!(
+            "#21-#23            : ABSENT — this Config predates the registry append; the \
+             roster is located from the LOCAL cardano.registry_* keys"
         ),
     }
 
