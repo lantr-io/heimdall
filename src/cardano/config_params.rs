@@ -49,6 +49,23 @@
 //! | 14 | `min_peg_out_fbtc` | TM skip rule |
 //! | 15 | `leader_reward` (lovelace) | pinned into the posted TM datum |
 //! | 16 | `schedule` (`ScheduleParams`) | surfaced; consumed by the N19 batch grid |
+//! | 17 | `spo_bans_policy_id` | the ban script address the roster is filtered against |
+//! | 18–20 | ban schedule (`base_ban_duration_ms`, `max_faults_before_permanent`, `max_validity_window_ms`) | the ApplyBan builder |
+//! | 21–23 | `spos_registry_policy_id`, `treasury_info_policy_id`, `treasury_info_asset_name` | the roster addresses |
+//!
+//! ## Why the policy ids are PUBLISHED rather than derived (#17, #21–#23)
+//!
+//! Every other ban value an operator could type — the three schedule numbers, the
+//! fault-verifier policy set, the bootstrap outref — is an *input* to the
+//! `spo_bans` policy id, not an output of it. So a node cannot derive the address
+//! it would read them from without already having them, and getting any one wrong
+//! derives a ban address no deployment has: a silently EMPTY ban list, and banned
+//! SPOs back in the roster with nothing in any log. Publishing the finished policy
+//! id breaks that cycle — a reader trusts the authenticated Config exactly as it
+//! already trusts the contract identifiers #0–#5, and needs no ban configuration
+//! whatsoever. A node that *does* still carry the local keys (for enforcement)
+//! cross-checks what it derives against #17 instead, so a stale copy is a startup
+//! error rather than an empty list. |
 
 use bitcoin::Amount;
 use pallas_codec::minicbor;
@@ -63,6 +80,14 @@ use tracing::{info, warn};
 /// Field count of a Config datum carrying the operational-parameter append
 /// (#12–#16 on top of upstream's 12 fields, `initial_btc_treasury_utxo` last).
 pub const CONFIG_FIELDS_WITH_TUNABLES: usize = 17;
+
+/// Field count of a Config datum carrying the ban-policy append (#17–#20) on top
+/// of the tunables.
+pub const CONFIG_FIELDS_WITH_BANS: usize = 21;
+
+/// Field count of a Config datum that also carries the registry identity
+/// (#21–#23) — the shape a bridge deployed at or after WI-068 genesis has.
+pub const CONFIG_FIELDS_WITH_REGISTRY: usize = 24;
 
 /// Field count of the upstream Config before the tunables were appended.
 const CONFIG_FIELDS_UPSTREAM: usize = 12;
@@ -101,6 +126,50 @@ pub struct Tunables {
     pub leader_reward: u64,
     /// #16.
     pub schedule: ScheduleParams,
+}
+
+/// Config #17–#20 — the ban policy, published so no SPO has to configure one.
+///
+/// Split by who needs what: #17 alone serves the MANDATORY read half (the roster
+/// is the registry minus active bans, so every node must read the same list), and
+/// #18–#20 serve the optional enforcement half — `apply_ban` computes a ban's end
+/// time from #18/#19 and bounds the ApplyBan validity interval by #20.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanParams {
+    /// #17. The `spo_bans` policy id; the ban script address follows from it, so
+    /// this one field is the whole read half.
+    pub spo_bans_policy_id: [u8; 28],
+    /// #18, milliseconds. `base_ban_duration_ms * 2^(n-1)` is the nth ban's length.
+    pub base_ban_duration_ms: i64,
+    /// #19. A pool is banned permanently at this many faults.
+    pub max_faults_before_permanent: i64,
+    /// #20, milliseconds. Upper bound on an ApplyBan tx's validity interval.
+    pub max_validity_window_ms: i64,
+}
+
+/// Config #21–#23 — the SPO registry's identity, published for the same reason
+/// as the ban policy: these are the values an SPO would otherwise hand-copy to
+/// locate the roster, and a wrong one yields a well-formed address holding
+/// nothing rather than an error.
+///
+/// Same read/spend split as the ban policy. READING the roster needs only what
+/// is here — no blueprint, no bootstrap outref, no TM-NFT policy. SPENDING the
+/// `treasury_info` state UTxO (the Update-Y key handoff) still needs the
+/// compiled script, so a node that performs handoffs also needs the blueprint;
+/// #22 becomes the cross-check on what it derives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryParams {
+    /// #21. The `spos_registry` policy id; the registry address follows from it.
+    pub spos_registry_policy_id: [u8; 28],
+    /// #22. The `treasury_info` policy id. A pure function of (#21, TM-NFT
+    /// policy), but published anyway: every reader must apply BOTH parameters
+    /// identically or it computes a different hash, a different address and an
+    /// unfindable state UTxO.
+    pub treasury_info_policy_id: [u8; 28],
+    /// #23. Asset name of the `treasury_info` state NFT — chosen at bootstrap
+    /// and derivable from nothing at all, so publishing it is the only way an
+    /// SPO can avoid typing it.
+    pub treasury_info_asset_name: Vec<u8>,
 }
 
 /// Config #0–#5 — the bridge's contract identifiers.
@@ -160,6 +229,12 @@ pub struct ConfigParams {
     pub initial_btc_treasury_utxo: Option<[u8; 36]>,
     /// #12–#16, or `None` on a Config that predates the append.
     pub tunables: Option<Tunables>,
+    /// #17–#20, or `None` on a Config that predates the ban append — on which a
+    /// node falls back to its local `[cardano]` ban keys.
+    pub bans: Option<BanParams>,
+    /// #21–#23, or `None` on a Config that predates the registry append — on
+    /// which a node falls back to its local `[cardano]` registry keys.
+    pub registry: Option<RegistryParams>,
 }
 
 /// Which Config UTxO a [`ConfigParams`] was read from.
@@ -342,12 +417,114 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
         None
     };
 
+    // Same rule one append later: #17-#20 landed together, so a datum stopping
+    // inside them is a botched Update. Refusing beats deriving a ban address from
+    // half a record — the failure that would produce is an empty ban list, which
+    // looks exactly like a bridge with no bans.
+    let bans = if field_count >= CONFIG_FIELDS_WITH_BANS {
+        Some(parse_bans(fields)?)
+    } else if field_count > CONFIG_FIELDS_WITH_TUNABLES {
+        return Err(format!(
+            "config datum has {field_count} fields — the ban policy is fields #17-#20, so a \
+             datum between {} and {} fields is a partially-applied governance Update. Refusing \
+             to guess which half is missing",
+            CONFIG_FIELDS_WITH_TUNABLES + 1,
+            CONFIG_FIELDS_WITH_BANS - 1,
+        ));
+    } else {
+        None
+    };
+
+    // Same all-or-nothing rule once more: #21-#23 landed as one append.
+    let registry = if field_count >= CONFIG_FIELDS_WITH_REGISTRY {
+        Some(parse_registry(fields)?)
+    } else if field_count > CONFIG_FIELDS_WITH_BANS {
+        return Err(format!(
+            "config datum has {field_count} fields — the registry identity is fields #21-#23, \
+             so a datum between {} and {} fields is a partially-applied governance Update. \
+             Refusing to guess which half is missing",
+            CONFIG_FIELDS_WITH_BANS + 1,
+            CONFIG_FIELDS_WITH_REGISTRY - 1,
+        ));
+    } else {
+        None
+    };
+
     Ok(ConfigParams {
         field_count,
         contracts,
         min_stake,
         initial_btc_treasury_utxo,
         tunables,
+        bans,
+        registry,
+    })
+}
+
+/// Decode #21–#23.
+fn parse_registry(fields: &[PlutusData]) -> Result<RegistryParams, String> {
+    let policy = |i: usize, name: &str| -> Result<[u8; 28], String> {
+        let raw =
+            plutus::field_bytes(fields, i).map_err(|e| format!("config #{i} ({name}): {e}"))?;
+        let len = raw.len();
+        <[u8; 28]>::try_from(raw).map_err(|_| {
+            format!("config #{i} ({name}) must be a 28-byte policy id, got {len} bytes")
+        })
+    };
+    let treasury_info_asset_name = plutus::field_bytes(fields, 23)
+        .map_err(|e| format!("config #23 (treasury_info_asset_name): {e}"))?;
+    // An empty asset name would match the policy's every token, so the state
+    // UTxO scan could not tell the singleton from anything else minted under it.
+    if treasury_info_asset_name.is_empty() {
+        return Err("config #23 (treasury_info_asset_name) is empty".to_string());
+    }
+    Ok(RegistryParams {
+        spos_registry_policy_id: policy(21, "spos_registry_policy_id")?,
+        treasury_info_policy_id: policy(22, "treasury_info_policy_id")?,
+        treasury_info_asset_name,
+    })
+}
+
+/// Decode #17–#20.
+///
+/// The bounds are `spo_bans`' own `ban_config_ok` bounds, checked here for the
+/// same reason the decoder rejects a zero fee rate: governance sanity is
+/// upstream's job, and refusing to act on a value the contract could not have
+/// been deployed with is ours. A zero `base_ban_duration_ms` would apply bans
+/// that expire the instant they start.
+fn parse_bans(fields: &[PlutusData]) -> Result<BanParams, String> {
+    let raw = plutus::field_bytes(fields, 17)
+        .map_err(|e| format!("config #17 (spo_bans_policy_id): {e}"))?;
+    let len = raw.len();
+    let spo_bans_policy_id = <[u8; 28]>::try_from(raw).map_err(|_| {
+        format!("config #17 (spo_bans_policy_id) must be a 28-byte policy id, got {len} bytes")
+    })?;
+    let at = |i: usize, name: &str| -> Result<i64, String> {
+        plutus::field_int(fields, i).map_err(|e| format!("config #{i} ({name}): {e}"))
+    };
+    let base_ban_duration_ms = at(18, "base_ban_duration_ms")?;
+    let max_faults_before_permanent = at(19, "max_faults_before_permanent")?;
+    let max_validity_window_ms = at(20, "max_validity_window_ms")?;
+    if base_ban_duration_ms <= 0 {
+        return Err(format!(
+            "config #18 (base_ban_duration_ms) must be > 0, got {base_ban_duration_ms}"
+        ));
+    }
+    if max_faults_before_permanent <= 0 {
+        return Err(format!(
+            "config #19 (max_faults_before_permanent) must be > 0, got {max_faults_before_permanent}"
+        ));
+    }
+    if max_validity_window_ms < 0 {
+        return Err(format!(
+            "config #20 (max_validity_window_ms) must be >= 0, got {max_validity_window_ms}"
+        ));
+    }
+    Ok(BanParams {
+        spo_bans_policy_id,
+        base_ban_duration_ms,
+        max_faults_before_permanent,
+        max_validity_window_ms,
     })
 }
 
@@ -639,6 +816,30 @@ mod tests {
         constr(0, fields)
     }
 
+    /// The 17-field shape plus the ban append (#17-#20).
+    fn config_datum_with_bans(policy: [u8; 28]) -> PlutusData {
+        let mut fields = plutus::constr_fields(&config_datum(7, 1_000, 100_000), 0)
+            .unwrap()
+            .to_vec();
+        fields.push(bytes(&policy)); // #17 spo_bans_policy_id
+        fields.push(int(600_000)); // #18 base_ban_duration_ms
+        fields.push(int(3)); // #19 max_faults_before_permanent
+        fields.push(int(3_600_000)); // #20 max_validity_window_ms
+        constr(0, fields)
+    }
+
+    /// The full genesis shape a WI-068 `deploy-bridge` writes: the ban policy
+    /// plus the registry identity.
+    fn config_datum_full() -> PlutusData {
+        let mut fields = plutus::constr_fields(&config_datum_with_bans([0xbb; 28]), 0)
+            .unwrap()
+            .to_vec();
+        fields.push(bytes(&[0xc1; 28])); // #21 spos_registry_policy_id
+        fields.push(bytes(&[0xc2; 28])); // #22 treasury_info_policy_id
+        fields.push(bytes(b"TMTx")); // #23 treasury_info_asset_name
+        constr(0, fields)
+    }
+
     fn snapshot_of(datum: &PlutusData) -> ParamSnapshot {
         ParamSnapshot {
             slot: 12_345,
@@ -717,6 +918,164 @@ mod tests {
         let fields = plutus::constr_fields(&full, 0).unwrap()[..15].to_vec();
         let err = parse_config_datum(&constr(0, fields)).unwrap_err();
         assert!(err.contains("partially-applied"), "{err}");
+    }
+
+    #[test]
+    fn decodes_the_published_ban_policy() {
+        let p = parse_config_datum(&config_datum_with_bans([0xbb; 28])).unwrap();
+        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_BANS);
+        let b = p.bans.unwrap();
+        assert_eq!(b.spo_bans_policy_id, [0xbb; 28]);
+        assert_eq!(b.base_ban_duration_ms, 600_000);
+        assert_eq!(b.max_faults_before_permanent, 3);
+        assert_eq!(b.max_validity_window_ms, 3_600_000);
+        // …and the tunables below it still decode: the ban fields are an append,
+        // not a replacement.
+        assert_eq!(p.tunables.unwrap().fee_rate_sat_per_vb, 7);
+    }
+
+    /// The deployed preprod shape, until the migrating Update lands. It must keep
+    /// working — a reader that required #17 would brick every node on the bridge
+    /// the moment it shipped.
+    #[test]
+    fn the_17_field_config_has_no_published_bans() {
+        let p = parse_config_datum(&config_datum(7, 1_000, 100_000)).unwrap();
+        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_TUNABLES);
+        assert!(p.bans.is_none());
+    }
+
+    /// Half the ban append is a botched Update. Guessing would derive a ban
+    /// address from a partial record — a valid-looking address holding no bans,
+    /// which reads exactly like a bridge that has never banned anyone.
+    #[test]
+    fn a_partial_ban_append_is_rejected() {
+        let full = config_datum_with_bans([0xbb; 28]);
+        for n in [18usize, 19, 20] {
+            let fields = plutus::constr_fields(&full, 0).unwrap()[..n].to_vec();
+            let err = parse_config_datum(&constr(0, fields)).unwrap_err();
+            assert!(err.contains("partially-applied"), "{n} fields: {err}");
+        }
+    }
+
+    #[test]
+    fn a_ban_policy_id_of_the_wrong_length_is_rejected() {
+        let mut fields = plutus::constr_fields(&config_datum_with_bans([0xbb; 28]), 0)
+            .unwrap()
+            .to_vec();
+        fields[17] = bytes(&[0xbb; 27]);
+        let err = parse_config_datum(&constr(0, fields)).unwrap_err();
+        assert!(err.contains("28-byte policy id"), "{err}");
+    }
+
+    /// `ban_config_ok`'s own bounds: a value the contract could not have been
+    /// deployed with means the reader is looking at the wrong thing.
+    #[test]
+    fn out_of_range_ban_schedule_values_are_rejected() {
+        let bad = |i: usize, v: i64| {
+            let mut fields = plutus::constr_fields(&config_datum_with_bans([0xbb; 28]), 0)
+                .unwrap()
+                .to_vec();
+            fields[i] = int(v);
+            parse_config_datum(&constr(0, fields)).unwrap_err()
+        };
+        assert!(bad(18, 0).contains("base_ban_duration_ms"));
+        assert!(bad(19, 0).contains("max_faults_before_permanent"));
+        assert!(bad(20, -1).contains("max_validity_window_ms"));
+    }
+
+    /// The cross-repo check: this is the datum `binocular update-config` actually
+    /// produces when it appends the ban policy to a 17-field Config, emitted from
+    /// `UpdateConfigCommand.rewriteFields` and serialised with Scalus. Two
+    /// independent encoders of one datum is exactly where a positional record
+    /// goes wrong, and the failure mode — a reader that mis-decodes #17 — is a
+    /// wrong ban address holding no bans.
+    #[test]
+    fn decodes_the_datum_binocular_update_config_writes() {
+        const VECTOR: &str = concat!(
+            "d8799f4100410141024103410441054106410741081a03938700410a58241111111111111111",
+            "11111111111111111111111111111111111111111111111111111111021903e81927101a001e",
+            "8480d8799f190e10191c20192a301954601907081907081902581a0001fa401a000546001a00",
+            "01fa40ff581cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1a000927",
+            "c0031a0036ee80ff",
+        );
+        let cbor = hex::decode(VECTOR).unwrap();
+        let datum: PlutusData = minicbor::decode(&cbor).unwrap();
+        let p = parse_config_datum(&datum).unwrap();
+
+        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_BANS);
+        let b = p.bans.expect("the appended ban policy");
+        assert_eq!(b.spo_bans_policy_id, [0xbb; 28]);
+        assert_eq!(b.base_ban_duration_ms, 600_000);
+        assert_eq!(b.max_faults_before_permanent, 3);
+        assert_eq!(b.max_validity_window_ms, 3_600_000);
+        // The append did not disturb what was already there.
+        assert_eq!(p.min_stake, 60_000_000);
+        assert_eq!(p.initial_btc_treasury_utxo, Some([0x11; 36]));
+        let t = p.tunables.expect("the tunables survive the append");
+        assert_eq!(t.fee_rate_sat_per_vb, 2);
+        assert_eq!(t.leader_reward, 2_000_000);
+        assert_eq!(t.schedule.tm_batch_interval, 21_600);
+    }
+
+    #[test]
+    fn decodes_the_published_registry_identity() {
+        let p = parse_config_datum(&config_datum_full()).unwrap();
+        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_REGISTRY);
+        let r = p.registry.unwrap();
+        assert_eq!(r.spos_registry_policy_id, [0xc1; 28]);
+        assert_eq!(r.treasury_info_policy_id, [0xc2; 28]);
+        assert_eq!(r.treasury_info_asset_name, b"TMTx");
+        // The appends below it are untouched.
+        assert_eq!(p.bans.unwrap().spo_bans_policy_id, [0xbb; 28]);
+        assert_eq!(p.tunables.unwrap().fee_rate_sat_per_vb, 7);
+    }
+
+    /// Both earlier shapes keep working: a bridge with the ban append but not the
+    /// registry one, and the deployed 17-field bridge with neither.
+    #[test]
+    fn the_earlier_config_shapes_have_no_published_registry() {
+        for (datum, bans) in [
+            (config_datum_with_bans([0xbb; 28]), true),
+            (config_datum(7, 1_000, 100_000), false),
+        ] {
+            let p = parse_config_datum(&datum).unwrap();
+            assert!(p.registry.is_none());
+            assert_eq!(p.bans.is_some(), bans);
+        }
+    }
+
+    #[test]
+    fn a_partial_registry_append_is_rejected() {
+        let full = config_datum_full();
+        for n in [22usize, 23] {
+            let fields = plutus::constr_fields(&full, 0).unwrap()[..n].to_vec();
+            let err = parse_config_datum(&constr(0, fields)).unwrap_err();
+            assert!(err.contains("partially-applied"), "{n} fields: {err}");
+        }
+    }
+
+    /// An empty asset name matches every token of the policy, so the state-UTxO
+    /// scan could not tell the singleton from anything else minted under it.
+    #[test]
+    fn an_empty_treasury_info_asset_name_is_rejected() {
+        let mut fields = plutus::constr_fields(&config_datum_full(), 0)
+            .unwrap()
+            .to_vec();
+        fields[23] = bytes(&[]);
+        let err = parse_config_datum(&constr(0, fields)).unwrap_err();
+        assert!(err.contains("treasury_info_asset_name"), "{err}");
+    }
+
+    #[test]
+    fn a_registry_policy_id_of_the_wrong_length_is_rejected() {
+        for i in [21usize, 22] {
+            let mut fields = plutus::constr_fields(&config_datum_full(), 0)
+                .unwrap()
+                .to_vec();
+            fields[i] = bytes(&[0xc1; 27]);
+            let err = parse_config_datum(&constr(0, fields)).unwrap_err();
+            assert!(err.contains("28-byte policy id"), "#{i}: {err}");
+        }
     }
 
     #[test]

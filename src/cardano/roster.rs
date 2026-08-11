@@ -84,6 +84,15 @@ pub enum RosterError {
     TooMany(usize),
     /// Bad blueprint/bootstrap configuration for the registry source.
     Config(String),
+    /// This node's locally compiled `treasury_info` hash disagrees with the one
+    /// the bridge Config publishes at #22.
+    ///
+    /// Distinct from [`Self::Config`] because the two are opposites on the
+    /// published route: a derivation that FAILS there costs only the Update-Y
+    /// capability (the addresses come from the Config), while one that SUCCEEDS
+    /// and disagrees means an Update-Y built here would write the key handoff to
+    /// an address no other SPO reads.
+    DerivedMismatch { derived: String, published: String },
 }
 
 impl std::fmt::Display for RosterError {
@@ -121,6 +130,15 @@ impl std::fmt::Display for RosterError {
             ),
             Self::TooMany(n) => write!(f, "{n} registrations exceed u16 FROST identifiers"),
             Self::Config(e) => write!(f, "registry source config: {e}"),
+            Self::DerivedMismatch { derived, published } => write!(
+                f,
+                "this node derives treasury_info policy {derived} but the bridge Config \
+                 publishes {published} (field #22) — an Update-Y built here would write the \
+                 key handoff to an address no other SPO reads. Check \
+                 cardano.registry_blueprint and cardano.treasury_policy_id (treasury_info's \
+                 two parameters), or delete the blueprint key and read the published identity \
+                 — this node then cannot perform the handoff"
+            ),
         }
     }
 }
@@ -408,7 +426,13 @@ pub struct RegistryRosterSource {
     /// witness, not just its hash. Reading the roster only needs the address and
     /// policy above, but re-deriving the script elsewhere would mean a second
     /// blueprint read and a second copy of the parameterization rules.
-    pub treasury_info_script: blueprint::ParameterizedScript,
+    ///
+    /// `None` when the source came from the Config's published identity (#21–#23)
+    /// and this node has no blueprint to compile it from. That is the read/spend
+    /// split: the published ids locate the roster, but a node that performs the
+    /// key handoff must also be able to build the script. Update-Y says so
+    /// explicitly rather than failing at witness-assembly time.
+    pub treasury_info_script: Option<blueprint::ParameterizedScript>,
     /// Treasury NFT asset name (hex), fixed at K1.
     pub treasury_info_asset_name_hex: String,
     /// `Roster::min_signers` override until WI-012's stake-weighted threshold.
@@ -461,10 +485,78 @@ impl RegistryRosterSource {
             registry_policy_hex: registry.hash_hex(),
             treasury_info_address: treasury.enterprise_address(network),
             treasury_info_policy_hex: treasury.hash_hex(),
-            treasury_info_script: treasury,
+            treasury_info_script: Some(treasury),
             treasury_info_asset_name_hex: treasury_info_asset_name_hex.to_string(),
             min_signers: None,
         })
+    }
+
+    /// The published route (WI-068): both addresses come from the policy ids the
+    /// Config carries at #21–#22, and the state NFT's name from #23.
+    ///
+    /// Nothing here reads a blueprint, an outref or the TM-NFT policy — which is
+    /// the point, since `treasury_info` is parameterized by TWO values that every
+    /// node must apply identically or it looks for the state UTxO at an address
+    /// nobody wrote to. `treasury_info_script` is left `None`; a node that also
+    /// performs the Update-Y handoff fills it in via [`Self::with_derived_script`].
+    #[must_use]
+    pub fn from_policy_ids(
+        spos_registry_policy_id: &[u8; 28],
+        treasury_info_policy_id: &[u8; 28],
+        treasury_info_asset_name: &[u8],
+        mainnet: bool,
+    ) -> Self {
+        let network = if mainnet {
+            pallas_addresses::Network::Mainnet
+        } else {
+            pallas_addresses::Network::Testnet
+        };
+        Self {
+            registry_address: blueprint::script_enterprise_address(
+                spos_registry_policy_id,
+                network,
+            ),
+            registry_policy_hex: hex::encode(spos_registry_policy_id),
+            treasury_info_address: blueprint::script_enterprise_address(
+                treasury_info_policy_id,
+                network,
+            ),
+            treasury_info_policy_hex: hex::encode(treasury_info_policy_id),
+            treasury_info_script: None,
+            treasury_info_asset_name_hex: hex::encode(treasury_info_asset_name),
+            min_signers: None,
+        }
+    }
+
+    /// Attach the compiled `treasury_info` script to a published source, so the
+    /// node can also SPEND the state UTxO (Update-Y).
+    ///
+    /// The derived hash must equal the published #22, and a mismatch is fatal:
+    /// the two parameters this compiles from are exactly what a node can get
+    /// wrong, and the consequence — a handoff written to an address no other SPO
+    /// reads — is the failure publishing #22 exists to prevent.
+    pub fn with_derived_script(
+        mut self,
+        blueprint_path: &str,
+        tm_nft_policy: &[u8; 28],
+    ) -> Result<Self, RosterError> {
+        let blueprint_json = std::fs::read_to_string(blueprint_path)
+            .map_err(|e| RosterError::Config(format!("read blueprint {blueprint_path}: {e}")))?;
+        let registry_policy: [u8; 28] = hex::decode(&self.registry_policy_hex)
+            .ok()
+            .and_then(|v| <[u8; 28]>::try_from(v).ok())
+            .ok_or_else(|| RosterError::Config("registry policy id is not 28 bytes".into()))?;
+        let treasury =
+            blueprint::treasury_info_script(&blueprint_json, &registry_policy, tm_nft_policy)
+                .map_err(|e| RosterError::Config(format!("parameterize treasury_info: {e}")))?;
+        if treasury.hash_hex() != self.treasury_info_policy_hex {
+            return Err(RosterError::DerivedMismatch {
+                derived: treasury.hash_hex(),
+                published: self.treasury_info_policy_hex.clone(),
+            });
+        }
+        self.treasury_info_script = Some(treasury);
+        Ok(self)
     }
 
     /// Build from `[cardano]` config: requires `registry_blueprint`,
@@ -495,6 +587,77 @@ impl RegistryRosterSource {
         // validator hash), required alongside the registry fields for a real roster.
         let tm_nft = cardano.tm_nft_policy().map_err(RosterError::Config)?;
         Self::from_blueprint(blueprint_path, bootstrap, asset_name_hex, &tm_nft, mainnet).map(Some)
+    }
+
+    /// Resolve the roster source the way every node should: from the bridge
+    /// Config when it publishes its registry identity (#21–#23), and only
+    /// otherwise from local keys.
+    ///
+    /// The precedence is not a preference. `treasury_info` is parameterized by
+    /// two values a node applies locally, so two nodes that disagree about either
+    /// look for the roster's state UTxO at different addresses — and the one that
+    /// is wrong finds nothing rather than an error. The Config is
+    /// NFT-authenticated and identical for everyone, so it is the only copy that
+    /// cannot diverge.
+    ///
+    /// A node that still carries the local keys derives from them too and CROSS-
+    /// CHECKS: that is how it keeps the compiled `treasury_info` script Update-Y
+    /// needs, and a disagreement is fatal rather than resolved by preference.
+    ///
+    /// Everything that derivation needs is OPTIONAL on this route, and a failure
+    /// to produce it is not fatal — the same treatment the ban sibling gives its
+    /// leftover keys. The addresses come from the Config; the compiled script buys
+    /// only the ability to SPEND the state UTxO, so a node with an unset
+    /// `tm_nft_policy`, a moved `plutus.json`, or a blueprint from a newer
+    /// contracts release loses the handoff and keeps the bridge. A derivation that
+    /// SUCCEEDS and disagrees with #22 stays fatal: that one is a real conflict
+    /// about where the handoff goes.
+    pub fn resolve(
+        cardano: &crate::config::CardanoConfig,
+        config: Option<&crate::cardano::config_params::ConfigParams>,
+    ) -> Result<Option<Self>, RosterError> {
+        let Some(published) = config.and_then(|c| c.registry.as_ref()) else {
+            return Self::from_config(cardano);
+        };
+        let mainnet = cardano.is_mainnet().map_err(RosterError::Config)?;
+        let source = Self::from_policy_ids(
+            &published.spos_registry_policy_id,
+            &published.treasury_info_policy_id,
+            &published.treasury_info_asset_name,
+            mainnet,
+        );
+        // The blueprint is a build artifact, not a per-bridge value, so a node
+        // may legitimately still have it while typing none of the identifiers.
+        // Where it does, compile the script for Update-Y — which also checks the
+        // derivation against #22.
+        let Some(blueprint_path) = cardano.registry_blueprint.as_deref() else {
+            return Ok(Some(source));
+        };
+        let derived = cardano
+            .tm_nft_policy()
+            .map_err(RosterError::Config)
+            .and_then(|tm_nft| source.clone().with_derived_script(blueprint_path, &tm_nft));
+        match derived {
+            Ok(with_script) => Ok(Some(with_script)),
+            Err(e @ RosterError::DerivedMismatch { .. }) => Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    "[roster] the bridge Config publishes the registry identity (#21-#23), so \
+                     this node reads the roster from it — but the local treasury_info script \
+                     could not be compiled ({e}). Reading is unaffected; an Update-Y key \
+                     handoff on this node is NOT possible until cardano.registry_blueprint and \
+                     cardano.treasury_policy_id resolve"
+                );
+                Ok(Some(source))
+            }
+        }
+    }
+
+    /// Whether this node can SPEND the `treasury_info` state UTxO — i.e. perform
+    /// the Update-Y key handoff after a DKG. Reading the roster never needs it.
+    #[must_use]
+    pub fn can_hand_off_key(&self) -> bool {
+        self.treasury_info_script.is_some()
     }
 
     /// Fetch + verify the snapshot, retrying transient failures.
@@ -928,5 +1091,242 @@ mod tests {
         assert!(parse_outref("aa:1").is_err());
         assert!(parse_outref(&"aa".repeat(32)).is_err());
         assert!(parse_outref(&format!("{}:x", "aa".repeat(32))).is_err());
+    }
+
+    // -- WI-068: the registry identity the bridge publishes -------------------
+
+    /// A Config carrying the registry append and nothing else this module reads.
+    fn config_publishing_registry() -> crate::cardano::config_params::ConfigParams {
+        use crate::cardano::config_params::{ConfigParams, Contracts, RegistryParams};
+        ConfigParams {
+            field_count: 24,
+            contracts: Contracts {
+                bridged_token_policy_id: vec![],
+                bridged_token_asset_name: vec![],
+                completed_peg_ins_policy_id: vec![],
+                completed_peg_outs_policy_id: vec![],
+                peg_in_script_hash: vec![],
+                peg_out_script_hash: vec![],
+            },
+            min_stake: 0,
+            initial_btc_treasury_utxo: None,
+            tunables: None,
+            bans: None,
+            registry: Some(RegistryParams {
+                spos_registry_policy_id: [0xc1; 28],
+                treasury_info_policy_id: [0xc2; 28],
+                treasury_info_asset_name: b"TMTx".to_vec(),
+            }),
+        }
+    }
+
+    /// The acceptance property: an SPO with NOTHING registry-related in its
+    /// `[cardano]` section resolves the roster, and two differently-configured
+    /// nodes cannot land on different addresses because neither derives one.
+    #[test]
+    fn a_published_registry_identity_needs_no_registry_keys() {
+        let published = config_publishing_registry();
+        let bare = crate::config::CardanoConfig {
+            network: Some("preprod".to_string()),
+            ..Default::default()
+        };
+        // Control: with no keys and no published identity there is no roster at
+        // all — the fixture path.
+        assert!(
+            RegistryRosterSource::resolve(&bare, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let src = RegistryRosterSource::resolve(&bare, Some(&published))
+            .unwrap()
+            .expect("the published identity resolves a roster source");
+        assert_eq!(src.registry_policy_hex, "c1".repeat(28));
+        assert_eq!(src.treasury_info_policy_hex, "c2".repeat(28));
+        assert_eq!(src.treasury_info_asset_name_hex, hex::encode("TMTx"));
+        assert!(src.registry_address.starts_with("addr_test1"));
+        assert_ne!(src.registry_address, src.treasury_info_address);
+        // No blueprint, so no compiled script — reading the roster does not need
+        // one; only the Update-Y handoff does, and it says so.
+        assert!(src.treasury_info_script.is_none());
+    }
+
+    /// A Config predating the append keeps the old behaviour exactly, including
+    /// the half-configured error.
+    #[test]
+    fn a_config_predating_the_registry_append_falls_back_to_local_keys() {
+        let mut pre_append = config_publishing_registry();
+        pre_append.registry = None;
+        pre_append.field_count = 21;
+        let half = crate::config::CardanoConfig {
+            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            ..Default::default()
+        };
+        for config in [None, Some(&pre_append)] {
+            let err = RegistryRosterSource::resolve(&half, config)
+                .expect_err("half-configured registry keys are a fault, not a fixture");
+            assert!(matches!(err, RosterError::Config(_)));
+        }
+    }
+
+    /// Write a blueprint carrying only `treasury_info` — the one validator the
+    /// published route ever compiles.
+    fn treasury_info_blueprint(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "heimdall-wi068-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plutus.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"validators":[{{"title":"{}","compiledCode":"{}"}}]}}"#,
+                crate::cardano::blueprint::TREASURY_INFO_TITLE,
+                include_str!("../../tests/fixtures/treasury_info_code.txt").trim()
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    /// The published policy id is the only copy that cannot diverge, so a local
+    /// derivation that disagrees is fatal rather than resolved by preference.
+    #[test]
+    fn a_derived_treasury_info_that_disagrees_with_the_config_is_fatal() {
+        let src = RegistryRosterSource::from_policy_ids(&[0xc1; 28], &[0xc2; 28], b"TMTx", false);
+        let path = treasury_info_blueprint("mismatch");
+
+        let err = src
+            .clone()
+            .with_derived_script(&path.to_string_lossy(), &[0x11; 28])
+            .expect_err("the fixture derives some other policy than the published #22");
+        let RosterError::DerivedMismatch { published, .. } = &err else {
+            panic!("expected a derived-vs-published mismatch, got {err:?}");
+        };
+        assert_eq!(*published, "c2".repeat(28));
+        assert!(err.to_string().contains("#22"), "{err}");
+
+        // …and when they agree, the script is attached so Update-Y can run.
+        let derived = crate::cardano::blueprint::treasury_info_script(
+            &std::fs::read_to_string(&path).unwrap(),
+            &[0xc1; 28],
+            &[0x11; 28],
+        )
+        .unwrap();
+        let agreeing =
+            RegistryRosterSource::from_policy_ids(&[0xc1; 28], &derived.hash, b"TMTx", false)
+                .with_derived_script(&path.to_string_lossy(), &[0x11; 28])
+                .expect("matching derivation");
+        assert!(agreeing.treasury_info_script.is_some());
+        assert!(agreeing.can_hand_off_key());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// The published route with the local keys STILL PRESENT — the state an
+    /// operator is in the moment before deleting them, and the one `resolve`'s
+    /// cross-check branch exists for.
+    #[test]
+    fn resolve_on_the_published_path_cross_checks_local_keys_when_they_derive() {
+        let path = treasury_info_blueprint("crosscheck");
+        let derived = crate::cardano::blueprint::treasury_info_script(
+            &std::fs::read_to_string(&path).unwrap(),
+            &[0xc1; 28],
+            &[0x11; 28],
+        )
+        .unwrap();
+
+        let mut published = config_publishing_registry();
+        published.registry.as_mut().unwrap().treasury_info_policy_id = derived.hash;
+        let cardano = crate::config::CardanoConfig {
+            network: Some("preprod".to_string()),
+            registry_blueprint: Some(path.to_string_lossy().into_owned()),
+            treasury_policy_id: Some(hex::encode([0x11; 28])),
+            ..Default::default()
+        };
+
+        // Agreement → the compiled script is attached, so this node can hand the
+        // key over as well as read the roster.
+        let src = RegistryRosterSource::resolve(&cardano, Some(&published))
+            .unwrap()
+            .expect("the published identity resolves");
+        assert_eq!(src.treasury_info_policy_hex, hex::encode(derived.hash));
+        assert!(
+            src.can_hand_off_key(),
+            "a node that CAN derive the script keeps Update-Y"
+        );
+
+        // Disagreement → fatal. Update-Y here would write the handoff to an
+        // address no other SPO reads, and no fallback makes that safe.
+        let mut wrong = published.clone();
+        wrong.registry.as_mut().unwrap().treasury_info_policy_id = [0xc2; 28];
+        let err = RegistryRosterSource::resolve(&cardano, Some(&wrong))
+            .expect_err("a derived hash disagreeing with #22 must not be resolved by preference");
+        assert!(
+            matches!(err, RosterError::DerivedMismatch { .. }),
+            "{err:?}"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// Everything the local derivation needs is optional on the published route:
+    /// the addresses come from the Config, and the compiled script buys only the
+    /// Update-Y handoff. So a node that cannot produce it loses the handoff and
+    /// KEEPS THE BRIDGE — the same treatment the ban sibling gives leftover keys.
+    ///
+    /// Before this, an unset `tm_nft_policy_id`, a moved `plutus.json` or a
+    /// blueprint from a newer contracts release each exited the daemon.
+    #[test]
+    fn an_undrivable_local_script_costs_the_handoff_not_the_roster() {
+        let published = config_publishing_registry();
+        let path = treasury_info_blueprint("undrivable");
+
+        let cases = [
+            // The blueprint is set but `tm_nft_policy` — treasury_info's second
+            // parameter — is not.
+            crate::config::CardanoConfig {
+                network: Some("preprod".to_string()),
+                registry_blueprint: Some(path.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            // The blueprint moved, or was never installed on this host.
+            crate::config::CardanoConfig {
+                network: Some("preprod".to_string()),
+                registry_blueprint: Some("/nonexistent/plutus.json".to_string()),
+                treasury_policy_id: Some(hex::encode([0x11; 28])),
+                ..Default::default()
+            },
+            // A blueprint that has no treasury_info validator at all (a newer or
+            // differently-built contracts release).
+            crate::config::CardanoConfig {
+                network: Some("preprod".to_string()),
+                registry_blueprint: Some(
+                    {
+                        let empty = path.parent().unwrap().join("empty.json");
+                        std::fs::write(&empty, r#"{"validators":[]}"#).unwrap();
+                        empty
+                    }
+                    .to_string_lossy()
+                    .into_owned(),
+                ),
+                treasury_policy_id: Some(hex::encode([0x11; 28])),
+                ..Default::default()
+            },
+        ];
+
+        for cardano in cases {
+            let src = RegistryRosterSource::resolve(&cardano, Some(&published))
+                .expect("an underivable local script is not fatal on the published route")
+                .expect("the published identity still resolves the roster");
+            assert_eq!(src.registry_policy_hex, "c1".repeat(28));
+            assert_eq!(src.treasury_info_policy_hex, "c2".repeat(28));
+            assert!(
+                !src.can_hand_off_key(),
+                "and it must not pretend it can hand the key over"
+            );
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

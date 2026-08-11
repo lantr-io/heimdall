@@ -558,11 +558,20 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     }
 
     // ── 5. Reference script — discover and report, never deploy ───────────
-    // `from_config` returns None only when NONE of the registry keys are set (the
-    // fixture-roster deployment, which legitimately has no reference script), and
-    // an error when only some are — that half-configured state is a fault, not a
-    // fixture.
-    let registry = crate::cardano::roster::RegistryRosterSource::from_config(&cfg.cardano);
+    // `resolve` returns None only when NONE of the registry keys are set AND the
+    // Config publishes no registry identity (the fixture-roster deployment, which
+    // legitimately has no reference script), and an error when the local keys are
+    // half-set or when a local derivation contradicts the published #22.
+    //
+    // NOT a startup gate. The registry reference script is what `register-spo`
+    // spends against; a running daemon reads the roster from UTxOs and never
+    // needs it. Failing here would exit(1) a packaged daemon on a bridge whose
+    // Config publishes the registry identity — exactly the deployment WI-068
+    // exists to make configuration-free — and systemd would crash-loop it.
+    let registry = crate::cardano::roster::RegistryRosterSource::resolve(
+        &cfg.cardano,
+        config.as_ref().map(|v| &v.params),
+    );
     match &registry {
         Ok(None) => b.push(
             5,
@@ -576,12 +585,13 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             Status::Fail,
             format!("cannot derive the registry script: {e}"),
             "set all of cardano.registry_blueprint, cardano.registry_bootstrap and \
-             cardano.treasury_info_asset_name — or none of them, for the fixture roster",
+             cardano.treasury_info_asset_name — or none of them, to read the registry \
+             identity the bridge publishes at Config #21-#23",
         ),
         Ok(Some(src)) => {
             let hash = &src.registry_policy_hex;
             match wallet_ref_script(cfg, &base_url, &project_id, hash).await {
-                Err(e) => b.push(5, "reference script", Status::Fail, e),
+                Err(e) => b.push(5, "reference script", Status::Warn, e),
                 Ok(Some(r)) => b.push(
                     5,
                     "reference script",
@@ -591,9 +601,13 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 Ok(None) => b.push_fix(
                     5,
                     "reference script",
-                    Status::Fail,
+                    Status::Warn,
                     format!("registry script {hash} is not deployed at this wallet"),
-                    "heimdall deploy-registry-ref --config <file> --blueprint <plutus.json> \
+                    "only needed to REGISTER — the daemon reads the roster without it, and \
+                     step 7 below says whether this node is already registered. To deploy it \
+                     you need the compiled script, so this one command still takes the \
+                     blueprint and the bootstrap outref:\n\
+                     heimdall deploy-registry-ref --config <file> --blueprint <plutus.json> \
                      --registry-bootstrap <txid:ix> --submit\n\
                      (~55 ADA, reclaimable — the daemon will not spend this for you)",
                 ),
@@ -615,21 +629,37 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             Status::Skipped,
             "no on-chain registry configured (fixture roster)",
         ),
-        Ok(Some(_)) => match crate::cardano::ban_list::BanListSource::from_config(&cfg.cardano) {
+        Ok(Some(_)) => match crate::cardano::ban_list::BanListSource::resolve(
+            &cfg.cardano,
+            config.as_ref().map(|v| &v.params),
+        ) {
             Ok(Some(src)) => {
-                let enforcing = cfg.cardano.fault_proof_srs_path.is_some();
+                // Ask the enforcement half itself rather than inferring from one
+                // of its five keys: a half-configured publish path answers
+                // `Err` here, which the daemon exits on, and reporting it as
+                // "enforcement configured" would hide exactly that.
+                let enforcement = crate::cardano::blockfrost_chain::DkgFaultBanFlow::from_config(
+                    &cfg.cardano,
+                    config.as_ref().map(|v| &v.params),
+                );
+                let (status, enforcement_note) = match &enforcement {
+                    Ok(Some(_)) => (Status::Pass, "fault enforcement configured".to_string()),
+                    Ok(None) => (
+                        Status::Pass,
+                        "detection only — faults excluded, not published".to_string(),
+                    ),
+                    Err(e) => (
+                        Status::Fail,
+                        format!("fault enforcement half-configured: {e}"),
+                    ),
+                };
                 b.push(
                     6,
                     "ban list",
-                    Status::Pass,
+                    status,
                     format!(
-                        "roster is ban-filtered against {} ({})",
-                        src.ban_address,
-                        if enforcing {
-                            "fault enforcement configured"
-                        } else {
-                            "detection only — faults excluded, not published"
-                        }
+                        "roster is ban-filtered against {} — {} ({enforcement_note})",
+                        src.ban_address, src.origin,
                     ),
                 );
             }
@@ -647,6 +677,8 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 format!("cannot derive the ban list: {e}"),
                 "the eligible roster is the registry MINUS active bans — a node that cannot \
                  read the list computes a different DKG participant set from one that can.\n\
+                 A bridge whose Config publishes the ban policy (#17) needs NO ban keys here; \
+                 otherwise:\n\
                  heimdall bootstrap-ban-list --config <file> ... --submit  (once per bridge)",
             ),
         },
@@ -709,6 +741,46 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 }
             }
         },
+    }
+
+    // ── 8. Key handoff (Update-Y) — a capability, reported not assumed ────
+    // A completed DKG only becomes consequential when `treasury_info` is rotated
+    // to the new group key, and SPENDING that state UTxO needs the compiled
+    // script — not just the policy id the Config publishes at #22. Reading the
+    // roster does not, so this is the one thing a fully published-route node
+    // still cannot do, and the one thing whose absence is invisible until it
+    // costs a whole ceremony: the leader fails at submission AFTER a full DKG and
+    // a distributed FROST authorization, and repeats that every cycle.
+    //
+    // A Warn, not a Fail: this node still runs and signs, and whether it is ever
+    // elected leader depends on the roster. Failing here would exit(1) a daemon
+    // that participates correctly.
+    match &registry {
+        Ok(None) | Err(_) => b.push(
+            8,
+            "key handoff (Update-Y)",
+            Status::Skipped,
+            "no on-chain registry configured (fixture roster)",
+        ),
+        Ok(Some(src)) if src.can_hand_off_key() => b.push(
+            8,
+            "key handoff (Update-Y)",
+            Status::Pass,
+            format!(
+                "treasury_info {} is compiled locally — this node can rotate the group key",
+                src.treasury_info_policy_hex
+            ),
+        ),
+        Ok(Some(_)) => b.push_fix(
+            8,
+            "key handoff (Update-Y)",
+            Status::Warn,
+            "no compiled treasury_info script — if this node is elected leader the \
+             Update-Y fails after a full DKG and the treasury is not handed over",
+            "set cardano.registry_blueprint and cardano.treasury_policy_id (treasury_info's \
+             two parameters). The derived hash is checked against the Config's #22, so a \
+             wrong one is refused rather than used",
+        ),
     }
 
     Report { steps: b.steps }

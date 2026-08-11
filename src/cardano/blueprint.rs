@@ -121,14 +121,7 @@ impl ParameterizedScript {
     /// Script(hash), stake: None }`.
     #[must_use]
     pub fn enterprise_address(&self, network: Network) -> String {
-        let shelley = ShelleyAddress::new(
-            network,
-            ShelleyPaymentPart::script_hash(self.hash.into()),
-            ShelleyDelegationPart::Null,
-        );
-        Address::Shelley(shelley)
-            .to_bech32()
-            .expect("bech32 encode script address")
+        script_enterprise_address(&self.hash, network)
     }
 
     /// The bech32 reward (stake) address (`stake_test1…` / `stake1…`) of this
@@ -156,6 +149,24 @@ impl ParameterizedScript {
             .to_bech32()
             .expect("bech32 of a mainnet/testnet stake address is total")
     }
+}
+
+/// Enterprise (no stake part) bech32 address of a bare script hash.
+///
+/// The half of [`ParameterizedScript::enterprise_address`] that needs no compiled
+/// code, for a script this node never parameterizes: the bridge Config publishes
+/// the finished `spo_bans` policy id (#17) and the ban script address is a pure
+/// function of it, so a node reads the ban list without a blueprint (WI-065).
+#[must_use]
+pub fn script_enterprise_address(hash: &[u8; 28], network: Network) -> String {
+    let shelley = ShelleyAddress::new(
+        network,
+        ShelleyPaymentPart::script_hash((*hash).into()),
+        ShelleyDelegationPart::Null,
+    );
+    Address::Shelley(shelley)
+        .to_bech32()
+        .expect("bech32 encode script address")
 }
 
 /// `compiledCode` (hex) of the validator titled `title`.

@@ -121,14 +121,32 @@ behaviour, and it is why these three cannot be left blank.
 the Config UTxO already knows. Step 4 checks what you typed against the chain, so a mistake is
 caught at startup rather than by a failed transaction — but you still have to type them.
 
-**[will be removed — WI-065]** The ban-list values are the same story, with a sharper edge.
-`ban_bootstrap`, `fault_proof_policies` and the three `*_ban_*` schedule numbers are required
-alongside the registry keys — the daemon refuses to start without them, because the eligible roster
-is the registry *minus* active bans and a node that cannot read that list computes a different DKG
-participant set from everyone else. They cannot be derived locally: they are inputs to the ban
-policy's own identifier, so you would need them to compute the address you would read them from.
-Copy them exactly; a wrong value yields a valid-looking address holding an empty list. WI-065 moves
-them into the Config UTxO, after which none of them are typed at all.
+**The registry and the ban list: usually nothing to type.** On a bridge deployed by
+`binocular deploy-bridge` at or after WI-068, the Config publishes the registry policy, the
+`treasury_info` policy and its state-NFT name (fields #21-#23) alongside the ban policy — so
+`registry_blueprint`, `registry_bootstrap` and `treasury_info_asset_name` are not needed either.
+Genesis mints both linked-list roots *before* the Config exists, so a bridge cannot exist without
+them; `heimdall bootstrap-registry` and `bootstrap-ban-list` are legacy, for bridges that predate
+that and for recovering a genesis that failed part-way.
+
+One thing the published ids do NOT cover: performing the DKG **key handoff** (Update-Y) spends the
+`treasury_info` state UTxO, and spending needs the compiled script rather than its hash. A node
+that does handoffs still needs a blueprint; what it derives is checked against the published #22,
+so a mismatch is a startup error instead of a handoff written where no one reads it.
+
+**The ban list specifically.** The eligible roster is the registry *minus* active bans,
+so a node that cannot read that list computes a different DKG participant set from everyone else —
+which is why the daemon refuses to start without one. But on a bridge whose Config publishes the
+ban policy (field #17), there is nothing to configure: the node reads the policy id from the
+Config, and the ban script address follows from it. `show-config-params` prints the address it
+resolved, and startup step 6 names the source.
+
+Only on a bridge whose Config *predates* that field do you still copy `ban_bootstrap`,
+`fault_proof_policies` and the three `*_ban_*` schedule numbers from the deployment notes. Copy them
+exactly: they are inputs to the ban policy's own identifier, so a wrong value yields a valid-looking
+address holding an empty list — banned SPOs back in your roster with nothing in any log. On a bridge
+that *does* publish #17, leftover local keys are simply unused; if they happen to derive a different
+policy the daemon says so and stops rather than picking one.
 
 **Secrets.** Two, and neither belongs in the TOML if you can avoid it:
 
@@ -193,27 +211,36 @@ sudo -u heimdall heimdall run-mover --config /etc/heimdall/heimdall.toml --once
 Run it as the `heimdall` user: the config is `0640 root:heimdall` so you cannot read it as
 yourself, and running as root would leave root-owned files in the state directory.
 
-This runs seven startup checks and prints all of them, then refuses to start if any failed. It is a
+This runs eight startup checks and prints all of them, then refuses to start if any failed. It is a
 dry run — it reads the chain and builds nothing.
 
 ```
-[1/7] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
-[2/7] cardano connectivity         PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
-[3/7] resolve the Config           PASS  2dce4027…#0 (17 fields, min_stake 0)
-[4/7] verify the contract set      PASS  6 identifier(s) agree with the Config
-[5/7] reference script             …
-[6/7] ban list                     PASS  roster is ban-filtered against addr_test1… (detection only)
-[7/7] registration status          …
+[1/8] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
+[2/8] cardano connectivity         PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
+[3/8] resolve the Config           PASS  2dce4027…#0 (24 fields, min_stake 0)
+[4/8] verify the contract set      PASS  every configured contract identifier matches the Config UTxO
+[5/8] reference script             …
+[6/8] ban list                     PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (#17) (detection only)
+[7/8] registration status          …
+[8/8] key handoff (Update-Y)       …
 ```
 
 Step 4 is the one that earns its keep: it compares every contract identifier you typed against the
 Config UTxO on chain and names any that disagree, with both values. Step 6 confirms your roster is
 ban-filtered — it fails if the registry is configured without a ban list, since that node could not
-agree with its peers on who is in the DKG. Steps 5 and 7 tell you what is still missing for
-registration — they never spend; they name the command and stop.
+agree with its peers on who is in the DKG. Step 7 tells you whether this node is registered; it
+never spends — it names the command and stops.
 
-Only `FAIL` blocks startup. A `WARN` is worth reading: `protocol.state_dir is unset` in particular
-is the one that silently costs money later.
+Only `FAIL` blocks startup. A `WARN` is worth reading, and steps 5 and 8 are the two you will most
+often see one on:
+
+- **Step 5 (`reference script`)** warns when the registry reference script is not deployed at your
+  wallet. That script is only needed to *register*; a running daemon reads the roster without it.
+- **Step 8 (`key handoff`)** warns when this node has no compiled `treasury_info` script. It still
+  runs DKG and signs — but if it is elected leader for an epoch, the Update-Y that hands the
+  treasury to the new group key fails, and the handoff does not happen. Set
+  `cardano.registry_blueprint` and `cardano.treasury_policy_id` to clear it.
+- `protocol.state_dir is unset` is the one that silently costs money later.
 
 Do not continue until this passes.
 
@@ -328,7 +355,7 @@ sudo -u heimdall heimdall show-roster --config /etc/heimdall/heimdall.toml
 ```
 
 Read-only. Your pool id and `bifrost_url` should appear. Re-running the step-4 check now should
-show `[6/6] registration status` satisfied.
+show `[7/8] registration status` satisfied.
 
 ---
 
@@ -436,7 +463,7 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 | the service will not start | `journalctl -u heimdall -p err`, then re-run the step-4 check — it names the failing check and what to fix |
 | starts, then nothing happens for days | expected; see *Quiet is normal* |
 | peers seem not to see you | step 5 — is the registered port open and reachable *from outside*? |
-| `[4/6] verify the contract set FAIL` | your config disagrees with the chain; the check prints both values for each mismatch |
+| `[4/8] verify the contract set FAIL` | your config disagrees with the chain; the check prints both values for each mismatch |
 | a transaction is refused | read the whole message: the min-stake gate and the preflight both refuse loudly rather than submitting something wrong |
 | it refuses to start over `cardano.fault_proof_srs_path` | you have DKG fault enforcement configured on mainnet against a setup that is not trustworthy — see [the fault-proof trusted setup](fault-proof-srs.md) |
 

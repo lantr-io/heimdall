@@ -373,7 +373,13 @@ pub struct CardanoConfig {
     /// The spo_bans one-shot bootstrap outref `<tx_hash>:<index>` that
     /// parameterizes the ban-list policy (the policy is also parameterized
     /// by the registry policy, so `registry_blueprint` + `registry_bootstrap`
-    /// must be set alongside). Unset → the ban list is not read.
+    /// must be set alongside).
+    ///
+    /// **Only for a bridge whose Config predates the ban-policy append.** Where
+    /// the Config publishes the finished policy id (#17) that value wins and this
+    /// key is not needed at all — see [`crate::cardano::ban_list::BanListSource::resolve`].
+    /// Left set on such a bridge it is unused, and a startup error if it derives
+    /// a different policy than the one published.
     pub ban_bootstrap: Option<String>,
     /// The authorized fault-verifier policy ids (hex), in the exact order the
     /// deployed `spo_bans` was parameterized with. The contract's
@@ -387,6 +393,8 @@ pub struct CardanoConfig {
     /// ban's length; a pool becomes permanently banned at
     /// `max_faults_before_permanent`; `max_validity_window_ms` bounds an
     /// ApplyBan tx's validity interval. All required alongside `ban_bootstrap`.
+    ///
+    /// Superseded by Config #18–#20 wherever the bridge publishes them.
     pub base_ban_duration_ms: Option<i64>,
     pub max_faults_before_permanent: Option<i64>,
     pub max_validity_window_ms: Option<i64>,
@@ -467,14 +475,41 @@ impl CardanoConfig {
     /// than guessed.
     pub fn is_mainnet(&self) -> Result<bool, String> {
         if let Some(network) = self.network.as_deref() {
-            return match network {
-                "mainnet" => Ok(true),
-                "preprod" | "preview" | "testnet" => Ok(false),
-                other => Err(format!(
-                    "unknown cardano.network {other:?} — expected \"mainnet\", \
-                     \"preprod\", \"preview\" or \"testnet\""
-                )),
+            let mainnet = match network {
+                "mainnet" => true,
+                "preprod" | "preview" | "testnet" => false,
+                other => {
+                    return Err(format!(
+                        "unknown cardano.network {other:?} — expected \"mainnet\", \
+                         \"preprod\", \"preview\" or \"testnet\""
+                    ));
+                }
             };
+            // Cross-check against the bridge itself. This value is the network
+            // TAG of every address this node derives, and it is the last input to
+            // those addresses still taken purely from local config — so a typo
+            // does not error, it produces a well-formed address on the other
+            // network that holds nothing. Where the roster and the ban list are
+            // concerned, "holds nothing" reads as "nobody is registered" and
+            // "nobody is banned", which is silent and wrong.
+            //
+            // The Config UTxO's own bech32 address is the bridge's own statement
+            // of which network it is on, so any disagreement is decisive.
+            if let Some(addr) = self.config_address.as_deref() {
+                let addr_mainnet = addr.starts_with("addr1") || addr.starts_with("stake1");
+                let addr_testnet =
+                    addr.starts_with("addr_test1") || addr.starts_with("stake_test1");
+                if (addr_mainnet || addr_testnet) && addr_mainnet != mainnet {
+                    return Err(format!(
+                        "cardano.network = {network:?} disagrees with cardano.config_address \
+                         {addr}, which is {} — every address this node derives (the registry, \
+                         the ban list, treasury_info) would carry the wrong network tag and \
+                         resolve to a valid-looking address holding nothing at all",
+                        if addr_mainnet { "mainnet" } else { "a testnet" }
+                    ));
+                }
+            }
+            return Ok(mainnet);
         }
         if self.blockfrost_url.is_some() {
             return Err(
@@ -792,6 +827,48 @@ fee_rate_sat_per_vb = 5
         local.network = Some("nonsense".to_string());
         let err = local.is_mainnet().expect_err("unknown network");
         assert!(err.contains("unknown cardano.network"), "{err}");
+    }
+
+    /// `cardano.network` is the network TAG of every address this node derives,
+    /// and the last input to those addresses still taken purely from local
+    /// config. A typo does not error on its own — it yields a well-formed address
+    /// on the other network holding nothing, which the roster reads as "nobody
+    /// registered" and the ban list as "nobody banned". The bridge's own Config
+    /// address states which network it is on, so the disagreement is decisive.
+    #[test]
+    fn a_network_disagreeing_with_the_bridges_own_address_is_refused() {
+        let testnet_addr = "addr_test1wq9dxvdxsmqcz9nk8w2n7tt6mkgvx8lsvkjy3kx0jkzmhtcxwvvhs";
+        let mainnet_addr = "addr1wx9dxvdxsmqcz9nk8w2n7tt6mkgvx8lsvkjy3kx0jkzmhtcqvvvhs";
+
+        let cfg = |network: &str, addr: &str| CardanoConfig {
+            network: Some(network.to_string()),
+            config_address: Some(addr.to_string()),
+            ..Default::default()
+        };
+
+        // Agreement, both ways round.
+        assert!(!cfg("preprod", testnet_addr).is_mainnet().unwrap());
+        assert!(cfg("mainnet", mainnet_addr).is_mainnet().unwrap());
+
+        // Disagreement, both ways round — and the message names both sides.
+        for (network, addr) in [("mainnet", testnet_addr), ("preprod", mainnet_addr)] {
+            let err = cfg(network, addr)
+                .is_mainnet()
+                .expect_err("the bridge's own address contradicts cardano.network");
+            assert!(err.contains(network), "{err}");
+            assert!(err.contains(addr), "{err}");
+        }
+
+        // No Config address to check against → nothing to contradict, and the
+        // fixture/demo deployments that set none keep working.
+        assert!(
+            CardanoConfig {
+                network: Some("mainnet".to_string()),
+                ..Default::default()
+            }
+            .is_mainnet()
+            .unwrap()
+        );
     }
 
     #[test]
