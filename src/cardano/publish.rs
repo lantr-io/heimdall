@@ -18,9 +18,8 @@
 //! index of the bridge-state singleton ([PTM-6]/[PTM-7]), the Config
 //! UTxO rides along as a second reference input (the validator reads
 //! `bridge_state_policy` from it, [PAR-1]), and the validator checks
-//! the embedded BTC tx spends the singleton's `treasury_utxo_id`. The
-//! always-ok scaffold policy (`ALWAYS_OK_PLUTUS_CBOR_HEX`) remains the
-//! no-script fallback.
+//! the embedded BTC tx spends the singleton's `treasury_utxo_id`.
+//! There is no scaffold fallback: `tm_script_cbor` is required.
 //!
 //! The current treasury is the singleton's head — no Confirmed chain
 //! walk exists any more.
@@ -33,7 +32,6 @@ use pallas_wallet::PrivateKey;
 use whisky::*;
 use whisky_pallas::WhiskyPallas;
 
-use crate::cardano::always_ok::{ALWAYS_OK_PLUTUS_CBOR_HEX, UNIT_REDEEMER_HEX};
 use crate::cardano::tx_common::whisky_network;
 use crate::cardano::wallet::pub_key_hash_hex;
 use crate::epoch::state::{EpochError, EpochResult};
@@ -110,15 +108,14 @@ impl MintRefs {
 }
 
 /// Encode the `UnconfirmedTm` datum:
-/// `Constr(constructor, [BoundedBytes(btc_tx), BoundedBytes(creator_pkh), BigInt(created_ms),
+/// `Constr(0, [BoundedBytes(btc_tx), BoundedBytes(creator_pkh), BigInt(created_ms),
 /// [BoundedBytes(outpoint_36) ..]])`.
 ///
-/// Constructor 0 = the record's only shape (rev 5.4: no `Confirmed` variant;
-/// the scaffold path may pass another tag). `creator` is the poster's payment
-/// key hash (it may GC the record after the on-chain grace period); `created`
-/// is POSIX ms, anchored by the TM mint policy to the tx's validity upper
-/// bound. The rev-5.3 `epoch`/`leader_reward` fields LEFT the datum (spec
-/// §Leader reward: DEFERRED).
+/// Constructor 0 is the record's ONLY shape (rev 5.4: no `Confirmed` variant).
+/// `creator` is the poster's payment key hash (it may GC the record after the
+/// on-chain grace period); `created` is POSIX ms, anchored by the TM mint
+/// policy to the tx's validity upper bound. The rev-5.3 `epoch`/`leader_reward`
+/// fields LEFT the datum (spec §Leader reward: DEFERRED).
 ///
 /// Field 3 `fulfilled_por_outpoints` is the rev-5.1 data-availability HINT: the
 /// Cardano outpoints (36 bytes each, tx hash ‖ output index LE) of the peg-out
@@ -134,13 +131,12 @@ impl MintRefs {
 /// Canonical encoding via `cardano::plutus::constr`.
 fn encode_datum_hex(
     btc_tx: &[u8],
-    constructor: u8,
     creator_pkh: &[u8],
     created_ms: i64,
     fulfilled_por_outpoints: &[[u8; 36]],
 ) -> String {
     let datum = crate::cardano::plutus::constr(
-        u64::from(constructor),
+        0,
         vec![
             crate::cardano::plutus::bytes(btc_tx),
             crate::cardano::plutus::bytes(creator_pkh),
@@ -157,10 +153,10 @@ fn encode_datum_hex(
     hex::encode(cbor)
 }
 
-/// Build the Cardano transaction that updates the treasury oracle by
-/// creating a new UTxO at the treasury address with:
-/// - inline datum: `Constr(constructor, [BoundedBytes(signed_btc_tx)])`
-/// - 1 freshly-minted treasury marker token
+/// Build the Cardano transaction that posts a TM record: a new UTxO at the
+/// TM address with:
+/// - inline datum: the `UnconfirmedTm` record (Constr 0)
+/// - 1 freshly-minted TM NFT (empty asset name, the real validator policy)
 ///
 /// The old oracle UTxO is NOT spent.
 ///
@@ -171,19 +167,18 @@ pub fn build_oracle_update_tx(
     treasury_policy_id: &str,
     treasury_asset_name_hex: &str,
     signed_btc_tx: &[u8],
-    constructor: u8,
     wallet_utxos: &[WalletUtxo],
     key: &PrivateKey,
-    // When `Some`, mint the TM NFT under the real TreasuryMovementValidator policy (CBOR from
-    // `binocular tm-script`). `treasury_policy_id` must then be the validator's script hash
-    // and `treasury_asset_name_hex` empty (the validator counts the empty-name token). When `None`,
-    // falls back to the always-ok scaffold policy (legacy).
-    tm_script_cbor: Option<&str>,
+    // The TreasuryMovementValidator CBOR (from `binocular tm-script`). REQUIRED: the TM NFT is
+    // only ever minted under the real policy — `treasury_policy_id` must be the validator's
+    // script hash and `treasury_asset_name_hex` empty (the validator counts the empty-name
+    // token). The always-ok scaffold fallback is gone with binocular's TmtxScript.
+    tm_script_cbor: &str,
     // The chain-linkage mint references `(config_utxo, singleton_utxo)` as `(tx_hash, index)`
     // pairs: the validator reads `bridge_state_policy` from the Config reference ([PAR-1]) and
     // checks the embedded BTC tx spends the singleton's head ([PTM-6]), authenticating the
-    // singleton reference by its "BSS" NFT ([PTM-7]). Required alongside `tm_script_cbor`.
-    mint_refs: Option<MintRefs>,
+    // singleton reference by its "BSS" NFT ([PTM-7]).
+    mint_refs: &MintRefs,
     // When `Some`, the network's live Plutus cost models `[V1, V2, V3]` (from Blockfrost). Used via
     // `Network::Custom` so the script-integrity hash matches the ledger's even when whisky's
     // hardcoded per-network cost models are stale. `None` → whisky's built-in Preprod models.
@@ -212,7 +207,6 @@ pub fn build_oracle_update_tx(
         hex::decode(&pkh).map_err(|e| EpochError::Chain(format!("wallet pkh decode: {e}")))?;
     let datum_hex = encode_datum_hex(
         signed_btc_tx,
-        constructor,
         &creator_pkh,
         created_ms,
         fulfilled_por_outpoints,
@@ -281,18 +275,14 @@ pub fn build_oracle_update_tx(
         // the SORTED order (see `MintRefs::sorted`) — the ledger presents reference inputs to
         // the script sorted by (tx_hash, index), and the redeemer's index points into that view.
         reference_inputs: mint_refs
-            .as_ref()
-            .map(|r| {
-                r.sorted()
-                    .into_iter()
-                    .map(|(h, i)| RefTxIn {
-                        tx_hash: h,
-                        tx_index: i,
-                        script_size: None,
-                    })
-                    .collect()
+            .sorted()
+            .into_iter()
+            .map(|(h, i)| RefTxIn {
+                tx_hash: h,
+                tx_index: i,
+                script_size: None,
             })
-            .unwrap_or_default(),
+            .collect(),
         withdrawals: vec![],
         mints: vec![MintItem::ScriptMint(ScriptMint {
             mint: MintParameter {
@@ -301,35 +291,29 @@ pub fn build_oracle_update_tx(
                 amount: 1,
             },
             redeemer: Some(Redeemer {
-                // Real validator: TmMintRedeemer(bridgeStateRefInputIndex) = Constr(0, [i]),
-                // where `i` is the singleton's position among the SORTED reference inputs
-                // ([PTM-7] then authenticates it by the "BSS" NFT, so a wrong index fails
-                // rather than misleads). Scaffold: unit.
-                data: match (tm_script_cbor, mint_refs.as_ref()) {
-                    (Some(_), Some(r)) => hex::encode(
-                        minicbor::to_vec(&crate::cardano::plutus::constr(
-                            0,
-                            vec![crate::cardano::plutus::int(i64::from(
-                                r.singleton_sorted_index(),
-                            ))],
-                        ))
-                        .expect("redeemer CBOR encode"),
-                    ),
-                    _ => UNIT_REDEEMER_HEX.to_string(),
-                },
-                // Generous budget for the real TreasuryMovementValidator mint branch (parses the
-                // embedded BTC tx's first input, reads the reference datum, checks the NFT
-                // binding). The always-ok scaffold needed ~14k mem; the validator needs much
-                // more. Well within Conway tx limits.
+                // TmMintRedeemer(bridgeStateRefInputIndex) = Constr(0, [i]), where `i` is the
+                // singleton's position among the SORTED reference inputs ([PTM-7] then
+                // authenticates it by the "BSS" NFT, so a wrong index fails rather than
+                // misleads).
+                data: hex::encode(
+                    minicbor::to_vec(&crate::cardano::plutus::constr(
+                        0,
+                        vec![crate::cardano::plutus::int(i64::from(
+                            mint_refs.singleton_sorted_index(),
+                        ))],
+                    ))
+                    .expect("redeemer CBOR encode"),
+                ),
+                // Generous budget for the TreasuryMovementValidator mint branch (parses the
+                // embedded BTC tx's first input, reads the reference datums, checks the NFT
+                // binding). Well within Conway tx limits.
                 ex_units: Budget {
                     mem: 2_000_000,
                     steps: 900_000_000,
                 },
             }),
             script_source: Some(ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
-                script_cbor: tm_script_cbor
-                    .unwrap_or(ALWAYS_OK_PLUTUS_CBOR_HEX)
-                    .to_string(),
+                script_cbor: tm_script_cbor.to_string(),
                 language_version: LanguageVersion::V3,
             })),
         })],
@@ -403,7 +387,6 @@ mod tests {
         let op2 = crate::cardano::cpo_trie::hint_bytes(&[0xbb; 32], 0);
         let c = decode(&encode_datum_hex(
             &btc_tx,
-            0,
             &creator,
             1_700_000_000_000,
             &[op1, op2],
@@ -464,7 +447,7 @@ mod tests {
     fn the_written_hint_is_what_the_reconstruction_reader_parses() {
         let op1 = crate::cardano::cpo_trie::hint_bytes(&[0xaa; 32], 1);
         let op2 = crate::cardano::cpo_trie::hint_bytes(&[0xbb; 32], 7);
-        let hex_str = encode_datum_hex(&[0x02], 0, &[0x7a; 28], 1, &[op1, op2]);
+        let hex_str = encode_datum_hex(&[0x02], &[0x7a; 28], 1, &[op1, op2]);
         let cbor = hex::decode(&hex_str).unwrap();
         let pd: PlutusData = pallas_codec::minicbor::decode(&cbor).unwrap();
         assert_eq!(
@@ -476,7 +459,7 @@ mod tests {
     // A zero-peg-out TM still writes the field — as an empty list.
     #[test]
     fn a_zero_pegout_tm_writes_an_empty_hint_list() {
-        let c = decode(&encode_datum_hex(&[0x02], 0, &[0x7a; 28], 1, &[]));
+        let c = decode(&encode_datum_hex(&[0x02], &[0x7a; 28], 1, &[]));
         assert_eq!(c.fields.len(), 4);
         match &c.fields[3] {
             PlutusData::Array(items) => assert!(items.is_empty()),

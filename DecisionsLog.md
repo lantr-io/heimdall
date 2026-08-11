@@ -1014,3 +1014,13 @@ is for). `bitcoin.rpc_url` serves only that opt-in path and the federation
 ops tools (`treasury-self-send`, `federation-spend`), which are not SPO
 runtime. The `gettxout` helpers are deleted; `broadcast_btc_tx` remains.
 
+**DEC-036: the always-ok posting scaffold is gone; `tm_script_cbor` is
+required.** binocular deleted TmtxScript (its salted always-ok stand-in) and
+the create-tmtx/spend-tmtx commands, so a post minted under anything but the
+real TreasuryMovementValidator lands at an address nothing scans. `publish.rs`
+therefore refuses to build without `cardano.tm_script_cbor`, the
+`oracle_constructor` knob is deleted (the UnconfirmedTm record is the only
+datum shape - always Constr 0), and the `"TMTx"` asset-name defaults become
+`""` (the real validator counts the empty-name token). `always_ok.rs` survives
+as a TEST FIXTURE ONLY for the tx-composition tests.
+

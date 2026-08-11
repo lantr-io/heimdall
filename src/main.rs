@@ -113,16 +113,16 @@ enum Commands {
         /// collection window.
         #[arg(long)]
         pegin_poll_ms: Option<u64>,
-        /// Bech32 address holding the treasury oracle UTxO. Defaults
-        /// to the always-OK testnet address.
+        /// Bech32 address of the TM validator (where TM records are posted).
+        /// Defaults to `cardano.treasury_address`.
         #[arg(long)]
         treasury_address: Option<String>,
-        /// Treasury marker token policy ID (56 hex chars). Defaults to
-        /// the always-OK script hash.
+        /// TM NFT policy ID (56 hex chars) = the TreasuryMovementValidator
+        /// script hash.
         #[arg(long)]
         treasury_policy_id: Option<String>,
-        /// Treasury marker token asset name as hex. Defaults to "TMTx"
-        /// (`544d5478`).
+        /// TM NFT asset name as hex. Defaults to "" — the real validator
+        /// counts the empty-name token.
         #[arg(long)]
         treasury_asset_name: Option<String>,
         /// BIP-39 mnemonic (12/15/24 words, space-separated) for the
@@ -1328,10 +1328,10 @@ fn main() {
     }
 }
 
-/// Apply the real TM-NFT minting policy and the Config-UTxO locator to the chain. Requires
+/// Apply the TM-NFT minting policy and the Config-UTxO locator to the chain. Requires
 /// `cardano.tm_script_cbor`, `cardano.config_address` and `cardano.config_nft_policy_id` to be
-/// configured together (else leave the always-ok scaffold; the Config UTxO anchors the TM chain
-/// the mint redeemer links against). Errors on a half-configured set.
+/// configured together — posting has no scaffold fallback, and the Config UTxO locates the
+/// bridge-state singleton the mint redeemer links against. Errors on a half-configured set.
 fn apply_tm_policy(
     chain: BlockfrostCardanoChain,
     cfg: &HeimdallConfig,
@@ -1386,11 +1386,9 @@ async fn run_demo(
     let script_address: String = cfg.cardano.pegin_script_address.clone().unwrap_or_default();
     let treasury_address: String = cfg.cardano.treasury_address.clone().unwrap_or_default();
     let treasury_policy_id: String = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
-    let treasury_asset_name_hex: String = cfg
-        .cardano
-        .treasury_asset_name
-        .clone()
-        .unwrap_or_else(|| hex::encode("TMTx"));
+    // Default "" — the real TM validator counts the empty-name token.
+    let treasury_asset_name_hex: String =
+        cfg.cardano.treasury_asset_name.clone().unwrap_or_default();
 
     // Chain + pegin source selection:
     // blockfrost_project_id → Blockfrost for both chain + pegin source
@@ -1481,11 +1479,7 @@ async fn run_demo(
             );
         }
 
-        bf_chain = bf_chain.with_submit_config(
-            cfg.bitcoin.submit,
-            cfg.cardano.submit_oracle,
-            cfg.cardano.oracle_constructor,
-        );
+        bf_chain = bf_chain.with_submit_config(cfg.bitcoin.submit, cfg.cardano.submit_oracle);
 
         // Per-pool stake source for the DKG threshold (default Blockfrost;
         // "yaci_store" for a local yaci-devkit devnet).
@@ -5288,14 +5282,11 @@ struct ChainTip {
     in_flight: bool,
 }
 
-/// The treasury marker-token asset name (hex). Shared by every treasury-sourcing
-/// path so they scan the SAME token unit; the real TM validator uses an empty
-/// asset name, the always-ok scaffold uses "TMTx".
+/// The TM NFT asset name (hex). Shared by every treasury-sourcing path so they
+/// scan the SAME token unit. Defaults to "" — the real TM validator counts the
+/// empty-name token (there is no scaffold asset name any more).
 fn treasury_asset_name_hex(cfg: &HeimdallConfig) -> String {
-    cfg.cardano
-        .treasury_asset_name
-        .clone()
-        .unwrap_or_else(|| hex::encode("TMTx"))
+    cfg.cardano.treasury_asset_name.clone().unwrap_or_default()
 }
 
 /// The current treasury for the CLI sweep: the bridge-state singleton's head.
@@ -5933,11 +5924,7 @@ fn run_sweep_pegins(
                 "cardano.treasury_address must be set (the TM validator address)".to_string()
             })?;
         let treasury_policy_id = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
-        let treasury_asset_name_hex = cfg
-            .cardano
-            .treasury_asset_name
-            .clone()
-            .unwrap_or_else(|| hex::encode("TMTx"));
+        let treasury_asset_name_hex = cfg.cardano.treasury_asset_name.clone().unwrap_or_default();
         let treasury_config = TreasuryConfig {
             y_51: fixture.y_51,
             y_fed: fixture.y_fed,
@@ -5979,11 +5966,7 @@ fn run_sweep_pegins(
         } else {
             cfg.bitcoin.submit
         };
-        chain = chain.with_submit_config(
-            bitcoin_submit,
-            cfg.cardano.submit_oracle,
-            cfg.cardano.oracle_constructor,
-        );
+        chain = chain.with_submit_config(bitcoin_submit, cfg.cardano.submit_oracle);
         chain = chain.with_validity_window(cfg.cardano.tm_validity_window_secs.unwrap_or(1800));
         let chain = apply_tm_policy(chain, cfg)?;
         // The data-availability hint describes the peg-outs of the tx being posted.

@@ -510,8 +510,6 @@ pub struct BlockfrostCardanoChain {
     submit_btc: bool,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     submit_oracle: bool,
-    /// Constructor tag used in the oracle datum (0 = unconfirmed, 1 = confirmed).
-    oracle_constructor: u8,
     /// Resolved Blockfrost base URL + project id, for raw-HTTP UTxO queries (lenient parsing).
     bf_base_url: String,
     bf_project_id: String,
@@ -742,7 +740,6 @@ impl BlockfrostCardanoChain {
             btc_rpc: None,
             submit_btc: false,
             submit_oracle: true,
-            oracle_constructor: 0,
             tm_script_cbor: None,
             validity_window_secs: 1800,
             config_address: None,
@@ -1017,15 +1014,9 @@ impl BlockfrostCardanoChain {
     }
 
     /// Override submission flags from config.
-    pub fn with_submit_config(
-        mut self,
-        submit_btc: bool,
-        submit_oracle: bool,
-        oracle_constructor: u8,
-    ) -> Self {
+    pub fn with_submit_config(mut self, submit_btc: bool, submit_oracle: bool) -> Self {
         self.submit_btc = submit_btc;
         self.submit_oracle = submit_oracle;
-        self.oracle_constructor = oracle_constructor;
         self
     }
 
@@ -2023,8 +2014,8 @@ impl CardanoChain for BlockfrostCardanoChain {
             total_lovelace,
         );
         debug!(
-            "[submit] building Cardano oracle-update tx: treasury={} constructor={} policy={}",
-            self.treasury_address, self.oracle_constructor, self.treasury_policy_id
+            "[submit] building the TM post tx: treasury={} policy={}",
+            self.treasury_address, self.treasury_policy_id
         );
 
         // Fetch the network's live cost models so the script-integrity hash matches the ledger's
@@ -2040,19 +2031,23 @@ impl CardanoChain for BlockfrostCardanoChain {
             cost_models[2].len()
         );
 
+        // The real validator CBOR is REQUIRED — there is no scaffold fallback (a post minted
+        // under anything else lands at an address nothing scans).
+        let tm_script_cbor = self.tm_script_cbor.as_deref().ok_or_else(|| {
+            EpochError::Chain(
+                "cardano.tm_script_cbor not set (from `binocular tm-script`) — required to \
+                 mint the TM NFT under the real TreasuryMovementValidator policy"
+                    .into(),
+            )
+        })?;
+
         // The chain-linkage mint references: the Config UTxO (the validator reads
         // `bridge_state_policy` from it, [PAR-1]) and the bridge-state singleton whose head the
-        // posted TM must spend ([PTM-6]/[PTM-7]). Only needed when minting under the real TM
-        // validator.
-        let mint_refs: Option<crate::cardano::publish::MintRefs> = if self.tm_script_cbor.is_some()
-        {
-            let (config, singleton) = self.query_config_singleton().await?;
-            Some(crate::cardano::publish::MintRefs {
-                config: (config.utxo.tx_hash, config.utxo.index),
-                singleton: singleton.utxo,
-            })
-        } else {
-            None
+        // posted TM must spend ([PTM-6]/[PTM-7]).
+        let (config, singleton) = self.query_config_singleton().await?;
+        let mint_refs = crate::cardano::publish::MintRefs {
+            config: (config.utxo.tx_hash, config.utxo.index),
+            singleton: singleton.utxo,
         };
 
         // Latest chain slot + time: seeds the datum's `created` and the finite
@@ -2070,11 +2065,10 @@ impl CardanoChain for BlockfrostCardanoChain {
             &self.treasury_policy_id,
             &self.treasury_asset_name_hex,
             tx_bytes,
-            self.oracle_constructor,
             &wallet_utxos,
             key,
-            self.tm_script_cbor.as_deref(),
-            mint_refs,
+            tm_script_cbor,
+            &mint_refs,
             Some(cost_models),
             latest_slot_time,
             self.validity_window_secs,

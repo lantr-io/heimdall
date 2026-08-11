@@ -342,14 +342,10 @@ pub struct CardanoConfig {
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
     pub submit_oracle: bool,
-    /// Constructor tag to use in the oracle datum.
-    /// 0 = unconfirmed TM tx (Binocular will update to 1 on Bitcoin confirmation).
-    /// Default: 0.
-    pub oracle_constructor: u8,
-    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). When set (with the
-    /// `config_*` fields below), the TM NFT is minted under the real validator policy — then
-    /// `treasury_policy_id` must be the validator's script hash and `treasury_asset_name` empty.
-    /// When unset, the always-ok scaffold policy is used.
+    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). REQUIRED for posting a
+    /// TM (with the `config_*` fields below): the TM NFT is only ever minted under the real
+    /// validator policy — `treasury_policy_id` must be the validator's script hash and
+    /// `treasury_asset_name` empty. The always-ok scaffold fallback is gone.
     pub tm_script_cbor: Option<String>,
     /// Validity window (seconds) for posted TM txs (`invalid_hereafter`/`created` = latest +
     /// window). `None` → 1800 (preprod/mainnet). MUST be small (e.g. 90) on a short-epoch
@@ -449,7 +445,6 @@ impl Default for CardanoConfig {
             stake_source: None,
             demo_exclude_unstaked: false,
             submit_oracle: true,
-            oracle_constructor: 0,
             tm_script_cbor: None,
             tm_validity_window_secs: None,
             config_address: None,
