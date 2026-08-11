@@ -1050,3 +1050,31 @@ root against the singleton's attested spi_root - a lagging node would answer
 `member=false` with an exclusion proof against a stale root, which reads as
 "was never swept". This node's trie is quorum-internal state for the [SPI-2]
 gate; depositors and tools ask a watchtower.
+
+**DEC-039: BuildTm requires `protocol.state_dir`; the walk stops at a
+non-TM.** Two defects with one shape - state the node cannot reconstruct is
+state it must not attest.
+
+`advance_spi_trie` returned `Ok(())` when `state_dir` was unset, while
+`build_tm_phase` reloaded `SpiTrie::load_or_empty(None)`, so every TM
+committed a `spi_root` covering only its own sweeps. Neither guard could see
+it: [SPI-2]'s `verify_spi_root` recomputes from the same empty trie and agrees,
+and `cross_check_bridge_roots` is skipped when `cardano.cpo_policy_id` is unset
+- and BOTH keys are commented out in the shipped heimdall.toml, so this was the
+DEFAULT configuration. Once such a TM confirms, the singleton's spi_root omits
+every earlier sweep permanently, binocular's [SPI-6] replay fails, and no
+depositor can obtain a [CPI-9] proof again. `load_cpo_trie` had the same hole on
+the CPO side. BuildTm now refuses without a state_dir rather than degrading:
+a node that cannot track the tries must not be the one proposing roots.
+
+`walk_confirmed_chain` also lacked binocular's rule of stopping, WITHOUT
+harvesting, at the first ancestor carrying no BTMR1 commitment output. The TM
+address is permissionlessly payable and the harvest cannot require the TM NFT
+(Confirm has burned it), so anyone could park a Constr-0 datum wrapping the
+public genesis funding transaction and send the walk past the chain's origin
+into unrelated Bitcoin history. The two implementations of [SPI-6] must agree;
+they now do.
+
+Test note: `fast_config` gives every node a temp state_dir, unique per CALL.
+Keying it on the identifier alone made `full_cycle_2_of_2` and
+`full_cycle_3_of_3` share node 1's trie under the parallel runner.

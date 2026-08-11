@@ -935,13 +935,28 @@ async fn harvest_confirmed_chain(
 /// `SweptPegInsProofService.walkConfirmedChain`).
 ///
 /// `head_utxo_id` is the singleton's `treasury_utxo_id` (`btc_txid ‖ vout LE`).
-/// The walk stops at the first txid `by_txid` has no record for: for a complete
-/// history that is the genesis funding transaction, which is not a TM and has no
-/// `UnconfirmedTm` record. A HISTORY GAP — a confirmed TM whose record's datum is
-/// missing — stops the walk the same way, and is caught downstream: the oldest
-/// kept TM's committed root then includes the dropped entries, so the replay
-/// fails its per-TM assertion (and the final singleton cross-check backstops a
-/// gap that swept nothing).
+///
+/// The walk stops, WITHOUT harvesting, at the first ancestor that carries no
+/// `"BTMR1"` commitment output. That transaction is the genesis funding tx (or
+/// the bootstrap origin), not a TM: its inputs are not swept deposits, and
+/// harvesting them would insert entries no TM ever attested.
+///
+/// That rule is load-bearing, not cosmetic. The TM address is permissionlessly
+/// payable and [`harvest_confirmed_chain`] filters only on the datum shape — it
+/// cannot require the TM NFT, because the record it needs has already been spent
+/// by Confirm. So anyone may pay min-ADA to the TM address with an inline
+/// Constr-0 datum whose field 0 is some other transaction's raw bytes; without
+/// this check the walk would follow input-0 ancestry straight past the true
+/// origin into unrelated Bitcoin history. binocular's
+/// `SweptPegInsProofService.walkConfirmedChain` applies the identical rule, and
+/// the two MUST agree: they derive the same set for the same [SPI-6] purpose.
+///
+/// The walk also stops at the first txid `by_txid` has no record for. For a
+/// complete history that is the same genesis transaction, reached from the other
+/// side. A HISTORY GAP — a confirmed TM whose record's datum is missing — stops
+/// it the same way and is caught downstream: the oldest kept TM's committed root
+/// then includes the dropped entries, so the replay fails its per-TM assertion
+/// (and the final singleton cross-check backstops a gap that swept nothing).
 fn walk_confirmed_chain(
     head_utxo_id: &[u8; 36],
     by_txid: &HashMap<[u8; 32], ConfirmedTm>,
@@ -954,6 +969,10 @@ fn walk_confirmed_chain(
     while let Some(tm) = by_txid.get(&cursor) {
         if !seen.insert(cursor) {
             break; // a cycle cannot happen on Bitcoin, but never loop forever
+        }
+        // Not a protocol TM → the chain's origin. Stop BEFORE harvesting it.
+        if confirmed_committed_roots(tm).is_err() {
+            break;
         }
         acc.push(tm.clone());
         let Some((prev_tx, _vout)) = tm.swept_inputs.first().and_then(|i| parse_hint(i)) else {
@@ -1624,12 +1643,22 @@ mod tests {
         tms.into_iter().map(|t| (t.btc_txid, t)).collect()
     }
 
+    /// A TM as the walk must see one: it carries a BTMR1 commitment output.
+    /// A record WITHOUT one is not a protocol TM and the walk stops there.
+    fn tm_with_commitment(txid: u8, prev: [u8; 32]) -> ConfirmedTm {
+        confirmed(
+            txid,
+            vec![hint_bytes(&prev, 0)],
+            vec![payment_out(0x00, 900_000), commitment_out(EMPTY_ROOT)],
+        )
+    }
+
     #[test]
     fn walk_orders_the_chain_backward_from_the_head() {
         // C spends B's treasury, B spends A's; the head is C's treasury output.
-        let a = confirmed(0xa1, vec![hint_bytes(&[0x00; 32], 0)], vec![]);
-        let b = confirmed(0xb2, vec![hint_bytes(&[0xa1; 32], 0)], vec![]);
-        let c = confirmed(0xc3, vec![hint_bytes(&[0xb2; 32], 0)], vec![]);
+        let a = tm_with_commitment(0xa1, [0x00; 32]);
+        let b = tm_with_commitment(0xb2, [0xa1; 32]);
+        let c = tm_with_commitment(0xc3, [0xb2; 32]);
         let head = hint_bytes(&[0xc3; 32], 0);
         let ordered = walk_confirmed_chain(&head, &by_txid_of(vec![c, b, a]));
         let txids: Vec<u8> = ordered.iter().map(|t| t.btc_txid[0]).collect();
@@ -1640,12 +1669,40 @@ mod tests {
     fn walk_never_visits_a_tm_past_the_head() {
         // D spends C's treasury (mined but not yet confirmed on Cardano): the
         // head still names C's output, so the backward walk cannot reach D.
-        let c = confirmed(0xc3, vec![hint_bytes(&[0x00; 32], 0)], vec![]);
-        let d = confirmed(0xd4, vec![hint_bytes(&[0xc3; 32], 0)], vec![]);
+        let c = tm_with_commitment(0xc3, [0x00; 32]);
+        let d = tm_with_commitment(0xd4, [0xc3; 32]);
         let head = hint_bytes(&[0xc3; 32], 0);
         let ordered = walk_confirmed_chain(&head, &by_txid_of(vec![c, d]));
         let txids: Vec<u8> = ordered.iter().map(|t| t.btc_txid[0]).collect();
         assert_eq!(txids, vec![0xc3]);
+    }
+
+    // The TM address is permissionlessly payable and the harvest cannot require
+    // the TM NFT (Confirm has already burned it), so anyone may park a Constr-0
+    // datum there wrapping ANY raw transaction — including the treasury's public
+    // genesis funding tx. Without the stop-at-no-commitment rule the walk would
+    // follow input-0 ancestry straight past the chain's origin into unrelated
+    // Bitcoin history and never terminate correctly. binocular applies the same
+    // rule; the two implementations must agree.
+    #[test]
+    fn walk_stops_at_a_record_carrying_no_btmr1_commitment() {
+        let genesis = confirmed(
+            0x00,
+            vec![hint_bytes(&[0x99; 32], 0)], // ancestry that must NOT be followed
+            vec![payment_out(0x51, 1_000_000)], // funding tx: no commitment
+        );
+        let a = tm_with_commitment(0xa1, [0x00; 32]);
+        let ancestor = tm_with_commitment(0x99, [0x88; 32]);
+        let head = hint_bytes(&[0xa1; 32], 0);
+        let ordered =
+            walk_confirmed_chain(&head, &by_txid_of(vec![a, genesis, ancestor]));
+        let txids: Vec<u8> = ordered.iter().map(|t| t.btc_txid[0]).collect();
+        assert_eq!(
+            txids,
+            vec![0xa1],
+            "the walk must stop AT the non-TM origin without harvesting it, \
+             and must not reach anything beyond it"
+        );
     }
 
     #[test]

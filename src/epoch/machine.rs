@@ -300,6 +300,16 @@ fn advance_cpo_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> 
 
     let me = config.identity.identifier;
     let Some(dir) = config.state_dir.as_deref() else {
+        // BuildTm refuses without a state_dir, so this node never PROPOSES a
+        // root. It can still observe someone else's Confirm, and skipping the
+        // advance leaves its trie behind the chain — say so rather than pass
+        // silently, because the divergence surfaces much later.
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  swept peg-ins trie NOT advanced: protocol.state_dir is not configured, so this \
+             node is not tracking the trie and cannot build or co-sign a Treasury Movement"
+        );
         return Ok(());
     };
     let mut trie = CpoTrie::load(dir)
@@ -348,6 +358,16 @@ fn advance_spi_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> 
 
     let me = config.identity.identifier;
     let Some(dir) = config.state_dir.as_deref() else {
+        // BuildTm refuses without a state_dir, so this node never PROPOSES a
+        // root. It can still observe someone else's Confirm, and skipping the
+        // advance leaves its trie behind the chain — say so rather than pass
+        // silently, because the divergence surfaces much later.
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  swept peg-ins trie NOT advanced: protocol.state_dir is not configured, so this \
+             node is not tracking the trie and cannot build or co-sign a Treasury Movement"
+        );
         return Ok(());
     };
     let mut trie = SpiTrie::load(dir)
@@ -1064,6 +1084,30 @@ async fn build_tm_phase(
     let me = *group_keys.key_package.identifier();
     crate::epoch_log!(me, epoch, "BuildTm: querying chain for treasury / pegouts");
 
+    // Both tries are CUMULATIVE state, and a TM commits the root that holds
+    // AFTER it. Without somewhere to persist them, every build reloads an empty
+    // trie and commits a root covering only its own movement — and neither
+    // guard catches it: [SPI-2]'s peer recomputation reloads the same empty
+    // trie and agrees, and `cross_check_bridge_roots` is skipped when
+    // `cardano.cpo_policy_id` is unset (both keys are commented out in the
+    // shipped heimdall.toml, so this is the DEFAULT configuration).
+    //
+    // Once such a TM confirms, the singleton's spi_root permanently omits every
+    // earlier sweep: binocular's [SPI-6] replay then fails and no depositor can
+    // obtain a [CPI-9] proof again. That is unrecoverable, so refuse to build
+    // rather than degrade — a node that cannot track the tries must not be the
+    // one proposing roots.
+    if config.state_dir.is_none() {
+        return Err(EpochError::TmBuild(
+            "protocol.state_dir is not configured, so the completed-peg-outs and swept-peg-ins \
+             tries cannot be persisted. A TM built without them commits roots covering only \
+             this movement, which strands every earlier peg-in permanently once it confirms. \
+             Set protocol.state_dir (and cardano.cpo_policy_id) before building Treasury \
+             Movements."
+                .to_string(),
+        ));
+    }
+
     // Poll until the previous treasury movement is confirmed on Bitcoin.
     let treasury = loop {
         let t = chain.query_treasury().await?;
@@ -1467,6 +1511,22 @@ mod tests {
         config.pegin_collection_window = Duration::from_millis(40);
         config.pegin_poll_interval = Duration::from_millis(10);
         config.quorum51_timeout = Duration::from_millis(500);
+        // BuildTm REQUIRES a state_dir: both tries are cumulative, and a node
+        // that cannot persist them would commit roots covering only its own
+        // movement.
+        //
+        // The path must be unique per CALL, not per identifier: every test
+        // numbers its nodes from 1, so keying on the identifier alone makes
+        // `full_cycle_2_of_2` and `full_cycle_3_of_3` share node 1's trie and
+        // clobber each other under the default parallel test runner. The
+        // counter gives each node in each test its own directory.
+        static NEXT_STATE_DIR: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let seq = NEXT_STATE_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        config.state_dir = Some(std::env::temp_dir().join(format!(
+            "heimdall-epoch-test-{}-{seq}",
+            std::process::id(),
+        )));
         config
     }
 
