@@ -5152,8 +5152,10 @@ fn run_show_config_params(cfg: &HeimdallConfig) -> Result<(), String> {
     {
         let b = &snapshot.config.params.bans;
         let mainnet = cfg.cardano.is_mainnet()?;
-        let source =
-            heimdall::cardano::ban_list::BanListSource::from_policy_id(&b.spo_bans_policy_id, mainnet);
+        let source = heimdall::cardano::ban_list::BanListSource::from_policy_id(
+            &b.spo_bans_policy_id,
+            mainnet,
+        );
         println!("#7  spo_bans policy: {}", source.ban_policy_hex);
         println!("      ban address  : {}", source.ban_address);
         println!("#8  base_ban_duration_ms      : {}", b.base_ban_duration_ms);

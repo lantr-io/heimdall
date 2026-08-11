@@ -1694,8 +1694,7 @@ mod tests {
         let a = tm_with_commitment(0xa1, [0x00; 32]);
         let ancestor = tm_with_commitment(0x99, [0x88; 32]);
         let head = hint_bytes(&[0xa1; 32], 0);
-        let ordered =
-            walk_confirmed_chain(&head, &by_txid_of(vec![a, genesis, ancestor]));
+        let ordered = walk_confirmed_chain(&head, &by_txid_of(vec![a, genesis, ancestor]));
         let txids: Vec<u8> = ordered.iter().map(|t| t.btc_txid[0]).collect();
         assert_eq!(
             txids,

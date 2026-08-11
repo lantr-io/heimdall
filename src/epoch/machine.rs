@@ -1520,13 +1520,11 @@ mod tests {
         // `full_cycle_2_of_2` and `full_cycle_3_of_3` share node 1's trie and
         // clobber each other under the default parallel test runner. The
         // counter gives each node in each test its own directory.
-        static NEXT_STATE_DIR: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static NEXT_STATE_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = NEXT_STATE_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        config.state_dir = Some(std::env::temp_dir().join(format!(
-            "heimdall-epoch-test-{}-{seq}",
-            std::process::id(),
-        )));
+        config.state_dir = Some(
+            std::env::temp_dir().join(format!("heimdall-epoch-test-{}-{seq}", std::process::id(),)),
+        );
         config
     }
 
