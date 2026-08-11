@@ -898,6 +898,40 @@ mod tests {
         assert!(bad(20, -1).contains("max_validity_window_ms"));
     }
 
+    /// The cross-repo check: this is the datum `binocular update-config` actually
+    /// produces when it appends the ban policy to a 17-field Config, emitted from
+    /// `UpdateConfigCommand.rewriteFields` and serialised with Scalus. Two
+    /// independent encoders of one datum is exactly where a positional record
+    /// goes wrong, and the failure mode — a reader that mis-decodes #17 — is a
+    /// wrong ban address holding no bans.
+    #[test]
+    fn decodes_the_datum_binocular_update_config_writes() {
+        const VECTOR: &str = concat!(
+            "d8799f4100410141024103410441054106410741081a03938700410a58241111111111111111",
+            "11111111111111111111111111111111111111111111111111111111021903e81927101a001e",
+            "8480d8799f190e10191c20192a301954601907081907081902581a0001fa401a000546001a00",
+            "01fa40ff581cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1a000927",
+            "c0031a0036ee80ff",
+        );
+        let cbor = hex::decode(VECTOR).unwrap();
+        let datum: PlutusData = minicbor::decode(&cbor).unwrap();
+        let p = parse_config_datum(&datum).unwrap();
+
+        assert_eq!(p.field_count, CONFIG_FIELDS_WITH_BANS);
+        let b = p.bans.expect("the appended ban policy");
+        assert_eq!(b.spo_bans_policy_id, [0xbb; 28]);
+        assert_eq!(b.base_ban_duration_ms, 600_000);
+        assert_eq!(b.max_faults_before_permanent, 3);
+        assert_eq!(b.max_validity_window_ms, 3_600_000);
+        // The append did not disturb what was already there.
+        assert_eq!(p.min_stake, 60_000_000);
+        assert_eq!(p.initial_btc_treasury_utxo, Some([0x11; 36]));
+        let t = p.tunables.expect("the tunables survive the append");
+        assert_eq!(t.fee_rate_sat_per_vb, 2);
+        assert_eq!(t.leader_reward, 2_000_000);
+        assert_eq!(t.schedule.tm_batch_interval, 21_600);
+    }
+
     #[test]
     fn a_zero_fee_rate_is_rejected() {
         let err = parse_config_datum(&config_datum(0, 1_000, 100_000)).unwrap_err();
