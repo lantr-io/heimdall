@@ -34,7 +34,7 @@ pub struct TreasuryConfig {
     /// group x-only key.
     pub y_51: bitcoin::key::UntweakedPublicKey,
     pub y_fed: bitcoin::key::UntweakedPublicKey,
-    pub federation_csv_blocks: u32,
+    pub federation_csv_blocks: u16,
     /// The current treasury Bitcoin UTxO, tracked OFF-CHAIN by the SPO (spec
     /// §640/§1677: "known from the previous TM's change output, or from protocol
     /// bootstrap"). heimdall builds every TM, so in steady state it knows its own

@@ -130,7 +130,23 @@ fn run() -> Result<(), String> {
 
     let secp = Secp256k1::new();
 
-    let y_fed = derive_y_fed(&cfg.bitcoin.y_fed_seed_hex, &secp)?;
+    // A demo depositor builds the peg-in address from the same federation key the
+    // treasury uses. Since WI-069 the seed is optional in the config — a real SPO
+    // reads the public key from the treasury_info datum — but this tool derives
+    // rather than reads, so it needs the seed spelled out. Parsing is the shared
+    // one in `cardano::federation`, so this and the daemon cannot disagree about
+    // what a valid seed is (this copy used not to trim).
+    let seed_hex = cfg
+        .bitcoin
+        .y_fed_seed_hex
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(
+            "bitcoin.y_fed_seed_hex is unset — this demo tool derives Y_federation locally              rather than reading it from the treasury_info datum, so it needs the seed",
+        )?;
+    let y_fed =
+        heimdall::cardano::federation::y_fed_from_seed_hex(seed_hex).map_err(|e| e.to_string())?;
 
     let wif = read_wif(&cli)?;
     let depositor_priv =
@@ -336,18 +352,6 @@ fn read_wif(cli: &Cli) -> Result<String, String> {
             .map_err(|e| format!("reading {}: {e}", path.display()));
     }
     Err("must pass --depositor-wif or --depositor-wif-file".to_string())
-}
-
-fn derive_y_fed(
-    seed_hex: &str,
-    secp: &Secp256k1<bitcoin::secp256k1::All>,
-) -> Result<UntweakedPublicKey, String> {
-    let seed: [u8; 32] = hex::decode(seed_hex)
-        .map_err(|e| format!("y_fed_seed_hex not valid hex: {e}"))?
-        .try_into()
-        .map_err(|_| "y_fed_seed_hex must be 32 bytes".to_string())?;
-    let sk = SecretKey::from_slice(&seed).map_err(|e| format!("y_fed seed → sk: {e}"))?;
-    Ok(sk.x_only_public_key(secp).0)
 }
 
 fn pegin_address(
