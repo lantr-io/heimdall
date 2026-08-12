@@ -2,10 +2,12 @@
 //!
 //! A one-shot mint creates the bridge's roster/key oracle. The tx must:
 //!
-//! 1. spend a wallet UTxO `input_ref` (the one-shot — replays are impossible
+//! 1. spend the one-shot UTxO baked into the policy id (replays are impossible
 //!    because an outpoint spends once),
 //! 2. mint exactly 1 treasury NFT under the parameterized `treasury_info`
-//!    policy with asset name `sha2_256(serialise_data(input_ref))`,
+//!    policy with asset name the [CFG-4] constant `"BFRTRY"` — rev 5.5 moved
+//!    uniqueness into the policy id, where the outpoint is a parameter, so the
+//!    name stopped being `sha2_256(serialise_data(input_ref))`,
 //! 3. send the NFT to the script's enterprise address with the inline
 //!    `TreasuryDatum { bifrost_identity_root, current_spos_frost_key,
 //!    y_federation, federation_csv_blocks, last_reset_tm_txid }` –

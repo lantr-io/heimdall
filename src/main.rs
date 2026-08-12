@@ -208,6 +208,23 @@ enum Commands {
     /// Spends a wallet UTxO as the one-shot; prints the signed tx, submits only
     /// with --submit. (Cardano side; bootstrap-treasury prints the BTC-side
     /// Taproot address.)
+    ///
+    /// LEGACY, for the same reason as `bootstrap-registry`, and more sharply:
+    /// `binocular deploy-bridge` mints the Treasury state NFT inside the federation
+    /// transaction, alongside the registry and ban roots. It has to. A one-shot mint
+    /// handler requires its outpoint to be an INPUT of the minting tx, so a genesis
+    /// that derives `treasury_info` from the federation one-shot and then spends that
+    /// outpoint on the other two roots leaves the Treasury state NFT unmintable by
+    /// anyone, for ever — and the instance that results has no Treasury state UTxO, so
+    /// no SPO can register ([REG-6] pins the registry to it) and Update-Y is
+    /// unreachable. Picking a different outpoint for this command does not rescue it:
+    /// that derives a policy the Config does not name and the registry root is not
+    /// bound to.
+    ///
+    /// So run it only against a bridge whose genesis predates that (WI-082), or to
+    /// recover a genesis that failed partway. On a bridge deployed the current way,
+    /// the one-shot is already spent and this command will say so rather than build a
+    /// tx that cannot mint.
     BootstrapTreasuryInfo {
         #[arg(long)]
         config: Option<String>,
@@ -216,10 +233,12 @@ enum Commands {
         #[arg(long)]
         blueprint: String,
         /// The spos_registry one-shot bootstrap output ref, as
-        /// <cardano_tx_hash>:<index>. Parameterizes the registry policy (and through
-        /// it treasury_info). It must still be unspent when the registry linked list
-        /// itself is bootstrapped later — pick a wallet UTxO that will be left alone
-        /// until then.
+        /// <cardano_tx_hash>:<index>. Parameterizes the registry policy. NOT
+        /// treasury_info: rev 5.5 runs the chain Config → treasury → registry
+        /// ([PRE-3], [PRE-4]), so this command takes the treasury's own one-shot from
+        /// `cardano.treasury_bootstrap` and the arrow points the other way. It must
+        /// still be unspent when the registry linked list itself is bootstrapped
+        /// later — pick a wallet UTxO that will be left alone until then.
         #[arg(long)]
         registry_bootstrap: String,
         /// 32-byte x-only key seeded into current_spos_frost_key. In Phase 1 this
