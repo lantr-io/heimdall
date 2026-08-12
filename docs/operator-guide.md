@@ -116,7 +116,7 @@ cadence, and two SPOs ticking on wall clocks scan different chain states and bui
 Treasury Movement bytes — so no co-signer can reproduce them. Refusing to start is the only safe
 behaviour, and it is why these three cannot be left blank.
 
-**[will be removed — WI-055, WI-056]** Most of the remaining ~20 values (`pegin_script_address`,
+**[will be removed — WI-070]** Most of the remaining ~20 values (`pegin_script_address`,
 `pegout_script_address`, `bridged_token_unit`, the treasury and registry identifiers) are things
 the Config UTxO already knows. Step 4 checks what you typed against the chain, so a mistake is
 caught at startup rather than by a failed transaction — but you still have to type them.
@@ -318,10 +318,14 @@ sudo -u heimdall heimdall deploy-registry-ref \
 It prints the reference UTxO it created:
 
 ```
-registry ref UTxO:    <tx_hash>:0  (pass as --registry-ref to register-spo)
+registry ref UTxO:    <tx_hash>#0
+                      register-spo finds this on its own — it is key-locked here, at
+                      this wallet. Nothing to copy.
 ```
 
-**Copy that outpoint.** **[will be removed — WI-056]** The next command cannot yet discover it.
+Nothing to copy: the script stays key-locked at your own wallet address, and the next command looks
+for it there. If you keep a reference script somewhere else — at another address of yours, or
+another SPO's — pass it as `--registry-ref <tx_hash>:<index>` and that is used instead.
 
 **2. Register.**
 
@@ -331,12 +335,21 @@ sudo -u heimdall heimdall register-spo \
     --blueprint /var/lib/heimdall/plutus.json \
     --registry-bootstrap <tx_hash>:<index> \
     --treasury-nft-name <hex> \
-    --registry-ref <the outpoint from step 1> \
     --cold-skey /path/to/pool-cold.skey \
     --bifrost-skey /var/lib/heimdall/bifrost.skey \
     --bifrost-url http://<your-host>:<your-port> \
     --submit
 ```
+
+It prints which reference script it picked, so you can see it found the one step 1 made:
+
+```
+registry ref:      <tx_hash>#0 (discovered at this wallet)
+```
+
+If step 1 was skipped, this command stops before building anything and prints the
+`deploy-registry-ref` line to run — it does not build a transaction that would be too large to
+submit.
 
 `--bifrost-url` is what step 5 was about: it is published on chain, peers fetch from it, and its
 port is the port your daemon will bind.
