@@ -11,12 +11,19 @@
 //!
 //! ```text
 //! Input  0..N : funding UTXO(s) (P2WPKH controlled by depositor WIF) — signed
-//! Output 0    : peg-in P2TR (internal key Y_fed, single leaf = depositor refund)
-//! Output 1    : OP_RETURN "BFR" || D || Q_auth (67 bytes)  [Bifrost dual-key beacon]
-//!               D      = depositor_xonly, the key committed in the refund leaf above
-//!               Q_auth = depositor's key-path Taproot output key = BIP-322 completion key
+//! Output 0    : peg-in P2TR (internal key Y_fed, single leaf = <csv> <Q_auth> refund)
+//! Output 1    : OP_RETURN "BFR" || Q_auth (35 bytes)  [Bifrost one-key beacon]
+//!               Q_auth = the depositor's BIP-86 Taproot OUTPUT key, derived from
+//!               the WIF. One key does both jobs: the refund leaf above commits it,
+//!               and the BIP-322 peg-in completion is signed under it.
 //! Output 2    : P2WPKH change back to depositor
 //! ```
+//!
+//! The refund leaf holds the OUTPUT key rather than the WIF's raw internal key, so
+//! taking the refund path after the timeout means signing with the BIP-86 *tweaked*
+//! key — which is what an ordinary Taproot wallet signs with by default. That is the
+//! whole reason for this form (WI-045/WI-072): no wallet would produce an untweaked
+//! BIP-322 signature, so the protocol asks for the key they can all sign under.
 //!
 //! UTXO selection: if `--funding-*` flags are not given, the tool queries the
 //! Bitcoin node for spendable UTXOs at the depositor's P2WPKH address — first
@@ -36,7 +43,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use bitcoin::hashes::Hash as _;
-use bitcoin::key::{PrivateKey, UntweakedPublicKey};
+use bitcoin::key::{PrivateKey, TapTweak, UntweakedPublicKey};
 use bitcoin::opcodes::all::OP_RETURN;
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey, ecdsa};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
@@ -65,9 +72,9 @@ struct Cli {
     #[arg(long, default_value = "heimdall.toml")]
     config: PathBuf,
 
-    /// Depositor's funding key in Bitcoin WIF format. The same key derives
-    /// the depositor x-only pubkey used in the OP_RETURN beacon and the
-    /// peg-in P2TR refund leaf. Mutually exclusive with --depositor-wif-file.
+    /// Depositor's funding key in Bitcoin WIF format. Its BIP-86 Taproot
+    /// output key is what the OP_RETURN beacon carries and what the peg-in
+    /// P2TR refund leaf commits. Mutually exclusive with --depositor-wif-file.
     #[arg(
         long,
         conflicts_with = "depositor_wif_file",
@@ -162,14 +169,21 @@ fn run() -> Result<(), String> {
     let depositor_compressed = CompressedPublicKey::from_private_key(&secp, &depositor_priv)
         .map_err(|e| format!("uncompressed WIF not supported: {e}"))?;
     let depositor_xonly = depositor_sk.x_only_public_key(&secp).0;
+    // Q_auth — the WIF's BIP-86 Taproot output key (key-path only, no script tree).
+    // This is the single depositor key the protocol knows: the beacon carries it,
+    // the peg-in refund leaf commits it, and the BIP-322 completion signs under it.
+    let depositor_outputkey = depositor_xonly
+        .tap_tweak(&secp, None)
+        .0
+        .to_x_only_public_key();
 
     let depositor_p2wpkh = Address::p2wpkh(&depositor_compressed, network);
 
-    let pegin_addr = pegin_address(&secp, y_fed, depositor_xonly, refund_timeout, network);
+    let pegin_addr = pegin_address(&secp, y_fed, depositor_outputkey, refund_timeout, network);
     info!("peg-in P2TR address: {pegin_addr}");
     info!(
-        "depositor x-only:    {}",
-        hex::encode(depositor_xonly.serialize())
+        "depositor Q_auth:    {}  (beacon payload + refund-leaf key)",
+        hex::encode(depositor_outputkey.serialize())
     );
     info!(
         "depositor auth P2TR: {}  (sign the BIP-322 completion here)",
@@ -274,13 +288,7 @@ fn run() -> Result<(), String> {
     }
 
     let pegin_spk = pegin_addr.script_pubkey();
-    // Beacon carries the depositor's key-path Taproot output key — the key the completion's
-    // BIP-322 signature verifies against — NOT the raw internal x-only.
-    let depositor_auth_spk = ScriptBuf::new_p2tr(&secp, depositor_xonly, None);
-    let depositor_auth_outputkey: [u8; 32] = depositor_auth_spk.as_bytes()[2..34]
-        .try_into()
-        .expect("p2tr scriptPubKey is OP_1 PUSH32 <32-byte key>");
-    let beacon_spk = build_beacon_spk(depositor_xonly.serialize(), depositor_auth_outputkey);
+    let beacon_spk = build_beacon_spk(depositor_outputkey.serialize());
     let change_spk = ScriptBuf::new_p2wpkh(&depositor_compressed.wpubkey_hash());
     let funding_spk = change_spk.clone();
 
@@ -357,26 +365,25 @@ fn read_wif(cli: &Cli) -> Result<String, String> {
 fn pegin_address(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
     y_fed: UntweakedPublicKey,
-    depositor_xonly: UntweakedPublicKey,
+    depositor_outputkey: UntweakedPublicKey,
     refund_timeout: u16,
     network: bitcoin::Network,
 ) -> Address {
-    let spend_info = pegin_spend_info(secp, y_fed, depositor_xonly, refund_timeout);
+    let spend_info = pegin_spend_info(secp, y_fed, depositor_outputkey, refund_timeout);
     let spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
     Address::from_script(&spk, network).expect("P2TR script always has a valid address")
 }
 
-/// The 67-byte dual-key beacon: `"BFR" || D || Q_auth`.
+/// The 35-byte one-key beacon: `"BFR" || Q_auth`.
 ///
-/// `D` is the refund key committed in the peg-in Taproot leaf; carrying it means a
-/// sweeper reads the refund key instead of recovering it by trying candidate outputs
-/// against the reconstructed peg-in address. `Q_auth` is the BIP-322 completion key,
-/// which may belong to a different wallet.
-fn build_beacon_spk(refund_xonly: [u8; 32], auth_outputkey: [u8; 32]) -> ScriptBuf {
-    let mut payload = Vec::with_capacity(67);
+/// `Q_auth` is the depositor's Taproot output key. It is the key committed in the
+/// peg-in Taproot refund leaf, so a sweeper reads the refund key here instead of
+/// recovering it by trying candidate outputs against the reconstructed peg-in
+/// address; and it is the key the BIP-322 completion signature verifies against.
+fn build_beacon_spk(depositor_outputkey: [u8; 32]) -> ScriptBuf {
+    let mut payload = Vec::with_capacity(35);
     payload.extend_from_slice(b"BFR");
-    payload.extend_from_slice(&refund_xonly);
-    payload.extend_from_slice(&auth_outputkey);
+    payload.extend_from_slice(&depositor_outputkey);
     script::Builder::new()
         .push_opcode(OP_RETURN)
         .push_slice(<&bitcoin::script::PushBytes>::try_from(payload.as_slice()).unwrap())

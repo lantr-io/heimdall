@@ -60,15 +60,20 @@ pub fn treasury_spend_info(
 /// ```text
 /// Internal key: Y_federation (key-path — federation sweeps into treasury)
 /// Script tree:
-///   Leaf 1 (depth 0): <refund_timeout> OP_CSV OP_DROP <depositor_xonly> OP_CHECKSIG
+///   Leaf 1 (depth 0): <refund_timeout> OP_CSV OP_DROP <Q_auth> OP_CHECKSIG
 /// ```
+///
+/// `Q_auth` is the depositor's Taproot OUTPUT key — the same key their `BFR`
+/// beacon carries and the same key their BIP-322 completion signs under. The
+/// leaf holds the output key rather than a raw internal key so that an ordinary
+/// wallet can take the refund path with its DEFAULT signer (WI-045/WI-072).
 pub fn pegin_spend_info(
     secp: &Secp256k1<All>,
     y_federation: UntweakedPublicKey,
-    depositor_xonly_pubkey: UntweakedPublicKey,
+    depositor_outputkey: UntweakedPublicKey,
     refund_timeout: u16,
 ) -> TaprootSpendInfo {
-    let leaf = build_csv_checksig_script(refund_timeout, depositor_xonly_pubkey);
+    let leaf = build_csv_checksig_script(refund_timeout, depositor_outputkey);
     bitcoin::taproot::TaprootBuilder::new()
         .add_leaf(0, leaf)
         .expect("valid leaf")
