@@ -554,7 +554,7 @@ struct BifrostFaultScripts {
 
 fn bifrost_fault_scripts(kind: FaultVerifierKind) -> BifrostFaultScripts {
     let blueprint_json = fetch_bifrost_plutus_json();
-    let registry = blueprint::spos_registry_script(&blueprint_json, &[0xC0; 32], 0)
+    let registry = blueprint::spos_registry_script(&blueprint_json, &[0xC0; 32], 0, &[0x77; 28])
         .expect("parameterize benchmark spos_registry");
     let round1_fault = blueprint::fault_verifier_script(
         &blueprint_json,

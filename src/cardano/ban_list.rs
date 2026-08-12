@@ -741,8 +741,12 @@ impl BanPolicyParams {
     ///
     /// The ban schedule is baked into the policy id, so an ApplyBan built from
     /// numbers other than the deployment's produces a `BanNodeData` the validator
-    /// rejects. Taking them from Config #18–#20 makes that impossible to get
-    /// wrong; the local keys remain for a Config predating the append.
+    /// rejects. Taking them from the published Config makes that impossible to
+    /// get wrong; the local keys remain for a Config predating the append.
+    ///
+    /// Rev 5.5 moved the three numbers from Config #8-#10 into `params[4..=6]`
+    /// ([CFG-6]: identities stay top level, tunable numbers live in `params`).
+    /// Only `spo_bans_policy_id` is left in [`BanParams`].
     ///
     /// `fault_proof_policies` has no published counterpart and stays local — it
     /// is a build artifact of the contracts release, which is WI-066's subject,
@@ -751,11 +755,11 @@ impl BanPolicyParams {
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
     ) -> Result<Self, BanListError> {
-        let Some(published) = config.map(|c| &c.bans) else {
+        let Some(published) = config.map(|c| &c.tunables) else {
             return Self::from_config(cardano);
         };
         // A local schedule that disagrees with the published one is dead config,
-        // not a conflict to resolve: #18–#20 are baked into the policy id the
+        // not a conflict to resolve: they are baked into the policy id the
         // bridge published, so the local numbers cannot describe this bridge. Say
         // which ones, since silently ignoring them is how an operator believes a
         // ban duration they typed is in force.
@@ -906,6 +910,8 @@ impl BanListSource {
     pub fn from_blueprint(
         blueprint_path: &str,
         registry_bootstrap: &str,
+        treasury_bootstrap: &str,
+        config_policy_id: &[u8; 28],
         ban_bootstrap: &str,
         params: &BanPolicyParams,
         mainnet: bool,
@@ -919,9 +925,16 @@ impl BanListSource {
         let err = |what: &str, e: BlueprintError| {
             BanListError::Config(format!("parameterize {what}: {e}"))
         };
-        let registry =
-            blueprint::spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-                .map_err(|e| err("spos_registry", e))?;
+        let (tsy_tx_id, tsy_index) = parse_outref(treasury_bootstrap)
+            .map_err(|e| BanListError::Config(format!("treasury bootstrap outref: {e}")))?;
+        // Rev 5.5: the registry policy is downstream of the treasury policy.
+        let registry = blueprint::registry_policy_from_bootstraps(
+            &blueprint_json,
+            (&reg_tx_id, u64::from(reg_index)),
+            (&tsy_tx_id, u64::from(tsy_index)),
+            config_policy_id,
+        )
+        .map_err(|e| err("spos_registry", e))?;
         // Guard the most dangerous misconfig: the three fault policies Heimdall
         // publishes under must be exactly the policies authorized by spo_bans.
         let own_fault_policies = [
@@ -1032,9 +1045,14 @@ impl BanListSource {
         };
         let params = BanPolicyParams::resolve(cardano, config)?;
         let mainnet = cardano.is_mainnet().map_err(BanListError::Config)?;
+        let (treasury_bootstrap, config_policy_id) =
+            crate::cardano::roster::treasury_derivation_inputs(cardano)
+                .map_err(BanListError::Config)?;
         Self::from_blueprint(
             blueprint_path,
             registry_bootstrap,
+            &treasury_bootstrap,
+            &config_policy_id,
             ban_bootstrap,
             &params,
             mainnet,
@@ -1053,8 +1071,8 @@ impl BanListSource {
     ///
     /// Both routes stay reachable because a node may legitimately have no Config
     /// to read at all (the fixture roster, and the dev/offline paths). Since rev
-    /// 5.4 a Config that IS readable always publishes the ban policy — the datum
-    /// makes #7-#10 mandatory — so `None` here means "no Config", never "an older
+    /// 5.5 a Config that IS readable always publishes the ban policy — the datum
+    /// makes #8 mandatory — so `None` here means "no Config", never "an older
     /// Config".
     pub fn resolve(
         cardano: &crate::config::CardanoConfig,
@@ -1627,6 +1645,8 @@ mod tests {
         let cardano = crate::config::CardanoConfig {
             registry_blueprint: Some("plutus.json".to_string()),
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            config_nft_policy_id: Some("77".repeat(28)),
             ..Default::default()
         };
 
@@ -1641,6 +1661,8 @@ mod tests {
         // registry is a fault, not a fixture.
         let half = crate::config::CardanoConfig {
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            config_nft_policy_id: Some("77".repeat(28)),
             ..Default::default()
         };
         assert!(matches!(
@@ -1738,10 +1760,11 @@ mod tests {
         let mut c = crate::cardano::config_params::test_config_params();
         c.bans = BanParams {
             spo_bans_policy_id: policy,
-            base_ban_duration_ms,
-            max_faults_before_permanent,
-            max_validity_window_ms,
         };
+        // Rev 5.5: the three schedule numbers live in params, not beside the policy id.
+        c.tunables.base_ban_duration_ms = base_ban_duration_ms;
+        c.tunables.max_faults_before_permanent = max_faults_before_permanent;
+        c.tunables.max_validity_window_ms = max_validity_window_ms;
         c
     }
 
@@ -1753,6 +1776,8 @@ mod tests {
         let cardano = crate::config::CardanoConfig {
             registry_blueprint: Some("plutus.json".to_string()),
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            config_nft_policy_id: Some("77".repeat(28)),
             network: Some("preprod".to_string()),
             ..Default::default()
         };
@@ -1782,6 +1807,8 @@ mod tests {
         let bare = crate::config::CardanoConfig {
             registry_blueprint: Some("plutus.json".to_string()),
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            config_nft_policy_id: Some("77".repeat(28)),
             network: Some("preprod".to_string()),
             ..Default::default()
         };
@@ -1818,6 +1845,8 @@ mod tests {
         let cardano = crate::config::CardanoConfig {
             registry_blueprint: Some("plutus.json".to_string()),
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            config_nft_policy_id: Some("77".repeat(28)),
             ..Default::default()
         };
         let err = BanListSource::resolve(&cardano, None)
@@ -1846,6 +1875,8 @@ mod tests {
         let cardano = crate::config::CardanoConfig {
             registry_blueprint: Some(path.to_string_lossy().into_owned()),
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            config_nft_policy_id: Some("77".repeat(28)),
             ban_bootstrap: Some(format!("{}:1", "ee".repeat(32))),
             // The blueprint's three fault verifiers share one compiled code, so
             // all three derive the same hash; `from_blueprint` only requires that
@@ -1911,6 +1942,8 @@ mod tests {
         let cardano = crate::config::CardanoConfig {
             registry_blueprint: Some(path.to_string_lossy().into_owned()),
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            config_nft_policy_id: Some("77".repeat(28)),
             ban_bootstrap: Some(format!("{}:1", "ee".repeat(32))),
             fault_proof_policies: vec![
                 own_fault_policy_hex(&path),
@@ -1939,6 +1972,8 @@ mod tests {
             let src = BanListSource::from_blueprint(
                 &path.to_string_lossy(),
                 cardano.registry_bootstrap.as_deref().unwrap(),
+                TEST_TREASURY_BOOTSTRAP,
+                &[0x77; 28],
                 cardano.ban_bootstrap.as_deref().unwrap(),
                 &params,
                 false,
@@ -2021,19 +2056,28 @@ mod tests {
     /// A blueprint carrying every validator `BanListSource::from_blueprint`
     /// parameterizes. The fault verifiers share one compiled code — the apply
     /// mechanics are identical across the three, and only the hashes matter here.
+    /// The treasury one-shot outref every ban-list test derives through, so the
+    /// helper and `from_blueprint` cannot disagree about which bridge they mean.
+    const TEST_TREASURY_BOOTSTRAP: &str =
+        "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11:0";
+
     fn test_blueprint() -> String {
         use crate::cardano::blueprint::{
             FAULT_VERIFIER_EQUIVOCATION_TITLE, FAULT_VERIFIER_ROUND1_TITLE,
-            FAULT_VERIFIER_ROUND2_TITLE, SPO_BANS_TITLE, SPOS_REGISTRY_TITLE,
+            FAULT_VERIFIER_ROUND2_TITLE, SPO_BANS_TITLE, SPOS_REGISTRY_TITLE, TREASURY_INFO_TITLE,
         };
         let registry = include_str!("../../tests/fixtures/spos_registry_code.txt").trim();
+        // Rev 5.5: the registry policy is derived THROUGH the treasury policy, so
+        // a blueprint that omits treasury_info can no longer produce one.
+        let treasury = include_str!("../../tests/fixtures/treasury_info_code.txt").trim();
         let fault = include_str!("../../tests/fixtures/fault_verifier_code.txt").trim();
         let bans = include_str!("../../tests/fixtures/spo_bans_code.txt").trim();
         let v =
             |title: &str, code: &str| format!(r#"{{"title":"{title}","compiledCode":"{code}"}}"#);
         format!(
-            r#"{{"validators":[{},{},{},{},{}]}}"#,
+            r#"{{"validators":[{},{},{},{},{},{}]}}"#,
             v(SPOS_REGISTRY_TITLE, registry),
+            v(TREASURY_INFO_TITLE, treasury),
             v(FAULT_VERIFIER_ROUND1_TITLE, fault),
             v(FAULT_VERIFIER_ROUND2_TITLE, fault),
             v(FAULT_VERIFIER_EQUIVOCATION_TITLE, fault),
@@ -2045,7 +2089,17 @@ mod tests {
     /// `from_blueprint` demands `fault_proof_policies` contain.
     fn own_fault_policy_hex(path: &std::path::Path) -> String {
         let json = std::fs::read_to_string(path).unwrap();
-        let registry = blueprint::spos_registry_script(&json, &[0xbb; 32], 0).unwrap();
+        // Must follow the SAME chain from_blueprint does, with the same inputs:
+        // Config → treasury → registry. Deriving the registry directly would pin
+        // a policy no caller produces.
+        let (tsy_tx_id, tsy_index) = parse_outref(TEST_TREASURY_BOOTSTRAP).unwrap();
+        let registry = blueprint::registry_policy_from_bootstraps(
+            &json,
+            (&[0xbb; 32], 0),
+            (&tsy_tx_id, u64::from(tsy_index)),
+            &[0x77; 28],
+        )
+        .unwrap();
         let round1 = blueprint::fault_verifier_round1_script(&json, &registry.hash).unwrap();
         round1.hash_hex()
     }

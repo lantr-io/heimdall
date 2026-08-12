@@ -815,11 +815,13 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     // contradicts what the chain publishes — would sign for an address no other
     // SPO is using, and produce nothing resembling an error while doing it.
     //
-    // The published copy is the `treasury_info` datum read above, NOT a separate
-    // fetch: a step that reports the identity healthy must be looking at the
-    // bytes the mover will actually build the tree from. A failed read stays a
-    // failure — never silently "the bridge publishes nothing", which would take
-    // the local seed and reintroduce the divergence this replaces.
+    // The published copy is the CONFIG datum read above, NOT a separate fetch: a
+    // step that reports the identity healthy must be looking at the bytes the
+    // mover will actually build the tree from. Rev 5.5 moved both values there
+    // from the treasury_info datum ([CFG-6]), which shortens this path — the
+    // Config is read on every startup regardless. A failed treasury_info read
+    // still fails this step, because a node that cannot see the roster has no
+    // business signing for the treasury either.
     match &snapshot {
         Some(Err(e)) => b.push_fix(
             9,
@@ -829,11 +831,16 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             "this is the same read step 7 failed on — fix that first",
         ),
         published => {
-            let datum = published
-                .as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .map(|s| &s.treasury_state.datum);
-            match crate::cardano::federation::resolve(&cfg.bitcoin, datum) {
+            // Rev 5.5: the federation identity is Config #11 / params[7], not the
+            // treasury_info datum ([CFG-6]). The arm above still fails the step on
+            // an unreadable treasury_info, so a FAILED read is never silently
+            // treated as "the bridge publishes nothing" — it just no longer
+            // supplies the value.
+            let _ = &published;
+            match crate::cardano::federation::resolve(
+                &cfg.bitcoin,
+                config.as_ref().map(|c| &c.params),
+            ) {
                 Ok(id) => b.push(
                     9,
                     "federation identity",

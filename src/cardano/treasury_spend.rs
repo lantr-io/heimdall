@@ -251,9 +251,6 @@ mod tests {
         TreasuryInfoDatum {
             bifrost_identity_root: root,
             current_spos_frost_key: vec![0xAB; 32],
-            y_federation: vec![0xCD; 32],
-            federation_csv_blocks: 144,
-            last_reset_tm_txid: vec![],
         }
     }
 
@@ -389,7 +386,7 @@ mod tests {
             &state,
             &script,
             &new_datum,
-            crate::cardano::treasury_info::registry_update_redeemer(&new_datum),
+            crate::cardano::treasury_info::registry_update_redeemer(0),
             pallas_addresses::Network::Testnet,
         );
 
@@ -420,10 +417,10 @@ mod tests {
             panic!("expected Constr redeemer");
         };
         assert_eq!(c.tag, 121);
+        // Rev 5.5: RegistryUpdate carries the Config reference-input index, not
+        // the new root. spos-registry.ak owns that value via [REG-5].
         assert_eq!(c.fields.len(), 1);
-        assert!(
-            matches!(&c.fields[0], PlutusData::BoundedBytes(b) if **b == new_datum.bifrost_identity_root)
-        );
+        assert!(matches!(&c.fields[0], PlutusData::BigInt(_)));
     }
 
     // The R1c wiring end to end (offline): located state → apply_registration
@@ -451,7 +448,7 @@ mod tests {
             &state,
             &script,
             &new_datum,
-            crate::cardano::treasury_info::registry_update_redeemer(&new_datum),
+            crate::cardano::treasury_info::registry_update_redeemer(0),
             pallas_addresses::Network::Testnet,
         );
 
@@ -468,8 +465,6 @@ mod tests {
         );
         // Everything else is preserved by registration.
         assert_eq!(continued.current_spos_frost_key, old.current_spos_frost_key);
-        assert_eq!(continued.y_federation, old.y_federation);
-        assert_eq!(continued.federation_csv_blocks, old.federation_csv_blocks);
     }
 
     // Compose the leg into a full whisky tx (with a stand-in mint for the
@@ -496,7 +491,7 @@ mod tests {
             &state,
             &script,
             &new_datum,
-            crate::cardano::treasury_info::registry_update_redeemer(&new_datum),
+            crate::cardano::treasury_info::registry_update_redeemer(0),
             pallas_addresses::Network::Testnet,
         );
 

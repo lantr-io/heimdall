@@ -166,10 +166,17 @@ impl DkgFaultBanFlow {
             .map_err(|e| format!("registry bootstrap outref: {e}"))?;
         let (ban_tx_id, ban_index) = crate::cardano::roster::parse_outref(ban_bootstrap)
             .map_err(|e| format!("ban bootstrap outref: {e}"))?;
-        let registry = crate::cardano::blueprint::spos_registry_script(
+        // Rev 5.5: the registry policy is downstream of the treasury policy, which
+        // is downstream of the Config identity.
+        let (treasury_bootstrap, config_policy_id) =
+            crate::cardano::roster::treasury_derivation_inputs(cardano)?;
+        let (tsy_tx_id, tsy_index) = crate::cardano::roster::parse_outref(&treasury_bootstrap)
+            .map_err(|e| format!("treasury bootstrap outref: {e}"))?;
+        let registry = crate::cardano::blueprint::registry_policy_from_bootstraps(
             &blueprint_json,
-            &reg_tx_id,
-            u64::from(reg_index),
+            (&reg_tx_id, u64::from(reg_index)),
+            (&tsy_tx_id, u64::from(tsy_index)),
+            &config_policy_id,
         )
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
         let round1_fault = crate::cardano::blueprint::fault_verifier_round1_script(
@@ -1753,6 +1760,15 @@ impl CardanoChain for BlockfrostCardanoChain {
                     .into(),
             )
         })?;
+        // Rev 5.5: treasury.ak reads y_federation from the CONFIG ([UY-5]), so the
+        // tx must carry the Config UTxO as a reference input and the redeemer must
+        // name its index. Fetch it here rather than threading it through the plan:
+        // the value it publishes is what the validator will check against, so a
+        // cached copy could disagree with the UTxO the tx actually references.
+        let (config_view, _) = self.query_config_singleton().await?;
+        let config_ref_tx = config_view.utxo.tx_hash.clone();
+        let y_federation = config_view.params.y_federation;
+
         let built = crate::cardano::update_y::build_update_y_tx(
             &crate::cardano::update_y::UpdateYRequest {
                 treasury_script,
@@ -1760,6 +1776,8 @@ impl CardanoChain for BlockfrostCardanoChain {
                 new_spos_frost_key: &plan.new_key.serialize(),
                 epoch: epoch_i64,
                 signature,
+                y_federation: &y_federation,
+                config_ref: (&config_ref_tx, config_view.utxo.index),
                 // The DKG handoff is roster-authorized: `signature` is the
                 // outgoing group key's (spec [UY-3]).
                 authorizer: crate::cardano::update_y::UpdateYAuthorizer::Roster,
