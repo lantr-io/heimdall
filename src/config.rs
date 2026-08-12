@@ -123,14 +123,6 @@ pub struct ProtocolConfig {
     /// the trie is rebuilt as empty on every start, which is correct only on a
     /// bridge that has completed no peg-outs — set this in any real deployment.
     pub state_dir: Option<String>,
-    /// Peg-out freshness margin (ms): a peg-out is payable only while at least
-    /// this far from its cancel deadline (`created + 30 days`). Paying one later
-    /// lets the owner take the BTC and then Cancel for the fBTC, so the treasury
-    /// pays twice. Default 7 days.
-    ///
-    /// MUST match across SPOs — it is a TM skip rule, and a divergent skip rule
-    /// produces divergent TM bytes and a failed FROST round.
-    pub pegout_freshness_margin_ms: u64,
 }
 
 impl Default for ProtocolConfig {
@@ -149,11 +141,6 @@ impl Default for ProtocolConfig {
             pegin_collection_window_secs: 5,
             pegin_poll_interval_ms: 1000,
             state_dir: None,
-            // 7 days. Large enough that a request selected now cannot reach its
-            // 30-day cancel deadline before the TM confirms, even after a long
-            // Bitcoin fee-market stall; small enough that a request stays payable
-            // for most of its life.
-            pegout_freshness_margin_ms: 7 * 24 * 3600 * 1000,
         }
     }
 }
@@ -308,35 +295,8 @@ pub struct CardanoConfig {
     /// request per transaction that ever touched the address. See
     /// `cardano::cpo_history`.
     pub kupo_url: Option<String>,
-    /// Policy id (script hash) of the bridge state singleton validator — Config
-    /// field 3, `bridge_state_policy`. With asset name `"BSS"` (hex `425353`) it
-    /// identifies the on-chain BridgeState UTxO, whose datum field 1 is the
-    /// completed-peg-outs root.
-    ///
-    /// The KEY keeps its old `cpo_policy_id` name for config compatibility, but the
-    /// VALUE is the bridge state policy. It is not a separate completed-peg-outs
-    /// policy, and heimdall no longer looks up asset name `"CPO"` (hex `43504f`).
-    ///
-    /// `reconstruct-cpo-trie` cross-checks its finished trie against that
-    /// singleton's `cpo_root` and refuses to write on a mismatch. That is the only
-    /// check covering the trie as a WHOLE — the per-movement assertions cannot
-    /// notice a replay that stopped one movement early — so the command requires
-    /// this.
-    pub cpo_policy_id: Option<String>,
     pub socket_path: Option<String>,
     pub network_magic: Option<u64>,
-    pub pegin_script_address: Option<String>,
-    pub pegin_policy_id: Option<String>,
-    /// Bech32 address of the `peg_out.ak` script holding PegOut UTxOs. Read by
-    /// `sweep-pegins` / `run-mover` when `--pegout-script-address` is not passed.
-    pub pegout_script_address: Option<String>,
-    /// The bridged-token (fBTC) unit `<policy_hex><asset_name_hex>` used to read each
-    /// PegOut UTxO's locked amount. Read by `sweep-pegins` / `run-mover` when
-    /// `--bridged-token-unit` is not passed.
-    pub bridged_token_unit: Option<String>,
-    pub treasury_address: Option<String>,
-    pub treasury_policy_id: Option<String>,
-    pub treasury_asset_name: Option<String>,
     pub mnemonic: Option<String>,
     /// register_spo R2 min-stake threshold (lovelace). A registering pool's
     /// `active_stake` must be `>=` this to build register_spo / join the DKG
@@ -362,10 +322,13 @@ pub struct CardanoConfig {
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
     pub submit_oracle: bool,
-    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). REQUIRED for posting a
-    /// TM (with the `config_*` fields below): the TM NFT is only ever minted under the real
-    /// validator policy — `treasury_policy_id` must be the validator's script hash and
-    /// `treasury_asset_name` empty. The always-ok scaffold fallback is gone.
+    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). REQUIRED to POST a
+    /// TM; SIGNING one does not need it.
+    ///
+    /// The Config publishes this validator's HASH (#4), which is what locates and reads
+    /// the TM address — but MINTING the TM NFT needs the code, and the always-ok scaffold
+    /// fallback is gone. So this is the compiled artifact, not an identifier: nothing here
+    /// can name a different bridge than the `config_*` fields below do.
     pub tm_script_cbor: Option<String>,
     /// Validity window (seconds) for posted TM txs (`invalid_hereafter`/`created` = latest +
     /// window). `None` → 1800 (preprod/mainnet). MUST be small (e.g. 90) on a short-epoch
@@ -388,24 +351,28 @@ pub struct CardanoConfig {
     /// Config NFT asset name (hex). Required alongside `config_nft_policy_id`.
     pub config_nft_asset_name: Option<String>,
     /// Path to the bifrost Aiken blueprint (plutus.json) holding the compiled
-    /// spos_registry + treasury_info validators. Together with
-    /// `registry_bootstrap` and `treasury_info_asset_name` this switches
-    /// `query_roster` from the demo fixture to the on-chain SPO registry.
+    /// spos_registry + treasury_info validators.
+    ///
+    /// A build artifact of the contracts release, not a per-bridge value — which
+    /// is why it survives WI-070 while every identifier it used to sit beside was
+    /// deleted. READING the roster needs none of it (the Config publishes the
+    /// registry and treasury_info policy ids at #11–#12). It buys exactly one
+    /// capability: SPENDING the `treasury_info` state UTxO, i.e. the Update-Y key
+    /// handoff, which needs the compiled script. What it derives is checked
+    /// against #12.
     pub registry_blueprint: Option<String>,
     /// The spos_registry one-shot bootstrap outref `<tx_hash>:<index>` that
-    /// parameterizes the registry policy (and through it treasury_info).
+    /// parameterizes the registry policy — and through it the `spo_bans` policy,
+    /// which is the only thing still reading it: the fault-enforcement half needs
+    /// to re-derive the ban policy it publishes proofs under.
     pub registry_bootstrap: Option<String>,
-    /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
-    /// Identifies the `treasury_info` state UTxO whose
-    /// `bifrost_identity_root` the registry snapshot is verified against.
-    pub treasury_info_asset_name: Option<String>,
     /// The spo_bans one-shot bootstrap outref `<tx_hash>:<index>` that
     /// parameterizes the ban-list policy (the policy is also parameterized
     /// by the registry policy, so `registry_blueprint` + `registry_bootstrap`
     /// must be set alongside).
     ///
     /// **Only for a bridge whose Config predates the ban-policy append.** Where
-    /// the Config publishes the finished policy id (#17) that value wins and this
+    /// the Config publishes the finished policy id (#7) that value wins and this
     /// key is not needed at all — see [`crate::cardano::ban_list::BanListSource::resolve`].
     /// Left set on such a bridge it is unused, and a startup error if it derives
     /// a different policy than the one published.
@@ -417,16 +384,6 @@ pub struct CardanoConfig {
     /// ban address (and a silently empty ban list). Required alongside
     /// `ban_bootstrap`.
     pub fault_proof_policies: Vec<String>,
-    /// `spo_bans` ban-schedule params, baked into the ban policy id, so they
-    /// must match the deployment. `base_ban_duration_ms * 2^(n-1)` is the nth
-    /// ban's length; a pool becomes permanently banned at
-    /// `max_faults_before_permanent`; `max_validity_window_ms` bounds an
-    /// ApplyBan tx's validity interval. All required alongside `ban_bootstrap`.
-    ///
-    /// Superseded by Config #18–#20 wherever the bridge publishes them.
-    pub base_ban_duration_ms: Option<i64>,
-    pub max_faults_before_permanent: Option<i64>,
-    pub max_validity_window_ms: Option<i64>,
     /// Reference-script UTxO `<tx_hash>:<index>` carrying the `spo_bans`
     /// validator. Required for automatic DKG fault banning because ApplyBan
     /// uses the script through withdraw/spend/mint paths.
@@ -450,16 +407,8 @@ impl Default for CardanoConfig {
             blockfrost_url: None,
             network: None,
             kupo_url: None,
-            cpo_policy_id: None,
             socket_path: None,
             network_magic: None,
-            pegin_script_address: None,
-            pegin_policy_id: None,
-            pegout_script_address: None,
-            bridged_token_unit: None,
-            treasury_address: None,
-            treasury_policy_id: None,
-            treasury_asset_name: None,
             mnemonic: None,
             min_stake_lovelace: None,
             stake_source: None,
@@ -472,12 +421,8 @@ impl Default for CardanoConfig {
             config_nft_asset_name: None,
             registry_blueprint: None,
             registry_bootstrap: None,
-            treasury_info_asset_name: None,
             ban_bootstrap: None,
             fault_proof_policies: Vec::new(),
-            base_ban_duration_ms: None,
-            max_faults_before_permanent: None,
-            max_validity_window_ms: None,
             spo_bans_ref: None,
             fault_verifier_round1_ref: None,
             fault_verifier_round2_ref: None,
@@ -611,13 +556,131 @@ impl Default for DemoConfig {
     }
 }
 
+// ── Retired keys ────────────────────────────────────────────────────
+
+/// One key this file no longer has, as `(section, key, what replaced it)`.
+///
+/// Every one of them named a value the whole BRIDGE has to agree on — a script
+/// hash, an address, a token, a ban duration, a selection rule. Carrying an
+/// operator-typed copy of such a value means two sources that can disagree, and
+/// disagreement here is never an error: a mistyped script hash yields a
+/// well-formed address holding nothing, which reads as "nothing pending" rather
+/// than "wrong bridge", and a divergent selection rule just makes the FROST round
+/// fail to converge with nothing in any log naming the cause.
+///
+/// Most were deleted by WI-070 in favour of the Config UTxO, which publishes them
+/// and is identical for every SPO. One — the peg-out freshness margin — has no
+/// Config field yet and became a compiled-in constant instead (WI-071); that
+/// makes it uniform per RELEASE rather than per bridge, which is weaker but is
+/// still a coordinated value rather than a per-operator one.
+///
+/// They are REFUSED rather than ignored. A key that silently does nothing leaves
+/// the operator believing a value they typed is in force — the same failure in a
+/// quieter form.
+/// `(section, key, what replaced it)`.
+pub type RetiredKey = (&'static str, &'static str, &'static str);
+
+const RETIRED_KEYS: &[RetiredKey] = &[
+    (
+        "protocol",
+        "pegout_freshness_margin_ms",
+        "the compiled-in PEG_OUT_FRESHNESS_MARGIN_MS (7 days) — a TM selection \
+         rule, so it must be identical on every SPO",
+    ),
+    (
+        "cardano",
+        "pegin_script_address",
+        "Config #5 (peg_in_script_hash)",
+    ),
+    (
+        "cardano",
+        "pegin_policy_id",
+        "Config #5 (peg_in_script_hash)",
+    ),
+    (
+        "cardano",
+        "pegout_script_address",
+        "Config #6 (peg_out_script_hash)",
+    ),
+    (
+        "cardano",
+        "bridged_token_unit",
+        "Config #1 (bridged_token_policy) ++ \"fSAT\"",
+    ),
+    (
+        "cardano",
+        "cpo_policy_id",
+        "Config #3 (bridge_state_policy)",
+    ),
+    ("cardano", "treasury_address", "Config #4 (tm_script_hash)"),
+    (
+        "cardano",
+        "treasury_policy_id",
+        "Config #4 (tm_script_hash)",
+    ),
+    (
+        "cardano",
+        "treasury_asset_name",
+        "Config #4 (tm_script_hash), empty name",
+    ),
+    (
+        "cardano",
+        "treasury_info_asset_name",
+        "Config #13 (treasury_info_asset_name)",
+    ),
+    (
+        "cardano",
+        "base_ban_duration_ms",
+        "Config #8 (base_ban_duration_ms)",
+    ),
+    (
+        "cardano",
+        "max_faults_before_permanent",
+        "Config #9 (max_faults_before_permanent)",
+    ),
+    (
+        "cardano",
+        "max_validity_window_ms",
+        "Config #10 (max_validity_window_ms)",
+    ),
+];
+
+/// The retired keys this document still sets, in the order they are listed above.
+fn retired_keys_in(doc: &toml::Value) -> Vec<RetiredKey> {
+    RETIRED_KEYS
+        .iter()
+        .filter(|(section, key, _)| {
+            doc.get(*section)
+                .and_then(toml::Value::as_table)
+                .is_some_and(|t| t.contains_key(*key))
+        })
+        .copied()
+        .collect()
+}
+
 // ── Loading ─────────────────────────────────────────────────────────
 
 impl HeimdallConfig {
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(path.display().to_string(), e))?;
-        toml::from_str(&contents).map_err(|e| ConfigError::Parse(path.display().to_string(), e))
+        Self::from_toml_str(&contents).map_err(|e| e.with_path(path.display().to_string().as_str()))
+    }
+
+    /// Parse a `heimdall.toml` document, refusing any key WI-070 retired.
+    ///
+    /// The check runs BEFORE deserialization so the diagnostic names the key and
+    /// its replacement, rather than the daemon starting on a config half of which
+    /// the operator believes is in force.
+    pub fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
+        let doc: toml::Value =
+            toml::from_str(contents).map_err(|e| ConfigError::Parse(String::new(), e))?;
+        let retired = retired_keys_in(&doc);
+        if !retired.is_empty() {
+            return Err(ConfigError::RetiredKeys(retired));
+        }
+        doc.try_into()
+            .map_err(|e| ConfigError::Parse(String::new(), e))
     }
 
     /// Load this SPO's bifrost identity keypair from `[bifrost].skey_path`.
@@ -636,21 +699,12 @@ impl HeimdallConfig {
     }
 
     /// Build an `EpochConfig` from the merged configuration plus the
-    /// per-instance identity.
-    pub fn to_epoch_config(&self, identity: SpoIdentity) -> EpochConfig {
-        let pegin_policy_id = self
-            .cardano
-            .pegin_policy_id
-            .as_deref()
-            .map(|hex_str| {
-                let v = hex::decode(hex_str).expect("pegin_policy_id must be hex");
-                assert_eq!(v.len(), 28, "pegin_policy_id must be 28 bytes");
-                let mut out = [0u8; 28];
-                out.copy_from_slice(&v);
-                out
-            })
-            .unwrap_or([0u8; 28]);
-
+    /// per-instance identity and the bridge's peg-in policy id.
+    ///
+    /// `pegin_policy_id` is Config #5, passed in rather than read from a key of
+    /// its own (WI-070): it identifies the bridge, not this operator. The
+    /// fixture/mock demo, which has no bridge to read, passes `[0u8; 28]`.
+    pub fn to_epoch_config(&self, identity: SpoIdentity, pegin_policy_id: [u8; 28]) -> EpochConfig {
         EpochConfig {
             dkg_round_timeout: Duration::from_secs(self.protocol.dkg_round_timeout_secs),
             dkg_window: Duration::from_secs(self.protocol.dkg_window_secs),
@@ -676,9 +730,6 @@ impl HeimdallConfig {
                 .state_dir
                 .as_deref()
                 .map(std::path::PathBuf::from),
-            pegout_freshness_margin: Duration::from_millis(
-                self.protocol.pegout_freshness_margin_ms,
-            ),
             // Only ever used if it turns out to BE the treasury's current key —
             // i.e. the bootstrap handoff. See `EpochConfig::y_fed_seed`.
             y_fed_seed: self
@@ -741,6 +792,24 @@ pub enum ConfigError {
     },
     /// The key file's contents are not a valid 32-byte secp256k1 secret.
     KeyParse(String),
+    /// The file still sets keys that no longer exist; each is listed with what
+    /// supersedes it. See [`RETIRED_KEYS`].
+    RetiredKeys(Vec<RetiredKey>),
+}
+
+impl ConfigError {
+    /// Attach the file this error came from, for the variants that carry a path.
+    ///
+    /// [`HeimdallConfig::from_toml_str`] parses a string and has no path to name;
+    /// [`HeimdallConfig::from_file`] does, and an operator with several configs
+    /// needs to be told which one is wrong.
+    #[must_use]
+    fn with_path(self, path: &str) -> Self {
+        match self {
+            Self::Parse(_, e) => Self::Parse(path.to_string(), e),
+            other => other,
+        }
+    }
 }
 
 impl std::fmt::Display for ConfigError {
@@ -756,6 +825,23 @@ impl std::fmt::Display for ConfigError {
                 "bifrost key file {path} has mode {mode:o}; must be 0600 (not group/other readable)"
             ),
             Self::KeyParse(s) => write!(f, "bifrost key: {s}"),
+            Self::RetiredKeys(keys) => {
+                writeln!(
+                    f,
+                    "this config sets {} key(s) that no longer exist. Each held a value the \
+                     whole bridge must agree on, so a per-operator copy could only disagree \
+                     with the other SPOs — and disagreement here is silent, not an error. \
+                     Delete each line:",
+                    keys.len()
+                )?;
+                for (section, key, replacement) in keys {
+                    writeln!(f, "  {section}.{key}  ->  {replacement}")?;
+                }
+                write!(
+                    f,
+                    "`heimdall show-config-params` prints what this node resolves from the chain."
+                )
+            }
         }
     }
 }
@@ -802,6 +888,70 @@ fee_rate_sat_per_vb = 5
         assert_eq!(cfg.bitcoin.fee_rate_sat_per_vb, 5);
         // Other bitcoin fields keep defaults.
         assert_eq!(cfg.bitcoin.per_pegout_fee_sat, 1000);
+    }
+
+    /// WI-070: a key the Config publishes is refused, not ignored. Ignoring it
+    /// leaves the operator believing a value they typed is in force, which is the
+    /// original divergence in a quieter form — so the message has to name both the
+    /// dead key and the thing that replaced it.
+    #[test]
+    fn a_config_still_setting_a_retired_key_is_refused_by_name() {
+        let err = HeimdallConfig::from_toml_str(
+            r#"
+[protocol]
+poll_interval_ms = 5000
+pegout_freshness_margin_ms = 604800000
+
+[cardano]
+blockfrost_project_id = "preprodXXX"
+treasury_address = "addr_test1wq3ywdhmjku42uv2pcmy0dwcnycl2slcnswnfapsg7f5z4cd30duu"
+cpo_policy_id = "aa"
+"#,
+        )
+        .expect_err("retired keys must not be silently ignored");
+        let msg = err.to_string();
+        assert!(msg.contains("cardano.treasury_address"), "{msg}");
+        assert!(msg.contains("Config #4 (tm_script_hash)"), "{msg}");
+        assert!(msg.contains("cardano.cpo_policy_id"), "{msg}");
+        assert!(msg.contains("Config #3 (bridge_state_policy)"), "{msg}");
+        // WI-071's half: retired in favour of a compiled-in constant rather than
+        // a Config field, and the message must not claim otherwise.
+        assert!(msg.contains("protocol.pegout_freshness_margin_ms"), "{msg}");
+        assert!(msg.contains("PEG_OUT_FRESHNESS_MARGIN_MS"), "{msg}");
+        // The keys that survive are not swept up with them.
+        assert!(!msg.contains("blockfrost_project_id"), "{msg}");
+        assert!(!msg.contains("poll_interval_ms"), "{msg}");
+    }
+
+    /// Every retired key is refused, and the message names each one — a partial
+    /// list would send an operator through this error once per key.
+    #[test]
+    fn every_retired_key_is_named() {
+        let mut doc = String::new();
+        for section in ["protocol", "cardano"] {
+            doc.push_str(&format!("[{section}]\n"));
+            for (s, key, _) in RETIRED_KEYS.iter().filter(|(s, ..)| *s == section) {
+                assert_eq!(*s, section);
+                doc.push_str(&format!("{key} = \"x\"\n"));
+            }
+        }
+        let err = HeimdallConfig::from_toml_str(&doc).expect_err("every retired key is refused");
+        let msg = err.to_string();
+        for (section, key, replacement) in RETIRED_KEYS {
+            assert!(msg.contains(&format!("{section}.{key}")), "{key}: {msg}");
+            assert!(msg.contains(replacement), "{key}: {msg}");
+        }
+    }
+
+    /// A config that sets none of them still loads — including one with no
+    /// `[cardano]` section at all (the local fixture demo).
+    #[test]
+    fn a_config_without_the_retired_keys_loads() {
+        HeimdallConfig::from_toml_str("[demo]\nbase_port = 18500\n").expect("fixture demo config");
+        HeimdallConfig::from_toml_str(
+            "[cardano]\nblockfrost_project_id = \"preprodXXX\"\nconfig_address = \"addr_test1x\"\n",
+        )
+        .expect("locator-only config");
     }
 
     #[test]
@@ -902,7 +1052,7 @@ fee_rate_sat_per_vb = 5
             bifrost_id_pk: Vec::new(),
             port: 18500,
         };
-        let epoch = cfg.to_epoch_config(identity.clone());
+        let epoch = cfg.to_epoch_config(identity.clone(), [0u8; 28]);
         let demo = EpochConfig::demo_default(identity);
 
         assert_eq!(epoch.dkg_round_timeout, demo.dkg_round_timeout);

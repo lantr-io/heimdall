@@ -277,9 +277,9 @@ pub trait CardanoChain: Send + Sync {
         ))
     }
 
-    /// Both attested roots held by the on-chain bridge state singleton, when
-    /// this node is configured to locate it (`cardano.cpo_policy_id` — the
-    /// `bridge_state_policy`, Config field 3).
+    /// Both attested roots held by the on-chain bridge state singleton, when this
+    /// node can locate it — i.e. whenever it reads a bridge Config, whose field 3
+    /// (`bridge_state_policy`) is the singleton's NFT policy.
     ///
     /// This is the tripwire for a persisted `cpo-trie.json` OR `spi-trie.json`
     /// that has fallen out of sync with the chain — most sharply after a

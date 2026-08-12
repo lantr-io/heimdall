@@ -102,8 +102,8 @@ impl DkgFaultBanFlow {
     /// after a fault is detected.
     ///
     /// `config` is the decoded bridge Config: it supplies the ban schedule
-    /// (#18–#20) when the bridge publishes one, and its ban policy id (#17) is
-    /// what the locally derived `spo_bans` is checked against (WI-065).
+    /// (#8–#10), and its ban policy id (#7) is what the locally derived
+    /// `spo_bans` is checked against (WI-065).
     pub fn from_config(
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
@@ -227,9 +227,10 @@ impl DkgFaultBanFlow {
         {
             return Err(format!(
                 "the fault-enforcement keys derive spo_bans policy {} but the bridge Config \
-                 publishes {} (field #17) — an ApplyBan built here would confirm into a ban \
-                 list no other SPO reads. Check cardano.ban_bootstrap, \
-                 cardano.fault_proof_policies and the ban-schedule keys against this bridge",
+                 publishes {} (field #7) — an ApplyBan built here would confirm into a ban \
+                 list no other SPO reads. Check cardano.ban_bootstrap and \
+                 cardano.fault_proof_policies against this bridge — the schedule half comes \
+                 from the Config itself (#8-#10), so it cannot be the thing that disagrees",
                 spo_bans.hash_hex(),
                 hex::encode(published.spo_bans_policy_id),
             ));
@@ -473,8 +474,8 @@ pub struct BlockfrostCardanoChain {
     /// `[cardano]`, kept so the federation identity can be RE-RESOLVED from the
     /// bridge Config on every roster read rather than pinned at startup.
     ///
-    /// The two fields above are what startup happened to see. Config #17 and
-    /// #21–#23 are chain state a governance Update can move, exactly like the
+    /// The two fields above are what startup happened to see. Config #7 and
+    /// #11–#13 are chain state a governance Update can move, exactly like the
     /// #12–#16 the batch snapshot re-reads every batch — so pinning them makes
     /// two honest nodes disagree according to when each was last restarted, which
     /// is the divergence publishing them was supposed to end. `None` → nothing to
@@ -889,7 +890,7 @@ impl BlockfrostCardanoChain {
         self
     }
 
-    /// Re-resolve the federation identity (Config #17, #21–#23) from the chain on
+    /// Re-resolve the federation identity (Config #7, #11–#13) from the chain on
     /// every roster read, instead of running forever on whatever startup saw.
     pub fn with_federation_refresh(mut self, cardano: crate::config::CardanoConfig) -> Self {
         self.federation_refresh = Some(cardano);
@@ -898,7 +899,7 @@ impl BlockfrostCardanoChain {
 
     /// The registry + ban sources AS OF NOW, re-read from the bridge Config.
     ///
-    /// The startup-resolved pair is the fallback, not the answer: #17 and #21–#23
+    /// The startup-resolved pair is the fallback, not the answer: #7 and #11–#13
     /// are chain state, and a node that pinned them at boot filters a different
     /// roster from a node booted after a governance Update — a divergence keyed on
     /// restart time, which no operator can see and no log records. The batch
@@ -949,7 +950,7 @@ impl BlockfrostCardanoChain {
         .await
         .map_err(|e| {
             EpochError::Chain(format!(
-                "bridge Config (federation identity #17/#21-#23): {e}"
+                "bridge Config (federation identity #7/#11-#13): {e}"
             ))
         })?;
 
@@ -1467,7 +1468,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         epoch: u64,
         attempt: u32,
     ) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
-        // Re-read #17/#21-#23 rather than trusting the startup snapshot: this is
+        // Re-read #7/#11-#13 rather than trusting the startup snapshot: this is
         // the derivation whose inputs must be identical on every node, so it is
         // the last one that should run on a per-node copy of chain state.
         let (registry, bans) = self.current_federation().await?;
@@ -1647,10 +1648,10 @@ impl CardanoChain for BlockfrostCardanoChain {
         // so a stale copy hands the treasury to a script nobody else watches.
         let Some(registry) = self.current_federation().await?.0 else {
             warn!(
-                "[update-y] no treasury_info configured (cardano.registry_blueprint / \
-                 registry_bootstrap / treasury_info_asset_name, or the Config's published \
-                 identity at #21-#23) — the derived group key stays LOCAL to this node and \
-                 the treasury is NOT handed over"
+                "[update-y] no treasury_info to hand the key over to — this node reads no \
+                 bridge Config, so there is no published registry identity (#11-#13). The \
+                 derived group key stays LOCAL to this node and the treasury is NOT handed \
+                 over"
             );
             return Ok(None);
         };
@@ -1742,7 +1743,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         let epoch_i64 = i64::try_from(plan.epoch)
             .map_err(|_| EpochError::Chain("epoch too large for Plutus Int".into()))?;
         // Spending the state UTxO needs the compiled script, not just the policy
-        // id the Config publishes (#22). A node reading the roster from the
+        // id the Config publishes (#12). A node reading the roster from the
         // published identity alone can still run every other phase, so say which
         // key is missing rather than failing at witness assembly.
         let treasury_script = registry.treasury_info_script.as_ref().ok_or_else(|| {
@@ -1819,15 +1820,16 @@ impl CardanoChain for BlockfrostCardanoChain {
     /// in the trie, duplicate within the batch) — keeping every skip decision in one place is
     /// what lets every SPO reach the identical verdict and build byte-identical TM bytes.
     ///
-    /// Unconfigured is a loud no-op rather than an error: a daemon deployed before
-    /// `cardano.pegout_script_address` / `cardano.bridged_token_unit` existed must keep
-    /// building peg-in-only TMs, and paying nothing is under-payment (the request stays open
-    /// until its own cancel deadline), never over-payment.
+    /// No peg-out source is a loud no-op rather than an error. Since WI-070 the
+    /// address (#6) and the fBTC unit (#1) both come from the Config, so this is a
+    /// chain built without one — the mock/fixture path, and the offline tests.
+    /// Paying nothing is under-payment (the request stays open until its own cancel
+    /// deadline), never over-payment.
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>> {
         let Some(src) = &self.pegout_source else {
             warn!(
-                "[pegout] no cardano.pegout_script_address / cardano.bridged_token_unit \
-                 — this TM pays NO peg-out; every pending withdrawal waits for a later batch"
+                "[pegout] no peg-out source on this chain — this TM pays NO peg-out; every \
+                 pending withdrawal waits for a later batch"
             );
             return Ok(vec![]);
         };
@@ -2046,6 +2048,33 @@ impl CardanoChain for BlockfrostCardanoChain {
                     .into(),
             )
         })?;
+        // …and it MUST be the validator this bridge's Config names (#4). The CBOR
+        // is the one local artifact left in [cardano], and its config comment
+        // promises "nothing here can name a different bridge than the config_*
+        // fields do" — which only holds if someone checks. An operator carrying a
+        // CBOR from a previous contracts release otherwise builds a mint of policy
+        // #4 witnessed by a script hashing to something else, and finds out when
+        // the node submits it. That failure-at-transaction-time mode is the whole
+        // subject of WI-053/WI-070.
+        {
+            let raw = hex::decode(tm_script_cbor).map_err(|e| {
+                EpochError::Chain(format!("cardano.tm_script_cbor is not valid hex: {e}"))
+            })?;
+            let derived = crate::cardano::blueprint::script_hash_v3(&raw);
+            let expected = hex::decode(&self.treasury_policy_id).map_err(|e| {
+                EpochError::Chain(format!("TM policy id from Config #4 is not valid hex: {e}"))
+            })?;
+            if derived[..] != expected[..] {
+                return Err(EpochError::Chain(format!(
+                    "cardano.tm_script_cbor hashes to {} but this bridge's Config names TM \
+                     validator {} (#4) — the CBOR is from a different contracts release, and \
+                     minting under #4 with it would be rejected at submission. Re-run \
+                     `binocular tm-script` against this deployment",
+                    hex::encode(derived),
+                    hex::encode(expected),
+                )));
+            }
+        }
 
         // The chain-linkage mint references: the Config UTxO (the validator reads
         // `bridge_state_policy` from it, [PAR-1]) and the bridge-state singleton whose head the

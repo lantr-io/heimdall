@@ -132,13 +132,67 @@ impl TmParams {
 pub struct Freshness {
     /// Chain "now", POSIX milliseconds.
     pub now_ms: i64,
-    /// Required distance (ms) from the cancel deadline.
-    pub margin_ms: i64,
+    /// Required distance (ms) from the cancel deadline. Private, and there are
+    /// exactly two ways to set it — see [`Freshness::at`] and
+    /// [`Freshness::inert`].
+    margin_ms: i64,
+}
+
+impl Freshness {
+    /// The protocol window at chain time `now_ms`. Every peg-out-bearing TM is
+    /// built through this.
+    #[must_use]
+    pub fn at(now_ms: i64) -> Self {
+        Self {
+            now_ms,
+            margin_ms: PEG_OUT_FRESHNESS_MARGIN_MS,
+        }
+    }
+
+    /// No window at all, for a TM that carries no peg-out — the admin
+    /// single-signer spends (`treasury-self-send`, `federation-spend`) and the
+    /// fixtures. Named rather than a bare `margin_ms: 0`, which would read like a
+    /// tuning choice instead of "there is nothing here to filter".
+    #[must_use]
+    pub fn inert() -> Self {
+        Self {
+            now_ms: 0,
+            margin_ms: 0,
+        }
+    }
 }
 
 /// `peg_out.ak::peg_out_cancel_timeout_ms` — 30 days in ms. A request may be
 /// cancelled by its owner once `created + this` has elapsed.
 pub const PEG_OUT_CANCEL_TIMEOUT_MS: i64 = 2_592_000_000;
+
+/// How far from that deadline a request must still be to be payable — 7 days,
+/// a quarter of the cancel window.
+///
+/// **A CONSENSUS CONSTANT, not a tunable.** It is a TM *selection* rule: it
+/// decides which requests enter a batch, so it decides the TM bytes. Two SPOs
+/// holding different values freeze different peg-out sets and sign different
+/// messages, and the FROST round then cannot converge — with nothing in either
+/// node's log naming the cause, because each one's selection was correct by its
+/// own rule.
+///
+/// It was `protocol.pegout_freshness_margin_ms` until WI-071, which is the same
+/// defect WI-053/060/065/069/070 each removed one instance of: a must-match value
+/// set per operator diverges silently instead of erroring. A shared default is
+/// not agreement, it is an untested assumption, and it breaks the first time
+/// someone tunes it.
+///
+/// Compiling it in does not make the value *right*, it makes it uniform across
+/// every node running the same release — which turns an invisible per-operator
+/// divergence into a visible per-release one. The real fix is to publish it in
+/// the Config datum so it is uniform across the bridge; that is WI-071's
+/// remaining half, deferred because widening the datum moves the config hash and
+/// with it every contract parameterized by it.
+///
+/// Sizing: large enough that a request selected now cannot reach its cancel
+/// deadline before the TM confirms, even after a long Bitcoin fee-market stall;
+/// small enough that a request stays payable for most of its 30-day life.
+pub const PEG_OUT_FRESHNESS_MARGIN_MS: i64 = 7 * 24 * 3600 * 1000;
 
 // ---------------------------------------------------------------------------
 // BTMR1 two-root commitment (spi_root ++ cpo_root)
@@ -1213,19 +1267,15 @@ mod tests {
         }
     }
 
-    /// Chain "now" every test builds against, and the default 7-day freshness
-    /// margin. `make_pegout` dates requests 1 day ago, comfortably inside the
-    /// 30-day cancel window.
+    /// Chain "now" every test builds against. `make_pegout` dates requests 1 day
+    /// ago, comfortably inside the 30-day cancel window.
     const NOW_MS: i64 = 1_700_000_000_000;
-    const MARGIN_MS: i64 = 7 * 24 * 3600 * 1000;
+    const MARGIN_MS: i64 = PEG_OUT_FRESHNESS_MARGIN_MS;
     const DAY_MS: i64 = 24 * 3600 * 1000;
     const TEST_FEE: u64 = 1_000;
 
     fn fresh() -> Freshness {
-        Freshness {
-            now_ms: NOW_MS,
-            margin_ms: MARGIN_MS,
-        }
+        Freshness::at(NOW_MS)
     }
 
     /// An empty completed-peg-outs trie: nothing completed yet, genesis root.
@@ -2031,6 +2081,23 @@ mod tests {
         .unwrap();
         assert!(tm.fulfilled.is_empty());
         assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::NearCancelDeadline);
+    }
+
+    /// The margin is a consensus constant (WI-071), so its VALUE is part of the
+    /// contract, not an implementation detail: change it and every node on the
+    /// old release freezes a different peg-out set from every node on the new one,
+    /// and their FROST round cannot converge. Pin it, and pin the relationship to
+    /// the cancel window it is measured against — a margin at or past the whole
+    /// 30 days would make every request permanently unpayable.
+    #[test]
+    fn the_freshness_margin_is_a_pinned_fraction_of_the_cancel_window() {
+        assert_eq!(PEG_OUT_FRESHNESS_MARGIN_MS, 7 * 24 * 3600 * 1000);
+        assert!(PEG_OUT_FRESHNESS_MARGIN_MS > 0);
+        assert!(PEG_OUT_FRESHNESS_MARGIN_MS < PEG_OUT_CANCEL_TIMEOUT_MS);
+        // And it is what `Freshness::at` applies — the only way to get a window.
+        assert_eq!(Freshness::at(NOW_MS).margin_ms, PEG_OUT_FRESHNESS_MARGIN_MS);
+        // `inert` really does filter nothing.
+        assert_eq!(Freshness::inert().margin_ms, 0);
     }
 
     // Exactly at the margin is still payable; one millisecond past it is not.

@@ -567,10 +567,10 @@ impl std::error::Error for DkgFetchError {}
 ///
 /// A not-yet-bootstrapped ban list is "no bans" only on the LOCAL-keys route,
 /// which exists for bridges predating the ban infrastructure. On the PUBLISHED
-/// route (Config #17) it is fatal: WI-068 mints the ban root in the transaction
+/// route (Config #7) it is fatal: WI-068 mints the ban root in the transaction
 /// before the one minting the Config NFT that names it, so a bridge that
-/// publishes #17 has a bootstrapped list by construction and an empty address
-/// means this node derived the WRONG address — a placeholder #17, or a
+/// publishes #7 has a bootstrapped list by construction and an empty address
+/// means this node derived the WRONG address — a placeholder #7, or a
 /// `cardano.network` disagreeing with the bridge, since the address's network tag
 /// is the last piece still taken from local config. Returning "no bans" there
 /// yields a FULLY UNFILTERED roster: a banned SPO rejoins, this node enumerates a

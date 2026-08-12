@@ -13,13 +13,14 @@ pegin_poll_interval_ms = 1000
 # trie on every start — correct only on a bridge that has completed no peg-out.
 # Set it before paying peg-outs, and rebuild after a re-bootstrap with
 # `reconstruct-cpo-trie`. BuildTm cross-checks the loaded root against the cpo_root
-# in the on-chain bridge state singleton (see cardano.cpo_policy_id) and refuses to
+# in the on-chain bridge state singleton (Config field 3) and refuses to
 # sign on a mismatch.
 # state_dir = "/var/lib/heimdall"
-# A peg-out is payable only while at least this far from its 30-day Cancel
-# deadline. Paying one later lets the owner take the BTC and then Cancel for the
-# fBTC. MUST match across SPOs — it is a TM skip rule. 7 days.
-pegout_freshness_margin_ms = 604800000
+# The peg-out freshness margin is NOT here. A peg-out is payable only while at
+# least 7 days from its 30-day Cancel deadline (paying one later lets the owner
+# take the BTC and then Cancel for the fBTC). It is a TM skip rule and must match
+# across SPOs, so WI-071 compiled it in as PEG_OUT_FRESHNESS_MARGIN_MS; a config
+# still setting pegout_freshness_margin_ms is refused.
 
 [bitcoin]
 network = "testnet4"
@@ -36,11 +37,10 @@ rpc_url = "http://127.0.0.1:48332"   # testnet4 RPC (bitcoind -testnet4)
 rpc_user = "bitcoin"
 rpc_pass = "bitcoin"
 submit = false          # DEV-ONLY direct broadcast; production: the binocular watchtower relays
-# The FROST treasury UTXO is no longer configured locally. The initial (anchor) outpoint lives
-# on-chain in the bridge Config UTxO (field 11, set by `binocular deploy-bridge` /
-# `binocular update-config`), and the current treasury is resolved by walking the Confirmed
-# Treasury Movement chain from that anchor (see [cardano] config_address below). The genesis
-# anchor's satoshi value is fetched via rpc_url gettxout.
+# The FROST treasury UTXO is not configured locally. Its current outpoint and satoshi
+# value are the head of the on-chain bridge-state singleton, which heimdall locates
+# through the Config UTxO's bridge_state_policy (field 3) — see the [cardano]
+# config_address below. `heimdall show-treasury` prints what it resolves.
 
 [cardano]
 # Kupo base URL. OPTIONAL, and used ONLY by `reconstruct-cpo-trie`, which rebuilds the
@@ -54,41 +54,33 @@ submit = false          # DEV-ONLY direct broadcast; production: the binocular w
 #           the whole address history — roughly one request per transaction. Meant for
 #           test environments, demos, and non-SPO tooling.
 # kupo_url = "http://localhost:1442"
-# Policy id of the bridge state singleton validator: Config field 3,
-# `bridge_state_policy`. Heimdall finds the singleton by the NFT
-# (this policy, asset name "BSS" = hex 425353); the old "CPO" (43504f) name is gone.
-# The key keeps its old name, but the VALUE is the bridge state policy.
-# Required by `reconstruct-cpo-trie`: it cross-checks the rebuilt trie against the
-# cpo_root in that singleton's datum and refuses to write on a mismatch — the only
-# check that covers the finished trie as a whole.
-# cpo_policy_id = "..."
 blockfrost_project_id = "preprodsTOaoyjcqGmy4SOSazxuHkbuXFOOkp8f"
 # socket_path = "/run/cardano-node/node.socket"
 # network_magic = 1
-# pegin_script_address = "addr_test1..."
-# pegin_policy_id = "abcdef..."
-# TM UTxO address = binocular's TreasuryMovementValidator, parameterized by
-# (oracle script hash, config NFT policy, config NFT asset name). STALE/PLACEHOLDER: the value
-# below predates the confirmed-chain refactor. After deploying, `binocular info` prints the real
-# TM address — paste it here. Until then this address is wrong and confirm-tmtx/relay will not
-# find the UTxO.
-treasury_address = "addr_test1wq3ywdhmjku42uv2pcmy0dwcnycl2slcnswnfapsg7f5z4cd30duu"
-# The TM NFT policy = the TreasuryMovementValidator script hash (`binocular tm-script` prints
-# it). STALE/PLACEHOLDER like the address above until the bridge is deployed.
-treasury_policy_id = "eafdc4d9733275d3e06cfe5fe54a13fff3ba5baa8d65636260537907"
-treasury_asset_name = ""  # the real TM validator counts the EMPTY-name token
 # mnemonic is loaded from $HEIMDALL_MNEMONIC (see .env, gitignored).
 # Setting mnemonic here would override the env var.
 submit_oracle = true   # publish oracle-update UTxO to Cardano after signing
-# Bridge Config UTxO locator: its field 3 (bridge_state_policy) locates the bridge-state
-# singleton whose head is the current treasury outpoint. Values from `binocular deploy-bridge`.
+
+# THE BRIDGE, in three keys. Values from `binocular deploy-bridge`.
+#
+# The Config UTxO is the whole discovery root. Its datum publishes the peg-in and
+# peg-out script hashes (#5/#6), the bridged-token policy (#1), the bridge-state
+# singleton policy (#3), the TM validator hash (#4), the ban policy and schedule
+# (#7-#10) and the SPO registry's identity (#11-#13) — and heimdall derives every
+# address, policy id and token unit it works from out of them (WI-070).
+#
+# There are no keys here for any of that, deliberately. They existed, and a wrong
+# one never errored: it produced a well-formed address holding nothing, which the
+# node reads as "nothing pending" while it keeps signing. A config that still
+# carries one is REFUSED at load, naming the Config field that replaced it.
 # config_address = "addr_test1..."                    # the config script address
 # config_nft_policy_id = "<config NFT policy, 56 hex>"
 # config_nft_asset_name = "424946434647"              # "BIFCFG" hex
-# REQUIRED for posting a TM: the TreasuryMovementValidator CBOR (from `binocular tm-script`),
-# alongside the config_* fields above. treasury_policy_id above must be the validator's script
-# hash (== treasury_address credential) and treasury_asset_name "" (the validator counts the
-# empty-name token). Minting is permissionless: the redeemer names the bridge-state singleton
+
+# REQUIRED for POSTING a TM; signing one does not need it. The Config publishes the
+# TreasuryMovementValidator's HASH (#4), which is enough to find and read the TM
+# address, but MINTING the TM NFT needs the code. From `binocular tm-script`.
+# Minting is permissionless: the redeemer names the bridge-state singleton
 # reference input, and the validator checks the posted TM spends the singleton's head.
 # tm_script_cbor = "<cbor from `binocular tm-script`>"
 

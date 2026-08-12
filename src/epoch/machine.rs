@@ -974,9 +974,11 @@ fn load_cpo_trie(
 /// so a trie that is right about its entries and short by a movement passes them
 /// all. Run before `build_tm`, so nothing is signed off a stale trie.
 ///
-/// `None` from the chain is "not configured", not "empty": it warns and proceeds,
-/// because a node with no `cardano.cpo_policy_id` cannot tell the two apart. It
-/// returns [`CpoTrust::Unverified`] in that case — since WI-031 the trie is the SOLE
+/// `None` from the chain is "no singleton to read", not "empty root": it warns and
+/// proceeds, because a node that cannot locate the singleton cannot tell the two
+/// apart. Since WI-070 the policy comes from Config #3, so this is the
+/// mock/fixture chain — a live node either resolves it or does not start. It
+/// returns [`CpoTrust::Unverified`] in that case; since WI-031 the trie is the SOLE
 /// already-paid authority, so "not cross-checked" has to be a value the caller can act
 /// on, not just a log line.
 async fn cross_check_bridge_roots(
@@ -1039,9 +1041,10 @@ async fn cross_check_bridge_roots(
             crate::epoch_warn!(
                 me,
                 epoch,
-                "  no cpo_policy_id configured — neither local trie root was cross-checked \
-                 against the bridge state singleton. Set cardano.cpo_policy_id before trusting \
-                 these tries to sign with."
+                "  no bridge state singleton to read — neither local trie root was \
+                 cross-checked against it. Point this node at a deployed bridge \
+                 (cardano.config_address + cardano.config_nft_policy_id, which publish the \
+                 singleton's policy at #3) before trusting these tries to sign with."
             );
             Ok(CpoTrust::Unverified)
         }
@@ -1064,8 +1067,8 @@ async fn cross_check_bridge_roots(
 enum CpoTrust {
     /// Cross-checked against the on-chain CPO singleton — safe to decide payment with.
     Verified,
-    /// No `cardano.cpo_policy_id`, so the local root was never checked against the
-    /// chain. The trie may be stale, or belong to a previous deployment.
+    /// No singleton to read it against, so the local root was never checked against
+    /// the chain. The trie may be stale, or belong to a previous deployment.
     Unverified,
 }
 
@@ -1084,9 +1087,8 @@ async fn build_tm_phase(
     // AFTER it. Without somewhere to persist them, every build reloads an empty
     // trie and commits a root covering only its own movement — and neither
     // guard catches it: [SPI-2]'s peer recomputation reloads the same empty
-    // trie and agrees, and `cross_check_bridge_roots` is skipped when
-    // `cardano.cpo_policy_id` is unset (both keys are commented out in the
-    // shipped heimdall.toml, so this is the DEFAULT configuration).
+    // trie and agrees, and `cross_check_bridge_roots` is skipped whenever there is
+    // no singleton to read (the mock/fixture chain).
     //
     // Once such a TM confirms, the singleton's spi_root permanently omits every
     // earlier sweep: binocular's [SPI-6] replay then fails and no depositor can
@@ -1098,8 +1100,7 @@ async fn build_tm_phase(
             "protocol.state_dir is not configured, so the completed-peg-outs and swept-peg-ins \
              tries cannot be persisted. A TM built without them commits roots covering only \
              this movement, which strands every earlier peg-in permanently once it confirms. \
-             Set protocol.state_dir (and cardano.cpo_policy_id) before building Treasury \
-             Movements."
+             Set protocol.state_dir before building Treasury Movements."
                 .to_string(),
         ));
     }
@@ -1233,10 +1234,11 @@ async fn build_tm_phase(
                 me,
                 epoch,
                 "  skipping ALL {} open peg-out(s): the completed-peg-outs trie was not \
-                 cross-checked against the chain (no cardano.cpo_policy_id), and it is the only \
+                 cross-checked against the bridge state singleton, and it is the only \
                  record of what an earlier movement already paid — paying without it would \
-                 re-pay every open request on every movement. Peg-ins are unaffected. Set \
-                 cardano.cpo_policy_id (and protocol.state_dir) to pay peg-outs.",
+                 re-pay every open request on every movement. Peg-ins are unaffected. Point \
+                 this node at a deployed bridge Config (and set protocol.state_dir) to pay \
+                 peg-outs.",
                 pegouts.len(),
             );
             Vec::new()
@@ -1262,11 +1264,6 @@ async fn build_tm_phase(
         })
         .collect();
 
-    // The freshness margin is the one selection input that stays node-local: the
-    // spec makes it heimdall's own bound on the signed-but-unconfirmed race, not a
-    // Config tunable. `now_ms` it compares against is the snapshot's chain time.
-    let pegout_freshness_margin_ms = config.pegout_freshness_margin.as_millis() as i64;
-
     let unsigned = build_tm(
         TreasuryInput {
             outpoint: treasury.outpoint,
@@ -1277,10 +1274,9 @@ async fn build_tm_phase(
         pegout_requests,
         change_script,
         &snapshot.tm_params,
-        &Freshness {
-            now_ms: snapshot.now_ms,
-            margin_ms: pegout_freshness_margin_ms,
-        },
+        // The margin is a compiled-in consensus constant (WI-071), not a config
+        // value; `now_ms` is the snapshot's CHAIN time, never the wall clock.
+        &Freshness::at(snapshot.now_ms),
         &cpo_trie,
         &spi_trie,
     )
@@ -2024,8 +2020,8 @@ mod tests {
         );
     }
 
-    /// The safety gate that makes deleting the multiset guard sound: with no
-    /// `cardano.cpo_policy_id` the local trie was never cross-checked, so it cannot be trusted
+    /// The safety gate that makes deleting the multiset guard sound: with no readable
+    /// bridge state singleton the local trie was never cross-checked, so it cannot be trusted
     /// to say what was already paid — and paying without any dedup re-pays every open request
     /// on every movement. The daemon must skip peg-outs entirely, while still sweeping
     /// peg-ins.
@@ -2376,7 +2372,7 @@ mod tests {
         );
     }
 
-    /// An unconfigured `cardano.cpo_policy_id` reports `None`, which is "cannot
+    /// A chain that cannot locate the singleton reports `None`, which is "cannot
     /// check", not "empty trie" — it warns and proceeds, or every such node would
     /// refuse to sign for a bridge with any peg-out history.
     #[tokio::test]

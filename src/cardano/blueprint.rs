@@ -155,7 +155,7 @@ impl ParameterizedScript {
 ///
 /// The half of [`ParameterizedScript::enterprise_address`] that needs no compiled
 /// code, for a script this node never parameterizes: the bridge Config publishes
-/// the finished `spo_bans` policy id (#17) and the ban script address is a pure
+/// the finished `spo_bans` policy id (#7) and the ban script address is a pure
 /// function of it, so a node reads the ban list without a blueprint (WI-065).
 #[must_use]
 pub fn script_enterprise_address(hash: &[u8; 28], network: Network) -> String {

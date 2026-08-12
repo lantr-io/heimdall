@@ -453,14 +453,6 @@ pub struct EpochConfig {
     /// process restarts for the epoch (WI-014 #5). `None` → in-memory only (the
     /// share is lost on restart and DKG re-runs next boundary).
     pub state_dir: Option<std::path::PathBuf>,
-    /// Freshness margin for peg-out selection: a request is payable only while at
-    /// least this far from its cancel deadline (`created +
-    /// peg_out_cancel_timeout_ms`, 30 days). Paying one any later risks the owner
-    /// cancelling for the fBTC after taking the BTC — the treasury pays twice.
-    ///
-    /// Must be the SAME on every SPO: it is a skip rule, and a skip rule that
-    /// differs makes two nodes build different TM bytes and fail FROST.
-    pub pegout_freshness_margin: Duration,
     /// The federation signing seed (`bitcoin.y_fed_seed_hex`), when this node
     /// has one. Used for exactly one thing: authorizing the BOOTSTRAP Update-Y,
     /// while the treasury is still keyed to `y_federation` and no roster exists
@@ -523,7 +515,6 @@ impl EpochConfig {
             pegin_poll_interval: Duration::from_millis(1000),
             pegin_refund_timeout_blocks: 4320,
             state_dir: None,
-            pegout_freshness_margin: Duration::from_millis(7 * 24 * 3600 * 1000),
             y_fed_seed: None,
             inject_fault: None,
         }

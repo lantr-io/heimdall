@@ -6,15 +6,26 @@
 //! locator keys silently dropped to a wall-clock cadence instead of the protocol's
 //! batch grid, which does not agree with the other SPOs, and nothing said so.
 //!
-//! This module runs nine checks in order and reports each one. It is the single
+//! This module runs eight checks in order and reports each one. It is the single
 //! state reader behind the startup gate; `heimdall doctor` (WI-054) and
 //! `heimdall status` (WI-058) are meant to render the same [`Report`] rather than
 //! grow their own opinion of what "healthy" means, because three readers that can
 //! disagree is worse than none.
 //!
+//! ## What it no longer checks
+//!
+//! There used to be a ninth step cross-checking each `[cardano]` contract
+//! identifier against the Config UTxO. WI-070 deleted those keys, and the check
+//! with them: heimdall derives every one of the identifiers from the Config now,
+//! so there is no second copy to disagree. A check over values that no longer
+//! exist would pass unconditionally and read as coverage. What survives is the
+//! part that was never a check — step 3 NAMES the contracts it derived, because
+//! which bridge this node resolved is something an operator has to be able to
+//! see.
+//!
 //! ## It never spends
 //!
-//! Steps 5 and 7 discover and *report*. A missing reference script and an
+//! Steps 4 and 6 discover and *report*. A missing reference script and an
 //! unregistered SPO both name the exact command to run and stop. Deploying the
 //! `spos_registry` reference script parks ~55 ADA and registering locks a security
 //! deposit; neither belongs to a service start, however convenient. That rule is
@@ -23,7 +34,7 @@
 use bitcoin::secp256k1::Secp256k1;
 
 use crate::cardano::bf_http::{self, BfUtxo};
-use crate::cardano::config_params::{ConfigView, Contracts, config_view_from_utxo};
+use crate::cardano::config_params::{ConfigView, config_view_from_utxo};
 use crate::cardano::ref_script::RefScriptUtxo;
 use crate::config::HeimdallConfig;
 
@@ -60,6 +71,11 @@ pub struct Step {
     pub status: Status,
     /// What was actually found — the value, the count, the endpoint.
     pub detail: String,
+    /// Values this step resolved, one per line, when there are too many to fit in
+    /// `detail`. Not a diagnosis: step 3 lists the contract addresses it derived
+    /// from the Config, which is the only place an operator ever sees which
+    /// bridge this node is on.
+    pub notes: Vec<String>,
     /// The exact command or config key that resolves this. Never a suggestion to
     /// "check your configuration".
     pub fix: Option<String>,
@@ -98,6 +114,9 @@ impl Report {
                 s.status.label(),
                 s.detail
             ));
+            for line in &s.notes {
+                out.push_str(&format!("            {line}\n"));
+            }
             if let Some(fix) = &s.fix {
                 for line in fix.lines() {
                     out.push_str(&format!("         -> {line}\n"));
@@ -119,6 +138,25 @@ impl Builder {
             title,
             status,
             detail: detail.into(),
+            notes: Vec::new(),
+            fix: None,
+        });
+    }
+
+    fn push_notes(
+        &mut self,
+        n: u8,
+        title: &'static str,
+        status: Status,
+        detail: impl Into<String>,
+        notes: Vec<String>,
+    ) {
+        self.steps.push(Step {
+            n,
+            title,
+            status,
+            detail: detail.into(),
+            notes,
             fix: None,
         });
     }
@@ -136,6 +174,7 @@ impl Builder {
             title,
             status,
             detail: detail.into(),
+            notes: Vec::new(),
             fix: Some(fix.into()),
         });
     }
@@ -172,102 +211,6 @@ fn mnemonic_source(cfg: &HeimdallConfig) -> Option<&'static str> {
         Ok(v) if !v.trim().is_empty() => Some("$HEIMDALL_MNEMONIC"),
         _ => None,
     }
-}
-
-/// One operator-supplied value that disagrees with the Config UTxO.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Mismatch {
-    /// The `heimdall.toml` key holding the stale copy.
-    pub key: &'static str,
-    /// Which Config field is authoritative.
-    pub config_field: &'static str,
-    pub configured: String,
-    pub on_chain: String,
-}
-
-impl std::fmt::Display for Mismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}: config file has {}, Config {} has {}",
-            self.key, self.configured, self.config_field, self.on_chain
-        )
-    }
-}
-
-/// The payment credential of a Shelley script address, lower-hex.
-fn address_script_hash(addr: &str) -> Option<String> {
-    match pallas_addresses::Address::from_bech32(addr) {
-        Ok(pallas_addresses::Address::Shelley(s)) => Some(hex::encode(s.payment().as_hash())),
-        _ => None,
-    }
-}
-
-/// Cross-check every operator-typed duplicate against the Config UTxO.
-///
-/// Only values the operator actually set are checked: an unset key is not a
-/// disagreement, it is a value the daemon will take from the Config. Comparison
-/// is case-insensitive because hex is written both ways in practice.
-#[must_use]
-pub fn contract_mismatches(cfg: &HeimdallConfig, on_chain: &Contracts) -> Vec<Mismatch> {
-    let c = &cfg.cardano;
-    let mut out = Vec::new();
-
-    let mut check = |key, field, configured: Option<String>, expected: String| {
-        if let Some(got) = configured
-            && !got.eq_ignore_ascii_case(&expected)
-        {
-            {
-                out.push(Mismatch {
-                    key,
-                    config_field: field,
-                    configured: got,
-                    on_chain: expected,
-                });
-            }
-        }
-    };
-
-    check(
-        "cardano.bridged_token_unit",
-        "#1 ‖ fSAT (bridged_token)",
-        c.bridged_token_unit.clone(),
-        on_chain.bridged_token_unit(),
-    );
-    check(
-        "cardano.pegin_policy_id",
-        "#5 (peg_in_script_hash)",
-        c.pegin_policy_id.clone(),
-        hex::encode(&on_chain.peg_in_script_hash),
-    );
-    check(
-        "cardano.cpo_policy_id",
-        "#3 (bridge_state_policy)",
-        c.cpo_policy_id.clone(),
-        hex::encode(&on_chain.bridge_state_policy_id),
-    );
-    // Addresses carry the script hash in their payment credential. An address we
-    // cannot decode is left alone rather than reported as a mismatch — that is a
-    // malformed-address problem, and inventing a hash to compare against would
-    // turn it into a confusing one.
-    check(
-        "cardano.pegin_script_address",
-        "#5 (peg_in_script_hash)",
-        c.pegin_script_address
-            .as_deref()
-            .and_then(address_script_hash),
-        hex::encode(&on_chain.peg_in_script_hash),
-    );
-    check(
-        "cardano.pegout_script_address",
-        "#6 (peg_out_script_hash)",
-        c.pegout_script_address
-            .as_deref()
-            .and_then(address_script_hash),
-        hex::encode(&on_chain.peg_out_script_hash),
-    );
-
-    out
 }
 
 /// Locate the Config UTxO and require it to be **unique**.
@@ -402,12 +345,11 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         // used to be missing here and step 6 carried step 7's title.
         for (n, title) in [
             (3u8, "resolve the Config"),
-            (4, "verify the contract set"),
-            (5, "reference script"),
-            (6, "ban list"),
-            (7, "registration status"),
-            (8, "key handoff (Update-Y)"),
-            (9, "federation identity"),
+            (4, "reference script"),
+            (5, "ban list"),
+            (6, "registration status"),
+            (7, "key handoff (Update-Y)"),
+            (8, "federation identity"),
         ] {
             b.push(n, title, Status::Skipped, "needs a Cardano provider");
         }
@@ -443,61 +385,63 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     // with its peers about the batch grid or the fee rate, and running anyway is
     // how two SPOs sign different bytes.
     let missing = missing_locator_keys(cfg);
-    let config: Option<ConfigView> = if epoch.is_none() {
-        b.push(
-            3,
-            "resolve the Config",
-            Status::Skipped,
-            "provider unreachable",
-        );
-        None
-    } else if !missing.is_empty() {
-        b.push_fix(
-            3,
-            "resolve the Config",
-            Status::Fail,
-            format!("not configured: {} unset", missing.join(", ")),
-            format!(
-                "set {} in heimdall.toml — without all of them the mover cannot see the \
+    let config: Option<ConfigView> =
+        if epoch.is_none() {
+            b.push(
+                3,
+                "resolve the Config",
+                Status::Skipped,
+                "provider unreachable",
+            );
+            None
+        } else if !missing.is_empty() {
+            b.push_fix(
+                3,
+                "resolve the Config",
+                Status::Fail,
+                format!("not configured: {} unset", missing.join(", ")),
+                format!(
+                    "set {} in heimdall.toml — without all of them the mover cannot see the \
                  protocol batch grid and falls back to a wall-clock cadence, which does not \
                  agree with the other SPOs",
-                missing.join(", ")
-            ),
-        );
-        None
-    } else {
-        let address = cfg.cardano.config_address.clone().unwrap_or_default();
-        let nft_unit = format!(
-            "{}{}",
-            cfg.cardano.config_nft_policy_id.clone().unwrap_or_default(),
-            cfg.cardano.config_nft_asset_name.as_deref().unwrap_or("")
-        );
-        match bf_http::fetch_address_utxos(&base_url, &project_id, &address).await {
-            Err(e) => {
-                b.push_fix(
-                    3,
-                    "resolve the Config",
-                    Status::Fail,
-                    format!("UTxO query at {address}: {e}"),
-                    "check cardano.config_address and provider access",
-                );
-                None
-            }
-            Ok(utxos) => match find_unique_config_utxo(&utxos, &nft_unit) {
+                    missing.join(", ")
+                ),
+            );
+            None
+        } else {
+            let address = cfg.cardano.config_address.clone().unwrap_or_default();
+            let nft_unit = format!(
+                "{}{}",
+                cfg.cardano.config_nft_policy_id.clone().unwrap_or_default(),
+                cfg.cardano.config_nft_asset_name.as_deref().unwrap_or("")
+            );
+            match bf_http::fetch_address_utxos(&base_url, &project_id, &address).await {
                 Err(e) => {
                     b.push_fix(
                         3,
                         "resolve the Config",
                         Status::Fail,
-                        format!("{e} at {address}"),
-                        "check cardano.config_address, cardano.config_nft_policy_id and \
-                         cardano.config_nft_asset_name against the bridge's deployment notes",
+                        format!("UTxO query at {address}: {e}"),
+                        "check cardano.config_address and provider access",
                     );
                     None
                 }
-                Ok(utxo) => match config_view_from_utxo(utxo) {
-                    Err(e) => {
-                        b.push_fix(
+                Ok(utxos) => {
+                    match find_unique_config_utxo(&utxos, &nft_unit) {
+                        Err(e) => {
+                            b.push_fix(
+                                3,
+                                "resolve the Config",
+                                Status::Fail,
+                                format!("{e} at {address}"),
+                                "check cardano.config_address, cardano.config_nft_policy_id and \
+                         cardano.config_nft_asset_name against the bridge's deployment notes",
+                            );
+                            None
+                        }
+                        Ok(utxo) => match config_view_from_utxo(utxo) {
+                            Err(e) => {
+                                b.push_fix(
                             3,
                             "resolve the Config",
                             Status::Fail,
@@ -505,72 +449,58 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             "the located UTxO does not decode as a Config datum — check the \
                              NFT policy id points at this bridge's Config",
                         );
-                        None
+                                None
+                            }
+                            // The report NAMES the contracts it derived. Since WI-070
+                            // there is no local copy left to cross-check them against —
+                            // and no check that could stand in for showing an operator,
+                            // on a fresh install, which bridge this node just resolved.
+                            Ok(view) => match cfg.cardano.is_mainnet() {
+                                Err(e) => {
+                                    b.push_fix(3, "resolve the Config", Status::Fail, e,
+                                "every address this node derives from the Config — the peg-in \
+                                 and peg-out scripts, the TM validator, the registry, the ban \
+                                 list — carries this network's tag, and the wrong one resolves \
+                                 to a valid-looking address holding nothing");
+                                    None
+                                }
+                                Ok(mainnet) => {
+                                    let c = view.params.bridge_contracts(mainnet);
+                                    b.push_notes(
+                                        3,
+                                        "resolve the Config",
+                                        Status::Pass,
+                                        format!(
+                                            "{} ({} fields, fee_rate {} sat/vB)",
+                                            view.utxo,
+                                            view.params.field_count,
+                                            view.params.tunables.fee_rate_sat_per_vb
+                                        ),
+                                        vec![
+                                            format!("peg-in    {}", c.pegin_script_address),
+                                            format!("peg-out   {}", c.pegout_script_address),
+                                            format!("TM        {}", c.tm_address),
+                                            format!("fBTC      {}", c.bridged_token_unit),
+                                            format!(
+                                                "bridge state policy {}",
+                                                c.bridge_state_policy_id
+                                            ),
+                                        ],
+                                    );
+                                    Some(view)
+                                }
+                            },
+                        },
                     }
-                    Ok(view) => {
-                        b.push(
-                            3,
-                            "resolve the Config",
-                            Status::Pass,
-                            format!(
-                                "{} ({} fields, fee_rate {} sat/vB)",
-                                view.utxo,
-                                view.params.field_count,
-                                view.params.tunables.fee_rate_sat_per_vb
-                            ),
-                        );
-                        Some(view)
-                    }
-                },
-            },
-        }
-    };
-
-    // ── 4. Verify the derived contract set against reality ────────────────
-    // The Config's contract identifiers are authoritative; everything in
-    // `[cardano]` naming a contract is an operator-typed duplicate. Checking them
-    // here is what makes those copies verified rather than trusted, and it catches
-    // a stale copy on first run instead of at transaction time.
-    match &config {
-        None => b.push(
-            4,
-            "verify the contract set",
-            Status::Skipped,
-            "needs the Config from step 3",
-        ),
-        Some(view) => {
-            let mismatches = contract_mismatches(cfg, &view.params.contracts);
-            if mismatches.is_empty() {
-                b.push(
-                    4,
-                    "verify the contract set",
-                    Status::Pass,
-                    "every configured contract identifier matches the Config UTxO",
-                );
-            } else {
-                b.push_fix(
-                    4,
-                    "verify the contract set",
-                    Status::Fail,
-                    format!(
-                        "{} identifier(s) disagree with the Config",
-                        mismatches.len()
-                    ),
-                    mismatches
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
+                }
             }
-        }
-    }
+        };
 
-    // ── 5. Reference script — discover and report, never deploy ───────────
-    // `resolve` returns None only when NONE of the registry keys are set AND the
-    // Config publishes no registry identity (the fixture-roster deployment, which
-    // legitimately has no reference script), and an error when the local keys are
-    // half-set or when a local derivation contradicts the published #22.
+    // ── 4. Reference script — discover and report, never deploy ───────────
+    // `resolve` returns None only when there is no Config to read the registry
+    // identity (#11-#13) from — the fixture-roster deployment, which legitimately
+    // has no reference script — and an error when a locally compiled
+    // `treasury_info` contradicts the published #12.
     //
     // NOT a startup gate. The registry reference script is what `register-spo`
     // spends against; a running daemon reads the roster from UTxOs and never
@@ -583,37 +513,39 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     );
     match &registry {
         Ok(None) => b.push(
-            5,
+            4,
             "reference script",
             Status::Skipped,
             "no on-chain registry configured (fixture roster)",
         ),
         Err(e) => b.push_fix(
-            5,
+            4,
             "reference script",
             Status::Fail,
             format!("cannot derive the registry script: {e}"),
-            "set all of cardano.registry_blueprint, cardano.registry_bootstrap and \
-             cardano.treasury_info_asset_name — or none of them, to read the registry \
-             identity the bridge publishes at Config #21-#23",
+            "the registry identity comes from the bridge Config (#11-#13) and needs no keys \
+             of its own. This is the one thing that can still disagree: cardano.registry_blueprint \
+             compiles a treasury_info script whose hash must equal the published #12. Point it \
+             at the blueprint this bridge was deployed from, or unset it — a node without one \
+             still reads the roster and signs, it just cannot perform the Update-Y handoff",
         ),
         Ok(Some(src)) => {
             let hash = &src.registry_policy_hex;
             match wallet_ref_script(cfg, &base_url, &project_id, hash).await {
-                Err(e) => b.push(5, "reference script", Status::Warn, e),
+                Err(e) => b.push(4, "reference script", Status::Warn, e),
                 Ok(Some(r)) => b.push(
-                    5,
+                    4,
                     "reference script",
                     Status::Pass,
                     format!("registry script {hash} deployed at {r}"),
                 ),
                 Ok(None) => b.push_fix(
-                    5,
+                    4,
                     "reference script",
                     Status::Warn,
                     format!("registry script {hash} is not deployed at this wallet"),
                     "only needed to REGISTER — the daemon reads the roster without it, and \
-                     step 7 below says whether this node is already registered. To deploy it \
+                     step 6 below says whether this node is already registered. To deploy it \
                      you need the compiled script, so this one command still takes the \
                      blueprint and the bootstrap outref:\n\
                      heimdall deploy-registry-ref --config <file> --blueprint <plutus.json> \
@@ -624,7 +556,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         }
     }
 
-    // ── 6. Ban list — consensus-relevant, so its absence is a failure ─────
+    // ── 5. Ban list — consensus-relevant, so its absence is a failure ─────
     // The eligible roster is the registry MINUS active bans, so two nodes that
     // disagree about whether the list is read enumerate different participant
     // sets and their DKG cannot converge — invisible from either node's own
@@ -633,7 +565,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     // rather than at the next epoch boundary.
     match &registry {
         Ok(None) | Err(_) => b.push(
-            6,
+            5,
             "ban list",
             Status::Skipped,
             "no on-chain registry configured (fixture roster)",
@@ -644,7 +576,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         ) {
             Ok(Some(src)) => {
                 // Ask the enforcement half itself rather than inferring from one
-                // of its five keys: a half-configured publish path answers
+                // of its keys: a half-configured publish path answers
                 // `Err` here, which the daemon exits on, and reporting it as
                 // "enforcement configured" would hide exactly that.
                 let enforcement = crate::cardano::blockfrost_chain::DkgFaultBanFlow::from_config(
@@ -663,7 +595,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     ),
                 };
                 b.push(
-                    6,
+                    5,
                     "ban list",
                     status,
                     format!(
@@ -673,36 +605,38 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 );
             }
             Ok(None) => b.push_fix(
-                6,
+                5,
                 "ban list",
                 Status::Fail,
                 "the registry roster is configured but no ban list resolved".to_string(),
-                "set cardano.ban_bootstrap to the ban-list bootstrap outref",
+                "this bridge's Config publishes no ban policy at #7 — point \
+                 cardano.config_address at a bridge that does. There is no local route any \
+                 more: the schedule the ban policy id is derived from lives only in the Config",
             ),
             Err(e) => b.push_fix(
-                6,
+                5,
                 "ban list",
                 Status::Fail,
                 format!("cannot derive the ban list: {e}"),
                 "the eligible roster is the registry MINUS active bans — a node that cannot \
                  read the list computes a different DKG participant set from one that can.\n\
-                 A bridge whose Config publishes the ban policy (#17) needs NO ban keys here; \
+                 A bridge whose Config publishes the ban policy (#7) needs NO ban keys here; \
                  otherwise:\n\
                  heimdall bootstrap-ban-list --config <file> ... --submit  (once per bridge)",
             ),
         },
     }
 
-    // ── 7. Registration status — report, never register ───────────────────
+    // ── 6. Registration status — report, never register ───────────────────
     let bifrost_pk = {
         let secp = Secp256k1::new();
         cfg.load_bifrost_keypair(&secp)
             .ok()
             .map(|kp| kp.x_only_public_key().0.serialize())
     };
-    // ONE read serves steps 7 and 9: the snapshot carries both the registered SPO
+    // ONE read serves steps 6 and 8: the snapshot carries both the registered SPO
     // set and the `treasury_info` datum the federation identity lives in. Fetched
-    // here rather than inside step 7 because step 9 needs it even on a node with
+    // here rather than inside step 6 because step 8 needs it even on a node with
     // no bifrost key, and asking twice invites the two steps to see different
     // chain states.
     let snapshot = match &registry {
@@ -712,30 +646,31 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
 
     match (&snapshot, bifrost_pk) {
         (None, _) => b.push(
-            7,
+            6,
             "registration status",
             Status::Skipped,
-            "no usable on-chain registry (step 5)",
+            "no usable on-chain registry (step 4)",
         ),
         (Some(_), None) => b.push(
-            7,
+            6,
             "registration status",
             Status::Skipped,
             "no [bifrost].skey_path — cannot tell which registry entry is ours",
         ),
         (Some(read), Some(pk)) => match read {
             Err(e) => b.push_fix(
-                7,
+                6,
                 "registration status",
                 Status::Fail,
                 format!("registry unreadable: {e}"),
-                "the registry or its treasury_info state could not be read or verified — \
-                 check cardano.registry_bootstrap and cardano.treasury_info_asset_name",
+                "the registry or its treasury_info state could not be read or verified at \
+                 the addresses the Config publishes (#11-#13) — check cardano.config_address \
+                 points at this bridge, and cardano.network at its network",
             ),
             Ok(snapshot) => {
                 if snapshot.spos.iter().any(|s| s.bifrost_id_pk == pk) {
                     b.push(
-                        7,
+                        6,
                         "registration status",
                         Status::Pass,
                         format!(
@@ -746,7 +681,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     );
                 } else {
                     b.push_fix(
-                        7,
+                        6,
                         "registration status",
                         Status::Fail,
                         format!(
@@ -760,7 +695,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                          --bifrost-url http://<host>:<port> --submit\n\
                          (run it without --submit first — it prints the transaction and stops. \
                          The registry reference script it needs is found automatically once \
-                         deploy-registry-ref has put one at this wallet; see step 5.)\n\
+                         deploy-registry-ref has put one at this wallet; see step 4.)\n\
                          Locks a security deposit — the daemon will not do this for you.",
                     );
                 }
@@ -768,10 +703,10 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         },
     }
 
-    // ── 8. Key handoff (Update-Y) — a capability, reported not assumed ────
+    // ── 7. Key handoff (Update-Y) — a capability, reported not assumed ────
     // A completed DKG only becomes consequential when `treasury_info` is rotated
     // to the new group key, and SPENDING that state UTxO needs the compiled
-    // script — not just the policy id the Config publishes at #22. Reading the
+    // script — not just the policy id the Config publishes at #12. Reading the
     // roster does not, so this is the one thing a fully published-route node
     // still cannot do, and the one thing whose absence is invisible until it
     // costs a whole ceremony: the leader fails at submission AFTER a full DKG and
@@ -782,13 +717,13 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     // that participates correctly.
     match &registry {
         Ok(None) | Err(_) => b.push(
-            8,
+            7,
             "key handoff (Update-Y)",
             Status::Skipped,
             "no on-chain registry configured (fixture roster)",
         ),
         Ok(Some(src)) if src.can_hand_off_key() => b.push(
-            8,
+            7,
             "key handoff (Update-Y)",
             Status::Pass,
             format!(
@@ -797,19 +732,20 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             ),
         ),
         Ok(Some(_)) => b.push_fix(
-            8,
+            7,
             "key handoff (Update-Y)",
             Status::Warn,
             "no compiled treasury_info script — if this node is elected leader the \
              Update-Y fails after a full DKG and the treasury is not handed over",
-            "set cardano.registry_blueprint and cardano.treasury_policy_id (treasury_info's \
-             two parameters). The derived hash is checked against the Config's #22, so a \
-             wrong one is refused rather than used",
+            "set cardano.registry_blueprint to the plutus.json this bridge was deployed from. \
+             It is the ONLY thing needed — treasury_info's one parameter is the registry policy \
+             the Config publishes at #11 — and the derived hash is checked against #12, so a \
+             wrong blueprint is refused rather than used",
         ),
     }
 
-    // ── 9. Federation identity — the treasury's own address (WI-069) ──────
-    // A Fail, unlike steps 5 and 8: this is not a capability the node can do
+    // ── 8. Federation identity — the treasury's own address (WI-069) ──────
+    // A Fail, unlike steps 4 and 7: this is not a capability the node can do
     // without. Y_fed and the CSV delay are what the treasury scriptPubKey is
     // built from, so a node that cannot resolve them — or whose local seed
     // contradicts what the chain publishes — would sign for an address no other
@@ -822,11 +758,11 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     // the local seed and reintroduce the divergence this replaces.
     match &snapshot {
         Some(Err(e)) => b.push_fix(
-            9,
+            8,
             "federation identity",
             Status::Fail,
             format!("treasury_info unreadable, so the treasury address cannot be derived: {e}"),
-            "this is the same read step 7 failed on — fix that first",
+            "this is the same read step 6 failed on — fix that first",
         ),
         published => {
             let datum = published
@@ -835,7 +771,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 .map(|s| &s.treasury_state.datum);
             match crate::cardano::federation::resolve(&cfg.bitcoin, datum) {
                 Ok(id) => b.push(
-                    9,
+                    8,
                     "federation identity",
                     Status::Pass,
                     format!(
@@ -846,7 +782,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     ),
                 ),
                 Err(e) => b.push_fix(
-                    9,
+                    8,
                     "federation identity",
                     Status::Fail,
                     e.to_string(),
@@ -888,43 +824,6 @@ async fn wallet_ref_script(
 mod tests {
     use super::*;
     use crate::config::HeimdallConfig;
-
-    fn contracts() -> Contracts {
-        Contracts {
-            bridged_token_policy_id: vec![0xAA; 28],
-            completed_peg_ins_policy_id: vec![0xBB; 28],
-            bridge_state_policy_id: vec![0xCC; 28],
-            peg_in_script_hash: vec![0xDD; 28],
-            peg_out_script_hash: vec![0xEE; 28],
-        }
-    }
-
-    #[test]
-    fn an_unset_key_is_not_a_mismatch() {
-        let cfg = HeimdallConfig::default();
-        assert!(contract_mismatches(&cfg, &contracts()).is_empty());
-    }
-
-    #[test]
-    fn a_matching_key_is_not_a_mismatch_whatever_its_case() {
-        let mut cfg = HeimdallConfig::default();
-        cfg.cardano.pegin_policy_id = Some(hex::encode(vec![0xDD; 28]).to_uppercase());
-        cfg.cardano.bridged_token_unit = Some(contracts().bridged_token_unit());
-        assert!(contract_mismatches(&cfg, &contracts()).is_empty());
-    }
-
-    #[test]
-    fn a_stale_copy_is_reported_with_both_values() {
-        let mut cfg = HeimdallConfig::default();
-        cfg.cardano.pegin_policy_id = Some(hex::encode(vec![0x01; 28]));
-        let m = contract_mismatches(&cfg, &contracts());
-        assert_eq!(m.len(), 1);
-        assert_eq!(m[0].key, "cardano.pegin_policy_id");
-        // Both sides must appear, or the operator cannot tell which to change.
-        let rendered = m[0].to_string();
-        assert!(rendered.contains(&hex::encode(vec![0x01; 28])));
-        assert!(rendered.contains(&hex::encode(vec![0xDD; 28])));
-    }
 
     #[test]
     fn every_locator_key_is_reported_when_none_are_set() {
@@ -982,26 +881,25 @@ mod tests {
         assert!(find_unique_config_utxo(&utxos, "polNFT").is_ok());
     }
 
+    fn step(n: u8, title: &'static str, status: Status) -> Step {
+        Step {
+            n,
+            title,
+            status,
+            detail: String::new(),
+            notes: Vec::new(),
+            fix: None,
+        }
+    }
+
     #[test]
     fn a_report_with_a_failure_is_not_ok_but_a_warning_is() {
         let warn = Report {
-            steps: vec![Step {
-                n: 1,
-                title: "local preflight",
-                status: Status::Warn,
-                detail: String::new(),
-                fix: None,
-            }],
+            steps: vec![step(1, "local preflight", Status::Warn)],
         };
         assert!(warn.ok());
         let fail = Report {
-            steps: vec![Step {
-                n: 3,
-                title: "resolve the Config",
-                status: Status::Fail,
-                detail: String::new(),
-                fix: None,
-            }],
+            steps: vec![step(3, "resolve the Config", Status::Fail)],
         };
         assert!(!fail.ok());
         assert_eq!(fail.first_failure().map(|s| s.n), Some(3));
@@ -1011,7 +909,8 @@ mod tests {
     /// `render` derives its "[n/total]" from `steps.len()`. It used to push four
     /// (3,4,5,6) while nine exist, so adding a step made the last line read
     /// "[9/7]" — and its entry for 6 carried step 7's title, so the ban-list check
-    /// was reported as "registration status".
+    /// was reported as "registration status". WI-070 dropped the contract-set
+    /// cross-check, so there are eight.
     #[tokio::test]
     async fn the_no_provider_report_accounts_for_every_step() {
         let cfg = HeimdallConfig::default();
@@ -1021,29 +920,48 @@ mod tests {
         );
         let report = preflight(&cfg).await;
         let numbers: Vec<u8> = report.steps.iter().map(|s| s.n).collect();
-        assert_eq!(numbers, (1..=9).collect::<Vec<u8>>(), "{numbers:?}");
+        assert_eq!(numbers, (1..=8).collect::<Vec<u8>>(), "{numbers:?}");
         // Every rendered line's step number is within the total it prints.
         let total = report.steps.len();
-        assert_eq!(total, 9);
+        assert_eq!(total, 8);
         for s in &report.steps {
             assert!(usize::from(s.n) <= total, "step {} of {total}", s.n);
         }
         // Titles line up with the steps the main path actually pushes.
         let titled: Vec<&str> = report.steps.iter().map(|s| s.title).collect();
-        assert_eq!(titled[5], "ban list");
-        assert_eq!(titled[6], "registration status");
-        assert_eq!(titled[8], "federation identity");
+        assert_eq!(titled[3], "reference script");
+        assert_eq!(titled[4], "ban list");
+        assert_eq!(titled[5], "registration status");
+        assert_eq!(titled[7], "federation identity");
+    }
+
+    /// Step 3 is the only place an operator is told WHICH bridge this node
+    /// resolved, now that nothing cross-checks a local copy of it.
+    #[test]
+    fn render_lists_the_resolved_contracts_under_their_step() {
+        let r = Report {
+            steps: vec![Step {
+                notes: vec![
+                    "peg-in    addr_test1wq808aas".into(),
+                    "fBTC      aabbcc66534154".into(),
+                ],
+                ..step(3, "resolve the Config", Status::Pass)
+            }],
+        };
+        let out = r.render();
+        assert!(out.contains("peg-in    addr_test1wq808aas"), "{out}");
+        assert!(out.contains("fBTC      aabbcc66534154"), "{out}");
+        // Not marked as a fix — nothing here is broken.
+        assert!(!out.contains("-> peg-in"), "{out}");
     }
 
     #[test]
     fn render_shows_the_fix_under_its_step() {
         let r = Report {
             steps: vec![Step {
-                n: 5,
-                title: "reference script",
-                status: Status::Fail,
                 detail: "not deployed".into(),
                 fix: Some("heimdall deploy-registry-ref ...".into()),
+                ..step(4, "reference script", Status::Fail)
             }],
         };
         let out = r.render();

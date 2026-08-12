@@ -116,37 +116,54 @@ cadence, and two SPOs ticking on wall clocks scan different chain states and bui
 Treasury Movement bytes — so no co-signer can reproduce them. Refusing to start is the only safe
 behaviour, and it is why these three cannot be left blank.
 
-**[will be removed — WI-070]** Most of the remaining ~20 values (`pegin_script_address`,
-`pegout_script_address`, `bridged_token_unit`, the treasury and registry identifiers) are things
-the Config UTxO already knows. Step 4 checks what you typed against the chain, so a mistake is
-caught at startup rather than by a failed transaction — but you still have to type them.
+**That is the whole bridge.** There is nothing else about it to type. The peg-in and peg-out script
+addresses, the bridged-token unit, the TM validator address and its state token, the bridge-state
+policy, the SPO registry's identity, its `treasury_info` state NFT, the ban policy and the ban
+schedule are all in that Config datum, and the daemon derives every one of them from it. Startup
+step 3 prints the addresses it resolved, so you can check them against the deployment notes without
+copying them into a file.
 
-**The registry and the ban list: usually nothing to type.** On a bridge deployed by
-`binocular deploy-bridge` at or after WI-068, the Config publishes the registry policy, the
-`treasury_info` policy and its state-NFT name (fields #21-#23) alongside the ban policy — so
-`registry_blueprint`, `registry_bootstrap` and `treasury_info_asset_name` are not needed either.
-Genesis mints both linked-list roots *before* the Config exists, so a bridge cannot exist without
-them; `heimdall bootstrap-registry` and `bootstrap-ban-list` are legacy, for bridges that predate
-that and for recovering a genesis that failed part-way.
+They used to be about twenty keys here, cross-checked against the chain at startup. WI-070 deleted
+both the keys and the check: a value every SPO must agree on is not an operator setting, and the
+second copy — not the typo in it — was the defect. A wrong script hash never produced an error, it
+produced a well-formed address holding nothing, which reads as "no peg-ins pending" and "nobody is
+banned" while the node keeps signing. **A config that still sets one is refused at startup**, with a
+message naming the Config field that replaced it; delete the line.
 
-One thing the published ids do NOT cover: performing the DKG **key handoff** (Update-Y) spends the
-`treasury_info` state UTxO, and spending needs the compiled script rather than its hash. A node
-that does handoffs still needs a blueprint; what it derives is checked against the published #22,
-so a mismatch is a startup error instead of a handoff written where no one reads it.
+One value that must match across SPOs is neither here nor in the Config: the
+**peg-out freshness margin**, which decides how close to its 30-day cancel deadline
+a request may still be paid. It is a TM *selection* rule, so it decides the TM
+bytes — and it was a `[protocol]` key with a comment telling you not to change it,
+which is not a mechanism. WI-071 compiled it in at 7 days; a config still setting
+`protocol.pegout_freshness_margin_ms` is refused. That makes it uniform per
+*release* rather than per bridge, which is weaker than publishing it and is why
+WI-071 stays open for the datum half.
 
-**The ban list specifically.** The eligible roster is the registry *minus* active bans,
-so a node that cannot read that list computes a different DKG participant set from everyone else —
-which is why the daemon refuses to start without one. But on a bridge whose Config publishes the
-ban policy (field #17), there is nothing to configure: the node reads the policy id from the
-Config, and the ban script address follows from it. `show-config-params` prints the address it
-resolved, and startup step 6 names the source.
+Two things survive, and neither is a bridge identifier:
 
-Only on a bridge whose Config *predates* that field do you still copy `ban_bootstrap`,
-`fault_proof_policies` and the three `*_ban_*` schedule numbers from the deployment notes. Copy them
-exactly: they are inputs to the ban policy's own identifier, so a wrong value yields a valid-looking
-address holding an empty list — banned SPOs back in your roster with nothing in any log. On a bridge
-that *does* publish #17, leftover local keys are simply unused; if they happen to derive a different
-policy the daemon says so and stops rather than picking one.
+- `tm_script_cbor` — only to POST a treasury movement. The Config publishes the TM validator's
+  *hash* (#4), which is enough to find and read the TM address, but minting the TM NFT needs the
+  compiled code. A node that only signs does not need it.
+- `registry_blueprint` — only to perform the DKG **key handoff** (Update-Y), which spends the
+  `treasury_info` state UTxO and so needs the compiled script rather than its hash. It is a build
+  artifact of the contracts release, not a per-bridge value, and what it derives is checked against
+  the published #12 — so a blueprint from the wrong release is refused rather than used. Startup
+  step 7 says which of the two you are; without it this node still runs DKG and signs, it just
+  cannot be the one that rotates the key.
+
+**The ban list.** The eligible roster is the registry *minus* active bans, so a node that cannot
+read that list computes a different DKG participant set from everyone else — which is why the
+daemon refuses to start without one. There is nothing to configure: the node reads the policy id
+from Config #7 and the ban script address follows from it. `show-config-params` prints the address
+it resolved, and startup step 5 names the source. Genesis mints both linked-list roots *before* the
+Config exists, so a bridge cannot exist without them; `heimdall bootstrap-registry` and
+`bootstrap-ban-list` are for creating a bridge, or recovering a genesis that failed part-way.
+
+Publishing a fault proof on chain — *enforcing* a ban rather than reading the list — is the one
+optional extra, and it does need `registry_bootstrap`, `ban_bootstrap` and `fault_proof_policies`
+copied exactly from the deployment notes, because building an ApplyBan means re-deriving the very
+policy id those values are inputs to. Faults are detected and the offender excluded from the
+ceremony with or without them.
 
 **Secrets.** Two, and neither belongs in the TOML if you can avoid it:
 
@@ -217,29 +234,39 @@ dry run — it reads the chain and builds nothing.
 ```
 [1/8] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
 [2/8] cardano connectivity         PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
-[3/8] resolve the Config           PASS  2dce4027…#0 (24 fields, min_stake 0)
-[4/8] verify the contract set      PASS  every configured contract identifier matches the Config UTxO
-[5/8] reference script             …
-[6/8] ban list                     PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (#17) (detection only)
-[7/8] registration status          …
-[8/8] key handoff (Update-Y)       …
+[3/8] resolve the Config           PASS  2dce4027…#0 (15 fields, fee_rate 2 sat/vB)
+            peg-in    addr_test1wq808aasvftrss2t5lzlw4waq0sccz36u5fcqh599szgs9s9ecwez
+            peg-out   addr_test1wr3e4k663yfdq23hhpkrfc8dpglafz0f4v4v2x04sm0udec8tvraj
+            TM        addr_test1wq3ywdhmjku42uv2pcmy0dwcnycl2slcnswnfapsg7f5z4cd30duu
+            fBTC      1e65fe8aa85835590a96ceb6d058a9ce6b7d55329e108da58c3ae0a466534154
+            bridge state policy  e39adb5a8912d02a37b86c34e0ed0a3fd489e9ab2ac519f586dfc6e7
+[4/8] reference script             …
+[5/8] ban list                     PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (#7) (detection only)
+[6/8] registration status          …
+[7/8] key handoff (Update-Y)       …
+[8/8] federation identity          PASS  Y_fed 0ce472ae…, csv 144 blocks — the bridge's treasury_info datum
 ```
 
-Step 4 is the one that earns its keep: it compares every contract identifier you typed against the
-Config UTxO on chain and names any that disagree, with both values. Step 6 confirms your roster is
-ban-filtered — it fails if the registry is configured without a ban list, since that node could not
-agree with its peers on who is in the DKG. Step 7 tells you whether this node is registered; it
-never spends — it names the command and stops.
+Step 3 is the one to read. It is the whole bridge: the addresses under it are what this node
+derived from the Config datum, and they are what it will scan, pay and post to. Check them against
+the deployment notes here — that is the point at which a wrong `config_nft_policy_id` becomes
+visible, rather than at the first movement.
 
-Only `FAIL` blocks startup. A `WARN` is worth reading, and steps 5 and 8 are the two you will most
+Step 5 confirms your roster is ban-filtered — it fails if the registry is configured without a ban
+list, since that node could not agree with its peers on who is in the DKG. Step 6 tells you whether
+this node is registered; it never spends — it names the command and stops. Step 8 is the treasury's
+own address: `Y_fed` and the CSV delay build the treasury scriptPubKey, so a node that resolves
+them differently signs for an address no other SPO is using.
+
+Only `FAIL` blocks startup. A `WARN` is worth reading, and steps 4 and 7 are the two you will most
 often see one on:
 
-- **Step 5 (`reference script`)** warns when the registry reference script is not deployed at your
+- **Step 4 (`reference script`)** warns when the registry reference script is not deployed at your
   wallet. That script is only needed to *register*; a running daemon reads the roster without it.
-- **Step 8 (`key handoff`)** warns when this node has no compiled `treasury_info` script. It still
+- **Step 7 (`key handoff`)** warns when this node has no compiled `treasury_info` script. It still
   runs DKG and signs — but if it is elected leader for an epoch, the Update-Y that hands the
   treasury to the new group key fails, and the handoff does not happen. Set
-  `cardano.registry_blueprint` and `cardano.treasury_policy_id` to clear it.
+  `cardano.registry_blueprint` to clear it.
 - `protocol.state_dir is unset` is the one that silently costs money later.
 
 Do not continue until this passes.

@@ -114,9 +114,9 @@ pub async fn fetch_bridge_state(
         [only] => *only,
         [] => {
             return Err(CpoTrieError::Source(format!(
-                "no unspent output holds the bridge state NFT {unit} — cardano.cpo_policy_id \
-                 names the wrong policy (it must be Config field 3, bridge_state_policy), the \
-                 singleton is not deployed, or the backend is not indexing that policy"
+                "no unspent output holds the bridge state NFT {unit} — this node is reading \
+                 the wrong bridge (Config field 3, bridge_state_policy), the singleton is not \
+                 deployed, or the backend is not indexing that policy"
             )));
         }
         many => {
@@ -368,9 +368,9 @@ mod tests {
             "{none}"
         );
         // The likeliest cause is a misconfigured policy id, not a sick indexer:
-        // `cardano.cpo_policy_id` must hold the BRIDGE STATE policy. Name the key.
+        // Name the Config field, so an operator knows which value to check.
         assert!(
-            format!("{none}").contains("cardano.cpo_policy_id"),
+            format!("{none}").contains("bridge_state_policy"),
             "the zero-holder error must name the config key that selects the policy: {none}"
         );
 

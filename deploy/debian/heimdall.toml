@@ -27,11 +27,12 @@ state_dir = "/var/lib/heimdall"
 # Poll cadence for the chain-watching loops (ms).
 poll_interval_ms = 5000
 
-# A peg-out is payable only while at least this far from its 30-day cancel
-# deadline. MUST be identical on every SPO: it is a TM selection rule, and a
-# divergent rule produces divergent TM bytes, so the FROST round cannot converge.
-# Do not change this unilaterally. Default 7 days.
-pegout_freshness_margin_ms = 604800000
+# There is no peg-out freshness margin to set here. A peg-out is payable only
+# while at least 7 days from its 30-day cancel deadline — a TM SELECTION rule, so
+# it decides the TM bytes, so a divergent one makes the FROST round fail to
+# converge with nothing in any log naming the cause. It was a key on this line
+# until WI-071, with a comment telling you not to change it; it is now compiled in
+# (PEG_OUT_FRESHNESS_MARGIN_MS), and a config still setting it is refused.
 
 
 [bitcoin]
@@ -45,7 +46,7 @@ pegout_freshness_margin_ms = 604800000
 # to be copied from the bridge's deployment notes into every operator's config,
 # with a wrong value producing no error at all — just a well-formed address nobody
 # else uses. They are published in the bridge's treasury_info datum, which
-# heimdall finds from the Config NFT alone, and startup check 9 prints which
+# heimdall finds from the Config NFT alone, and startup check 8 prints which
 # source it used.
 #
 # Set them ONLY for a deployment with no readable treasury_info (the fixture-roster
@@ -123,64 +124,43 @@ stake_source = "blockfrost"
 #config_nft_policy_id = ""
 #config_nft_asset_name = ""
 
-# The treasury movement validator (PlutusV3 CBOR hex) and the TM state token.
+# NOTHING ELSE ABOUT THE BRIDGE BELONGS IN THIS FILE.
+#
+# The peg-in and peg-out script addresses, the bridged-token unit, the TM
+# validator address and its state token, the bridge-state policy, the SPO
+# registry's identity, its treasury_info state NFT and the ban policy and its
+# schedule are all published in that Config datum, and heimdall derives every one
+# of them from it. They used to be keys here, copied out of a deployment note per
+# operator. A wrong value never produced an error — it produced a well-formed
+# address holding nothing, which reads as "no peg-ins pending", "no peg-outs
+# pending" and "nobody is banned" while the node keeps signing.
+#
+# heimdall REFUSES to start if any of them is still present, and names the Config
+# field that replaced it. `heimdall show-config-params` prints what it resolved
+# from the chain, and startup step 3 lists every contract address it derived.
+
+# The treasury movement validator (PlutusV3 CBOR hex). REQUIRED only to POST a
+# treasury movement: minting the TM NFT needs the compiled script, which the
+# Config publishes the hash of (#4) but not the code. A node that only signs
+# does not need it.
 #tm_script_cbor = ""
-#treasury_address = ""
-#treasury_policy_id = ""
-#treasury_asset_name = ""
 
-# Peg-in / peg-out contracts and the bridged token (policy id ++ asset name hex).
-#pegin_script_address = ""
-#pegin_policy_id = ""
-#pegout_script_address = ""
-#bridged_token_unit = ""
-
-# On-chain SPO registry. LEAVE ALL THREE UNSET on any bridge whose Config
-# publishes the registry identity (fields #21-#23) — the node reads the registry
-# policy, the treasury_info policy and its state-NFT name from there, and there
-# is nothing here to get wrong. `heimdall show-config-params` prints what it
-# resolved; startup step 5 names the source.
-#
-# Set all three ONLY for a bridge deployed before those fields existed (or for
-# the demo fixture roster, which sets none of them). Half-set is a startup error,
-# not a fixture.
-#
-# One exception, and only if this node should perform the DKG key handoff:
-# spending the treasury_info state UTxO (Update-Y) needs the COMPILED script, not
-# just the policy id the Config publishes, so a handoff-capable node still sets
-# registry_blueprint (with treasury_policy_id above). What it derives is checked
-# against the published #22, so a wrong blueprint is refused rather than used.
-# Startup step 8 says which of the two you are. Without it this node still runs
-# DKG and signs; it just cannot be the one that rotates the key.
+# The compiled contracts (plutus.json), for the ONE thing the published identity
+# cannot buy: spending the treasury_info state UTxO, i.e. the Update-Y key
+# handoff after a DKG. Reading the roster never needs it. A build artifact of the
+# contracts release, not a per-bridge value — and what it derives is checked
+# against the Config's #12, so a blueprint from the wrong release is refused
+# rather than used. Startup step 7 says which of the two you are; without it this
+# node still runs DKG and signs, it just cannot be the one that rotates the key.
 #registry_blueprint = "/var/lib/heimdall/plutus.json"
-#registry_bootstrap = "<tx_hash>:<index>"
-#treasury_info_asset_name = ""
 
-# Ban list. LEAVE THIS UNSET on any bridge whose Config publishes the ban policy
-# (field #17) — the node reads it from there and there is nothing here to get
-# wrong. `heimdall show-config-params` prints the ban address it resolved.
-#
-# It is not an operator preference either way: the eligible roster is the
-# registry MINUS active bans, so a node that does not read the list enumerates a
-# different set of DKG participants, assigns different indices, and cannot
-# converge with the others. Nothing in either node's log would say so — which is
-# why the daemon refuses to start with the registry keys set and no ban list from
-# either source.
-#
-# Set these ONLY for a bridge deployed before #17 existed, and then copy all
-# five exactly from the deployment notes: each is an input to the ban policy's
-# own identifier, so one wrong value derives a valid-looking address holding no
-# bans at all. On that route the registry keys above are required too — the ban
-# policy is parameterized by the registry policy.
-#ban_bootstrap = "<tx_hash>:<index>"
-#fault_proof_policies = ["<28-byte hex>", "<28-byte hex>", "<28-byte hex>"]
-#base_ban_duration_ms = 0
-#max_faults_before_permanent = 0
-#max_validity_window_ms = 0
-
-# Fault enforcement — publishing a fault proof on chain so misbehaviour costs
+# Fault ENFORCEMENT — publishing a fault proof on chain so misbehaviour costs
 # something. Entirely OPTIONAL and off by default: faults are detected and the
-# offender excluded from the ceremony either way, with or without these.
+# offender excluded from the ceremony either way, with or without these, and the
+# ban list heimdall FILTERS the roster against comes from Config #7 and needs
+# none of them. What these buy is the ability to build an ApplyBan under that
+# same policy, which means re-deriving it — so each value must match the
+# deployment exactly, being an input to the policy's own identifier.
 #
 # All of them or none. Setting one and omitting another is a startup error
 # rather than a half-working publish path.
@@ -188,6 +168,9 @@ stake_source = "blockfrost"
 # Do not enable on mainnet yet — the deployed round1/round2 verifiers are
 # generated from a test setup and heimdall will refuse to start. See
 # docs/fault-proof-srs.md in the heimdall repository.
+#registry_bootstrap = "<tx_hash>:<index>"
+#ban_bootstrap = "<tx_hash>:<index>"
+#fault_proof_policies = ["<28-byte hex>", "<28-byte hex>", "<28-byte hex>"]
 #spo_bans_ref = "<tx_hash>:<index>"
 #fault_verifier_round1_ref = "<tx_hash>:<index>"
 #fault_verifier_round2_ref = "<tx_hash>:<index>"

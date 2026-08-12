@@ -235,10 +235,10 @@ impl std::fmt::Display for BanListError {
             Self::NotBootstrapped => write!(
                 f,
                 "ban list not bootstrapped: no ban-policy NFTs at the ban script address. On a \
-                 bridge whose Config publishes the ban policy (#17) the root was minted at \
+                 bridge whose Config publishes the ban policy (#7) the root was minted at \
                  genesis, BEFORE the Config naming it — so this means the address is wrong, not \
                  the list empty: check cardano.network against the bridge (the network tag is \
-                 the only part of the address still taken from local config), and that #17 is \
+                 the only part of the address still taken from local config), and that #7 is \
                  not a placeholder. Otherwise mint the 'ban-root' anchor with bootstrap-ban-list"
             ),
             Self::MissingRoot => {
@@ -686,7 +686,7 @@ pub struct BanListSource {
 /// bridge's own published value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BanSourceOrigin {
-    /// Config #17 — this node configured nothing ban-related.
+    /// Config #7 — this node configured nothing ban-related.
     Config,
     /// The node's own `[cardano]` keys, on a Config predating the ban append.
     LocalKeys,
@@ -700,13 +700,13 @@ impl BanSourceOrigin {
     ///
     /// On the PUBLISHED route it may not. WI-068 mints both roots in the
     /// transaction BEFORE the one that mints the Config NFT naming them, so a
-    /// Config that publishes #17 at all publishes a policy whose root already
+    /// Config that publishes #7 at all publishes a policy whose root already
     /// exists. An empty address therefore means this node is looking at the
-    /// WRONG address — a placeholder or zero #17, or a `cardano.network` that
+    /// WRONG address — a placeholder or zero #7, or a `cardano.network` that
     /// disagrees with the bridge, since the network tag is the one part of the
     /// address that still comes from local config and is never checked against
     /// the Config. Reading that as "no bans" produces a fully unfiltered roster,
-    /// which is the exact failure publishing #17 exists to prevent.
+    /// which is the exact failure publishing #7 exists to prevent.
     #[must_use]
     pub fn tolerates_unbootstrapped(self) -> bool {
         matches!(self, Self::LocalKeys)
@@ -716,7 +716,7 @@ impl BanSourceOrigin {
 impl std::fmt::Display for BanSourceOrigin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Config => write!(f, "published by the bridge Config (#17)"),
+            Self::Config => write!(f, "published by the bridge Config (#7)"),
             Self::LocalKeys => write!(f, "LOCAL heimdall.toml ban keys"),
         }
     }
@@ -737,12 +737,14 @@ pub struct BanPolicyParams {
 }
 
 impl BanPolicyParams {
-    /// The enforcement half's parameters, published values first.
+    /// The enforcement half's parameters: the schedule from the bridge Config,
+    /// the verifier policy set from `[cardano]`.
     ///
-    /// The ban schedule is baked into the policy id, so an ApplyBan built from
+    /// The schedule is baked into the ban policy id, so an ApplyBan built from
     /// numbers other than the deployment's produces a `BanNodeData` the validator
-    /// rejects. Taking them from Config #18–#20 makes that impossible to get
-    /// wrong; the local keys remain for a Config predating the append.
+    /// rejects. There is no local copy to prefer or cross-check any more (WI-070):
+    /// a value every SPO must reproduce exactly is not an operator setting, and
+    /// the three keys that used to hold it are refused at load time.
     ///
     /// `fault_proof_policies` has no published counterpart and stays local — it
     /// is a build artifact of the contracts release, which is WI-066's subject,
@@ -752,40 +754,14 @@ impl BanPolicyParams {
         config: Option<&crate::cardano::config_params::ConfigParams>,
     ) -> Result<Self, BanListError> {
         let Some(published) = config.map(|c| &c.bans) else {
-            return Self::from_config(cardano);
+            return Err(BanListError::Config(
+                "the ban schedule comes from the bridge Config (#8-#10) and this node could \
+                 not read one — set cardano.config_address + cardano.config_nft_policy_id. \
+                 Fault enforcement builds an ApplyBan whose BanNodeData must reproduce the \
+                 deployment's schedule exactly, so there is nothing to fall back to"
+                    .into(),
+            ));
         };
-        // A local schedule that disagrees with the published one is dead config,
-        // not a conflict to resolve: #18–#20 are baked into the policy id the
-        // bridge published, so the local numbers cannot describe this bridge. Say
-        // which ones, since silently ignoring them is how an operator believes a
-        // ban duration they typed is in force.
-        for (name, local, published) in [
-            (
-                "base_ban_duration_ms",
-                cardano.base_ban_duration_ms,
-                published.base_ban_duration_ms,
-            ),
-            (
-                "max_faults_before_permanent",
-                cardano.max_faults_before_permanent,
-                published.max_faults_before_permanent,
-            ),
-            (
-                "max_validity_window_ms",
-                cardano.max_validity_window_ms,
-                published.max_validity_window_ms,
-            ),
-        ] {
-            if local.is_some_and(|l| l != published) {
-                tracing::warn!(
-                    "[bans] cardano.{name} = {} is IGNORED — the bridge Config publishes {} and \
-                     that value is baked into ban policy this node enforces against. Delete the \
-                     local key",
-                    local.unwrap_or_default(),
-                    published
-                );
-            }
-        }
         Ok(Self {
             fault_proof_policies: Self::fault_policies_from_config(cardano)?,
             base_ban_duration_ms: published.base_ban_duration_ms,
@@ -794,45 +770,43 @@ impl BanPolicyParams {
         })
     }
 
-    /// Parse from `[cardano]` config. Every field is required — the values are
-    /// baked into the ban policy id, so there is no safe default.
-    pub fn from_config(cardano: &crate::config::CardanoConfig) -> Result<Self, BanListError> {
-        let fault_proof_policies = Self::fault_policies_from_config(cardano)?;
-        let req = |v: Option<i64>, name: &str| {
-            v.ok_or_else(|| {
-                BanListError::Config(format!(
-                    "cardano.{name} is required alongside cardano.ban_bootstrap"
-                ))
-            })
+    /// The same parameters at GENESIS, where the schedule cannot come from the
+    /// Config because the Config does not exist yet.
+    ///
+    /// WI-068 mints the ban root in the transaction BEFORE the Config NFT that
+    /// names it, so `bootstrap-ban-list` runs at a moment when [`Self::resolve`]
+    /// has nothing to read and — with the local keys retired — no fallback
+    /// either. Its two sibling genesis commands (`deploy-spo-bans-ref`,
+    /// `init-scripts`) always took the schedule as explicit flags for exactly
+    /// this reason; this is the same door, not a reopened config key.
+    ///
+    /// Range-checked here to match `ban_config_ok`: these three values are
+    /// inputs to the ban policy id, so an out-of-range one bootstraps a list at
+    /// an address no node will ever read.
+    pub fn from_genesis_flags(
+        cardano: &crate::config::CardanoConfig,
+        base_ban_duration_ms: i64,
+        max_faults_before_permanent: i64,
+        max_validity_window_ms: i64,
+    ) -> Result<Self, BanListError> {
+        let check = |v: i64, name: &str, min: i64| -> Result<i64, BanListError> {
+            if v < min {
+                return Err(BanListError::Config(format!(
+                    "--{name} must be >= {min}, got {v}: it is an input to the ban policy id, \
+                     so an out-of-range value bootstraps the list at an address no node reads"
+                )));
+            }
+            Ok(v)
         };
-        let base_ban_duration_ms = req(cardano.base_ban_duration_ms, "base_ban_duration_ms")?;
-        let max_faults_before_permanent = req(
-            cardano.max_faults_before_permanent,
-            "max_faults_before_permanent",
-        )?;
-        let max_validity_window_ms = req(cardano.max_validity_window_ms, "max_validity_window_ms")?;
-        // Match ban_config_ok's bounds — the params are baked into the policy id,
-        // so an out-of-range value silently derives the wrong ban address.
-        if base_ban_duration_ms <= 0 {
-            return Err(BanListError::Config(
-                "cardano.base_ban_duration_ms must be > 0".into(),
-            ));
-        }
-        if max_faults_before_permanent <= 0 {
-            return Err(BanListError::Config(
-                "cardano.max_faults_before_permanent must be > 0".into(),
-            ));
-        }
-        if max_validity_window_ms < 0 {
-            return Err(BanListError::Config(
-                "cardano.max_validity_window_ms must be >= 0".into(),
-            ));
-        }
         Ok(Self {
-            fault_proof_policies,
-            base_ban_duration_ms,
-            max_faults_before_permanent,
-            max_validity_window_ms,
+            fault_proof_policies: Self::fault_policies_from_config(cardano)?,
+            base_ban_duration_ms: check(base_ban_duration_ms, "base-ban-duration-ms", 1)?,
+            max_faults_before_permanent: check(
+                max_faults_before_permanent,
+                "max-faults-before-permanent",
+                1,
+            )?,
+            max_validity_window_ms: check(max_validity_window_ms, "max-validity-window-ms", 0)?,
         })
     }
 
@@ -879,7 +853,7 @@ impl BanPolicyParams {
 
 impl BanListSource {
     /// The published route (WI-065): the ban script address is a pure function
-    /// of the `spo_bans` policy id the Config carries at #17.
+    /// of the `spo_bans` policy id the Config carries at #7.
     ///
     /// This is the whole read half. Nothing here reads a blueprint, an outref or
     /// a schedule number, so a node reading the ban list this way has NOTHING
@@ -970,10 +944,16 @@ impl BanListSource {
         })
     }
 
-    /// Build from `[cardano]` config. The ban list is configured iff
-    /// `ban_bootstrap` is set (`None` otherwise); it then also requires the
-    /// registry fields the ban policy is parameterized by, plus the
-    /// fault-verifier policy set + ban-schedule params ([`BanPolicyParams`]).
+    /// Build from `[cardano]` alone, i.e. with no bridge Config in hand.
+    ///
+    /// Since WI-070 this can only answer `Ok(None)` — "no ban list configured",
+    /// when `ban_bootstrap` is unset — or `Err`. It cannot produce a source: the
+    /// ban policy id is a hash over the schedule (Config #8–#10), and the local
+    /// keys that used to carry it are refused at load time, so there is nothing
+    /// left to derive an address from. Kept as the `None` branch of
+    /// [`Self::resolve`] so "not configured" stays distinguishable from
+    /// "configured and broken"; callers wanting a usable source must pass a
+    /// Config.
     pub fn from_config(
         cardano: &crate::config::CardanoConfig,
     ) -> Result<Option<Self>, BanListError> {
@@ -981,16 +961,14 @@ impl BanListSource {
     }
 
     /// Derive the ban address from this node's own `[cardano]` keys, taking the
-    /// schedule from `config` where the bridge publishes one.
+    /// schedule from `config`.
     ///
-    /// The `config` argument is the whole point. The ban policy id is a hash over
-    /// (registry policy, fault-verifier set, schedule, ban one-shot), and the
-    /// ENFORCEMENT half builds its ApplyBan from [`BanPolicyParams::resolve`] —
-    /// published schedule first. A cross-check derived from the LOCAL schedule
-    /// instead computes a second, different hash in the same process, so a node
-    /// whose #18–#20 differ from its TOML is refused startup over a value nothing
-    /// consumes while the value that IS consumed matches the bridge perfectly.
-    /// One derivation per process: pass the same `config` both halves see.
+    /// The `config` argument is not optional in practice. The ban policy id is a
+    /// hash over (registry policy, fault-verifier set, schedule, ban one-shot),
+    /// and the schedule half is Config #8–#10 — there is no local copy since
+    /// WI-070. Passing the same `config` the enforcement half sees is what makes
+    /// this ONE derivation per process rather than two hashes that can differ
+    /// over a value nothing consumes.
     fn from_local_keys(
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
@@ -1047,7 +1025,7 @@ impl BanListSource {
     ///
     /// `config` is the decoded Config datum, or `None` when this node cannot
     /// locate one at all. Precedence is not a preference — the Config is
-    /// NFT-authenticated and identical for every SPO, so a node reading #17 and a
+    /// NFT-authenticated and identical for every SPO, so a node reading #7 and a
     /// node deriving from its own TOML must agree or one of them is filtering a
     /// roster nobody else has.
     ///
@@ -1068,24 +1046,24 @@ impl BanListSource {
 
         // Defence in depth, free wherever the local keys are still present: if
         // they derive a DIFFERENT policy than the bridge published, one of the
-        // two addresses holds no bans — and the whole reason to publish #17 is
+        // two addresses holds no bans — and the whole reason to publish #7 is
         // that neither the operator nor the node can tell which from the outside.
         //
         // Derived with the SAME params the enforcement half uses (published
         // schedule first), so this compares the one hash this process acts on
-        // against #17, not a second hash nothing consumes.
+        // against #7, not a second hash nothing consumes.
         //
         // A local derivation that FAILS is only a stale leftover, not a
-        // disagreement: #17 is authoritative and these keys are on their way out
+        // disagreement: #7 is authoritative and these keys are on their way out
         // (the enforcement path fails loudly on its own if it needs them). Say so
         // and carry on rather than bricking a node over config it no longer uses.
         if cardano.ban_bootstrap.is_some() {
             match Self::from_local_keys(cardano, config) {
                 Ok(Some(local)) if local.ban_policy_hex != source.ban_policy_hex => {
                     return Err(BanListError::Config(format!(
-                        "the bridge Config publishes ban policy {} (field #17) but this node's \
+                        "the bridge Config publishes ban policy {} (field #7) but this node's \
                          local ban keys derive {}. One of those addresses holds no bans at all. \
-                         The ban schedule is NOT the disagreement — #18–#20 are taken from the \
+                         The ban schedule is NOT the disagreement — #8-#10 are taken from the \
                          Config here — so it is one of cardano.ban_bootstrap, \
                          cardano.registry_bootstrap, cardano.registry_blueprint or \
                          cardano.fault_proof_policies. Delete cardano.ban_bootstrap to read the \
@@ -1095,7 +1073,7 @@ impl BanListSource {
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(
-                    "[bans] the bridge Config publishes ban policy {} (field #17), so the local \
+                    "[bans] the bridge Config publishes ban policy {} (field #7), so the local \
                      ban keys are unused and could not be checked against it ({e}) — delete \
                      cardano.ban_bootstrap and the ban-schedule keys",
                     source.ban_policy_hex
@@ -1653,68 +1631,65 @@ mod tests {
         assert!(BanListSource::from_config(&fixture).unwrap().is_none());
     }
 
+    /// The verifier policy set is still local (a contracts-release build
+    /// artifact), so it is still the half that can be wrong.
     #[test]
-    fn ban_policy_params_from_config_validates() {
+    fn ban_policy_params_validate_the_local_verifier_set() {
+        let published = config_publishing_schedule([0x77; 28], 86_400_000, 3, 600_000);
         let mut c = crate::config::CardanoConfig::default();
+
         // no fault policies → not 3
         assert!(matches!(
-            BanPolicyParams::from_config(&c),
+            BanPolicyParams::resolve(&c, Some(&published)),
             Err(BanListError::Config(_))
         ));
-        // exactly 3 28-byte policies but ban-schedule params missing
+
         c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "33".repeat(28)];
-        assert!(matches!(
-            BanPolicyParams::from_config(&c),
-            Err(BanListError::Config(_))
-        ));
-        c.base_ban_duration_ms = Some(86_400_000);
-        c.max_faults_before_permanent = Some(3);
-        c.max_validity_window_ms = Some(600_000);
-        let p = BanPolicyParams::from_config(&c).unwrap();
+        let p = BanPolicyParams::resolve(&c, Some(&published)).unwrap();
         assert_eq!(
             p.fault_proof_policies,
             vec![[0x11; 28], [0x22; 28], [0x33; 28]]
         );
+        // The schedule is the Config's, entirely (WI-070).
         assert_eq!(p.base_ban_duration_ms, 86_400_000);
         assert_eq!(p.max_faults_before_permanent, 3);
         assert_eq!(p.max_validity_window_ms, 600_000);
+
         // wrong count (2) → error
         c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28)];
         assert!(matches!(
-            BanPolicyParams::from_config(&c),
+            BanPolicyParams::resolve(&c, Some(&published)),
             Err(BanListError::Config(_))
         ));
         // 3 entries but one is not 28 bytes (27) → error
         c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "33".repeat(27)];
         assert!(matches!(
-            BanPolicyParams::from_config(&c),
+            BanPolicyParams::resolve(&c, Some(&published)),
             Err(BanListError::Config(_))
         ));
         // 3 entries but a DUPLICATE (count is 3, but not distinct) → error.
         c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "11".repeat(28)];
         assert!(matches!(
-            BanPolicyParams::from_config(&c),
+            BanPolicyParams::resolve(&c, Some(&published)),
             Err(BanListError::Config(_))
         ));
-        // Out-of-range ban-schedule params (contract bounds) → error.
-        c.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "33".repeat(28)];
-        c.base_ban_duration_ms = Some(0); // must be > 0
-        assert!(matches!(
-            BanPolicyParams::from_config(&c),
-            Err(BanListError::Config(_))
-        ));
-        c.base_ban_duration_ms = Some(86_400_000);
-        c.max_faults_before_permanent = Some(0); // must be > 0
-        assert!(matches!(
-            BanPolicyParams::from_config(&c),
-            Err(BanListError::Config(_))
-        ));
-        c.max_faults_before_permanent = Some(3);
-        c.max_validity_window_ms = Some(-1); // must be >= 0
-        assert!(matches!(
-            BanPolicyParams::from_config(&c),
-            Err(BanListError::Config(_))
-        ));
+    }
+
+    /// WI-070: with the three local schedule keys gone there is nothing to fall
+    /// back to, and enforcement must say so rather than invent a schedule the
+    /// deployed policy id was not built from.
+    #[test]
+    fn the_ban_schedule_without_a_config_is_an_error_not_a_default() {
+        let c = crate::config::CardanoConfig {
+            fault_proof_policies: vec!["11".repeat(28), "22".repeat(28), "33".repeat(28)],
+            ..Default::default()
+        };
+        let err = BanPolicyParams::resolve(&c, None).expect_err("no schedule without a Config");
+        let BanListError::Config(msg) = err else {
+            panic!("expected a config error");
+        };
+        assert!(msg.contains("#8-#10"), "{msg}");
+        assert!(msg.contains("cardano.config_address"), "{msg}");
     }
 
     // -- WI-065: the ban policy the bridge publishes -------------------------
@@ -1790,9 +1765,6 @@ mod tests {
         let with_stale_keys = crate::config::CardanoConfig {
             ban_bootstrap: Some(format!("{}:1", "ee".repeat(32))),
             fault_proof_policies: vec!["11".repeat(28), "22".repeat(28), "33".repeat(28)],
-            base_ban_duration_ms: Some(86_400_000),
-            max_faults_before_permanent: Some(9),
-            max_validity_window_ms: Some(1),
             ..bare.clone()
         };
         let a = BanListSource::resolve(&bare, Some(&published))
@@ -1855,19 +1827,20 @@ mod tests {
                 "22".repeat(28),
                 "33".repeat(28),
             ],
-            base_ban_duration_ms: Some(86_400_000),
-            max_faults_before_permanent: Some(3),
-            max_validity_window_ms: Some(600_000),
             network: Some("preprod".to_string()),
             ..Default::default()
         };
-        let derived = BanListSource::from_config(&cardano)
+        // The schedule is the Config's on both routes (WI-070), so the local
+        // derivation is taken against the very schedule the bridge publishes —
+        // which is what makes any difference below a REAL disagreement about the
+        // outrefs or the verifier set, not an artefact of two schedules.
+        let schedule = config_publishing_schedule([0x00; 28], 86_400_000, 3, 600_000);
+        let derived = BanListSource::from_local_keys(&cardano, Some(&schedule))
             .expect("the local keys derive a policy")
             .unwrap();
         assert_eq!(derived.origin, BanSourceOrigin::LocalKeys);
 
-        // Same policy AND the same schedule on both routes → agreement, and the
-        // Config still wins.
+        // The same policy published → agreement, and the Config still wins.
         let mut policy = [0u8; 28];
         policy.copy_from_slice(&hex::decode(&derived.ban_policy_hex).unwrap());
         let same_schedule = config_publishing_schedule(policy, 86_400_000, 3, 600_000);
@@ -1894,85 +1867,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The cross-check must derive the SAME hash the enforcement half acts on.
-    ///
-    /// The schedule is baked into the policy id, and `BanPolicyParams::resolve`
-    /// takes it from Config #18-#20. A cross-check that instead used the LOCAL
-    /// #18-#20 computes a second hash nothing in the process consumes, and refuses
-    /// startup over it — a node whose stale TOML schedule differs from the bridge's
-    /// is bricked while the value it would actually have enforced with is correct.
-    #[test]
-    fn a_stale_local_schedule_is_not_a_disagreement() {
-        let dir = std::env::temp_dir().join(format!("heimdall-wi068-sched-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("plutus.json");
-        std::fs::write(&path, test_blueprint()).unwrap();
-
-        let cardano = crate::config::CardanoConfig {
-            registry_blueprint: Some(path.to_string_lossy().into_owned()),
-            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
-            ban_bootstrap: Some(format!("{}:1", "ee".repeat(32))),
-            fault_proof_policies: vec![
-                own_fault_policy_hex(&path),
-                "22".repeat(28),
-                "33".repeat(28),
-            ],
-            // Stale numbers, left over from before the bridge published them.
-            base_ban_duration_ms: Some(86_400_000),
-            max_faults_before_permanent: Some(3),
-            max_validity_window_ms: Some(600_000),
-            network: Some("preprod".to_string()),
-            ..Default::default()
-        };
-
-        // What the bridge actually deployed: the same blueprint and outrefs, a
-        // DIFFERENT schedule — so a different policy id from the one the local
-        // numbers derive.
-        let published_policy = {
-            let params = BanPolicyParams {
-                fault_proof_policies: BanPolicyParams::fault_policies_from_config(&cardano)
-                    .unwrap(),
-                base_ban_duration_ms: 600_000,
-                max_faults_before_permanent: 5,
-                max_validity_window_ms: 3_600_000,
-            };
-            let src = BanListSource::from_blueprint(
-                &path.to_string_lossy(),
-                cardano.registry_bootstrap.as_deref().unwrap(),
-                cardano.ban_bootstrap.as_deref().unwrap(),
-                &params,
-                false,
-            )
-            .unwrap();
-            let mut p = [0u8; 28];
-            p.copy_from_slice(&hex::decode(&src.ban_policy_hex).unwrap());
-            p
-        };
-        // Guard the premise: the two schedules really do derive different policies.
-        assert_ne!(
-            hex::encode(published_policy),
-            BanListSource::from_config(&cardano)
-                .unwrap()
-                .unwrap()
-                .ban_policy_hex,
-            "the test schedules must differ in the policy id, or it proves nothing"
-        );
-
-        let resolved = BanListSource::resolve(
-            &cardano,
-            Some(&config_publishing_schedule(
-                published_policy,
-                600_000,
-                5,
-                3_600_000,
-            )),
-        )
-        .expect("a stale local schedule is dead config, not a disagreement")
-        .unwrap();
-        assert_eq!(resolved.origin, BanSourceOrigin::Config);
-        assert_eq!(resolved.ban_policy_hex, hex::encode(published_policy));
-    }
-
     /// WI-068: on the published route the ban root is minted at genesis, before
     /// the Config that names it — so an address holding nothing is a WRONG
     /// address, and reading it as "no bans" is an unfiltered roster. On the
@@ -1993,7 +1887,7 @@ mod tests {
             published
                 .active_bans_from(Err(BanListError::NotBootstrapped), 0)
                 .is_err(),
-            "a published #17 whose address holds no root is a WRONG address — reading it \
+            "a published #7 whose address holds no root is a WRONG address — reading it \
              as 'no bans' publishes an unfiltered roster"
         );
         assert_eq!(

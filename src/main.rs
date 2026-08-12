@@ -97,14 +97,6 @@ enum Commands {
         /// `2` preview). Required with `--cardano-socket`.
         #[arg(long)]
         cardano_magic: Option<u64>,
-        /// Bech32 address of the peg-in script. Required with
-        /// `--cardano-socket`.
-        #[arg(long)]
-        pegin_script_address: Option<String>,
-        /// Peg-in policy ID as 56 hex chars (28 bytes). Required with
-        /// `--cardano-socket`.
-        #[arg(long)]
-        pegin_policy_id: Option<String>,
         /// How long (seconds) `CollectPegins` polls the source before
         /// freezing the observed set.
         #[arg(long)]
@@ -113,18 +105,6 @@ enum Commands {
         /// collection window.
         #[arg(long)]
         pegin_poll_ms: Option<u64>,
-        /// Bech32 address of the TM validator (where TM records are posted).
-        /// Defaults to `cardano.treasury_address`.
-        #[arg(long)]
-        treasury_address: Option<String>,
-        /// TM NFT policy ID (56 hex chars) = the TreasuryMovementValidator
-        /// script hash.
-        #[arg(long)]
-        treasury_policy_id: Option<String>,
-        /// TM NFT asset name as hex. Defaults to "" — the real validator
-        /// counts the empty-name token.
-        #[arg(long)]
-        treasury_asset_name: Option<String>,
         /// BIP-39 mnemonic (12/15/24 words, space-separated) for the
         /// Cardano wallet that pays fees and signs the oracle-update tx.
         /// The payment key is derived at `m/1852'/1815'/0'/0/0`
@@ -321,7 +301,8 @@ enum Commands {
         /// The ban-list one-shot bootstrap output ref (<tx_hash>:<index>).
         #[arg(long)]
         ban_bootstrap: String,
-        /// Ban-schedule params (must equal the SPO config's).
+        /// Ban-schedule params. Genesis-only: they must equal what the bridge
+        /// Config will publish at #8-#10, which is what every node then reads.
         #[arg(long)]
         base_ban_duration_ms: i64,
         #[arg(long)]
@@ -354,7 +335,8 @@ enum Commands {
         /// The ban-list one-shot bootstrap output ref (<tx_hash>:<index>).
         #[arg(long)]
         ban_bootstrap: String,
-        /// Ban-schedule params (must equal the SPO config's).
+        /// Ban-schedule params. Genesis-only: they must equal what the bridge
+        /// Config will publish at #8-#10, which is what every node then reads.
         #[arg(long)]
         base_ban_duration_ms: i64,
         #[arg(long)]
@@ -494,6 +476,17 @@ enum Commands {
         /// apply-ban reads to re-derive the same ban policy).
         #[arg(long)]
         ban_bootstrap: String,
+        /// Ban-schedule params, for GENESIS only: WI-068 mints the ban root in
+        /// the transaction BEFORE the Config NFT that names it, so there is
+        /// nothing to read them from yet. Required when this node cannot read a
+        /// bridge Config; refused when it can, since the Config is then
+        /// authoritative and a second copy could only disagree with it.
+        #[arg(long)]
+        base_ban_duration_ms: Option<i64>,
+        #[arg(long)]
+        max_faults_before_permanent: Option<i64>,
+        #[arg(long)]
+        max_validity_window_ms: Option<i64>,
         /// Actually submit via Blockfrost (default: build + print only).
         #[arg(long)]
         submit: bool,
@@ -561,11 +554,12 @@ enum Commands {
         #[arg(long)]
         blueprint: Option<String>,
         /// The spos_registry one-shot bootstrap outref (<tx_hash>:<index>).
-        /// Falls back to cardano.registry_bootstrap.
+        /// Only for a bridge with no readable Config — pass it with --blueprint
+        /// and --treasury-nft-name, or none of the three.
         #[arg(long)]
         registry_bootstrap: Option<String>,
         /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
-        /// Falls back to cardano.treasury_info_asset_name.
+        /// Only for a bridge with no readable Config (see --registry-bootstrap).
         #[arg(long)]
         treasury_nft_name: Option<String>,
     },
@@ -582,14 +576,6 @@ enum Commands {
         /// Cardano network magic (`42` for the yaci devnet).
         #[arg(long)]
         cardano_magic: u64,
-        /// Bech32 address of the peg-in script holding the PegInRequest UTxOs.
-        /// Falls back to `cardano.pegin_script_address` if omitted.
-        #[arg(long)]
-        pegin_script_address: Option<String>,
-        /// Peg-in policy ID as 56 hex chars (28 bytes).
-        /// Falls back to `cardano.pegin_policy_id` if omitted.
-        #[arg(long)]
-        pegin_policy_id: Option<String>,
         /// Current treasury outpoint to sweep, as <txid>:<vout>. Omit (together with
         /// --treasury-amount-sat) to chain-source the treasury from the Cardano tip
         /// Confirmed-TM (WI-028); pass both to override.
@@ -598,15 +584,6 @@ enum Commands {
         /// Treasury input amount in satoshis. Omit to chain-source from Cardano.
         #[arg(long, requires = "treasury_outpoint")]
         treasury_amount_sat: Option<u64>,
-        /// Bech32 address of the `peg_out.ak` script holding PegOut UTxOs (the TM pays every
-        /// pending peg-out there; destination + amount come from each on-chain PegOut UTxO).
-        /// Falls back to `cardano.pegout_script_address` if omitted.
-        #[arg(long)]
-        pegout_script_address: Option<String>,
-        /// The bridged-token (fBTC) unit `<policy_hex><asset_name_hex>` used to read each PegOut
-        /// UTxO's locked amount. Falls back to `cardano.bridged_token_unit` if omitted.
-        #[arg(long)]
-        bridged_token_unit: Option<String>,
         /// DEV-ONLY: broadcast directly via bitcoin.rpc_url (default: build + print
         /// only). Production SPOs run no Bitcoin node — the binocular watchtower
         /// relays the signed TM from the posted UnconfirmedTm record.
@@ -705,18 +682,6 @@ enum Commands {
         cardano_socket: String,
         #[arg(long, default_value_t = 1)]
         cardano_magic: u64,
-        /// Falls back to `cardano.pegin_script_address` if omitted.
-        #[arg(long)]
-        pegin_script_address: Option<String>,
-        /// Falls back to `cardano.pegin_policy_id` if omitted.
-        #[arg(long)]
-        pegin_policy_id: Option<String>,
-        /// Falls back to `cardano.pegout_script_address` if omitted.
-        #[arg(long)]
-        pegout_script_address: Option<String>,
-        /// Falls back to `cardano.bridged_token_unit` if omitted.
-        #[arg(long)]
-        bridged_token_unit: Option<String>,
         /// Poll ceiling in seconds, and the tick cadence when there is no batch grid to
         /// follow. With a Config `schedule` the mover builds on the protocol's grid
         /// (B_i = epoch_start + i*tm_batch_interval) and this only bounds how long it
@@ -758,7 +723,7 @@ fn load_config(path: Option<&str>) -> HeimdallConfig {
 ///
 /// Prints the whole report either way — an operator watching a fresh install needs
 /// to see WHICH bridge and WHICH contracts this node resolved, not merely that it
-/// started. Nothing here spends: steps 5 and 6 name the command and stop.
+/// started. Nothing here spends: a failing step names the command and stops.
 fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let report = rt.block_on(heimdall::preflight::preflight(cfg));
@@ -772,15 +737,6 @@ fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
             f.n, f.title
         )),
     }
-}
-
-/// Resolve a per-bridge value from the CLI flag (override) else the config, exiting
-/// with a message that names both the `--flag` and the `cardano.<key>` it can come from.
-fn resolve_arg(cli: Option<String>, cfg_val: Option<&String>, flag: &str, cfg_key: &str) -> String {
-    cli.or_else(|| cfg_val.cloned()).unwrap_or_else(|| {
-        error!("Error: pass --{flag} or set cardano.{cfg_key} in the config");
-        std::process::exit(1);
-    })
 }
 
 fn main() {
@@ -801,13 +757,8 @@ fn main() {
             blockfrost_project_id,
             cardano_socket,
             cardano_magic,
-            pegin_script_address,
-            pegin_policy_id,
             pegin_window_secs,
             pegin_poll_ms,
-            treasury_address,
-            treasury_policy_id,
-            treasury_asset_name,
             cardano_mnemonic,
         } => {
             let mut cfg = load_config(config.as_deref());
@@ -831,26 +782,11 @@ fn main() {
             if let Some(v) = cardano_magic {
                 cfg.cardano.network_magic = Some(v);
             }
-            if let Some(ref v) = pegin_script_address {
-                cfg.cardano.pegin_script_address = Some(v.clone());
-            }
-            if let Some(ref v) = pegin_policy_id {
-                cfg.cardano.pegin_policy_id = Some(v.clone());
-            }
             if let Some(v) = pegin_window_secs {
                 cfg.protocol.pegin_collection_window_secs = v;
             }
             if let Some(v) = pegin_poll_ms {
                 cfg.protocol.pegin_poll_interval_ms = v;
-            }
-            if let Some(ref v) = treasury_address {
-                cfg.cardano.treasury_address = Some(v.clone());
-            }
-            if let Some(ref v) = treasury_policy_id {
-                cfg.cardano.treasury_policy_id = Some(v.clone());
-            }
-            if let Some(ref v) = treasury_asset_name {
-                cfg.cardano.treasury_asset_name = Some(v.clone());
             }
             if let Some(ref v) = cardano_mnemonic {
                 cfg.cardano.mnemonic = Some(v.clone());
@@ -1124,6 +1060,9 @@ fn main() {
             blueprint,
             registry_bootstrap,
             ban_bootstrap,
+            base_ban_duration_ms,
+            max_faults_before_permanent,
+            max_validity_window_ms,
             submit,
         } => {
             let cfg = load_config(config.as_deref());
@@ -1132,6 +1071,11 @@ fn main() {
                 &blueprint,
                 &registry_bootstrap,
                 &ban_bootstrap,
+                (
+                    base_ban_duration_ms,
+                    max_faults_before_permanent,
+                    max_validity_window_ms,
+                ),
                 submit,
             ) {
                 error!("Error: {e}");
@@ -1199,53 +1143,19 @@ fn main() {
             config,
             cardano_socket,
             cardano_magic,
-            pegin_script_address,
-            pegin_policy_id,
             treasury_outpoint,
             treasury_amount_sat,
-            pegout_script_address,
-            bridged_token_unit,
             broadcast,
             existing_tm_hex,
             exclude_pegin,
         } => {
             let cfg = load_config(config.as_deref());
-            // CLI flags override; otherwise fall back to the [cardano] config.
-            let c = &cfg.cardano;
-            let pegin_script_address = resolve_arg(
-                pegin_script_address,
-                c.pegin_script_address.as_ref(),
-                "pegin-script-address",
-                "pegin_script_address",
-            );
-            let pegin_policy_id = resolve_arg(
-                pegin_policy_id,
-                c.pegin_policy_id.as_ref(),
-                "pegin-policy-id",
-                "pegin_policy_id",
-            );
-            let pegout_script_address = resolve_arg(
-                pegout_script_address,
-                c.pegout_script_address.as_ref(),
-                "pegout-script-address",
-                "pegout_script_address",
-            );
-            let bridged_token_unit = resolve_arg(
-                bridged_token_unit,
-                c.bridged_token_unit.as_ref(),
-                "bridged-token-unit",
-                "bridged_token_unit",
-            );
             if let Err(e) = run_sweep_pegins(
                 &cfg,
                 &cardano_socket,
                 cardano_magic,
-                &pegin_script_address,
-                &pegin_policy_id,
                 treasury_outpoint.as_deref(),
                 treasury_amount_sat,
-                &pegout_script_address,
-                &bridged_token_unit,
                 broadcast,
                 existing_tm_hex.as_deref(),
                 &exclude_pegin,
@@ -1259,10 +1169,6 @@ fn main() {
             config,
             cardano_socket,
             cardano_magic,
-            pegin_script_address,
-            pegin_policy_id,
-            pegout_script_address,
-            bridged_token_unit,
             interval_secs,
             once,
             broadcast,
@@ -1270,52 +1176,21 @@ fn main() {
         } => {
             let cfg = load_config(config.as_deref());
 
-            // WI-053: the startup gate runs BEFORE the per-value resolution below.
-            // Order matters twice over. It is what this item exists to fix — the
-            // first sign of a misconfiguration used to be a failed transaction,
-            // and the worst case produced no sign at all (a node missing a Config
-            // locator key ran the wall-clock fallback, which does not agree with
-            // the other SPOs). And running it AFTER `resolve_arg` would be nearly
-            // useless: that exits the process on the first unset key, so the
-            // operator would get one bare line instead of the whole picture.
+            // WI-053: the startup gate runs BEFORE anything else. It is what this
+            // item exists to fix — the first sign of a misconfiguration used to be
+            // a failed transaction, and the worst case produced no sign at all (a
+            // node missing a Config locator key ran the wall-clock fallback, which
+            // does not agree with the other SPOs). It also resolves and PRINTS the
+            // contract set every tick below derives from the same Config, so the
+            // operator sees which bridge this node is on before it moves anything.
             if let Err(e) = run_preflight_gate(&cfg) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
-            // CLI flags override; otherwise fall back to the [cardano] config.
-            let c = &cfg.cardano;
-            let pegin_script_address = resolve_arg(
-                pegin_script_address,
-                c.pegin_script_address.as_ref(),
-                "pegin-script-address",
-                "pegin_script_address",
-            );
-            let pegin_policy_id = resolve_arg(
-                pegin_policy_id,
-                c.pegin_policy_id.as_ref(),
-                "pegin-policy-id",
-                "pegin_policy_id",
-            );
-            let pegout_script_address = resolve_arg(
-                pegout_script_address,
-                c.pegout_script_address.as_ref(),
-                "pegout-script-address",
-                "pegout_script_address",
-            );
-            let bridged_token_unit = resolve_arg(
-                bridged_token_unit,
-                c.bridged_token_unit.as_ref(),
-                "bridged-token-unit",
-                "bridged_token_unit",
-            );
             if let Err(e) = run_mover(
                 &cfg,
                 &cardano_socket,
                 cardano_magic,
-                &pegin_script_address,
-                &pegin_policy_id,
-                &pegout_script_address,
-                &bridged_token_unit,
                 interval_secs,
                 once,
                 broadcast,
@@ -1431,12 +1306,30 @@ async fn run_demo(
     // until the on-chain SPO registry is wired.
     let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(&cfg, &federation);
 
-    let script_address: String = cfg.cardano.pegin_script_address.clone().unwrap_or_default();
-    let treasury_address: String = cfg.cardano.treasury_address.clone().unwrap_or_default();
-    let treasury_policy_id: String = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
-    // Default "" — the real TM validator counts the empty-name token.
-    let treasury_asset_name_hex: String =
-        cfg.cardano.treasury_asset_name.clone().unwrap_or_default();
+    // The bridge Config, read once (WI-070). It carries the contract identifiers
+    // AND the ban/registry identities below, so both come from ONE read of ONE
+    // authenticated UTxO.
+    //
+    // WI-070 decision, made explicitly because the demo is why these were ever
+    // local keys: the demo gets NO fixture route back. Either it runs against a
+    // deployed bridge, in which case every identifier is the Config's like any
+    // other node's; or it runs on the mock chain, where there is no bridge and it
+    // needs none of them. The middle case the old keys served — a live chain with
+    // hand-typed contract addresses — is exactly the divergence this item removes.
+    let bridge_config = match config_view_async(&cfg).await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("bridge Config: {e}");
+            std::process::exit(1);
+        }
+    };
+    let contracts = bridge_config.as_ref().map(|v| {
+        let mainnet = cfg.cardano.is_mainnet().unwrap_or_else(|e| {
+            error!("Error: {e}");
+            std::process::exit(1);
+        });
+        v.params.bridge_contracts(mainnet)
+    });
 
     // Chain + pegin source selection:
     // blockfrost_project_id → Blockfrost for both chain + pegin source
@@ -1445,7 +1338,39 @@ async fn run_demo(
     let chain: Arc<dyn CardanoChain>;
     let pegin_source: Arc<dyn CardanoPegInSource>;
 
+    // Both live-chain routes scan a real peg-in address, and it is the Config's.
+    //
+    // The N2C route reaches here with `contracts == None` unavoidably: reading the
+    // Config goes through Blockfrost (`config_locator` needs a project id), so a
+    // socket-only node has no way to resolve one however it is configured. Say
+    // that, rather than advising two keys that cannot help — a socket node setting
+    // config_address + config_nft_policy_id still lands on this same exit.
+    let live_contracts = || {
+        contracts.clone().unwrap_or_else(|| {
+            if cfg.cardano.blockfrost_project_id.is_none() {
+                error!(
+                    "Error: a live-chain demo needs the bridge Config, and reading it \
+                     currently requires cardano.blockfrost_project_id — an N2C/socket-only \
+                     node cannot resolve the peg-in, peg-out and TM addresses at all. Set a \
+                     Blockfrost project id (it may point at a local blockfrost-compatible \
+                     backend), or leave both cardano.blockfrost_project_id and \
+                     cardano.socket_path unset to run the offline fixture demo"
+                );
+            } else {
+                error!(
+                    "Error: a live-chain demo needs the bridge Config — set \
+                     cardano.config_address and cardano.config_nft_policy_id. The peg-in, \
+                     peg-out and TM addresses come from it; leave \
+                     cardano.blockfrost_project_id and cardano.socket_path unset to run the \
+                     offline fixture demo instead"
+                );
+            }
+            std::process::exit(1);
+        })
+    };
+
     if let Some(project_id) = cfg.cardano.blockfrost_project_id.as_deref() {
+        let contracts = live_contracts();
         let treasury_config = TreasuryConfig {
             y_51: fixture.y_51,
             y_fed: fixture.y_fed,
@@ -1455,60 +1380,33 @@ async fn run_demo(
         };
         let mut bf_chain = BlockfrostCardanoChain::new(
             project_id,
-            &treasury_address,
-            &treasury_policy_id,
-            &treasury_asset_name_hex,
+            &contracts.tm_address,
+            &contracts.tm_policy_id,
+            heimdall::cardano::config_params::TM_ASSET_NAME_HEX,
             treasury_config,
             fixture.roster.clone(),
             cfg.cardano.blockfrost_url.as_deref(),
         )
-        // Only reached when no Config UTxO is configured — with one, the batch's
-        // fee rate is the Config's (WI-040).
+        // Only reached when the Config predates the operational parameters — with
+        // them, the batch's fee rate is the Config's (WI-040).
         .with_local_fee_rate(cfg.bitcoin.fee_rate_sat_per_vb);
 
-        // The on-chain completed-peg-outs singleton, so BuildTm can cross-check the
-        // persisted trie against it before signing anything. Unset cpo_policy_id
-        // leaves the check off and BuildTm says so once per movement.
+        // The on-chain bridge-state singleton, so BuildTm can cross-check the
+        // persisted completed-peg-outs trie against it before signing anything.
         bf_chain = bf_chain.with_cpo_source(
-            cfg.cardano.cpo_policy_id.as_deref(),
+            Some(&contracts.bridge_state_policy_id),
             cfg.cardano.kupo_url.as_deref(),
         );
 
-        // Peg-out payments (WI-030). Reading a PegOut UTxO needs both the address to scan and
-        // the fBTC unit whose quantity is the locked amount, so half a config is a startup
-        // error rather than a silently peg-in-only daemon. Absent entirely is allowed (and
-        // warned about per build). `.filter(|s| !s.is_empty())` because blanking a TOML key to
-        // "" is a normal way to disable it — an empty address would otherwise be scanned on
-        // every BuildTm, and an empty unit would match zero UTxOs while the daemon reported
-        // itself peg-out-capable.
-        match (
-            cfg.cardano
-                .pegout_script_address
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-            cfg.cardano
-                .bridged_token_unit
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-        ) {
-            (Some(addr), Some(unit)) => {
-                info!("peg-out requests:     {addr}");
-                bf_chain = bf_chain.with_pegout_source(addr, unit);
-            }
-            (None, None) => warn!(
-                "no cardano.pegout_script_address / cardano.bridged_token_unit — this \
-                 daemon builds peg-in-only TMs and pays NO pending withdrawal"
-            ),
-            _ => {
-                error!(
-                    "set BOTH cardano.pegout_script_address and \
-                     cardano.bridged_token_unit, or NEITHER"
-                );
-                std::process::exit(1);
-            }
-        }
+        // Peg-out payments (WI-030). Both halves — the address to scan and the fBTC
+        // unit whose quantity is the locked amount — are Config fields (#6 and #1),
+        // so "half configured" is no longer expressible and neither is a daemon
+        // that silently pays no withdrawal.
+        info!("peg-out requests:     {}", contracts.pegout_script_address);
+        bf_chain = bf_chain.with_pegout_source(
+            &contracts.pegout_script_address,
+            &contracts.bridged_token_unit,
+        );
 
         if let Some(mnemonic) = &cfg.cardano.mnemonic {
             let wallet_addr = heimdall::cardano::wallet::wallet_address_from_mnemonic(mnemonic)
@@ -1537,33 +1435,9 @@ async fn run_demo(
         bf_chain = bf_chain.with_stake_source(stake_source);
         bf_chain = bf_chain.with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked);
 
-        // The bridge Config, read once at startup. It publishes the ban policy
-        // (#17-#20), so a node needs no ban keys of its own — and an unreadable
-        // one is fatal rather than a quiet fall back to whatever this operator
-        // typed, which is how two nodes end up filtering different rosters.
-        let bridge_config = match config_locator(&cfg) {
-            None => None,
-            Some(loc) => {
-                match heimdall::cardano::config_params::fetch_config(
-                    &loc.base_url,
-                    &loc.project_id,
-                    &loc.address,
-                    &loc.nft_unit,
-                )
-                .await
-                {
-                    Ok(view) => Some(view),
-                    Err(e) => {
-                        error!("bridge Config: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-        };
-
-        // On-chain SPO registry roster (WI-010): configured via
-        // cardano.{registry_blueprint, registry_bootstrap, treasury_info_asset_name}.
-        // Without it query_roster serves the fixture roster.
+        // On-chain SPO registry roster (WI-010), from the identity the Config
+        // publishes at #11-#13. Without a Config, query_roster serves the fixture
+        // roster — but this branch already required one above.
         match heimdall::cardano::roster::RegistryRosterSource::resolve(
             &cfg.cardano,
             bridge_config.as_ref().map(|v| &v.params),
@@ -1588,16 +1462,16 @@ async fn run_demo(
                 } else {
                     warn!(
                         "on-chain key handoff:  NOT possible on this node — the roster comes \
-                         from the Config's published identity (#21-#23) and there is no \
+                         from the Config's published identity (#11-#13) and there is no \
                          compiled treasury_info script to spend the state UTxO with. DKG runs \
                          and the group key is derived, but if this node is elected leader the \
                          Update-Y FAILS and the treasury is not handed over. Set \
-                         cardano.registry_blueprint + cardano.treasury_policy_id to enable it"
+                         cardano.registry_blueprint to enable it"
                     );
                 }
                 bf_chain = bf_chain.with_registry_roster(source);
                 // Ban filtering (WI-011/012): from the Config's published ban
-                // policy (#17) where the bridge has one, else the local keys.
+                // policy (#7).
                 match heimdall::cardano::ban_list::BanListSource::resolve(
                     &cfg.cardano,
                     bridge_config.as_ref().map(|v| &v.params),
@@ -1666,7 +1540,7 @@ async fn run_demo(
 
         // Everything resolved above is what THIS PROCESS SAW AT BOOT. The
         // federation identity is chain state a governance Update can move, so
-        // hand the chain the config it needs to re-resolve #17/#21-#23 on every
+        // hand the chain the config it needs to re-resolve #7/#11-#13 on every
         // roster read — otherwise two honest nodes filter different rosters
         // according to when each was last restarted, which is the divergence
         // publishing those fields was meant to end. Startup keeps resolving them
@@ -1677,18 +1551,23 @@ async fn run_demo(
         chain = Arc::new(bf_chain);
         pegin_source = Arc::new(BlockfrostPegInSource::new(
             project_id,
-            &script_address,
+            &contracts.pegin_script_address,
             cfg.cardano.blockfrost_url.as_deref(),
         ));
     } else if let Some(socket) = cfg.cardano.socket_path.clone() {
+        let contracts = live_contracts();
         let magic = cfg
             .cardano
             .network_magic
             .expect("cardano.network_magic required with cardano.socket_path");
         chain = Arc::new(mock_chain_with_rpc(&cfg, fixture.clone()));
         pegin_source = Arc::new(
-            PallasPegInSource::from_bech32(socket, NetworkMagic(magic), &script_address)
-                .expect("pallas source"),
+            PallasPegInSource::from_bech32(
+                socket,
+                NetworkMagic(magic),
+                &contracts.pegin_script_address,
+            )
+            .expect("pallas source"),
         );
     } else {
         chain = Arc::new(mock_chain_with_rpc(&cfg, fixture.clone()));
@@ -1843,11 +1722,21 @@ async fn run_demo(
     } else {
         Vec::new()
     };
-    let mut config = cfg.to_epoch_config(SpoIdentity {
-        identifier: id,
-        bifrost_id_pk: own_bifrost_id_pk,
-        port,
-    });
+    // Config #5, or all-zero on the offline fixture demo, which has no peg-in
+    // contract to scan and no chain to scan it on.
+    let pegin_policy_id = contracts
+        .as_ref()
+        .and_then(|c| hex::decode(&c.pegin_policy_id).ok())
+        .and_then(|v| <[u8; 28]>::try_from(v).ok())
+        .unwrap_or([0u8; 28]);
+    let mut config = cfg.to_epoch_config(
+        SpoIdentity {
+            identifier: id,
+            bifrost_id_pk: own_bifrost_id_pk,
+            port,
+        },
+        pegin_policy_id,
+    );
     // DEMO-ONLY fault injection (--inject-fault); parse-and-die on a bad kind.
     config.inject_fault = match inject_fault.as_deref() {
         None => None,
@@ -2179,6 +2068,53 @@ async fn config_view_async(
     .map(Some)
 }
 
+/// Every bridge identifier, derived from the Config UTxO (WI-070).
+///
+/// This is the one place a command turns "which bridge am I on" into concrete
+/// addresses and policy ids. There is no local fallback and no override: the
+/// values name the BRIDGE, every SPO must agree on them, and a second copy in
+/// `heimdall.toml` could only disagree — silently, since a wrong script hash
+/// yields a well-formed address holding nothing rather than an error.
+///
+/// Fails when no Config is configured. That is the honest answer for the
+/// commands that call this: peg-ins, peg-outs and treasury movements are all
+/// operations against a deployed bridge, and there is nothing to guess from.
+fn bridge_contracts(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+) -> Result<heimdall::cardano::config_params::BridgeContracts, String> {
+    Ok(bridge_config_and_contracts(rt, cfg)?.1)
+}
+
+/// The Config read AND the contract identifiers derived from it, so a caller
+/// that needs both takes them from ONE snapshot.
+fn bridge_config_and_contracts(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+) -> Result<
+    (
+        heimdall::cardano::config_params::ConfigView,
+        heimdall::cardano::config_params::BridgeContracts,
+    ),
+    String,
+> {
+    // NOTE the Blockfrost requirement is not incidental: `config_locator` needs a
+    // project id, so a socket-only (N2C) node cannot read a Config however it is
+    // configured — and since WI-070 every address comes from the Config. Callers
+    // with an N2C fallback path (sweep-pegins keeps one) therefore never reach it
+    // today; the message says so rather than implying the other two keys suffice.
+    let view = config_view(rt, cfg)?.ok_or(
+        "no bridge Config to read the contract identifiers from — set \
+         cardano.config_address, cardano.config_nft_policy_id and \
+         cardano.blockfrost_project_id (reading the Config goes through Blockfrost, so a \
+         socket-only node cannot resolve one). Every peg-in/peg-out/TM address is derived \
+         from that one UTxO, so there is nothing to fall back to",
+    )?;
+    let mainnet = cfg.cardano.is_mainnet()?;
+    let contracts = view.params.bridge_contracts(mainnet);
+    Ok((view, contracts))
+}
+
 /// Resolve the treasury's federation identity (WI-069).
 ///
 /// Walks the whole chain from the one Config NFT: Config #12/#13 name the
@@ -2195,10 +2131,24 @@ async fn config_view_async(
 async fn resolve_federation(
     cfg: &HeimdallConfig,
 ) -> Result<heimdall::cardano::federation::FederationIdentity, String> {
+    let config = config_view_async(cfg).await?;
+    resolve_federation_from(cfg, config.as_ref()).await
+}
+
+/// As [`resolve_federation`], but against a Config the caller already read.
+///
+/// The sweep reads the Config for the contract identifiers and then needs the
+/// federation identity from the same UTxO. Re-reading it would cost a second
+/// round trip AND — the part that matters — take the two halves from two
+/// different chain snapshots, so a governance Update landing between them would
+/// produce a movement built half from the old Config and half from the new.
+async fn resolve_federation_from(
+    cfg: &HeimdallConfig,
+    config: Option<&heimdall::cardano::config_params::ConfigView>,
+) -> Result<heimdall::cardano::federation::FederationIdentity, String> {
     use heimdall::cardano::roster::RegistryRosterSource;
 
-    let config = config_view_async(cfg).await?;
-    let source = RegistryRosterSource::resolve(&cfg.cardano, config.as_ref().map(|v| &v.params))
+    let source = RegistryRosterSource::resolve(&cfg.cardano, config.map(|v| &v.params))
         .map_err(|e| format!("cannot locate the treasury_info state: {e}"))?;
 
     let published = match (source, config_locator(cfg)) {
@@ -2340,31 +2290,25 @@ fn spi_trie_from_cfg(cfg: &HeimdallConfig) -> Result<heimdall::cardano::spi_trie
 /// datum, and every membership proof built against the real payment history is
 /// refused by `peg-out.ak`.
 ///
-/// No `cardano.cpo_policy_id` means the check cannot run at all; that warns and
-/// proceeds, because an unconfigured node cannot tell "not checked" from "empty".
+/// The singleton is located by the Config's `bridge_state_policy` (#3), so the
+/// check always runs on a bridge this node can read at all (WI-070) — there is no
+/// "not configured" case left to warn about and proceed past.
 fn cross_check_cpo_trie_from_cfg(
     rt: &tokio::runtime::Runtime,
     cfg: &HeimdallConfig,
+    bridge_state_policy: &str,
     trie: &heimdall::cardano::cpo_trie::CpoTrie,
-) -> Result<CpoTrust, String> {
+) -> Result<(), String> {
     use heimdall::cardano::cpo_history::{BlockfrostHistory, CpoHistorySource, KupoHistory};
 
-    let Some(policy) = cfg.cardano.cpo_policy_id.as_deref() else {
-        warn!(
-            "[cpo] no cardano.cpo_policy_id — the local root was NOT cross-checked \
-             against the on-chain bridge state singleton. Set it before signing a TM on a \
-             live bridge."
-        );
-        return Ok(CpoTrust::Unverified);
-    };
+    let policy = bridge_state_policy;
     // Same backend selection as `reconstruct-cpo-trie`, so both reads see the same index.
     let source: Box<dyn CpoHistorySource> = match cfg.cardano.kupo_url.as_deref() {
         Some(url) => Box::new(KupoHistory::new(url)),
         None => {
             let project_id = cfg.cardano.blockfrost_project_id.as_deref().ok_or(
-                "set cardano.kupo_url or cardano.blockfrost_project_id — cardano.cpo_policy_id \
-                 is set, so the bridge state singleton must be readable to cross-check \
-                 the local trie",
+                "set cardano.kupo_url or cardano.blockfrost_project_id — the bridge state \
+                 singleton must be readable to cross-check the local completed-peg-outs trie",
             )?;
             Box::new(BlockfrostHistory::new(
                 project_id,
@@ -2400,29 +2344,7 @@ fn cross_check_cpo_trie_from_cfg(
         "[cpo] local root matches the bridge state singleton's cpo_root ({})",
         hex::encode(on_chain)
     );
-    Ok(CpoTrust::Verified)
-}
-
-/// Whether the local completed-peg-outs trie may be trusted to decide which peg-outs an
-/// earlier movement already paid. Mirrors the epoch machine's own gate — since WI-031 the
-/// trie is the sole already-paid record, so "not cross-checked" has to be actionable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CpoTrust {
-    /// Cross-checked against the on-chain bridge state singleton's `cpo_root`.
-    Verified,
-    /// No `cardano.cpo_policy_id` — the local root was never checked against the chain.
-    Unverified,
-}
-
-/// The freshness window for peg-out selection. `now_ms` must be CHAIN time.
-fn freshness_from_cfg(
-    cfg: &HeimdallConfig,
-    now_ms: i64,
-) -> heimdall::bitcoin::tm_builder::Freshness {
-    heimdall::bitcoin::tm_builder::Freshness {
-        now_ms,
-        margin_ms: cfg.protocol.pegout_freshness_margin_ms as i64,
-    }
+    Ok(())
 }
 
 /// Build the Bitcoin RPC config; errors if `bitcoin.rpc_url` is unset.
@@ -2476,10 +2398,7 @@ fn run_treasury_self_send(
         treasury_spk,
         &dev_tm_params_from_cfg(cfg),
         // No peg-outs, so the freshness window is inert.
-        &heimdall::bitcoin::tm_builder::Freshness {
-            now_ms: 0,
-            margin_ms: 0,
-        },
+        &heimdall::bitcoin::tm_builder::Freshness::inert(),
         // A self-send fulfils nothing, so it re-commits the trie's current root.
         &cpo_trie_from_cfg(cfg)?,
         // …and sweeps nothing, so the spi_root is unchanged too.
@@ -2562,10 +2481,8 @@ fn run_federation_spend(
         vec![],
         treasury_spk,
         &dev_tm_params_from_cfg(cfg),
-        &heimdall::bitcoin::tm_builder::Freshness {
-            now_ms: 0,
-            margin_ms: 0,
-        },
+        // Treasury-only, so the freshness window is inert.
+        &heimdall::bitcoin::tm_builder::Freshness::inert(),
         &cpo_trie_from_cfg(cfg)?,
         &spi_trie_from_cfg(cfg)?,
     )
@@ -2918,6 +2835,7 @@ fn run_bootstrap_ban_list(
     blueprint_path: &str,
     registry_bootstrap: &str,
     ban_bootstrap: &str,
+    schedule_flags: (Option<i64>, Option<i64>, Option<i64>),
     submit: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::apply_ban::build_ban_bootstrap_tx;
@@ -2957,10 +2875,41 @@ fn run_bootstrap_ban_list(
     }
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     // The ban schedule is a property of the deployment, not of this operator, so
-    // take it from the bridge Config wherever that publishes one (#18-#20).
+    // take it from the bridge Config (#8-#10) whenever there IS one.
+    //
+    // At genesis there is not: WI-068 mints the ban root in the transaction
+    // BEFORE the Config NFT that names it, which is precisely when this command
+    // runs. With the local schedule keys retired, `resolve` then has nothing to
+    // read and no fallback, so the command could not bootstrap the very bridge
+    // it exists to bootstrap. The three flags are that missing door — the same
+    // one `deploy-spo-bans-ref` and `init-scripts` always had.
     let bridge_config = config_view(&rt, cfg)?;
-    let params = BanPolicyParams::resolve(&cfg.cardano, bridge_config.as_ref().map(|v| &v.params))
-        .map_err(|e| e.to_string())?;
+    let (flag_base, flag_faults, flag_window) = schedule_flags;
+    let params = match bridge_config.as_ref().map(|v| &v.params) {
+        Some(published) => {
+            // A readable Config is authoritative; a second copy on the command
+            // line could only disagree with it, silently deriving a different
+            // ban policy id. Refuse rather than pick a winner.
+            if flag_base.is_some() || flag_faults.is_some() || flag_window.is_some() {
+                return Err(
+                    "--base-ban-duration-ms / --max-faults-before-permanent /                      --max-validity-window-ms are genesis-only flags, but this node can read                      the bridge Config, which already publishes the schedule (#8-#10). Drop                      them: two copies could differ, and the difference would silently derive                      a ban policy id no deployment has"
+                        .to_string(),
+                );
+            }
+            BanPolicyParams::resolve(&cfg.cardano, Some(published)).map_err(|e| e.to_string())?
+        }
+        None => {
+            let (Some(base), Some(faults), Some(window)) = (flag_base, flag_faults, flag_window)
+            else {
+                return Err(
+                    "no bridge Config is readable, so the ban schedule must be given                      explicitly: pass --base-ban-duration-ms, --max-faults-before-permanent                      and --max-validity-window-ms. This is the genesis case — WI-068 mints                      the ban root before the Config NFT that names it exists, so there is                      nothing on chain to read the schedule from yet. Use the same three                      values the Config will publish, or the ban list lands at an address no                      node will read"
+                        .to_string(),
+                );
+            };
+            BanPolicyParams::from_genesis_flags(&cfg.cardano, base, faults, window)
+                .map_err(|e| e.to_string())?
+        }
+    };
     let spo_bans = spo_bans_script(
         &blueprint_json,
         &registry.hash,
@@ -2980,7 +2929,7 @@ fn run_bootstrap_ban_list(
     {
         return Err(format!(
             "these parameters derive ban policy {} but the bridge Config publishes {} \
-             (field #17) — that bridge's ban list is already bootstrapped, and a root minted \
+             (field #7) — that bridge's ban list is already bootstrapped, and a root minted \
              here would sit at an address no SPO reads",
             spo_bans.hash_hex(),
             hex::encode(published.spo_bans_policy_id),
@@ -4040,16 +3989,15 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         }
         None => {
             if args.submit {
-                return Err(
-                    "no min_stake threshold — the R2 gate cannot run. Configure the bridge \
-                     Config UTxO (cardano.config_address + config_nft_policy_id) to read the \
-                     protocol's Config #9, or set cardano.min_stake_lovelace, before submitting"
-                        .into(),
-                );
+                return Err("no min_stake threshold — the R2 gate cannot run. Set \
+                     cardano.min_stake_lovelace before submitting. It is a LOCAL operational \
+                     policy: rev 5.4 removed min_stake from the Config datum, where it never \
+                     had an on-chain reader, so there is no chain value to defer to"
+                    .into());
             }
             warn!(
-                "[register-spo] no min_stake threshold (no Config UTxO configured and \
-                 no cardano.min_stake_lovelace); dry run only — submission would be refused"
+                "[register-spo] no min_stake threshold (cardano.min_stake_lovelace is unset); \
+                 dry run only — submission would be refused"
             );
         }
     }
@@ -4363,9 +4311,9 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     // The ban a tx applies is computed from the SCHEDULE — its end time from
-    // #18/#19 and the validity interval from #20 — so those numbers must be the
+    // #8/#9 and the validity interval from #10 — so those numbers must be the
     // deployment's, not this operator's. Read them from the Config where the
-    // bridge publishes them; the derived policy is then checked against #17.
+    // bridge publishes them; the derived policy is then checked against #7.
     let bridge_config = config_view(&rt, cfg)?;
     let params = BanPolicyParams::resolve(&cfg.cardano, bridge_config.as_ref().map(|v| &v.params))
         .map_err(|e| e.to_string())?;
@@ -4385,7 +4333,7 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     {
         return Err(format!(
             "this ban would be applied to policy {} but the bridge Config publishes {} \
-             (field #17) — it would confirm into a ban list no other SPO reads. Check \
+             (field #7) — it would confirm into a ban list no other SPO reads. Check \
              cardano.ban_bootstrap and cardano.fault_proof_policies against this bridge",
             spo_bans.hash_hex(),
             hex::encode(published.spo_bans_policy_id),
@@ -4703,40 +4651,68 @@ fn run_show_roster(
     let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
-    // Resolve the registry the way the daemon does — published identity (#21-#23)
-    // first, local keys only otherwise. This report is what the operator guide
-    // sends people to in order to check their own registration, so it has to work
-    // on a bridge where the guide has already told them to delete those keys.
-    // The CLI flags stay as overrides, layered onto `[cardano]` before resolving
-    // so both halves of the report describe ONE deployment.
+    // Resolve the registry the way the daemon does — from the Config's published
+    // identity (#11-#13). This report is what the operator guide sends people to
+    // in order to check their own registration, so it has to describe the same
+    // deployment the daemon reads.
+    //
+    // The three flags survive as a FULLY EXPLICIT escape hatch for a bridge with
+    // no readable Config: all three or none, because a registry address derived
+    // from a partial set is a valid-looking address holding nothing. They are not
+    // backed by config keys any more (WI-070) — nothing here can go stale in a
+    // file and be forgotten.
     let bridge_config = config_view(&rt, cfg)?;
     let cardano = heimdall::config::CardanoConfig {
-        registry_blueprint: blueprint.or_else(|| cfg.cardano.registry_blueprint.clone()),
-        registry_bootstrap: registry_bootstrap.or_else(|| cfg.cardano.registry_bootstrap.clone()),
-        treasury_info_asset_name: treasury_nft_name
-            .or_else(|| cfg.cardano.treasury_info_asset_name.clone()),
+        registry_blueprint: blueprint
+            .clone()
+            .or_else(|| cfg.cardano.registry_blueprint.clone()),
         ..cfg.cardano.clone()
     };
-    let source = RegistryRosterSource::resolve(&cardano, bridge_config.as_ref().map(|v| &v.params))
-        .map_err(|e| e.to_string())?
-        .ok_or(
-            "no registry to show: this bridge's Config publishes no registry identity \
-             (#21-#23), and cardano.registry_blueprint / registry_bootstrap / \
-             treasury_info_asset_name are unset. Pass --blueprint, --registry-bootstrap and \
-             --treasury-nft-name, or point cardano.config_address at a bridge that \
-             publishes them",
-        )?;
+    let (source, origin) = match (
+        RegistryRosterSource::resolve(&cardano, bridge_config.as_ref().map(|v| &v.params))
+            .map_err(|e| e.to_string())?,
+        (blueprint, registry_bootstrap, treasury_nft_name),
+    ) {
+        // A readable Config wins, but say so rather than dropping the operator's
+        // flags in silence — believing a value you typed is in force when it is
+        // not is the same failure the retired-key refusal exists to prevent.
+        // --blueprint is exempt: it is applied above, being an artifact path
+        // rather than an identifier.
+        (Some(src), (_, boot, nft)) => {
+            let ignored: Vec<&str> = [
+                boot.as_ref().map(|_| "--registry-bootstrap"),
+                nft.as_ref().map(|_| "--treasury-nft-name"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if !ignored.is_empty() {
+                warn!(
+                    "ignoring {} — this node reads a bridge Config, and #11-#13 name the \
+                     registry authoritatively",
+                    ignored.join(" and ")
+                );
+            }
+            (src, "bridge Config #11-#13")
+        }
+        (None, (Some(bp), Some(boot), Some(nft))) => (
+            RegistryRosterSource::from_blueprint(&bp, &boot, &nft, cfg.cardano.is_mainnet()?)
+                .map_err(|e| e.to_string())?,
+            "the --blueprint / --registry-bootstrap / --treasury-nft-name flags",
+        ),
+        (None, _) => {
+            return Err(
+                "no registry to show: this node reads no bridge Config (set \
+                 cardano.config_address + cardano.config_nft_policy_id), and the explicit \
+                 route needs ALL of --blueprint, --registry-bootstrap and --treasury-nft-name"
+                    .to_string(),
+            );
+        }
+    };
     println!("registry policy:   {}", source.registry_policy_hex);
     println!("registry address:  {}", source.registry_address);
     println!("treasury_info:     {}", source.treasury_info_address);
-    println!(
-        "registry source:   {}",
-        if bridge_config.is_some() {
-            "bridge Config #11-#13"
-        } else {
-            "LOCAL heimdall.toml registry keys"
-        }
-    );
+    println!("registry source:   {origin}");
 
     let epoch = rt.block_on(bf_http::fetch_current_epoch(&base_url, pid))?;
     let snapshot = rt
@@ -4912,10 +4888,6 @@ fn run_mover(
     cfg: &HeimdallConfig,
     cardano_socket: &str,
     cardano_magic: u64,
-    pegin_script_address: &str,
-    pegin_policy_id: &str,
-    pegout_script_address: &str,
-    bridged_token_unit: &str,
     interval_secs: u64,
     once: bool,
     broadcast: bool,
@@ -4996,12 +4968,8 @@ fn run_mover(
             cfg,
             cardano_socket,
             cardano_magic,
-            pegin_script_address,
-            pegin_policy_id,
             None, // chain-source the treasury (WI-028)
             None,
-            pegout_script_address,
-            bridged_token_unit,
             broadcast,
             None, // no existing-tm override
             exclude_pegin,
@@ -5039,47 +5007,15 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
     use heimdall::cardano::cpo_history::{BlockfrostHistory, CpoHistorySource, KupoHistory};
     use heimdall::cardano::cpo_trie::{ReconstructConfig, reconstruct};
 
-    let tm_address = cfg
-        .cardano
-        .treasury_address
-        .as_deref()
-        .ok_or("set cardano.treasury_address (the TM validator address)")?;
-    let pegout_address = cfg
-        .cardano
-        .pegout_script_address
-        .as_deref()
-        .ok_or("set cardano.pegout_script_address")?;
-    let unit = cfg
-        .cardano
-        .bridged_token_unit
-        .as_deref()
-        .ok_or("set cardano.bridged_token_unit (<policy_hex><asset_name_hex>)")?
-        .trim()
-        .to_ascii_lowercase();
-    if unit.len() < 56 {
-        return Err(format!(
-            "cardano.bridged_token_unit '{unit}' is too short: expected a 56-hex policy id \
-             followed by the asset name"
-        ));
-    }
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    // Every address and token this walk follows is the bridge's, so all of them
+    // come from its Config (WI-070) — including the bridge-state policy the
+    // finished trie is cross-checked against, which is the ONLY check covering the
+    // trie as a whole (every per-movement assertion is relative to the previous
+    // movement, so a replay stopping one TM short of the tip passes all of them).
+    let contracts = bridge_contracts(&rt, cfg)?;
+    let unit = contracts.bridged_token_unit.to_ascii_lowercase();
     let (fbtc_policy_id, fbtc_asset_name_hex) = unit.split_at(56);
-
-    // Required, not optional. Every per-movement assertion is relative to the
-    // previous movement, so a replay that stops one TM short of the tip passes
-    // every one of them and still yields a short trie. Only the on-chain singleton
-    // catches that, and a node signing off a short trie proposes roots the quorum
-    // refuses while producing membership proofs `peg-out.ak` rejects.
-    let cpo_policy_id = cfg
-        .cardano
-        .cpo_policy_id
-        .as_deref()
-        .ok_or(
-            "set cardano.cpo_policy_id — the reconstructed trie is cross-checked against the \
-             on-chain completed-peg-outs singleton, and that is the only check covering the \
-             finished trie as a whole",
-        )?
-        .trim()
-        .to_ascii_lowercase();
 
     // Backend selection: Kupo when configured, else the Blockfrost-compatible API.
     //
@@ -5104,13 +5040,12 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
         }
     };
 
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
     let recon = ReconstructConfig {
-        tm_address: tm_address.to_string(),
-        pegout_address: pegout_address.to_string(),
+        tm_address: contracts.tm_address.clone(),
+        pegout_address: contracts.pegout_script_address.clone(),
         fbtc_policy_id: fbtc_policy_id.to_string(),
         fbtc_asset_name_hex: fbtc_asset_name_hex.to_string(),
-        cpo_policy_id,
+        cpo_policy_id: contracts.bridge_state_policy_id.clone(),
     };
     // `reconstruct` itself logs the active backend and its endpoint before its
     // first read, so every caller reports it identically and this command does not
@@ -5158,21 +5093,10 @@ fn run_reconstruct_spi_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
     use heimdall::cardano::cpo_history::{BlockfrostHistory, CpoHistorySource, KupoHistory};
     use heimdall::cardano::cpo_trie::reconstruct_spi;
 
-    let tm_address = cfg
-        .cardano
-        .treasury_address
-        .as_deref()
-        .ok_or("set cardano.treasury_address (the TM validator address)")?;
-    let policy = cfg
-        .cardano
-        .cpo_policy_id
-        .as_deref()
-        .ok_or(
-            "set cardano.cpo_policy_id (the bridge_state_policy, Config field 3) — the singleton \
-             supplies the walk's head and the attested spi_root",
-        )?
-        .trim()
-        .to_ascii_lowercase();
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    // The TM address (#4) and the bridge-state policy (#3) — the singleton that
+    // supplies the walk's head and the attested spi_root — both from the Config.
+    let contracts = bridge_contracts(&rt, cfg)?;
 
     let source: Box<dyn CpoHistorySource> = match cfg.cardano.kupo_url.as_deref() {
         Some(url) => Box::new(KupoHistory::new(url)),
@@ -5189,10 +5113,13 @@ fn run_reconstruct_spi_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
         }
     };
 
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
     println!("reconstructing the swept peg-ins trie");
     let trie = rt
-        .block_on(reconstruct_spi(source.as_ref(), tm_address, &policy))
+        .block_on(reconstruct_spi(
+            source.as_ref(),
+            &contracts.tm_address,
+            &contracts.bridge_state_policy_id,
+        ))
         .map_err(|e| e.to_string())?;
 
     println!(
@@ -5364,21 +5291,17 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
     use heimdall::cardano::blockfrost_chain::scan_tm_utxos;
     use heimdall::frost::dkg::run_demo_dkg;
 
-    let address = cfg
-        .cardano
-        .treasury_address
-        .as_deref()
-        .ok_or("cardano.treasury_address not set")?;
     let pid = cfg
         .cardano
         .blockfrost_project_id
         .as_deref()
         .ok_or("cardano.blockfrost_project_id not set")?;
     let base_url = heimdall::cardano::bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
-    let policy = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
-    let asset_unit = format!("{policy}{}", treasury_asset_name_hex(cfg));
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let contracts = bridge_contracts(&rt, cfg)?;
+    let address = &contracts.tm_address;
+    let asset_unit = contracts.tm_asset_unit();
     let scan = rt.block_on(scan_tm_utxos(
         &base_url,
         pid,
@@ -5525,13 +5448,6 @@ struct ChainTip {
     in_flight: bool,
 }
 
-/// The TM NFT asset name (hex). Shared by every treasury-sourcing path so they
-/// scan the SAME token unit. Defaults to "" — the real TM validator counts the
-/// empty-name token (there is no scaffold asset name any more).
-fn treasury_asset_name_hex(cfg: &HeimdallConfig) -> String {
-    cfg.cardano.treasury_asset_name.clone().unwrap_or_default()
-}
-
 /// The current treasury for the CLI sweep: the bridge-state singleton's head.
 ///
 /// Rev 5.4 removed the Confirmed TM chain — the head outpoint AND its satoshi
@@ -5554,11 +5470,10 @@ fn singleton_chain_tip(
         "chain-sourced treasury requires a Config locator (cardano.config_address + \
          config_nft_policy_id) — or pass --treasury-outpoint and --treasury-amount-sat",
     )?;
-    let mainnet = cfg
-        .cardano
-        .treasury_address
-        .as_deref()
-        .is_some_and(|a| a.starts_with("addr1"));
+    // The network tag, from the one key that carries it — not sniffed off a
+    // configured address, since there is no longer one to sniff (WI-070) and
+    // `is_mainnet` cross-checks itself against the Config address anyway.
+    let mainnet = cfg.cardano.is_mainnet()?;
     let (_config, singleton) =
         rt.block_on(heimdall::cardano::blockfrost_chain::fetch_config_singleton(
             &loc.base_url,
@@ -5598,12 +5513,8 @@ fn run_sweep_pegins(
     cfg: &HeimdallConfig,
     cardano_socket: &str,
     cardano_magic: u64,
-    pegin_script_address: &str,
-    pegin_policy_id: &str,
     treasury_outpoint: Option<&str>,
     treasury_amount_sat: Option<u64>,
-    pegout_script_address: &str,
-    bridged_token_unit: &str,
     broadcast: bool,
     existing_tm_hex: Option<&str>,
     exclude_pegin: &[String],
@@ -5636,12 +5547,23 @@ fn run_sweep_pegins(
     // One runtime for the federation read, the peg-in scan and the (optional) broadcast.
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
+    // The bridge's own contract identifiers, from the Config UTxO (WI-070). Read
+    // ONCE at the top for the same reason as the federation identity below: every
+    // address a movement touches comes from here, and a node that cannot resolve
+    // them must not get as far as building anything.
+    let (bridge_config, contracts) = bridge_config_and_contracts(&rt, cfg)?;
+
     // The federation identity comes from the treasury_info datum, not this node's
     // local seed (WI-069): the mover runs on every SPO, and a per-operator value
     // here builds a treasury address the other signers are not using. Resolved
     // ONCE and up front — a node that cannot establish it must not sign, and must
     // not discover that only after the TM is assembled and signed.
-    let federation = rt.block_on(resolve_federation(cfg))?;
+    //
+    // It reuses the Config read just above rather than fetching it again: run_mover
+    // calls this every tick, and two reads would also take the contract set and the
+    // federation identity from two different chain snapshots, so a governance Update
+    // landing between them would build a movement half from each.
+    let federation = rt.block_on(resolve_federation_from(cfg, Some(&bridge_config)))?;
     let y_fed = federation.y_fed;
     let csv = federation.csv_blocks;
 
@@ -5654,10 +5576,11 @@ fn run_sweep_pegins(
     info!("  FROST group key Y_51: {}", hex::encode(y_51.serialize()));
     let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
 
-    let policy_id: [u8; 28] = hex::decode(pegin_policy_id)
-        .map_err(|e| format!("pegin_policy_id: {e}"))?
-        .try_into()
-        .map_err(|_| "pegin_policy_id must be 28 bytes (56 hex chars)".to_string())?;
+    let policy_id: [u8; 28] = hex::decode(&contracts.pegin_policy_id)
+        .ok()
+        .and_then(|v| <[u8; 28]>::try_from(v).ok())
+        .ok_or("Config #5 (peg_in_script_hash) is not a 28-byte script hash")?;
+    let pegin_script_address = &contracts.pegin_script_address;
 
     // Scan PegInRequests: via Blockfrost (incl. yaci-devkit's blockfrost_url) when configured,
     // else via the N2C socket.
@@ -5701,27 +5624,19 @@ fn run_sweep_pegins(
         match cfg.cardano.blockfrost_project_id.as_deref() {
             Some(pid) => {
                 let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
-                let address = cfg.cardano.treasury_address.clone().unwrap_or_default();
-                let asset_unit = format!(
-                    "{}{}",
-                    cfg.cardano.treasury_policy_id.clone().unwrap_or_default(),
-                    treasury_asset_name_hex(cfg)
-                );
-                if address.is_empty() {
-                    None
-                } else {
-                    match rt.block_on(heimdall::cardano::blockfrost_chain::scan_tm_utxos(
-                        &base_url,
-                        pid,
-                        &address,
-                        &asset_unit,
-                        cfg.bitcoin.inflight_deadline_secs,
-                    )) {
-                        Ok(scan) => Some(scan),
-                        Err(e) => {
-                            warn!("[sweep] could not scan TM UTxOs: {e}");
-                            None
-                        }
+                let address = contracts.tm_address.clone();
+                let asset_unit = contracts.tm_asset_unit();
+                match rt.block_on(heimdall::cardano::blockfrost_chain::scan_tm_utxos(
+                    &base_url,
+                    pid,
+                    &address,
+                    &asset_unit,
+                    cfg.bitcoin.inflight_deadline_secs,
+                )) {
+                    Ok(scan) => Some(scan),
+                    Err(e) => {
+                        warn!("[sweep] could not scan TM UTxOs: {e}");
+                        None
                     }
                 }
             }
@@ -5815,8 +5730,8 @@ fn run_sweep_pegins(
             rt.block_on(fetch_pegout_requests(
                 &base_url,
                 pid,
-                pegout_script_address,
-                bridged_token_unit,
+                &contracts.pegout_script_address,
+                &contracts.bridged_token_unit,
             ))
             .map_err(|e| format!("fetch_pegout_requests: {e}"))?
         }
@@ -5833,14 +5748,15 @@ fn run_sweep_pegins(
     // (WI-031 item 8).
     if pegout_data.malformed > 0 {
         warn!(
-            "  {} UTxO(s) at {pegout_script_address} carry the bridged token but no \
+            "  {} UTxO(s) at {} carry the bridged token but no \
              decodable PegOutDatum — no TM can pay them (their owners can still Cancel)",
-            pegout_data.malformed
+            pegout_data.malformed, contracts.pegout_script_address
         );
     }
     info!(
-        "scanned {} open peg-out request(s) at {pegout_script_address}",
-        pegout_data.requests.len()
+        "scanned {} open peg-out request(s) at {}",
+        pegout_data.requests.len(),
+        contracts.pegout_script_address
     );
 
     // Auto-mover: with nothing pending at all, don't post a treasury→treasury self-move
@@ -5896,7 +5812,7 @@ fn run_sweep_pegins(
     // requests are still owed a payment (WI-031) and the root this TM commits, so a trie out
     // of sync with the chain must stop the sweep before anything is built or signed.
     let cpo_trie = cpo_trie_from_cfg(cfg)?;
-    let cpo_trust = cross_check_cpo_trie_from_cfg(&rt, cfg, &cpo_trie)?;
+    cross_check_cpo_trie_from_cfg(&rt, cfg, &contracts.bridge_state_policy_id, &cpo_trie)?;
 
     // ── Peg-out selection ──────────────────────────────────────────────────────────────────────
     // An open PegOut UTxO is NOT an unpaid one: it survives at the script address until someone
@@ -5941,20 +5857,12 @@ fn run_sweep_pegins(
         sweep_batch.batch.open(),
     );
 
+    // The trie is the only record of what an earlier TM already paid, and it has
+    // been cross-checked against the singleton above — an unverifiable one aborts
+    // the sweep rather than reaching here, because paying unchecked re-pays every
+    // open request on every sweep and drains the treasury irrecoverably.
     let mut pegout_requests: Vec<PegOutRequest> = Vec::new();
-    if !pegout_data.requests.is_empty() && cpo_trust == CpoTrust::Unverified {
-        // The trie is the only record of what an earlier TM already paid, so a trie this node
-        // cannot vouch for means "pay no peg-out", never "pay unchecked" — unchecked, every
-        // open request is re-paid on every sweep, draining the treasury irrecoverably.
-        // Peg-ins still sweep.
-        warn!(
-            "[pegout] skipping ALL {} open peg-out(s): the completed-peg-outs trie was not \
-             cross-checked against the chain (no cardano.cpo_policy_id), and it is the only \
-             record of what an earlier TM already paid. Set cardano.cpo_policy_id (and \
-             protocol.state_dir) to pay peg-outs.",
-            pegout_data.requests.len(),
-        );
-    } else if !pegout_data.requests.is_empty() {
+    if !pegout_data.requests.is_empty() {
         for po in &pegout_data.requests {
             info!(
                 "  peg-out → {} — {} sat ({}#{})",
@@ -6011,7 +5919,7 @@ fn run_sweep_pegins(
         pegout_requests,
         treasury_spk.clone(),
         &tm_params,
-        &freshness_from_cfg(cfg, chain_now_ms),
+        &heimdall::bitcoin::tm_builder::Freshness::at(chain_now_ms),
         &cpo_trie,
         &spi_trie,
     )
@@ -6165,16 +6073,6 @@ fn run_sweep_pegins(
     // this setup heimdall posts to Cardano while binocular `relay` carries it to Bitcoin.
     if let Some(project_id) = cfg.cardano.blockfrost_project_id.as_deref() {
         let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(cfg, &federation);
-        let treasury_address = cfg
-            .cardano
-            .treasury_address
-            .clone()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                "cardano.treasury_address must be set (the TM validator address)".to_string()
-            })?;
-        let treasury_policy_id = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
-        let treasury_asset_name_hex = cfg.cardano.treasury_asset_name.clone().unwrap_or_default();
         let treasury_config = TreasuryConfig {
             y_51: fixture.y_51,
             y_fed: fixture.y_fed,
@@ -6184,16 +6082,16 @@ fn run_sweep_pegins(
         };
         let mut chain = BlockfrostCardanoChain::new(
             project_id,
-            &treasury_address,
-            &treasury_policy_id,
-            &treasury_asset_name_hex,
+            &contracts.tm_address,
+            &contracts.tm_policy_id,
+            heimdall::cardano::config_params::TM_ASSET_NAME_HEX,
             treasury_config,
             fixture.roster.clone(),
             cfg.cardano.blockfrost_url.as_deref(),
         )
         .with_local_fee_rate(cfg.bitcoin.fee_rate_sat_per_vb);
         chain = chain.with_cpo_source(
-            cfg.cardano.cpo_policy_id.as_deref(),
+            Some(&contracts.bridge_state_policy_id),
             cfg.cardano.kupo_url.as_deref(),
         );
         if let Some(mnemonic) = &cfg.cardano.mnemonic {

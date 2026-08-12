@@ -171,28 +171,28 @@ pub struct RegistryParams {
 
 /// Config #1–#6 — the bridge's contract identifiers.
 ///
-/// These are the AUTHORITATIVE copies. Everything heimdall carries in its own
-/// `[cardano]` section — `bridged_token_unit`, `pegin_policy_id`,
-/// `pegin_script_address`, `pegout_script_address`, `cpo_policy_id` — is an
-/// operator-typed duplicate of one of them, which is exactly the kind of copy
-/// that goes stale after a redeploy and is discovered at transaction time. The
-/// startup gate (WI-053 step 4) cross-checks the duplicates against these, so a
-/// wrong one is caught on first run instead.
+/// These are the ONLY copies. heimdall's `[cardano]` section used to carry
+/// `bridged_token_unit`, `pegin_policy_id`, `pegin_script_address`,
+/// `pegout_script_address` and `cpo_policy_id` alongside them, and the startup
+/// gate cross-checked the two. WI-070 deleted that half: a value the Config
+/// publishes is not an operator setting, and the second copy — not the typo in it
+/// — was the defect. [`ConfigParams::bridge_contracts`] derives every one of them
+/// from the datum instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contracts {
     /// #1
     pub bridged_token_policy_id: Vec<u8>,
     /// #2
     pub completed_peg_ins_policy_id: Vec<u8>,
-    /// #3 — the bridge-state singleton's NFT policy. heimdall's
-    /// `cardano.cpo_policy_id` names this policy since rev 5.4.
-    pub bridge_state_policy_id: Vec<u8>,
     /// #5. One Aiken validator serves `mint`, `withdraw` and `spend`, so this
-    /// single hash is both heimdall's `pegin_policy_id` and the payment
-    /// credential of `pegin_script_address`.
-    pub peg_in_script_hash: Vec<u8>,
-    /// #6. Likewise the payment credential of `pegout_script_address`.
-    pub peg_out_script_hash: Vec<u8>,
+    /// single hash is both the peg-in NFT policy id and the payment credential
+    /// of the peg-in script address.
+    ///
+    /// Length-checked at parse time, not at use: it is derived straight into a
+    /// bech32 address, and there is no sensible way to render a short one.
+    pub peg_in_script_hash: [u8; 28],
+    /// #6. Likewise the payment credential of the peg-out script address.
+    pub peg_out_script_hash: [u8; 28],
 }
 
 impl Contracts {
@@ -205,6 +205,79 @@ impl Contracts {
             hex::encode(&self.bridged_token_policy_id),
             hex::encode(BRIDGED_TOKEN_ASSET_NAME)
         )
+    }
+}
+
+/// The TM state token's asset name — empty, a protocol constant like
+/// [`BRIDGED_TOKEN_ASSET_NAME`]. The TreasuryMovementValidator counts the
+/// empty-name token under its own script hash, so there is nothing per-bridge
+/// about it and nothing for an operator to set.
+pub const TM_ASSET_NAME_HEX: &str = "";
+
+/// Every bridge identifier heimdall works from, derived from the authenticated
+/// Config datum (WI-070).
+///
+/// Each field used to be a `[cardano]` key an operator copied out of the bridge's
+/// deployment notes. That made every one of them a value two SPOs could disagree
+/// about, and disagreement is never an error here — a mistyped script hash yields
+/// a well-formed address holding nothing, which reads as "no peg-ins pending" and
+/// "no peg-outs pending" while the node keeps signing. Deriving them from the one
+/// NFT-authenticated UTxO removes the second source rather than checking it.
+///
+/// The network tag is the sole local input, and [`crate::config::CardanoConfig::is_mainnet`]
+/// already cross-checks it against the Config address's own bech32 prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeContracts {
+    /// #5, hex. The peg-in NFT policy id.
+    pub pegin_policy_id: String,
+    /// #5 as a bech32 enterprise address — where PegInRequest UTxOs sit.
+    pub pegin_script_address: String,
+    /// #6 as a bech32 enterprise address — where PegOut UTxOs sit.
+    pub pegout_script_address: String,
+    /// #1 ‖ [`BRIDGED_TOKEN_ASSET_NAME`] — the fBTC unit whose quantity is a
+    /// PegOut request's locked amount.
+    pub bridged_token_unit: String,
+    /// #3, hex. The bridge-state singleton's NFT policy.
+    pub bridge_state_policy_id: String,
+    /// #4, hex. The TM validator script hash = the TM NFT policy id.
+    pub tm_policy_id: String,
+    /// #4 as a bech32 enterprise address — the TM validator address every
+    /// UnconfirmedTm/Confirmed record is posted to.
+    pub tm_address: String,
+}
+
+impl BridgeContracts {
+    /// The `(policy, asset name)` unit identifying a TM state token.
+    #[must_use]
+    pub fn tm_asset_unit(&self) -> String {
+        format!("{}{TM_ASSET_NAME_HEX}", self.tm_policy_id)
+    }
+}
+
+impl ConfigParams {
+    /// Derive every bridge identifier from this Config datum.
+    ///
+    /// `mainnet` decides only the bech32 network tag of the three derived
+    /// addresses; the hashes themselves are the datum's.
+    #[must_use]
+    pub fn bridge_contracts(&self, mainnet: bool) -> BridgeContracts {
+        use crate::cardano::blueprint::script_enterprise_address;
+        let network = if mainnet {
+            pallas_addresses::Network::Mainnet
+        } else {
+            pallas_addresses::Network::Testnet
+        };
+        let peg_in = self.contracts.peg_in_script_hash;
+        let peg_out = self.contracts.peg_out_script_hash;
+        BridgeContracts {
+            pegin_policy_id: hex::encode(peg_in),
+            pegin_script_address: script_enterprise_address(&peg_in, network),
+            pegout_script_address: script_enterprise_address(&peg_out, network),
+            bridged_token_unit: self.contracts.bridged_token_unit(),
+            bridge_state_policy_id: hex::encode(self.bridge_state_policy),
+            tm_policy_id: hex::encode(self.tm_script_hash),
+            tm_address: script_enterprise_address(&self.tm_script_hash, network),
+        }
     }
 }
 
@@ -347,11 +420,14 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
         plutus::field_bytes(fields, i).map_err(|e| format!("config #{i} ({name}): {e}"))
     };
     let contracts = Contracts {
-        bridged_token_policy_id: contract_field(1, "bridged_token_policy")?,
+        // #1 is a policy id, so length-check it at parse like #5/#6 rather than
+        // at use. Callers concatenate it with an asset name and split the result
+        // back at 56 hex chars (run_reconstruct_cpo_trie), which panics rather
+        // than erroring on a short one.
+        bridged_token_policy_id: field_hash28(fields, 1, "bridged_token_policy")?.to_vec(),
         completed_peg_ins_policy_id: contract_field(2, "completed_peg_ins_policy")?,
-        bridge_state_policy_id: contract_field(3, "bridge_state_policy")?,
-        peg_in_script_hash: contract_field(5, "peg_in_script_hash")?,
-        peg_out_script_hash: contract_field(6, "peg_out_script_hash")?,
+        peg_in_script_hash: field_hash28(fields, 5, "peg_in_script_hash")?,
+        peg_out_script_hash: field_hash28(fields, 6, "peg_out_script_hash")?,
     };
 
     let bridge_state_policy = field_hash28(fields, 3, "bridge_state_policy")?;
@@ -360,11 +436,25 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
     let config_int = |i: usize, name: &str| -> Result<i64, String> {
         plutus::field_int(fields, i).map_err(|e| format!("config #{i} ({name}): {e}"))
     };
+    // Range-check the ban schedule here, the way BanPolicyParams::from_config used
+    // to before these moved on chain. The three values are INPUTS to the spo_bans
+    // policy id, so an out-of-range one derives the wrong ban address and yields a
+    // silently empty ban list — the exact failure WI-065 exists to remove. Bounds
+    // match the contract's own ban_config_ok.
     let bans = BanParams {
         spo_bans_policy_id: field_hash28(fields, 7, "spo_bans_policy_id")?,
-        base_ban_duration_ms: config_int(8, "base_ban_duration_ms")?,
-        max_faults_before_permanent: config_int(9, "max_faults_before_permanent")?,
-        max_validity_window_ms: config_int(10, "max_validity_window_ms")?,
+        base_ban_duration_ms: positive(
+            config_int(8, "base_ban_duration_ms")?,
+            "config #8 (base_ban_duration_ms)",
+        )? as i64,
+        max_faults_before_permanent: positive(
+            config_int(9, "max_faults_before_permanent")?,
+            "config #9 (max_faults_before_permanent)",
+        )? as i64,
+        max_validity_window_ms: nonneg(
+            config_int(10, "max_validity_window_ms")?,
+            "config #10 (max_validity_window_ms)",
+        )? as i64,
     };
     let registry = RegistryParams {
         spos_registry_policy_id: field_hash28(fields, 11, "spos_registry_policy_id")?,
@@ -425,9 +515,8 @@ pub(crate) fn test_config_params() -> ConfigParams {
         contracts: Contracts {
             bridged_token_policy_id: Vec::new(),
             completed_peg_ins_policy_id: Vec::new(),
-            bridge_state_policy_id: Vec::new(),
-            peg_in_script_hash: Vec::new(),
-            peg_out_script_hash: Vec::new(),
+            peg_in_script_hash: [0; 28],
+            peg_out_script_hash: [0; 28],
         },
         bridge_state_policy: [0; 28],
         tm_script_hash: [0; 28],
@@ -775,14 +864,70 @@ mod tests {
         let c = &p.contracts;
         assert_eq!(c.bridged_token_policy_id, vec![0xaa; 28]);
         assert_eq!(c.completed_peg_ins_policy_id, vec![0xab; 28]);
-        assert_eq!(c.bridge_state_policy_id, vec![0xb5; 28]);
-        assert_eq!(c.peg_in_script_hash, vec![0xad; 28]);
-        assert_eq!(c.peg_out_script_hash, vec![0xae; 28]);
+        assert_eq!(c.peg_in_script_hash, [0xad; 28]);
+        assert_eq!(c.peg_out_script_hash, [0xae; 28]);
         // The unit is the Blockfrost concatenation, with the [CFG-1] constant name.
         assert_eq!(
             c.bridged_token_unit(),
             format!("{}{}", "aa".repeat(28), hex::encode(b"fSAT"))
         );
+    }
+
+    /// WI-070: every identifier the operator used to type is a pure function of
+    /// this datum. The two script hashes appear TWICE in each derivation — once
+    /// as a policy id and once as the payment credential of an address — so a
+    /// derivation that crossed them would still look well-formed. Pin both.
+    #[test]
+    fn derives_every_bridge_identifier_from_the_datum() {
+        let p = parse_config_datum(&config_datum(7, 1_000, 100_000)).unwrap();
+        let b = p.bridge_contracts(false);
+
+        assert_eq!(b.pegin_policy_id, "ad".repeat(28));
+        assert_eq!(b.bridge_state_policy_id, "b5".repeat(28));
+        assert_eq!(b.tm_policy_id, "ac".repeat(28));
+        assert_eq!(
+            b.bridged_token_unit,
+            format!("{}{}", "aa".repeat(28), hex::encode(b"fSAT"))
+        );
+        // The TM state token has no per-bridge name.
+        assert_eq!(b.tm_asset_unit(), "ac".repeat(28));
+
+        // Each address is the enterprise script address of its own hash, and the
+        // three are distinct — a swapped pair would pass a "looks like bech32" test.
+        let addr_of = |h: [u8; 28]| {
+            crate::cardano::blueprint::script_enterprise_address(
+                &h,
+                pallas_addresses::Network::Testnet,
+            )
+        };
+        assert_eq!(b.pegin_script_address, addr_of([0xad; 28]));
+        assert_eq!(b.pegout_script_address, addr_of([0xae; 28]));
+        assert_eq!(b.tm_address, addr_of([0xac; 28]));
+        for a in [
+            &b.pegin_script_address,
+            &b.pegout_script_address,
+            &b.tm_address,
+        ] {
+            assert!(a.starts_with("addr_test1w"), "{a}");
+        }
+
+        // The network tag is the one local input, and it must actually move.
+        assert!(
+            p.bridge_contracts(true)
+                .pegin_script_address
+                .starts_with("addr1w")
+        );
+    }
+
+    /// #5/#6 are script hashes, and a datum carrying something else is refused at
+    /// parse time rather than turned into a short, valid-looking address.
+    #[test]
+    fn a_contract_field_that_is_not_a_script_hash_is_refused() {
+        let full = config_datum(7, 1_000, 100_000);
+        let mut fields = plutus::constr_fields(&full, 0).unwrap().to_vec();
+        fields[5] = bytes(&[0xad; 20]);
+        let err = parse_config_datum(&constr(0, fields)).unwrap_err();
+        assert!(err.contains("peg_in_script_hash"), "{err}");
     }
 
     #[test]
@@ -920,10 +1065,7 @@ mod tests {
                 vec![],
                 change,
                 params,
-                &Freshness {
-                    now_ms: 0,
-                    margin_ms: 0,
-                },
+                &Freshness::inert(),
                 &crate::bitcoin::tm_builder::FixedCpoRoot([0u8; 32]),
                 &crate::bitcoin::tm_builder::FixedSpiRoot([0u8; 32]),
             )

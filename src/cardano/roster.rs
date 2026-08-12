@@ -426,7 +426,7 @@ pub struct RegistryRosterSource {
     /// policy above, but re-deriving the script elsewhere would mean a second
     /// blueprint read and a second copy of the parameterization rules.
     ///
-    /// `None` when the source came from the Config's published identity (#21–#23)
+    /// `None` when the source came from the Config's published identity (#11–#13)
     /// and this node has no blueprint to compile it from. That is the read/spend
     /// split: the published ids locate the roster, but a node that performs the
     /// key handoff must also be able to build the script. Update-Y says so
@@ -557,52 +557,18 @@ impl RegistryRosterSource {
         Ok(self)
     }
 
-    /// Build from `[cardano]` config: requires `registry_blueprint`,
-    /// `registry_bootstrap` and `treasury_info_asset_name` all set (`None`
-    /// when none are — the caller falls back to its fixture roster), errors
-    /// when only some are.
-    pub fn from_config(
-        cardano: &crate::config::CardanoConfig,
-    ) -> Result<Option<Self>, RosterError> {
-        let fields = (
-            cardano.registry_blueprint.as_deref(),
-            cardano.registry_bootstrap.as_deref(),
-            cardano.treasury_info_asset_name.as_deref(),
-        );
-        let (blueprint_path, bootstrap, asset_name_hex) = match fields {
-            (None, None, None) => return Ok(None),
-            (Some(b), Some(r), Some(a)) => (b, r, a),
-            _ => {
-                return Err(RosterError::Config(
-                    "set all of cardano.registry_blueprint, cardano.registry_bootstrap and \
-                     cardano.treasury_info_asset_name (or none, for the fixture roster)"
-                        .into(),
-                ));
-            }
-        };
-        let mainnet = cardano.is_mainnet().map_err(RosterError::Config)?;
-        // PRE-1 (rev 5.4): treasury_info no longer takes the TM-NFT policy;
-        // its only parameter besides the registry fields is gone.
-        Self::from_blueprint(blueprint_path, bootstrap, asset_name_hex, mainnet).map(Some)
-    }
-
-    /// Resolve the roster source the way every node should: from the bridge
-    /// Config when there is one to read, and only otherwise from local keys.
+    /// Resolve the roster source: from the bridge Config, or not at all.
     ///
-    /// The precedence is not a preference. `treasury_info` is parameterized by a
-    /// value a node applies locally, so two nodes that disagree about it look for
-    /// the roster's state UTxO at different addresses — and the one that is wrong
-    /// finds nothing rather than an error. The Config is NFT-authenticated and
-    /// identical for everyone, so it is the only copy that cannot diverge.
+    /// `treasury_info` is parameterized by values a node applies locally, so two
+    /// nodes that disagree about any of them look for the roster's state UTxO at
+    /// different addresses — and the one that is wrong finds nothing rather than
+    /// an error. The Config is NFT-authenticated and identical for everyone, so
+    /// since rev 5.4 (#11–#13 mandatory) it is the only source. WI-070 deleted the
+    /// local-keys route with the `treasury_info_asset_name` key it needed: `None`
+    /// here means no bridge to read at all, which is the fixture-roster demo.
     ///
-    /// A node that still carries the local keys derives from them too and CROSS-
-    /// CHECKS: that is how it keeps the compiled `treasury_info` script Update-Y
-    /// needs, and a disagreement is fatal rather than resolved by preference.
-    ///
-    /// Everything that derivation needs is OPTIONAL on this route, and a failure
-    /// to produce it is not fatal — the same treatment the ban sibling gives its
-    /// leftover keys. The addresses come from the Config; the compiled script buys
-    /// only the ability to SPEND the state UTxO, so a node with a moved
+    /// `registry_blueprint` survives, and is OPTIONAL. It buys only the ability to
+    /// SPEND the state UTxO (the Update-Y handoff), so a node with a moved
     /// `plutus.json` or a blueprint from a newer contracts release loses the
     /// handoff and keeps the bridge. A derivation that SUCCEEDS and disagrees
     /// with #12 stays fatal: that one is a real conflict about where the handoff
@@ -614,7 +580,7 @@ impl RegistryRosterSource {
         // Since rev 5.4 the registry identity (#11-#13) is MANDATORY in the
         // datum, so having a Config at all means having the identity.
         let Some(published) = config.map(|c| &c.registry) else {
-            return Self::from_config(cardano);
+            return Ok(None);
         };
         let mainnet = cardano.is_mainnet().map_err(RosterError::Config)?;
         let source = Self::from_policy_ids(
@@ -1132,22 +1098,26 @@ mod tests {
         assert!(src.treasury_info_script.is_none());
     }
 
-    /// A node with NO Config to read falls back to its local keys, and a
-    /// half-configured set of them is a fault rather than a silent fixture.
+    /// WI-070: there is no local-keys route left to fall back to. The registry
+    /// identity is the Config's (#11–#13, mandatory since rev 5.4), and the keys
+    /// that used to derive it locally cannot name the state NFT any more — so a
+    /// node with no Config has no roster, whatever else it carries.
     ///
-    /// Rev 5.4 removed the third case this once covered — a Config that predates
-    /// the registry append. The datum now carries the identity mandatorily, so
-    /// `parse_config_datum` refuses such a Config outright and no `ConfigParams`
-    /// can express it.
+    /// `registry_blueprint`/`registry_bootstrap` survive for other jobs
+    /// (Update-Y, the ban policy), and their presence must not conjure a roster
+    /// out of an unread bridge.
     #[test]
-    fn no_config_falls_back_to_local_keys_and_half_configured_keys_are_a_fault() {
-        let half = crate::config::CardanoConfig {
+    fn without_a_config_there_is_no_roster_whatever_else_is_set() {
+        let leftovers = crate::config::CardanoConfig {
+            registry_blueprint: Some("plutus.json".to_string()),
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
             ..Default::default()
         };
-        let err = RegistryRosterSource::resolve(&half, None)
-            .expect_err("half-configured registry keys are a fault, not a fixture");
-        assert!(matches!(err, RosterError::Config(_)));
+        assert!(
+            RegistryRosterSource::resolve(&leftovers, None)
+                .expect("no Config is the fixture case, not an error")
+                .is_none()
+        );
     }
 
     /// Write a blueprint carrying only `treasury_info` — the one validator the
@@ -1221,7 +1191,6 @@ mod tests {
         let cardano = crate::config::CardanoConfig {
             network: Some("preprod".to_string()),
             registry_blueprint: Some(path.to_string_lossy().into_owned()),
-            treasury_policy_id: Some(hex::encode([0x11; 28])),
             ..Default::default()
         };
 
@@ -1273,7 +1242,6 @@ mod tests {
             crate::config::CardanoConfig {
                 network: Some("preprod".to_string()),
                 registry_blueprint: Some("/nonexistent/plutus.json".to_string()),
-                treasury_policy_id: Some(hex::encode([0x11; 28])),
                 ..Default::default()
             },
             // A blueprint that has no treasury_info validator at all (a newer or
@@ -1289,7 +1257,6 @@ mod tests {
                     .to_string_lossy()
                     .into_owned(),
                 ),
-                treasury_policy_id: Some(hex::encode([0x11; 28])),
                 ..Default::default()
             },
         ];
