@@ -37,6 +37,7 @@ pub mod pegin_source;
 pub mod pegout_datum;
 pub mod plutus;
 pub mod publish;
+pub mod ref_script;
 pub mod register_pool;
 pub mod register_spo;
 pub mod registry;

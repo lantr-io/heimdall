@@ -414,9 +414,11 @@ enum Commands {
         /// This SPO's Bifrost endpoint URL (where DKG data is published).
         #[arg(long)]
         bifrost_url: String,
-        /// The registry reference-script UTxO (<tx_hash>:<index>), from
-        /// deploy-registry-ref. Without it the ~12 KB registry script is
-        /// embedded twice and the tx exceeds the 16 KB size limit.
+        /// Override the registry reference-script UTxO (<tx_hash>:<index>).
+        /// Not needed for the usual case: the one `deploy-registry-ref` left
+        /// key-locked at this wallet is discovered automatically. Pass this to
+        /// use a reference script held anywhere else — another SPO's, or one at
+        /// an address that is not this wallet.
         #[arg(long)]
         registry_ref: Option<String>,
         /// Actually submit via Blockfrost (requires passing the min-stake gate).
@@ -2990,7 +2992,11 @@ fn run_deploy_registry_ref(
     }
     let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
     println!("submitted: tx_hash={tx_hash}");
-    println!("registry ref UTxO:    {tx_hash}:0  (pass as --registry-ref to register-spo)");
+    println!("registry ref UTxO:    {tx_hash}#0");
+    println!(
+        "                      register-spo finds this on its own — it is key-locked here, at \
+         this wallet. Nothing to copy."
+    );
     Ok(())
 }
 
@@ -3757,6 +3763,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
     use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::ref_script::find_ref_script;
     use heimdall::cardano::register_spo::{
         RegisterSpoRequest, RegistrationSignatures, build_register_spo_tx, pool_id_from_cold_vkey,
         registration_message, verify_registration,
@@ -3975,15 +3982,45 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         window.current_slot, window.epoch_end_slot
     );
 
-    let registry_ref = args
-        .registry_ref
-        .as_deref()
-        .map(|s| {
-            let (tx_id, index) = parse_cardano_outref(s)?;
-            Ok::<_, String>((hex::encode(tx_id), index))
-        })
-        .transpose()
-        .map_err(|e| format!("--registry-ref: {e}"))?;
+    // The registry script is needed for both the spend and the mint; at ~12 KB,
+    // embedding it twice does not fit in a 16 KB transaction, so it must be
+    // referenced. `deploy-registry-ref` key-locks it at this very wallet, whose
+    // UTxOs we just fetched — so the outpoint no longer has to be copied by hand
+    // between the two commands (WI-056). `--registry-ref` overrides, for a
+    // reference script held anywhere else: another SPO's, or one at an address
+    // that is not this wallet. Blockfrost has no by-script-hash query, so those
+    // cannot be discovered.
+    let registry_ref = match args.registry_ref.as_deref() {
+        Some(s) => {
+            let (tx_id, index) =
+                parse_cardano_outref(s).map_err(|e| format!("--registry-ref: {e}"))?;
+            let outref = (hex::encode(tx_id), index);
+            println!(
+                "registry ref:      {}#{} (--registry-ref)",
+                outref.0, outref.1
+            );
+            Some(outref)
+        }
+        None => {
+            let hash = registry.hash_hex();
+            let found = find_ref_script(&wallet_raw, &hash).ok_or_else(|| {
+                format!(
+                    "no reference script for the registry ({hash}) at {wallet_addr}.\n\
+                     The ~12 KB registry script is needed for both the spend and the mint of \
+                     this transaction, and embedding it twice exceeds the 16 KB limit, so it \
+                     must be on chain first:\n\
+                     \x20 heimdall deploy-registry-ref --config <file> --blueprint {} \
+                     --registry-bootstrap {} --submit\n\
+                     (~55 ADA, reclaimable — it stays key-locked at this wallet, and this \
+                     command then finds it on its own).\n\
+                     If one is already deployed elsewhere, pass it as --registry-ref <txid:ix>.",
+                    args.blueprint, args.registry_bootstrap,
+                )
+            })?;
+            println!("registry ref:      {found} (discovered at this wallet)");
+            Some(found.outref())
+        }
+    };
 
     let req = RegisterSpoRequest {
         registry_script: &registry,
