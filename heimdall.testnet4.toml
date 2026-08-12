@@ -14,11 +14,16 @@ rpc_pass = "bitcoin"
 # demo simplification uses 720 (~5 days). Must match the SPO daemons.
 pegin_refund_timeout_blocks = 720
 
-# 32-byte hex seed for the deterministic demo federation key (Y_fed).
-# Must match what every SPO daemon uses, or your peg-in P2TR address
-# won't be redeemable by the federation. In production this comes from
-# the on-chain treasury oracle.
+# 32-byte hex seed for the deterministic demo federation key (Y_fed), and the CSV
+# delay of the federation leaf. Must match what every SPO daemon uses, or your
+# peg-in P2TR address won't be redeemable by the federation.
+#
+# A real SPO sets NEITHER (WI-069): both are published in the bridge's
+# treasury_info datum, which heimdall reaches from the Config NFT. This demo has
+# no such datum, so both are spelled out — and there is no default for either,
+# precisely because a guess derives a well-formed address holding nothing.
 y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe"
+federation_csv_blocks = 144
 
 # Broadcast signed BTC tx automatically. Leave false for first-run dry
 # runs (depositor prints raw hex either way); flip to true once you've

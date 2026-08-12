@@ -84,7 +84,7 @@ pub struct TreasuryUtxo {
     pub y_51: bitcoin::key::UntweakedPublicKey,
     /// The Taproot script-tree leaf key for the federation fallback.
     pub y_fed: bitcoin::key::UntweakedPublicKey,
-    pub federation_csv_blocks: u32,
+    pub federation_csv_blocks: u16,
     /// Whether it is safe to begin the NEXT treasury movement off this UTxO.
     /// A new movement can only begin once the previous one is confirmed, so the
     /// Blockfrost impl (WI-028) sets this false when an Unconfirmed TM (or an

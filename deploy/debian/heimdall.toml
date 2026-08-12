@@ -39,10 +39,27 @@ pegout_freshness_margin_ms = 604800000
 # "regtest". Must match the bridge you are joining.
 #network = "testnet4"
 
-# Federation fallback key seed (32 bytes hex) and the CSV delay of the federation
-# leaf in the treasury taproot tree. Both are BRIDGE-WIDE CONSTANTS: they feed the
-# treasury address every SPO must derive identically. Copy them from the bridge's
-# deployment notes; do not generate your own.
+# Federation identity — LEAVE BOTH UNSET on a bridge with an on-chain registry.
+#
+# They feed the treasury address every SPO must derive identically, so they used
+# to be copied from the bridge's deployment notes into every operator's config,
+# with a wrong value producing no error at all — just a well-formed address nobody
+# else uses. They are published in the bridge's treasury_info datum, which
+# heimdall finds from the Config NFT alone, and startup check 9 prints which
+# source it used.
+#
+# Set them ONLY for a deployment with no readable treasury_info (the fixture-roster
+# demo). There they are mandatory: heimdall refuses to start without them, because
+# an input to the treasury address has no safe default.
+#
+# y_fed_seed_hex is a SPENDING SECRET, not an identifier: it signs the treasury's
+# federation recovery path, which is why the chain carries only the derived public
+# key. Set it only on a node that performs federation spends — there it also
+# cross-checks the published key, the one check a node without the seed cannot
+# make, and a disagreement is fatal rather than silently resolved.
+#
+# Leaving these commented out is the normal case. Setting either to "" counts as
+# unset, not as an empty value.
 #y_fed_seed_hex = ""
 #federation_csv_blocks = 144
 

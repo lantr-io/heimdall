@@ -1557,7 +1557,11 @@ impl CardanoChain for BlockfrostCardanoChain {
         // self-limiting — under wrong keys the FROST signatures simply do not verify, so
         // nothing can be signed away, let alone lost.
         let secp = bitcoin::key::Secp256k1::new();
-        let csv_u16 = csv_to_u16(csv)?;
+        // No narrowing check: `federation_csv_blocks` is a `u16` end to end since
+        // WI-069, validated where it enters from the treasury_info datum. It used
+        // to be a `u32` that every consumer cast, so a value above 65535
+        // truncated into a different Taproot tree.
+        let csv_u16 = csv;
         let mut leaf_candidates = vec![self.treasury_config.y_fed];
         if y_51 != self.treasury_config.y_fed {
             leaf_candidates.push(y_51);
@@ -2102,17 +2106,6 @@ impl CardanoChain for BlockfrostCardanoChain {
 // ---------------------------------------------------------------------------
 // Shared TM-UTxO scan (WI-028) — used by `query_treasury` and the sweep CLI.
 // ---------------------------------------------------------------------------
-
-/// Convert the u32 federation CSV to the u16 the Taproot leaf timelock needs,
-/// erroring (never silently truncating) on overflow — so every treasury-sourcing
-/// path derives the same scriptPubKey from the same config.
-pub fn csv_to_u16(csv: u32) -> EpochResult<u16> {
-    u16::try_from(csv).map_err(|_| {
-        EpochError::Chain(format!(
-            "federation_csv_blocks {csv} exceeds the 16-bit CSV limit"
-        ))
-    })
-}
 
 /// Result of scanning the TM validator address for treasury movements.
 pub struct TmScan {

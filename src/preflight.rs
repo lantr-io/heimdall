@@ -6,7 +6,7 @@
 //! locator keys silently dropped to a wall-clock cadence instead of the protocol's
 //! batch grid, which does not agree with the other SPOs, and nothing said so.
 //!
-//! This module runs seven checks in order and reports each one. It is the single
+//! This module runs nine checks in order and reports each one. It is the single
 //! state reader behind the startup gate; `heimdall doctor` (WI-054) and
 //! `heimdall status` (WI-058) are meant to render the same [`Report`] rather than
 //! grow their own opinion of what "healthy" means, because three readers that can
@@ -397,11 +397,17 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             "no provider configured",
             "set cardano.blockfrost_project_id",
         );
+        // Every step this early return skips, so the report is always the whole
+        // picture and `render`'s "[n/total]" counts what it printed. Steps 7 and 8
+        // used to be missing here and step 6 carried step 7's title.
         for (n, title) in [
             (3u8, "resolve the Config"),
             (4, "verify the contract set"),
             (5, "reference script"),
-            (6, "registration status"),
+            (6, "ban list"),
+            (7, "registration status"),
+            (8, "key handoff (Update-Y)"),
+            (9, "federation identity"),
         ] {
             b.push(n, title, Status::Skipped, "needs a Cardano provider");
         }
@@ -694,20 +700,30 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             .ok()
             .map(|kp| kp.x_only_public_key().0.serialize())
     };
-    match (&registry, bifrost_pk) {
-        (Ok(None), _) | (Err(_), _) => b.push(
+    // ONE read serves steps 7 and 9: the snapshot carries both the registered SPO
+    // set and the `treasury_info` datum the federation identity lives in. Fetched
+    // here rather than inside step 7 because step 9 needs it even on a node with
+    // no bifrost key, and asking twice invites the two steps to see different
+    // chain states.
+    let snapshot = match &registry {
+        Ok(Some(src)) => Some(src.fetch_snapshot(&base_url, &project_id).await),
+        _ => None,
+    };
+
+    match (&snapshot, bifrost_pk) {
+        (None, _) => b.push(
             7,
             "registration status",
             Status::Skipped,
             "no usable on-chain registry (step 5)",
         ),
-        (Ok(Some(_)), None) => b.push(
+        (Some(_), None) => b.push(
             7,
             "registration status",
             Status::Skipped,
             "no [bifrost].skey_path — cannot tell which registry entry is ours",
         ),
-        (Ok(Some(src)), Some(pk)) => match src.fetch_snapshot(&base_url, &project_id).await {
+        (Some(read), Some(pk)) => match read {
             Err(e) => b.push_fix(
                 7,
                 "registration status",
@@ -790,6 +806,54 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
              two parameters). The derived hash is checked against the Config's #22, so a \
              wrong one is refused rather than used",
         ),
+    }
+
+    // ── 9. Federation identity — the treasury's own address (WI-069) ──────
+    // A Fail, unlike steps 5 and 8: this is not a capability the node can do
+    // without. Y_fed and the CSV delay are what the treasury scriptPubKey is
+    // built from, so a node that cannot resolve them — or whose local seed
+    // contradicts what the chain publishes — would sign for an address no other
+    // SPO is using, and produce nothing resembling an error while doing it.
+    //
+    // The published copy is the `treasury_info` datum read above, NOT a separate
+    // fetch: a step that reports the identity healthy must be looking at the
+    // bytes the mover will actually build the tree from. A failed read stays a
+    // failure — never silently "the bridge publishes nothing", which would take
+    // the local seed and reintroduce the divergence this replaces.
+    match &snapshot {
+        Some(Err(e)) => b.push_fix(
+            9,
+            "federation identity",
+            Status::Fail,
+            format!("treasury_info unreadable, so the treasury address cannot be derived: {e}"),
+            "this is the same read step 7 failed on — fix that first",
+        ),
+        published => {
+            let datum = published
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .map(|s| &s.treasury_state.datum);
+            match crate::cardano::federation::resolve(&cfg.bitcoin, datum) {
+                Ok(id) => b.push(
+                    9,
+                    "federation identity",
+                    Status::Pass,
+                    format!(
+                        "Y_fed {}, csv {} blocks — {}",
+                        hex::encode(id.y_fed.serialize()),
+                        id.csv_blocks,
+                        id.origin
+                    ),
+                ),
+                Err(e) => b.push_fix(
+                    9,
+                    "federation identity",
+                    Status::Fail,
+                    e.to_string(),
+                    e.fix(),
+                ),
+            }
+        }
     }
 
     Report { steps: b.steps }
@@ -941,6 +1005,34 @@ mod tests {
         };
         assert!(!fail.ok());
         assert_eq!(fail.first_failure().map(|s| s.n), Some(3));
+    }
+
+    /// The no-provider early return must still account for EVERY step, because
+    /// `render` derives its "[n/total]" from `steps.len()`. It used to push four
+    /// (3,4,5,6) while nine exist, so adding a step made the last line read
+    /// "[9/7]" — and its entry for 6 carried step 7's title, so the ban-list check
+    /// was reported as "registration status".
+    #[tokio::test]
+    async fn the_no_provider_report_accounts_for_every_step() {
+        let cfg = HeimdallConfig::default();
+        assert!(
+            cfg.cardano.blockfrost_project_id.is_none(),
+            "fixture must take the no-provider path"
+        );
+        let report = preflight(&cfg).await;
+        let numbers: Vec<u8> = report.steps.iter().map(|s| s.n).collect();
+        assert_eq!(numbers, (1..=9).collect::<Vec<u8>>(), "{numbers:?}");
+        // Every rendered line's step number is within the total it prints.
+        let total = report.steps.len();
+        assert_eq!(total, 9);
+        for s in &report.steps {
+            assert!(usize::from(s.n) <= total, "step {} of {total}", s.n);
+        }
+        // Titles line up with the steps the main path actually pushes.
+        let titled: Vec<&str> = report.steps.iter().map(|s| s.title).collect();
+        assert_eq!(titled[5], "ban list");
+        assert_eq!(titled[6], "registration status");
+        assert_eq!(titled[8], "federation identity");
     }
 
     #[test]

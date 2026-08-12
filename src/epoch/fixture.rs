@@ -13,6 +13,7 @@ use bitcoin::secp256k1::{Keypair, SecretKey};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
 use frost_secp256k1_tr::Identifier;
 
+use crate::cardano::federation::FederationIdentity;
 use crate::config::HeimdallConfig;
 use crate::epoch::state::{Roster, SpoInfo};
 
@@ -27,7 +28,7 @@ pub struct StaticFixture {
     pub y_fed: UntweakedPublicKey,
     /// Timeout (in Bitcoin blocks) before the federation fallback leaf
     /// becomes spendable. Must match what the on-chain treasury commits to.
-    pub federation_csv_blocks: u32,
+    pub federation_csv_blocks: u16,
     /// Current treasury outpoint and amount. For the first cycle this
     /// is synthetic.
     pub treasury_outpoint: OutPoint,
@@ -145,22 +146,17 @@ pub fn demo_static_fixture(min_signers: u16, max_signers: u16, base_port: u16) -
 }
 
 /// Build a demo fixture from the merged `HeimdallConfig`.
-pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
+///
+/// The federation identity is passed in, not derived here: since WI-069 it comes
+/// from the `treasury_info` datum wherever the bridge has one, with the
+/// operator's local seed only a cross-check. Resolving it is the caller's job,
+/// because it needs a chain read — see [`crate::cardano::federation::resolve`].
+pub fn demo_static_fixture_from_config(
+    cfg: &HeimdallConfig,
+    federation: &FederationIdentity,
+) -> StaticFixture {
     let secp = Secp256k1::new();
-
-    let y_fed_seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_fed_seed_hex)
-        .expect("bitcoin.y_fed_seed_hex must be valid hex")
-        .try_into()
-        .expect("bitcoin.y_fed_seed_hex must be 32 bytes");
-
-    let y_fed = UntweakedPublicKey::from_slice(
-        &SecretKey::from_slice(&y_fed_seed)
-            .unwrap()
-            .x_only_public_key(&secp)
-            .0
-            .serialize(),
-    )
-    .unwrap();
+    let y_fed = federation.y_fed;
 
     // Deterministic per-SPO identities (WI-023): the no-registry demo runs
     // `max_signers` real processes that talk over the authenticated HTTP
@@ -207,7 +203,7 @@ pub fn demo_static_fixture_from_config(cfg: &HeimdallConfig) -> StaticFixture {
         },
         y_51: y_fed, // bootstrap: internal key = federation
         y_fed,
-        federation_csv_blocks: cfg.bitcoin.federation_csv_blocks,
+        federation_csv_blocks: federation.csv_blocks,
         // Demo mock treasury. The real treasury is resolved on-chain: the Config UTxO's
         // anchor (field 11) + the Confirmed TM chain (see cardano::tm_chain).
         treasury_outpoint: OutPoint {

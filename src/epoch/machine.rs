@@ -688,12 +688,8 @@ async fn publish_keys_phase(
     match chain.query_treasury().await {
         Ok(treasury) => {
             let secp = Secp256k1::new();
-            let new_spend = treasury_spend_info(
-                &secp,
-                y_51,
-                treasury.y_fed,
-                treasury.federation_csv_blocks as u16,
-            );
+            let new_spend =
+                treasury_spend_info(&secp, y_51, treasury.y_fed, treasury.federation_csv_blocks);
             let new_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(new_spend.output_key());
             crate::epoch_log!(
                 me,
@@ -1167,7 +1163,7 @@ async fn build_tm_phase(
         &secp,
         treasury.y_51,
         treasury.y_fed,
-        treasury.federation_csv_blocks as u16,
+        treasury.federation_csv_blocks,
     );
 
     // Treasury *change output*: send to the new roster's Taproot address,
@@ -1179,7 +1175,7 @@ async fn build_tm_phase(
         &secp,
         new_y_51,
         treasury.y_fed,
-        treasury.federation_csv_blocks as u16,
+        treasury.federation_csv_blocks,
     );
     let change_script = bitcoin::ScriptBuf::new_p2tr_tweaked(change_spend.output_key());
 

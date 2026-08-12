@@ -490,7 +490,12 @@ impl RegistryRosterSource {
     }
 
     /// The published route (WI-068): both addresses come from the policy ids the
-    /// Config carries at #21–#22, and the state NFT's name from #23.
+    /// Config carries at #11–#12, and the state NFT's name from #13.
+    ///
+    /// This is also how the treasury's federation identity is reached (WI-069):
+    /// the `treasury_info` UTxO located here carries `y_federation` and
+    /// `federation_csv_blocks` in its datum, so the whole treasury address hangs
+    /// off the one Config NFT.
     ///
     /// Nothing here reads a blueprint, an outref or the TM-NFT policy — which is
     /// the point, since `treasury_info` is parameterized by TWO values that every
