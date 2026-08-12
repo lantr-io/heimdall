@@ -439,7 +439,13 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
     peer_infos: &[&crate::epoch::state::SpoInfo],
     out: &mut BTreeMap<Identifier, T>,
 ) -> EpochResult<()> {
-    let need = peer_infos.len() + out.len(); // self already present
+    // Everyone = every peer plus self. NOT `out.len()`: `out` is resume state
+    // (`collected.round1.entry(i).or_default()`), so a round retried after a
+    // restart arrives with peers already in it, and counting them twice puts
+    // `need` above the reachable maximum — the loop below can then never satisfy
+    // `out.len() < need` and the round always ends in `PollTimeout`, however many
+    // peers answered.
+    let need = peer_infos.len() + 1;
     let deadline = clock.deadline(config.quorum51_timeout);
     while out.len() < need {
         for peer in peer_infos {

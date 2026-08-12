@@ -375,7 +375,11 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
         plutus::field_bytes(fields, i).map_err(|e| format!("config #{i} ({name}): {e}"))
     };
     let contracts = Contracts {
-        bridged_token_policy_id: contract_field(2, "bridged_token_policy")?,
+        // #2 is a policy id, so length-check it at parse the way #4-#8 are.
+        // Callers concatenate it with the asset name and split the result back at
+        // 56 hex chars (run_reconstruct_cpo_trie), which PANICS rather than
+        // erroring when the field is short.
+        bridged_token_policy_id: field_hash28(fields, 2, "bridged_token_policy")?.to_vec(),
         completed_peg_ins_policy_id: contract_field(3, "completed_peg_ins_policy")?,
         bridge_state_policy_id: contract_field(4, "bridge_state_policy")?,
         peg_in_script_hash: contract_field(6, "peg_in_script_hash")?,
@@ -442,9 +446,24 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
             params_int(3, "min_peg_out_fbtc")?,
             "config params[3] (min_peg_out_fbtc)",
         )?,
-        base_ban_duration_ms: params_int(4, "base_ban_duration_ms")?,
-        max_faults_before_permanent: params_int(5, "max_faults_before_permanent")?,
-        max_validity_window_ms: params_int(6, "max_validity_window_ms")?,
+        // Range-checked like the three tunables above, and for a sharper reason:
+        // these are INPUTS to the spo_bans policy id, so an out-of-range value
+        // does not merely misconfigure a duration — it derives a ban address no
+        // deployment has, which reads back as a silently EMPTY ban list with
+        // banned SPOs still in the roster. Bounds match the contract's own
+        // ban_config_ok.
+        base_ban_duration_ms: positive(
+            params_int(4, "base_ban_duration_ms")?,
+            "config params[4] (base_ban_duration_ms)",
+        )? as i64,
+        max_faults_before_permanent: positive(
+            params_int(5, "max_faults_before_permanent")?,
+            "config params[5] (max_faults_before_permanent)",
+        )? as i64,
+        max_validity_window_ms: nonneg(
+            params_int(6, "max_validity_window_ms")?,
+            "config params[6] (max_validity_window_ms)",
+        )? as i64,
         federation_csv_blocks,
     };
 
@@ -821,6 +840,68 @@ mod tests {
                 },
             },
             config_created_ms: Some(1_699_000_000_000),
+        }
+    }
+
+    /// Swap one field of the rev-5.5 datum, keeping every other field valid.
+    fn config_datum_with(field: usize, value: PlutusData) -> PlutusData {
+        let PlutusData::Constr(mut c) = config_datum(7, 1_000, 100_000) else {
+            unreachable!("config_datum builds a Constr")
+        };
+        c.fields = pallas_codec::utils::MaybeIndefArray::Indef(
+            c.fields
+                .to_vec()
+                .into_iter()
+                .enumerate()
+                .map(|(i, f)| if i == field { value.clone() } else { f })
+                .collect(),
+        );
+        PlutusData::Constr(c)
+    }
+
+    /// #2 is a policy id. A short one used to reach `unit.split_at(56)` in
+    /// run_reconstruct_cpo_trie and PANIC ("byte index 56 is out of bounds")
+    /// rather than report a malformed Config.
+    #[test]
+    fn a_short_bridged_token_policy_is_an_error_not_a_panic() {
+        let err = parse_config_datum(&config_datum_with(2, bytes(&[0xaa; 20]))).unwrap_err();
+        assert!(
+            err.contains("bridged_token_policy") && err.contains("28-byte"),
+            "expected a 28-byte length complaint, got: {err}"
+        );
+    }
+
+    /// The ban schedule is baked into the spo_bans policy id, so an out-of-range
+    /// value derives a ban address no deployment has — which reads back as an
+    /// empty ban list, not as an error, unless it is refused here.
+    #[test]
+    fn an_out_of_range_ban_schedule_is_refused() {
+        let params_with = |base: i64, faults: i64, window: i64| {
+            constr(
+                0,
+                vec![
+                    schedule_data(),
+                    int(7),
+                    int(1_000),
+                    int(100_000),
+                    int(base),
+                    int(faults),
+                    int(window),
+                    int(144),
+                ],
+            )
+        };
+        for (base, faults, window, want) in [
+            (0, 3, 3_600_000, "base_ban_duration_ms"),
+            (600_000, 0, 3_600_000, "max_faults_before_permanent"),
+            (600_000, 3, -1, "max_validity_window_ms"),
+        ] {
+            let err = parse_config_datum(&config_datum_with(1, params_with(base, faults, window)))
+                .unwrap_err();
+            assert!(
+                err.contains(want),
+                "expected {want} to be refused, got: {err}"
+            );
         }
     }
 
