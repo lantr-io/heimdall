@@ -954,10 +954,16 @@ impl BanListSource {
         })
     }
 
-    /// Build from `[cardano]` config. The ban list is configured iff
-    /// `ban_bootstrap` is set (`None` otherwise); it then also requires the
-    /// registry fields the ban policy is parameterized by, plus the
-    /// fault-verifier policy set + ban-schedule params ([`BanPolicyParams`]).
+    /// Build from `[cardano]` alone, i.e. with no bridge Config in hand.
+    ///
+    /// Since the schedule was retired from `[cardano]` (WI-065) this can only
+    /// answer `Ok(None)` — "no ban list configured", when `ban_bootstrap` is
+    /// unset — or `Err`. It cannot produce a source: the ban policy id is a hash
+    /// over the schedule, which now lives only in the Config, so there is nothing
+    /// left to derive an address from. Kept as the `None` branch of
+    /// [`Self::resolve`] so "not configured" stays distinguishable from
+    /// "configured and broken"; callers wanting a usable source must pass a
+    /// Config.
     pub fn from_config(
         cardano: &crate::config::CardanoConfig,
     ) -> Result<Option<Self>, BanListError> {
@@ -1791,16 +1797,17 @@ mod tests {
         assert_eq!(b.origin, BanSourceOrigin::Config);
     }
 
-    /// A node with NO Config to read keeps the old behaviour exactly — including
-    /// WI-060's refusal, since without one the local keys are the only way to
-    /// read the list.
+    /// A node with NO Config to read cannot resolve a ban list at all, and says
+    /// so — WI-060's refusal still applies, but there is no local route behind it
+    /// any more: the schedule the policy id is derived from lives only in the
+    /// Config since WI-065.
     ///
     /// Rev 5.4 removed the second case this once covered — a Config predating the
     /// ban append. The datum now carries the ban policy mandatorily, so
     /// `parse_config_datum` refuses such a Config and no `ConfigParams` can
     /// express it.
     #[test]
-    fn no_config_falls_back_to_the_local_keys() {
+    fn no_config_means_no_ban_list_at_all() {
         let cardano = crate::config::CardanoConfig {
             registry_blueprint: Some("plutus.json".to_string()),
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
