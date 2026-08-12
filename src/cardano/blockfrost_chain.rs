@@ -236,7 +236,8 @@ impl DkgFaultBanFlow {
                 "the fault-enforcement keys derive spo_bans policy {} but the bridge Config \
                  publishes {} (field #17) — an ApplyBan built here would confirm into a ban \
                  list no other SPO reads. Check cardano.ban_bootstrap, \
-                 cardano.fault_proof_policies and the ban-schedule keys against this bridge",
+                 cardano.fault_proof_policies against this bridge — the schedule half comes \
+                 from the Config itself (params[4..6]), so it cannot be what disagrees",
                 spo_bans.hash_hex(),
                 hex::encode(published.spo_bans_policy_id),
             ));

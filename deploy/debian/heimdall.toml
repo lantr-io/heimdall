@@ -167,16 +167,21 @@ stake_source = "blockfrost"
 # why the daemon refuses to start with the registry keys set and no ban list from
 # either source.
 #
-# Set these ONLY for a bridge deployed before #17 existed, and then copy all
-# five exactly from the deployment notes: each is an input to the ban policy's
-# own identifier, so one wrong value derives a valid-looking address holding no
-# bans at all. On that route the registry keys above are required too — the ban
-# policy is parameterized by the registry policy.
+# Set these ONLY for a bridge deployed before #17 existed, and then copy them
+# exactly from the deployment notes: each is an input to the ban policy's own
+# identifier, so one wrong value derives a valid-looking address holding no bans
+# at all. On that route the registry keys above are required too — the ban policy
+# is parameterized by the registry policy.
 #ban_bootstrap = "<tx_hash>:<index>"
 #fault_proof_policies = ["<28-byte hex>", "<28-byte hex>", "<28-byte hex>"]
-#base_ban_duration_ms = 0
-#max_faults_before_permanent = 0
-#max_validity_window_ms = 0
+
+# The ban SCHEDULE is no longer settable here. base_ban_duration_ms,
+# max_faults_before_permanent and max_validity_window_ms come from the bridge
+# Config (params[4..6]) and heimdall REFUSES to start if this file still sets
+# them — a key that silently did nothing left the operator believing a ban
+# duration they typed was in force. Delete them if you are carrying them over.
+# At genesis, where no Config exists yet, `bootstrap-ban-list` takes the same
+# three values as explicit flags.
 
 # Fault enforcement — publishing a fault proof on chain so misbehaviour costs
 # something. Entirely OPTIONAL and off by default: faults are detected and the
