@@ -428,16 +428,6 @@ pub struct CardanoConfig {
     /// ban address (and a silently empty ban list). Required alongside
     /// `ban_bootstrap`.
     pub fault_proof_policies: Vec<String>,
-    /// `spo_bans` ban-schedule params, baked into the ban policy id, so they
-    /// must match the deployment. `base_ban_duration_ms * 2^(n-1)` is the nth
-    /// ban's length; a pool becomes permanently banned at
-    /// `max_faults_before_permanent`; `max_validity_window_ms` bounds an
-    /// ApplyBan tx's validity interval. All required alongside `ban_bootstrap`.
-    ///
-    /// Superseded by Config #18–#20 wherever the bridge publishes them.
-    pub base_ban_duration_ms: Option<i64>,
-    pub max_faults_before_permanent: Option<i64>,
-    pub max_validity_window_ms: Option<i64>,
     /// Reference-script UTxO `<tx_hash>:<index>` carrying the `spo_bans`
     /// validator. Required for automatic DKG fault banning because ApplyBan
     /// uses the script through withdraw/spend/mint paths.
@@ -487,9 +477,6 @@ impl Default for CardanoConfig {
             treasury_info_asset_name: None,
             ban_bootstrap: None,
             fault_proof_policies: Vec::new(),
-            base_ban_duration_ms: None,
-            max_faults_before_permanent: None,
-            max_validity_window_ms: None,
             spo_bans_ref: None,
             fault_verifier_round1_ref: None,
             fault_verifier_round2_ref: None,
@@ -623,13 +610,74 @@ impl Default for DemoConfig {
     }
 }
 
+/// Keys the bridge Config publishes, and which heimdall therefore refuses.
+///
+/// The ban schedule is not an operator setting and never was: the three values
+/// are INPUTS to the `spo_bans` policy id, so a node cannot derive the address it
+/// would read them from without already having them, and one wrong digit derives
+/// a ban address no deployment has — a silently EMPTY ban list, with banned SPOs
+/// back in the roster and nothing in any log. That had already happened in three
+/// checked-in fixtures. The Config publishes them at `params[4..6]`, authenticated
+/// by the Config NFT, so every SPO reads the same numbers or none at all.
+///
+/// `(section, key, what replaced it)`.
+pub type RetiredKey = (&'static str, &'static str, &'static str);
+
+const RETIRED_KEYS: &[RetiredKey] = &[
+    (
+        "cardano",
+        "base_ban_duration_ms",
+        "Config params[4] (base_ban_duration_ms)",
+    ),
+    (
+        "cardano",
+        "max_faults_before_permanent",
+        "Config params[5] (max_faults_before_permanent)",
+    ),
+    (
+        "cardano",
+        "max_validity_window_ms",
+        "Config params[6] (max_validity_window_ms)",
+    ),
+];
+
+/// The retired keys this document still sets, in the order listed above.
+fn retired_keys_in(doc: &toml::Value) -> Vec<RetiredKey> {
+    RETIRED_KEYS
+        .iter()
+        .filter(|(section, key, _)| {
+            doc.get(*section)
+                .and_then(toml::Value::as_table)
+                .is_some_and(|t| t.contains_key(*key))
+        })
+        .copied()
+        .collect()
+}
+
 // ── Loading ─────────────────────────────────────────────────────────
 
 impl HeimdallConfig {
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(path.display().to_string(), e))?;
-        toml::from_str(&contents).map_err(|e| ConfigError::Parse(path.display().to_string(), e))
+        Self::from_toml_str(&contents).map_err(|e| e.with_path(path.display().to_string().as_str()))
+    }
+
+    /// Parse a `heimdall.toml`, REFUSING any key the bridge Config now publishes.
+    ///
+    /// The check runs before deserialization so the diagnostic can name the key
+    /// and its replacement. Refusing rather than ignoring is the point: a key
+    /// that silently does nothing leaves the operator believing a value they
+    /// typed is in force, which is the same failure in a quieter form.
+    pub fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
+        let doc: toml::Value =
+            toml::from_str(contents).map_err(|e| ConfigError::Parse(String::new(), e))?;
+        let retired = retired_keys_in(&doc);
+        if !retired.is_empty() {
+            return Err(ConfigError::RetiredKeys(retired));
+        }
+        doc.try_into()
+            .map_err(|e| ConfigError::Parse(String::new(), e))
     }
 
     /// Load this SPO's bifrost identity keypair from `[bifrost].skey_path`.
@@ -753,6 +801,18 @@ pub enum ConfigError {
     },
     /// The key file's contents are not a valid 32-byte secp256k1 secret.
     KeyParse(String),
+    /// The document sets keys the bridge Config now publishes.
+    RetiredKeys(Vec<RetiredKey>),
+}
+
+impl ConfigError {
+    /// Attach the file path to a parse-time error raised before it was known.
+    fn with_path(self, path: &str) -> Self {
+        match self {
+            Self::Parse(_, e) => Self::Parse(path.to_string(), e),
+            other => other,
+        }
+    }
 }
 
 impl std::fmt::Display for ConfigError {
@@ -768,6 +828,24 @@ impl std::fmt::Display for ConfigError {
                 "bifrost key file {path} has mode {mode:o}; must be 0600 (not group/other readable)"
             ),
             Self::KeyParse(s) => write!(f, "bifrost key: {s}"),
+            Self::RetiredKeys(keys) => {
+                writeln!(
+                    f,
+                    "this config sets {} key(s) the bridge Config now publishes. They are \
+                     refused rather than ignored, because a key that silently does nothing \
+                     leaves you believing a value you typed is in force:",
+                    keys.len()
+                )?;
+                for (section, key, replacement) in keys {
+                    writeln!(f, "  [{section}].{key}  ->  {replacement}")?;
+                }
+                write!(
+                    f,
+                    "Delete them: the ban schedule is baked into the spo_bans policy id, so a \
+                     local copy that differs from the deployment's derives a ban address no \
+                     node reads"
+                )
+            }
         }
     }
 }
@@ -779,6 +857,35 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three ban-schedule keys are REFUSED, not ignored. Ignoring them is
+    /// how an operator ends up believing a ban duration they typed is in force
+    /// while the node enforces the bridge's — or worse, derives a ban address no
+    /// deployment has and reads back an empty ban list.
+    #[test]
+    fn retired_ban_schedule_keys_are_refused_with_their_replacement() {
+        for key in [
+            "base_ban_duration_ms",
+            "max_faults_before_permanent",
+            "max_validity_window_ms",
+        ] {
+            let doc = format!("[cardano]\n{key} = 1\n");
+            let err = HeimdallConfig::from_toml_str(&doc)
+                .expect_err("a retired key must be refused, not ignored");
+            let rendered = format!("{err}");
+            assert!(
+                rendered.contains(key) && rendered.contains("params["),
+                "the diagnostic must name the key and where it moved: {rendered}"
+            );
+        }
+    }
+
+    /// ...and a config that sets none of them still loads.
+    #[test]
+    fn a_config_without_the_retired_keys_loads() {
+        let cfg = HeimdallConfig::from_toml_str("[cardano]\nnetwork = \"preprod\"\n").unwrap();
+        assert_eq!(cfg.cardano.network.as_deref(), Some("preprod"));
+    }
 
     #[test]
     fn empty_toml_uses_defaults() {

@@ -314,7 +314,9 @@ enum Commands {
         /// The ban-list one-shot bootstrap output ref (<tx_hash>:<index>).
         #[arg(long)]
         ban_bootstrap: String,
-        /// Ban-schedule params (must equal the SPO config's).
+        /// Ban-schedule params. Genesis-only: they must equal what the bridge
+        /// Config will publish at params[4..6], which is what every node reads
+        /// once the Config exists — there is no local copy any more.
         #[arg(long)]
         base_ban_duration_ms: i64,
         #[arg(long)]
@@ -347,7 +349,9 @@ enum Commands {
         /// The ban-list one-shot bootstrap output ref (<tx_hash>:<index>).
         #[arg(long)]
         ban_bootstrap: String,
-        /// Ban-schedule params (must equal the SPO config's).
+        /// Ban-schedule params. Genesis-only: they must equal what the bridge
+        /// Config will publish at params[4..6], which is what every node reads
+        /// once the Config exists — there is no local copy any more.
         #[arg(long)]
         base_ban_duration_ms: i64,
         #[arg(long)]
@@ -487,6 +491,16 @@ enum Commands {
         /// apply-ban reads to re-derive the same ban policy).
         #[arg(long)]
         ban_bootstrap: String,
+        /// Ban-schedule params, for GENESIS only: the ban root is minted before
+        /// the Config NFT that names it exists, so there is nothing to read them
+        /// from yet. Required when this node cannot read a bridge Config;
+        /// refused when it can, since the Config is then authoritative.
+        #[arg(long)]
+        base_ban_duration_ms: Option<i64>,
+        #[arg(long)]
+        max_faults_before_permanent: Option<i64>,
+        #[arg(long)]
+        max_validity_window_ms: Option<i64>,
         /// Actually submit via Blockfrost (default: build + print only).
         #[arg(long)]
         submit: bool,
@@ -1113,6 +1127,9 @@ fn main() {
             blueprint,
             registry_bootstrap,
             ban_bootstrap,
+            base_ban_duration_ms,
+            max_faults_before_permanent,
+            max_validity_window_ms,
             submit,
         } => {
             let cfg = load_config(config.as_deref());
@@ -1121,6 +1138,11 @@ fn main() {
                 &blueprint,
                 &registry_bootstrap,
                 &ban_bootstrap,
+                (
+                    base_ban_duration_ms,
+                    max_faults_before_permanent,
+                    max_validity_window_ms,
+                ),
                 submit,
             ) {
                 error!("Error: {e}");
@@ -2908,6 +2930,7 @@ fn run_bootstrap_ban_list(
     blueprint_path: &str,
     registry_bootstrap: &str,
     ban_bootstrap: &str,
+    schedule_flags: (Option<i64>, Option<i64>, Option<i64>),
     submit: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::apply_ban::build_ban_bootstrap_tx;
@@ -2956,10 +2979,47 @@ fn run_bootstrap_ban_list(
     }
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     // The ban schedule is a property of the deployment, not of this operator, so
-    // take it from the bridge Config wherever that publishes one (#18-#20).
+    // take it from the bridge Config whenever there IS one (params[4..6]).
+    //
+    // At genesis there is not: the ban root is minted in the transaction BEFORE
+    // the Config NFT that names it, which is precisely when this command runs.
+    // With the local schedule keys retired, `resolve` then has nothing to read
+    // and no fallback — so without these flags the command could not bootstrap
+    // the very bridge it exists to bootstrap.
     let bridge_config = config_view(&rt, cfg)?;
-    let params = BanPolicyParams::resolve(&cfg.cardano, bridge_config.as_ref().map(|v| &v.params))
-        .map_err(|e| e.to_string())?;
+    let (flag_base, flag_faults, flag_window) = schedule_flags;
+    let params = match bridge_config.as_ref().map(|v| &v.params) {
+        Some(published) => {
+            // A readable Config is authoritative; a second copy on the command
+            // line could only disagree with it, silently deriving a different
+            // ban policy id. Refuse rather than pick a winner.
+            if flag_base.is_some() || flag_faults.is_some() || flag_window.is_some() {
+                return Err("--base-ban-duration-ms / --max-faults-before-permanent / \
+                     --max-validity-window-ms are genesis-only flags, but this node can read \
+                     the bridge Config, which already publishes the schedule (params[4..6]). \
+                     Drop them: two copies could differ, and the difference would silently \
+                     derive a ban policy id no deployment has"
+                    .to_string());
+            }
+            BanPolicyParams::resolve(&cfg.cardano, Some(published)).map_err(|e| e.to_string())?
+        }
+        None => {
+            let (Some(base), Some(faults), Some(window)) = (flag_base, flag_faults, flag_window)
+            else {
+                return Err(
+                    "no bridge Config is readable, so the ban schedule must be given \
+                     explicitly: pass --base-ban-duration-ms, --max-faults-before-permanent \
+                     and --max-validity-window-ms. This is the genesis case — the ban root is \
+                     minted before the Config NFT that names it exists, so there is nothing \
+                     on chain to read the schedule from yet. Use the same three values the \
+                     Config will publish, or the ban list lands at an address no node reads"
+                        .to_string(),
+                );
+            };
+            BanPolicyParams::from_genesis_flags(&cfg.cardano, base, faults, window)
+                .map_err(|e| e.to_string())?
+        }
+    };
     let spo_bans = spo_bans_script(
         &blueprint_json,
         &registry.hash,
