@@ -617,16 +617,19 @@ impl RegistryRosterSource {
             return Self::from_config(cardano);
         };
         let mainnet = cardano.is_mainnet().map_err(RosterError::Config)?;
+        // Rev 5.5 [CFG-4]: the state NFT's asset name is a protocol constant, not
+        // Config #13. Uniqueness comes from the one-shot outpoint baked into the
+        // policy id, so the name had nothing left to say.
         let source = Self::from_policy_ids(
             &published.spos_registry_policy_id,
             &published.treasury_info_policy_id,
-            &published.treasury_info_asset_name,
+            crate::cardano::config_params::TREASURY_INFO_ASSET_NAME,
             mainnet,
         );
         // The blueprint is a build artifact, not a per-bridge value, so a node
         // may legitimately still have it while typing none of the identifiers.
         // Where it does, compile the script for Update-Y — which also checks the
-        // derivation against #12.
+        // derivation against #10.
         let Some(blueprint_path) = cardano.registry_blueprint.as_deref() else {
             return Ok(Some(source));
         };
@@ -744,9 +747,6 @@ mod tests {
         let datum = TreasuryInfoDatum {
             bifrost_identity_root: root,
             current_spos_frost_key: vec![0xAB; 32],
-            y_federation: vec![0xCD; 32],
-            federation_csv_blocks: 144,
-            last_reset_tm_txid: vec![],
         };
         let unit = format!("{TREASURY_POLICY}{TREASURY_NFT_NAME}");
         bf_utxo(&"77".repeat(32), 0, &unit, datum.to_cbor())
@@ -1096,7 +1096,6 @@ mod tests {
         c.registry = RegistryParams {
             spos_registry_policy_id: [0xc1; 28],
             treasury_info_policy_id: [0xc2; 28],
-            treasury_info_asset_name: b"TMTx".to_vec(),
         };
         c
     }
@@ -1124,7 +1123,11 @@ mod tests {
             .expect("the published identity resolves a roster source");
         assert_eq!(src.registry_policy_hex, "c1".repeat(28));
         assert_eq!(src.treasury_info_policy_hex, "c2".repeat(28));
-        assert_eq!(src.treasury_info_asset_name_hex, hex::encode("TMTx"));
+        // [CFG-4]: the constant, not a Config field.
+        assert_eq!(
+            src.treasury_info_asset_name_hex,
+            hex::encode(crate::cardano::config_params::TREASURY_INFO_ASSET_NAME)
+        );
         assert!(src.registry_address.starts_with("addr_test1"));
         assert_ne!(src.registry_address, src.treasury_info_address);
         // No blueprint, so no compiled script — reading the roster does not need

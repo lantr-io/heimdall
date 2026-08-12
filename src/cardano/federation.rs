@@ -16,27 +16,26 @@
 //!
 //! ## They were already on chain
 //!
-//! The `treasury_info` state UTxO publishes both, at datum fields #2 and #3 (see
-//! [`crate::cardano::treasury_info::TreasuryInfoDatum`]) — heimdall writes them
-//! there at bootstrap, and `treasury.ak` enforces that copy when it authorizes an
-//! Update-Y. So nothing new needs publishing; this module reads what is there.
-//! The whole path hangs off the one Config NFT:
+//! Rev 5.4 published both in the `treasury_info` state datum, at fields #2/#3.
+//! Rev 5.5 moved them to the **Config** datum ([CFG-6]: an identity or a key is a
+//! top-level Config field, a tunable number lives in `params`):
 //!
 //! ```text
-//! config NFT → Config #12 treasury_info_policy_id → the script's enterprise address
-//!            → Config #13 treasury_info_asset_name → the state NFT
-//!            → its datum → #2 y_federation, #3 federation_csv_blocks
+//! config NFT → its datum → #11  y_federation
+//!                        → params[7] federation_csv_blocks
 //! ```
 //!
-//! and heimdall already walks it: [`crate::cardano::roster::RegistrySnapshot`]
-//! carries the very UTxO, fetched to cross-check the identity-trie root. The
-//! federation identity costs no extra query.
+//! which is a strictly shorter path than the rev-5.4 one — heimdall reads the
+//! Config on every startup regardless, so the federation identity now costs no
+//! query at all, not merely no EXTRA query.
 //!
-//! **This depends on an invariant that is now load-bearing.** `treasury_info` is
-//! SPENT and recreated by every Update-Y, so its datum is live state rather than
-//! fixed genesis data. `update_y` and `treasury_info` both assert that a new
-//! datum preserves `y_federation` and `federation_csv_blocks` verbatim; those
-//! checks now protect the treasury ADDRESS, not merely consistency.
+//! **The load-bearing invariant moved with them, and got weaker in a good way.**
+//! Under rev 5.4 these lived in state that every Update-Y spent and recreated, so
+//! the treasury ADDRESS depended on two validators preserving them verbatim
+//! across every rotation. In the Config they are governance data: an Update
+//! rotates them deliberately, and no rotation of the FROST key can touch them by
+//! accident. That is also what finally makes federation-key rotation a real
+//! operation rather than a row in a permission matrix nothing implemented.
 //!
 //! ## The seed is not the published value
 //!
@@ -49,13 +48,13 @@
 use bitcoin::key::UntweakedPublicKey;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 
-use crate::cardano::treasury_info::TreasuryInfoDatum;
+use crate::cardano::config_params::ConfigParams;
 use crate::config::BitcoinConfig;
 
 /// Where a resolved federation identity came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FederationOrigin {
-    /// The `treasury_info` datum. Nothing to configure, nothing to mistype.
+    /// The Config datum. Nothing to configure, nothing to mistype.
     Published,
     /// The `treasury_info` datum, and the local seed derives the same key — the
     /// strongest state: the value is published AND this node can spend the
@@ -109,7 +108,7 @@ pub enum FederationError {
     KeyMismatch { derived: String, published: String },
     /// The operator's CSV delay contradicts the published one. Same reasoning —
     /// it is an input to the same address.
-    CsvMismatch { local: u32, published: i64 },
+    CsvMismatch { local: u32, published: u16 },
 }
 
 impl FederationError {
@@ -120,18 +119,18 @@ impl FederationError {
     pub fn fix(&self) -> String {
         match self {
             Self::Unconfigured(what) => format!(
-                "no treasury_info datum was readable and bitcoin.{what} is unset. Either point \
-                 this node at a bridge whose Config publishes the registry identity (#11-#13), \
-                 so the federation identity comes with it, or set bitcoin.{what} to the value \
+                "no Config datum was readable and bitcoin.{what} is unset. Either point \
+                 this node at a bridge whose Config publishes the federation identity (#11 and \
+                 params[7]), or set bitcoin.{what} to the value \
                  this treasury was locked with. There is no default: it is an input to the \
                  treasury ADDRESS, so a guess yields a well-formed address holding nothing"
             ),
             Self::BadSeed(_) => "bitcoin.y_fed_seed_hex must be 32 bytes of hex. Only a node \
                  that performs federation SPENDS needs it at all — every other node reads the \
-                 public key from the treasury_info datum, so the fix may be to remove the key"
+                 public key from the Config datum, so the fix may be to remove the key"
                 .to_string(),
             Self::BadPublishedKey(_) | Self::BadCsvBlocks { .. } => {
-                "the treasury_info datum on chain does not carry a usable federation identity. \
+                "the Config datum on chain does not carry a usable federation identity. \
                  This is bridge state, not operator config — check that cardano.config_address \
                  and cardano.config_nft_policy_id name the bridge you meant to join"
                     .to_string()
@@ -155,7 +154,7 @@ impl std::fmt::Display for FederationError {
                 "no federation {what}: nothing published, nothing configured"
             ),
             Self::BadSeed(e) => write!(f, "bitcoin.y_fed_seed_hex: {e}"),
-            Self::BadPublishedKey(e) => write!(f, "treasury_info datum y_federation: {e}"),
+            Self::BadPublishedKey(e) => write!(f, "Config #11 y_federation: {e}"),
             Self::BadCsvBlocks { value, source } => write!(
                 f,
                 "federation_csv_blocks {value} ({source}) is not a usable relative timelock — \
@@ -164,13 +163,13 @@ impl std::fmt::Display for FederationError {
             ),
             Self::KeyMismatch { derived, published } => write!(
                 f,
-                "bitcoin.y_fed_seed_hex derives {derived} but the treasury_info datum publishes \
+                "bitcoin.y_fed_seed_hex derives {derived} but the Config publishes \
                  {published}. These build DIFFERENT treasury addresses, so one of them is not \
                  this bridge — refusing to sign for an address the other SPOs are not using"
             ),
             Self::CsvMismatch { local, published } => write!(
                 f,
-                "bitcoin.federation_csv_blocks is {local} but the treasury_info datum publishes \
+                "bitcoin.federation_csv_blocks is {local} but the Config publishes \
                  {published}. The delay is an input to the treasury address, so these build \
                  different ones"
             ),
@@ -228,23 +227,23 @@ fn csv_u16(value: i64, source: &'static str) -> Result<u16, FederationError> {
 /// SPO has no business being decided per-operator, and the failure it produces is
 /// invisible — a well-formed address holding nothing.
 ///
-/// `published` is `None` only when there is genuinely no `treasury_info` to read
-/// (the fixture-roster demo). A FAILED read must never be passed as `None`: "the
+/// `published` is `None` only when there is genuinely no Config to read (the
+/// fixture-roster demo). A FAILED read must never be passed as `None`: "the
 /// bridge publishes nothing" and "we could not ask" have different right answers,
 /// and taking the local value on the second reintroduces exactly the per-operator
 /// divergence this replaces.
 pub fn resolve(
     cfg: &BitcoinConfig,
-    published: Option<&TreasuryInfoDatum>,
+    published: Option<&ConfigParams>,
 ) -> Result<FederationIdentity, FederationError> {
     let local_key = configured_seed(cfg).map(y_fed_from_seed_hex).transpose()?;
 
     match published {
-        Some(d) => {
-            let y_fed = UntweakedPublicKey::from_slice(&d.y_federation).map_err(|e| {
+        Some(c) => {
+            let y_fed = UntweakedPublicKey::from_slice(&c.y_federation).map_err(|e| {
                 FederationError::BadPublishedKey(format!(
                     "not a valid x-only point ({}): {e}",
-                    hex::encode(&d.y_federation)
+                    hex::encode(c.y_federation)
                 ))
             })?;
             // The one check only a seed-holder can make. A node without the seed
@@ -260,17 +259,20 @@ pub fn resolve(
                 Some(_) => FederationOrigin::PublishedAndHeld,
                 None => FederationOrigin::Published,
             };
+            let published_csv = c.tunables.federation_csv_blocks;
             if let Some(local_csv) = cfg.federation_csv_blocks
-                && i64::from(local_csv) != d.federation_csv_blocks
+                && u32::from(published_csv) != local_csv
             {
                 return Err(FederationError::CsvMismatch {
                     local: local_csv,
-                    published: d.federation_csv_blocks,
+                    published: published_csv,
                 });
             }
+            // parse_config_datum already refused a zero or out-of-range value, so
+            // no second range check is needed here.
             Ok(FederationIdentity {
                 y_fed,
-                csv_blocks: csv_u16(d.federation_csv_blocks, "treasury_info datum")?,
+                csv_blocks: published_csv,
                 origin,
             })
         }
@@ -306,14 +308,14 @@ mod tests {
         }
     }
 
-    fn datum(key: &[u8], csv: i64) -> TreasuryInfoDatum {
-        TreasuryInfoDatum {
-            bifrost_identity_root: [0u8; 32],
-            current_spos_frost_key: vec![0xAA; 32],
-            y_federation: key.to_vec(),
-            federation_csv_blocks: csv,
-            last_reset_tm_txid: Vec::new(),
-        }
+    /// A Config publishing the federation identity: #11 `y_federation` and
+    /// `params[7]` `federation_csv_blocks`. Rev 5.5 moved both here from the
+    /// `treasury_info` datum ([CFG-6]).
+    fn datum(key: &[u8], csv: u16) -> ConfigParams {
+        let mut c = crate::cardano::config_params::test_config_params();
+        c.y_federation = key.try_into().expect("32-byte x-only key");
+        c.tunables.federation_csv_blocks = csv;
+        c
     }
 
     /// The acceptance condition of WI-069: an SPO joining a bridge whose
@@ -429,33 +431,16 @@ mod tests {
         );
     }
 
-    /// The relative-timelock encoding is 16-bit and every consumer casts to it,
-    /// so a wider published value would truncate into a DIFFERENT tree — 65536
-    /// becoming 0. Caught where the value enters, not where it is cast.
+    /// The 16-bit range check moved to where the value now ENTERS: rev 5.5
+    /// publishes `federation_csv_blocks` in the Config datum, so
+    /// `parse_config_datum` refuses a zero or truncating value and this function
+    /// receives a `u16` that is already known good. The tests moved with it —
+    /// see `config_params::tests::a_csv_delay_that_would_truncate_is_refused`.
     #[test]
-    fn a_csv_delay_that_would_truncate_is_refused() {
+    fn a_published_csv_delay_is_already_range_checked() {
         let (_, key) = seed_and_key(0x99);
-        for bad in [65_536i64, 65_792, i64::from(u32::MAX)] {
-            let e = resolve(&cfg(None, None), Some(&datum(&key, bad))).expect_err("must refuse");
-            assert!(
-                matches!(e, FederationError::BadCsvBlocks { .. }),
-                "{bad}: got {e:?}"
-            );
-        }
-        assert!(resolve(&cfg(None, None), Some(&datum(&key, 65_535))).is_ok());
-    }
-
-    /// Zero is not a delay; it would build a tree whose leaf is spendable at once.
-    #[test]
-    fn a_zero_or_negative_csv_delay_is_refused() {
-        let (_, key) = seed_and_key(0xAA);
-        for bad in [0i64, -1] {
-            let e = resolve(&cfg(None, None), Some(&datum(&key, bad))).expect_err("must refuse");
-            assert!(
-                matches!(e, FederationError::BadCsvBlocks { .. }),
-                "{bad}: got {e:?}"
-            );
-        }
+        let id = resolve(&cfg(None, None), Some(&datum(&key, 65_535))).expect("resolves");
+        assert_eq!(id.csv_blocks, 65_535);
     }
 
     /// Every variant carries its own remedy. The `Unconfigured` one is the trap:

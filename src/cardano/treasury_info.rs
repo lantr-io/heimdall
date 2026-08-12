@@ -5,17 +5,17 @@
 //! `treasury_info` UTxO carries:
 //!
 //! ```text
-//! Constr(0, [ bifrost_identity_root, current_spos_frost_key,
-//!             y_federation,          federation_csv_blocks,
-//!             last_reset_tm_txid ])
-//! //          ^ByteArray x3          ^Int                   ^ByteArray
+//! Constr(0, [ bifrost_identity_root, current_spos_frost_key ])
+//! //          ^ByteArray             ^ByteArray
 //! ```
 //!
-//! matching the Aiken `bifrost/types/treasury.ak` `TreasuryDatum` (N10b: the two
-//! vestigial pointer fields were retired and the federation fields added; field
-//! #4 `last_reset_tm_txid` is vestigial since the `FederationReset` branch was
-//! removed per spec [UY-5]/[UY-7]/[UY-8] – it stays in the encoding to keep the
-//! datum shape in lockstep with the deployed blueprint, and stays empty).
+//! matching the Aiken `bifrost/types/treasury.ak` `TreasuryDatum`. Rev 5.5 cut it
+//! to two fields (spec [TSY-1]): `last_reset_tm_txid` was inert once the
+//! `FederationReset` branch was withdrawn ([UY-7]/[UY-8]), and `y_federation` /
+//! `federation_csv_blocks` were instance configuration rather than state —
+//! nothing here ever rotated them — so they are Config #11 and `params[7]` now
+//! ([CFG-6]). A Config Update rotates them, which is the federation-key rotation
+//! the field-permission matrix always promised.
 //!
 //! `register_spo` (R1c) spends this UTxO to insert `bifrost_id_pk → pool_id`
 //! into the `bifrost_identity_root` Merkle-Patricia-Forestry trie. This module
@@ -36,19 +36,12 @@ use crate::cardano::mpf;
 use crate::cardano::plutus::{self, array, bytes, constr, int};
 
 /// The `treasury_info` state datum (`TreasuryDatum`). `bifrost_identity_root` is
-/// the 32-byte MPF root; `current_spos_frost_key` / `y_federation` are x-only
-/// keys; `federation_csv_blocks` is the CSV timeout (an on-chain `Int`).
+/// the 32-byte MPF root; `current_spos_frost_key` is an x-only key. Both are 32
+/// bytes, which the K1 mint enforces (spec [TSY-8]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreasuryInfoDatum {
     pub bifrost_identity_root: mpf::Hash,
     pub current_spos_frost_key: Vec<u8>,
-    pub y_federation: Vec<u8>,
-    pub federation_csv_blocks: i64,
-    /// #4 – vestigial since the `FederationReset` branch was removed (spec
-    /// [UY-5] replaces it with a federation-signed Update-Y). Kept so the datum
-    /// encoding matches the deployed blueprint shape; empty at bootstrap and
-    /// preserved verbatim by every spend branch.
-    pub last_reset_tm_txid: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -111,8 +104,7 @@ impl From<plutus::PlutusError> for TreasuryInfoError {
 // ---------------------------------------------------------------------------
 
 impl TreasuryInfoDatum {
-    /// Encode as `Constr(0, [root, frost_key, y_federation, federation_csv_blocks,
-    /// last_reset_tm_txid])`.
+    /// Encode as `Constr(0, [root, frost_key])`.
     #[must_use]
     pub fn to_plutus_data(&self) -> PlutusData {
         constr(
@@ -120,9 +112,6 @@ impl TreasuryInfoDatum {
             vec![
                 bytes(&self.bifrost_identity_root),
                 bytes(&self.current_spos_frost_key),
-                bytes(&self.y_federation),
-                int(self.federation_csv_blocks),
-                bytes(&self.last_reset_tm_txid),
             ],
         )
     }
@@ -135,9 +124,13 @@ impl TreasuryInfoDatum {
 
     pub fn from_plutus_data(data: &PlutusData) -> Result<Self, TreasuryInfoError> {
         let fields = plutus::constr_fields(data, 0)?;
-        if fields.len() != 5 {
+        // Exact arity, per spec [TSY-1]. This datum is NOT append-extensible:
+        // only ConfigDatum is, because every contract is parameterized by the
+        // Config NFT and so the Config alone cannot be swapped. This one sits
+        // behind its own NFT, and replacing it is a bootstrap.
+        if fields.len() != 2 {
             return Err(TreasuryInfoError::FieldCount {
-                expected: 5,
+                expected: 2,
                 got: fields.len(),
             });
         }
@@ -149,32 +142,59 @@ impl TreasuryInfoDatum {
         Ok(TreasuryInfoDatum {
             bifrost_identity_root,
             current_spos_frost_key: plutus::field_bytes(fields, 1)?,
-            y_federation: plutus::field_bytes(fields, 2)?,
-            federation_csv_blocks: plutus::field_int(fields, 3)?,
-            last_reset_tm_txid: plutus::field_bytes(fields, 4)?,
         })
     }
 }
 
-/// Encode the `TreasurySpendRedeemer::RegistryUpdate { new_bifrost_identity_root }`
-/// (constructor 0) — the Register/Deregister path. `treasury.ak` preserves every
-/// other datum field itself (record-update spread off the spent datum), so only
-/// the new MPF root travels in the redeemer.
+/// Encode the `TreasurySpendRedeemer::RegistryUpdate { config_ref_input_index }`
+/// (constructor 0) — the Register/Deregister path.
+///
+/// Rev 5.5 dropped `new_bifrost_identity_root` from this redeemer. `treasury.ak`
+/// never constrained that value: `spos-registry.ak` owns it through the [REG-5]
+/// MPF proof, and the continuing output's datum is the only source of truth. The
+/// index is where the Config UTxO sits in `reference_inputs`; `treasury.ak` reads
+/// `spos_registry_policy_id` from it (spec [TSY-12], [TSY-13]) rather than taking
+/// the registry policy as a compile parameter, which is what broke the dependency
+/// cycle and let `spo_registry` pin this UTxO ([REG-6]).
 #[must_use]
-pub fn registry_update_redeemer(new: &TreasuryInfoDatum) -> PlutusData {
-    constr(0, vec![bytes(&new.bifrost_identity_root)])
+pub fn registry_update_redeemer(config_ref_input_index: u64) -> PlutusData {
+    constr(
+        0,
+        vec![int(
+            i64::try_from(config_ref_input_index).unwrap_or(i64::MAX)
+        )],
+    )
 }
 
-/// Encode the `TreasurySpendRedeemer::UpdateY { new_spos_frost_key, epoch, signature }`
+/// Encode `TreasurySpendRedeemer::Retire` (constructor 2) — instance teardown.
+///
+/// Carries nothing: the branch checks a burn of both NFTs by policy id and
+/// constant name (spec [TSY-19], [TSY-20]). Authorization is inherited, because
+/// burning the Config NFT necessarily spends the Config UTxO and runs
+/// `config.ak`'s own `Retire` under `update_auth`.
+#[must_use]
+pub fn retire_redeemer() -> PlutusData {
+    constr(2, vec![])
+}
+
+/// Encode `TreasurySpendRedeemer::UpdateY { epoch, signature, config_ref_input_index }`
 /// (constructor 1) – the DKG key-rotation path. Per spec [UY-5] the same
 /// redeemer carries a federation-authorized rotation: the validator accepts the
-/// signature under either the spent datum's `current_spos_frost_key` or its
-/// `y_federation`.
+/// signature under either the spent datum's `current_spos_frost_key` or the
+/// Config's `y_federation` (Config #11 since rev 5.5, not a datum field).
+///
+/// `new_spos_frost_key` is NOT in the redeemer. `treasury.ak` reads it from the
+/// continuing output's datum, which is safe because the signed message commits
+/// to it: change the datum's key and the signature stops verifying.
 #[must_use]
-pub fn update_y_redeemer(new_spos_frost_key: &[u8], epoch: i64, signature: &[u8]) -> PlutusData {
+pub fn update_y_redeemer(epoch: i64, signature: &[u8], config_ref_input_index: u64) -> PlutusData {
     constr(
         1,
-        vec![bytes(new_spos_frost_key), int(epoch), bytes(signature)],
+        vec![
+            int(epoch),
+            bytes(signature),
+            int(i64::try_from(config_ref_input_index).unwrap_or(i64::MAX)),
+        ],
     )
 }
 
@@ -305,9 +325,6 @@ mod tests {
         TreasuryInfoDatum {
             bifrost_identity_root: root,
             current_spos_frost_key: vec![0xABu8; 32],
-            y_federation: vec![0xCDu8; 32],
-            federation_csv_blocks: 144,
-            last_reset_tm_txid: vec![],
         }
     }
 
@@ -346,26 +363,29 @@ mod tests {
             TreasuryInfoDatum::from_plutus_data(&wrong),
             Err(TreasuryInfoError::WrongConstructor(1))
         ));
-        // too few fields (4, not the N10b 5) → FieldCount before any field decode
-        let four = constr(0, vec![bytes(&[0u8; 32]), bytes(b""), bytes(b""), int(144)]);
-        assert!(matches!(
-            TreasuryInfoDatum::from_plutus_data(&four),
-            Err(TreasuryInfoError::FieldCount {
-                expected: 5,
-                got: 4
-            })
-        ));
-        // root not 32 bytes (5-field datum so the field-count check passes first)
-        let short = constr(
+        // The rev-5.4 five-field datum → FieldCount before any field decode.
+        // spec [TSY-1] fixes the arity at 2, so an OLD instance's datum is
+        // refused outright rather than silently read as its first two fields.
+        let five = constr(
             0,
             vec![
-                bytes(&[0u8; 8]),
+                bytes(&[0u8; 32]),
                 bytes(b""),
                 bytes(b""),
                 int(144),
                 bytes(b""),
             ],
         );
+        assert!(matches!(
+            TreasuryInfoDatum::from_plutus_data(&five),
+            Err(TreasuryInfoError::FieldCount {
+                expected: 2,
+                got: 5
+            })
+        ));
+        // A two-field datum whose root is the wrong width: arity passes, the
+        // root decode is what refuses it.
+        let short = constr(0, vec![bytes(&[0u8; 8]), bytes(b"")]);
         assert!(matches!(
             TreasuryInfoDatum::from_plutus_data(&short),
             Err(TreasuryInfoError::BadRootLen(8))
@@ -401,11 +421,6 @@ mod tests {
         assert_eq!(
             new_datum.current_spos_frost_key,
             current.current_spos_frost_key
-        );
-        assert_eq!(new_datum.y_federation, current.y_federation);
-        assert_eq!(
-            new_datum.federation_csv_blocks,
-            current.federation_csv_blocks
         );
     }
 
@@ -446,37 +461,51 @@ mod tests {
 
         // The spend redeemer also encodes.
         let current = sample_datum(trie.root_hash());
-        let (new_datum, _) = apply_registration(&current, &trie, b"absent-key", b"pool").unwrap();
-        let redeemer = registry_update_redeemer(&new_datum);
+        let (_new_datum, _) = apply_registration(&current, &trie, b"absent-key", b"pool").unwrap();
+        let redeemer = registry_update_redeemer(0);
         let _cbor = minicbor::to_vec(redeemer).unwrap();
     }
 
-    // RegistryUpdate is Constr(0, [new_root]) — a single field now that
-    // treasury.ak preserves every other datum field itself.
+    // Rev 5.5: RegistryUpdate is Constr(0, [config_ref_input_index]). The new
+    // root left the redeemer — treasury.ak never constrained it (spos-registry.ak
+    // owns it via the [REG-5] MPF proof), and the continuing datum is the only
+    // source of truth.
     #[test]
-    fn registry_update_redeemer_is_single_field_constr0() {
-        let d = sample_datum([3u8; 32]);
-        let PlutusData::Constr(c) = registry_update_redeemer(&d) else {
+    fn registry_update_redeemer_is_the_config_index_only() {
+        let PlutusData::Constr(c) = registry_update_redeemer(3) else {
             panic!("expected Constr");
         };
         assert_eq!(c.tag, 121); // Constr 0
         let fields: Vec<_> = c.fields.to_vec();
         assert_eq!(fields.len(), 1);
-        assert!(matches!(&fields[0], PlutusData::BoundedBytes(b) if **b == [3u8; 32]));
+        assert!(matches!(&fields[0], PlutusData::BigInt(_)));
     }
 
-    // UpdateY is Constr(1, [new_key, epoch, signature]).
+    // Retire is Constr(2, []) — the teardown branch carries nothing, because
+    // burning the Config NFT is the whole authorization ([TSY-19]).
     #[test]
-    fn update_y_redeemer_is_constr1_three_fields() {
-        let PlutusData::Constr(c) = update_y_redeemer(&[0xAB; 32], 7, &[0xCD; 64]) else {
+    fn retire_redeemer_is_empty_constr2() {
+        let PlutusData::Constr(c) = retire_redeemer() else {
+            panic!("expected Constr");
+        };
+        assert_eq!(c.tag, 123); // Constr 2
+        assert!(c.fields.is_empty());
+    }
+
+    // Rev 5.5: UpdateY is Constr(1, [epoch, signature, config_ref_input_index]).
+    // new_spos_frost_key left the redeemer — treasury.ak reads it from the
+    // continuing datum, which is safe because the signed message commits to it.
+    #[test]
+    fn update_y_redeemer_is_constr1_without_the_new_key() {
+        let PlutusData::Constr(c) = update_y_redeemer(7, &[0xCD; 64], 0) else {
             panic!("expected Constr");
         };
         assert_eq!(c.tag, 122); // Constr 1
         let fields: Vec<_> = c.fields.to_vec();
         assert_eq!(fields.len(), 3);
-        assert!(matches!(&fields[0], PlutusData::BoundedBytes(b) if **b == [0xAB; 32]));
-        assert!(matches!(&fields[1], PlutusData::BigInt(_)));
-        assert!(matches!(&fields[2], PlutusData::BoundedBytes(b) if **b == [0xCD; 64]));
+        assert!(matches!(&fields[0], PlutusData::BigInt(_)));
+        assert!(matches!(&fields[1], PlutusData::BoundedBytes(b) if **b == [0xCD; 64]));
+        assert!(matches!(&fields[2], PlutusData::BigInt(_)));
     }
 
     // The signed message MUST match treasury.ak byte-for-byte. This vector is the

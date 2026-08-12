@@ -40,7 +40,7 @@ use whisky_pallas::WhiskyPallas;
 
 use crate::cardano::blueprint::ParameterizedScript;
 use crate::cardano::mpf;
-use crate::cardano::plutus::{bytes, constr, int, int_from_u64};
+use crate::cardano::plutus::{bytes, constr, int_from_u64};
 use crate::cardano::publish::WalletUtxo;
 use crate::cardano::treasury_info::TreasuryInfoDatum;
 use crate::cardano::tx_common::{network_from_address, whisky_network};
@@ -78,46 +78,38 @@ pub fn output_ref_plutus_data(tx_id: &[u8; 32], output_index: u64) -> PlutusData
 // Bootstrap datum + mint redeemer
 // ---------------------------------------------------------------------------
 
-/// The K1 initial datum: the empty MPF identity root (the fresh-deployment
-/// default – spec [PRE-2] lets the operator override it, e.g. for a
-/// replacement deployment carrying registered SPOs forward) + the current
-/// frost key + the federation fields. In Phase 1 `current_spos_frost_key` ==
-/// `y_federation` (the federation is the key-path signer until the first DKG).
+/// The K1 initial datum: the MPF identity root and the current frost key.
+///
+/// Pass [`mpf::NULL_HASH`] for a fresh deployment. Spec [PRE-2] lets the operator
+/// seed a non-empty root so a replacement deployment carries its registered SPOs
+/// forward, and rev 5.5 implements that on-chain: `treasury.ak` checks both
+/// fields are 32 bytes ([TSY-8]) and constrains neither VALUE, because the
+/// one-shot outpoint in the policy id means only the deployer can ever mint.
+///
+/// In Phase 1 `current_spos_frost_key` == `y_federation` (the federation is the
+/// key-path signer until the first DKG). `y_federation` itself is no longer in
+/// this datum — it is Config #11 ([CFG-6]).
 #[must_use]
 pub fn bootstrap_datum(
     current_spos_frost_key: Vec<u8>,
-    y_federation: Vec<u8>,
-    federation_csv_blocks: i64,
+    bifrost_identity_root: mpf::Hash,
 ) -> TreasuryInfoDatum {
     TreasuryInfoDatum {
-        bifrost_identity_root: mpf::NULL_HASH,
+        bifrost_identity_root,
         current_spos_frost_key,
-        y_federation,
-        federation_csv_blocks,
-        // Vestigial since the FederationReset branch was removed ([UY-5]);
-        // kept empty to match the deployed datum shape.
-        last_reset_tm_txid: vec![],
     }
 }
 
-/// `TreasuryMintRedeemer = Constr(0, [input_ref, current_spos_frost_key,
-/// y_federation, federation_csv_blocks])`. The fields must equal the datum's —
-/// the validator rebuilds the expected datum from the redeemer.
+/// The K1 mint redeemer: **nothing**, encoded as `Constr(0, [])`.
+///
+/// Rev 5.5 deleted `TreasuryMintRedeemer`. The one-shot outpoint is a validator
+/// parameter now, so it is baked into the policy id rather than named per mint,
+/// and the asset name is the [CFG-4] constant `"BFRTRY"`. That leaves the
+/// deployer with nothing to tell the minting policy: it reads the datum off the
+/// output the transaction already has to produce.
 #[must_use]
-pub fn treasury_mint_redeemer(
-    tx_id: &[u8; 32],
-    output_index: u64,
-    datum: &TreasuryInfoDatum,
-) -> PlutusData {
-    constr(
-        0,
-        vec![
-            output_ref_plutus_data(tx_id, output_index),
-            bytes(&datum.current_spos_frost_key),
-            bytes(&datum.y_federation),
-            int(datum.federation_csv_blocks),
-        ],
-    )
+pub fn treasury_mint_redeemer() -> PlutusData {
+    constr(0, vec![])
 }
 
 // ---------------------------------------------------------------------------
@@ -176,18 +168,23 @@ pub fn build_treasury_bootstrap_tx(
         .ok_or_else(|| {
             EpochError::Chain("no pure-ADA wallet UTxO for the one-shot input".into())
         })?;
-    let tx_id: [u8; 32] = hex::decode(&fee_utxo.tx_hash)
+    let _tx_id: [u8; 32] = hex::decode(&fee_utxo.tx_hash)
         .ok()
         .and_then(|v| v.try_into().ok())
         .ok_or_else(|| {
             EpochError::Chain(format!("bad wallet UTxO tx hash: {}", fee_utxo.tx_hash))
         })?;
 
-    let asset_name = hash_output_ref(&tx_id, u64::from(fee_utxo.output_index));
+    // Rev 5.5 [CFG-4]: the asset name is the constant, not sha256 of the consumed
+    // outpoint. Uniqueness moved into the POLICY ID, where the one-shot outpoint
+    // is a validator parameter — which is what makes the mint one-shot per BRIDGE
+    // rather than one-shot per outpoint. The fee UTxO no longer decides the name,
+    // but it must still be the outpoint the script was parameterized with.
+    let asset_name = crate::cardano::config_params::TREASURY_INFO_ASSET_NAME;
     let asset_name_hex = hex::encode(asset_name);
     let asset_unit = format!("{policy_id_hex}{asset_name_hex}");
 
-    let redeemer = treasury_mint_redeemer(&tx_id, u64::from(fee_utxo.output_index), datum);
+    let redeemer = treasury_mint_redeemer();
     let redeemer_hex = hex::encode(minicbor::to_vec(&redeemer).expect("redeemer CBOR encode"));
     let datum_hex = hex::encode(datum.to_cbor());
 
@@ -369,43 +366,50 @@ mod tests {
     // evaluator re-serialises `redeemer.input_ref` with encoding memory, so a
     // definite-encoded redeemer makes the asset-name check fail in simulation
     // (a Haskell node would accept it — but tooling parity matters).
+    /// Rev 5.5: the mint redeemer carries nothing at all. The one-shot outpoint
+    /// is a validator parameter and the asset name is the [CFG-4] constant, so
+    /// there is nothing left for the deployer to say. An EMPTY Constr encodes
+    /// definitely (`d87980`) rather than with the indefinite-length marker — the
+    /// marker only appears around a non-empty field list, so there is no
+    /// re-serialisation hazard here.
     #[test]
-    fn mint_redeemer_is_canonical() {
-        let d = bootstrap_datum(vec![1, 2], vec![3, 4], 6);
-        let r = treasury_mint_redeemer(&[0xaa; 32], 1, &d);
-        let hex = hex::encode(minicbor::to_vec(&r).unwrap());
-        // Constr 0 indef [ Constr 0 indef [ bytes32, 1 ], 0102, 0304, int 6 ]
+    fn mint_redeemer_is_empty_and_canonical() {
+        let hex = hex::encode(minicbor::to_vec(&treasury_mint_redeemer()).unwrap());
+        assert_eq!(hex, "d87980");
+    }
+
+    #[test]
+    fn bootstrap_datum_roundtrips_with_either_root() {
+        let fresh = bootstrap_datum(vec![0xAB; 32], mpf::NULL_HASH);
+        assert_eq!(fresh.bifrost_identity_root, mpf::NULL_HASH);
+        let decoded: PlutusData = minicbor::decode(&fresh.to_cbor()).unwrap();
         assert_eq!(
-            hex,
-            format!("d8799fd8799f5820{}01ff42010242030406ff", "aa".repeat(32))
+            TreasuryInfoDatum::from_plutus_data(&decoded).unwrap(),
+            fresh
+        );
+
+        // spec [PRE-2]: a replacement deployment seeds a non-empty root, and the
+        // two-field datum carries it through unchanged.
+        let seeded = bootstrap_datum(vec![0xAB; 32], [0x77; 32]);
+        let decoded: PlutusData = minicbor::decode(&seeded.to_cbor()).unwrap();
+        assert_eq!(
+            TreasuryInfoDatum::from_plutus_data(&decoded).unwrap(),
+            seeded
         );
     }
 
     #[test]
-    fn bootstrap_datum_has_empty_root_and_roundtrips() {
-        let d = bootstrap_datum(vec![0xAB; 32], vec![0xCD; 32], 144);
-        assert_eq!(d.bifrost_identity_root, mpf::NULL_HASH);
-        let decoded: PlutusData = minicbor::decode(&d.to_cbor()).unwrap();
-        assert_eq!(TreasuryInfoDatum::from_plutus_data(&decoded).unwrap(), d);
-    }
-
-    #[test]
     fn mint_redeemer_shape() {
-        let d = bootstrap_datum(vec![1, 2], vec![3, 4], 6);
-        let r = treasury_mint_redeemer(&[0xaa; 32], 1, &d);
-        let cbor = minicbor::to_vec(&r).unwrap();
+        let cbor = minicbor::to_vec(&treasury_mint_redeemer()).unwrap();
         let back: PlutusData = minicbor::decode(&cbor).unwrap();
         let PlutusData::Constr(c) = back else {
             panic!("expected Constr");
         };
         assert_eq!(c.tag, 121);
-        assert_eq!(c.fields.len(), 4);
-        let PlutusData::Constr(input_ref) = &c.fields[0] else {
-            panic!("expected input_ref Constr");
-        };
-        assert_eq!(input_ref.tag, 121);
-        assert_eq!(input_ref.fields.len(), 2);
-        assert!(matches!(&c.fields[1], PlutusData::BoundedBytes(b) if **b == [1u8, 2]));
+        assert!(
+            c.fields.is_empty(),
+            "rev 5.5 mint redeemer carries no fields"
+        );
     }
 
     // spec [PRE-2]: the bootstrap MUST accept an operator-supplied
@@ -419,7 +423,7 @@ mod tests {
         let key = derive_payment_key(mnemonic).unwrap();
         let wallet_addr = crate::cardano::wallet::wallet_address(&key);
         let operator_root = [9u8; 32];
-        let mut datum = bootstrap_datum(vec![0xAB; 32], vec![0xCD; 32], 144);
+        let mut datum = bootstrap_datum(vec![0xAB; 32], mpf::NULL_HASH);
         datum.bifrost_identity_root = operator_root;
         let utxos = vec![WalletUtxo {
             tx_hash: "bb".repeat(32),
@@ -480,15 +484,19 @@ mod tests {
                 pure_ada: true,
             },
         ];
-        let datum = bootstrap_datum(vec![0xAB; 32], vec![0xCD; 32], 144);
+        let datum = bootstrap_datum(vec![0xAB; 32], mpf::NULL_HASH);
 
         let built =
             build_treasury_bootstrap_tx(&script, &wallet_addr, &utxos, &datum, &key, None).unwrap();
 
-        // The richest UTxO became the one-shot, and names the NFT.
+        // The richest UTxO became the one-shot. Rev 5.5 [CFG-4]: it no longer
+        // NAMES the NFT — the name is the constant, and uniqueness lives in the
+        // policy id, where the outpoint is a validator parameter.
         assert_eq!(built.input_ref, (one_shot_hash.clone(), 3));
-        let expected_name = hash_output_ref(&[0xbb; 32], 3);
-        assert_eq!(built.asset_name_hex, hex::encode(expected_name));
+        assert_eq!(
+            built.asset_name_hex,
+            hex::encode(crate::cardano::config_params::TREASURY_INFO_ASSET_NAME)
+        );
         assert_eq!(built.policy_id_hex, script.hash_hex());
 
         let tx: Tx = minicbor::decode(&hex::decode(&built.signed_tx_hex).unwrap()).unwrap();
@@ -509,7 +517,10 @@ mod tests {
         assert_eq!(policy.as_slice(), script.hash);
         let assets: Vec<_> = assets.iter().collect();
         assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].0.as_slice(), expected_name);
+        assert_eq!(
+            assets[0].0.as_slice(),
+            crate::cardano::config_params::TREASURY_INFO_ASSET_NAME
+        );
         assert_eq!(i64::from(assets[0].1), 1);
 
         // Output 0: script address, NFT + ADA only, inline bootstrap datum.
@@ -539,7 +550,10 @@ mod tests {
         assert_eq!(out_policies[0].0.as_slice(), script.hash);
         let out_assets: Vec<_> = out_policies[0].1.iter().collect();
         assert_eq!(out_assets.len(), 1);
-        assert_eq!(out_assets[0].0.as_slice(), expected_name);
+        assert_eq!(
+            out_assets[0].0.as_slice(),
+            crate::cardano::config_params::TREASURY_INFO_ASSET_NAME
+        );
         assert_eq!(u64::from(out_assets[0].1), 1);
 
         // Witness set: the mint redeemer rides along, canonically encoded.
@@ -548,7 +562,7 @@ mod tests {
             .redeemer
             .as_ref()
             .expect("redeemer present");
-        let expected_redeemer = treasury_mint_redeemer(&[0xbb; 32], 3, &datum);
+        let expected_redeemer = treasury_mint_redeemer();
         let redeemer_matches = match redeemers {
             pallas_primitives::conway::Redeemers::List(rs) => {
                 rs.iter().any(|r| r.data == expected_redeemer)

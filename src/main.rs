@@ -224,16 +224,9 @@ enum Commands {
         registry_bootstrap: String,
         /// 32-byte x-only key seeded into current_spos_frost_key. In Phase 1 this
         /// is Y_federation (the federation is the key-path signer until the first
-        /// DKG), so it normally equals --y-federation.
+        /// DKG), so it normally equals the Config's #11 y_federation.
         #[arg(long)]
         frost_key: String,
-        /// 32-byte x-only federation fallback key (y_federation), hex — the
-        /// script-leaf key of both Taproot trees.
-        #[arg(long)]
-        y_federation: String,
-        /// The timeout_federation CSV value baked into the federation leaves.
-        #[arg(long)]
-        federation_csv_blocks: i64,
         /// 32-byte hex bifrost identity root seeded into the datum (spec
         /// [PRE-2] – e.g. a replacement deployment carrying registered SPOs
         /// forward). Omit for the empty MPF root (fresh deployment).
@@ -944,8 +937,6 @@ fn main() {
             blueprint,
             registry_bootstrap,
             frost_key,
-            y_federation,
-            federation_csv_blocks,
             identity_root,
             submit,
         } => {
@@ -955,8 +946,6 @@ fn main() {
                 &blueprint,
                 &registry_bootstrap,
                 &frost_key,
-                &y_federation,
-                federation_csv_blocks,
                 identity_root.as_deref(),
                 submit,
             ) {
@@ -2197,28 +2186,16 @@ async fn resolve_federation(
 ) -> Result<heimdall::cardano::federation::FederationIdentity, String> {
     use heimdall::cardano::roster::RegistryRosterSource;
 
+    // Rev 5.5: both values are Config fields (#11 and params[7]), so this needs
+    // the Config read every command already performs and no treasury_info fetch
+    // at all ([CFG-6]). RegistryRosterSource::resolve stays as the check that the
+    // Config names a locatable roster — a Config that does not is not a bridge
+    // this node can join, federation identity or no.
     let config = config_view_async(cfg).await?;
-    let source = RegistryRosterSource::resolve(&cfg.cardano, config.as_ref().map(|v| &v.params))
+    let _source = RegistryRosterSource::resolve(&cfg.cardano, config.as_ref().map(|v| &v.params))
         .map_err(|e| format!("cannot locate the treasury_info state: {e}"))?;
 
-    let published = match (source, config_locator(cfg)) {
-        (Some(src), Some(loc)) => Some(
-            src.fetch_snapshot(&loc.base_url, &loc.project_id)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "cannot read the treasury_info datum at {}: {e}",
-                        src.treasury_info_address
-                    )
-                })?
-                .treasury_state
-                .datum,
-        ),
-        // No registry configured (fixture roster), or no provider to ask with.
-        _ => None,
-    };
-
-    heimdall::cardano::federation::resolve(&cfg.bitcoin, published.as_ref())
+    heimdall::cardano::federation::resolve(&cfg.bitcoin, config.as_ref().map(|v| &v.params))
         .map_err(|e| format!("{e}\n{}", e.fix()))
 }
 
@@ -2638,8 +2615,6 @@ fn run_bootstrap_treasury_info(
     blueprint_path: &str,
     registry_bootstrap: &str,
     frost_key: &str,
-    y_federation: &str,
-    federation_csv_blocks: i64,
     identity_root: Option<&str>,
     submit: bool,
 ) -> Result<(), String> {
@@ -2666,27 +2641,18 @@ fn run_bootstrap_treasury_info(
     let frost = hex::decode(frost_key).map_err(|e| format!("--frost-key: {e}"))?;
     bitcoin::XOnlyPublicKey::from_slice(&frost)
         .map_err(|e| format!("--frost-key is not a valid x-only secp256k1 point: {e}"))?;
-    let y_fed = hex::decode(y_federation).map_err(|e| format!("--y-federation: {e}"))?;
-    bitcoin::XOnlyPublicKey::from_slice(&y_fed)
-        .map_err(|e| format!("--y-federation is not a valid x-only secp256k1 point: {e}"))?;
-    if federation_csv_blocks <= 0 {
-        return Err("--federation-csv-blocks must be positive".into());
-    }
-    let mut datum = bootstrap_datum(frost, y_fed, federation_csv_blocks);
+    // Rev 5.5: y_federation and federation_csv_blocks are CONFIG fields (#11 and
+    // params[7]), written by the Config bootstrap rather than this one ([CFG-6]).
+    // They are no longer arguments here.
+    let mut datum = bootstrap_datum(frost, heimdall::cardano::mpf::NULL_HASH);
     // spec [PRE-2]: the operator may seed a non-empty identity root (e.g. a
-    // replacement deployment carrying registered SPOs forward).
+    // replacement deployment carrying registered SPOs forward). Rev 5.5
+    // implements it on-chain, so this no longer warns.
     if let Some(root_hex) = identity_root {
         datum.bifrost_identity_root = hex::decode(root_hex)
             .map_err(|e| format!("--identity-root: {e}"))?
             .try_into()
             .map_err(|_| "--identity-root must be 32 bytes".to_string())?;
-        if datum.bifrost_identity_root != heimdall::cardano::mpf::NULL_HASH {
-            eprintln!(
-                "warning: --identity-root is not the empty MPF root — treasury.ak's mint branch \
-                 still pins mpf.root(mpf.empty) until the [PRE-2] on-chain change is deployed, \
-                 so this tx fails phase-2 validation against an older validator"
-            );
-        }
     }
 
     let pid = cfg
@@ -4253,7 +4219,15 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     } else {
         UpdateYAuthorizer::Roster
     };
-    let (expected_signer, signer_role) = authorizer.signing_key(&state.datum);
+    // Rev 5.5 [UY-5]: the federation key is Config #11, not a datum field, and
+    // the tx must reference the Config UTxO so treasury.ak can read it
+    // ([TSY-12]). This CLI parameterizes its scripts from the blueprint, so it
+    // did not previously need a Config read at all.
+    let config = rt
+        .block_on(config_view_async(cfg))?
+        .ok_or("update-y needs the Config UTxO (y_federation is #11); set cardano.config_address and cardano.config_nft_policy_id")?;
+    let y_federation = config.params.y_federation;
+    let (expected_signer, signer_role) = authorizer.signing_key(&state.datum, &y_federation);
 
     println!("treasury policy:   {}", treasury.hash_hex());
     println!(
@@ -4265,10 +4239,7 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
         hex::encode(&state.datum.current_spos_frost_key)
     );
     if args.federation {
-        println!(
-            "y_federation:      {}",
-            hex::encode(&state.datum.y_federation)
-        );
+        println!("y_federation:      {}", hex::encode(y_federation));
     }
     println!("new key:           {}", hex::encode(new_key));
     println!("epoch:             {}", args.epoch);
@@ -4310,6 +4281,8 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
         epoch: epoch_i64,
         signature: &signature,
         authorizer,
+        y_federation: &y_federation,
+        config_ref: (&config.utxo.tx_hash, config.utxo.index),
         wallet_address: &wallet_addr,
         wallet_utxos: &wallet_utxos,
         key: &key,
@@ -5292,16 +5265,20 @@ fn run_show_config_params(cfg: &HeimdallConfig) -> Result<(), String> {
             &b.spo_bans_policy_id,
             mainnet,
         );
-        println!("#7  spo_bans policy: {}", source.ban_policy_hex);
+        let t = &snapshot.config.params.tunables;
+        println!("#8  spo_bans policy: {}", source.ban_policy_hex);
         println!("      ban address  : {}", source.ban_address);
-        println!("#8  base_ban_duration_ms      : {}", b.base_ban_duration_ms);
         println!(
-            "#9  max_faults_before_permanent: {}",
-            b.max_faults_before_permanent
+            "    params[4] base_ban_duration_ms      : {}",
+            t.base_ban_duration_ms
         );
         println!(
-            "#10 max_validity_window_ms     : {}",
-            b.max_validity_window_ms
+            "    params[5] max_faults_before_permanent: {}",
+            t.max_faults_before_permanent
+        );
+        println!(
+            "    params[6] max_validity_window_ms     : {}",
+            t.max_validity_window_ms
         );
         println!(
             "      (the roster is filtered against this address; no ban keys are needed \
@@ -5313,22 +5290,30 @@ fn run_show_config_params(cfg: &HeimdallConfig) -> Result<(), String> {
         let source = heimdall::cardano::roster::RegistryRosterSource::from_policy_ids(
             &r.spos_registry_policy_id,
             &r.treasury_info_policy_id,
-            &r.treasury_info_asset_name,
+            heimdall::cardano::config_params::TREASURY_INFO_ASSET_NAME,
             cfg.cardano.is_mainnet()?,
         );
-        println!("#11 registry policy: {}", source.registry_policy_hex);
+        println!("#9  registry policy: {}", source.registry_policy_hex);
         println!("      registry addr: {}", source.registry_address);
-        println!("#12 treasury_info  : {}", source.treasury_info_policy_hex);
+        println!("#10 treasury_info  : {}", source.treasury_info_policy_hex);
         println!("      state addr   : {}", source.treasury_info_address);
         println!(
-            "#13 treasury_info NFT name: {} ({})",
+            "    treasury_info NFT name: {} ({}) — the [CFG-4] constant, not a Config field",
             source.treasury_info_asset_name_hex,
-            String::from_utf8_lossy(&r.treasury_info_asset_name)
+            String::from_utf8_lossy(heimdall::cardano::config_params::TREASURY_INFO_ASSET_NAME)
         );
         println!(
             "      (the roster is read from these; no registry keys are needed in \
              [cardano]. The Update-Y handoff additionally needs a blueprint to compile \
-             treasury_info, checked against #12)"
+             treasury_info, checked against #10)"
+        );
+    }
+    {
+        let p = &snapshot.config.params;
+        println!(
+            "#11 y_federation : {} (params[7] federation_csv_blocks: {})",
+            hex::encode(p.y_federation),
+            p.tunables.federation_csv_blocks
         );
     }
 

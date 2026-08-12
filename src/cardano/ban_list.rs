@@ -741,8 +741,12 @@ impl BanPolicyParams {
     ///
     /// The ban schedule is baked into the policy id, so an ApplyBan built from
     /// numbers other than the deployment's produces a `BanNodeData` the validator
-    /// rejects. Taking them from Config #18–#20 makes that impossible to get
-    /// wrong; the local keys remain for a Config predating the append.
+    /// rejects. Taking them from the published Config makes that impossible to
+    /// get wrong; the local keys remain for a Config predating the append.
+    ///
+    /// Rev 5.5 moved the three numbers from Config #8-#10 into `params[4..=6]`
+    /// ([CFG-6]: identities stay top level, tunable numbers live in `params`).
+    /// Only `spo_bans_policy_id` is left in [`BanParams`].
     ///
     /// `fault_proof_policies` has no published counterpart and stays local — it
     /// is a build artifact of the contracts release, which is WI-066's subject,
@@ -751,11 +755,11 @@ impl BanPolicyParams {
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
     ) -> Result<Self, BanListError> {
-        let Some(published) = config.map(|c| &c.bans) else {
+        let Some(published) = config.map(|c| &c.tunables) else {
             return Self::from_config(cardano);
         };
         // A local schedule that disagrees with the published one is dead config,
-        // not a conflict to resolve: #18–#20 are baked into the policy id the
+        // not a conflict to resolve: they are baked into the policy id the
         // bridge published, so the local numbers cannot describe this bridge. Say
         // which ones, since silently ignoring them is how an operator believes a
         // ban duration they typed is in force.
@@ -1053,8 +1057,8 @@ impl BanListSource {
     ///
     /// Both routes stay reachable because a node may legitimately have no Config
     /// to read at all (the fixture roster, and the dev/offline paths). Since rev
-    /// 5.4 a Config that IS readable always publishes the ban policy — the datum
-    /// makes #7-#10 mandatory — so `None` here means "no Config", never "an older
+    /// 5.5 a Config that IS readable always publishes the ban policy — the datum
+    /// makes #8 mandatory — so `None` here means "no Config", never "an older
     /// Config".
     pub fn resolve(
         cardano: &crate::config::CardanoConfig,
@@ -1738,10 +1742,11 @@ mod tests {
         let mut c = crate::cardano::config_params::test_config_params();
         c.bans = BanParams {
             spo_bans_policy_id: policy,
-            base_ban_duration_ms,
-            max_faults_before_permanent,
-            max_validity_window_ms,
         };
+        // Rev 5.5: the three schedule numbers live in params, not beside the policy id.
+        c.tunables.base_ban_duration_ms = base_ban_duration_ms;
+        c.tunables.max_faults_before_permanent = max_faults_before_permanent;
+        c.tunables.max_validity_window_ms = max_validity_window_ms;
         c
     }
 

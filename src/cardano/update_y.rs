@@ -99,19 +99,28 @@ impl std::error::Error for UpdateYError {}
 pub enum UpdateYAuthorizer {
     /// The outgoing roster: the spent datum's `current_spos_frost_key`.
     Roster,
-    /// The federation: the spent datum's `y_federation` ([UY-5]).
+    /// The federation: the CONFIG's `y_federation` ([UY-5]). Rev 5.5 moved that
+    /// key out of the treasury datum and into Config #11, so the co-authority is
+    /// governance data now rather than state a rotation could disturb.
     Federation,
 }
 
 impl UpdateYAuthorizer {
-    /// The SPENT-datum key the signature must verify under, plus that datum
-    /// field's name for error messages. The single place the authorizer is
-    /// mapped to a key, so the builder and the CLI cannot disagree.
+    /// The key the signature must verify under, plus a name for error messages.
+    /// The single place the authorizer is mapped to a key, so the builder and the
+    /// CLI cannot disagree.
+    ///
+    /// The two now come from different UTxOs: the roster key from the SPENT
+    /// datum, the federation key from the CONFIG ([UY-5], rev 5.5).
     #[must_use]
-    pub fn signing_key(self, datum: &TreasuryInfoDatum) -> (&[u8], &'static str) {
+    pub fn signing_key<'a>(
+        self,
+        datum: &'a TreasuryInfoDatum,
+        y_federation: &'a [u8; 32],
+    ) -> (&'a [u8], &'static str) {
         match self {
             Self::Roster => (&datum.current_spos_frost_key, "current_spos_frost_key"),
-            Self::Federation => (&datum.y_federation, "y_federation"),
+            Self::Federation => (y_federation.as_slice(), "config y_federation"),
         }
     }
 }
@@ -129,8 +138,16 @@ pub struct UpdateYRequest<'a> {
     /// state.output_index, epoch, new_key)`, under the SPENT-datum key named
     /// by `authorizer`.
     pub signature: &'a [u8],
-    /// Which spent-datum key produced `signature` (spec [UY-5]).
+    /// Which key produced `signature` (spec [UY-5]).
     pub authorizer: UpdateYAuthorizer,
+    /// Config #11 `y_federation`, for the [UY-5] federation branch. Also what
+    /// `treasury.ak` reads, so the builder verifies under the same key the
+    /// validator will.
+    pub y_federation: &'a [u8; 32],
+    /// The Config UTxO, added to the tx as a REFERENCE input. `treasury.ak`
+    /// reads `y_federation` from it (spec [TSY-12]) and locates it by the index
+    /// below, never by scanning.
+    pub config_ref: (&'a str, u32),
     pub wallet_address: &'a str,
     pub wallet_utxos: &'a [WalletUtxo],
     /// Fee-paying wallet key (any funded key — submission is permissionless).
@@ -169,7 +186,9 @@ pub fn build_update_y_tx(req: &UpdateYRequest) -> Result<UpdateYTx, UpdateYError
 
     // Verify the BIP340 signature under the spent datum's key named by
     // `authorizer`, over the same message treasury.ak checks ([UY-5]).
-    let (authorizer_key, role) = req.authorizer.signing_key(&req.state.datum);
+    let (authorizer_key, role) = req
+        .authorizer
+        .signing_key(&req.state.datum, req.y_federation);
     let xonly =
         XOnlyPublicKey::from_slice(authorizer_key).map_err(|e| UpdateYError::BadAuthorizerKey {
             role,
@@ -199,12 +218,15 @@ pub fn build_update_y_tx(req: &UpdateYRequest) -> Result<UpdateYTx, UpdateYError
 
     let network = crate::cardano::tx_common::network_from_address(req.wallet_address);
 
-    // Only current_spos_frost_key changes — mirrors treasury.ak's record-update
-    // spread. Every other field is copied from the spent datum verbatim.
+    // Only current_spos_frost_key changes; treasury.ak asserts
+    // bifrost_identity_root is untouched ([TSY-17]). Rev 5.5 also reads the new
+    // key FROM this datum rather than from the redeemer, which is safe because
+    // the signed message commits to it.
     let mut new_datum = req.state.datum.clone();
     new_datum.current_spos_frost_key = req.new_spos_frost_key.to_vec();
 
-    let redeemer = update_y_redeemer(req.new_spos_frost_key, req.epoch, req.signature);
+    // The Config is the only reference input, so its index is 0.
+    let redeemer = update_y_redeemer(req.epoch, req.signature, 0);
     let (treasury_in, treasury_out) = treasury_spend_leg(
         req.state,
         req.treasury_script,
@@ -251,7 +273,11 @@ pub fn build_update_y_tx(req: &UpdateYRequest) -> Result<UpdateYTx, UpdateYError
         change_address: req.wallet_address.to_string(),
         signing_key: vec![],
         network: Some(crate::cardano::tx_common::whisky_network(&req.cost_models)),
-        reference_inputs: vec![],
+        reference_inputs: vec![RefTxIn {
+            tx_hash: req.config_ref.0.to_string(),
+            tx_index: req.config_ref.1,
+            script_size: None,
+        }],
         withdrawals: vec![],
         mints: vec![],
         certificates: vec![],
@@ -282,6 +308,9 @@ pub fn build_update_y_tx(req: &UpdateYRequest) -> Result<UpdateYTx, UpdateYError
 
 #[cfg(test)]
 mod tests {
+    /// The Config UTxO the tx references so `treasury.ak` can read #11
+    /// `y_federation` (spec [TSY-12]).
+    const CONFIG_REF_TX: &str = "cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11";
     use super::*;
     use crate::cardano::bf_http::{BfAmount, BfUtxo};
     use crate::cardano::blueprint;
@@ -339,9 +368,13 @@ mod tests {
             panic!("UpdateY redeemer must be a Constr");
         };
         let fields: Vec<_> = constr.fields.iter().collect();
-        assert_eq!(fields.len(), 3, "UpdateY carries [new_key, epoch, sig]");
-        let PlutusData::BoundedBytes(sig) = fields[2] else {
-            panic!("third UpdateY field must be the signature bytes");
+        assert_eq!(
+            fields.len(),
+            3,
+            "rev 5.5 UpdateY carries [epoch, sig, config_ref_input_index]"
+        );
+        let PlutusData::BoundedBytes(sig) = fields[1] else {
+            panic!("second UpdateY field must be the signature bytes");
         };
         sig.to_vec().try_into().expect("64-byte signature")
     }
@@ -357,13 +390,10 @@ mod tests {
         .unwrap()
     }
 
-    fn sample_datum(current_spos_frost_key: Vec<u8>, y_federation: Vec<u8>) -> TreasuryInfoDatum {
+    fn sample_datum(current_spos_frost_key: Vec<u8>) -> TreasuryInfoDatum {
         TreasuryInfoDatum {
             bifrost_identity_root: mpf::NULL_HASH,
             current_spos_frost_key,
-            y_federation,
-            federation_csv_blocks: 144,
-            last_reset_tm_txid: vec![],
         }
     }
 
@@ -437,7 +467,8 @@ mod tests {
     fn builds_a_rotation_tx_with_updatey_redeemer() {
         let script = test_script();
         let (roster_kp, roster_pk) = test_keypair(0xA1);
-        let old = sample_datum(roster_pk.to_vec(), vec![0xCDu8; 32]);
+        let old = sample_datum(roster_pk.to_vec());
+        let fed_pk = [0xCDu8; 32];
         let state = located_state(&script, &old);
         let (key, wallet_addr, wallet_utxos) = test_wallet();
 
@@ -456,6 +487,8 @@ mod tests {
             invalid_hereafter: None,
             cost_models: None,
             authorizer: UpdateYAuthorizer::Roster,
+            y_federation: &fed_pk,
+            config_ref: (CONFIG_REF_TX, 0),
         };
         let built = build_update_y_tx(&req).unwrap();
 
@@ -464,11 +497,6 @@ mod tests {
         assert_eq!(
             built.new_datum.bifrost_identity_root,
             old.bifrost_identity_root
-        );
-        assert_eq!(built.new_datum.y_federation, old.y_federation);
-        assert_eq!(
-            built.new_datum.federation_csv_blocks,
-            old.federation_csv_blocks
         );
 
         let tx: Tx = minicbor::decode(&hex::decode(&built.signed_tx_hex).unwrap()).unwrap();
@@ -506,7 +534,7 @@ mod tests {
         let script = test_script();
         let (fed_kp, fed_pk) = test_keypair(0xB2);
         // Roster key is junk: the federation branch must never consult it.
-        let old = sample_datum(vec![0xABu8; 32], fed_pk.to_vec());
+        let old = sample_datum(vec![0xABu8; 32]);
         let state = located_state(&script, &old);
         let (key, wallet_addr, wallet_utxos) = test_wallet();
 
@@ -527,13 +555,14 @@ mod tests {
             invalid_hereafter: None,
             cost_models: None,
             authorizer: UpdateYAuthorizer::Federation,
+            y_federation: &fed_pk,
+            config_ref: (CONFIG_REF_TX, 0),
         };
         let built = build_update_y_tx(&req).unwrap();
 
         // The rotation is an ordinary Update-Y: only the key changes, to the
         // arbitrary successor; y_federation itself is preserved.
         assert_eq!(built.new_datum.current_spos_frost_key, successor.to_vec());
-        assert_eq!(built.new_datum.y_federation, old.y_federation);
         assert_eq!(
             built.new_datum.bifrost_identity_root,
             old.bifrost_identity_root
@@ -557,7 +586,7 @@ mod tests {
             .verify_schnorr(
                 &schnorr::Signature::from_slice(&carried).unwrap(),
                 &Message::from_digest(msg),
-                &XOnlyPublicKey::from_slice(&old.y_federation).unwrap(),
+                &XOnlyPublicKey::from_slice(&fed_pk).unwrap(),
             )
             .expect("redeemer signature verifies under y_federation");
     }
@@ -571,7 +600,7 @@ mod tests {
         let script = test_script();
         let (roster_kp, roster_pk) = test_keypair(0xA1);
         let (fed_kp, fed_pk) = test_keypair(0xB2);
-        let old = sample_datum(roster_pk.to_vec(), fed_pk.to_vec());
+        let old = sample_datum(roster_pk.to_vec());
         let state = located_state(&script, &old);
         let (key, wallet_addr, wallet_utxos) = test_wallet();
 
@@ -593,6 +622,8 @@ mod tests {
                 invalid_hereafter: None,
                 cost_models: None,
                 authorizer,
+                y_federation: &fed_pk,
+                config_ref: (CONFIG_REF_TX, 0),
             })
         };
 
@@ -600,7 +631,7 @@ mod tests {
         assert!(matches!(
             build(&roster_sig, UpdateYAuthorizer::Federation),
             Err(UpdateYError::SignatureInvalid {
-                role: "y_federation"
+                role: "config y_federation"
             })
         ));
         // Federation-signed but claimed as roster-authorized: rejected.
