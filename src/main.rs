@@ -5959,7 +5959,7 @@ fn run_sweep_pegins(
             parsed.btc_txid,
             parsed.btc_vout,
             parsed.value.to_sat(),
-            hex::encode(parsed.depositor_xonly_pubkey.serialize()),
+            hex::encode(parsed.depositor_outputkey.serialize()),
         );
         pegin_inputs.push(PegInInput {
             outpoint,
