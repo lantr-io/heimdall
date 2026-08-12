@@ -130,7 +130,15 @@ fn run() -> Result<(), String> {
 
     let secp = Secp256k1::new();
 
-    let y_fed = derive_y_fed(&cfg.bitcoin.y_fed_seed_hex, &secp)?;
+    // A demo depositor builds the peg-in address from the same federation key
+    // the treasury uses. Since WI-069 the seed is optional in the config (a real
+    // SPO reads the public key from Config #15 instead), but this tool derives
+    // rather than reads, so it needs the seed spelled out.
+    let seed_hex = cfg.bitcoin.y_fed_seed_hex.as_deref().ok_or(
+        "bitcoin.y_fed_seed_hex is unset — this demo tool derives Y_federation locally rather \
+         than reading Config #15, so it needs the seed",
+    )?;
+    let y_fed = derive_y_fed(seed_hex, &secp)?;
 
     let wif = read_wif(&cli)?;
     let depositor_priv =

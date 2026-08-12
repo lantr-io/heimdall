@@ -6,7 +6,7 @@
 //! locator keys silently dropped to a wall-clock cadence instead of the protocol's
 //! batch grid, which does not agree with the other SPOs, and nothing said so.
 //!
-//! This module runs seven checks in order and reports each one. It is the single
+//! This module runs nine checks in order and reports each one. It is the single
 //! state reader behind the startup gate; `heimdall doctor` (WI-054) and
 //! `heimdall status` (WI-058) are meant to render the same [`Report`] rather than
 //! grow their own opinion of what "healthy" means, because three readers that can
@@ -402,6 +402,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             (4, "verify the contract set"),
             (5, "reference script"),
             (6, "registration status"),
+            (9, "federation identity"),
         ] {
             b.push(n, title, Status::Skipped, "needs a Cardano provider");
         }
@@ -789,6 +790,40 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             "set cardano.registry_blueprint and cardano.treasury_policy_id (treasury_info's \
              two parameters). The derived hash is checked against the Config's #22, so a \
              wrong one is refused rather than used",
+        ),
+    }
+
+    // ── 9. Federation identity — the treasury's own address (WI-069) ──────
+    // A Fail, unlike steps 5 and 8: this is not a capability the node can do
+    // without. Y_fed and the CSV delay are what the treasury scriptPubKey is
+    // built from, so a node that cannot resolve them, or whose local seed
+    // contradicts what the bridge publishes, would sign for an address no other
+    // SPO is using — and produce nothing that looks like an error while doing it.
+    match crate::cardano::federation::resolve(
+        &cfg.bitcoin,
+        config.as_ref().and_then(|v| v.params.federation.as_ref()),
+    ) {
+        Ok(id) => b.push(
+            9,
+            "federation identity",
+            Status::Pass,
+            format!(
+                "Y_fed {}, csv {} blocks — {}",
+                hex::encode(id.y_fed.serialize()),
+                id.csv_blocks,
+                id.origin
+            ),
+        ),
+        Err(e) => b.push_fix(
+            9,
+            "federation identity",
+            Status::Fail,
+            e.to_string(),
+            "Y_federation and the recovery CSV delay build the treasury's Taproot address. \
+             A bridge deployed after [CFG-4] publishes both at Config #15-#16 and this node \
+             needs NEITHER key — delete bitcoin.y_fed_seed_hex and \
+             bitcoin.federation_csv_blocks unless this node performs federation spends, in \
+             which case the seed stays and must agree with what is published",
         ),
     }
 

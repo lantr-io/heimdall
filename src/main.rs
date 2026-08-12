@@ -875,9 +875,12 @@ fn main() {
         } => {
             let mut cfg = load_config(config.as_deref());
             if let Some(v) = federation_csv_blocks {
-                cfg.bitcoin.federation_csv_blocks = v as u32;
+                cfg.bitcoin.federation_csv_blocks = Some(u32::from(v));
             }
-            print_bootstrap_treasury(&cfg);
+            if let Err(e) = print_bootstrap_treasury(&cfg) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
         }
         Commands::FrostTreasury { config, frost_key } => {
             let cfg = load_config(config.as_deref());
@@ -1401,9 +1404,28 @@ async fn run_demo(
     deterministic: bool,
     inject_fault: Option<String>,
 ) {
+    // The treasury's federation identity: published at Config #15-#16 where the
+    // bridge carries it, local `[bitcoin]` keys otherwise (WI-069). Fatal on
+    // failure — it is an input to the treasury ADDRESS, so continuing on a guess
+    // means signing for an address no other SPO is using.
+    let federation = match resolve_federation(&cfg).await {
+        Ok(f) => {
+            info!(
+                "[federation] Y_fed {} — {}",
+                hex::encode(f.y_fed.serialize()),
+                f.origin
+            );
+            f
+        }
+        Err(e) => {
+            error!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     // The fixture provides a fallback roster (SPO identities + ports)
     // until the on-chain SPO registry is wired.
-    let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(&cfg);
+    let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(&cfg, &federation);
 
     let script_address: String = cfg.cardano.pegin_script_address.clone().unwrap_or_default();
     let treasury_address: String = cfg.cardano.treasury_address.clone().unwrap_or_default();
@@ -1941,7 +1963,14 @@ fn y_fed_keypair(
     ),
     String,
 > {
-    let seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_fed_seed_hex)
+    // The seed itself, not the published key: these are the FEDERATION-OPS
+    // commands, the ones that SIGN with it. Config #15 publishes only the public
+    // half, so it cannot stand in here (WI-069).
+    let seed_hex = cfg.bitcoin.y_fed_seed_hex.as_deref().ok_or(
+        "bitcoin.y_fed_seed_hex is unset — this command signs with the federation key, so the \
+         published Config #15 public key cannot stand in for it",
+    )?;
+    let seed: [u8; 32] = hex::decode(seed_hex.trim())
         .map_err(|e| format!("y_fed_seed_hex: {e}"))?
         .try_into()
         .map_err(|_| "y_fed_seed_hex must be 32 bytes".to_string())?;
@@ -1963,10 +1992,18 @@ fn parse_outpoint(s: &str) -> Result<bitcoin::OutPoint, String> {
 /// since a silent truncation would change the Taproot spend path and produce an
 /// invalid scriptPubKey / signatures.
 fn csv_blocks_u16(cfg: &HeimdallConfig) -> Result<u16, String> {
-    u16::try_from(cfg.bitcoin.federation_csv_blocks).map_err(|_| {
+    // These are the federation-ops commands, run by the operator who holds the
+    // seed and who therefore knows the delay the treasury was locked with. There
+    // is no default (WI-069): a guessed delay builds a different Taproot tree,
+    // so the leaf would not be in it and the spend would simply not validate.
+    let blocks = cfg.bitcoin.federation_csv_blocks.ok_or(
+        "bitcoin.federation_csv_blocks is unset — it is an input to the treasury address, so \
+         there is no safe default. Set it to the delay this bridge's treasury was locked with \
+         (a bridge deployed after [CFG-4] publishes it at Config #16)",
+    )?;
+    u16::try_from(blocks).map_err(|_| {
         format!(
-            "federation_csv_blocks ({}) exceeds u16::MAX ({})",
-            cfg.bitcoin.federation_csv_blocks,
+            "federation_csv_blocks ({blocks}) exceeds u16::MAX ({})",
             u16::MAX
         )
     })
@@ -2111,16 +2148,45 @@ fn config_view(
     rt: &tokio::runtime::Runtime,
     cfg: &HeimdallConfig,
 ) -> Result<Option<heimdall::cardano::config_params::ConfigView>, String> {
+    rt.block_on(config_view_async(cfg))
+}
+
+/// [`config_view`] for callers that are already inside the runtime.
+async fn config_view_async(
+    cfg: &HeimdallConfig,
+) -> Result<Option<heimdall::cardano::config_params::ConfigView>, String> {
     let Some(loc) = config_locator(cfg) else {
         return Ok(None);
     };
-    rt.block_on(heimdall::cardano::config_params::fetch_config(
+    heimdall::cardano::config_params::fetch_config(
         &loc.base_url,
         &loc.project_id,
         &loc.address,
         &loc.nft_unit,
-    ))
+    )
+    .await
     .map(Some)
+}
+
+/// Resolve the treasury's federation identity: Config #15–#16 where the bridge
+/// publishes them, this node's `[bitcoin]` keys otherwise, and a hard error when
+/// the two disagree (WI-069).
+///
+/// A Config read failure is NOT swallowed into the local fallback: "the bridge
+/// publishes nothing" and "we could not ask" have different right answers, and
+/// silently taking the local value on the second would reintroduce exactly the
+/// per-operator divergence this replaces.
+async fn resolve_federation(
+    cfg: &HeimdallConfig,
+) -> Result<heimdall::cardano::federation::FederationIdentity, String> {
+    let published = config_view_async(cfg).await?;
+    heimdall::cardano::federation::resolve(
+        &cfg.bitcoin,
+        published
+            .as_ref()
+            .and_then(|v| v.params.federation.as_ref()),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Freeze the scanned peg-outs against `batch` — the CLI sweep's half of the rule
@@ -6054,7 +6120,8 @@ fn run_sweep_pegins(
     // the BTC tx is broadcast is governed by config (`bitcoin.submit`), NOT by --broadcast — on
     // this setup heimdall posts to Cardano while binocular `relay` carries it to Bitcoin.
     if let Some(project_id) = cfg.cardano.blockfrost_project_id.as_deref() {
-        let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(cfg);
+        let federation = rt.block_on(resolve_federation(cfg))?;
+        let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(cfg, &federation);
         let treasury_address = cfg
             .cardano
             .treasury_address
@@ -6141,38 +6208,49 @@ fn run_sweep_pegins(
     Ok(())
 }
 
-fn print_bootstrap_treasury(cfg: &HeimdallConfig) {
-    use bitcoin::key::{Secp256k1, UntweakedPublicKey};
-    use bitcoin::secp256k1::SecretKey;
+fn print_bootstrap_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
+    use bitcoin::key::Secp256k1;
     use bitcoin::{Address, ScriptBuf};
     use heimdall::bitcoin::taproot::treasury_spend_info;
 
     let secp = Secp256k1::new();
 
-    let y_fed_seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_fed_seed_hex)
-        .expect("bitcoin.y_fed_seed_hex must be valid hex")
-        .try_into()
-        .expect("bitcoin.y_fed_seed_hex must be 32 bytes");
-
-    let y_fed = UntweakedPublicKey::from_slice(
-        &SecretKey::from_slice(&y_fed_seed)
-            .unwrap()
-            .x_only_public_key(&secp)
-            .0
-            .serialize(),
-    )
-    .unwrap();
+    // The DEPLOYER's command: it prints the address the genesis BTC is sent to,
+    // and the deployer is the party that holds the federation seed. So it derives
+    // from the seed rather than reading Config #15 — at this point in a bridge's
+    // life there is no Config to read (WI-069).
+    let y_fed = cfg
+        .bitcoin
+        .y_fed_seed_hex
+        .as_deref()
+        .ok_or_else(|| {
+            "bitcoin.y_fed_seed_hex is unset — this command derives the genesis treasury address \
+             from the federation seed, before any Config exists to publish it"
+                .to_string()
+        })
+        .and_then(|s| {
+            heimdall::cardano::federation::y_fed_from_seed_hex(s).map_err(|e| e.to_string())
+        })?;
 
     let network = cfg.bitcoin.parsed_network();
-    let csv_blocks = csv_blocks_u16(cfg).unwrap_or_else(|e| panic!("{e}"));
+    let csv_blocks = csv_blocks_u16(cfg)?;
 
     // At bootstrap Y_51 = Y_fed.
     let spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv_blocks);
     let output_key = spend_info.output_key();
     let script_pubkey = ScriptBuf::new_p2tr_tweaked(output_key);
-    let address = Address::from_script(&script_pubkey, network).expect("valid P2TR address");
+    let address =
+        Address::from_script(&script_pubkey, network).map_err(|e| format!("P2TR address: {e}"))?;
 
     println!("{address}");
+    // The two values that produced it — they are what the deployer must publish
+    // at Config #15-#16, and what every SPO then reads instead of typing.
+    println!(
+        "y_federation_pubkey: {}  (Config #15 — the PUBLIC key, never the seed)",
+        hex::encode(y_fed.serialize())
+    );
+    println!("federation_csv_blocks: {csv_blocks}  (Config #16)");
+    Ok(())
 }
 
 /// Print the treasury Taproot address when Y_fed = Y_51 = FROST group key.

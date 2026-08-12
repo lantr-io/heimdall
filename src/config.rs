@@ -188,9 +188,24 @@ pub struct BitcoinConfig {
     /// must clear is Config datum field #13, read at the batch snapshot slot — a
     /// skip rule, so it too must be identical across SPOs.
     pub per_pegout_fee_sat: u64,
-    pub federation_csv_blocks: u32,
-    /// 32-byte hex seed for the Y_federation key.
-    pub y_fed_seed_hex: String,
+    /// Relative-timelock delay (blocks) of the treasury's federation recovery
+    /// leaf. `None` = take it from Config #16, which is where a bridge deployed
+    /// after [CFG-4] publishes it (WI-069).
+    ///
+    /// It had a default of 144, which was the bug: it is an input to the
+    /// treasury ADDRESS, so a node that left it alone did not fail — it derived
+    /// a well-formed address nobody else was using. Setting it on a bridge that
+    /// publishes a different value is now fatal, not silently preferred.
+    pub federation_csv_blocks: Option<u32>,
+    /// 32-byte hex seed for the Y_federation key. `None` = take the derived
+    /// PUBLIC key from Config #15 (WI-069).
+    ///
+    /// This is a SPENDING SECRET, not an identifier: `federation-spend` signs
+    /// the treasury's recovery path with it, which is why the Config publishes
+    /// only the public half. Keep it set on a node that performs federation
+    /// operations — it then also cross-checks the published key, the one check
+    /// no other reader can make. On every other node it should be absent.
+    pub y_fed_seed_hex: Option<String>,
     /// Optional bitcoind JSON-RPC endpoint. DEV / FEDERATION-OPS ONLY: the SPO
     /// runtime never requires a Bitcoin node — every Bitcoin fact reaches
     /// heimdall through Cardano (PIR datums carry the raw deposit txs,
@@ -226,8 +241,13 @@ impl Default for BitcoinConfig {
             network: "regtest".to_string(),
             fee_rate_sat_per_vb: 1,
             per_pegout_fee_sat: 1000,
-            federation_csv_blocks: 144,
-            y_fed_seed_hex: hex::encode([0xFEu8; 32]),
+            // No defaults, deliberately (WI-069): both are inputs to the
+            // treasury address, so a guessed value produces a well-formed
+            // address holding nothing rather than an error. Unset means "ask the
+            // Config", and a bridge that publishes neither makes the operator
+            // say so explicitly.
+            federation_csv_blocks: None,
+            y_fed_seed_hex: None,
             rpc_url: None,
             rpc_user: None,
             rpc_pass: None,
@@ -661,8 +681,11 @@ impl HeimdallConfig {
             ),
             // Only ever used if it turns out to BE the treasury's current key —
             // i.e. the bootstrap handoff. See `EpochConfig::y_fed_seed`.
-            y_fed_seed: hex::decode(&self.bitcoin.y_fed_seed_hex)
-                .ok()
+            y_fed_seed: self
+                .bitcoin
+                .y_fed_seed_hex
+                .as_deref()
+                .and_then(|h| hex::decode(h.trim()).ok())
                 .and_then(|b| <[u8; 32]>::try_from(b).ok()),
             // Demo-only; the harness/CLI sets this after building the config.
             inject_fault: None,
@@ -749,7 +772,11 @@ mod tests {
         assert_eq!(cfg.protocol.dkg_round_timeout_secs, 300);
         assert_eq!(cfg.protocol.poll_interval_ms, 5000);
         assert_eq!(cfg.bitcoin.network, "regtest");
-        assert_eq!(cfg.bitcoin.federation_csv_blocks, 144);
+        // No default (WI-069): both federation values are inputs to the treasury
+        // ADDRESS, so a guess yields a well-formed address holding nothing. Unset
+        // means "read Config #15-#16".
+        assert_eq!(cfg.bitcoin.federation_csv_blocks, None);
+        assert_eq!(cfg.bitcoin.y_fed_seed_hex, None);
         assert_eq!(cfg.demo.base_port, 18500);
         assert_eq!(cfg.demo.min_signers, 2);
         assert_eq!(cfg.demo.max_signers, 3);

@@ -14,11 +14,15 @@ rpc_pass = "bitcoin"
 # demo simplification uses 720 (~5 days). Must match the SPO daemons.
 pegin_refund_timeout_blocks = 720
 
-# 32-byte hex seed for the deterministic demo federation key (Y_fed).
-# Must match what every SPO daemon uses, or your peg-in P2TR address
-# won't be redeemable by the federation. In production this comes from
-# the on-chain treasury oracle.
+# 32-byte hex seed for the deterministic demo federation key (Y_fed), plus the
+# CSV delay of the federation leaf. Must match what every SPO daemon uses, or
+# your peg-in P2TR address won't be redeemable by the federation. A real bridge
+# publishes the derived PUBLIC key and the delay at Config #15-#16 and an SPO
+# sets neither of these (WI-069); this demo has no Config to read, so both are
+# spelled out — there is no default for either, precisely because a guess would
+# derive a well-formed address holding nothing.
 y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe"
+federation_csv_blocks = 144
 
 # Broadcast signed BTC tx automatically. Leave false for first-run dry
 # runs (depositor prints raw hex either way); flip to true once you've

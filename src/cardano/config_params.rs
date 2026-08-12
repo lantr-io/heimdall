@@ -46,10 +46,13 @@
 //! | 8–10 | ban schedule (`base_ban_duration_ms`, `max_faults_before_permanent`, `max_validity_window_ms`) | the ApplyBan builder |
 //! | 11–13 | `spos_registry_policy_id`, `treasury_info_policy_id`, `treasury_info_asset_name` | the roster addresses |
 //! | 14 | `params` (nested [`Tunables`]) | TM fee rate + skip floors + schedule |
+//! | 15–16 | `y_federation_pubkey`, `federation_csv_blocks` | the treasury's Taproot tree ([CFG-4]) |
 //!
-//! `params` is LAST on purpose (spec §Config datum): every field before it is a
-//! scalar at a frozen index, so the datum grows by appending after the nested
-//! record instead of pushing it along.
+//! `params` sits at index 14 on purpose (spec §Config datum): every field before
+//! it is a scalar at a frozen index, so the datum grows by appending AFTER the
+//! nested record instead of pushing it along — which is exactly how #15–#16
+//! arrived, and why a validator deployed against the fifteen-field datum still
+//! reads `params` correctly from a Config migrated in place.
 //!
 //! ## Why the policy ids are PUBLISHED rather than derived (#7, #11–#13)
 //!
@@ -82,7 +85,16 @@ use tracing::{info, warn};
 
 /// Field count of the rev-5.4 Config datum (spec §Config datum). Appends are the
 /// legal evolution, so a reader accepts MORE fields and refuses fewer.
+///
+/// Deliberately NOT raised to 17 by WI-069: fields #15–#16 are optional here (see
+/// [`FederationParams`]), so heimdall keeps working against a bridge deployed
+/// before them. Raising this would refuse the live preprod Config outright.
 pub const CONFIG_FIELDS: usize = 15;
+
+/// Config index of `y_federation_pubkey` ([CFG-4], WI-069).
+pub const FEDERATION_FIELD_Y: usize = 15;
+/// Config index of `federation_csv_blocks` ([CFG-4], WI-069).
+pub const FEDERATION_FIELD_CSV: usize = 16;
 
 /// `params[3]` — the tunable protocol schedule, E-relative slot values (spec
 /// §TM batches and the protocol schedule).
@@ -169,6 +181,33 @@ pub struct RegistryParams {
     pub treasury_info_asset_name: Vec<u8>,
 }
 
+/// Config #15–#16 — the federation identity of the Bitcoin treasury ([CFG-4]).
+///
+/// These decide the treasury ADDRESS. `Y_51` rotates each epoch with the DKG and
+/// arrives over the wire, but the federation recovery leaf does not rotate: every
+/// SPO rebuilds the Taproot tree locally from these two. A node holding a
+/// different value derives a different scriptPubKey, signs a different BIP-341
+/// sighash, and contributes a FROST share over a message no other signer
+/// produced — with nothing to notice it, because the address it derived is
+/// perfectly well-formed. It is simply not the one the BTC is in.
+///
+/// Optional here, unlike [`BanParams`] and [`RegistryParams`]: they arrived with
+/// the rev-5.4 layout that [`CONFIG_FIELDS`] pins, whereas these are appended
+/// after it, so a Config written before this change legitimately lacks them and
+/// its SPOs keep using their local `[bitcoin]` values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationParams {
+    /// #15. The x-only (32-byte, BIP-340) `Y_federation` PUBLIC key.
+    ///
+    /// Never the seed. Whoever holds the seed can spend the treasury through the
+    /// federation leaf; a reader only ever needs the public half to rebuild the
+    /// tree, so publishing the seed would hand the treasury to every reader.
+    pub y_federation_pubkey: [u8; 32],
+    /// #16. Relative-timelock delay (blocks) of the federation recovery leaf.
+    /// Both an input to the address and the recovery path's own timelock.
+    pub federation_csv_blocks: u32,
+}
+
 /// Config #1–#6 — the bridge's contract identifiers.
 ///
 /// These are the AUTHORITATIVE copies. Everything heimdall carries in its own
@@ -230,6 +269,9 @@ pub struct ConfigParams {
     pub registry: RegistryParams,
     /// #14 — always present in the rev-5.4 layout.
     pub tunables: Tunables,
+    /// #15–#16, appended after `params` (WI-069). `None` on a bridge deployed
+    /// before they existed — see [`FederationParams`].
+    pub federation: Option<FederationParams>,
 }
 
 /// Which Config UTxO a [`ConfigParams`] was read from.
@@ -401,6 +443,43 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
         schedule: parse_schedule(&params[3])?,
     };
 
+    // #15–#16 are APPENDED after `params`, so a Config written before WI-069
+    // legitimately stops at 15 fields and its SPOs keep using their local
+    // `[bitcoin]` values. Present means read: half-present is a malformed datum,
+    // not a partial upgrade, because a bridge is deployed with both or neither.
+    let federation = if field_count > FEDERATION_FIELD_Y {
+        if field_count <= FEDERATION_FIELD_CSV {
+            return Err(format!(
+                "config datum has {field_count} fields: #{FEDERATION_FIELD_Y} \
+                 (y_federation_pubkey) is present but #{FEDERATION_FIELD_CSV} \
+                 (federation_csv_blocks) is missing — the federation identity is written \
+                 as a pair"
+            ));
+        }
+        let pubkey = plutus::field_bytes(fields, FEDERATION_FIELD_Y)
+            .map_err(|e| format!("config #{FEDERATION_FIELD_Y} (y_federation_pubkey): {e}"))?;
+        let y_federation_pubkey: [u8; 32] = pubkey.as_slice().try_into().map_err(|_| {
+            format!(
+                "config #{FEDERATION_FIELD_Y} (y_federation_pubkey): expected 32 bytes \
+                 (x-only BIP-340), got {}",
+                pubkey.len()
+            )
+        })?;
+        let csv = config_int(FEDERATION_FIELD_CSV, "federation_csv_blocks")?;
+        let federation_csv_blocks = u32::try_from(csv).map_err(|_| {
+            format!(
+                "config #{FEDERATION_FIELD_CSV} (federation_csv_blocks): {csv} is not a \
+                 block count"
+            )
+        })?;
+        Some(FederationParams {
+            y_federation_pubkey,
+            federation_csv_blocks,
+        })
+    } else {
+        None
+    };
+
     Ok(ConfigParams {
         field_count,
         contracts,
@@ -409,6 +488,7 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
         bans,
         registry,
         tunables,
+        federation,
     })
 }
 
@@ -459,6 +539,10 @@ pub(crate) fn test_config_params() -> ConfigParams {
                 stability_window: 0,
             },
         },
+        // The pre-WI-069 shape: `field_count` above says fifteen, so a fixture
+        // that published a federation identity would contradict itself. A test
+        // that wants one sets both.
+        federation: None,
     }
 }
 
@@ -799,15 +883,74 @@ mod tests {
         assert_eq!(t.schedule.stability_window, 129_601);
     }
 
+    /// A valid x-only key, since #15 is parsed as a curve point and not just as
+    /// 32 bytes.
+    fn a_real_x_only_key() -> [u8; 32] {
+        crate::cardano::federation::y_fed_from_seed_hex(&hex::encode([0x42u8; 32]))
+            .expect("valid seed")
+            .serialize()
+    }
+
     /// Appending is the legal evolution: unknown trailing fields are ignored.
+    /// Past #16 now, since #15–#16 are fields this reader knows (WI-069).
     #[test]
-    fn a_config_grown_past_15_fields_still_decodes() {
+    fn a_config_grown_past_the_known_fields_still_decodes() {
         let full = config_datum(7, 1_000, 100_000);
         let mut fields = plutus::constr_fields(&full, 0).unwrap().to_vec();
-        fields.push(int(99));
+        fields.push(bytes(&a_real_x_only_key())); // #15
+        fields.push(int(144)); // #16
+        fields.push(int(99)); // #17 — a field this reader has never heard of
         let p = parse_config_datum(&constr(0, fields)).unwrap();
-        assert_eq!(p.field_count, CONFIG_FIELDS + 1);
+        assert_eq!(p.field_count, FEDERATION_FIELD_CSV + 2);
         assert_eq!(p.tunables.fee_rate_sat_per_vb, 7);
+        assert_eq!(p.federation.expect("read").federation_csv_blocks, 144);
+    }
+
+    /// The pre-WI-069 layout: fifteen fields, no federation identity. Its SPOs
+    /// keep using their local `[bitcoin]` values, so this must stay readable —
+    /// which is why `CONFIG_FIELDS` was NOT raised to 17.
+    #[test]
+    fn a_config_without_the_federation_fields_still_decodes() {
+        let p = parse_config_datum(&config_datum(7, 1_000, 100_000)).unwrap();
+        assert_eq!(p.field_count, CONFIG_FIELDS);
+        assert!(p.federation.is_none());
+    }
+
+    #[test]
+    fn the_federation_identity_is_read_from_15_and_16() {
+        let key = a_real_x_only_key();
+        let full = config_datum(7, 1_000, 100_000);
+        let mut fields = plutus::constr_fields(&full, 0).unwrap().to_vec();
+        fields.push(bytes(&key));
+        fields.push(int(288));
+        let p = parse_config_datum(&constr(0, fields)).unwrap();
+        let f = p.federation.expect("published");
+        assert_eq!(f.y_federation_pubkey, key);
+        assert_eq!(f.federation_csv_blocks, 288);
+    }
+
+    /// A bridge publishes both or neither — the pair is written by one deploy.
+    /// Half of it means the datum is malformed, not partially upgraded, and
+    /// guessing the other half would derive a wrong treasury address.
+    #[test]
+    fn a_half_written_federation_identity_is_refused() {
+        let full = config_datum(7, 1_000, 100_000);
+        let mut fields = plutus::constr_fields(&full, 0).unwrap().to_vec();
+        fields.push(bytes(&a_real_x_only_key()));
+        let e = parse_config_datum(&constr(0, fields)).expect_err("must refuse");
+        assert!(e.contains("written as a pair"), "{e}");
+    }
+
+    /// 32 bytes is the x-only width; a compressed 33-byte key here would build a
+    /// different tree, so it is a mis-encode rather than a tolerable variant.
+    #[test]
+    fn a_federation_key_of_the_wrong_width_is_refused() {
+        let full = config_datum(7, 1_000, 100_000);
+        let mut fields = plutus::constr_fields(&full, 0).unwrap().to_vec();
+        fields.push(bytes(&[0x02; 33]));
+        fields.push(int(144));
+        let e = parse_config_datum(&constr(0, fields)).expect_err("must refuse");
+        assert!(e.contains("expected 32 bytes"), "{e}");
     }
 
     /// A shorter datum is an OLDER layout, not a version this reader guesses at.
