@@ -166,10 +166,17 @@ impl DkgFaultBanFlow {
             .map_err(|e| format!("registry bootstrap outref: {e}"))?;
         let (ban_tx_id, ban_index) = crate::cardano::roster::parse_outref(ban_bootstrap)
             .map_err(|e| format!("ban bootstrap outref: {e}"))?;
-        let registry = crate::cardano::blueprint::spos_registry_script(
+        // Rev 5.5: the registry policy is downstream of the treasury policy, which
+        // is downstream of the Config identity.
+        let (treasury_bootstrap, config_policy_id) =
+            crate::cardano::roster::treasury_derivation_inputs(cardano)?;
+        let (tsy_tx_id, tsy_index) = crate::cardano::roster::parse_outref(&treasury_bootstrap)
+            .map_err(|e| format!("treasury bootstrap outref: {e}"))?;
+        let registry = crate::cardano::blueprint::registry_policy_from_bootstraps(
             &blueprint_json,
-            &reg_tx_id,
-            u64::from(reg_index),
+            (&reg_tx_id, u64::from(reg_index)),
+            (&tsy_tx_id, u64::from(tsy_index)),
+            &config_policy_id,
         )
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
         let round1_fault = crate::cardano::blueprint::fault_verifier_round1_script(

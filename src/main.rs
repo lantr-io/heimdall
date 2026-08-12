@@ -2631,10 +2631,24 @@ fn run_bootstrap_treasury_info(
     let blueprint_json = std::fs::read_to_string(blueprint_path)
         .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
-        .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+    // Rev 5.5 derivation order: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    let treasury = treasury_info_script(
+        &blueprint_json,
+        &tsy_tx_id,
+        u64::from(tsy_index),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+    let registry = spos_registry_script(
+        &blueprint_json,
+        &reg_tx_id,
+        u64::from(reg_index),
+        &treasury.hash,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
     println!("registry policy id:   {}", registry.hash_hex());
     println!("treasury_info policy: {}", treasury.hash_hex());
 
@@ -2692,6 +2706,7 @@ fn run_bootstrap_treasury_info(
         &wallet_utxos,
         &datum,
         &key,
+        (&hex::encode(tsy_tx_id), tsy_index),
         Some(cost_models),
     )
     .map_err(|e| format!("build bootstrap tx: {e}"))?;
@@ -2821,8 +2836,17 @@ fn run_bootstrap_registry(
     let blueprint_json = std::fs::read_to_string(blueprint_path)
         .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
+        &blueprint_json,
+        (&reg_tx_id, u64::from(reg_index)),
+        (&tsy_tx_id, u64::from(tsy_index)),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
 
     let pid = cfg
         .cardano
@@ -2904,8 +2928,17 @@ fn run_bootstrap_ban_list(
     // set + ban schedule + its own one-shot outref. Everything but the outref is
     // config-pinned (shared with apply-ban) so the derived policy id matches.
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
+        &blueprint_json,
+        (&reg_tx_id, u64::from(reg_index)),
+        (&tsy_tx_id, u64::from(tsy_index)),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
     // apply-ban derives the ban policy id from `cardano.ban_bootstrap`. If config
     // pins a different outref than the one bootstrapped here, `ban-root` is minted
@@ -3017,8 +3050,17 @@ fn run_deploy_registry_ref(
     let blueprint_json = std::fs::read_to_string(blueprint_path)
         .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
+        &blueprint_json,
+        (&reg_tx_id, u64::from(reg_index)),
+        (&tsy_tx_id, u64::from(tsy_index)),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
 
     let pid = cfg
         .cardano
@@ -3091,8 +3133,17 @@ fn run_deploy_fault_ref(
     let blueprint_json = std::fs::read_to_string(blueprint_path)
         .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
+        &blueprint_json,
+        (&reg_tx_id, u64::from(reg_index)),
+        (&tsy_tx_id, u64::from(tsy_index)),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
     let verifier = match kind {
         "round1" => fault_verifier_round1_script(&blueprint_json, &registry.hash),
         "round2" => fault_verifier_round2_script(&blueprint_json, &registry.hash),
@@ -3176,8 +3227,17 @@ fn run_deploy_spo_bans_ref(
     let blueprint_json = std::fs::read_to_string(blueprint_path)
         .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
+        &blueprint_json,
+        (&reg_tx_id, u64::from(reg_index)),
+        (&tsy_tx_id, u64::from(tsy_index)),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
     let r1 = fault_verifier_round1_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("fault_verifier_round1: {e}"))?;
     let r2 = fault_verifier_round2_script(&blueprint_json, &registry.hash)
@@ -3284,8 +3344,17 @@ fn run_init_scripts(
     let blueprint_json = std::fs::read_to_string(blueprint_path)
         .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
+        &blueprint_json,
+        (&reg_tx_id, u64::from(reg_index)),
+        (&tsy_tx_id, u64::from(tsy_index)),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
     let r1 = fault_verifier_round1_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("fault_verifier_round1: {e}"))?;
     let r2 = fault_verifier_round2_script(&blueprint_json, &registry.hash)
@@ -3845,10 +3914,24 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let blueprint_json = std::fs::read_to_string(&args.blueprint)
         .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
-        .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let treasury = treasury_info_script(
+        &blueprint_json,
+        &tsy_tx_id,
+        u64::from(tsy_index),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+    let registry = spos_registry_script(
+        &blueprint_json,
+        &reg_tx_id,
+        u64::from(reg_index),
+        &treasury.hash,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
 
     // ── identities: local secret keys, or the air-gapped halves ──
     let cold_skey: Option<ed25519::SecretKey> = args
@@ -4087,10 +4170,17 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         }
     };
 
+    // Rev 5.5: treasury.ak's RegistryUpdate branch reads the registry policy from
+    // the Config datum ([TSY-12]), so the tx must reference the Config UTxO.
+    let config_view = rt
+        .block_on(config_view_async(cfg))?
+        .ok_or("register-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
+
     let req = RegisterSpoRequest {
         registry_script: &registry,
         treasury_script: &treasury,
         treasury_asset_name_hex: &args.treasury_nft_name,
+        config_ref: (config_view.utxo.tx_hash.clone(), config_view.utxo.index),
         registry_utxos: &registry_utxos,
         treasury_utxos: &treasury_utxos,
         wallet_address: &wallet_addr,
@@ -4165,10 +4255,24 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     let blueprint_json = std::fs::read_to_string(&args.blueprint)
         .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
-    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
-        .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let treasury = treasury_info_script(
+        &blueprint_json,
+        &tsy_tx_id,
+        u64::from(tsy_index),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+    let registry = spos_registry_script(
+        &blueprint_json,
+        &reg_tx_id,
+        u64::from(reg_index),
+        &treasury.hash,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
 
     let new_key = parse_hex_n::<32>(&args.new_key, "--new-key")?;
     let epoch_i64 =
@@ -4321,8 +4425,17 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let blueprint_json = std::fs::read_to_string(&args.blueprint)
         .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
+        &blueprint_json,
+        (&reg_tx_id, u64::from(reg_index)),
+        (&tsy_tx_id, u64::from(tsy_index)),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
     let fault_kind = parse_fault_verifier_kind(&args.fault_kind)?;
     let fault = fault_verifier_script(&blueprint_json, fault_kind, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
@@ -4526,8 +4639,17 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
     let blueprint_json = std::fs::read_to_string(&args.blueprint)
         .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
+        &blueprint_json,
+        (&reg_tx_id, u64::from(reg_index)),
+        (&tsy_tx_id, u64::from(tsy_index)),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
     let json = std::fs::read_to_string(&args.evidence_file)
         .map_err(|e| format!("read evidence file {}: {e}", args.evidence_file))?;
     let ev: EvidenceFile = serde_json::from_str(&json)

@@ -452,27 +452,65 @@ pub fn parse_outref(s: &str) -> Result<([u8; 32], u32), String> {
     Ok((tx_id, index))
 }
 
+/// The two rev-5.5 inputs every blueprint derivation needs beyond the registry
+/// bootstrap: the treasury's own one-shot outref and the Config NFT policy id.
+///
+/// One accessor, because the pair is required by three unrelated call paths
+/// (roster, ban list, fault verifiers) and each getting it from `[cardano]`
+/// separately is how one of them ends up reading a different bridge.
+pub fn treasury_derivation_inputs(
+    cardano: &crate::config::CardanoConfig,
+) -> Result<(String, [u8; 28]), String> {
+    let bootstrap = cardano
+        .treasury_bootstrap
+        .clone()
+        .ok_or("cardano.treasury_bootstrap is required to derive the treasury policy (rev 5.5: it is a parameter of treasury_info)")?;
+    let hex_str = cardano.config_nft_policy_id.as_deref().ok_or(
+        "cardano.config_nft_policy_id is required to derive the treasury policy (rev 5.5 [PRE-3])",
+    )?;
+    let policy: [u8; 28] = hex::decode(hex_str)
+        .ok()
+        .and_then(|v| <[u8; 28]>::try_from(v).ok())
+        .ok_or("cardano.config_nft_policy_id is not 28 bytes")?;
+    Ok((bootstrap, policy))
+}
+
 impl RegistryRosterSource {
     /// Parameterize the registry + `treasury_info` scripts from the blueprint
     /// and derive their addresses. `mainnet` picks the address network tag.
     pub fn from_blueprint(
         blueprint_path: &str,
         registry_bootstrap: &str,
-        treasury_info_asset_name_hex: &str,
+        treasury_bootstrap: &str,
+        config_policy_id: &[u8; 28],
         mainnet: bool,
     ) -> Result<Self, RosterError> {
         let blueprint_json = std::fs::read_to_string(blueprint_path)
             .map_err(|e| RosterError::Config(format!("read blueprint {blueprint_path}: {e}")))?;
-        let (tx_id, index) = parse_outref(registry_bootstrap)
+        let (reg_tx_id, reg_index) = parse_outref(registry_bootstrap)
             .map_err(|e| RosterError::Config(format!("registry bootstrap outref: {e}")))?;
+        let (tsy_tx_id, tsy_index) = parse_outref(treasury_bootstrap)
+            .map_err(|e| RosterError::Config(format!("treasury bootstrap outref: {e}")))?;
         let err = |what: &str, e: BlueprintError| {
             RosterError::Config(format!("parameterize {what}: {e}"))
         };
-        let registry = blueprint::spos_registry_script(&blueprint_json, &tx_id, u64::from(index))
-            .map_err(|e| err("spos_registry", e))?;
-        // spec [PRE-1]: treasury_info is parameterized by the registry policy alone.
-        let treasury = blueprint::treasury_info_script(&blueprint_json, &registry.hash)
-            .map_err(|e| err("treasury_info", e))?;
+        // Rev 5.5 derivation order: Config → treasury → registry. It used to run
+        // the other way, which made the dependency a cycle and the [REG-6] pin
+        // impossible ([PRE-3], [PRE-4]).
+        let treasury = blueprint::treasury_info_script(
+            &blueprint_json,
+            &tsy_tx_id,
+            u64::from(tsy_index),
+            config_policy_id,
+        )
+        .map_err(|e| err("treasury_info", e))?;
+        let registry = blueprint::spos_registry_script(
+            &blueprint_json,
+            &reg_tx_id,
+            u64::from(reg_index),
+            &treasury.hash,
+        )
+        .map_err(|e| err("spos_registry", e))?;
         let network = if mainnet {
             pallas_addresses::Network::Mainnet
         } else {
@@ -484,7 +522,9 @@ impl RegistryRosterSource {
             treasury_info_address: treasury.enterprise_address(network),
             treasury_info_policy_hex: treasury.hash_hex(),
             treasury_info_script: Some(treasury),
-            treasury_info_asset_name_hex: treasury_info_asset_name_hex.to_string(),
+            treasury_info_asset_name_hex: hex::encode(
+                crate::cardano::config_params::TREASURY_INFO_ASSET_NAME,
+            ),
             min_signers: None,
         })
     }
@@ -538,15 +578,25 @@ impl RegistryRosterSource {
     /// the parameter this compiles from is exactly what a node can get wrong,
     /// and the consequence — a handoff written to an address no other SPO reads
     /// — is the failure publishing #12 exists to prevent.
-    pub fn with_derived_script(mut self, blueprint_path: &str) -> Result<Self, RosterError> {
+    pub fn with_derived_script(
+        mut self,
+        blueprint_path: &str,
+        treasury_bootstrap: &str,
+        config_policy_id: &[u8; 28],
+    ) -> Result<Self, RosterError> {
         let blueprint_json = std::fs::read_to_string(blueprint_path)
             .map_err(|e| RosterError::Config(format!("read blueprint {blueprint_path}: {e}")))?;
-        let registry_policy: [u8; 28] = hex::decode(&self.registry_policy_hex)
-            .ok()
-            .and_then(|v| <[u8; 28]>::try_from(v).ok())
-            .ok_or_else(|| RosterError::Config("registry policy id is not 28 bytes".into()))?;
-        let treasury = blueprint::treasury_info_script(&blueprint_json, &registry_policy)
-            .map_err(|e| RosterError::Config(format!("parameterize treasury_info: {e}")))?;
+        let (tsy_tx_id, tsy_index) = parse_outref(treasury_bootstrap)
+            .map_err(|e| RosterError::Config(format!("treasury bootstrap outref: {e}")))?;
+        // Rev 5.5 [PRE-3]: the treasury script compiles from its OWN one-shot
+        // outpoint and the Config NFT policy, not from the registry policy.
+        let treasury = blueprint::treasury_info_script(
+            &blueprint_json,
+            &tsy_tx_id,
+            u64::from(tsy_index),
+            config_policy_id,
+        )
+        .map_err(|e| RosterError::Config(format!("parameterize treasury_info: {e}")))?;
         if treasury.hash_hex() != self.treasury_info_policy_hex {
             return Err(RosterError::DerivedMismatch {
                 derived: treasury.hash_hex(),
@@ -558,32 +608,50 @@ impl RegistryRosterSource {
     }
 
     /// Build from `[cardano]` config: requires `registry_blueprint`,
-    /// `registry_bootstrap` and `treasury_info_asset_name` all set (`None`
-    /// when none are — the caller falls back to its fixture roster), errors
-    /// when only some are.
+    /// `registry_bootstrap`, `treasury_bootstrap` and `config_nft_policy_id`
+    /// all set (`None` when none are — the caller falls back to its fixture
+    /// roster), errors when only some are.
+    ///
+    /// Rev 5.5 swapped `treasury_info_asset_name` for `treasury_bootstrap` +
+    /// `config_nft_policy_id`. The asset name is the [CFG-4] constant now, and
+    /// the treasury script compiles from its own one-shot outpoint and the
+    /// Config identity ([PRE-3]) rather than from the registry policy.
     pub fn from_config(
         cardano: &crate::config::CardanoConfig,
     ) -> Result<Option<Self>, RosterError> {
         let fields = (
             cardano.registry_blueprint.as_deref(),
             cardano.registry_bootstrap.as_deref(),
-            cardano.treasury_info_asset_name.as_deref(),
+            cardano.treasury_bootstrap.as_deref(),
+            cardano.config_nft_policy_id.as_deref(),
         );
-        let (blueprint_path, bootstrap, asset_name_hex) = match fields {
-            (None, None, None) => return Ok(None),
-            (Some(b), Some(r), Some(a)) => (b, r, a),
+        let (blueprint_path, bootstrap, treasury_bootstrap, config_policy_hex) = match fields {
+            (None, None, None, _) => return Ok(None),
+            (Some(b), Some(r), Some(t), Some(c)) => (b, r, t, c),
             _ => {
                 return Err(RosterError::Config(
-                    "set all of cardano.registry_blueprint, cardano.registry_bootstrap and \
-                     cardano.treasury_info_asset_name (or none, for the fixture roster)"
+                    "set all of cardano.registry_blueprint, cardano.registry_bootstrap, \
+                     cardano.treasury_bootstrap and cardano.config_nft_policy_id (or none of \
+                     the first three, for the fixture roster)"
                         .into(),
                 ));
             }
         };
+        let config_policy_id: [u8; 28] = hex::decode(config_policy_hex)
+            .ok()
+            .and_then(|v| <[u8; 28]>::try_from(v).ok())
+            .ok_or_else(|| {
+                RosterError::Config("cardano.config_nft_policy_id is not 28 bytes".into())
+            })?;
         let mainnet = cardano.is_mainnet().map_err(RosterError::Config)?;
-        // PRE-1 (rev 5.4): treasury_info no longer takes the TM-NFT policy;
-        // its only parameter besides the registry fields is gone.
-        Self::from_blueprint(blueprint_path, bootstrap, asset_name_hex, mainnet).map(Some)
+        Self::from_blueprint(
+            blueprint_path,
+            bootstrap,
+            treasury_bootstrap,
+            &config_policy_id,
+            mainnet,
+        )
+        .map(Some)
     }
 
     /// Resolve the roster source the way every node should: from the bridge
@@ -630,10 +698,24 @@ impl RegistryRosterSource {
         // may legitimately still have it while typing none of the identifiers.
         // Where it does, compile the script for Update-Y — which also checks the
         // derivation against #10.
-        let Some(blueprint_path) = cardano.registry_blueprint.as_deref() else {
+        let (Some(blueprint_path), Some(treasury_bootstrap), Some(config_policy_hex)) = (
+            cardano.registry_blueprint.as_deref(),
+            cardano.treasury_bootstrap.as_deref(),
+            cardano.config_nft_policy_id.as_deref(),
+        ) else {
             return Ok(Some(source));
         };
-        match source.clone().with_derived_script(blueprint_path) {
+        let Some(config_policy_id) = hex::decode(config_policy_hex)
+            .ok()
+            .and_then(|v| <[u8; 28]>::try_from(v).ok())
+        else {
+            return Ok(Some(source));
+        };
+        match source.clone().with_derived_script(
+            blueprint_path,
+            treasury_bootstrap,
+            &config_policy_id,
+        ) {
             Ok(with_script) => Ok(Some(with_script)),
             Err(e @ RosterError::DerivedMismatch { .. }) => Err(e),
             Err(e) => {
@@ -1146,6 +1228,8 @@ mod tests {
     fn no_config_falls_back_to_local_keys_and_half_configured_keys_are_a_fault() {
         let half = crate::config::CardanoConfig {
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            treasury_bootstrap: Some(format!("{}:0", "aa".repeat(32))),
+            config_nft_policy_id: Some("77".repeat(28)),
             ..Default::default()
         };
         let err = RegistryRosterSource::resolve(&half, None)
@@ -1184,7 +1268,11 @@ mod tests {
 
         let err = src
             .clone()
-            .with_derived_script(&path.to_string_lossy())
+            .with_derived_script(
+                &path.to_string_lossy(),
+                &format!("{}:0", "aa".repeat(32)),
+                &[0x77; 28],
+            )
             .expect_err("the fixture derives some other policy than the published #12");
         let RosterError::DerivedMismatch { published, .. } = &err else {
             panic!("expected a derived-vs-published mismatch, got {err:?}");
@@ -1195,12 +1283,18 @@ mod tests {
         // …and when they agree, the script is attached so Update-Y can run.
         let derived = crate::cardano::blueprint::treasury_info_script(
             &std::fs::read_to_string(&path).unwrap(),
-            &[0xc1; 28],
+            &[0xaa; 32],
+            0,
+            &[0x77; 28],
         )
         .unwrap();
         let agreeing =
             RegistryRosterSource::from_policy_ids(&[0xc1; 28], &derived.hash, b"TMTx", false)
-                .with_derived_script(&path.to_string_lossy())
+                .with_derived_script(
+                    &path.to_string_lossy(),
+                    &format!("{}:0", "aa".repeat(32)),
+                    &[0x77; 28],
+                )
                 .expect("matching derivation");
         assert!(agreeing.treasury_info_script.is_some());
         assert!(agreeing.can_hand_off_key());
@@ -1215,7 +1309,9 @@ mod tests {
         let path = treasury_info_blueprint("crosscheck");
         let derived = crate::cardano::blueprint::treasury_info_script(
             &std::fs::read_to_string(&path).unwrap(),
-            &[0xc1; 28],
+            &[0xaa; 32],
+            0,
+            &[0x77; 28],
         )
         .unwrap();
 
@@ -1225,6 +1321,10 @@ mod tests {
             network: Some("preprod".to_string()),
             registry_blueprint: Some(path.to_string_lossy().into_owned()),
             treasury_policy_id: Some(hex::encode([0x11; 28])),
+            // Rev 5.5: compiling treasury_info needs its own one-shot outref and
+            // the Config NFT policy, not the registry policy.
+            treasury_bootstrap: Some(format!("{}:0", "aa".repeat(32))),
+            config_nft_policy_id: Some("77".repeat(28)),
             ..Default::default()
         };
 

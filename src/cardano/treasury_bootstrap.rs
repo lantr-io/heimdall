@@ -143,6 +143,10 @@ pub fn build_treasury_bootstrap_tx(
     wallet_utxos: &[WalletUtxo],
     datum: &TreasuryInfoDatum,
     key: &PrivateKey,
+    // The outpoint `treasury_script` was PARAMETERIZED with. Rev 5.5 makes it a
+    // validator parameter, so the caller chooses it before compiling and this tx
+    // must spend that exact UTxO ([TSY-3]).
+    one_shot: (&str, u32),
     // Live `[V1, V2, V3]` cost models (see `publish::build_oracle_update_tx`);
     // `None` → whisky's built-in Preprod models.
     cost_models: Option<Vec<Vec<i64>>>,
@@ -155,25 +159,33 @@ pub fn build_treasury_bootstrap_tx(
     let script_address = treasury_script.enterprise_address(network);
     let policy_id_hex = treasury_script.hash_hex();
 
-    // The one-shot + fee input: the richest PURE-ADA wallet UTxO. Pure-ADA is
-    // required — this builder emits a single change output that forwards only
-    // ADA, so a token-bearing one-shot would silently drop its native tokens
-    // and the tx fails ledger value-conservation (ValueNotConservedUTxO, hit on
-    // a preprod wallet carrying leftover test tokens). Matches the pure-ADA
-    // selection in `tx_common::select_fee` / `register_pool::select_inputs`.
+    // The one-shot + fee input. Rev 5.5: this is NOT a free choice any more. The
+    // outpoint is a validator parameter, so it is already baked into
+    // `treasury_script`'s hash — the tx must spend exactly that UTxO or the
+    // policy simply refuses ([TSY-3]). Before, the builder picked the richest
+    // pure-ADA UTxO and the asset name followed from whatever it picked.
+    //
+    // Pure-ADA is still required: this builder emits a single change output that
+    // forwards only ADA, so a token-bearing one-shot would silently drop its
+    // native tokens and fail ledger value-conservation (ValueNotConservedUTxO,
+    // hit on a preprod wallet carrying leftover test tokens).
     let fee_utxo = wallet_utxos
         .iter()
-        .filter(|u| u.pure_ada)
-        .max_by_key(|u| u.lovelace)
+        .find(|u| u.tx_hash == one_shot.0 && u.output_index == one_shot.1)
         .ok_or_else(|| {
-            EpochError::Chain("no pure-ADA wallet UTxO for the one-shot input".into())
+            EpochError::Chain(format!(
+                "the treasury one-shot outpoint {}:{} is not in this wallet — it is a parameter \
+                 of treasury_info, so the bootstrap tx must spend that exact UTxO",
+                one_shot.0, one_shot.1
+            ))
         })?;
-    let _tx_id: [u8; 32] = hex::decode(&fee_utxo.tx_hash)
-        .ok()
-        .and_then(|v| v.try_into().ok())
-        .ok_or_else(|| {
-            EpochError::Chain(format!("bad wallet UTxO tx hash: {}", fee_utxo.tx_hash))
-        })?;
+    if !fee_utxo.pure_ada {
+        return Err(EpochError::Chain(format!(
+            "the treasury one-shot outpoint {}:{} carries native tokens; this builder emits an \
+             ADA-only change output, so the tx would fail value conservation",
+            one_shot.0, one_shot.1
+        )));
+    }
 
     // Rev 5.5 [CFG-4]: the asset name is the constant, not sha256 of the consumed
     // outpoint. Uniqueness moved into the POLICY ID, where the one-shot outpoint
@@ -431,9 +443,16 @@ mod tests {
             lovelace: 50_000_000,
             pure_ada: true,
         }];
-        let built =
-            build_treasury_bootstrap_tx(&test_script(), &wallet_addr, &utxos, &datum, &key, None)
-                .expect("spec [PRE-2]: a non-empty operator-supplied identity root is accepted");
+        let built = build_treasury_bootstrap_tx(
+            &test_script(),
+            &wallet_addr,
+            &utxos,
+            &datum,
+            &key,
+            (&"bb".repeat(32), 3),
+            None,
+        )
+        .expect("spec [PRE-2]: a non-empty operator-supplied identity root is accepted");
         // The state output's inline datum carries the operator's root verbatim.
         let tx: Tx = minicbor::decode(&hex::decode(&built.signed_tx_hex).unwrap()).unwrap();
         let PseudoTransactionOutput::PostAlonzo(out) = &tx.transaction_body.outputs[0] else {
@@ -486,8 +505,16 @@ mod tests {
         ];
         let datum = bootstrap_datum(vec![0xAB; 32], mpf::NULL_HASH);
 
-        let built =
-            build_treasury_bootstrap_tx(&script, &wallet_addr, &utxos, &datum, &key, None).unwrap();
+        let built = build_treasury_bootstrap_tx(
+            &script,
+            &wallet_addr,
+            &utxos,
+            &datum,
+            &key,
+            (&one_shot_hash, 3),
+            None,
+        )
+        .unwrap();
 
         // The richest UTxO became the one-shot. Rev 5.5 [CFG-4]: it no longer
         // NAMES the NFT — the name is the constant, and uniqueness lives in the

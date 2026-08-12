@@ -393,11 +393,22 @@ pub struct CardanoConfig {
     /// `query_roster` from the demo fixture to the on-chain SPO registry.
     pub registry_blueprint: Option<String>,
     /// The spos_registry one-shot bootstrap outref `<tx_hash>:<index>` that
-    /// parameterizes the registry policy (and through it treasury_info).
+    /// parameterizes the registry policy.
     pub registry_bootstrap: Option<String>,
-    /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
-    /// Identifies the `treasury_info` state UTxO whose
-    /// `bifrost_identity_root` the registry snapshot is verified against.
+    /// The treasury_info one-shot bootstrap outref `<tx_hash>:<index>` that
+    /// parameterizes the treasury policy, together with the Config NFT policy id
+    /// ([PRE-3]).
+    ///
+    /// Rev 5.5 inverted the derivation. It used to run registry → treasury,
+    /// because `treasury_info` took `registry_policy_id`; that made the
+    /// dependency a cycle and so made the [REG-6] pin impossible. It now runs
+    /// Config → treasury → registry, and this key is the treasury's own half.
+    pub treasury_bootstrap: Option<String>,
+    /// Treasury NFT asset name (hex).
+    ///
+    /// **Unused since rev 5.5** — the name is the [CFG-4] protocol constant
+    /// `"BFRTRY"`. Kept so an existing `heimdall.toml` still parses; the value
+    /// is ignored.
     pub treasury_info_asset_name: Option<String>,
     /// The spo_bans one-shot bootstrap outref `<tx_hash>:<index>` that
     /// parameterizes the ban-list policy (the policy is also parameterized
@@ -472,6 +483,7 @@ impl Default for CardanoConfig {
             config_nft_asset_name: None,
             registry_blueprint: None,
             registry_bootstrap: None,
+            treasury_bootstrap: None,
             treasury_info_asset_name: None,
             ban_bootstrap: None,
             fault_proof_policies: Vec::new(),

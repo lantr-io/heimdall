@@ -227,31 +227,92 @@ pub fn apply_params(
 
 /// `spos_registry` parameterized by its one-shot bootstrap output ref
 /// (`bootstrap_tx_id`, `bootstrap_output_index` — two separate params, not an
-/// `OutputReference`). The resulting hash is the `registry_policy_id`.
+/// `OutputReference`) and, since rev 5.5, the `treasury_policy_id` it pins.
+/// The resulting hash is the `registry_policy_id`.
+///
+/// The third parameter is [REG-6]: `spos-registry.ak` locates the Treasury state
+/// UTxO by redeemer index, and until rev 5.5 authenticated it not at all, so a
+/// registrant could point the index at a wallet UTxO carrying a datum of the
+/// right shape and satisfy the [REG-5] absence proof against a trie it chose.
+///
+/// It could not have been a parameter before: `treasury_info` took
+/// `registry_policy_id`, which made the treasury policy a function of this one
+/// and the dependency a cycle. [PRE-4] broke that by reading the registry policy
+/// from the Config datum instead, so the build order is now a chain — Config
+/// identity, then treasury, then registry.
 pub fn spos_registry_script(
     blueprint_json: &str,
     bootstrap_tx_id: &[u8; 32],
     bootstrap_output_index: u64,
+    treasury_policy_id: &[u8; 28],
 ) -> Result<ParameterizedScript, BlueprintError> {
     let code = validator_compiled_code(blueprint_json, SPOS_REGISTRY_TITLE)?;
     apply_params(
         &code,
-        &[bytes(bootstrap_tx_id), int_from_u64(bootstrap_output_index)],
+        &[
+            bytes(bootstrap_tx_id),
+            int_from_u64(bootstrap_output_index),
+            bytes(treasury_policy_id),
+        ],
     )
 }
 
-/// `treasury_info` parameterized by `registry_policy_id` ALONE – spec [PRE-1].
-/// The N10b `tm_nft_policy_id` 2nd param existed only for the
-/// `treasury.ak::FederationReset` branch; with that branch removed ([UY-5]
-/// replaces it) the validator reads nothing the bridge owns. Every caller MUST
-/// apply the same single parameter or it computes a different treasury_info
-/// hash (→ a different address, → the state UTxO is unfindable).
+/// `treasury_info` parameterized by its OWN one-shot outpoint and the Config NFT
+/// policy id — spec [PRE-1] (revised) and [PRE-3].
+///
+/// The one-shot outpoint is what makes the state NFT a singleton: rev 5.4 minted
+/// it one-shot per OUTPOINT rather than per bridge, so anyone could mint a rival
+/// state UTxO with a datum of their choosing. Baking the outpoint into the policy
+/// id means only the deployer can ever mint, and the asset name becomes the
+/// [CFG-4] constant `"BFRTRY"`.
+///
+/// It takes NO `registry_policy_id`: that parameter made the dependency a cycle
+/// and so made [REG-6] impossible. `treasury.ak` reads the registry policy from
+/// the Config datum at run time instead ([PRE-4]).
+///
+/// Every caller MUST apply the same three parameters or it computes a different
+/// treasury_info hash (→ a different address, → the state UTxO is unfindable).
 pub fn treasury_info_script(
     blueprint_json: &str,
-    registry_policy_id: &[u8; 28],
+    one_shot_tx_id: &[u8; 32],
+    one_shot_output_index: u64,
+    config_policy_id: &[u8; 28],
 ) -> Result<ParameterizedScript, BlueprintError> {
     let code = validator_compiled_code(blueprint_json, TREASURY_INFO_TITLE)?;
-    apply_params(&code, &[bytes(registry_policy_id)])
+    apply_params(
+        &code,
+        &[
+            bytes(one_shot_tx_id),
+            int_from_u64(one_shot_output_index),
+            bytes(config_policy_id),
+        ],
+    )
+}
+
+/// The registry policy, derived the rev-5.5 way: Config → treasury → registry.
+///
+/// One place for the ORDER, because getting it wrong is silent: every wrong
+/// input yields a well-formed policy id, a well-formed address, and a UTxO set
+/// that is simply empty. Rev 5.4 ran registry → treasury; the cycle that created
+/// is what made the [REG-6] pin impossible.
+pub fn registry_policy_from_bootstraps(
+    blueprint_json: &str,
+    registry_bootstrap: (&[u8; 32], u64),
+    treasury_bootstrap: (&[u8; 32], u64),
+    config_policy_id: &[u8; 28],
+) -> Result<ParameterizedScript, BlueprintError> {
+    let treasury = treasury_info_script(
+        blueprint_json,
+        treasury_bootstrap.0,
+        treasury_bootstrap.1,
+        config_policy_id,
+    )?;
+    spos_registry_script(
+        blueprint_json,
+        registry_bootstrap.0,
+        registry_bootstrap.1,
+        &treasury.hash,
+    )
 }
 
 /// The blueprint's own `hash` field of the validator titled `title` — final
@@ -377,17 +438,23 @@ mod tests {
     const TREASURY_MOVEMENT_HASH: &str = "372db474c29284bbcbb4b6527c0749d81ad3f2d524a57c55c83044c8";
 
     // `bitcoin/treasury.treasury_info.mint` (unparameterized compiledCode) from
-    // the same blueprint, and the hash `aiken blueprint apply` produces for it
-    // with param `581c796609d4a6a9f0bda089817e69e56e555356b2eca684f747c91baa16`
-    // (a registry policy id; itself aiken's output for spos_registry applied to
-    // bootstrap_tx_id = 0xaa*32, bootstrap_output_index = 1).
+    // the rev-5.5 blueprint, and the hashes `aiken blueprint apply` produces for
+    // it. Both are aiken's OWN output, generated by applying the params below to
+    // this exact compiledCode — so an equal hash here means apply_params
+    // reproduces `aiken blueprint apply` byte-for-byte, not merely that it
+    // agrees with itself.
     const TREASURY_INFO_CODE: &str = include_str!("../../tests/fixtures/treasury_info_code.txt");
-    const REGISTRY_POLICY_FOR_VECTOR: [u8; 28] = [
-        0x79, 0x66, 0x09, 0xd4, 0xa6, 0xa9, 0xf0, 0xbd, 0xa0, 0x89, 0x81, 0x7e, 0x69, 0xe5, 0x6e,
-        0x55, 0x53, 0x56, 0xb2, 0xec, 0xa6, 0x84, 0xf7, 0x47, 0xc9, 0x1b, 0xaa, 0x16,
-    ];
+    /// tx0 = 0x66 * 32, the first of treasury_info's three params.
+    const TX0_FOR_VECTOR: [u8; 32] = [0x66; 32];
+    /// config_policy_id = 0x77 * 28, the third.
+    const CONFIG_POLICY_FOR_VECTOR: [u8; 28] = [0x77; 28];
+    /// aiken's hash after applying tx0 ALONE — the partial application the
+    /// mechanics tests use.
+    const TREASURY_INFO_ONE_PARAM_HASH: &str =
+        "311ca823042e76e2388eb64fed27df20bed39f9700c1f4d0815189ee";
+    /// aiken's hash after applying all three: (tx0, index0 = 0, config_policy).
     const TREASURY_INFO_APPLIED_HASH: &str =
-        "c62f114c966a2ad65ecb27a871600b5b480b08ea98b5ff65625ac627";
+        "e7f62420b4696ff8f260003aaa121870609d75a49892b79b79cc430b";
 
     // A parameterized fault-verifier compiledCode fixture. The concrete
     // validator title is supplied by the blueprint, while the apply mechanics
@@ -466,40 +533,34 @@ mod tests {
     // equal hashes ⇒ equal script bytes (the hash covers the whole program).
     #[test]
     fn apply_params_matches_aiken_blueprint_apply() {
-        let applied = apply_params(
-            TREASURY_INFO_CODE.trim(),
-            &[bytes(&REGISTRY_POLICY_FOR_VECTOR)],
-        )
-        .unwrap();
-        assert_eq!(applied.hash_hex(), TREASURY_INFO_APPLIED_HASH);
+        let applied = apply_params(TREASURY_INFO_CODE.trim(), &[bytes(&TX0_FOR_VECTOR)]).unwrap();
+        assert_eq!(applied.hash_hex(), TREASURY_INFO_ONE_PARAM_HASH);
     }
 
-    // spec [PRE-1]: `treasury_info` MUST take ONLY `registry_policy_id`. With
-    // FederationReset removed it reads nothing the bridge owns. The pin is
-    // TREASURY_INFO_APPLIED_HASH — aiken's own hash for the ONE-param
-    // application of this compiledCode — so applying a second param (or a
-    // different one) fails here.
+    // spec [PRE-1] (revised) / [PRE-3]: `treasury_info` takes its OWN one-shot
+    // outpoint and the Config NFT policy id — and NOT `registry_policy_id`, which
+    // is what made the dependency a cycle and the [REG-6] pin impossible. The pin
+    // is aiken's own hash for the THREE-param application, so applying the wrong
+    // count, order or values fails here.
     #[test]
-    fn treasury_info_applies_single_registry_param() {
+    fn treasury_info_applies_one_shot_and_config_policy() {
         let blueprint = format!(
             r#"{{"validators":[{{"title":"{TREASURY_INFO_TITLE}","compiledCode":"{}"}}]}}"#,
             TREASURY_INFO_CODE.trim()
         );
-        let script = treasury_info_script(&blueprint, &REGISTRY_POLICY_FOR_VECTOR).unwrap();
+        let script =
+            treasury_info_script(&blueprint, &TX0_FOR_VECTOR, 0, &CONFIG_POLICY_FOR_VECTOR)
+                .unwrap();
         assert_eq!(
             script.hash_hex(),
             TREASURY_INFO_APPLIED_HASH,
-            "spec [PRE-1]: treasury_info must be parameterized by registry_policy_id alone"
+            "spec [PRE-3]: treasury_info is (tx0, index0, config_policy_id)"
         );
     }
 
     #[test]
     fn enterprise_address_is_script_keyed() {
-        let applied = apply_params(
-            TREASURY_INFO_CODE.trim(),
-            &[bytes(&REGISTRY_POLICY_FOR_VECTOR)],
-        )
-        .unwrap();
+        let applied = apply_params(TREASURY_INFO_CODE.trim(), &[bytes(&TX0_FOR_VECTOR)]).unwrap();
         let addr = applied.enterprise_address(Network::Testnet);
         assert!(addr.starts_with("addr_test1w"), "script address: {addr}");
         // Round-trip: the payment part is our script hash, no delegation part.
@@ -514,11 +575,7 @@ mod tests {
 
     #[test]
     fn enterprise_address_mainnet_prefix() {
-        let applied = apply_params(
-            TREASURY_INFO_CODE.trim(),
-            &[bytes(&REGISTRY_POLICY_FOR_VECTOR)],
-        )
-        .unwrap();
+        let applied = apply_params(TREASURY_INFO_CODE.trim(), &[bytes(&TX0_FOR_VECTOR)]).unwrap();
         let addr = applied.enterprise_address(Network::Mainnet);
         assert!(addr.starts_with("addr1w"), "mainnet script address: {addr}");
     }
@@ -572,7 +629,7 @@ mod tests {
         let path = std::env::var("BIFROST_PLUTUS_JSON")
             .expect("set BIFROST_PLUTUS_JSON to the upstream plutus.json");
         let blueprint = std::fs::read_to_string(path).unwrap();
-        let registry = spos_registry_script(&blueprint, &[0xaa; 32], 1).unwrap();
+        let registry = spos_registry_script(&blueprint, &[0xaa; 32], 1, &[0x77; 28]).unwrap();
         // N10b: spos_registry references TreasuryDatum, whose shape changed (federation
         // fields + last_reset_tm_txid), so its compiled code — and this hash — moved.
         assert_eq!(
@@ -586,7 +643,7 @@ mod tests {
         // upstream blueprint (whose treasury_info compiledCode still declares
         // the vestigial tm_nft_policy_id parameter after it); re-pin when the
         // bridge-track treasury.ak change regenerates plutus.json.
-        let treasury = treasury_info_script(&blueprint, &registry.hash).unwrap();
+        let treasury = treasury_info_script(&blueprint, &[0x66; 32], 0, &[0x77; 28]).unwrap();
         assert_eq!(
             treasury.hash_hex(),
             "691f2dd908d5e5dd18d7c8ed526caea8465757011ae20d7e6c308a21"

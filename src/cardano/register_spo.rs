@@ -376,6 +376,12 @@ pub struct RegisterSpoRequest<'a> {
     /// spend and the mint, and embedding it twice blows past the 16 KB
     /// tx-size limit. `None` embeds it (offline tests).
     pub registry_ref: Option<(String, u32)>,
+    /// `(tx_hash, index)` of the Config UTxO. Rev 5.5: `treasury.ak`'s
+    /// `RegistryUpdate` branch reads `spos_registry_policy_id` from the Config
+    /// datum ([TSY-12], [TSY-13]) instead of taking the registry policy as a
+    /// compile parameter — which is what broke the dependency cycle and let
+    /// `spo_registry` pin this UTxO ([REG-6]). So the tx must REFERENCE it.
+    pub config_ref: (String, u32),
     /// Live `[V1, V2, V3]` cost models; `None` → whisky's built-in Preprod.
     pub cost_models: Option<Vec<Vec<i64>>>,
 }
@@ -463,11 +469,41 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
     let network = network_from_address(req.wallet_address);
     let registry_address = req.registry_script.enterprise_address(network);
 
+    // Reference inputs, in the order the built tx will carry them. whisky adds
+    // the registry reference script itself and the post-build fixup sorts the
+    // set by (tx_id, index), so the Config's redeemer index must be computed
+    // against that SAME sort — not assumed to be 0.
+    let mut reference_inputs = vec![RefTxIn {
+        tx_hash: req.config_ref.0.clone(),
+        tx_index: req.config_ref.1,
+        script_size: None,
+    }];
+    if let Some((ref_tx, ref_ix)) = &req.registry_ref {
+        reference_inputs.push(RefTxIn {
+            tx_hash: ref_tx.clone(),
+            tx_index: *ref_ix,
+            script_size: None,
+        });
+    }
+    let config_ref_index = {
+        let mut keys: Vec<(Vec<u8>, u32)> = reference_inputs
+            .iter()
+            .map(|r| (hex::decode(&r.tx_hash).unwrap_or_default(), r.tx_index))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let want = (
+            hex::decode(&req.config_ref.0).unwrap_or_default(),
+            req.config_ref.1,
+        );
+        u64::try_from(keys.iter().position(|k| *k == want).unwrap_or(0)).unwrap_or(0)
+    };
+
     let (treasury_in, treasury_out) = treasury_spend_leg(
         &state,
         req.treasury_script,
         &new_treasury_datum,
-        registry_update_redeemer(0),
+        registry_update_redeemer(config_ref_index),
         network,
     );
 
@@ -615,7 +651,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
         change_address: req.wallet_address.to_string(),
         signing_key: vec![],
         network: Some(whisky_network(&req.cost_models)),
-        reference_inputs: vec![],
+        reference_inputs: reference_inputs.clone(),
         withdrawals: vec![],
         mints: vec![MintItem::ScriptMint(ScriptMint {
             mint: MintParameter {
@@ -1185,6 +1221,7 @@ mod tests {
             invalid_before: Some(70_000_000),
             invalid_hereafter: Some(70_432_000),
             registry_ref: None,
+            config_ref: ("cc".repeat(32), 0),
             cost_models: None,
         };
         let built = build_register_spo_tx(&req).expect("build register_spo tx");
@@ -1470,6 +1507,7 @@ mod tests {
             invalid_before: None,
             invalid_hereafter: None,
             registry_ref: None,
+            config_ref: ("cc".repeat(32), 0),
             cost_models: None,
         };
         assert!(matches!(
