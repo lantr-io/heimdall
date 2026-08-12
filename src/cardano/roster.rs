@@ -679,8 +679,9 @@ impl RegistryRosterSource {
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
     ) -> Result<Option<Self>, RosterError> {
-        // Since rev 5.4 the registry identity (#11-#13) is MANDATORY in the
-        // datum, so having a Config at all means having the identity.
+        // Since rev 5.4 the registry identity is MANDATORY in the datum, so
+        // having a Config at all means having the identity. Rev 5.5 renumbered it
+        // to #9 (registry) + #10 (treasury); the asset name became a constant.
         let Some(published) = config.map(|c| &c.registry) else {
             return Self::from_config(cardano);
         };
@@ -720,7 +721,7 @@ impl RegistryRosterSource {
             Err(e @ RosterError::DerivedMismatch { .. }) => Err(e),
             Err(e) => {
                 tracing::warn!(
-                    "[roster] the bridge Config publishes the registry identity (#11-#13), so \
+                    "[roster] the bridge Config publishes the registry identity (#9-#10), so \
                      this node reads the roster from it — but the local treasury_info script \
                      could not be compiled ({e}). Reading is unaffected; an Update-Y key \
                      handoff on this node is NOT possible until cardano.registry_blueprint \

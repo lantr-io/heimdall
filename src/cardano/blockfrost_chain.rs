@@ -102,7 +102,7 @@ impl DkgFaultBanFlow {
     /// after a fault is detected.
     ///
     /// `config` is the decoded bridge Config: it supplies the ban schedule
-    /// (#18–#20) when the bridge publishes one, and its ban policy id (#17) is
+    /// (params[4..6]) when the bridge publishes one, and its ban policy id (#8) is
     /// what the locally derived `spo_bans` is checked against (WI-065).
     pub fn from_config(
         cardano: &crate::config::CardanoConfig,

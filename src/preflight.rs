@@ -686,7 +686,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 format!("cannot derive the ban list: {e}"),
                 "the eligible roster is the registry MINUS active bans — a node that cannot \
                  read the list computes a different DKG participant set from one that can.\n\
-                 A bridge whose Config publishes the ban policy (#17) needs NO ban keys here; \
+                 A bridge whose Config publishes the ban policy (#8) needs NO ban keys here; \
                  otherwise:\n\
                  heimdall bootstrap-ban-list --config <file> ... --submit  (once per bridge)",
             ),

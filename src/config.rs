@@ -416,7 +416,7 @@ pub struct CardanoConfig {
     /// must be set alongside).
     ///
     /// **Only for a bridge whose Config predates the ban-policy append.** Where
-    /// the Config publishes the finished policy id (#17) that value wins and this
+    /// the Config publishes the finished policy id (#8) that value wins and this
     /// key is not needed at all — see [`crate::cardano::ban_list::BanListSource::resolve`].
     /// Left set on such a bridge it is unused, and a startup error if it derives
     /// a different policy than the one published.

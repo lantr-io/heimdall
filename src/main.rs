@@ -1586,7 +1586,7 @@ async fn run_demo(
                 }
                 bf_chain = bf_chain.with_registry_roster(source);
                 // Ban filtering (WI-011/012): from the Config's published ban
-                // policy (#17) where the bridge has one, else the local keys.
+                // policy (#8) where the bridge has one, else the local keys.
                 match heimdall::cardano::ban_list::BanListSource::resolve(
                     &cfg.cardano,
                     bridge_config.as_ref().map(|v| &v.params),
@@ -4827,7 +4827,7 @@ fn run_show_roster(
     println!(
         "registry source:   {}",
         if bridge_config.is_some() {
-            "bridge Config #11-#13"
+            "bridge Config #9-#10"
         } else {
             "LOCAL heimdall.toml registry keys"
         }

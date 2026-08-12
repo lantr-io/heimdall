@@ -235,7 +235,7 @@ impl std::fmt::Display for BanListError {
             Self::NotBootstrapped => write!(
                 f,
                 "ban list not bootstrapped: no ban-policy NFTs at the ban script address. On a \
-                 bridge whose Config publishes the ban policy (#17) the root was minted at \
+                 bridge whose Config publishes the ban policy (#8) the root was minted at \
                  genesis, BEFORE the Config naming it — so this means the address is wrong, not \
                  the list empty: check cardano.network against the bridge (the network tag is \
                  the only part of the address still taken from local config), and that #17 is \
@@ -716,7 +716,7 @@ impl BanSourceOrigin {
 impl std::fmt::Display for BanSourceOrigin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Config => write!(f, "published by the bridge Config (#17)"),
+            Self::Config => write!(f, "published by the bridge Config (#8)"),
             Self::LocalKeys => write!(f, "LOCAL heimdall.toml ban keys"),
         }
     }
