@@ -133,7 +133,7 @@ impl std::fmt::Display for RosterError {
             Self::DerivedMismatch { derived, published } => write!(
                 f,
                 "this node derives treasury_info policy {derived} but the bridge Config \
-                 publishes {published} (field #12) — an Update-Y built here would write the \
+                 publishes {published} (field #10) — an Update-Y built here would write the \
                  key handoff to an address no other SPO reads. Check \
                  cardano.registry_blueprint, or delete it and read the published identity \
                  — this node then cannot perform the handoff"
@@ -1274,12 +1274,13 @@ mod tests {
                 &format!("{}:0", "aa".repeat(32)),
                 &[0x77; 28],
             )
-            .expect_err("the fixture derives some other policy than the published #12");
+            .expect_err("the fixture derives some other policy than the published #10");
         let RosterError::DerivedMismatch { published, .. } = &err else {
             panic!("expected a derived-vs-published mismatch, got {err:?}");
         };
         assert_eq!(*published, "c2".repeat(28));
-        assert!(err.to_string().contains("#12"), "{err}");
+        // The message names the field an operator goes and reads; rev 5.5 renumbered it to #10.
+        assert!(err.to_string().contains("#10"), "{err}");
 
         // …and when they agree, the script is attached so Update-Y can run.
         let derived = crate::cardano::blueprint::treasury_info_script(
