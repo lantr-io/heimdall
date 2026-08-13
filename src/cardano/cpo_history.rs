@@ -700,7 +700,13 @@ impl CpoHistorySource for BlockfrostHistory {
         // holding ONE output; a chain state that needs a second page of either is
         // already the "not a singleton" case the caller rejects, and truncating it
         // at 100 changes nothing about that verdict.
-        let path = format!("assets/{unit}/addresses?page=1&count={PAGE}");
+        // No `page` parameter: this asks for the FIRST page, and the first page is
+        // what every Blockfrost-compatible backend returns by default — but they do
+        // not agree on how to name it. Blockfrost numbers pages from 1; yaci-store
+        // numbers THIS endpoint from 0, so `page=1` fetches the empty second page
+        // and the singleton reads as "nobody holds this NFT". Omitting the
+        // parameter is the only spelling both accept.
+        let path = format!("assets/{unit}/addresses?count={PAGE}");
         let Some(v) = self.get_json(&path).await? else {
             return Ok(Vec::new()); // 404: nobody holds it
         };
