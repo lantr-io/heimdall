@@ -1363,7 +1363,16 @@ mod tests {
         let y_fed = xonly_from_seed([3u8; 32]);
         let depositor = xonly_from_seed([7u8; 32]);
         let treasury_si = treasury_spend_info(&secp, y_51, y_fed, 144);
-        let pegin_si = pegin_spend_info(&secp, y_51, depositor, 720);
+        let pegin_si = pegin_spend_info(
+            &secp,
+            &crate::bitcoin::taproot::PeginTreeParams {
+                y_51,
+                y_federation: y_fed,
+                federation_csv_blocks: 144,
+                refund_timeout: 720,
+            },
+            depositor,
+        );
 
         let tm = build_tm_t(
             TreasuryInput {

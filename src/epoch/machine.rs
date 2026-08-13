@@ -769,7 +769,7 @@ async fn publish_keys_phase(
 
 /// Poll the Cardano peg-in source over `config.pegin_collection_window`,
 /// parsing each observed request against the spec-derived peg-in
-/// Taproot for the current Y_51 + refund_timeout + Q_auth.
+/// Taproot for the current Y_51 internal key, the Y_fed emergency leaf and Q_auth.
 /// Parse failures are logged and dropped. The deduped, parsed set is
 /// frozen into the next `BuildTm` phase.
 async fn collect_pegins_phase(
@@ -783,11 +783,17 @@ async fn collect_pegins_phase(
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
 
-    // Pull the current treasury keys from the on-chain oracle. The peg-in
-    // Taproot Q is derived per-depositor inside `parse_pegin_request` from
-    // Y_51 and the Q_auth its OP_RETURN beacon carries.
+    // Pull the current treasury keys from the on-chain oracle. The peg-in Taproot Q is
+    // derived per-depositor inside `parse_pegin_request` from these plus the Q_auth its
+    // OP_RETURN beacon carries. Y_fed and its CSV delay are the federation emergency-sweep
+    // leaf (WI-081); nothing here is configured locally.
     let treasury = chain.query_treasury().await?;
-    let refund_timeout = config.pegin_refund_timeout_blocks;
+    let pegin_tree = crate::bitcoin::taproot::PeginTreeParams {
+        y_51: treasury.y_51,
+        y_federation: treasury.y_fed,
+        federation_csv_blocks: treasury.federation_csv_blocks,
+        refund_timeout: config.pegin_refund_timeout_blocks,
+    };
 
     let deadline = clock.deadline(config.pegin_collection_window);
     let mut accepted: BTreeMap<CardanoOutRef, ParsedPegIn> = BTreeMap::new();
@@ -808,9 +814,9 @@ async fn collect_pegins_phase(
             if accepted.contains_key(&req.cardano_utxo) {
                 continue;
             }
-            // Peg-in internal key is Y_51 (the FROST group key), not Y_fed —
+            // Peg-in internal key is Y_51 (the FROST group key); Y_fed is a LEAF key —
             // see parse_pegin_request / commit 6af7c67.
-            match parse_pegin_request(&req, treasury.y_51, refund_timeout) {
+            match parse_pegin_request(&req, &pegin_tree) {
                 Ok(parsed) => {
                     accepted.insert(req.cardano_utxo.clone(), parsed);
                 }

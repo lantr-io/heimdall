@@ -5839,6 +5839,14 @@ fn run_sweep_pegins(
     let y_51 = group_xonly(dkg.public_key_package.verifying_key())?.xonly;
     info!("  FROST group key Y_51: {}", hex::encode(y_51.serialize()));
     let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
+    // The whole bridge-wide half of the peg-in tree, all of it read from the chain: Y_51 is
+    // the internal key, Y_fed + its CSV delay are the federation emergency-sweep leaf (WI-081).
+    let pegin_tree = heimdall::bitcoin::taproot::PeginTreeParams {
+        y_51,
+        y_federation: y_fed,
+        federation_csv_blocks: csv,
+        refund_timeout,
+    };
 
     let policy_id: [u8; 28] = hex::decode(pegin_policy_id)
         .map_err(|e| format!("pegin_policy_id: {e}"))?
@@ -5943,7 +5951,7 @@ fn run_sweep_pegins(
         // Skip PIRs that don't reconstruct under Y_51 (other bridges' deposits, or encodings we
         // don't yet support) rather than aborting the whole sweep — a TM sweeps the valid peg-ins
         // and drops the rest. Mirrors the daemon's collect_pegins drop behaviour.
-        let parsed = match parse_pegin_request(req, y_51, refund_timeout) {
+        let parsed = match parse_pegin_request(req, &pegin_tree) {
             Ok(p) => p,
             Err(e) => {
                 warn!("  dropped peg-in {:?}: {e}", req.cardano_utxo);
