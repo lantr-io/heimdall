@@ -67,6 +67,21 @@ pub const PAD_COMMIT_LEN: usize = 32;
 /// `min_signers` `t`; it is a constant namespace tag.
 pub const THRESHOLD_51: u64 = 51;
 
+/// The namespace label of the FEDERATION key ceremony (WI-087) — the
+/// genesis-time DKG that produces `Y_federation`.
+///
+/// A second label rather than a second epoch number, because the federation
+/// ceremony has no epoch to number: it runs *before* the bridge exists. Zero
+/// says what it is — the epoch DKG's label is the stake share it needs, and
+/// this ceremony is weighted by nothing at all.
+///
+/// It sits inside the signed canonical bytes, not only in the URL path, so a
+/// Round-1 package from an epoch ceremony can never be replayed into a
+/// federation one however the two are scheduled — a real risk, since the two use
+/// the same transport, the same routes and (for an SPO that is also a federation
+/// member) the same identity key.
+pub const THRESHOLD_FEDERATION: u64 = 0;
+
 /// The 32-byte message one FROST signing session signs.
 pub const SIGN_MESSAGE_LEN: usize = 32;
 

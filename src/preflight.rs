@@ -837,28 +837,49 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             // treated as "the bridge publishes nothing" — it just no longer
             // supplies the value.
             let _ = &published;
-            match crate::cardano::federation::resolve(
-                &cfg.bitcoin,
-                config.as_ref().map(|c| &c.params),
+            // Since WI-087 the federation key this node may hold is either the
+            // single seed or a SHARE from the federation ceremony. An unreadable
+            // share file fails the step rather than being treated as "no share":
+            // that difference decides whether the published key gets cross-checked
+            // at all, and a node that silently skips the check is exactly the state
+            // this step exists to catch.
+            match crate::federation::persist::group_key(
+                cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
             ) {
-                Ok(id) => b.push(
-                    9,
-                    "federation identity",
-                    Status::Pass,
-                    format!(
-                        "Y_fed {}, csv {} blocks — {}",
-                        hex::encode(id.y_fed.serialize()),
-                        id.csv_blocks,
-                        id.origin
-                    ),
-                ),
                 Err(e) => b.push_fix(
                     9,
                     "federation identity",
                     Status::Fail,
                     e.to_string(),
-                    e.fix(),
+                    "the federation ceremony share is unreadable, so the published key cannot \
+                     be cross-checked against what this node holds. Repair or remove \
+                     federation-key.json under protocol.state_dir — an absent share is a \
+                     legitimate state, an unreadable one is not",
                 ),
+                Ok(share) => match crate::cardano::federation::resolve(
+                    &cfg.bitcoin,
+                    share,
+                    config.as_ref().map(|c| &c.params),
+                ) {
+                    Ok(id) => b.push(
+                        9,
+                        "federation identity",
+                        Status::Pass,
+                        format!(
+                            "Y_fed {}, csv {} blocks — {}",
+                            hex::encode(id.y_fed.serialize()),
+                            id.csv_blocks,
+                            id.origin
+                        ),
+                    ),
+                    Err(e) => b.push_fix(
+                        9,
+                        "federation identity",
+                        Status::Fail,
+                        e.to_string(),
+                        e.fix(),
+                    ),
+                },
             }
         }
     }

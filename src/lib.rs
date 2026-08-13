@@ -3,6 +3,7 @@ pub mod cardano;
 pub mod circuits;
 pub mod config;
 pub mod epoch;
+pub mod federation;
 pub mod frost;
 pub mod http;
 pub mod logging;

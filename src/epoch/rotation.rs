@@ -197,6 +197,24 @@ fn load_outgoing_dkg(
             return Ok((state, keys));
         }
     }
+    // The one case that is NOT a misconfiguration: the treasury's current key is
+    // the FEDERATION key and the federation is a t-of-n one (WI-087), so the
+    // authority exists but no single node holds it. That is the bootstrap
+    // handoff, and it is authorized out of band — the daemon has no way to
+    // convene the federation, which is a different signing group with a different
+    // roster and no epoch schedule.
+    if let Ok(Some(y_fed)) = crate::federation::persist::group_key(Some(dir))
+        && y_fed == plan.current_key
+    {
+        return Err(EpochError::Frost(format!(
+            "cannot authorize Update-Y here: the treasury's current key {} is the FEDERATION \
+             key, and this federation is a threshold key — no single node can sign for it. \
+             Authorize this rotation out of band: `heimdall update-y --federation` prints the \
+             message, the members sign it together with `heimdall federation-sign`, and it is \
+             submitted with --signature",
+            hex::encode(plan.current_key.serialize())
+        )));
+    }
     Err(EpochError::Frost(format!(
         "cannot authorize Update-Y: no persisted DKG in {} has group key {} (the treasury's \
          current_spos_frost_key), and it is not the federation key — this node cannot have taken \

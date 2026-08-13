@@ -15,6 +15,11 @@ use heimdall::epoch::mocks::{MockCardanoChain, OsRngSource, SeededRngSource, Sys
 use heimdall::epoch::run_epoch_loop;
 use heimdall::epoch::state::SpoIdentity;
 use heimdall::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
+use heimdall::federation::roster::FederationMember;
+use heimdall::federation::{
+    CeremonyLimits, FederationKeyState, FederationRoster, ceremony, persist as federation_persist,
+    spend as federation_spend,
+};
 use heimdall::frost::xonly::group_xonly;
 use heimdall::http::peer_network::HttpPeerNetwork;
 use heimdall::http::server::router;
@@ -186,12 +191,95 @@ enum Commands {
         #[arg(long)]
         amount_sat: u64,
     },
+    /// Print this node's Bifrost identity — the public half of
+    /// `[bifrost].skey_path`. Read-only; touches no chain and no secret beyond
+    /// reading the key file.
+    ///
+    /// This is the value other people need from you: the other federation
+    /// members put it in their `[federation].members`, and `register-spo` binds
+    /// it on chain. It also reports where this node sits in the configured
+    /// federation, so a mismatched member list is visible before a ceremony
+    /// rather than as a stall during one.
+    BifrostId {
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Form the initial federation (WI-087): run the distributed key generation
+    /// that produces `federation_setup_Y`, the key in the CSV recovery leaf of
+    /// the treasury and of every peg-in deposit. Genesis publishes it as Config
+    /// #11, and from then on it is called `y_federation` — the setup name marks
+    /// the window in which it lives on the members' own machines and nowhere
+    /// else.
+    ///
+    /// This is the FIRST thing that happens when a bridge is stood up — before
+    /// genesis, before the Config exists — so it reads no chain state at all. Its
+    /// participants are the typed-in `[federation]` roster, and it waits for ALL
+    /// of them: a member absent from the ceremony can never sign the key it
+    /// produces. Every member runs this command, with the same member list and
+    /// the same `min_signers`.
+    ///
+    /// The share is persisted `0600` under `protocol.state_dir`; re-running with
+    /// a share already there just prints the key again. Losing every copy loses
+    /// the recovery path for good — the ceremony cannot reproduce the same key.
+    FederationDkg {
+        #[arg(long)]
+        config: Option<String>,
+        /// Give up on a round after N seconds instead of waiting indefinitely.
+        /// The ceremony has no deadline of its own — a forming federation is not
+        /// late for anything — so this is for an operator who wants the command
+        /// to return rather than sit.
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+        /// Keep serving this node's ceremony payloads for N seconds after its
+        /// own share is derived (default 120).
+        ///
+        /// A member that finishes first still holds payloads its slower peers
+        /// have not fetched, and an endpoint that disappears is indistinguishable
+        /// from one that published nothing — so exiting immediately can strand a
+        /// peer that was seconds behind. 0 exits at once.
+        #[arg(long, default_value_t = 120)]
+        serve_after_secs: u64,
+    },
+    /// Sign one 32-byte message AS THE FEDERATION — a FROST session among the
+    /// members, producing a single BIP-340 signature under `Y_federation`.
+    ///
+    /// The generic half of `federation-spend`, for the authorizations that are
+    /// not Bitcoin transactions. The one that exists today is Update-Y as the
+    /// federation (spec [UY-5], dead-roster recovery): run `update-y
+    /// --federation`, take the `sign message:` line it prints, sign it here with
+    /// the other members, and pass the result back as `--signature`.
+    ///
+    /// Every participating member runs this with the SAME `--message` and
+    /// `--signers`.
+    FederationSign {
+        #[arg(long)]
+        config: Option<String>,
+        /// The 32-byte message to sign, hex.
+        #[arg(long)]
+        message: String,
+        /// Which members will sign, as roster indices (default: all). Every
+        /// participant must pass the same list — see `federation-spend`.
+        #[arg(long, value_delimiter = ',')]
+        signers: Vec<u16>,
+        /// Give up on a signing round after N seconds (default 300).
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+        /// Keep serving for N seconds after the signature is aggregated
+        /// (default 60), so a co-signer one poll behind can still fetch.
+        #[arg(long, default_value_t = 60)]
+        serve_after_secs: u64,
+    },
     /// FEDERATION emergency spend of the treasury (scenario 3, N23): a Taproot
     /// SCRIPT-PATH spend via the `y_fed` CSV leaf — the fallback for when the FROST
     /// group is dark. The treasury UTxO must already be `federation_csv_blocks`
     /// deep on Bitcoin. Change returns to the same treasury address (federation
     /// self-send); the on-chain key rotation to y_federation is separate (N10b).
     /// Prints the signed tx — heimdall does not send it (WI-086).
+    ///
+    /// Signs with whichever federation key this node holds: a `federation-dkg`
+    /// share means a FROST session among the members (every one of them runs this
+    /// same command, with the same arguments), while `bitcoin.y_fed_seed_hex`
+    /// means the single-key federation that predates WI-087.
     FederationSpend {
         #[arg(long)]
         config: Option<String>,
@@ -207,6 +295,27 @@ enum Commands {
         /// y_fed (as `bootstrap-treasury` prints it).
         #[arg(long)]
         y51: Option<String>,
+        /// Which federation members will sign, as roster indices
+        /// (`--signers 1,3,4`; `federation-dkg` prints the numbering). Every
+        /// participant MUST pass the same list: FROST binds each share to the
+        /// exact set of co-signers, so two members that assumed different sets
+        /// produce an aggregate that verifies against nothing. Default: all
+        /// members. Ignored by the single-key federation.
+        #[arg(long, value_delimiter = ',')]
+        signers: Vec<u16>,
+        /// Give up on a signing round after N seconds (default 300). Distributed
+        /// federation only.
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+        /// Keep serving this node's signing payloads for N seconds after the
+        /// signature is aggregated (default 60). The transaction is printed
+        /// first, so this only delays the process exiting.
+        ///
+        /// Without it the first member to aggregate exits and stops answering,
+        /// and a co-signer one poll behind waits for a share it can no longer
+        /// fetch. Distributed federation only; 0 exits at once.
+        #[arg(long, default_value_t = 60)]
+        serve_after_secs: u64,
     },
     /// Print the Cardano wallet base address + payment key hash (the TM-NFT mint
     /// authority) derived from the configured mnemonic / $HEIMDALL_MNEMONIC.
@@ -949,14 +1058,59 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::BifrostId { config } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = print_bifrost_id(&cfg) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::FederationDkg {
+            config,
+            timeout_secs,
+            serve_after_secs,
+        } => {
+            let cfg = load_config(config.as_deref());
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            if let Err(e) = rt.block_on(run_federation_dkg(&cfg, timeout_secs, serve_after_secs)) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::FederationSign {
+            config,
+            message,
+            signers,
+            timeout_secs,
+            serve_after_secs,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) =
+                run_federation_sign(&cfg, &message, &signers, timeout_secs, serve_after_secs)
+            {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::FederationSpend {
             config,
             outpoint,
             amount_sat,
             y51,
+            signers,
+            timeout_secs,
+            serve_after_secs,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) = run_federation_spend(&cfg, &outpoint, amount_sat, y51.as_deref()) {
+            if let Err(e) = run_federation_spend(
+                &cfg,
+                &outpoint,
+                amount_sat,
+                y51.as_deref(),
+                &signers,
+                timeout_secs,
+                serve_after_secs,
+            ) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -2017,10 +2171,24 @@ fn y_fed_keypair(
     ),
     String,
 > {
-    let seed_hex = configured_seed(cfg).ok_or(
-        "bitcoin.y_fed_seed_hex is unset — this command SIGNS with the federation key, so the \
-         public key published in the treasury_info datum cannot stand in for it",
-    )?;
+    let seed_hex = configured_seed(cfg).ok_or_else(|| {
+        // A ceremony federation gets a different answer, because the problem is
+        // different: the key is not missing, it is SHARED, and no single node can
+        // produce this signature at all.
+        if federation_share(cfg).ok().flatten().is_some() {
+            "this command signs with the federation key as a SINGLE key, and this node holds a \
+             SHARE of a t-of-n federation key — no one node can produce that signature alone. \
+             For Update-Y, run `heimdall federation-sign --message <the sign message printed \
+             above>` together with the other members and pass the result back as --signature. \
+             `treasury-self-send` has no distributed form: fund the genesis anchor directly at \
+             the address `bootstrap-treasury` prints, instead of normalising a funding tx"
+                .to_string()
+        } else {
+            "bitcoin.y_fed_seed_hex is unset — this command SIGNS with the federation key, so \
+             the public key published in the Config datum cannot stand in for it"
+                .to_string()
+        }
+    })?;
     let kp = heimdall::cardano::federation::keypair_from_seed_hex(seed_hex)
         .map_err(|e| e.to_string())?;
     Ok((kp.secret_key(), kp.x_only_public_key().0))
@@ -2250,7 +2418,14 @@ async fn resolve_federation(
     let _source = RegistryRosterSource::resolve(&cfg.cardano, config.as_ref().map(|v| &v.params))
         .map_err(|e| format!("cannot locate the treasury_info state: {e}"))?;
 
-    heimdall::cardano::federation::resolve(&cfg.bitcoin, config.as_ref().map(|v| &v.params))
+    // Since WI-087 the key this node may hold locally is either the single seed or
+    // a share of a ceremony key. Reading it here means the published value is
+    // cross-checked against what this node actually signs with, whichever of the
+    // two that is.
+    let share = federation_share(cfg)?
+        .map(|s| s.federation_setup_y().map_err(|e| e.to_string()))
+        .transpose()?;
+    heimdall::cardano::federation::resolve(&cfg.bitcoin, share, config.as_ref().map(|v| &v.params))
         .map_err(|e| format!("{e}\n{}", e.fix()))
 }
 
@@ -2535,29 +2710,421 @@ fn run_treasury_self_send(
     Ok(())
 }
 
-/// Build (and with --broadcast, send) the FEDERATION emergency spend of the
-/// treasury (scenario 3, N23): a Taproot SCRIPT-PATH spend via the `y_fed` CSV
-/// leaf, the fallback for when the FROST group is dark. The treasury UTxO must
-/// already be `federation_csv_blocks` deep on Bitcoin. Change returns to the
-/// same treasury address (federation self-send); the on-chain rotation to
-/// y_federation is a separate step (N10b). `y51_hex` is the treasury's current
-/// internal key (its FROST group key) — needed only to rebuild the treasury tree
-/// / leaf control block; `y_fed` + csv come from the config.
+// ── Federation key ceremony and signing (WI-087) ────────────────────────
+
+/// The typed-in `[federation]` roster.
+fn federation_roster(cfg: &HeimdallConfig) -> Result<FederationRoster, String> {
+    FederationRoster::from_config(&cfg.federation).map_err(|e| e.to_string())
+}
+
+/// Where the federation share is kept. Required for the ceremony, and by name:
+/// a share generated with nowhere to write it dies with the process, and this
+/// key — unlike an epoch key — has no next boundary to be regenerated at.
+fn federation_state_dir(cfg: &HeimdallConfig) -> Result<std::path::PathBuf, String> {
+    cfg.protocol
+        .state_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            "protocol.state_dir is unset, so there is nowhere to persist the federation share. \
+             Unlike an epoch share this one never regenerates: the ceremony cannot reproduce \
+             the same key, so a share that exists only in this process is a recovery path lost \
+             when the process exits. Set protocol.state_dir before running the ceremony"
+                .to_string()
+        })
+}
+
+/// This node's persisted federation share, if it has one — cross-checked against
+/// the configured roster whenever one is configured.
+fn federation_share(cfg: &HeimdallConfig) -> Result<Option<FederationKeyState>, String> {
+    let Some(dir) = cfg.protocol.state_dir.as_deref() else {
+        return Ok(None);
+    };
+    let Some(state) =
+        federation_persist::read(std::path::Path::new(dir)).map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    // A share is only meaningful against the membership + threshold that made it.
+    // With no `[federation]` section there is nothing to check it against — which
+    // is legitimate for a node that only READS the key (`bootstrap-treasury`), so
+    // the check applies exactly when a roster is configured.
+    if !cfg.federation.members.is_empty() {
+        state
+            .check_roster(&federation_roster(cfg)?)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(Some(state))
+}
+
+/// Start this node's ceremony endpoint and return the transport peers fetch from.
+///
+/// Same server, same routes and same authenticated wire as the epoch DKG — only
+/// the roster behind it is different. The listen port follows the same rule too:
+/// `http.listen_port` when the advertised URL is not where this process binds,
+/// otherwise the port inside this member's own `bifrost_url`.
+async fn serve_federation(
+    cfg: &HeimdallConfig,
+    me: &FederationMember,
+    keypair: bitcoin::secp256k1::Keypair,
+) -> Result<Arc<HttpPeerNetwork>, String> {
+    let port = match cfg.http.listen_port {
+        Some(p) => p,
+        None => port_from_url(&me.bifrost_url)?,
+    };
+    let net = Arc::new(HttpPeerNetwork::new(
+        bitcoin::secp256k1::Secp256k1::new(),
+        keypair,
+        me.address(),
+    ));
+    let app = router(net.shared_state());
+    let bind = format!("{}:{port}", cfg.http.bind_address);
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .map_err(|e| format!("bind {bind}: {e}"))?;
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    info!(
+        "[federation] listening on {bind}; peers fetch from {}",
+        me.bifrost_url
+    );
+    Ok(net)
+}
+
+/// Locate this node in the federation and load the identity key it publishes
+/// under. Both halves fail loudly: a node that cannot prove which member it is
+/// has no business contributing material to a key that decides where the
+/// treasury lives.
+fn federation_identity(
+    cfg: &HeimdallConfig,
+    roster: &FederationRoster,
+) -> Result<(FederationMember, bitcoin::secp256k1::Keypair), String> {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let keypair = cfg
+        .load_bifrost_keypair(&secp)
+        .map_err(|e| format!("[bifrost].skey_path: {e}"))?;
+    let my_pk = keypair.x_only_public_key().0.serialize();
+    let me = roster.own(&my_pk).ok_or_else(|| {
+        format!(
+            "this node's bifrost identity key ({}) is not in [federation].members. Every \
+             member's config lists the WHOLE federation, this node included",
+            hex::encode(my_pk)
+        )
+    })?;
+    Ok((me.clone(), keypair))
+}
+
+fn federation_limits(cfg: &HeimdallConfig, timeout_secs: Option<u64>) -> CeremonyLimits {
+    let poll = std::time::Duration::from_millis(cfg.protocol.poll_interval_ms);
+    match timeout_secs {
+        Some(s) => CeremonyLimits::bounded(poll, std::time::Duration::from_secs(s)),
+        None => CeremonyLimits::unbounded(poll),
+    }
+}
+
+/// Print this node's bifrost identity key and where it sits in the configured
+/// federation.
+///
+/// The public half has to be typed into other people's config files, so it needs
+/// to come out of the same file the daemon signs with — not be re-derived by
+/// whatever tool the operator has to hand. Reporting the federation position
+/// alongside it turns "my key is not in the list" into a line of output rather
+/// than a ceremony that waits for a member nobody else can see.
+fn print_bifrost_id(cfg: &HeimdallConfig) -> Result<(), String> {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let keypair = cfg
+        .load_bifrost_keypair(&secp)
+        .map_err(|e| format!("[bifrost].skey_path: {e}"))?;
+    let pk = keypair.x_only_public_key().0.serialize();
+    println!("bifrost_id_pk: {}", hex::encode(pk));
+
+    if cfg.federation.members.is_empty() {
+        println!("federation:    none configured ([federation].members is empty)");
+        return Ok(());
+    }
+    let roster = federation_roster(cfg)?;
+    print!("{}", roster.table());
+    match roster.own(&pk) {
+        Some(me) => println!("this node:     {}", me.label()),
+        None => println!(
+            "this node:     NOT a member — this key is not in [federation].members, so a \
+             ceremony run here would refuse to start"
+        ),
+    }
+    Ok(())
+}
+
+/// Run the federation key ceremony (WI-087) and persist this node's share.
+///
+/// Idempotent by design: a share already on disk for the configured roster is
+/// printed rather than replaced. Re-running the ceremony would produce a
+/// DIFFERENT key — hence a different treasury address — so "run it again" is
+/// never the answer once one exists, and a command that quietly did so would
+/// strand whatever the old address holds.
+async fn run_federation_dkg(
+    cfg: &HeimdallConfig,
+    timeout_secs: Option<u64>,
+    serve_after_secs: u64,
+) -> Result<(), String> {
+    let roster = federation_roster(cfg)?;
+    let dir = federation_state_dir(cfg)?;
+    let (me, keypair) = federation_identity(cfg, &roster)?;
+    print!("{}", roster.table());
+    println!("this node: {}", me.label());
+
+    if let Some(existing) = federation_share(cfg)? {
+        let y = existing.federation_setup_y().map_err(|e| e.to_string())?;
+        println!("\nthe federation key already exists — nothing to do.");
+        println!("federation_setup_Y: {}", hex::encode(y.serialize()));
+        println!(
+            "(share: {})",
+            federation_persist::state_path(&dir).display()
+        );
+        // Said here because this is where a half-finished ceremony is discovered:
+        // the member that failed re-runs, finds everyone else already done, and
+        // waits for peers that will never publish again. The round payloads are
+        // per-process, so a completed member cannot re-serve them.
+        println!(
+            "\nIf another member did NOT complete, this cannot be fixed by re-running there: \
+             a ceremony only forms a key when every member is in it, and the payloads are not \
+             kept after it ends. Every member deletes its federation-key.json and the whole \
+             federation runs the ceremony again — which produces a DIFFERENT y_federation, so \
+             do it before any BTC is sent to an address derived from this one."
+        );
+        return Ok(());
+    }
+
+    let peers: Arc<dyn PeerNetwork> = serve_federation(cfg, &me, keypair).await?;
+    let mut rng = OsRngSource.rng(b"federation-dkg");
+    let keys = ceremony::run_dkg(
+        &peers,
+        &roster,
+        me.identifier,
+        &mut rng,
+        &federation_limits(cfg, timeout_secs),
+    )
+    .await
+    .map_err(|e| {
+        format!(
+            "{e}\n\nIf other members DID complete, they now hold shares of a key this node has \
+             none of. That cannot be repaired here alone: every member must delete its \
+             federation-key.json and the federation must run the ceremony again."
+        )
+    })?;
+
+    let state = FederationKeyState::from_output(&roster, &keys).map_err(|e| e.to_string())?;
+    // Fatal, unlike the epoch ceremony's best-effort persist: there is no next
+    // boundary to regenerate at, so an unpersisted share is a recovery path that
+    // ends when this process does.
+    federation_persist::write(&dir, &state).map_err(|e| {
+        format!(
+            "the ceremony completed but the share could NOT be persisted: {e}. The key exists \
+             only in this process — fix the state dir and run the ceremony again (all members \
+             must, since a re-run produces a different key)"
+        )
+    })?;
+
+    let y = state.federation_setup_y().map_err(|e| e.to_string())?;
+    println!("\nfederation key formed.");
+    println!("federation_setup_Y: {}", hex::encode(y.serialize()));
+    println!(
+        "                    ↳ genesis publishes this as Config #11 y_federation \
+         (binocular bridge.y-federation-hex)"
+    );
+    println!(
+        "share:              {} (0600 — losing every copy loses the recovery path)",
+        federation_persist::state_path(&dir).display()
+    );
+    println!(
+        "next:               `heimdall bootstrap-treasury` prints the genesis treasury address"
+    );
+
+    // Keep answering for a while. This node is done, but a slower member may
+    // still be fetching the payloads only this process holds — and to that member
+    // an endpoint that has exited looks exactly like one that published nothing.
+    if serve_after_secs > 0 {
+        info!(
+            "[federation] serving for another {serve_after_secs}s so members still collecting \
+             can fetch from this node (--serve-after-secs 0 to exit at once)"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(serve_after_secs)).await;
+    }
+    Ok(())
+}
+
+/// Which federation key this node holds, and therefore how it signs.
+enum FederationSigner {
+    /// The single seed of the pre-WI-087 federation.
+    Seed(bitcoin::secp256k1::Keypair),
+    /// A share of a ceremony key: signing means a FROST session.
+    Share(Box<FederationKeyState>),
+}
+
+impl FederationSigner {
+    /// The public half — `federation_setup_Y` before genesis publishes it, and
+    /// `y_federation` after. Same 32 bytes; what changes is who else can read
+    /// them.
+    fn public_key(&self) -> Result<bitcoin::key::UntweakedPublicKey, String> {
+        match self {
+            Self::Seed(kp) => Ok(kp.x_only_public_key().0),
+            Self::Share(state) => state.federation_setup_y().map_err(|e| e.to_string()),
+        }
+    }
+
+    /// How this node came by the key, for the operator reading the output.
+    fn label(&self) -> String {
+        match self {
+            Self::Seed(_) => "derived from bitcoin.y_fed_seed_hex — one seed, one holder".into(),
+            Self::Share(state) => format!(
+                "the {}-of-{} federation ceremony key",
+                state.min_signers, state.max_signers
+            ),
+        }
+    }
+}
+
+/// Resolve the federation key this node signs with, refusing both and neither.
+///
+/// Both is the interesting case: the seed and a ceremony key are different keys
+/// locking different treasuries, so a preference order would silently pick one,
+/// and picking wrong produces a perfectly well-formed transaction for an address
+/// that holds nothing.
+fn federation_signer(cfg: &HeimdallConfig) -> Result<FederationSigner, String> {
+    let share = federation_share(cfg)?;
+    let seed = configured_seed(cfg).map(str::to_string);
+    match (share, seed) {
+        (Some(_), Some(_)) => Err(
+            "this node holds two federation keys: bitcoin.y_fed_seed_hex and a persisted \
+             federation-dkg share. They lock different treasuries, so exactly one belongs to \
+             this bridge and nothing here can tell which — remove the other"
+                .to_string(),
+        ),
+        (Some(state), None) => Ok(FederationSigner::Share(Box::new(state))),
+        (None, Some(seed_hex)) => Ok(FederationSigner::Seed(
+            heimdall::cardano::federation::keypair_from_seed_hex(&seed_hex)
+                .map_err(|e| e.to_string())?,
+        )),
+        (None, None) => Err(
+            "this node holds no federation key: no federation-dkg share under \
+             protocol.state_dir, and no bitcoin.y_fed_seed_hex. Run `heimdall federation-dkg` \
+             to take part in the ceremony that generates one, or set the seed if this bridge \
+             uses the single-key federation that ceremony replaces. The key published on chain \
+             cannot stand in — it is the public half"
+                .to_string(),
+        ),
+    }
+}
+
+/// Sign one 32-byte message as the federation and print the signature.
+///
+/// The generic form of what `federation-spend` does to a sighash, for the
+/// authorizations that are not Bitcoin transactions — today, Update-Y as the
+/// federation ([UY-5]), which already accepts an externally produced signature
+/// via `--signature`.
+fn run_federation_sign(
+    cfg: &HeimdallConfig,
+    message_hex: &str,
+    signers: &[u16],
+    timeout_secs: Option<u64>,
+    serve_after_secs: u64,
+) -> Result<(), String> {
+    let message = parse_hex_n::<32>(message_hex, "--message")?;
+    let signer = federation_signer(cfg)?;
+    let (signature, session) = match &signer {
+        // A single-key federation is a one-party session; the same command works
+        // so a caller does not have to know which shape this bridge uses.
+        FederationSigner::Seed(kp) => {
+            println!("signing with the single federation seed (no co-signers)");
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            (
+                secp.sign_schnorr_no_aux_rand(
+                    &bitcoin::secp256k1::Message::from_digest(message),
+                    kp,
+                )
+                .serialize(),
+                None,
+            )
+        }
+        FederationSigner::Share(state) => {
+            let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+            let (sig, held) = frost_federation_signature(
+                cfg,
+                rt,
+                state,
+                message,
+                signers,
+                timeout_secs,
+                serve_after_secs,
+            )?;
+            (sig, Some(held))
+        }
+    };
+
+    println!("message:      {}", hex::encode(message));
+    println!(
+        "y_federation: {}",
+        hex::encode(signer.public_key()?.serialize())
+    );
+    println!("signature:    {}", hex::encode(signature));
+    println!(
+        "(pass it to the command that asked for it, e.g. `update-y --federation --signature <signature>`)"
+    );
+
+    if let Some(session) = session {
+        session.hold();
+    }
+    Ok(())
+}
+
+/// Build (and print) the FEDERATION emergency spend of the treasury (scenario 3,
+/// N23): a Taproot SCRIPT-PATH spend via the `y_fed` CSV leaf, the fallback for
+/// when the FROST group is dark. The treasury UTxO must already be
+/// `federation_csv_blocks` deep on Bitcoin. Change returns to the same treasury
+/// address (federation self-send); the on-chain rotation to y_federation is a
+/// separate step (N10b). `y51_hex` is the treasury's current internal key (its
+/// FROST group key) — needed only to rebuild the treasury tree / leaf control
+/// block.
+///
+/// `y_fed` and the CSV delay come from the **Config datum** wherever the bridge
+/// has one (#11 and `params[7]`, via [`resolve_federation`]) — what this node
+/// holds locally is the SECRET half and a cross-check, never the source of the
+/// address. That mattered less when one operator signed alone; with a threshold
+/// federation several operators must build byte-identical transactions, so a
+/// per-operator `federation_csv_blocks` would be exactly the silent divergence
+/// [`heimdall::cardano::federation`] exists to prevent — each member would hash a
+/// different tree, and the session would stall with every member waiting for the
+/// others. Local values are the source only before genesis, when there is
+/// genuinely no Config to read.
 fn run_federation_spend(
     cfg: &HeimdallConfig,
     outpoint: &str,
     amount_sat: u64,
     y51_hex: Option<&str>,
+    signers: &[u16],
+    timeout_secs: Option<u64>,
+    serve_after_secs: u64,
 ) -> Result<(), String> {
     use bitcoin::key::{Secp256k1, UntweakedPublicKey};
     use bitcoin::{Amount, ScriptBuf};
     use heimdall::bitcoin::taproot::treasury_spend_info;
-    use heimdall::bitcoin::tm_builder::{TreasuryInput, build_tm, sign_tm_federation_leaf};
+    use heimdall::bitcoin::tm_builder::{TreasuryInput, build_tm, federation_leaf_spend};
 
     let secp = Secp256k1::new();
     let outpoint = parse_outpoint(outpoint)?;
-    let (y_fed_sk, y_fed) = y_fed_keypair(&secp, cfg)?;
-    let csv = csv_blocks_u16(cfg)?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    // Published-wins, and a local key that disagrees with the published one is
+    // fatal here rather than quietly preferred — this node would otherwise sign
+    // for an address the other members are not using.
+    let federation = rt.block_on(resolve_federation(cfg))?;
+    let signer = federation_signer(cfg)?;
+    let y_fed = federation.y_fed;
+    let csv = federation.csv_blocks;
+    println!(
+        "y_federation: {} ({})",
+        hex::encode(y_fed.serialize()),
+        federation.origin
+    );
     // Omitted => the bootstrap treasury, whose internal key is y_fed itself.
     let y51 = match y51_hex {
         Some(h) => {
@@ -2594,7 +3161,36 @@ fn run_federation_spend(
     )
     .map_err(|e| format!("build federation spend: {e}"))?;
 
-    let signed = sign_tm_federation_leaf(&secp, &unsigned, &y_fed_sk, csv)
+    // One leaf spend, two ways to sign the SAME 32 bytes: the single seed signs
+    // locally, a ceremony share runs a FROST session with its co-signers. Sharing
+    // the construction is what makes the two produce the same transaction —
+    // anything built differently would be a different sighash.
+    let spend = federation_leaf_spend(&unsigned, y_fed, csv)
+        .map_err(|e| format!("federation leaf: {e}"))?;
+    let (signature, session) = match &signer {
+        FederationSigner::Seed(kp) => {
+            println!("signing with the single federation seed (no co-signers)");
+            let sig = secp.sign_schnorr_no_aux_rand(
+                &bitcoin::secp256k1::Message::from_digest(spend.sighash),
+                kp,
+            );
+            (sig.serialize(), None)
+        }
+        FederationSigner::Share(state) => {
+            let (sig, held) = frost_federation_signature(
+                cfg,
+                rt,
+                state,
+                spend.sighash,
+                signers,
+                timeout_secs,
+                serve_after_secs,
+            )?;
+            (sig, Some(held))
+        }
+    };
+    let signed = spend
+        .finish(signature)
         .map_err(|e| format!("sign federation spend: {e}"))?;
     let raw = bitcoin::consensus::encode::serialize(&signed);
 
@@ -2618,7 +3214,111 @@ fn run_federation_spend(
         "(send it with: bitcoin-cli sendrawtransaction <raw tx>; the treasury UTxO must \
          be >= {csv} blocks deep)"
     );
+
+    // The transaction is out; only now does this node stop answering its
+    // co-signers. See `HeldSession`.
+    if let Some(session) = session {
+        session.hold();
+    }
     Ok(())
+}
+
+/// Run the FROST session that signs one 32-byte message with the federation key.
+///
+/// Every participating member runs `federation-spend` with the SAME arguments —
+/// same outpoint, same amount, same `--y51`, same `--signers` — because each
+/// builds the transaction itself and they must arrive at one sighash. The
+/// session then binds to that sighash, so two members that built different
+/// transactions never mix their material: they just wait for each other.
+/// A finished FROST session whose endpoint is deliberately still up.
+///
+/// The tokio runtime owns the axum server this node served its payloads from, so
+/// dropping it stops answering — and to a co-signer one poll behind, an endpoint
+/// that has finished is indistinguishable from one that published nothing. So the
+/// runtime outlives the signature, and [`Self::hold`] keeps it serving for the
+/// grace window after the transaction has been printed.
+struct HeldSession {
+    rt: tokio::runtime::Runtime,
+    grace: std::time::Duration,
+}
+
+impl HeldSession {
+    fn hold(self) {
+        if self.grace.is_zero() {
+            return;
+        }
+        info!(
+            "[federation] serving for another {}s so co-signers can still fetch this node's \
+             share (--serve-after-secs 0 to exit at once)",
+            self.grace.as_secs()
+        );
+        // The sleep is CREATED inside `block_on`, not passed into it: a
+        // `tokio::time::Sleep` registers with the reactor when it is constructed,
+        // and constructing one outside the runtime panics with "there is no
+        // reactor running".
+        let grace = self.grace;
+        self.rt
+            .block_on(async move { tokio::time::sleep(grace).await });
+    }
+}
+
+fn frost_federation_signature(
+    cfg: &HeimdallConfig,
+    rt: tokio::runtime::Runtime,
+    state: &FederationKeyState,
+    sighash: [u8; 32],
+    signers: &[u16],
+    timeout_secs: Option<u64>,
+    serve_after_secs: u64,
+) -> Result<([u8; 64], HeldSession), String> {
+    let roster = federation_roster(cfg)?;
+    let (me, keypair) = federation_identity(cfg, &roster)?;
+    let keys = state.to_group_keys().map_err(|e| e.to_string())?;
+    // The share must be THIS member's. A share file copied from another member
+    // carries their index, so the node would publish material under an identity
+    // its peers address to somebody else — and the aggregate would fail with
+    // nothing pointing at a misplaced file.
+    if me.identifier != *keys.key_package.identifier() {
+        return Err(format!(
+            "the persisted share is member #{}'s, but this node's bifrost key makes it member \
+             #{}. A share belongs to the member that generated it — check that \
+             protocol.state_dir and [bifrost].skey_path belong to the same member",
+            heimdall::frost::identifier_u16(*keys.key_package.identifier()),
+            heimdall::frost::identifier_u16(me.identifier),
+        ));
+    }
+    let set = if signers.is_empty() {
+        roster.ids()
+    } else {
+        roster.signers_from_indices(signers)?
+    };
+    print!("{}", roster.table());
+
+    let signature = rt.block_on(async {
+        let peers: Arc<dyn PeerNetwork> = serve_federation(cfg, &me, keypair).await?;
+        let mut rng = OsRngSource.rng(b"federation-spend");
+        federation_spend::frost_sign(
+            &peers,
+            &roster,
+            &keys,
+            sighash,
+            &set,
+            &mut rng,
+            // Bounded by default here, unlike the ceremony: a spend is a
+            // coordinated moment among people already talking to each other, and
+            // a command that sits for ever tells them nothing about who is late.
+            &federation_limits(cfg, Some(timeout_secs.unwrap_or(300))),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    Ok((
+        signature,
+        HeldSession {
+            rt,
+            grace: std::time::Duration::from_secs(serve_after_secs),
+        },
+    ))
 }
 
 /// The Cardano wallet mnemonic: `cardano.mnemonic` from config, else
@@ -6445,17 +7145,18 @@ fn print_bootstrap_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
     let secp = Secp256k1::new();
 
     // The DEPLOYER's command: it prints the address the genesis BTC is sent to,
-    // and the deployer is the party holding the federation seed. It derives from
-    // that seed rather than reading `treasury_info`, because at this point in a
-    // bridge's life there is no treasury_info UTxO to read — this address is what
-    // the bridge is bootstrapped from (WI-069).
-    let seed_hex = configured_seed(cfg).ok_or_else(|| {
-        "bitcoin.y_fed_seed_hex is unset — this command derives the GENESIS treasury address \
-         from the federation seed, before any chain state exists to publish it"
-            .to_string()
-    })?;
-    let y_fed =
-        heimdall::cardano::federation::y_fed_from_seed_hex(seed_hex).map_err(|e| e.to_string())?;
+    // derived from the federation key this node holds rather than from any chain
+    // state — at this point in a bridge's life there is none to read, and this
+    // address is what the bridge is bootstrapped from (WI-069).
+    //
+    // Since WI-087 that key is normally `federation_setup_Y`, the ceremony's
+    // group key, which a member holds a share of; `bitcoin.y_fed_seed_hex` is the
+    // older single-holder form. Either one is the whole input here, because only
+    // the PUBLIC half decides an address — and this is the last step at which it
+    // is a LOCAL value: the line below is what gets published, after which it is
+    // read from Config #11 under the name y_federation.
+    let signer = federation_signer(cfg)?;
+    let y_fed = signer.public_key()?;
 
     let network = cfg.bitcoin.parsed_network();
     let csv_blocks = csv_blocks_u16(cfg)?;
@@ -6468,11 +7169,12 @@ fn print_bootstrap_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
         Address::from_script(&script_pubkey, network).map_err(|e| format!("P2TR address: {e}"))?;
 
     println!("{address}");
-    // The values that produced it. These go into the treasury_info datum at
-    // bootstrap, and every SPO then reads them from there instead of typing them.
+    // The values that produced it. These go into the Config datum at genesis, and
+    // every SPO then reads them from there instead of typing them.
     println!(
-        "y_federation:          {}  (the PUBLIC key — never publish the seed)",
-        hex::encode(y_fed.serialize())
+        "y_federation:          {}  ({})",
+        hex::encode(y_fed.serialize()),
+        signer.label()
     );
     println!("federation_csv_blocks: {csv_blocks}");
     Ok(())

@@ -122,6 +122,22 @@ impl DkgNamespace {
             attempt,
         }
     }
+
+    /// The namespace of the FEDERATION key ceremony (WI-087).
+    ///
+    /// `epoch` and `attempt` are 0 because it has neither: it runs once, before
+    /// any chain state exists, and it does not rerun over a reduced set — every
+    /// listed member must attend, so there is no smaller candidate set for a
+    /// second attempt to be over. Separation from the epoch DKG comes from
+    /// [`canonical::THRESHOLD_FEDERATION`] alone.
+    #[must_use]
+    pub fn federation() -> Self {
+        Self {
+            epoch: 0,
+            threshold: canonical::THRESHOLD_FEDERATION,
+            attempt: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

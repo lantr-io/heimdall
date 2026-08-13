@@ -21,6 +21,7 @@ pub struct HeimdallConfig {
     pub http: HttpConfig,
     pub demo: DemoConfig,
     pub bifrost: BifrostConfig,
+    pub federation: FederationConfig,
     pub log: LogConfig,
 }
 
@@ -33,6 +34,7 @@ impl Default for HeimdallConfig {
             http: HttpConfig::default(),
             demo: DemoConfig::default(),
             bifrost: BifrostConfig::default(),
+            federation: FederationConfig::default(),
             log: LogConfig::default(),
         }
     }
@@ -80,6 +82,67 @@ impl Default for BifrostConfig {
     fn default() -> Self {
         Self { skey_path: None }
     }
+}
+
+// ── [federation] ────────────────────────────────────────────────────
+
+/// The federation key ceremony's inputs (WI-087): who is in the federation, and
+/// how many of them it takes to sign.
+///
+/// This is the ONE roster in heimdall that is typed in rather than read from a
+/// chain, and it has to be: `Y_federation` is Config #11 and an input to the
+/// treasury ADDRESS the genesis anchor is funded at, so it must exist before the
+/// bridge does. There is no registry to enumerate, no ban list to filter by and
+/// no stake to weight — see [`crate::federation`].
+///
+/// Every member's node holds the SAME list. Order does not matter: participants
+/// are sorted by `bifrost_id_pk` to assign FROST indices, the same lexicographic
+/// rule the epoch DKG uses, so every node derives the identical numbering from
+/// the same set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FederationConfig {
+    /// FROST threshold `t` of the federation key — how many members it takes to
+    /// sign a recovery spend.
+    ///
+    /// REQUIRED, with no default, and deliberately so: it is baked into the key
+    /// at generation and cannot be changed afterwards without re-running the
+    /// ceremony and moving the treasury to a new address. A default here would
+    /// be a consensus value decided by whoever left a key unset.
+    ///
+    /// Recommended `n - 1`: one dark member must not brick the path that exists
+    /// *because* members can go dark, and it still takes nearly everyone to move
+    /// the treasury. `t <= n/2` is accepted but warned about loudly — it lets a
+    /// minority sweep the whole treasury once the CSV delay passes.
+    pub min_signers: Option<u16>,
+    /// Every federation member, including this node. Empty means no federation
+    /// is configured (the legacy single-seed deployment).
+    pub members: Vec<FederationMemberConfig>,
+}
+
+impl Default for FederationConfig {
+    fn default() -> Self {
+        Self {
+            min_signers: None,
+            members: Vec::new(),
+        }
+    }
+}
+
+/// One federation member: the two facts the ceremony's authenticated transport
+/// needs — where to fetch its payloads from, and which key signs them.
+///
+/// No `pool_id`: a federation member need not be a Cardano SPO, and at genesis
+/// there is no registry to look one up in. The transport's 28-byte member
+/// address is derived from `bifrost_id_pk` instead (see
+/// [`crate::federation::roster`]), so the typed list stays the whole input.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct FederationMemberConfig {
+    /// The member's 32-byte x-only secp256k1 identity key, hex.
+    pub bifrost_id_pk: String,
+    /// Where this member serves its ceremony payloads, e.g.
+    /// `https://spo1.example.com`.
+    pub bifrost_url: String,
 }
 
 // ── [protocol] ──────────────────────────────────────────────────────

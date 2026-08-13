@@ -56,24 +56,42 @@ use crate::config::BitcoinConfig;
 pub enum FederationOrigin {
     /// The Config datum. Nothing to configure, nothing to mistype.
     Published,
-    /// The `treasury_info` datum, and the local seed derives the same key — the
-    /// strongest state: the value is published AND this node can spend the
-    /// recovery path.
+    /// The Config datum, and the local seed derives the same key — the strongest
+    /// state for a single-key federation: the value is published AND this node
+    /// can spend the recovery path by itself.
     PublishedAndHeld,
+    /// The Config datum, and this node holds a SHARE of that key from the
+    /// federation ceremony (WI-087). The strongest state there is: the value is
+    /// published, and this node can contribute to a recovery spend — which no
+    /// single member can perform alone.
+    PublishedAndShared,
     /// The operator's own `[bitcoin]` keys, on a deployment with no readable
-    /// `treasury_info` (the fixture-roster demo).
+    /// Config (the fixture-roster demo).
     LocalConfig,
+    /// `federation_setup_Y` — the local ceremony's group key, with no Config to
+    /// read. The state a federation is in BEFORE genesis: the key exists, and the
+    /// bridge that will publish it as #11 does not yet. This is the ONE window in
+    /// which a local copy is authoritative; see [`crate::federation`].
+    LocalDkg,
 }
 
 impl std::fmt::Display for FederationOrigin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Published => write!(f, "published in the treasury_info datum"),
+            Self::Published => write!(f, "published in the Config datum"),
             Self::PublishedAndHeld => write!(
                 f,
-                "published in the treasury_info datum, and the local seed matches"
+                "published in the Config datum, and the local seed matches"
             ),
-            Self::LocalConfig => write!(f, "local [bitcoin] config — no treasury_info to read"),
+            Self::PublishedAndShared => write!(
+                f,
+                "published in the Config datum, and this node holds a share of it"
+            ),
+            Self::LocalConfig => write!(f, "local [bitcoin] config — no Config datum to read"),
+            Self::LocalDkg => write!(
+                f,
+                "federation_setup_Y from the local ceremony — no Config datum to read yet"
+            ),
         }
     }
 }
@@ -131,10 +149,19 @@ pub enum FederationError {
     BadPublishedKey(String),
     /// A CSV delay outside the 16-bit relative-timelock encoding, or zero.
     BadCsvBlocks { value: i64, source: &'static str },
-    /// The seed this node holds derives a DIFFERENT key than the chain
-    /// publishes. Fatal: one of the two is wrong about which treasury this is,
-    /// and continuing means signing for an address nobody else uses.
-    KeyMismatch { derived: String, published: String },
+    /// The key this node holds is a DIFFERENT key than the chain publishes.
+    /// Fatal: one of the two is wrong about which treasury this is, and
+    /// continuing means signing for an address nobody else uses.
+    KeyMismatch {
+        source: &'static str,
+        derived: String,
+        published: String,
+    },
+    /// This node holds BOTH a `y_fed_seed_hex` and a federation ceremony share.
+    /// They are different keys, so the node has two answers to "which treasury
+    /// is this" — and the wrong one builds a well-formed address holding
+    /// nothing.
+    TwoLocalKeys { seed: String, share: String },
     /// The operator's CSV delay contradicts the published one. Same reasoning —
     /// it is an input to the same address.
     CsvMismatch { local: u32, published: u16 },
@@ -154,6 +181,16 @@ impl FederationError {
     #[must_use]
     pub fn fix(&self) -> String {
         match self {
+            Self::Unconfigured("y_fed_seed_hex") => {
+                "no Config datum was readable and this node holds no federation key. Either \
+                 point it at a bridge whose Config publishes the federation identity (#11 and \
+                 params[7]); or, if you are STANDING A BRIDGE UP, run `heimdall federation-dkg` \
+                 so the members generate the key together; or set bitcoin.y_fed_seed_hex to the \
+                 single seed this treasury was locked with. There is no default: it is an input \
+                 to the treasury ADDRESS, so a guess yields a well-formed address holding \
+                 nothing"
+                    .to_string()
+            }
             Self::Unconfigured(what) => format!(
                 "no Config datum was readable and bitcoin.{what} is unset. Either point \
                  this node at a bridge whose Config publishes the federation identity (#11 and \
@@ -178,7 +215,15 @@ impl FederationError {
                  bitcoin.pegin_refund_timeout_blocks to use what the bridge publishes, or point \
                  this node at the bridge those values belong to. Keep the seed ONLY if this \
                  node performs federation spends, in which case it must be the seed for THIS \
-                 treasury"
+                 treasury. If the key came from a federation ceremony share instead, this node \
+                 is pointed at a bridge some OTHER federation locked"
+                    .to_string()
+            }
+            Self::TwoLocalKeys { .. } => {
+                "a node holds ONE federation key. Either remove bitcoin.y_fed_seed_hex (the \
+                 single-key federation this ceremony replaces), or point protocol.state_dir at \
+                 a directory without a federation-key.json — whichever of the two belongs to \
+                 the bridge this node is joining"
                     .to_string()
             }
             Self::RefundTimeoutTooShort { .. } => {
@@ -207,11 +252,22 @@ impl std::fmt::Display for FederationError {
                  it must be 1..={}. A wider value truncates into a different Taproot tree",
                 u16::MAX
             ),
-            Self::KeyMismatch { derived, published } => write!(
+            Self::KeyMismatch {
+                source,
+                derived,
+                published,
+            } => write!(
                 f,
-                "bitcoin.y_fed_seed_hex derives {derived} but the Config publishes \
-                 {published}. These build DIFFERENT treasury addresses, so one of them is not \
-                 this bridge — refusing to sign for an address the other SPOs are not using"
+                "{source} gives {derived} but the Config publishes {published}. These build \
+                 DIFFERENT treasury addresses, so one of them is not this bridge — refusing to \
+                 sign for an address the other SPOs are not using"
+            ),
+            Self::TwoLocalKeys { seed, share } => write!(
+                f,
+                "this node holds two federation keys: bitcoin.y_fed_seed_hex derives {seed} and \
+                 the persisted federation ceremony share is of {share}. They lock different \
+                 treasuries, so exactly one of them belongs to this bridge and nothing here can \
+                 tell which"
             ),
             Self::CsvMismatch { local, published } => write!(
                 f,
@@ -292,9 +348,10 @@ fn csv_u16(value: i64, source: &'static str) -> Result<u16, FederationError> {
 /// divergence this replaces.
 pub fn resolve(
     cfg: &BitcoinConfig,
+    local_share_key: Option<UntweakedPublicKey>,
     published: Option<&ConfigParams>,
 ) -> Result<FederationIdentity, FederationError> {
-    let local_key = configured_seed(cfg).map(y_fed_from_seed_hex).transpose()?;
+    let (local_key, held) = local_key(cfg, local_share_key)?;
 
     match published {
         Some(c) => {
@@ -304,17 +361,19 @@ pub fn resolve(
                     hex::encode(c.y_federation)
                 ))
             })?;
-            // The one check only a seed-holder can make. A node without the seed
-            // has nothing to compare the published key against — which is
-            // precisely why the seed stays useful after the key is on chain.
+            // The one check only a key-holder can make. A node holding neither
+            // the seed nor a share has nothing to compare the published key
+            // against — which is precisely why what this node holds stays useful
+            // after the key is on chain.
             let origin = match local_key {
                 Some(derived) if derived != y_fed => {
                     return Err(FederationError::KeyMismatch {
+                        source: held.source(),
                         derived: hex::encode(derived.serialize()),
                         published: hex::encode(y_fed.serialize()),
                     });
                 }
-                Some(_) => FederationOrigin::PublishedAndHeld,
+                Some(_) => held.published_origin(),
                 None => FederationOrigin::Published,
             };
             let published_csv = c.tunables.federation_csv_blocks;
@@ -363,15 +422,85 @@ pub fn resolve(
                 y_fed,
                 csv_blocks,
                 pegin_refund_timeout_blocks: refund,
-                origin: FederationOrigin::LocalConfig,
+                origin: held.local_origin(),
             })
         }
+    }
+}
+
+/// Which of the two ways a node can hold the federation key it holds it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldBy {
+    /// Nothing local — this node only reads the published value.
+    Nothing,
+    /// `bitcoin.y_fed_seed_hex`: the whole key, in one place.
+    Seed,
+    /// A share from the federation ceremony (WI-087). This node can contribute
+    /// to a recovery spend; it cannot make one alone, which is the point.
+    Share,
+}
+
+impl HeldBy {
+    fn source(self) -> &'static str {
+        match self {
+            Self::Nothing => "no local federation key",
+            Self::Seed => "bitcoin.y_fed_seed_hex",
+            Self::Share => "the persisted federation ceremony share",
+        }
+    }
+
+    fn published_origin(self) -> FederationOrigin {
+        match self {
+            Self::Share => FederationOrigin::PublishedAndShared,
+            _ => FederationOrigin::PublishedAndHeld,
+        }
+    }
+
+    fn local_origin(self) -> FederationOrigin {
+        match self {
+            Self::Share => FederationOrigin::LocalDkg,
+            _ => FederationOrigin::LocalConfig,
+        }
+    }
+}
+
+/// The federation key this node holds locally, and how.
+///
+/// Holding BOTH is refused rather than ranked. They are different keys — a
+/// ceremony key is not derivable from an operator's seed — so a preference order
+/// would silently pick a treasury, and the wrong pick is invisible: a
+/// well-formed address that holds nothing. This is the same rule the
+/// published-vs-local cross-check below applies, one level earlier.
+fn local_key(
+    cfg: &BitcoinConfig,
+    share_key: Option<UntweakedPublicKey>,
+) -> Result<(Option<UntweakedPublicKey>, HeldBy), FederationError> {
+    let seed_key = configured_seed(cfg).map(y_fed_from_seed_hex).transpose()?;
+    match (seed_key, share_key) {
+        (Some(seed), Some(share)) => Err(FederationError::TwoLocalKeys {
+            seed: hex::encode(seed.serialize()),
+            share: hex::encode(share.serialize()),
+        }),
+        (Some(seed), None) => Ok((Some(seed), HeldBy::Seed)),
+        (None, Some(share)) => Ok((Some(share), HeldBy::Share)),
+        (None, None) => Ok((None, HeldBy::Nothing)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seed-and-published cases, which is what most of these tests are
+    /// about. A node holding a federation ceremony SHARE instead goes through
+    /// `super::resolve`'s middle argument, exercised by the tests that call it
+    /// directly at the bottom of this module.
+    fn resolve(
+        cfg: &BitcoinConfig,
+        published: Option<&ConfigParams>,
+    ) -> Result<FederationIdentity, FederationError> {
+        super::resolve(cfg, None, published)
+    }
 
     fn seed_and_key(byte: u8) -> (String, [u8; 32]) {
         let seed = hex::encode([byte; 32]);
@@ -558,6 +687,68 @@ mod tests {
         let (_, key) = seed_and_key(0x99);
         let id = resolve(&cfg(None, None), Some(&datum(&key, 65_535))).expect("resolves");
         assert_eq!(id.csv_blocks, 65_535);
+    }
+
+    /// WI-087: a node holding a SHARE of a DKG'd federation key cross-checks the
+    /// published value exactly as a seed-holder does — and reports itself as a
+    /// share-holder, which is a materially different capability (it can
+    /// contribute to a recovery spend, not perform one).
+    #[test]
+    fn a_ceremony_share_cross_checks_the_published_key_too() {
+        let (_, key) = seed_and_key(0xA1);
+        let share = UntweakedPublicKey::from_slice(&key).unwrap();
+        let id = super::resolve(&cfg(None, None), Some(share), Some(&datum(&key, 144)))
+            .expect("resolves");
+        assert_eq!(id.origin, FederationOrigin::PublishedAndShared);
+        assert_eq!(id.y_fed.serialize(), key);
+
+        let (_, other) = seed_and_key(0xA2);
+        let e = super::resolve(&cfg(None, None), Some(share), Some(&datum(&other, 144)))
+            .expect_err("must refuse");
+        assert!(
+            matches!(
+                e,
+                FederationError::KeyMismatch {
+                    source: "the persisted federation ceremony share",
+                    ..
+                }
+            ),
+            "got {e:?}"
+        );
+    }
+
+    /// Before genesis there is no Config to read, and the ceremony's group key is
+    /// the whole of what this node knows — the state `bootstrap-treasury` derives
+    /// the genesis address in.
+    #[test]
+    fn a_ceremony_share_alone_is_the_pre_genesis_state() {
+        let (_, key) = seed_and_key(0xA3);
+        let share = UntweakedPublicKey::from_slice(&key).unwrap();
+        let id = super::resolve(&cfg(None, Some(144)), Some(share), None).expect("resolves");
+        assert_eq!(id.origin, FederationOrigin::LocalDkg);
+        assert_eq!(id.y_fed.serialize(), key);
+        assert_eq!(id.csv_blocks, 144);
+    }
+
+    /// A node holds ONE federation key. A seed beside a ceremony share is two
+    /// answers to which treasury this is, and no preference order can be right —
+    /// picking wrong builds a well-formed address holding nothing.
+    #[test]
+    fn a_seed_beside_a_ceremony_share_is_refused_not_ranked() {
+        let (seed, _) = seed_and_key(0xA4);
+        let (_, other) = seed_and_key(0xA5);
+        let share = UntweakedPublicKey::from_slice(&other).unwrap();
+        let e = super::resolve(&cfg(Some(&seed), Some(144)), Some(share), None)
+            .expect_err("must refuse");
+        assert!(
+            matches!(e, FederationError::TwoLocalKeys { .. }),
+            "got {e:?}"
+        );
+        assert!(
+            e.fix().contains("remove bitcoin.y_fed_seed_hex"),
+            "{}",
+            e.fix()
+        );
     }
 
     /// Every variant carries its own remedy. The `Unconfigured` one is the trap:
