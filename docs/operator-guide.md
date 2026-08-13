@@ -167,57 +167,18 @@ that has already paid peg-outs the node would treat them as unpaid.
 UTxO is the discovery root: the daemon finds the single UTxO holding that token and reads
 everything else from its datum — the peg-in and peg-out script addresses, the bridged-token unit,
 the TM validator and its state token, the bridge-state singleton, the registry and ban identities,
-and the operational parameters and batch schedule.
+and the operational parameters and batch schedule. **The daemon will not start until all three are
+set** — the check in the next section reports a missing one as a hard failure, not a warning.
 
-**The daemon will not start without them.** Step 3 of the next check is a hard failure, not a
-warning. That is deliberate: a node that cannot see the batch grid would fall back to a wall-clock
-cadence, and two SPOs ticking on wall clocks scan different chain states and build different
-Treasury Movement bytes — so no co-signer can reproduce them. Refusing to start is the only safe
-behaviour, and it is why these three cannot be left blank.
+**The registry and the ban list need nothing typed.** One exception: performing the DKG **key
+handoff** (Update-Y) spends the `treasury_info` state UTxO, and spending it needs the compiled
+script, not just its hash. A node that does handoffs sets `cardano.registry_blueprint`; a wrong one
+is a startup error, not a silent failure. Without it the node still runs DKG and signs — it just
+cannot be the one that rotates the key, and startup step 7 says which of the two you are.
 
-There used to be roughly twenty more — the peg-in, peg-out, treasury and registry identifiers —
-copied out of the deployment notes and cross-checked against the chain at startup. They are gone
-(WI-070). A copy that can disagree with the Config was never a convenience: a mistyped script hash
-does not fail, it names an address that holds nothing, which reads exactly like a bridge with no
-pending work while the node keeps signing. **A config that still sets one is refused at load,
-naming the Config field that replaced it** — so an upgrade tells you rather than silently ignoring
-what you typed. `heimdall show-config-params` prints what your node resolves from the chain.
-
-**The registry and the ban list: nothing to type either.** The Config publishes the ban policy
-(#8), the registry policy (#9) and the `treasury_info` policy (#10). Genesis mints both
-linked-list roots *before* the Config exists, so a bridge cannot exist without them;
-`heimdall bootstrap-registry` and `bootstrap-ban-list` are legacy, for bridges that predate that
-and for recovering a genesis that failed part-way.
-
-> Field numbers here are the rev-5.5 datum: twelve fields, `params` nested at #1, identities at
-> #2-#11. Older notes number them differently — the datum was renumbered when `params` moved to
-> the front ([CFG-5]) — so trust `src/cardano/config_params.rs`, which is what actually parses it,
-> over any number written in prose.
-
-One thing the published ids do NOT cover: performing the DKG **key handoff** (Update-Y) spends the
-`treasury_info` state UTxO, and spending needs the compiled script rather than its hash. A node
-that does handoffs still needs a blueprint; what it derives is checked against the published #10,
-so a mismatch is a startup error instead of a handoff written where no one reads it.
-
-**The ban list specifically.** The eligible roster is the registry *minus* active bans,
-so a node that cannot read that list computes a different DKG participant set from everyone else —
-which is why the daemon refuses to start without one. But on a bridge whose Config publishes the
-ban policy (#8), there is nothing to configure: the node reads the policy id from the
-Config, and the ban script address follows from it. `show-config-params` prints the address it
-resolved, and startup step 6 names the source.
-
-Only on a bridge whose Config *predates* that field do you still copy `ban_bootstrap` and
-`fault_proof_policies` from the deployment notes. Copy them exactly: they are inputs to the ban
-policy's own identifier, so a wrong value yields a valid-looking address holding an empty list —
-banned SPOs back in your roster with nothing in any log. On a bridge that *does* publish #8,
-leftover local keys are simply unused; if they happen to derive a different policy the daemon says
-so and stops rather than picking one.
-
-**Do not add the ban SCHEDULE to your config, on any bridge.** `base_ban_duration_ms`,
-`max_faults_before_permanent` and `max_validity_window_ms` under `[cardano]` are *refused*:
-heimdall names them and exits before it reads anything else, because a key that silently did
-nothing would leave you believing a value you typed was in force. They come from the Config's
-`params` on every bridge. Older deployment notes still list them — leave them out.
+On an older bridge whose Config does not publish the ban policy, you also copy `ban_bootstrap` and
+`fault_proof_policies` from the deployment notes — exactly, since they are inputs to the ban
+policy's own identifier and a wrong value yields a valid-looking address holding an empty list.
 
 **Secrets.** Two, and neither belongs in the TOML if you can avoid it:
 
@@ -300,11 +261,10 @@ Step 3's field count is the datum's, and **more than twelve is normal** — the 
 appending, and a reader decodes the twelve it knows and ignores the rest. Fewer than twelve is a
 bridge older than this build, and it fails.
 
-Step 3 is the one that earns its keep now: it resolves the Config UTxO, and everything the node
-knows about the bridge follows from it. (There used to be a step 4 comparing the identifiers you
-typed against the chain; WI-070 deleted the copies, so there is nothing left to compare — the check
-went with them.) Step 5 confirms your roster is ban-filtered — it fails if the registry is
-configured without a ban list, since that node could not agree with its peers on who is in the DKG.
+Step 3 is the one that earns its keep: it resolves the Config UTxO, and everything the node knows
+about the bridge follows from it. Step 5 confirms your roster is ban-filtered — it fails if the
+registry is configured without a ban list, since that node could not agree with its peers on who is
+in the DKG.
 Step 6 tells you whether this node is registered; it never spends — it names the command and stops.
 
 Only `FAIL` blocks startup. A `WARN` is worth reading, and steps 4 and 7 are the two you will most
@@ -500,8 +460,8 @@ subsystem.
 
 **The bridge runs on multi-day cycles.** Treasury Movements span one or more Cardano epochs (5+
 days), peg-ins wait for ~100 Bitcoin confirmations (~12 hours), and the mover follows the
-protocol's on-chain **batch grid** rather than a wall-clock interval — so it acts when the schedule
-opens an opportunity, not every `--interval-secs`. Shortening that interval produces more
+protocol's on-chain **batch schedule** (the one from step 3) rather than a wall-clock interval — so
+it acts when that schedule opens an opportunity, not every `--interval-secs`. Shortening that interval produces more
 Blockfrost scans, not more movements.
 
 A healthy idle node therefore says very little. Long silences are correct behaviour. What tells you
