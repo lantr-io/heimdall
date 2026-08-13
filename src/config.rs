@@ -207,21 +207,19 @@ pub struct BitcoinConfig {
     /// reader can make, and a disagreement is fatal. On every other node it
     /// should be absent.
     pub y_fed_seed_hex: Option<String>,
-    /// Optional bitcoind JSON-RPC endpoint. DEV / FEDERATION-OPS ONLY: the SPO
-    /// runtime never requires a Bitcoin node — every Bitcoin fact reaches
-    /// heimdall through Cardano (PIR datums carry the raw deposit txs,
-    /// UnconfirmedTm records carry the raw TMs, the bridge-state singleton
-    /// carries the treasury head). This endpoint serves only the opt-in dev
-    /// broadcast below and the federation ops tools (treasury-self-send,
-    /// federation-spend).
+    /// Optional bitcoind JSON-RPC endpoint, read by the `depositor` tool ALONE.
+    ///
+    /// Nothing in heimdall proper reads it. Every Bitcoin fact reaches heimdall
+    /// through Cardano (PIR datums carry the raw deposit txs, UnconfirmedTm records
+    /// carry the raw TMs, the bridge-state singleton carries the treasury head), and
+    /// heimdall never sends a transaction to Bitcoin (WI-086) — it prints signed
+    /// bytes and a watchtower, or `bitcoin-cli`, sends them. The depositor is the one
+    /// exception because it READS the UTxO set to choose funding inputs, which no
+    /// amount of piping replaces; `--funding-txid`/`--funding-vout`/
+    /// `--funding-amount-sat` let even it run without a node.
     pub rpc_url: Option<String>,
     pub rpc_user: Option<String>,
     pub rpc_pass: Option<String>,
-    /// DEV-ONLY: broadcast the signed BTC tx to `rpc_url` via
-    /// `sendrawtransaction`. Default FALSE — in production the SPO never
-    /// broadcasts; watchtowers relay `signed_btc_tx` from the UnconfirmedTm
-    /// record (that is what the record is for).
-    pub submit: bool,
     /// Depositor refund timelock (BTC blocks) in the peg-in Taproot's refund leaf.
     ///
     /// OPTIONAL, and no default — [CFG-9] publishes it in the Config as
@@ -260,7 +258,6 @@ impl Default for BitcoinConfig {
             rpc_url: None,
             rpc_user: None,
             rpc_pass: None,
-            submit: false,
             pegin_refund_timeout_blocks: None,
             inflight_deadline_secs: None,
         }
@@ -633,6 +630,13 @@ impl Default for DemoConfig {
 pub type RetiredKey = (&'static str, &'static str, &'static str);
 
 const RETIRED_KEYS: &[RetiredKey] = &[
+    (
+        "bitcoin",
+        "submit",
+        "nothing — heimdall never sends a transaction to Bitcoin (WI-086). It prints the \
+         signed bytes; a watchtower relays them from the UnconfirmedTm record, or you send \
+         them with `bitcoin-cli sendrawtransaction`",
+    ),
     (
         "cardano",
         "base_ban_duration_ms",

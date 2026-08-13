@@ -174,8 +174,8 @@ enum Commands {
     },
     /// Self-send the bootstrap treasury UTXO so the treasury becomes output[0]
     /// (normalises a faucet funding tx; see internal-docs decisions D1).
-    /// Key-path spend signed with the single y_fed key. Prints the signed tx;
-    /// broadcasts only with --broadcast.
+    /// Key-path spend signed with the single y_fed key. Prints the signed tx —
+    /// heimdall does not send it (WI-086).
     TreasurySelfSend {
         #[arg(long)]
         config: Option<String>,
@@ -185,16 +185,13 @@ enum Commands {
         /// Input amount in satoshis.
         #[arg(long)]
         amount_sat: u64,
-        /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
-        #[arg(long)]
-        broadcast: bool,
     },
     /// FEDERATION emergency spend of the treasury (scenario 3, N23): a Taproot
     /// SCRIPT-PATH spend via the `y_fed` CSV leaf — the fallback for when the FROST
     /// group is dark. The treasury UTxO must already be `federation_csv_blocks`
     /// deep on Bitcoin. Change returns to the same treasury address (federation
     /// self-send); the on-chain key rotation to y_federation is separate (N10b).
-    /// Prints the signed tx, broadcasts only with --broadcast.
+    /// Prints the signed tx — heimdall does not send it (WI-086).
     FederationSpend {
         #[arg(long)]
         config: Option<String>,
@@ -210,9 +207,6 @@ enum Commands {
         /// y_fed (as `bootstrap-treasury` prints it).
         #[arg(long)]
         y51: Option<String>,
-        /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
-        #[arg(long)]
-        broadcast: bool,
     },
     /// Print the Cardano wallet base address + payment key hash (the TM-NFT mint
     /// authority) derived from the configured mnemonic / $HEIMDALL_MNEMONIC.
@@ -651,15 +645,16 @@ enum Commands {
         /// UTxO's locked amount. Falls back to `cardano.bridged_token_unit` if omitted.
         #[arg(long)]
         bridged_token_unit: Option<String>,
-        /// DEV-ONLY: broadcast directly via bitcoin.rpc_url (default: build + print
-        /// only). Production SPOs run no Bitcoin node — the binocular watchtower
-        /// relays the signed TM from the posted UnconfirmedTm record.
+        /// Execute the side effects: POST the Treasury Movement to Cardano. Without
+        /// it the TM is built, signed and printed only. Nothing here reaches Bitcoin —
+        /// the binocular watchtower relays the signed TM from the posted UnconfirmedTm
+        /// record (WI-086).
         #[arg(long)]
         broadcast: bool,
         /// Override the locally-built signed TM with these raw BTC tx bytes (hex). Use when
         /// the on-chain TM bytes are fixed (already confirmed on Bitcoin) but the local builder
-        /// would produce different bytes (e.g. different PIR set). Cardano TM datum will contain
-        /// these bytes; Bitcoin broadcast is skipped regardless of `bitcoin.submit`.
+        /// would produce different bytes (e.g. different PIR set). The Cardano TM datum will
+        /// contain these bytes.
         #[arg(long)]
         existing_tm_hex: Option<String>,
         /// Peg-in BTC outpoint(s) `<txid>:<vout>` to DROP from the sweep even though their
@@ -947,10 +942,9 @@ fn main() {
             config,
             outpoint,
             amount_sat,
-            broadcast,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) = run_treasury_self_send(&cfg, &outpoint, amount_sat, broadcast) {
+            if let Err(e) = run_treasury_self_send(&cfg, &outpoint, amount_sat) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -960,12 +954,9 @@ fn main() {
             outpoint,
             amount_sat,
             y51,
-            broadcast,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) =
-                run_federation_spend(&cfg, &outpoint, amount_sat, y51.as_deref(), broadcast)
-            {
+            if let Err(e) = run_federation_spend(&cfg, &outpoint, amount_sat, y51.as_deref()) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1580,15 +1571,7 @@ async fn run_demo(
                 .expect("cardano.mnemonic must be a valid BIP-39 mnemonic");
         }
 
-        if let Some(rpc_url) = &cfg.bitcoin.rpc_url {
-            bf_chain = bf_chain.with_btc_rpc(
-                rpc_url,
-                cfg.bitcoin.rpc_user.clone(),
-                cfg.bitcoin.rpc_pass.clone(),
-            );
-        }
-
-        bf_chain = bf_chain.with_submit_config(cfg.bitcoin.submit, cfg.cardano.submit_oracle);
+        bf_chain = bf_chain.with_submit_config(cfg.cardano.submit_oracle);
 
         // Per-pool stake source for the DKG threshold (default Blockfrost;
         // "yaci_store" for a local yaci-devkit devnet).
@@ -2497,13 +2480,11 @@ fn run_treasury_self_send(
     cfg: &HeimdallConfig,
     outpoint: &str,
     amount_sat: u64,
-    broadcast: bool,
 ) -> Result<(), String> {
     use bitcoin::key::Secp256k1;
     use bitcoin::{Amount, ScriptBuf};
     use heimdall::bitcoin::taproot::treasury_spend_info;
     use heimdall::bitcoin::tm_builder::{TreasuryInput, build_tm, sign_tm_single_key};
-    use heimdall::cardano::btc_rpc::broadcast_btc_tx;
 
     let secp = Secp256k1::new();
     let outpoint = parse_outpoint(outpoint)?;
@@ -2547,15 +2528,10 @@ fn run_treasury_self_send(
     );
     println!("raw tx         : {}", hex::encode(&raw));
 
-    if !broadcast {
-        println!("(not broadcast — pass --broadcast to send)");
-        return Ok(());
-    }
-    let rpc = btc_rpc_config(cfg)?;
-    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    rt.block_on(broadcast_btc_tx(&rpc, &raw))
-        .map_err(|e| format!("broadcast: {e}"))?;
-    println!("broadcast OK");
+    // heimdall does not send this. Signing needs the federation seed; SENDING needs
+    // a Bitcoin node, and heimdall has no business holding one (WI-086) — so the
+    // signed bytes above are the deliverable.
+    println!("(send it with: bitcoin-cli sendrawtransaction <raw tx>)");
     Ok(())
 }
 
@@ -2572,13 +2548,11 @@ fn run_federation_spend(
     outpoint: &str,
     amount_sat: u64,
     y51_hex: Option<&str>,
-    broadcast: bool,
 ) -> Result<(), String> {
     use bitcoin::key::{Secp256k1, UntweakedPublicKey};
     use bitcoin::{Amount, ScriptBuf};
     use heimdall::bitcoin::taproot::treasury_spend_info;
     use heimdall::bitcoin::tm_builder::{TreasuryInput, build_tm, sign_tm_federation_leaf};
-    use heimdall::cardano::btc_rpc::broadcast_btc_tx;
 
     let secp = Secp256k1::new();
     let outpoint = parse_outpoint(outpoint)?;
@@ -2636,17 +2610,14 @@ fn run_federation_spend(
     );
     println!("  raw tx : {}", hex::encode(&raw));
 
-    if !broadcast {
-        println!(
-            "(not broadcast — pass --broadcast; the treasury UTxO must be >= {csv} blocks deep)"
-        );
-        return Ok(());
-    }
-    let rpc = btc_rpc_config(cfg)?;
-    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    rt.block_on(broadcast_btc_tx(&rpc, &raw))
-        .map_err(|e| format!("broadcast: {e}"))?;
-    println!("broadcast OK");
+    // heimdall does not send this (WI-086). The recovery case makes that the right
+    // shape rather than a limitation: whoever holds the federation key is not
+    // necessarily running a node beside heimdall, and handing them signed bytes is a
+    // smaller ask than handing them an RPC to configure.
+    println!(
+        "(send it with: bitcoin-cli sendrawtransaction <raw tx>; the treasury UTxO must \
+         be >= {csv} blocks deep)"
+    );
     Ok(())
 }
 
@@ -6380,10 +6351,9 @@ fn run_sweep_pegins(
     // Protocol path (technical_documentation.md §"Post signed TM as Unconfirmed TM tx"): when
     // Blockfrost is configured, hand the signed TM to the shared Cardano chain, which POSTS the
     // Unconfirmed TM UTxO to Cardano (Constr(0, [signed_btc_tx]) at treasury_address) when
-    // `cardano.submit_oracle` is set, and broadcasts to Bitcoin when `bitcoin.submit` is set. A
-    // watchtower (binocular) then relays to Bitcoin and runs the validated Confirm. NOTE: whether
-    // the BTC tx is broadcast is governed by config (`bitcoin.submit`), NOT by --broadcast — on
-    // this setup heimdall posts to Cardano while binocular `relay` carries it to Bitcoin.
+    // `cardano.submit_oracle` is set. That post is the whole of heimdall's output: a watchtower
+    // (binocular `relay`) carries the signed bytes to Bitcoin and then runs the validated
+    // Confirm. Nothing on this path can reach Bitcoin itself (WI-086).
     if let Some(project_id) = cfg.cardano.blockfrost_project_id.as_deref() {
         let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(cfg, &federation);
         let treasury_address = cfg
@@ -6425,22 +6395,11 @@ fn run_sweep_pegins(
                 .with_mnemonic(mnemonic)
                 .map_err(|e| format!("with_mnemonic: {e}"))?;
         }
-        if let Some(rpc_url) = &cfg.bitcoin.rpc_url {
-            chain = chain.with_btc_rpc(
-                rpc_url,
-                cfg.bitcoin.rpc_user.clone(),
-                cfg.bitcoin.rpc_pass.clone(),
-            );
-        }
-        // Honor the documented contract: when the BTC TM bytes come from `--existing-tm-hex`,
-        // the tx is already on Bitcoin (and would be a double-spend), so DON'T let the chain
-        // re-broadcast it regardless of how `bitcoin.submit` is set in the config.
-        let bitcoin_submit = if override_in_effect {
-            false
-        } else {
-            cfg.bitcoin.submit
-        };
-        chain = chain.with_submit_config(bitcoin_submit, cfg.cardano.submit_oracle);
+        // No Bitcoin wiring: this posts the TM to CARDANO, and the watchtower relays
+        // the signed bytes from the record (WI-086). `--existing-tm-hex` used to need
+        // a guard here against re-broadcasting somebody else's already-confirmed
+        // transaction; with nothing able to broadcast, the guard has no subject.
+        chain = chain.with_submit_config(cfg.cardano.submit_oracle);
         chain = chain.with_validity_window(cfg.cardano.tm_validity_window_secs.unwrap_or(1800));
         let chain = apply_tm_policy(chain, cfg)?;
         // The data-availability hint describes the peg-outs of the tx being posted.
@@ -6466,13 +6425,16 @@ fn run_sweep_pegins(
         return Ok(());
     }
 
-    // Legacy fallback: no Blockfrost configured → direct Bitcoin broadcast only (pre-protocol
-    // shortcut; the TM never lands on Cardano, so binocular confirm-tmtx has nothing to confirm).
-    let rpc = btc_rpc_config(cfg)?;
-    rt.block_on(broadcast_btc_tx(&rpc, &raw))
-        .map_err(|e| format!("broadcast: {e}"))?;
-    info!("broadcast OK");
-    Ok(())
+    // No Blockfrost configured: there is nowhere to post the TM, and the pre-protocol
+    // shortcut that used to broadcast straight to Bitcoin is gone (WI-086) — it built a
+    // movement that never landed on Cardano, so `confirm-tmtx` had nothing to confirm
+    // and no watchtower could reconcile it. The signed bytes were printed above.
+    Err(
+        "cardano.blockfrost_project_id is unset, so the Treasury Movement cannot be posted \
+         to Cardano — and posting it is the only thing that makes it relayable. The signed \
+         Bitcoin transaction was printed above."
+            .to_string(),
+    )
 }
 
 fn print_bootstrap_treasury(cfg: &HeimdallConfig) -> Result<(), String> {

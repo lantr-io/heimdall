@@ -27,21 +27,21 @@ You need:
 | A host reachable from the internet | On one TCP port, for the SPO-to-SPO protocol. See [step 5](#5-make-your-endpoint-reachable). |
 | The bridge's deployment notes | Roughly twenty values identifying the bridge you are joining, from whoever deployed it. |
 
-You do **not** need a Bitcoin node. Heimdall never *reads* Bitcoin at all — the treasury's
-outpoint and value come from the bridge-state singleton on Cardano — and it does not broadcast
-either: it posts Treasury Movements to Cardano and the watchtowers relay them to Bitcoin.
-
-`bitcoin.rpc_url` and `bitcoin.submit` exist for one reason, and `submit` defaults to `false`:
-they let a *test* deployment broadcast its own movement, which is how the end-to-end scenarios
-assert that a TM really spends its inputs. Leave them alone on a real node. A second broadcaster
-is not redundancy here — it is a way to publish a movement the Cardano side has not recorded.
+You do **not** need a Bitcoin node, and heimdall could not use one if you had it. It never
+*reads* Bitcoin — the treasury's outpoint and value come from the bridge-state singleton on
+Cardano — and it never *sends* a transaction to Bitcoin. It builds and signs the Treasury
+Movement's Bitcoin transaction, then posts it to **Cardano** inside the UnconfirmedTm record,
+which is what that record carries it for; a watchtower relays it. There is no setting that
+changes this: a second broadcaster was never redundancy, only a way to move BTC that the Cardano
+side has no record of.
 
 ---
 
 ## 1. Install
 
 Two routes, same binary, same config file content. They differ only in where the config lives and
-how it gets there. Pick one — do not run both against the same bridge.
+how it gets there. Pick one — do not run both against the same bridge. A third route, building
+from source, is [below](#building-from-source).
 
 ### Debian package
 
@@ -76,6 +76,51 @@ for state; the full `docker run` line is in [step 7](#7-start-it).
 
 There is **no APT repository** — upgrading means downloading the next `.deb`. See
 [deploy/README.md](../deploy/README.md) for the per-route reference, including the NixOS module.
+
+### Building from source
+
+You do not have to trust the release artifact. The published binary, the one in the `.deb` and
+the one in the container image are the same file, produced by `deploy/build-musl.sh` — so
+building it yourself is a matter of running the same script the release does.
+
+```bash
+git clone https://github.com/lantr-io/heimdall
+cd heimdall
+git checkout v<version>          # a release tag, not main, unless you mean to run main
+deploy/build-linux.sh            # → deploy/out/heimdall
+```
+
+`build-linux.sh` runs `build-musl.sh` inside a `rust:alpine` container, which is what CI does
+(`.github/workflows/release.yml`). That matters for two reasons: Alpine is musl-native on amd64,
+so this is a *native* build for the deploy target rather than a cross-compile, and OpenSSL is
+linked statically — the result is a fully static ELF with no runtime dependencies, which is why
+the same file works on Debian, on NixOS and in a `scratch`-adjacent image. You need Docker; you
+do not need a Rust toolchain on the host. Add `--clean` to wipe the cached cargo/target volumes
+and rebuild from nothing.
+
+To go straight to a package or an image from that binary:
+
+```bash
+deploy/debian/build-deb.sh       # → deploy/out/heimdall_<version>-1_amd64.deb
+deploy/docker/build-image.sh     # → a local heimdall image
+```
+
+Neither compiles anything: both wrap the binary `build-musl.sh` produced, deliberately, so the
+artifact in the package cannot drift from the one you built and checked. `VERSION` defaults to
+the `Cargo.toml` version plus the git sha (`0.1.0+4d1386f`), which is how a locally built package
+stays distinguishable from a release.
+
+If you would rather build on the host with your own toolchain, `cargo build --release` works and
+produces a dynamically linked binary at `target/release/heimdall` — fine for a machine you also
+develop on, and *not* what the packaging path ships. Rust edition 2024, so a recent stable
+toolchain.
+
+Verify whichever way you got here — the version string carries the git sha, so it tells you
+exactly what you are running:
+
+```bash
+heimdall --version
+```
 
 ---
 
