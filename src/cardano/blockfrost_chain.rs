@@ -1640,6 +1640,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             // must too (`leaf_candidates[0]` above is this same value).
             config_y_fed: self.treasury_config.y_fed,
             federation_csv_blocks: csv,
+            pegin_refund_timeout_blocks: self.treasury_config.pegin_refund_timeout_blocks,
             btc_confirmed,
         })
     }
@@ -2378,6 +2379,7 @@ mod tests {
                 y_51: key,
                 y_fed: key,
                 federation_csv_blocks: 144,
+                pegin_refund_timeout_blocks: 720,
                 treasury_outpoint: op(0x11, 0),
                 treasury_value: Amount::from_sat(100_000),
             },

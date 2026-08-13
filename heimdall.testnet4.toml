@@ -12,6 +12,10 @@ rpc_pass = "bitcoin"
 
 # Depositor refund timelock (BTC blocks). Spec default 4320 (~30 days);
 # demo simplification uses 720 (~5 days). Must match the SPO daemons.
+# OPTIONAL since [CFG-9]: the bridge publishes this as Config params[8], and a node that
+# leaves it unset reads the published value. Set here it is a CROSS-CHECK, and a disagreement
+# with the Config is fatal — the delay is hashed into every deposit address, so two SPOs on
+# different values reconstruct different ones. Must exceed federation_csv_blocks.
 pegin_refund_timeout_blocks = 720
 
 # 32-byte hex seed for the deterministic demo federation key (Y_fed), and the CSV

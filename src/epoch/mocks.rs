@@ -352,6 +352,8 @@ impl CardanoChain for MockCardanoChain {
             y_fed,
             config_y_fed: y_fed,
             federation_csv_blocks: self.fixture.federation_csv_blocks,
+            // The mock's tree is self-consistent; 720 > the fixture's 144 federation delay.
+            pegin_refund_timeout_blocks: 720,
             btc_confirmed: true,
         })
     }

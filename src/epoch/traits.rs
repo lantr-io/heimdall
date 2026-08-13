@@ -94,6 +94,10 @@ pub struct TreasuryUtxo {
     /// head is locked under the published key; different while one is mid-rotation.
     pub config_y_fed: bitcoin::key::UntweakedPublicKey,
     pub federation_csv_blocks: u16,
+    /// The peg-in refund leaf's CSV delay, Config `params[8]` ([CFG-9]) — carried
+    /// beside the federation delay because the peg-in tree needs both, and both
+    /// must come from the bridge rather than from each node's own file.
+    pub pegin_refund_timeout_blocks: u16,
     /// Whether it is safe to begin the NEXT treasury movement off this UTxO.
     /// A new movement can only begin once the previous one is confirmed, so the
     /// Blockfrost impl (WI-028) sets this false when an Unconfirmed TM (or an
