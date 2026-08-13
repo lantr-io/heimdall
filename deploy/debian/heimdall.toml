@@ -27,11 +27,12 @@ state_dir = "/var/lib/heimdall"
 # Poll cadence for the chain-watching loops (ms).
 poll_interval_ms = 5000
 
-# A peg-out is payable only while at least this far from its 30-day cancel
-# deadline. MUST be identical on every SPO: it is a TM selection rule, and a
-# divergent rule produces divergent TM bytes, so the FROST round cannot converge.
-# Do not change this unilaterally. Default 7 days.
-pegout_freshness_margin_ms = 604800000
+# There is no peg-out freshness margin to set here any more (WI-071). It decided
+# which requests enter a batch, so it decided the TM bytes — two operators on
+# different values freeze different peg-out sets and their FROST round never
+# converges, with neither log able to say why. "MUST be identical on every SPO"
+# was a warning label where a constant belonged; it is now compiled in, and a
+# config still setting it is refused at load.
 
 
 [bitcoin]

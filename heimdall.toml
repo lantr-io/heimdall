@@ -16,10 +16,9 @@ pegin_poll_interval_ms = 1000
 # in the on-chain bridge state singleton (Config #4) and refuses to
 # sign on a mismatch.
 # state_dir = "/var/lib/heimdall"
-# A peg-out is payable only while at least this far from its 30-day Cancel
-# deadline. Paying one later lets the owner take the BTC and then Cancel for the
-# fBTC. MUST match across SPOs — it is a TM skip rule. 7 days.
-pegout_freshness_margin_ms = 604800000
+# The peg-out freshness margin is a compiled-in protocol constant since WI-071,
+# not a key: it is a TM selection rule, so a per-operator value silently splits
+# the peg-out set the co-signers agree on.
 
 [bitcoin]
 network = "testnet4"

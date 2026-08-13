@@ -639,10 +639,7 @@ mod tests {
             &TmParams::fee_rate_only(1),
             // `created: 0` with a `now` of 0 and no margin keeps the request
             // inside the freshness window without pinning a wall-clock time.
-            &crate::bitcoin::tm_builder::Freshness {
-                now_ms: 0,
-                margin_ms: 0,
-            },
+            &crate::bitcoin::tm_builder::Freshness::inert(),
             &crate::cardano::cpo_trie::CpoTrie::empty(),
             &crate::cardano::spi_trie::SpiTrie::empty(),
         )

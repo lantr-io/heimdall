@@ -2541,17 +2541,6 @@ enum CpoTrust {
     Unverified,
 }
 
-/// The freshness window for peg-out selection. `now_ms` must be CHAIN time.
-fn freshness_from_cfg(
-    cfg: &HeimdallConfig,
-    now_ms: i64,
-) -> heimdall::bitcoin::tm_builder::Freshness {
-    heimdall::bitcoin::tm_builder::Freshness {
-        now_ms,
-        margin_ms: cfg.protocol.pegout_freshness_margin_ms as i64,
-    }
-}
-
 /// Build the Bitcoin RPC config; errors if `bitcoin.rpc_url` is unset.
 fn btc_rpc_config(
     cfg: &HeimdallConfig,
@@ -2600,11 +2589,8 @@ fn run_treasury_self_send(
         vec![],
         treasury_spk,
         &dev_tm_params_from_cfg(cfg),
-        // No peg-outs, so the freshness window is inert.
-        &heimdall::bitcoin::tm_builder::Freshness {
-            now_ms: 0,
-            margin_ms: 0,
-        },
+        // No peg-outs, so there is nothing for the window to filter.
+        &heimdall::bitcoin::tm_builder::Freshness::inert(),
         // A self-send fulfils nothing, so it re-commits the trie's current root.
         &cpo_trie_from_cfg(cfg)?,
         // …and sweeps nothing, so the spi_root is unchanged too.
@@ -3072,10 +3058,7 @@ fn run_federation_spend(
         vec![],
         treasury_spk,
         &dev_tm_params_from_cfg(cfg),
-        &heimdall::bitcoin::tm_builder::Freshness {
-            now_ms: 0,
-            margin_ms: 0,
-        },
+        &heimdall::bitcoin::tm_builder::Freshness::inert(),
         &cpo_trie_from_cfg(cfg)?,
         &spi_trie_from_cfg(cfg)?,
     )
@@ -6763,7 +6746,7 @@ fn run_sweep_pegins(
         pegout_requests,
         treasury_spk.clone(),
         &tm_params,
-        &freshness_from_cfg(cfg, chain_now_ms),
+        &heimdall::bitcoin::tm_builder::Freshness::at(chain_now_ms),
         &cpo_trie,
         &spi_trie,
     )

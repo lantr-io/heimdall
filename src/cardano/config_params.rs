@@ -1230,10 +1230,7 @@ mod tests {
                 vec![],
                 change,
                 params,
-                &Freshness {
-                    now_ms: 0,
-                    margin_ms: 0,
-                },
+                &Freshness::inert(),
                 &crate::bitcoin::tm_builder::FixedCpoRoot([0u8; 32]),
                 &crate::bitcoin::tm_builder::FixedSpiRoot([0u8; 32]),
             )
