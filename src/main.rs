@@ -144,15 +144,33 @@ enum Commands {
         #[arg(long)]
         federation_csv_blocks: Option<u16>,
     },
-    /// Print the FROST group treasury address (Y_fed = Y_51 = FROST key).
-    /// Runs a deterministic DKG to derive the group key, then prints the P2TR address.
+    /// Print the treasury Taproot address for a given FROST group key: internal key
+    /// `Y_51`, recovery leaf `(y_federation, federation_csv_blocks)` — the same tree
+    /// `sweep-pegins` and the auto-mover sign against.
+    ///
+    /// The deployer's counterpart to `bootstrap-treasury`: that one prints the GENESIS
+    /// address, where `Y_51 = y_federation` because no roster exists yet; this one
+    /// prints the address the treasury lives at once a roster does. Both derive from
+    /// local values on purpose — they run before there is a Config UTxO to read.
     FrostTreasury {
         /// Path to a TOML configuration file.
         #[arg(long)]
         config: Option<String>,
-        /// 32-byte FROST group key as hex (skips DKG if provided).
+        /// 32-byte x-only FROST group key as hex. Omit to derive it from the
+        /// deterministic demo DKG (`demo.min_signers` / `demo.max_signers`) — the same
+        /// key `sweep-pegins` reproduces.
         #[arg(long)]
         frost_key: Option<String>,
+        /// The federation fallback key `y_federation` (32-byte x-only hex): the key in
+        /// the treasury tree's CSV recovery leaf, published as Config #11. Omit ONLY for
+        /// the bootstrap treasury, where it equals `Y_51` — on a deployed bridge the two
+        /// differ, and defaulting it to `Y_51` prints an address the bridge never uses.
+        #[arg(long)]
+        y_federation: Option<String>,
+        /// Federation CSV timeout in blocks (overrides TOML). Hashed into the recovery
+        /// leaf, so it changes the address.
+        #[arg(long)]
+        federation_csv_blocks: Option<u16>,
     },
     /// Self-send the bootstrap treasury UTXO so the treasury becomes output[0]
     /// (normalises a faucet funding tx; see internal-docs decisions D1).
@@ -908,9 +926,19 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::FrostTreasury { config, frost_key } => {
-            let cfg = load_config(config.as_deref());
-            if let Err(e) = print_frost_treasury(&cfg, frost_key.as_deref()) {
+        Commands::FrostTreasury {
+            config,
+            frost_key,
+            y_federation,
+            federation_csv_blocks,
+        } => {
+            let mut cfg = load_config(config.as_deref());
+            if let Some(v) = federation_csv_blocks {
+                cfg.bitcoin.federation_csv_blocks = Some(u32::from(v));
+            }
+            if let Err(e) =
+                print_frost_treasury(&cfg, frost_key.as_deref(), y_federation.as_deref())
+            {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -6490,37 +6518,74 @@ fn print_bootstrap_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
 /// Print the treasury Taproot address when Y_fed = Y_51 = FROST group key.
 ///
 /// `frost_key_hex` must be the 32-byte x-only FROST group key as hex.
-fn print_frost_treasury(cfg: &HeimdallConfig, frost_key_hex: Option<&str>) -> Result<(), String> {
+fn print_frost_treasury(
+    cfg: &HeimdallConfig,
+    frost_key_hex: Option<&str>,
+    y_federation_hex: Option<&str>,
+) -> Result<(), String> {
     use bitcoin::key::{Secp256k1, UntweakedPublicKey};
     use bitcoin::{Address, ScriptBuf};
     use heimdall::bitcoin::taproot::treasury_spend_info;
+    use heimdall::frost::dkg::run_demo_dkg;
 
     let secp = Secp256k1::new();
     let network = cfg.bitcoin.parsed_network();
     let csv_blocks = csv_blocks_u16(cfg)?;
 
-    let hex_str = frost_key_hex.ok_or("--frost-key <32-byte-hex> is required")?;
-    let bytes: Vec<u8> = hex::decode(hex_str).map_err(|e| format!("--frost-key: {e}"))?;
-    let group_key: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("--frost-key must be 32 bytes (x-only), got {}", bytes.len()))?;
-    let group_key = UntweakedPublicKey::from_slice(&group_key)
-        .map_err(|e| format!("--frost-key is not a valid x-only pubkey: {e}"))?;
+    fn xonly(flag: &str, hex_str: &str) -> Result<UntweakedPublicKey, String> {
+        let bytes: Vec<u8> = hex::decode(hex_str).map_err(|e| format!("{flag}: {e}"))?;
+        let key: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| format!("{flag} must be 32 bytes (x-only), got {}", bytes.len()))?;
+        UntweakedPublicKey::from_slice(&key)
+            .map_err(|e| format!("{flag} is not a valid x-only pubkey: {e}"))
+    }
+
+    // No --frost-key: reproduce the deterministic demo DKG, exactly as `sweep-pegins`
+    // and `show-treasury` do, so the address this prints is the one they will sign for.
+    let group_key = match frost_key_hex {
+        Some(h) => xonly("--frost-key", h)?,
+        None => {
+            let dkg = run_demo_dkg(
+                b"heimdall-demo-seed-v1-0123456789",
+                cfg.demo.min_signers,
+                cfg.demo.max_signers,
+            );
+            group_xonly(dkg.public_key_package.verifying_key())?.xonly
+        }
+    };
+    // The recovery leaf's key. Defaulting it to Y_51 is only correct at genesis; on a
+    // deployed bridge y_federation is Config #11 and the two are different keys, so a
+    // silent default would print a well-formed address holding nothing — the failure
+    // mode WI-074 hit from the depositor side.
+    let y_fed = match y_federation_hex {
+        Some(h) => xonly("--y-federation", h)?,
+        None => group_key,
+    };
 
     println!(
         "FROST group key (x-only): {}",
         hex::encode(group_key.serialize())
     );
+    println!(
+        "y_federation (leaf key):  {}{}",
+        hex::encode(y_fed.serialize()),
+        if y_federation_hex.is_none() {
+            "  (defaulted to Y_51 — genesis tree)"
+        } else {
+            ""
+        }
+    );
+    println!("federation CSV blocks:    {csv_blocks}");
 
-    // Y_fed = Y_51 = FROST group key
-    let spend_info = treasury_spend_info(&secp, group_key, group_key, csv_blocks);
+    let spend_info = treasury_spend_info(&secp, group_key, y_fed, csv_blocks);
     let output_key = spend_info.output_key();
     let script_pubkey = ScriptBuf::new_p2tr_tweaked(output_key);
     let address =
         Address::from_script(&script_pubkey, network).map_err(|e| format!("P2TR address: {e}"))?;
 
-    println!("Treasury address (Y_fed=Y_51=FROST): {address}");
+    println!("Treasury address: {address}");
     println!("Script pubkey: {}", hex::encode(script_pubkey.as_bytes()));
     Ok(())
 }

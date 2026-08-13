@@ -537,6 +537,10 @@ pub async fn fetch_account_registered(
 /// whisky-common's hardcoded per-network cost models go stale (e.g. preprod's PlutusV3 grew
 /// from 298 to 350 params), which makes the tx's script-integrity hash mismatch the ledger's
 /// (`PPViewHashesDontMatch`). Passing these live arrays via `Network::Custom` fixes that.
+///
+/// The three slots are POSITIONS, not requirements: a chain that publishes no V1/V2
+/// model gets an empty array in that slot, because whisky indexes this list by
+/// language and heimdall's transactions are PlutusV3 only. See the loop.
 pub async fn fetch_cost_models(base_url: &str, project_id: &str) -> Result<Vec<Vec<i64>>, String> {
     let url = format!("{base_url}/epochs/latest/parameters");
     let resp = reqwest::Client::new()
@@ -564,9 +568,31 @@ pub async fn fetch_cost_models(base_url: &str, project_id: &str) -> Result<Vec<V
         .ok_or_else(|| "parameters: no cost_models_raw/cost_models".to_string())?;
     let mut out = Vec::with_capacity(3);
     for lang in ["PlutusV1", "PlutusV2", "PlutusV3"] {
-        let entry = raw
-            .get(lang)
-            .ok_or_else(|| format!("parameters: no cost_models[{lang}]"))?;
+        // A chain need not publish a cost model for every language, and heimdall
+        // does not need every language: it builds PlutusV3 transactions only, and
+        // the script-integrity hash covers just the language views of the
+        // languages a transaction actually uses. So a missing V1/V2 becomes an
+        // empty SPACER rather than a refusal.
+        //
+        // The spacer is the point. whisky takes these positionally —
+        // `Network::Custom(v)` is indexed `v[0]=V1, v[1]=V2, v[2]=V3` — and its
+        // evaluator rejects a list shorter than 3 outright. Dropping a missing
+        // language instead of holding its slot would slide V3 down to index 1,
+        // hash the wrong model into the script-integrity hash, and the chain
+        // would answer PPViewHashesDontMatch with nothing pointing here.
+        //
+        // PlutusV3 is not optional: heimdall's transactions carry V3 scripts, so
+        // its model does reach the hash and a placeholder would be a wrong one.
+        let Some(entry) = raw.get(lang) else {
+            if lang == "PlutusV3" {
+                return Err(format!(
+                    "parameters: no cost_models[{lang}] — heimdall's scripts are PlutusV3, so \
+                     this chain cannot execute them"
+                ));
+            }
+            out.push(Vec::new());
+            continue;
+        };
         let nums: Vec<i64> = if let Some(arr) = entry.as_array() {
             arr.iter()
                 .map(|n| {
