@@ -124,6 +124,44 @@ heimdall --version
 
 ---
 
+## Forming the initial federation
+
+**Skip this if you are joining an existing bridge** — you are an SPO, the federation key already
+exists, and you read it from the Config. This section is for the party standing a bridge up, and
+it happens before everything else in this guide.
+
+The **federation key** `Y_federation` is the key in the CSV recovery leaf of both Taproot trees —
+the treasury's and every peg-in deposit's. It is the way the treasury moves when the FROST group
+is dark, after `federation_csv_blocks` have passed. It is also an *input* to genesis: it is
+published as Config #11, and the treasury address the genesis anchor is funded at is derived from
+it. So it must exist before the bridge does, which is why nothing here reads a chain.
+
+**[will change — WI-087]** Today it is a single key, derived from one seed held by one party:
+
+```bash
+# 1. Generate the seed. Whoever holds this can sweep the whole treasury alone
+#    once the CSV delay passes — treat it as the most sensitive key in the system.
+openssl rand -hex 32                                # → bitcoin.y_fed_seed_hex
+
+# 2. heimdall prints the PUBLIC half and the genesis treasury address:
+heimdall bootstrap-treasury --config heimdall.toml
+#   bcrt1p…                                          ← fund the genesis anchor here
+#   y_federation:          <64 hex>                  ← the public key. Never publish the seed.
+#   federation_csv_blocks: 144
+```
+
+The `y_federation` value goes into binocular's `bridge.y-federation-hex`, and `deploy-bridge`
+publishes it at Config #11 — after which every SPO and every depositor reads it from the chain
+rather than being told it.
+
+That single seed is what WI-087 replaces: `Y_federation` becomes the output of a distributed key
+generation among the federation members, so that the mechanism which exists *because* the signing
+group might be unavailable is not itself one person's secret. That ceremony has no chain to read —
+no Config NFT, no registry, no stake — so its participants are a typed-in list of URLs and
+identity keys, and it waits for all of them.
+
+---
+
 ## 2. Create your Bifrost identity key
 
 This is your long-lived secp256k1 identity. It is bound on-chain at registration, and the daemon
