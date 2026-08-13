@@ -154,52 +154,52 @@ oracle_constructor = 0
 # How this node learns each pool's active stake for the stake-weighted DKG.
 stake_source = "blockfrost"
 
-# ── The bridge — copy from the bridge's deployment notes ─────────────────────
+# ── The bridge: THREE values, and they are the only ones ─────────────────────
 #
-# The Config UTxO is the discovery root: the daemon derives the config address
-# from the policy id, finds the single UTxO holding that token, and reads the
-# operational parameters (fee rate, batch schedule, selection floors) from its
-# datum. Without all three of these the daemon cannot see the batch grid and
-# falls back to a wall-clock cadence, which does NOT agree with the other SPOs.
+# The Config UTxO is the discovery root and, since WI-070, the whole of it. The
+# daemon derives the config address from the policy id, finds the single UTxO
+# holding that token, and reads EVERYTHING else from its datum: the peg-in and
+# peg-out script addresses, the bridged-token unit, the TM validator address and
+# its state token, the bridge-state singleton policy, the registry and ban
+# identities, and the operational parameters (fee rate, batch schedule,
+# selection floors).
+#
+# The identifiers used to be typed here as well, and checked against the chain at
+# startup. That is worse than it sounds: a stale copy does not fail, it scans an
+# address that holds nothing — which reads exactly like a bridge with no pending
+# work, on a node that keeps signing. There is now no second copy to disagree, so
+# a key naming any of them is REFUSED at load rather than ignored.
+#
+# `heimdall show-config-params` prints what this node resolved.
 #config_address = ""
 #config_nft_policy_id = ""
 #config_nft_asset_name = ""
 
-# The treasury movement validator (PlutusV3 CBOR hex) and the TM state token.
+# The treasury movement validator (PlutusV3 CBOR hex). Not an identifier: posting
+# a TM needs the compiled script, which the Config publishes only the hash of.
 #tm_script_cbor = ""
-#treasury_address = ""
-#treasury_policy_id = ""
-#treasury_asset_name = ""
-
-# Peg-in / peg-out contracts and the bridged token (policy id ++ asset name hex).
-#pegin_script_address = ""
-#pegin_policy_id = ""
-#pegout_script_address = ""
-#bridged_token_unit = ""
 
 # On-chain SPO registry. LEAVE ALL THREE UNSET on any bridge whose Config
-# publishes the registry identity (fields #21-#23) — the node reads the registry
+# publishes the registry identity (#9-#10) — the node reads the registry
 # policy, the treasury_info policy and its state-NFT name from there, and there
 # is nothing here to get wrong. `heimdall show-config-params` prints what it
-# resolved; startup step 5 names the source.
+# resolved; startup step 4 names the source.
 #
-# Set all three ONLY for a bridge deployed before those fields existed (or for
-# the demo fixture roster, which sets none of them). Half-set is a startup error,
-# not a fixture.
+# Set them ONLY for a bridge deployed before those fields existed (or for the
+# demo fixture roster, which sets none of them).
 #
 # One exception, and only if this node should perform the DKG key handoff:
 # spending the treasury_info state UTxO (Update-Y) needs the COMPILED script, not
 # just the policy id the Config publishes, so a handoff-capable node still sets
-# registry_blueprint (with treasury_policy_id above). What it derives is checked
-# against the published #22, so a wrong blueprint is refused rather than used.
-# Startup step 8 says which of the two you are. Without it this node still runs
-# DKG and signs; it just cannot be the one that rotates the key.
+# registry_blueprint. What it derives is checked against the published #10, so a
+# wrong blueprint is refused rather than used. Startup step 7 says which of the
+# two you are. Without it this node still runs DKG and signs; it just cannot be
+# the one that rotates the key.
 #registry_blueprint = "/var/lib/heimdall/plutus.json"
 #registry_bootstrap = "<tx_hash>:<index>"
-#treasury_info_asset_name = ""
 
 # Ban list. LEAVE THIS UNSET on any bridge whose Config publishes the ban policy
-# (field #17) — the node reads it from there and there is nothing here to get
+# (#8) — the node reads it from there and there is nothing here to get
 # wrong. `heimdall show-config-params` prints the ban address it resolved.
 #
 # It is not an operator preference either way: the eligible roster is the

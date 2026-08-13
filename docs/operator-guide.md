@@ -162,9 +162,12 @@ The values fall into three groups.
 set: without it the completed-peg-outs trie is rebuilt **empty** on every start, and on a bridge
 that has already paid peg-outs the node would treat them as unpaid.
 
-**About the bridge.** Copy these from the bridge's deployment notes. The Config UTxO is the
-discovery root — `config_address`, `config_nft_policy_id` and `config_nft_asset_name` are what let
-the daemon find the bridge's operational parameters and its batch schedule.
+**About the bridge — three values, and that is all.** `config_address`,
+`config_nft_policy_id` and `config_nft_asset_name`, from the bridge's deployment notes. The Config
+UTxO is the discovery root: the daemon finds the single UTxO holding that token and reads
+everything else from its datum — the peg-in and peg-out script addresses, the bridged-token unit,
+the TM validator and its state token, the bridge-state singleton, the registry and ban identities,
+and the operational parameters and batch schedule.
 
 **The daemon will not start without them.** Step 3 of the next check is a hard failure, not a
 warning. That is deliberate: a node that cannot see the batch grid would fall back to a wall-clock
@@ -172,17 +175,16 @@ cadence, and two SPOs ticking on wall clocks scan different chain states and bui
 Treasury Movement bytes — so no co-signer can reproduce them. Refusing to start is the only safe
 behaviour, and it is why these three cannot be left blank.
 
-**[will be removed — WI-070]** Most of the remaining ~20 values (`pegin_script_address`,
-`pegout_script_address`, `bridged_token_unit`, the treasury and registry identifiers) are things
-the Config UTxO already knows. Step 4 checks what you typed against the chain, so a mistake is
-caught at startup rather than by a failed transaction — but you still have to type them.
+There used to be roughly twenty more — the peg-in, peg-out, treasury and registry identifiers —
+copied out of the deployment notes and cross-checked against the chain at startup. They are gone
+(WI-070). A copy that can disagree with the Config was never a convenience: a mistyped script hash
+does not fail, it names an address that holds nothing, which reads exactly like a bridge with no
+pending work while the node keeps signing. **A config that still sets one is refused at load,
+naming the Config field that replaced it** — so an upgrade tells you rather than silently ignoring
+what you typed. `heimdall show-config-params` prints what your node resolves from the chain.
 
-**The registry and the ban list: usually nothing to type.** On a bridge deployed by
-`binocular deploy-bridge` at or after WI-068, the Config publishes the ban policy (#8), the
-registry policy (#9) and the `treasury_info` policy (#10) — so `registry_blueprint`,
-`registry_bootstrap` and `treasury_info_asset_name` are not needed either. The `treasury_info`
-state NFT has no Config field: its name is the protocol constant `"BFRTRY"` ([CFG-4]), which is
-why `treasury_info_asset_name` is ignored on any bridge of this vintage. Genesis mints both
+**The registry and the ban list: nothing to type either.** The Config publishes the ban policy
+(#8), the registry policy (#9) and the `treasury_info` policy (#10). Genesis mints both
 linked-list roots *before* the Config exists, so a bridge cannot exist without them;
 `heimdall bootstrap-registry` and `bootstrap-ban-list` are legacy, for bridges that predate that
 and for recovering a genesis that failed part-way.
@@ -266,7 +268,7 @@ with a testnet bech32 prefix, and the fault-proof safety gate described in
 [the fault-proof trusted setup](fault-proof-srs.md) would fail open. Refusing to guess is the only
 safe behaviour.
 
-Verify your backend serves what heimdall needs before switching over: step 4 below exercises the
+Verify your backend serves what heimdall needs before switching over: the check below exercises the
 read paths against whatever you configured, so run it after the change and read every line.
 
 ---
@@ -287,32 +289,33 @@ dry run — it reads the chain and builds nothing.
 [1/8] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
 [2/8] cardano connectivity         PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
 [3/8] resolve the Config           PASS  2dce4027…#0 (12 fields, fee_rate 1 sat/vB)
-[4/8] verify the contract set      PASS  every configured contract identifier matches the Config UTxO
-[5/8] reference script             …
-[6/8] ban list                     PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (detection only)
-[7/8] registration status          …
-[8/8] key handoff (Update-Y)       …
+[4/8] reference script             …
+[5/8] ban list                     PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (detection only)
+[6/8] registration status          …
+[7/8] key handoff (Update-Y)       …
+[8/8] federation identity          PASS  Y_fed 37b381ac…, csv 144 blocks — published in the Config datum
 ```
 
 Step 3's field count is the datum's, and **more than twelve is normal** — the Config grows by
 appending, and a reader decodes the twelve it knows and ignores the rest. Fewer than twelve is a
 bridge older than this build, and it fails.
 
-Step 4 is the one that earns its keep: it compares every contract identifier you typed against the
-Config UTxO on chain and names any that disagree, with both values. Step 6 confirms your roster is
-ban-filtered — it fails if the registry is configured without a ban list, since that node could not
-agree with its peers on who is in the DKG. Step 7 tells you whether this node is registered; it
-never spends — it names the command and stops.
+Step 3 is the one that earns its keep now: it resolves the Config UTxO, and everything the node
+knows about the bridge follows from it. (There used to be a step 4 comparing the identifiers you
+typed against the chain; WI-070 deleted the copies, so there is nothing left to compare — the check
+went with them.) Step 5 confirms your roster is ban-filtered — it fails if the registry is
+configured without a ban list, since that node could not agree with its peers on who is in the DKG.
+Step 6 tells you whether this node is registered; it never spends — it names the command and stops.
 
-Only `FAIL` blocks startup. A `WARN` is worth reading, and steps 5 and 8 are the two you will most
+Only `FAIL` blocks startup. A `WARN` is worth reading, and steps 4 and 7 are the two you will most
 often see one on:
 
-- **Step 5 (`reference script`)** warns when the registry reference script is not deployed at your
+- **Step 4 (`reference script`)** warns when the registry reference script is not deployed at your
   wallet. That script is only needed to *register*; a running daemon reads the roster without it.
-- **Step 8 (`key handoff`)** warns when this node has no compiled `treasury_info` script. It still
+- **Step 7 (`key handoff`)** warns when this node has no compiled `treasury_info` script. It still
   runs DKG and signs — but if it is elected leader for an epoch, the Update-Y that hands the
   treasury to the new group key fails, and the handoff does not happen. Set
-  `cardano.registry_blueprint` and `cardano.treasury_policy_id` to clear it.
+  `cardano.registry_blueprint` to clear it.
 - `protocol.state_dir is unset` is the one that silently costs money later.
 
 Do not continue until this passes.
@@ -549,7 +552,8 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 | the service will not start | `journalctl -u heimdall -p err`, then re-run the step-4 check — it names the failing check and what to fix |
 | starts, then nothing happens for days | expected; see *Quiet is normal* |
 | peers seem not to see you | step 5 — is the registered port open and reachable *from outside*? |
-| `[4/8] verify the contract set FAIL` | your config disagrees with the chain; the check prints both values for each mismatch |
+| `[3/8] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
+| a key you set is `refused` at load | it names a value the Config publishes; delete it, and `show-config-params` prints what the chain says |
 | a transaction is refused | read the whole message: the min-stake gate and the preflight both refuse loudly rather than submitting something wrong |
 | it refuses to start over `cardano.fault_proof_srs_path` | you have DKG fault enforcement configured on mainnet against a setup that is not trustworthy — see [the fault-proof trusted setup](fault-proof-srs.md) |
 
