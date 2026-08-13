@@ -8,12 +8,14 @@
 : "${Y51:?set Y51 to the FROST group key (heimdall show-treasury)}"
 : "${Y_FED:?set Y_FED to the federation key (Config y_federation)}"
 : "${FED_CSV:?set FED_CSV to the federation leaf CSV delay (Config params.federation_csv_blocks)}"
+: "${REFUND:?set REFUND to the refund leaf CSV delay (Config params.pegin_refund_timeout_blocks)}"
 
 cargo run --bin depositor -- \
   --config heimdall.testnet4.toml \
   --frost-key "$Y51" \
   --y-federation "$Y_FED" \
   --federation-csv-blocks "$FED_CSV" \
+  --refund-timeout-blocks "$REFUND" \
   --depositor-wif-file .keys/alice.wif \
   --deposit-amount-sat 4000 \
   --fee-sat 200

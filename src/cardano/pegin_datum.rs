@@ -448,7 +448,7 @@ mod tests {
     /// cargo run --bin depositor -- --config heimdall.testnet4.toml \
     ///   --frost-key b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854 \
     ///   --y-federation b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854 \
-    ///   --federation-csv-blocks 144 \
+    ///   --federation-csv-blocks 144 --refund-timeout-blocks 720 \
     ///   --depositor-wif cN9spWsvaxA8taS7DFMxnk1yJD2gaF2PX1npuTpy3vuZFJdwavaw \
     ///   --deposit-amount-sat 50000 --fee-sat 2000 \
     ///   --funding-txid 7afd38db928a8f30f789d5c2dc9f918a6b55f85dd251f42f2e31b535bdaa0583 \

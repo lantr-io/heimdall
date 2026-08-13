@@ -35,6 +35,11 @@ pub struct TreasuryConfig {
     pub y_51: bitcoin::key::UntweakedPublicKey,
     pub y_fed: bitcoin::key::UntweakedPublicKey,
     pub federation_csv_blocks: u16,
+    /// The CSV delay of the peg-in tree's depositor refund leaf — Config
+    /// `params[8]` ([CFG-9]). Beside `federation_csv_blocks` because the two are
+    /// the same kind of value: block counts hashed into the peg-in Taproot, so
+    /// both decide the deposit address and both must be UNANIMOUS across SPOs.
+    pub pegin_refund_timeout_blocks: u16,
     /// The current treasury Bitcoin UTxO, tracked OFF-CHAIN by the SPO (spec
     /// §640/§1677: "known from the previous TM's change output, or from protocol
     /// bootstrap"). heimdall builds every TM, so in steady state it knows its own
@@ -165,6 +170,7 @@ pub fn treasury_from_btc_tx_bytes(
         // and published keys are the same value here by construction.
         config_y_fed: config.y_fed,
         federation_csv_blocks: config.federation_csv_blocks,
+        pegin_refund_timeout_blocks: config.pegin_refund_timeout_blocks,
         btc_confirmed,
     })
 }
@@ -230,6 +236,7 @@ pub fn parse_treasury_datum(
         // and published keys are the same value here by construction.
         config_y_fed: config.y_fed,
         federation_csv_blocks: config.federation_csv_blocks,
+        pegin_refund_timeout_blocks: config.pegin_refund_timeout_blocks,
         btc_confirmed,
     })
 }
@@ -628,6 +635,7 @@ mod tests {
             y_51: y_fed, // bootstrap: internal key = federation
             y_fed,
             federation_csv_blocks: 144,
+            pegin_refund_timeout_blocks: 720,
             treasury_outpoint: OutPoint::null(),
             treasury_value: Amount::from_sat(10_000_000),
         }

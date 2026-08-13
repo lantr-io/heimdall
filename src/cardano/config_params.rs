@@ -55,7 +55,8 @@
 //!
 //! Placement follows [CFG-6]: an identity or a key is a top-level field, a
 //! tunable number lives inside `params`. That is why `y_federation` is #11 while
-//! `federation_csv_blocks` is `params[7]`.
+//! `federation_csv_blocks` is `params[7]` and `pegin_refund_timeout_blocks`
+//! is `params[8]` ([CFG-9]).
 //!
 //! ## Why the policy ids are PUBLISHED rather than derived (#7, #11–#13)
 //!
@@ -134,6 +135,17 @@ pub struct Tunables {
     /// `y_federation`. `u16` end to end: a larger value would truncate into a
     /// different tree (WI-069).
     pub federation_csv_blocks: u16,
+    /// params[8]. The CSV delay of the peg-in tree's DEPOSITOR REFUND leaf —
+    /// spec [CFG-9]. Published for the same reason as `federation_csv_blocks`
+    /// beside it: both are block counts hashed into the peg-in Taproot, so both
+    /// decide the deposit ADDRESS, and every SPO must reconstruct that address
+    /// byte for byte. It was the last of the tree's four inputs left in each
+    /// operator's own file, and the divergence it allowed was silent — two nodes
+    /// on different values freeze different peg-in sets and never reach a
+    /// signing threshold. Same `u16` end to end, for the same truncation reason.
+    ///
+    /// MUST exceed `federation_csv_blocks`, checked on read rather than assumed.
+    pub pegin_refund_timeout_blocks: u16,
 }
 
 /// The bridged token's asset name — the [CFG-1] protocol constant, not a Config
@@ -411,11 +423,12 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
 
     let params =
         plutus::constr_fields(&fields[1], 0).map_err(|e| format!("config #1 (params): {e}"))?;
-    if params.len() != 8 {
+    if params.len() != 9 {
         return Err(format!(
-            "config #1 (params) has {} slots, expected 8 \
+            "config #1 (params) has {} slots, expected 9 \
              [schedule, fee_rate, per_pegout_fee, min_peg_out_fbtc, base_ban_duration_ms, \
-             max_faults_before_permanent, max_validity_window_ms, federation_csv_blocks]",
+             max_faults_before_permanent, max_validity_window_ms, federation_csv_blocks, \
+             pegin_refund_timeout_blocks]",
             params.len()
         ));
     }
@@ -431,6 +444,24 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
     })?;
     if federation_csv_blocks == 0 {
         return Err("config params[7] (federation_csv_blocks) must be positive".to_string());
+    }
+    let refund_raw = params_int(8, "pegin_refund_timeout_blocks")?;
+    let pegin_refund_timeout_blocks = u16::try_from(refund_raw).map_err(|_| {
+        format!(
+            "config params[8] (pegin_refund_timeout_blocks) is {refund_raw}, which is not a \
+             valid u16 CSV delay — a value above 65535 would truncate into a different \
+             Taproot tree"
+        )
+    })?;
+    // The federation's recovery window must open BEFORE the depositor can take the deposit
+    // back (spec [CFG-9]). A Config that says otherwise is unusable, so refuse it here rather
+    // than let every deriver rediscover it one deposit at a time.
+    if pegin_refund_timeout_blocks <= federation_csv_blocks {
+        return Err(format!(
+            "config params[8] (pegin_refund_timeout_blocks = {pegin_refund_timeout_blocks}) \
+             must exceed params[7] (federation_csv_blocks = {federation_csv_blocks}): the \
+             federation's sweep window has to open before the depositor's refund does"
+        ));
     }
     let tunables = Tunables {
         schedule: parse_schedule(&params[0])?,
@@ -465,6 +496,7 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
             "config params[6] (max_validity_window_ms)",
         )? as i64,
         federation_csv_blocks,
+        pegin_refund_timeout_blocks,
     };
 
     Ok(ConfigParams {
@@ -526,6 +558,7 @@ pub(crate) fn test_config_params() -> ConfigParams {
             max_faults_before_permanent: 0,
             max_validity_window_ms: 0,
             federation_csv_blocks: 144,
+            pegin_refund_timeout_blocks: 720,
         },
     }
 }
@@ -812,6 +845,7 @@ mod tests {
                         int(3),         // max_faults_before_permanent
                         int(3_600_000), // max_validity_window_ms
                         int(144),       // federation_csv_blocks
+                        int(720),       // pegin_refund_timeout_blocks  [CFG-9]
                     ],
                 ), // #1 params
                 bytes(&[0xaa; 28]), // #2 bridged_token_policy
@@ -979,7 +1013,7 @@ mod tests {
             ],
         ))
         .unwrap_err();
-        assert!(err.contains("expected 8"), "{err}");
+        assert!(err.contains("expected 9"), "{err}");
     }
 
     /// A wrong-width script hash at #4/#5 is a wrong VALUE, not a shorter one.

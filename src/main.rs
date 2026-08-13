@@ -1480,6 +1480,9 @@ async fn run_demo(
             y_51: fixture.y_51,
             y_fed: fixture.y_fed,
             federation_csv_blocks: fixture.federation_csv_blocks,
+            // The published refund delay ([CFG-9]). Read from the Config where one exists;
+            // this demo path carries the same value the depositor tooling defaults to.
+            pegin_refund_timeout_blocks: cfg.bitcoin.pegin_refund_timeout_blocks.unwrap_or(4320),
             treasury_outpoint: fixture.treasury_outpoint,
             treasury_value: fixture.treasury_value,
         };
@@ -5838,12 +5841,11 @@ fn run_sweep_pegins(
     );
     let y_51 = group_xonly(dkg.public_key_package.verifying_key())?.xonly;
     info!("  FROST group key Y_51: {}", hex::encode(y_51.serialize()));
-    let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
-    // The bridge-wide half of the peg-in tree. Provenance differs per field and it matters:
-    // `y_fed` + `csv` are read from the chain (`resolve_federation`), `y_51` is the demo DKG's
-    // deterministic group key derived locally above, and `refund_timeout` is local config.
-    // Only the first two are chain-sourced; the other two are values this node could disagree
-    // with its peers about.
+    let refund_timeout = federation.pegin_refund_timeout_blocks;
+    // The bridge-wide half of the peg-in tree. `y_fed`, `csv` and `refund_timeout` are read
+    // from the bridge (`resolve_federation`, and [CFG-9] for the last); `y_51` is the demo
+    // DKG's deterministic group key derived locally above, and remains the one value this
+    // path could disagree with its peers about.
     let pegin_tree = heimdall::bitcoin::taproot::PeginTreeParams {
         y_51,
         y_federation: y_fed,
@@ -6377,6 +6379,9 @@ fn run_sweep_pegins(
             y_51: fixture.y_51,
             y_fed: fixture.y_fed,
             federation_csv_blocks: fixture.federation_csv_blocks,
+            // The published refund delay ([CFG-9]). Read from the Config where one exists;
+            // this demo path carries the same value the depositor tooling defaults to.
+            pegin_refund_timeout_blocks: cfg.bitcoin.pegin_refund_timeout_blocks.unwrap_or(4320),
             treasury_outpoint: fixture.treasury_outpoint,
             treasury_value: fixture.treasury_value,
         };
