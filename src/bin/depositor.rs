@@ -2,16 +2,19 @@
 //! Bitcoin transaction from a depositor's funding UTXO(s).
 //!
 //! Heimdall the daemon is an SPO program; the depositor is a different actor.
-//! This binary lives next to it for convenient reuse of `pegin_spend_info`,
-//! `Y_federation` derivation, and the Bitcoin RPC client — it is NOT part of
-//! the SPO control plane.
+//! This binary lives next to it for convenient reuse of `pegin_spend_info` and the Bitcoin
+//! RPC client — it is NOT part of the SPO control plane. It derives no bridge key of its
+//! own: every value that decides the deposit address is a required argument.
 //!
-//! Tx layout produced (demo-simplified peg-in, per
-//! `ft-bifrost-bridge/documentation/demo_simplifications.md`):
+//! Tx layout produced (spec § Peg-in Taproot tree; the one-leaf demo simplification this
+//! used to follow was retired by WI-081):
 //!
 //! ```text
 //! Input  0..N : funding UTXO(s) (P2WPKH controlled by depositor WIF) — signed
-//! Output 0    : peg-in P2TR (internal key Y_51, single leaf = <csv> <Q_auth> refund)
+//! Output 0    : peg-in P2TR — internal key Y_51 (the 51% quorum's key-path sweep), and
+//!               TWO leaves (spec § Peg-in Taproot tree):
+//!                 <federation_csv_blocks> OP_CSV OP_DROP <Y_federation> OP_CHECKSIG
+//!                 <refund_timeout>        OP_CSV OP_DROP <Q_auth>       OP_CHECKSIG
 //! Output 1    : OP_RETURN "BFR" || Q_auth (35 bytes)  [Bifrost one-key beacon]
 //!               Q_auth = the depositor's BIP-86 Taproot OUTPUT key, derived from
 //!               the WIF. One key does both jobs: the refund leaf above commits it,
@@ -53,7 +56,7 @@ use bitcoin::{
 };
 use clap::Parser;
 
-use heimdall::bitcoin::taproot::pegin_spend_info;
+use heimdall::bitcoin::taproot::{PeginTreeParams, pegin_spend_info};
 use heimdall::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
 use heimdall::config::HeimdallConfig;
 use tracing::{error, info, warn};
@@ -75,14 +78,35 @@ struct Cli {
     /// The peg-in Taproot INTERNAL key: the 32-byte x-only FROST group key
     /// `Y_51`, as hex. Get it from `heimdall show-treasury` ("our Y_51: …").
     ///
-    /// Required, and deliberately not derivable here. Both sweep paths
-    /// reconstruct the deposit address as `Taproot(Y_51, refund_leaf(Q_auth))`,
-    /// so a deposit built under any other internal key is unsweepable — the BTC
-    /// sits there until the refund timeout with nothing to show for it. A tool
-    /// that guessed this value would produce a well-formed address that no
-    /// federation will ever touch, which is worse than refusing to run.
+    /// Required, and deliberately not derivable here. Both sweep paths reconstruct the
+    /// deposit address as `Taproot(Y_51; federation leaf + refund leaf)` — this is the
+    /// INTERNAL key of that tree, so a deposit built under any other one is unsweepable and
+    /// the BTC sits there until the refund timeout. A tool that guessed it would produce a
+    /// well-formed address no federation will ever touch, which is worse than refusing to
+    /// run. The other two tree inputs are `--y-federation` and `--federation-csv-blocks`.
     #[arg(long)]
     frost_key: String,
+
+    /// The federation fallback key `Y_federation`, 32-byte x-only hex — the key in the
+    /// deposit tree's EMERGENCY-SWEEP leaf, not the internal key. Published as the
+    /// bridge's Config `y_federation`.
+    ///
+    /// Required for the same reason as `--frost-key`: it is an input to the deposit
+    /// ADDRESS (spec § Peg-in Taproot tree gives the tree two leaves), so a wrong or
+    /// absent value builds a well-formed P2TR that neither the federation can sweep nor
+    /// this depositor can refund.
+    #[arg(long)]
+    y_federation: String,
+
+    /// The CSV delay of the deposit tree's federation leaf, in blocks — the bridge's
+    /// Config `params.federation_csv_blocks`.
+    ///
+    /// A flag and not a config key, for the same reason as the two above: it is an input
+    /// to the deposit ADDRESS. `bitcoin.federation_csv_blocks` is deliberately unset on a
+    /// correctly configured node (WI-069 moved it on chain), so reading it from there would
+    /// either refuse to run or silently use a value the bridge does not publish.
+    #[arg(long)]
+    federation_csv_blocks: u16,
 
     /// Depositor's funding key in Bitcoin WIF format. Its BIP-86 Taproot
     /// output key is what the OP_RETURN beacon carries and what the peg-in
@@ -149,12 +173,22 @@ fn run() -> Result<(), String> {
 
     let secp = Secp256k1::new();
 
-    // The peg-in Taproot internal key is the FROST group key Y_51 — NOT the
-    // federation key Y_fed. It has to be passed in: Y_51 is a distributed key with
-    // no local seed to derive it from, and the daemon reconstructs every deposit
-    // address under it (`parse_pegin_request`), so getting it from anywhere else
-    // silently produces deposits no federation can sweep.
-    let y_51 = parse_frost_key(&cli.frost_key)?;
+    // The peg-in Taproot internal key is the FROST group key Y_51 — NOT the federation
+    // key Y_fed, which sits in the emergency-sweep LEAF. Both have to be passed in: they
+    // are consensus values the daemon reconstructs every deposit address from
+    // (`parse_pegin_request`), so getting either from anywhere else silently produces
+    // deposits no federation can sweep.
+    let y_51 = parse_xonly("--frost-key", &cli.frost_key)?;
+    let y_federation = parse_xonly("--y-federation", &cli.y_federation)?;
+    let federation_csv_blocks = cli.federation_csv_blocks;
+    let pegin_tree = PeginTreeParams {
+        y_51,
+        y_federation,
+        federation_csv_blocks,
+        refund_timeout,
+    };
+    // One rule, one message, shared with every other deriver.
+    pegin_tree.validate()?;
 
     let wif = read_wif(&cli)?;
     let depositor_priv =
@@ -180,11 +214,15 @@ fn run() -> Result<(), String> {
 
     let depositor_p2wpkh = Address::p2wpkh(&depositor_compressed, network);
 
-    let pegin_addr = pegin_address(&secp, y_51, depositor_outputkey, refund_timeout, network);
+    let pegin_addr = pegin_address(&secp, &pegin_tree, depositor_outputkey, network);
     info!("peg-in P2TR address: {pegin_addr}");
     info!(
-        "peg-in internal key: {}  (Y_51)",
+        "peg-in internal key: {}  (Y_51, key path)",
         hex::encode(y_51.serialize())
+    );
+    info!(
+        "federation leaf:     {}  (Y_fed, after {federation_csv_blocks} blocks)",
+        hex::encode(y_federation.serialize())
     );
     info!(
         "depositor Q_auth:    {}  (beacon payload + refund-leaf key)",
@@ -367,25 +405,24 @@ fn read_wif(cli: &Cli) -> Result<String, String> {
     Err("must pass --depositor-wif or --depositor-wif-file".to_string())
 }
 
-/// Parse `--frost-key`: the 32-byte x-only FROST group key `Y_51` as hex.
-fn parse_frost_key(hex_str: &str) -> Result<UntweakedPublicKey, String> {
-    let bytes = hex::decode(hex_str.trim()).map_err(|e| format!("--frost-key: {e}"))?;
+/// Parse a 32-byte x-only key argument, naming the flag in every failure.
+fn parse_xonly(flag: &str, hex_str: &str) -> Result<UntweakedPublicKey, String> {
+    let bytes = hex::decode(hex_str.trim()).map_err(|e| format!("{flag}: {e}"))?;
     let bytes: [u8; 32] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| format!("--frost-key must be 32 bytes (x-only), got {}", bytes.len()))?;
+        .map_err(|_| format!("{flag} must be 32 bytes (x-only), got {}", bytes.len()))?;
     UntweakedPublicKey::from_slice(&bytes)
-        .map_err(|e| format!("--frost-key is not a valid x-only pubkey: {e}"))
+        .map_err(|e| format!("{flag} is not a valid x-only pubkey: {e}"))
 }
 
 fn pegin_address(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
-    y_51: UntweakedPublicKey,
+    tree: &PeginTreeParams,
     depositor_outputkey: UntweakedPublicKey,
-    refund_timeout: u16,
     network: bitcoin::Network,
 ) -> Address {
-    let spend_info = pegin_spend_info(secp, y_51, depositor_outputkey, refund_timeout);
+    let spend_info = pegin_spend_info(secp, tree, depositor_outputkey);
     let spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
     Address::from_script(&spk, network).expect("P2TR script always has a valid address")
 }
@@ -695,18 +732,18 @@ mod tests {
     fn frost_key_round_trips_and_tolerates_whitespace() {
         // A real Y_51: the live deployment's FROST group key.
         let hex_str = "b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854";
-        let key = parse_frost_key(&format!("  {hex_str}\n")).unwrap();
+        let key = parse_xonly("--frost-key", &format!("  {hex_str}\n")).unwrap();
         assert_eq!(hex::encode(key.serialize()), hex_str);
     }
 
     #[test]
     fn frost_key_rejects_wrong_length_and_off_curve() {
         // Truncated: caught before it can be mistaken for a valid point.
-        let err = parse_frost_key("b1e15a53").unwrap_err();
+        let err = parse_xonly("--frost-key", "b1e15a53").unwrap_err();
         assert!(err.contains("32 bytes"), "{err}");
         // Right length, not a curve point — a deposit built under it would be
         // unspendable, so it must not reach the address derivation.
-        let err = parse_frost_key(&"ff".repeat(32)).unwrap_err();
+        let err = parse_xonly("--frost-key", &"ff".repeat(32)).unwrap_err();
         assert!(err.contains("x-only pubkey"), "{err}");
     }
 
@@ -721,16 +758,32 @@ mod tests {
             .unwrap()
             .x_only_public_key(&secp)
             .0;
-        let y_51 =
-            parse_frost_key("b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854")
-                .unwrap();
+        let y_51 = parse_xonly(
+            "--frost-key",
+            "b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854",
+        )
+        .unwrap();
         let other = SecretKey::from_slice(&[0xFE; 32])
             .unwrap()
             .x_only_public_key(&secp)
             .0;
 
-        let a = pegin_address(&secp, y_51, depositor, 720, network);
-        let b = pegin_address(&secp, other, depositor, 720, network);
+        let tree = PeginTreeParams {
+            y_51,
+            y_federation: other,
+            federation_csv_blocks: 144,
+            refund_timeout: 720,
+        };
+        let a = pegin_address(&secp, &tree, depositor, network);
+        let b = pegin_address(
+            &secp,
+            &PeginTreeParams {
+                y_51: other,
+                ..tree
+            },
+            depositor,
+            network,
+        );
         assert_ne!(a, b);
     }
 
@@ -757,10 +810,21 @@ mod tests {
         assert_eq!(&bytes[5..37], &outputkey.serialize());
 
         // …and that is exactly the key the peg-in refund leaf holds.
-        let y_51 =
-            parse_frost_key("b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854")
-                .unwrap();
-        let si = pegin_spend_info(&secp, y_51, outputkey, 720);
+        let y_51 = parse_xonly(
+            "--frost-key",
+            "b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854",
+        )
+        .unwrap();
+        let si = pegin_spend_info(
+            &secp,
+            &PeginTreeParams {
+                y_51,
+                y_federation: y_51,
+                federation_csv_blocks: 144,
+                refund_timeout: 720,
+            },
+            outputkey,
+        );
         let leaf = heimdall::bitcoin::taproot::build_csv_checksig_script(720, outputkey);
         assert!(si.script_map().keys().any(|(s, _)| *s == leaf));
     }

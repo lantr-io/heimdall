@@ -1635,6 +1635,10 @@ impl CardanoChain for BlockfrostCardanoChain {
             value,
             y_51,
             y_fed,
+            // The PUBLISHED federation key, not the one the head happens to be locked
+            // under: a depositor builds against what the Config names, so the peg-in tree
+            // must too (`leaf_candidates[0]` above is this same value).
+            config_y_fed: self.treasury_config.y_fed,
             federation_csv_blocks: csv,
             btc_confirmed,
         })

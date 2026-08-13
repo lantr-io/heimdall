@@ -14,10 +14,11 @@
 //!    OUTPUT key and it does two jobs: the deposit's refund leaf commits
 //!    it, and the BIP-322 peg-in completion is signed under it. Reading
 //!    the beacon therefore hands an SPO the refund key outright.
-//! 3. Using the treasury group key `Y_51` from the on-chain treasury
-//!    oracle and the `refund_timeout` protocol parameter (720 blocks per
-//!    demo, overridable per-network), we reconstruct the expected peg-in
-//!    Taproot address Q via `pegin_spend_info`.
+//! 3. From the on-chain treasury oracle — the group key `Y_51`, the
+//!    federation key `Y_fed` and its CSV delay — plus the `refund_timeout`
+//!    protocol parameter, we reconstruct the expected peg-in Taproot address
+//!    Q via `pegin_spend_info`. The tree has two leaves: the federation's
+//!    emergency sweep and the depositor's refund.
 //! 4. Exactly one tx output must pay to that Q; that output's
 //!    `(txid, vout, value)` becomes the TM input.
 
@@ -27,7 +28,7 @@ use bitcoin::taproot::TaprootSpendInfo;
 use bitcoin::{Amount, ScriptBuf, Transaction, Txid};
 use pallas_primitives::PlutusData;
 
-use crate::bitcoin::taproot::pegin_spend_info;
+use crate::bitcoin::taproot::{PeginTreeParams, pegin_spend_info};
 use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInRequest};
 
 /// Dust threshold for P2TR outputs; must match `tm_builder::DUST_THRESHOLD`.
@@ -188,24 +189,23 @@ pub fn parse_beacon(tx: &Transaction) -> Result<UntweakedPublicKey, ParseError> 
 
 /// Parse and validate a raw Cardano peg-in request.
 ///
-/// `y_51` is the peg-in Taproot **internal key** — the FROST group key from the
-/// on-chain treasury oracle (the 51% main-line sweep key). It is NOT the
-/// federation key `Y_fed`: commit `6af7c67` ("simplify peg-in Taproot to Y_fed")
-/// switched the internal key to `Y_fed` as a demo shortcut, but spec-compliant
-/// deposits (and the live BIP-322 ones) are keyed to `Y_51`. `refund_timeout` is
-/// a protocol parameter (720 blocks per demo).
+/// `tree` carries the bridge-wide half of the peg-in Taproot — every value except the
+/// depositor's. All of it comes from the on-chain treasury oracle ([`crate::epoch::traits::TreasuryUtxo`] has
+/// `y_51`, `y_fed` and `federation_csv_blocks`), so no node configures any of it. The
+/// internal key is `Y_51`, the FROST group key, and NOT `Y_fed`: commit `6af7c67`
+/// ("simplify peg-in Taproot to Y_fed") switched it as a demo shortcut, and
+/// spec-compliant deposits are keyed to `Y_51`.
 ///
-/// The peg-in tree is `Taproot(Y_51, <refund_timeout> OP_CSV OP_DROP <Q_auth> OP_CHECKSIG)`,
-/// and `Q_auth` — the depositor's Taproot output key — is READ from the 35-byte
-/// beacon. Because the leaf commits the same key the beacon carries, the peg-in
-/// address is computed once instead of searched for: the earlier form, whose beacon
-/// named a completion key the leaf did not use, forced the refund key to be recovered
-/// by reconstructing the address for every candidate key in the tx and seeing which
-/// one appeared as an output — ambiguous whenever more than one candidate matched.
+/// The tree has TWO leaves (spec § Peg-in Taproot tree): the federation's emergency
+/// sweep under `Y_fed`, and the depositor's refund under `Q_auth` — the Taproot output
+/// key READ from the 35-byte beacon. Because that leaf commits the same key the beacon
+/// carries, the peg-in address is computed once instead of searched for: the earlier
+/// form, whose beacon named a completion key the leaf did not use, forced the refund key
+/// to be recovered by reconstructing the address for every candidate key in the tx and
+/// seeing which one appeared as an output — ambiguous whenever more than one matched.
 pub fn parse_pegin_request(
     req: &CardanoPegInRequest,
-    y_51: UntweakedPublicKey,
-    refund_timeout: u16,
+    tree: &PeginTreeParams,
 ) -> Result<ParsedPegIn, ParseError> {
     // 1. Decode the Cardano datum: we only trust field[1] (raw tx).
     let plutus: PlutusData = pallas_codec::minicbor::decode(&req.datum_cbor)
@@ -220,13 +220,13 @@ pub fn parse_pegin_request(
     // 3. Read the depositor's Taproot output key Q_auth from the OP_RETURN beacon.
     let depositor_outputkey = parse_beacon(&btc_tx)?;
 
-    // 4. Locate the deposit output. Q_auth is known, so the peg-in address
-    //    `Taproot(Y_51, refund_leaf(Q_auth, refund_timeout))` is computed once rather
-    //    than searched for. Two outputs paying that same address remain ambiguous —
-    //    this function resolves the peg-in from the tx alone, with no datum outpoint
-    //    to disambiguate them — so that case is still refused.
+    // 4. Locate the deposit output. Q_auth is known and the rest of the tree comes from
+    //    the oracle, so the peg-in address is computed once rather than searched for. Two
+    //    outputs paying that same address remain ambiguous — this function resolves the
+    //    peg-in from the tx alone, with no datum outpoint to disambiguate them — so that
+    //    case is still refused.
     let secp = Secp256k1::new();
-    let spend_info = pegin_spend_info(&secp, y_51, depositor_outputkey, refund_timeout);
+    let spend_info = pegin_spend_info(&secp, tree, depositor_outputkey);
     let expected_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
     let mut hits = btc_tx
         .output
@@ -291,11 +291,23 @@ mod tests {
         xonly_from_seed([0xFEu8; 32])
     }
 
+    /// The bridge-wide tree the fixtures are built and parsed under. `test_y_fed()` is the
+    /// INTERNAL key here for historical reasons (the fixtures were written when it was);
+    /// what matters is that build and parse use the same params.
+    fn test_tree() -> PeginTreeParams {
+        PeginTreeParams {
+            y_51: test_y_fed(),
+            y_federation: xonly_from_seed([0xEDu8; 32]),
+            federation_csv_blocks: 144,
+            refund_timeout: REFUND_TIMEOUT,
+        }
+    }
+
     fn pegin_spk(depositor_xonly_bytes: [u8; 32]) -> ScriptBuf {
         let secp = Secp256k1::new();
         let depositor =
             UntweakedPublicKey::from_slice(&depositor_xonly_bytes).expect("valid xonly");
-        let si = pegin_spend_info(&secp, test_y_fed(), depositor, REFUND_TIMEOUT);
+        let si = pegin_spend_info(&secp, &test_tree(), depositor);
         ScriptBuf::new_p2tr_tweaked(si.output_key())
     }
 
@@ -403,7 +415,7 @@ mod tests {
     }
 
     fn parse(req: &CardanoPegInRequest) -> Result<ParsedPegIn, ParseError> {
-        parse_pegin_request(req, test_y_fed(), REFUND_TIMEOUT)
+        parse_pegin_request(req, &test_tree())
     }
 
     // ------ Happy path --------------------------------------------------
@@ -435,6 +447,8 @@ mod tests {
     /// ```text
     /// cargo run --bin depositor -- --config heimdall.testnet4.toml \
     ///   --frost-key b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854 \
+    ///   --y-federation b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854 \
+    ///   --federation-csv-blocks 144 \
     ///   --depositor-wif cN9spWsvaxA8taS7DFMxnk1yJD2gaF2PX1npuTpy3vuZFJdwavaw \
     ///   --deposit-amount-sat 50000 --fee-sat 2000 \
     ///   --funding-txid 7afd38db928a8f30f789d5c2dc9f918a6b55f85dd251f42f2e31b535bdaa0583 \
@@ -442,7 +456,7 @@ mod tests {
     /// ```
     #[test]
     fn depositor_built_deposit_round_trips() {
-        let raw_tx = hex::decode("020000000001018305aabd35b5312e2ff451d25df8556b8a919fdcc2d589f7308f8a92db38fd7a0200000000fdffffff0350c300000000000022512080c3fa89c4b814ec7a98fd9392a318f252c187140e0f9ae1bbae31919866591a0000000000000000256a234246522a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c3680bb000000000000160014fc7250a211deddc70ee5a2738de5f07817351cef02483045022100a189c360944fefe0cd5c9eec79c77caefd8d2cb0440b3f82bc46a62e86da14570220504507ec214003640ef4aed9ef6e9ae879c4c7dc691852e84ef3ca9956a44ead0121034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa00000000")
+        let raw_tx = hex::decode("020000000001018305aabd35b5312e2ff451d25df8556b8a919fdcc2d589f7308f8a92db38fd7a0200000000fdffffff0350c300000000000022512069cf12c4a55c407ba4ffae3bcad9832d2f6fb0f36e555265b9f72428539850830000000000000000256a234246522a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c3680bb000000000000160014fc7250a211deddc70ee5a2738de5f07817351cef0247304402205b9845147ffec180c0c2d6674b4ada8735f1738f351d30c0a32d0d294904faba02207a07d4f6a222808fd7d1c77a5c5e35a011fe87b1667bb1f4250f13a1e13f0ad20121034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa00000000")
             .unwrap();
         let y_51 = UntweakedPublicKey::from_slice(
             &hex::decode("b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854")
@@ -450,8 +464,15 @@ mod tests {
         )
         .unwrap();
 
+        // The live demo pins Y_federation to the FROST key's own value, so both are y_51 here.
+        let tree = PeginTreeParams {
+            y_51,
+            y_federation: y_51,
+            federation_csv_blocks: 144,
+            refund_timeout: 720,
+        };
         let req = make_request(build_datum_bytes(raw_tx));
-        let parsed = parse_pegin_request(&req, y_51, 720).expect("depositor output must parse");
+        let parsed = parse_pegin_request(&req, &tree).expect("depositor output must parse");
 
         assert_eq!(parsed.btc_vout, 0);
         assert_eq!(parsed.value, Amount::from_sat(50_000));
@@ -460,10 +481,16 @@ mod tests {
             hex::encode(parsed.depositor_outputkey.serialize()),
             "2a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36"
         );
-        // The reconstruction landed on the address the depositor actually paid.
+        // The reconstruction landed on the address the depositor actually paid. Both sides
+        // of that are this crate's, so it proves internal consistency and nothing more.
+        // The CROSS-implementation check is not automated here: ft's
+        // `documentation/pegin_deposit.py` and the frontend's bitcoinjs-lib were each run by
+        // hand on these inputs (2026-08-13) and produced the same 69cf12c4… output key. If
+        // the leaf depth or ordering ever diverges between the three, this test stays green
+        // — re-run those two before trusting it.
         assert_eq!(
             hex::encode(ScriptBuf::new_p2tr_tweaked(parsed.spend_info.output_key()).as_bytes()),
-            "512080c3fa89c4b814ec7a98fd9392a318f252c187140e0f9ae1bbae31919866591a"
+            "512069cf12c4a55c407ba4ffae3bcad9832d2f6fb0f36e555265b9f7242853985083"
         );
     }
 
@@ -503,7 +530,14 @@ mod tests {
 
         let req = make_request(build_datum_bytes(raw_tx));
         assert!(matches!(
-            parse_pegin_request(&req, y_51, 720).unwrap_err(),
+            parse_pegin_request(
+                &req,
+                &PeginTreeParams {
+                    y_51,
+                    ..test_tree()
+                }
+            )
+            .unwrap_err(),
             ParseError::NoPegInOutput
         ));
     }
@@ -541,7 +575,14 @@ mod tests {
         let other_treasury_key = xonly_from_seed([0xAB; 32]);
         assert_ne!(other_treasury_key, test_y_fed());
         assert!(matches!(
-            parse_pegin_request(&req, other_treasury_key, 720).unwrap_err(),
+            parse_pegin_request(
+                &req,
+                &PeginTreeParams {
+                    y_51: other_treasury_key,
+                    ..test_tree()
+                }
+            )
+            .unwrap_err(),
             ParseError::NoPegInOutput
         ));
     }
@@ -784,6 +825,42 @@ mod tests {
         ));
     }
 
+    /// The federation leaf is part of the address, so a wrong `y_federation` makes a real
+    /// deposit unrecognisable — the failure this test's neighbours never covered, because
+    /// they all vary the internal key instead.
+    #[test]
+    fn no_pegin_output_wrong_federation_key() {
+        let xonly = depositor_xonly();
+        let tx = build_pegin_tx(xonly, Amount::from_sat(100_000));
+        let req = make_request(build_datum_bytes(serialize(&tx)));
+        let wrong = PeginTreeParams {
+            y_federation: xonly_from_seed([0x77; 32]),
+            ..test_tree()
+        };
+        assert_ne!(wrong.y_federation, test_tree().y_federation);
+        assert!(matches!(
+            parse_pegin_request(&req, &wrong).unwrap_err(),
+            ParseError::NoPegInOutput
+        ));
+    }
+
+    /// Same for the federation leaf's CSV delay: it is hashed into the leaf, so it moves the
+    /// address just as surely as the key does.
+    #[test]
+    fn no_pegin_output_wrong_federation_csv() {
+        let xonly = depositor_xonly();
+        let tx = build_pegin_tx(xonly, Amount::from_sat(100_000));
+        let req = make_request(build_datum_bytes(serialize(&tx)));
+        let wrong = PeginTreeParams {
+            federation_csv_blocks: test_tree().federation_csv_blocks + 1,
+            ..test_tree()
+        };
+        assert!(matches!(
+            parse_pegin_request(&req, &wrong).unwrap_err(),
+            ParseError::NoPegInOutput
+        ));
+    }
+
     #[test]
     fn no_pegin_output_wrong_y_fed() {
         // Build the peg-in address from a *different* Y_fed than the
@@ -793,7 +870,11 @@ mod tests {
         let stale_y_fed = xonly_from_seed([0x99u8; 32]);
         let secp = Secp256k1::new();
         let depositor = UntweakedPublicKey::from_slice(&xonly).unwrap();
-        let stale_si = pegin_spend_info(&secp, stale_y_fed, depositor, REFUND_TIMEOUT);
+        let stale_tree = PeginTreeParams {
+            y_51: stale_y_fed,
+            ..test_tree()
+        };
+        let stale_si = pegin_spend_info(&secp, &stale_tree, depositor);
         let stale_spk = ScriptBuf::new_p2tr_tweaked(stale_si.output_key());
 
         let tx = build_tx_with_outputs(vec![
