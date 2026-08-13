@@ -3040,8 +3040,10 @@ fn run_federation_sign(
             )
         }
         FederationSigner::Share(state) => {
+            let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
             let (sig, held) = frost_federation_signature(
                 cfg,
+                rt,
                 state,
                 message,
                 signers,
@@ -3075,7 +3077,18 @@ fn run_federation_sign(
 /// address (federation self-send); the on-chain rotation to y_federation is a
 /// separate step (N10b). `y51_hex` is the treasury's current internal key (its
 /// FROST group key) — needed only to rebuild the treasury tree / leaf control
-/// block; `y_fed` + csv come from what this node holds and from the config.
+/// block.
+///
+/// `y_fed` and the CSV delay come from the **Config datum** wherever the bridge
+/// has one (#11 and `params[7]`, via [`resolve_federation`]) — what this node
+/// holds locally is the SECRET half and a cross-check, never the source of the
+/// address. That mattered less when one operator signed alone; with a threshold
+/// federation several operators must build byte-identical transactions, so a
+/// per-operator `federation_csv_blocks` would be exactly the silent divergence
+/// [`heimdall::cardano::federation`] exists to prevent — each member would hash a
+/// different tree, and the session would stall with every member waiting for the
+/// others. Local values are the source only before genesis, when there is
+/// genuinely no Config to read.
 fn run_federation_spend(
     cfg: &HeimdallConfig,
     outpoint: &str,
@@ -3092,12 +3105,19 @@ fn run_federation_spend(
 
     let secp = Secp256k1::new();
     let outpoint = parse_outpoint(outpoint)?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    // Published-wins, and a local key that disagrees with the published one is
+    // fatal here rather than quietly preferred — this node would otherwise sign
+    // for an address the other members are not using.
+    let federation = rt.block_on(resolve_federation(cfg))?;
     let signer = federation_signer(cfg)?;
-    let y_fed = match &signer {
-        FederationSigner::Seed(kp) => kp.x_only_public_key().0,
-        FederationSigner::Share(state) => state.y_federation().map_err(|e| e.to_string())?,
-    };
-    let csv = csv_blocks_u16(cfg)?;
+    let y_fed = federation.y_fed;
+    let csv = federation.csv_blocks;
+    println!(
+        "y_federation: {} ({})",
+        hex::encode(y_fed.serialize()),
+        federation.origin
+    );
     // Omitted => the bootstrap treasury, whose internal key is y_fed itself.
     let y51 = match y51_hex {
         Some(h) => {
@@ -3152,6 +3172,7 @@ fn run_federation_spend(
         FederationSigner::Share(state) => {
             let (sig, held) = frost_federation_signature(
                 cfg,
+                rt,
                 state,
                 spend.sighash,
                 signers,
@@ -3236,6 +3257,7 @@ impl HeldSession {
 
 fn frost_federation_signature(
     cfg: &HeimdallConfig,
+    rt: tokio::runtime::Runtime,
     state: &FederationKeyState,
     sighash: [u8; 32],
     signers: &[u16],
@@ -3265,7 +3287,6 @@ fn frost_federation_signature(
     };
     print!("{}", roster.table());
 
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
     let signature = rt.block_on(async {
         let peers: Arc<dyn PeerNetwork> = serve_federation(cfg, &me, keypair).await?;
         let mut rng = OsRngSource.rng(b"federation-spend");

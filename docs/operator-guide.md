@@ -259,6 +259,12 @@ so two members assuming different sets produce a signature that verifies against
 member prints the identical signed transaction; any one of them can broadcast it — heimdall does
 not send transactions to Bitcoin.
 
+The key and the CSV delay it rebuilds the treasury tree from come from the **Config datum** (#11
+and `params[7]`), not from anyone's config file — the command prints which source it used. Your
+share is the secret half and a cross-check: if it disagrees with what the bridge publishes,
+heimdall refuses rather than signing for an address the other members are not using. Only before
+genesis, when there is no Config to read, do the local values apply.
+
 For the authorizations that are not Bitcoin transactions — today, rotating the treasury's FROST
 key as the federation (`update-y --federation`, the dead-roster recovery) — `federation-sign` does
 the same thing to a plain 32-byte message:
