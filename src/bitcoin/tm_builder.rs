@@ -991,26 +991,51 @@ pub fn sign_tm_single_key(
     Ok(tx)
 }
 
-/// Sign the treasury input (index 0) via the **federation CSV leaf** — the
-/// emergency script-path fallback for when the FROST group is dark (scenario 3,
-/// N23). Unlike the key-path signers this reveals the leaf + its control block
-/// and signs the **raw** `y_fed` key (the leaf's `OP_CHECKSIG` checks `y_fed`
-/// un-tweaked), and it sets the treasury input's `nSequence` to `csv_blocks` so
-/// `OP_CSV`'s relative timelock is enabled and satisfied — the treasury UTxO must
-/// already be `csv_blocks` deep on Bitcoin. Only input 0 is federation-spent.
+/// A federation CSV-leaf spend of the treasury input, built up to the point
+/// where a signature over [`Self::sighash`] is all that is missing.
 ///
-/// `y_fed_secret` must correspond to the treasury tree's federation-leaf key (the
-/// same key passed to [`crate::bitcoin::taproot::treasury_spend_info`]); a
-/// mismatch (or wrong `csv_blocks`) means the leaf is not in the tree and yields
-/// [`TmBuildError::FederationLeafSpend`]. Changing `nSequence` changes the txid,
-/// so this is a standalone federation tx, not a FROST-coordinated one.
-pub fn sign_tm_federation_leaf(
-    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+/// The split exists because `Y_federation` has two possible shapes and only one
+/// step differs between them: a single seed signs [`Self::sighash`] locally
+/// ([`sign_tm_federation_leaf`]), while a DKG'd federation runs a FROST session
+/// over exactly the same 32 bytes ([`crate::federation::spend`]) and comes back
+/// with the same kind of signature. Everything else — the revealed leaf, the
+/// control block, the `nSequence` that both satisfies `OP_CSV` and commits into
+/// the sighash — is identical, and must stay identical: a difference in any of
+/// them changes the sighash, so the two paths would be signing different
+/// transactions while looking like they agree.
+#[derive(Debug, Clone)]
+pub struct FederationLeafSpend {
+    /// The transaction with `nSequence` already set on input 0. The signature is
+    /// over THIS transaction, so it must not be modified afterwards.
+    pub tx: Transaction,
+    /// The revealed leaf script: `<csv> OP_CSV OP_DROP <y_fed> OP_CHECKSIG`.
+    pub leaf: ScriptBuf,
+    /// Its control block — proof the leaf is in the treasury's Taproot tree.
+    pub control_block: bitcoin::taproot::ControlBlock,
+    /// The BIP-341 script-path sighash to sign. Verified against `y_fed`
+    /// UNTWEAKED: `OP_CHECKSIG` checks the key the leaf pushes.
+    pub sighash: [u8; 32],
+}
+
+/// Build the treasury's federation CSV-leaf spend (scenario 3, N23) — the
+/// emergency script-path fallback for when the FROST group is dark.
+///
+/// Reveals the leaf + its control block and sets the treasury input's
+/// `nSequence` to `csv_blocks`, so `OP_CSV`'s relative timelock is enabled and
+/// satisfied — the treasury UTxO must already be `csv_blocks` deep on Bitcoin.
+/// Only input 0 is federation-spent.
+///
+/// `y_fed` must be the treasury tree's federation-leaf key (the same key passed
+/// to [`crate::bitcoin::taproot::treasury_spend_info`]); a mismatch, or a wrong
+/// `csv_blocks`, means the leaf is not in the tree and yields
+/// [`TmBuildError::FederationLeafSpend`] here rather than an unexplained script
+/// failure at broadcast. Changing `nSequence` changes the txid, so this is a
+/// standalone federation transaction, never one of the key-path movements.
+pub fn federation_leaf_spend(
     unsigned: &UnsignedTm,
-    y_fed_secret: &bitcoin::secp256k1::SecretKey,
+    y_fed: bitcoin::key::UntweakedPublicKey,
     csv_blocks: u16,
-) -> Result<Transaction, TmBuildError> {
-    use bitcoin::secp256k1::{Keypair, Message};
+) -> Result<FederationLeafSpend, TmBuildError> {
     use bitcoin::taproot::{LeafVersion, TapLeafHash};
 
     let n = unsigned.tx.input.len();
@@ -1022,10 +1047,8 @@ pub fn sign_tm_federation_leaf(
         });
     }
 
-    let keypair = Keypair::from_secret_key(secp, y_fed_secret);
-    let y_fed_xonly = keypair.x_only_public_key().0;
     // The exact leaf `treasury_spend_info` built: <csv> OP_CSV OP_DROP <y_fed> OP_CHECKSIG.
-    let leaf = crate::bitcoin::taproot::build_csv_checksig_script(csv_blocks, y_fed_xonly);
+    let leaf = crate::bitcoin::taproot::build_csv_checksig_script(csv_blocks, y_fed);
     let leaf_hash = TapLeafHash::from_script(&leaf, LeafVersion::TapScript);
     let control_block = unsigned.input_spend_info[0]
         .control_block(&(leaf.clone(), LeafVersion::TapScript))
@@ -1054,21 +1077,52 @@ pub fn sign_tm_federation_leaf(
             .map_err(|e| TmBuildError::FederationLeafSpend(format!("sighash: {e}")))?
     };
 
-    let sig =
-        secp.sign_schnorr_no_aux_rand(&Message::from_digest(sighash.to_byte_array()), &keypair);
-    let tap_sig = bitcoin::taproot::Signature {
-        signature: sig,
-        sighash_type: TapSighashType::Default,
-    };
+    Ok(FederationLeafSpend {
+        tx,
+        leaf,
+        control_block,
+        sighash: sighash.to_byte_array(),
+    })
+}
 
-    // Script-path witness: [Schnorr signature, revealed leaf script, control block].
-    let mut witness = Witness::new();
-    witness.push(tap_sig.to_vec());
-    witness.push(leaf.as_bytes());
-    witness.push(control_block.serialize());
-    tx.input[0].witness = witness;
+impl FederationLeafSpend {
+    /// Attach a 64-byte BIP-340 signature over [`Self::sighash`] and return the
+    /// witnessed transaction — whether one key or a FROST quorum produced it.
+    pub fn finish(self, signature: [u8; 64]) -> Result<Transaction, TmBuildError> {
+        let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(&signature)
+            .map_err(|e| TmBuildError::FederationLeafSpend(format!("schnorr signature: {e}")))?;
+        let tap_sig = bitcoin::taproot::Signature {
+            signature,
+            sighash_type: TapSighashType::Default,
+        };
+        // Script-path witness: [Schnorr signature, revealed leaf script, control block].
+        let mut witness = Witness::new();
+        witness.push(tap_sig.to_vec());
+        witness.push(self.leaf.as_bytes());
+        witness.push(self.control_block.serialize());
+        let mut tx = self.tx;
+        tx.input[0].witness = witness;
+        Ok(tx)
+    }
+}
 
-    Ok(tx)
+/// Federation CSV-leaf spend signed by a SINGLE key — the pre-WI-087 federation,
+/// where one party holds `y_fed_seed_hex` outright.
+///
+/// The distributed federation signs the same [`FederationLeafSpend::sighash`]
+/// through [`crate::federation::spend::frost_sign`] instead.
+pub fn sign_tm_federation_leaf(
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    unsigned: &UnsignedTm,
+    y_fed_secret: &bitcoin::secp256k1::SecretKey,
+    csv_blocks: u16,
+) -> Result<Transaction, TmBuildError> {
+    use bitcoin::secp256k1::{Keypair, Message};
+
+    let keypair = Keypair::from_secret_key(secp, y_fed_secret);
+    let spend = federation_leaf_spend(unsigned, keypair.x_only_public_key().0, csv_blocks)?;
+    let sig = secp.sign_schnorr_no_aux_rand(&Message::from_digest(spend.sighash), &keypair);
+    spend.finish(sig.serialize())
 }
 
 /// FROST analogue of [`sign_tm_single_key`]: sign every key-path TM input with a
@@ -2647,6 +2701,50 @@ mod tests {
         // A key/csv that is not the tree's leaf has no control block → error.
         assert!(matches!(
             sign_tm_federation_leaf(&secp, &tm, &sk_from_seed([9u8; 32]), 144),
+            Err(TmBuildError::FederationLeafSpend(_))
+        ));
+    }
+
+    /// WI-087: a DKG'd federation signs the SAME transaction as a single key —
+    /// only the signature is produced elsewhere. Building the spend and finishing
+    /// it with an externally supplied signature must reproduce
+    /// [`sign_tm_federation_leaf`] byte for byte, because any divergence would
+    /// mean the two paths hash different transactions while appearing equivalent,
+    /// and the FROST quorum would be signing something nobody can broadcast.
+    #[test]
+    fn the_split_leaf_spend_reproduces_the_single_key_transaction() {
+        use bitcoin::secp256k1::{Keypair, Message, Secp256k1};
+
+        let secp = Secp256k1::new();
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![],
+            change_address(),
+            &default_params(),
+        )
+        .unwrap();
+        let y_fed_sk = sk_from_seed([3u8; 32]);
+        let keypair = Keypair::from_secret_key(&secp, &y_fed_sk);
+
+        let spend = federation_leaf_spend(&tm, keypair.x_only_public_key().0, 144).unwrap();
+        // The sighash is the one the caller signs — here locally, in production a
+        // FROST session over exactly these 32 bytes.
+        let sig = secp
+            .sign_schnorr_no_aux_rand(&Message::from_digest(spend.sighash), &keypair)
+            .serialize();
+        let assembled = spend.finish(sig).unwrap();
+
+        let direct = sign_tm_federation_leaf(&secp, &tm, &y_fed_sk, 144).unwrap();
+        assert_eq!(
+            bitcoin::consensus::encode::serialize(&assembled),
+            bitcoin::consensus::encode::serialize(&direct),
+            "the two-step and one-step federation spends must be the same transaction"
+        );
+
+        // The same wrong-key refusal, before any signature is asked for.
+        assert!(matches!(
+            federation_leaf_spend(&tm, xonly_from_seed([9u8; 32]), 144),
             Err(TmBuildError::FederationLeafSpend(_))
         ));
     }

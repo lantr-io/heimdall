@@ -54,9 +54,13 @@ pegout_freshness_margin_ms = 604800000
 #
 # y_fed_seed_hex is a SPENDING SECRET, not an identifier: it signs the treasury's
 # federation recovery path, which is why the chain carries only the derived public
-# key. Set it only on a node that performs federation spends — there it also
-# cross-checks the published key, the one check a node without the seed cannot
-# make, and a disagreement is fatal rather than silently resolved.
+# key. It is the SINGLE-KEY federation — one seed, one holder, who can sweep the
+# whole treasury alone once the CSV delay passes. A federation formed by the
+# ceremony ([federation] below) leaves it unset: each member holds a SHARE, under
+# protocol.state_dir, and no member can spend alone.
+#
+# Setting both is refused. They are different keys locking different treasuries,
+# so nothing can tell which one is this bridge's.
 #
 # Leaving these commented out is the normal case. Setting either to "" counts as
 # unset, not as an empty value.
@@ -75,6 +79,38 @@ pegout_freshness_margin_ms = 604800000
 #rpc_url = "http://127.0.0.1:8332"
 #rpc_user = ""
 #rpc_pass = ""
+
+
+# [federation] — ONLY for the people STANDING A BRIDGE UP. An SPO joining an
+# existing bridge leaves this out entirely: the federation key is already formed
+# and published at Config #11, and joining does not make you a member of it.
+#
+# This is the one participant list heimdall does not read from a chain, and it
+# cannot be: Y_federation is an input to genesis — it is Config #11, and the
+# treasury address the genesis anchor is funded at derives from it — so the key
+# exists before the bridge does. There is no registry to enumerate, no ban list to
+# filter by, no stake to weight.
+#
+# Every member's config carries the IDENTICAL block: the same members (order is
+# irrelevant — they are numbered by key) and the same min_signers. `heimdall
+# bifrost-id` prints the numbering and a digest to compare with the others, and a
+# member running a different threshold is named during the ceremony rather than
+# stalling it. Then every member runs `heimdall federation-dkg`, which waits for
+# all of them.
+#
+# min_signers has NO DEFAULT on purpose: it is baked into the key at generation, so
+# changing it later means a new key, a new treasury address and moving the funds.
+# Use n-1 unless you have a reason not to — one dark member must not brick the path
+# that exists because members go dark. A value at or below n/2 is accepted but
+# warned about: a minority could then move the whole treasury after the CSV delay.
+#
+# See docs/operator-guide.md, "Forming the initial federation".
+#[federation]
+#min_signers = 4
+#members = [
+#  { bifrost_id_pk = "<64 hex>", bifrost_url = "https://spo1.example.com" },
+#  { bifrost_id_pk = "<64 hex>", bifrost_url = "https://spo2.example.com" },
+#]
 
 
 [cardano]

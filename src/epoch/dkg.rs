@@ -740,7 +740,7 @@ async fn publish_detected_fault(
 /// cross-node identical-Y_51 property itself follows from part3 being a pure,
 /// deterministic function of the qualified set's shared Round 1+2 payloads, and
 /// is asserted end-to-end by the multi-instance acceptance test.
-fn check_dkg_output_coherent(
+pub(crate) fn check_dkg_output_coherent(
     me: Identifier,
     key_package: &frost::keys::KeyPackage,
     public_key_package: &frost::keys::PublicKeyPackage,

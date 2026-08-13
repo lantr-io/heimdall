@@ -46,39 +46,59 @@ impl PersistedDkg {
         roster: &Roster,
         keys: &GroupKeys,
     ) -> EpochResult<Self> {
-        let kp = keys
-            .key_package
-            .serialize()
-            .map_err(|e| EpochError::Frost(format!("serialize KeyPackage: {e}")))?;
-        let pkp = keys
-            .public_key_package
-            .serialize()
-            .map_err(|e| EpochError::Frost(format!("serialize PublicKeyPackage: {e}")))?;
+        let (key_package_hex, public_key_package_hex) = group_keys_to_hex(keys)?;
         Ok(Self {
             epoch,
             attempt,
             roster: roster.clone(),
-            key_package_hex: hex::encode(kp),
-            public_key_package_hex: hex::encode(pkp),
+            key_package_hex,
+            public_key_package_hex,
         })
     }
 
     /// Rebuild the in-memory [`GroupKeys`] from the persisted bytes.
     pub fn to_group_keys(&self) -> EpochResult<GroupKeys> {
-        let kp_bytes = hex::decode(&self.key_package_hex)
-            .map_err(|e| EpochError::Frost(format!("KeyPackage hex: {e}")))?;
-        let pkp_bytes = hex::decode(&self.public_key_package_hex)
-            .map_err(|e| EpochError::Frost(format!("PublicKeyPackage hex: {e}")))?;
-        let key_package = frost::keys::KeyPackage::deserialize(&kp_bytes)
-            .map_err(|e| EpochError::Frost(format!("deserialize KeyPackage: {e}")))?;
-        let public_key_package = frost::keys::PublicKeyPackage::deserialize(&pkp_bytes)
-            .map_err(|e| EpochError::Frost(format!("deserialize PublicKeyPackage: {e}")))?;
-        Ok(GroupKeys {
-            verifying_key: *public_key_package.verifying_key(),
-            public_key_package,
-            key_package,
-        })
+        group_keys_from_hex(&self.key_package_hex, &self.public_key_package_hex)
     }
+}
+
+/// A DKG output as the two hex strings that persist it: this node's
+/// `KeyPackage` (the secret share) and the group's `PublicKeyPackage`.
+///
+/// Shared with the federation key ceremony ([`crate::federation::persist`]),
+/// which persists the same pair under its own file: two ceremonies, one
+/// "what a share on disk looks like". A format change has to reach both, and
+/// this is what makes that automatic rather than a thing to remember.
+pub(crate) fn group_keys_to_hex(keys: &GroupKeys) -> EpochResult<(String, String)> {
+    let kp = keys
+        .key_package
+        .serialize()
+        .map_err(|e| EpochError::Frost(format!("serialize KeyPackage: {e}")))?;
+    let pkp = keys
+        .public_key_package
+        .serialize()
+        .map_err(|e| EpochError::Frost(format!("serialize PublicKeyPackage: {e}")))?;
+    Ok((hex::encode(kp), hex::encode(pkp)))
+}
+
+/// Inverse of [`group_keys_to_hex`].
+pub(crate) fn group_keys_from_hex(
+    key_package_hex: &str,
+    public_key_package_hex: &str,
+) -> EpochResult<GroupKeys> {
+    let kp_bytes = hex::decode(key_package_hex)
+        .map_err(|e| EpochError::Frost(format!("KeyPackage hex: {e}")))?;
+    let pkp_bytes = hex::decode(public_key_package_hex)
+        .map_err(|e| EpochError::Frost(format!("PublicKeyPackage hex: {e}")))?;
+    let key_package = frost::keys::KeyPackage::deserialize(&kp_bytes)
+        .map_err(|e| EpochError::Frost(format!("deserialize KeyPackage: {e}")))?;
+    let public_key_package = frost::keys::PublicKeyPackage::deserialize(&pkp_bytes)
+        .map_err(|e| EpochError::Frost(format!("deserialize PublicKeyPackage: {e}")))?;
+    Ok(GroupKeys {
+        verifying_key: *public_key_package.verifying_key(),
+        public_key_package,
+        key_package,
+    })
 }
 
 const DKG_STATE_PREFIX: &str = "dkg-epoch-";
@@ -163,7 +183,7 @@ pub fn read_dkg_state(state_dir: &Path, epoch: u64) -> EpochResult<Option<Persis
 }
 
 #[cfg(unix)]
-fn create_dir_0700(dir: &Path) -> EpochResult<()> {
+pub(crate) fn create_dir_0700(dir: &Path) -> EpochResult<()> {
     use std::os::unix::fs::DirBuilderExt;
     if dir.is_dir() {
         return Ok(());
@@ -176,13 +196,13 @@ fn create_dir_0700(dir: &Path) -> EpochResult<()> {
 }
 
 #[cfg(not(unix))]
-fn create_dir_0700(dir: &Path) -> EpochResult<()> {
+pub(crate) fn create_dir_0700(dir: &Path) -> EpochResult<()> {
     std::fs::create_dir_all(dir)
         .map_err(|e| EpochError::Chain(format!("create state dir {dir:?}: {e}")))
 }
 
 #[cfg(unix)]
-fn write_file_0600(path: &Path, bytes: &[u8]) -> EpochResult<()> {
+pub(crate) fn write_file_0600(path: &Path, bytes: &[u8]) -> EpochResult<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
@@ -202,7 +222,7 @@ fn write_file_0600(path: &Path, bytes: &[u8]) -> EpochResult<()> {
 }
 
 #[cfg(not(unix))]
-fn write_file_0600(path: &Path, bytes: &[u8]) -> EpochResult<()> {
+pub(crate) fn write_file_0600(path: &Path, bytes: &[u8]) -> EpochResult<()> {
     std::fs::write(path, bytes).map_err(|e| EpochError::Chain(format!("write {path:?}: {e}")))
 }
 
