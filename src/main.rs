@@ -205,8 +205,11 @@ enum Commands {
         config: Option<String>,
     },
     /// Form the initial federation (WI-087): run the distributed key generation
-    /// that produces `Y_federation`, the key in the CSV recovery leaf of the
-    /// treasury and of every peg-in deposit.
+    /// that produces `federation_setup_Y`, the key in the CSV recovery leaf of
+    /// the treasury and of every peg-in deposit. Genesis publishes it as Config
+    /// #11, and from then on it is called `y_federation` — the setup name marks
+    /// the window in which it lives on the members' own machines and nowhere
+    /// else.
     ///
     /// This is the FIRST thing that happens when a bridge is stood up — before
     /// genesis, before the Config exists — so it reads no chain state at all. Its
@@ -2420,7 +2423,7 @@ async fn resolve_federation(
     // cross-checked against what this node actually signs with, whichever of the
     // two that is.
     let share = federation_share(cfg)?
-        .map(|s| s.y_federation().map_err(|e| e.to_string()))
+        .map(|s| s.federation_setup_y().map_err(|e| e.to_string()))
         .transpose()?;
     heimdall::cardano::federation::resolve(&cfg.bitcoin, share, config.as_ref().map(|v| &v.params))
         .map_err(|e| format!("{e}\n{}", e.fix()))
@@ -2871,9 +2874,9 @@ async fn run_federation_dkg(
     println!("this node: {}", me.label());
 
     if let Some(existing) = federation_share(cfg)? {
-        let y = existing.y_federation().map_err(|e| e.to_string())?;
+        let y = existing.federation_setup_y().map_err(|e| e.to_string())?;
         println!("\nthe federation key already exists — nothing to do.");
-        println!("y_federation: {}", hex::encode(y.serialize()));
+        println!("federation_setup_Y: {}", hex::encode(y.serialize()));
         println!(
             "(share: {})",
             federation_persist::state_path(&dir).display()
@@ -2922,17 +2925,20 @@ async fn run_federation_dkg(
         )
     })?;
 
-    let y = state.y_federation().map_err(|e| e.to_string())?;
+    let y = state.federation_setup_y().map_err(|e| e.to_string())?;
     println!("\nfederation key formed.");
+    println!("federation_setup_Y: {}", hex::encode(y.serialize()));
     println!(
-        "y_federation: {}   ← Config #11 / binocular bridge.y-federation-hex",
-        hex::encode(y.serialize())
+        "                    ↳ genesis publishes this as Config #11 y_federation \
+         (binocular bridge.y-federation-hex)"
     );
     println!(
-        "share:        {} (0600 — losing every copy loses the recovery path)",
+        "share:              {} (0600 — losing every copy loses the recovery path)",
         federation_persist::state_path(&dir).display()
     );
-    println!("next:         `heimdall bootstrap-treasury` prints the genesis treasury address");
+    println!(
+        "next:               `heimdall bootstrap-treasury` prints the genesis treasury address"
+    );
 
     // Keep answering for a while. This node is done, but a slower member may
     // still be fetching the payloads only this process holds — and to that member
@@ -2956,12 +2962,13 @@ enum FederationSigner {
 }
 
 impl FederationSigner {
-    /// `Y_federation` — the public half, which is what goes on chain and into
-    /// both Taproot trees.
+    /// The public half — `federation_setup_Y` before genesis publishes it, and
+    /// `y_federation` after. Same 32 bytes; what changes is who else can read
+    /// them.
     fn public_key(&self) -> Result<bitcoin::key::UntweakedPublicKey, String> {
         match self {
             Self::Seed(kp) => Ok(kp.x_only_public_key().0),
-            Self::Share(state) => state.y_federation().map_err(|e| e.to_string()),
+            Self::Share(state) => state.federation_setup_y().map_err(|e| e.to_string()),
         }
     }
 
@@ -7142,10 +7149,12 @@ fn print_bootstrap_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
     // state — at this point in a bridge's life there is none to read, and this
     // address is what the bridge is bootstrapped from (WI-069).
     //
-    // Since WI-087 that key is normally the federation CEREMONY's group key,
-    // which a member holds a share of; `bitcoin.y_fed_seed_hex` is the older
-    // single-holder form. Either one is the whole input here, because only the
-    // PUBLIC half decides an address.
+    // Since WI-087 that key is normally `federation_setup_Y`, the ceremony's
+    // group key, which a member holds a share of; `bitcoin.y_fed_seed_hex` is the
+    // older single-holder form. Either one is the whole input here, because only
+    // the PUBLIC half decides an address — and this is the last step at which it
+    // is a LOCAL value: the line below is what gets published, after which it is
+    // read from Config #11 under the name y_federation.
     let signer = federation_signer(cfg)?;
     let y_fed = signer.public_key()?;
 

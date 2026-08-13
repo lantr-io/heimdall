@@ -157,7 +157,7 @@ impl From<EpochError> for CeremonyError {
     }
 }
 
-/// Run the federation DKG and return this node's share of `Y_federation`.
+/// Run the federation DKG and return this node's share of `federation_setup_Y`.
 ///
 /// `me` is this node's identifier in `roster` — located by its own bifrost key,
 /// never assumed, because the index is derived from the member list and a node

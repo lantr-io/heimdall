@@ -56,8 +56,8 @@ pegout_freshness_margin_ms = 604800000
 # federation recovery path, which is why the chain carries only the derived public
 # key. It is the SINGLE-KEY federation — one seed, one holder, who can sweep the
 # whole treasury alone once the CSV delay passes. A federation formed by the
-# ceremony ([federation] below) leaves it unset: each member holds a SHARE, under
-# protocol.state_dir, and no member can spend alone.
+# ceremony ([federation] below) leaves it unset: each member holds a SHARE of
+# federation_setup_Y, under protocol.state_dir, and no member can spend alone.
 #
 # Setting both is refused. They are different keys locking different treasuries,
 # so nothing can tell which one is this bridge's.
@@ -86,10 +86,12 @@ pegout_freshness_margin_ms = 604800000
 # and published at Config #11, and joining does not make you a member of it.
 #
 # This is the one participant list heimdall does not read from a chain, and it
-# cannot be: Y_federation is an input to genesis — it is Config #11, and the
-# treasury address the genesis anchor is funded at derives from it — so the key
-# exists before the bridge does. There is no registry to enumerate, no ban list to
-# filter by, no stake to weight.
+# cannot be: the key it produces (federation_setup_Y) is an input to genesis — the
+# treasury address the genesis anchor is funded at derives from it — so it exists
+# before the bridge does. There is no registry to enumerate, no ban list to filter
+# by, no stake to weight. Genesis publishes the key as Config #11, and from then
+# on it is y_federation and every node reads it from the chain; the setup name
+# marks the one window in which a local copy is the source.
 #
 # Every member's config carries the IDENTICAL block: the same members (order is
 # irrelevant — they are numbered by key) and the same min_signers. `heimdall

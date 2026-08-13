@@ -1,7 +1,25 @@
-//! The federation key — `Y_federation` — and the ceremony that produces it
-//! (WI-087).
+//! The federation setup key — `federation_setup_Y` — and the ceremony that
+//! produces it (WI-087).
 //!
-//! `Y_federation` is the key in the CSV recovery leaf of both Taproot trees, the
+//! ## One value, two names
+//!
+//! What this module produces and what the rest of heimdall reads are the same 32
+//! bytes at different moments in a bridge's life, and the names keep them apart:
+//!
+//! - **`federation_setup_Y`** — here. The output of the ceremony, held as shares
+//!   by the members, existing before the bridge does and readable from nowhere
+//!   but their own machines.
+//! - **`y_federation`** — everywhere else ([`crate::cardano::federation`]). The
+//!   same key once genesis publishes it at **Config #11**, after which every node
+//!   and every depositor reads it from the chain rather than being told it.
+//!
+//! The distinction is not pedantry: the setup name marks exactly the window in
+//! which a local value is authoritative. Outside it, a node taking this key from
+//! its own disk instead of the Config is the bug — see
+//! [`crate::cardano::federation::resolve`], where published always wins and a
+//! local copy is only ever a cross-check.
+//!
+//! It is the key in the CSV recovery leaf of both Taproot trees, the
 //! treasury's and every peg-in deposit's. It is how the treasury moves when the
 //! FROST group is dark, once `federation_csv_blocks` have passed. Until WI-087 it
 //! was a single 32-byte seed (`bitcoin.y_fed_seed_hex`) held by one party — so
@@ -15,7 +33,7 @@
 //! The epoch ceremony ([`crate::epoch::dkg`]) reads its candidate set from the
 //! on-chain registry, filters it by the ban list, weights it by stake and anchors
 //! its schedule to the epoch boundary. Every one of those inputs is rooted in the
-//! Config NFT — and `Y_federation` is an *input to genesis*: it is Config #11, and
+//! Config NFT — and this key is an *input to genesis*: it becomes Config #11, and
 //! the treasury ADDRESS the genesis anchor is funded at is derived from it. The
 //! key must therefore exist before the bridge does. **There is no chain to read.**
 //!

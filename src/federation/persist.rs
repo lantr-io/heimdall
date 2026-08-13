@@ -42,14 +42,22 @@ pub struct FederationKeyState {
     pub roster_digest: String,
     pub min_signers: u16,
     pub max_signers: u16,
-    /// The group key's x-only form — `Y_federation`, exactly as it is published
-    /// at Config #11 and hashed into both Taproot trees.
+    /// The group key's x-only form: the **federation setup key**,
+    /// `federation_setup_Y`.
+    ///
+    /// One value, two names, on purpose. Here it is what the ceremony PRODUCED —
+    /// a key that exists before the bridge does and is not yet anybody's to read.
+    /// It becomes `y_federation` the moment genesis publishes it at Config #11,
+    /// and from then on that is the name for it: every node reads it from the
+    /// chain, and only a member holding a share still has this local copy. The
+    /// setup name keeps the two situations apart while both are true.
     ///
     /// Derivable from `public_key_package_hex`, and stored anyway: it is the one
     /// field an operator reads, compares against the deployment notes and pastes
-    /// into `binocular`'s `bridge.y-federation-hex`. [`Self::y_federation`]
-    /// re-derives it and refuses a file where the two disagree.
-    pub y_federation: String,
+    /// into `binocular`'s `bridge.y-federation-hex`.
+    /// [`Self::federation_setup_y`] re-derives it and refuses a file where the
+    /// two disagree.
+    pub federation_setup_y: String,
     /// frost `KeyPackage::serialize`, hex — this node's secret signing share.
     pub key_package_hex: String,
     /// frost `PublicKeyPackage::serialize`, hex — the group.
@@ -102,7 +110,7 @@ impl FederationKeyState {
             roster_digest: hex::encode(roster.digest()),
             min_signers: roster.min_signers,
             max_signers: roster.len(),
-            y_federation: hex::encode(y.xonly.serialize()),
+            federation_setup_y: hex::encode(y.xonly.serialize()),
             key_package_hex,
             public_key_package_hex,
         })
@@ -114,24 +122,24 @@ impl FederationKeyState {
             .map_err(|e| StateError::Keys(e.to_string()))
     }
 
-    /// `Y_federation`, re-derived from the group package rather than trusted
-    /// from the `y_federation` field — and the two must agree.
+    /// The federation setup key, re-derived from the group package rather than
+    /// trusted from the `federation_setup_y` field — and the two must agree.
     ///
     /// The stored field is a convenience for humans; the key that decides an
     /// ADDRESS is not something to read from the convenience copy. A file whose
     /// two halves disagree has been edited or corrupted, and the direction of
     /// the error matters: derive from the material this node actually signs
     /// with.
-    pub fn y_federation(&self) -> Result<UntweakedPublicKey, StateError> {
+    pub fn federation_setup_y(&self) -> Result<UntweakedPublicKey, StateError> {
         let keys = self.to_group_keys()?;
         let derived = group_xonly(&keys.verifying_key).map_err(StateError::Keys)?;
-        let stored = hex::decode(self.y_federation.trim())
-            .map_err(|e| StateError::Parse(format!("y_federation is not hex: {e}")))?;
+        let stored = hex::decode(self.federation_setup_y.trim())
+            .map_err(|e| StateError::Parse(format!("federation_setup_y is not hex: {e}")))?;
         if stored != derived.xonly.serialize() {
             return Err(StateError::Keys(format!(
-                "y_federation {} does not derive from the stored group package (which yields \
-                 {}) — the file has been edited or corrupted",
-                self.y_federation,
+                "federation_setup_y {} does not derive from the stored group package (which \
+                 yields {}) — the file has been edited or corrupted",
+                self.federation_setup_y,
                 hex::encode(derived.xonly.serialize())
             )));
         }
@@ -207,7 +215,7 @@ pub fn read(state_dir: &Path) -> Result<Option<FederationKeyState>, StateError> 
     }
 }
 
-/// The PUBLIC half alone: `Y_federation` if this node holds a share of it.
+/// The PUBLIC half alone: the federation setup key, if this node holds a share.
 ///
 /// This is what the federation-identity resolution
 /// ([`crate::cardano::federation::resolve`]) needs — it cross-checks the
@@ -217,7 +225,7 @@ pub fn group_key(state_dir: Option<&Path>) -> Result<Option<UntweakedPublicKey>,
     let Some(dir) = state_dir else {
         return Ok(None);
     };
-    read(dir)?.map(|s| s.y_federation()).transpose()
+    read(dir)?.map(|s| s.federation_setup_y()).transpose()
 }
 
 #[cfg(test)]
@@ -309,7 +317,10 @@ mod tests {
 
         // The public read used by the federation-identity resolution agrees.
         let published = group_key(Some(dir.as_path())).expect("read").expect("some");
-        assert_eq!(hex::encode(published.serialize()), loaded.y_federation);
+        assert_eq!(
+            hex::encode(published.serialize()),
+            loaded.federation_setup_y
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -349,15 +360,15 @@ mod tests {
             .expect("a URL change is not a re-key");
     }
 
-    /// The convenience copy of `Y_federation` never overrides the material the
+    /// The convenience copy of the setup key never overrides the material the
     /// node signs with — a file whose halves disagree is refused.
     #[test]
-    fn an_edited_y_federation_field_is_refused() {
+    fn an_edited_setup_key_field_is_refused() {
         let mut state = FederationKeyState::from_output(&roster(2, &[0x11, 0x22]), &group_keys())
             .expect("capture");
-        state.y_federation().expect("consistent as written");
-        state.y_federation = member_key(0x77);
-        let e = state.y_federation().expect_err("must refuse");
+        state.federation_setup_y().expect("consistent as written");
+        state.federation_setup_y = member_key(0x77);
+        let e = state.federation_setup_y().expect_err("must refuse");
         assert!(e.to_string().contains("does not derive"), "{e}");
     }
 

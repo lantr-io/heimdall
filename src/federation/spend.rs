@@ -1,9 +1,15 @@
 //! Signing with the federation key — the second signing path.
 //!
-//! Once `Y_federation` is a `t`-of-`n` FROST key, everything that used to sign
-//! with the single seed becomes a distributed session: the treasury's CSV
+//! Once the federation key is a `t`-of-`n` FROST key, everything that used to
+//! sign with the single seed becomes a distributed session: the treasury's CSV
 //! recovery spend (`federation-spend`), and any other message the federation
 //! authorizes as itself.
+//!
+//! This module signs with the key by the name the CHAIN gives it —
+//! `y_federation`, Config #11 — because by the time anything is signed the bridge
+//! exists and the published value is what the treasury was locked with. The
+//! ceremony's `federation_setup_Y` ([`crate::federation`]) is the same key before
+//! that point.
 //!
 //! **This path must work precisely when the epoch machinery does not.** It is the
 //! recovery route for a dark FROST group, so it depends on no chain read, no
@@ -32,7 +38,7 @@
 //! ## No Taproot tweak
 //!
 //! The recovery leaf is spent by SCRIPT path, and a script-path signature is
-//! verified against the key pushed in the leaf — `Y_federation` itself — not
+//! verified against the key pushed in the leaf — `y_federation` itself — not
 //! against the tweaked output key. So this session uses the UNTWEAKED FROST
 //! rounds, and the result verifies under the group key's BIP-340 x-only form
 //! (see [`crate::frost::xonly`], which pins that property for both parities).
@@ -69,7 +75,7 @@ use crate::http::wire::SignNamespace;
 /// federation spend its own replay domain.
 pub const FEDERATION_SESSION: u32 = u32::MAX - 1;
 
-/// Produce a `t`-of-`n` BIP-340 signature over `message` under `Y_federation`.
+/// Produce a `t`-of-`n` BIP-340 signature over `message` under `y_federation`.
 ///
 /// `signers` must be identical on every participating node — see the module
 /// docs. `keys` is this node's persisted share; its identifier is authoritative
@@ -174,16 +180,16 @@ pub async fn frost_sign(
         )
         .map_err(|e| {
             CeremonyError::Frost(format!(
-                "the aggregated signature does not verify under Y_federation {}: {e}",
+                "the aggregated signature does not verify under y_federation {}: {e}",
                 hex::encode(y_fed.serialize())
             ))
         })?;
 
-    info!("[federation] signature aggregated and verified under Y_federation");
+    info!("[federation] signature aggregated and verified under y_federation");
     Ok(bytes)
 }
 
-/// `Y_federation` in the x-only form the recovery leaf pushes.
+/// `y_federation` in the x-only form the recovery leaf pushes.
 pub fn verifying_key(keys: &GroupKeys) -> Result<UntweakedPublicKey, CeremonyError> {
     group_xonly(&keys.verifying_key)
         .map(|g| g.xonly)
@@ -261,7 +267,7 @@ mod tests {
     }
 
     /// A THRESHOLD of members — not all of them — produces a signature that
-    /// verifies under Y_federation, with no tweak: the acceptance property of
+    /// verifies under y_federation, with no tweak: the acceptance property of
     /// the federation spend path.
     #[tokio::test]
     async fn a_threshold_of_members_signs_under_y_federation() {
@@ -310,7 +316,7 @@ mod tests {
                 &Message::from_digest(message),
                 &y_fed,
             )
-            .expect("script-path signature must verify under Y_federation");
+            .expect("script-path signature must verify under y_federation");
     }
 
     /// The WI-087 acceptance property, end to end: a THRESHOLD of federation

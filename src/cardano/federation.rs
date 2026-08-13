@@ -68,9 +68,10 @@ pub enum FederationOrigin {
     /// The operator's own `[bitcoin]` keys, on a deployment with no readable
     /// Config (the fixture-roster demo).
     LocalConfig,
-    /// The local federation ceremony's group key, with no Config to read. The
-    /// state a federation is in BEFORE genesis: the key exists, and the bridge
-    /// that will publish it does not yet.
+    /// `federation_setup_Y` — the local ceremony's group key, with no Config to
+    /// read. The state a federation is in BEFORE genesis: the key exists, and the
+    /// bridge that will publish it as #11 does not yet. This is the ONE window in
+    /// which a local copy is authoritative; see [`crate::federation`].
     LocalDkg,
 }
 
@@ -89,7 +90,7 @@ impl std::fmt::Display for FederationOrigin {
             Self::LocalConfig => write!(f, "local [bitcoin] config — no Config datum to read"),
             Self::LocalDkg => write!(
                 f,
-                "the local federation ceremony's group key — no Config datum to read yet"
+                "federation_setup_Y from the local ceremony — no Config datum to read yet"
             ),
         }
     }
