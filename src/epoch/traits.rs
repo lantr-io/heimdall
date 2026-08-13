@@ -82,8 +82,17 @@ pub struct TreasuryUtxo {
     /// was locked under). At bootstrap this equals `y_fed`; after the
     /// first DKG it is the previous epoch's FROST group x-only key.
     pub y_51: bitcoin::key::UntweakedPublicKey,
-    /// The Taproot script-tree leaf key for the federation fallback.
+    /// The federation leaf key of the TREASURY tree — chosen by matching the head's
+    /// scriptPubKey against the candidates, so on a bridge still using the collapsed
+    /// `Y_fed = Y_51` convention this reports `y_51`. Correct for rebuilding the treasury
+    /// tree; WRONG for anything a depositor must agree with, which is why the peg-in tree
+    /// takes `config_y_fed` instead.
     pub y_fed: bitcoin::key::UntweakedPublicKey,
+    /// The federation key the bridge PUBLISHES (Config `y_federation`) — the value a
+    /// depositor is told to build their deposit under, and therefore the one the peg-in
+    /// tree's emergency-sweep leaf must use. Equal to `y_fed` on a bridge whose treasury
+    /// head is locked under the published key; different while one is mid-rotation.
+    pub config_y_fed: bitcoin::key::UntweakedPublicKey,
     pub federation_csv_blocks: u16,
     /// Whether it is safe to begin the NEXT treasury movement off this UTxO.
     /// A new movement can only begin once the previous one is confirmed, so the

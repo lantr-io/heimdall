@@ -2,16 +2,19 @@
 //! Bitcoin transaction from a depositor's funding UTXO(s).
 //!
 //! Heimdall the daemon is an SPO program; the depositor is a different actor.
-//! This binary lives next to it for convenient reuse of `pegin_spend_info`,
-//! `Y_federation` derivation, and the Bitcoin RPC client — it is NOT part of
-//! the SPO control plane.
+//! This binary lives next to it for convenient reuse of `pegin_spend_info` and the Bitcoin
+//! RPC client — it is NOT part of the SPO control plane. It derives no bridge key of its
+//! own: every value that decides the deposit address is a required argument.
 //!
-//! Tx layout produced (demo-simplified peg-in, per
-//! `ft-bifrost-bridge/documentation/demo_simplifications.md`):
+//! Tx layout produced (spec § Peg-in Taproot tree; the one-leaf demo simplification this
+//! used to follow was retired by WI-081):
 //!
 //! ```text
 //! Input  0..N : funding UTXO(s) (P2WPKH controlled by depositor WIF) — signed
-//! Output 0    : peg-in P2TR (internal key Y_51, single leaf = <csv> <Q_auth> refund)
+//! Output 0    : peg-in P2TR — internal key Y_51 (the 51% quorum's key-path sweep), and
+//!               TWO leaves (spec § Peg-in Taproot tree):
+//!                 <federation_csv_blocks> OP_CSV OP_DROP <Y_federation> OP_CHECKSIG
+//!                 <refund_timeout>        OP_CSV OP_DROP <Q_auth>       OP_CHECKSIG
 //! Output 1    : OP_RETURN "BFR" || Q_auth (35 bytes)  [Bifrost one-key beacon]
 //!               Q_auth = the depositor's BIP-86 Taproot OUTPUT key, derived from
 //!               the WIF. One key does both jobs: the refund leaf above commits it,
@@ -75,12 +78,12 @@ struct Cli {
     /// The peg-in Taproot INTERNAL key: the 32-byte x-only FROST group key
     /// `Y_51`, as hex. Get it from `heimdall show-treasury` ("our Y_51: …").
     ///
-    /// Required, and deliberately not derivable here. Both sweep paths
-    /// reconstruct the deposit address as `Taproot(Y_51, refund_leaf(Q_auth))`,
-    /// so a deposit built under any other internal key is unsweepable — the BTC
-    /// sits there until the refund timeout with nothing to show for it. A tool
-    /// that guessed this value would produce a well-formed address that no
-    /// federation will ever touch, which is worse than refusing to run.
+    /// Required, and deliberately not derivable here. Both sweep paths reconstruct the
+    /// deposit address as `Taproot(Y_51; federation leaf + refund leaf)` — this is the
+    /// INTERNAL key of that tree, so a deposit built under any other one is unsweepable and
+    /// the BTC sits there until the refund timeout. A tool that guessed it would produce a
+    /// well-formed address no federation will ever touch, which is worse than refusing to
+    /// run. The other two tree inputs are `--y-federation` and `--federation-csv-blocks`.
     #[arg(long)]
     frost_key: String,
 
@@ -94,6 +97,16 @@ struct Cli {
     /// this depositor can refund.
     #[arg(long)]
     y_federation: String,
+
+    /// The CSV delay of the deposit tree's federation leaf, in blocks — the bridge's
+    /// Config `params.federation_csv_blocks`.
+    ///
+    /// A flag and not a config key, for the same reason as the two above: it is an input
+    /// to the deposit ADDRESS. `bitcoin.federation_csv_blocks` is deliberately unset on a
+    /// correctly configured node (WI-069 moved it on chain), so reading it from there would
+    /// either refuse to run or silently use a value the bridge does not publish.
+    #[arg(long)]
+    federation_csv_blocks: u16,
 
     /// Depositor's funding key in Bitcoin WIF format. Its BIP-86 Taproot
     /// output key is what the OP_RETURN beacon carries and what the peg-in
@@ -167,31 +180,15 @@ fn run() -> Result<(), String> {
     // deposits no federation can sweep.
     let y_51 = parse_xonly("--frost-key", &cli.frost_key)?;
     let y_federation = parse_xonly("--y-federation", &cli.y_federation)?;
-    let federation_csv_blocks: u16 = match cfg.bitcoin.federation_csv_blocks {
-        Some(b) => u16::try_from(b)
-            .map_err(|_| format!("bitcoin.federation_csv_blocks ({b}) exceeds u16::MAX"))?,
-        None => {
-            return Err(
-                "bitcoin.federation_csv_blocks is unset — it is the CSV delay of the \
-                        deposit tree's federation leaf, and therefore an input to the deposit \
-                        address, so there is no safe default"
-                    .to_string(),
-            );
-        }
-    };
+    let federation_csv_blocks = cli.federation_csv_blocks;
     let pegin_tree = PeginTreeParams {
         y_51,
         y_federation,
         federation_csv_blocks,
         refund_timeout,
     };
-    if refund_timeout <= federation_csv_blocks {
-        return Err(format!(
-            "pegin_refund_timeout_blocks ({refund_timeout}) must exceed \
-             federation_csv_blocks ({federation_csv_blocks}): the federation's sweep window \
-             has to open before this deposit's refund does"
-        ));
-    }
+    // One rule, one message, shared with every other deriver.
+    pegin_tree.validate()?;
 
     let wif = read_wif(&cli)?;
     let depositor_priv =

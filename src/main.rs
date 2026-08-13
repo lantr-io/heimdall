@@ -5839,14 +5839,18 @@ fn run_sweep_pegins(
     let y_51 = group_xonly(dkg.public_key_package.verifying_key())?.xonly;
     info!("  FROST group key Y_51: {}", hex::encode(y_51.serialize()));
     let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
-    // The whole bridge-wide half of the peg-in tree, all of it read from the chain: Y_51 is
-    // the internal key, Y_fed + its CSV delay are the federation emergency-sweep leaf (WI-081).
+    // The bridge-wide half of the peg-in tree. Provenance differs per field and it matters:
+    // `y_fed` + `csv` are read from the chain (`resolve_federation`), `y_51` is the demo DKG's
+    // deterministic group key derived locally above, and `refund_timeout` is local config.
+    // Only the first two are chain-sourced; the other two are values this node could disagree
+    // with its peers about.
     let pegin_tree = heimdall::bitcoin::taproot::PeginTreeParams {
         y_51,
         y_federation: y_fed,
         federation_csv_blocks: csv,
         refund_timeout,
     };
+    pegin_tree.validate()?;
 
     let policy_id: [u8; 28] = hex::decode(pegin_policy_id)
         .map_err(|e| format!("pegin_policy_id: {e}"))?

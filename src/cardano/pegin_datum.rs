@@ -190,7 +190,7 @@ pub fn parse_beacon(tx: &Transaction) -> Result<UntweakedPublicKey, ParseError> 
 /// Parse and validate a raw Cardano peg-in request.
 ///
 /// `tree` carries the bridge-wide half of the peg-in Taproot — every value except the
-/// depositor's. All of it comes from the on-chain treasury oracle ([`TreasuryUtxo`] has
+/// depositor's. All of it comes from the on-chain treasury oracle ([`crate::epoch::traits::TreasuryUtxo`] has
 /// `y_51`, `y_fed` and `federation_csv_blocks`), so no node configures any of it. The
 /// internal key is `Y_51`, the FROST group key, and NOT `Y_fed`: commit `6af7c67`
 /// ("simplify peg-in Taproot to Y_fed") switched it as a demo shortcut, and
@@ -448,6 +448,7 @@ mod tests {
     /// cargo run --bin depositor -- --config heimdall.testnet4.toml \
     ///   --frost-key b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854 \
     ///   --y-federation b1e15a532a4e816ec75af608256b0808e36fb7d22560605178850885e53f2854 \
+    ///   --federation-csv-blocks 144 \
     ///   --depositor-wif cN9spWsvaxA8taS7DFMxnk1yJD2gaF2PX1npuTpy3vuZFJdwavaw \
     ///   --deposit-amount-sat 50000 --fee-sat 2000 \
     ///   --funding-txid 7afd38db928a8f30f789d5c2dc9f918a6b55f85dd251f42f2e31b535bdaa0583 \
@@ -480,10 +481,13 @@ mod tests {
             hex::encode(parsed.depositor_outputkey.serialize()),
             "2a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36"
         );
-        // The reconstruction landed on the address the depositor actually paid — and that
-        // address is the one ft's INDEPENDENT reference implementation derives too:
-        // `pegin_deposit.py::pegin_outputkey` on the same inputs yields 69cf12c4…, so the
-        // two-leaf tree agrees across a Rust and a Python implementation of BIP-341.
+        // The reconstruction landed on the address the depositor actually paid. Both sides
+        // of that are this crate's, so it proves internal consistency and nothing more.
+        // The CROSS-implementation check is not automated here: ft's
+        // `documentation/pegin_deposit.py` and the frontend's bitcoinjs-lib were each run by
+        // hand on these inputs (2026-08-13) and produced the same 69cf12c4… output key. If
+        // the leaf depth or ordering ever diverges between the three, this test stays green
+        // — re-run those two before trusting it.
         assert_eq!(
             hex::encode(ScriptBuf::new_p2tr_tweaked(parsed.spend_info.output_key()).as_bytes()),
             "512069cf12c4a55c407ba4ffae3bcad9832d2f6fb0f36e555265b9f7242853985083"
@@ -817,6 +821,42 @@ mod tests {
         let req = make_request(build_datum_bytes(serialize(&tx)));
         assert!(matches!(
             parse(&req).unwrap_err(),
+            ParseError::NoPegInOutput
+        ));
+    }
+
+    /// The federation leaf is part of the address, so a wrong `y_federation` makes a real
+    /// deposit unrecognisable — the failure this test's neighbours never covered, because
+    /// they all vary the internal key instead.
+    #[test]
+    fn no_pegin_output_wrong_federation_key() {
+        let xonly = depositor_xonly();
+        let tx = build_pegin_tx(xonly, Amount::from_sat(100_000));
+        let req = make_request(build_datum_bytes(serialize(&tx)));
+        let wrong = PeginTreeParams {
+            y_federation: xonly_from_seed([0x77; 32]),
+            ..test_tree()
+        };
+        assert_ne!(wrong.y_federation, test_tree().y_federation);
+        assert!(matches!(
+            parse_pegin_request(&req, &wrong).unwrap_err(),
+            ParseError::NoPegInOutput
+        ));
+    }
+
+    /// Same for the federation leaf's CSV delay: it is hashed into the leaf, so it moves the
+    /// address just as surely as the key does.
+    #[test]
+    fn no_pegin_output_wrong_federation_csv() {
+        let xonly = depositor_xonly();
+        let tx = build_pegin_tx(xonly, Amount::from_sat(100_000));
+        let req = make_request(build_datum_bytes(serialize(&tx)));
+        let wrong = PeginTreeParams {
+            federation_csv_blocks: test_tree().federation_csv_blocks + 1,
+            ..test_tree()
+        };
+        assert!(matches!(
+            parse_pegin_request(&req, &wrong).unwrap_err(),
             ParseError::NoPegInOutput
         ));
     }

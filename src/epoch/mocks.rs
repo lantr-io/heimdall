@@ -350,6 +350,7 @@ impl CardanoChain for MockCardanoChain {
             value: self.fixture.treasury_value,
             y_51,
             y_fed,
+            config_y_fed: y_fed,
             federation_csv_blocks: self.fixture.federation_csv_blocks,
             btc_confirmed: true,
         })
