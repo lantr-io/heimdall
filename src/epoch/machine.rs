@@ -783,27 +783,11 @@ async fn collect_pegins_phase(
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
 
-    // Pull the current treasury keys from the on-chain oracle. The peg-in Taproot Q is
-    // derived per-depositor inside `parse_pegin_request` from these plus the Q_auth its
-    // OP_RETURN beacon carries.
-    //
-    // `config_y_fed`, NOT `y_fed`: the latter is whichever candidate reproduces the treasury
-    // HEAD's scriptPubKey, which on a bridge still using the collapsed `Y_fed = Y_51`
-    // convention is `y_51`. A depositor builds against the key the Config PUBLISHES, so the
-    // peg-in tree has to use that one or the two derive different addresses in silence.
-    //
-    // All four inputs now come from the bridge, not from this node's file: [CFG-9] published
-    // the refund delay, which was the last one an operator could get wrong alone.
+    // The bridge's peg-in tree, straight from the oracle. `TreasuryUtxo::pegin_tree` owns
+    // the field mapping — notably that the federation LEAF key is the PUBLISHED
+    // `config_y_fed`, not the head-derived `y_fed` — so no call site re-decides it.
     let treasury = chain.query_treasury().await?;
-    let pegin_tree = crate::bitcoin::taproot::PeginTreeParams {
-        y_51: treasury.y_51,
-        y_federation: treasury.config_y_fed,
-        federation_csv_blocks: treasury.federation_csv_blocks,
-        refund_timeout: treasury.pegin_refund_timeout_blocks,
-    };
-    // A refund window that opens before the federation's is a misconfiguration, not an
-    // invariant: fail the phase with the reason instead of panicking inside the derivation.
-    pegin_tree.validate().map_err(EpochError::Chain)?;
+    let pegin_tree = treasury.pegin_tree().map_err(EpochError::Chain)?;
 
     let deadline = clock.deadline(config.pegin_collection_window);
     let mut accepted: BTreeMap<CardanoOutRef, ParsedPegIn> = BTreeMap::new();

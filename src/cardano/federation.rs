@@ -96,6 +96,30 @@ pub struct FederationIdentity {
     pub origin: FederationOrigin,
 }
 
+impl FederationIdentity {
+    /// The peg-in Taproot tree, for the paths that resolve the federation directly rather
+    /// than through the treasury oracle (the CLI mover). Same three published values as
+    /// [`crate::epoch::traits::TreasuryUtxo::pegin_tree`] — this exists so the field
+    /// mapping is written once per source, not once per call site.
+    ///
+    /// `y_51` is the caller's because it is the one input this type does not carry: the
+    /// mover derives it from the demo DKG rather than reading it off the chain, which is
+    /// the last remaining difference between the two paths.
+    pub fn pegin_tree(
+        &self,
+        y_51: UntweakedPublicKey,
+    ) -> Result<crate::bitcoin::taproot::PeginTreeParams, String> {
+        let tree = crate::bitcoin::taproot::PeginTreeParams {
+            y_51,
+            y_federation: self.y_fed,
+            federation_csv_blocks: self.csv_blocks,
+            refund_timeout: self.pegin_refund_timeout_blocks,
+        };
+        tree.validate()?;
+        Ok(tree)
+    }
+}
+
 #[derive(Debug)]
 pub enum FederationError {
     /// Nothing published and nothing configured. Refusing beats guessing: any

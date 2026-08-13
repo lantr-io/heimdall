@@ -5831,8 +5831,6 @@ fn run_sweep_pegins(
     // ONCE and up front — a node that cannot establish it must not sign, and must
     // not discover that only after the TM is assembled and signed.
     let federation = rt.block_on(resolve_federation(cfg))?;
-    let y_fed = federation.y_fed;
-    let csv = federation.csv_blocks;
 
     let dkg = run_demo_dkg(
         b"heimdall-demo-seed-v1-0123456789",
@@ -5841,18 +5839,10 @@ fn run_sweep_pegins(
     );
     let y_51 = group_xonly(dkg.public_key_package.verifying_key())?.xonly;
     info!("  FROST group key Y_51: {}", hex::encode(y_51.serialize()));
-    let refund_timeout = federation.pegin_refund_timeout_blocks;
-    // The bridge-wide half of the peg-in tree. `y_fed`, `csv` and `refund_timeout` are read
-    // from the bridge (`resolve_federation`, and [CFG-9] for the last); `y_51` is the demo
-    // DKG's deterministic group key derived locally above, and remains the one value this
-    // path could disagree with its peers about.
-    let pegin_tree = heimdall::bitcoin::taproot::PeginTreeParams {
-        y_51,
-        y_federation: y_fed,
-        federation_csv_blocks: csv,
-        refund_timeout,
-    };
-    pegin_tree.validate()?;
+    // Same tree, resolved from the federation identity because this path derives Y_51 from
+    // the demo DKG above rather than reading it off the oracle. The other three values are
+    // the bridge's, and the mapping lives in one place.
+    let pegin_tree = federation.pegin_tree(y_51)?;
 
     let policy_id: [u8; 28] = hex::decode(pegin_policy_id)
         .map_err(|e| format!("pegin_policy_id: {e}"))?
@@ -6051,7 +6041,9 @@ fn run_sweep_pegins(
         return Ok(());
     }
 
-    let treasury_spend_info = treasury_spend_info(&secp, y_51, y_fed, csv);
+    // The TREASURY tree, which keeps the federation key as its leaf and its own CSV.
+    let treasury_spend_info =
+        treasury_spend_info(&secp, y_51, federation.y_fed, federation.csv_blocks);
     let treasury_spk = ScriptBuf::new_p2tr_tweaked(treasury_spend_info.output_key());
 
     // Treasury input: an explicit --treasury-outpoint/--treasury-amount-sat pair
