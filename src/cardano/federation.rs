@@ -88,6 +88,11 @@ pub struct FederationIdentity {
     /// failure this module exists to prevent. Checked once, here, where the value
     /// enters the system.
     pub csv_blocks: u16,
+    /// The peg-in refund leaf's CSV delay — Config `params[8]` ([CFG-9]). Carried
+    /// here because it is the same kind of value as `csv_blocks`: a block count
+    /// hashed into a Taproot tree, so it decides an address and must be unanimous.
+    /// Published-wins with the same fatal cross-check against a local override.
+    pub pegin_refund_timeout_blocks: u16,
     pub origin: FederationOrigin,
 }
 
@@ -109,6 +114,13 @@ pub enum FederationError {
     /// The operator's CSV delay contradicts the published one. Same reasoning —
     /// it is an input to the same address.
     CsvMismatch { local: u32, published: u16 },
+    /// A local `pegin_refund_timeout_blocks` disagrees with the Config's [CFG-9]
+    /// value. Fatal for the same reason as `CsvMismatch`: it is an input to every
+    /// deposit address, so the two produce different peg-in sets.
+    RefundTimeoutMismatch { local: u16, published: u16 },
+    /// The refund window would open before the federation's sweep, letting a
+    /// depositor take the deposit back while the federation is still recovering it.
+    RefundTimeoutTooShort { refund: u16, csv: u16 },
 }
 
 impl FederationError {
@@ -135,11 +147,21 @@ impl FederationError {
                  and cardano.config_nft_policy_id name the bridge you meant to join"
                     .to_string()
             }
-            Self::KeyMismatch { .. } | Self::CsvMismatch { .. } => {
-                "remove bitcoin.y_fed_seed_hex / bitcoin.federation_csv_blocks to use what the \
-                 bridge publishes, or point this node at the bridge those values belong to. \
-                 Keep the seed ONLY if this node performs federation spends, in which case it \
-                 must be the seed for THIS treasury"
+            Self::KeyMismatch { .. }
+            | Self::CsvMismatch { .. }
+            | Self::RefundTimeoutMismatch { .. } => {
+                "remove bitcoin.y_fed_seed_hex / bitcoin.federation_csv_blocks / \
+                 bitcoin.pegin_refund_timeout_blocks to use what the bridge publishes, or point \
+                 this node at the bridge those values belong to. Keep the seed ONLY if this \
+                 node performs federation spends, in which case it must be the seed for THIS \
+                 treasury"
+                    .to_string()
+            }
+            Self::RefundTimeoutTooShort { .. } => {
+                "the peg-in refund window must open AFTER the federation's sweep window, or a \
+                 depositor can take the deposit back while the federation is still recovering \
+                 it. Raise bitcoin.pegin_refund_timeout_blocks above \
+                 bitcoin.federation_csv_blocks — or unset both and use what the bridge publishes"
                     .to_string()
             }
         }
@@ -172,6 +194,18 @@ impl std::fmt::Display for FederationError {
                 "bitcoin.federation_csv_blocks is {local} but the Config publishes \
                  {published}. The delay is an input to the treasury address, so these build \
                  different ones"
+            ),
+            Self::RefundTimeoutMismatch { local, published } => write!(
+                f,
+                "bitcoin.pegin_refund_timeout_blocks is {local} but the Config publishes \
+                 {published}. The delay is hashed into every peg-in deposit address, so these \
+                 reconstruct different ones and freeze different peg-in sets"
+            ),
+            Self::RefundTimeoutTooShort { refund, csv } => write!(
+                f,
+                "pegin_refund_timeout_blocks ({refund}) must exceed federation_csv_blocks \
+                 ({csv}): the federation's sweep window has to open before the depositor's \
+                 refund does"
             ),
         }
     }
@@ -268,11 +302,21 @@ pub fn resolve(
                     published: published_csv,
                 });
             }
-            // parse_config_datum already refused a zero or out-of-range value, so
-            // no second range check is needed here.
+            let published_refund = c.tunables.pegin_refund_timeout_blocks;
+            if let Some(local_refund) = cfg.pegin_refund_timeout_blocks
+                && local_refund != published_refund
+            {
+                return Err(FederationError::RefundTimeoutMismatch {
+                    local: local_refund,
+                    published: published_refund,
+                });
+            }
+            // parse_config_datum already refused a zero or out-of-range value, and
+            // enforced refund > csv, so no second check is needed here.
             Ok(FederationIdentity {
                 y_fed,
                 csv_blocks: published_csv,
+                pegin_refund_timeout_blocks: published_refund,
                 origin,
             })
         }
@@ -281,9 +325,20 @@ pub fn resolve(
             let csv = cfg
                 .federation_csv_blocks
                 .ok_or(FederationError::Unconfigured("federation_csv_blocks"))?;
+            let csv_blocks = csv_u16(i64::from(csv), "bitcoin.federation_csv_blocks")?;
+            let refund = cfg
+                .pegin_refund_timeout_blocks
+                .ok_or(FederationError::Unconfigured("pegin_refund_timeout_blocks"))?;
+            if refund <= csv_blocks {
+                return Err(FederationError::RefundTimeoutTooShort {
+                    refund,
+                    csv: csv_blocks,
+                });
+            }
             Ok(FederationIdentity {
                 y_fed,
-                csv_blocks: csv_u16(i64::from(csv), "bitcoin.federation_csv_blocks")?,
+                csv_blocks,
+                pegin_refund_timeout_blocks: refund,
                 origin: FederationOrigin::LocalConfig,
             })
         }
@@ -304,6 +359,8 @@ mod tests {
         BitcoinConfig {
             y_fed_seed_hex: seed.map(str::to_string),
             federation_csv_blocks: csv,
+            // The unpublished path needs it locally, and it must exceed `csv`.
+            pegin_refund_timeout_blocks: csv.map(|c| (c as u16).saturating_add(576)),
             ..BitcoinConfig::default()
         }
     }
@@ -378,6 +435,42 @@ mod tests {
         assert_eq!(id.origin, FederationOrigin::LocalConfig);
         assert_eq!(id.y_fed.serialize(), key);
         assert_eq!(id.csv_blocks, 288);
+        assert_eq!(id.pegin_refund_timeout_blocks, 864);
+    }
+
+    /// A local refund delay that disagrees with the published one is FATAL, for the same
+    /// reason a CSV mismatch is: it is hashed into every deposit address, so the two nodes
+    /// reconstruct different ones and freeze different peg-in sets.
+    #[test]
+    fn a_local_refund_timeout_that_contradicts_the_published_one_is_fatal() {
+        let (seed, key) = seed_and_key(0x66);
+        let mut c = cfg(Some(&seed), Some(144));
+        c.pegin_refund_timeout_blocks = Some(999);
+        let published = datum(&key, 144);
+        let e = resolve(&c, Some(&published)).unwrap_err();
+        assert!(
+            matches!(e, FederationError::RefundTimeoutMismatch { local: 999, .. }),
+            "got {e:?}"
+        );
+    }
+
+    /// A refund window opening before the federation's sweep is refused outright.
+    #[test]
+    fn a_refund_window_that_opens_before_the_federation_sweep_is_refused() {
+        let (seed, _) = seed_and_key(0x66);
+        let mut c = cfg(Some(&seed), Some(720));
+        c.pegin_refund_timeout_blocks = Some(144);
+        let e = resolve(&c, None).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                FederationError::RefundTimeoutTooShort {
+                    refund: 144,
+                    csv: 720
+                }
+            ),
+            "got {e:?}"
+        );
     }
 
     /// The case that used to silently derive a well-formed treasury address

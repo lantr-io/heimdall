@@ -222,10 +222,19 @@ pub struct BitcoinConfig {
     /// broadcasts; watchtowers relay `signed_btc_tx` from the UnconfirmedTm
     /// record (that is what the record is for).
     pub submit: bool,
-    /// Depositor refund timelock (BTC blocks) in the peg-in Taproot's
-    /// refund leaf. Spec default 4320 (~30 days); override for
-    /// testnet4/preprod which use shorter timeouts.
-    pub pegin_refund_timeout_blocks: u16,
+    /// Depositor refund timelock (BTC blocks) in the peg-in Taproot's refund leaf.
+    ///
+    /// OPTIONAL, and no default — [CFG-9] publishes it in the Config as
+    /// `params[8]`, so a correctly configured node leaves this unset and reads the
+    /// bridge's value. Set, it becomes a CROSS-CHECK and a disagreement with the
+    /// published value is FATAL, exactly like `federation_csv_blocks` beside it.
+    ///
+    /// It used to be a plain `u16` defaulting to 4320, which is the worst shape for
+    /// a value every SPO must agree on byte for byte: a node that simply never set
+    /// the key silently diverged from one that did, the two reconstructed different
+    /// deposit addresses, froze different peg-in sets, and the ceremony stalled with
+    /// nothing naming the cause.
+    pub pegin_refund_timeout_blocks: Option<u16>,
     /// Opt-in staleness deadline (seconds). An Unconfirmed TM still on-chain this
     /// long after its Cardano block (chain time − block time) is treated as DEAD —
     /// it never confirmed, so it stops blocking the tip and reserving its peg-ins.
@@ -252,7 +261,7 @@ impl Default for BitcoinConfig {
             rpc_user: None,
             rpc_pass: None,
             submit: false,
-            pegin_refund_timeout_blocks: 4320,
+            pegin_refund_timeout_blocks: None,
             inflight_deadline_secs: None,
         }
     }
@@ -730,7 +739,9 @@ impl HeimdallConfig {
                 self.protocol.pegin_collection_window_secs,
             ),
             pegin_poll_interval: Duration::from_millis(self.protocol.pegin_poll_interval_ms),
-            pegin_refund_timeout_blocks: self.bitcoin.pegin_refund_timeout_blocks,
+            // EpochConfig keeps a concrete value for the demo/mock paths; the daemon reads
+            // the published one off the treasury oracle ([CFG-9]).
+            pegin_refund_timeout_blocks: self.bitcoin.pegin_refund_timeout_blocks.unwrap_or(4320),
             state_dir: self
                 .protocol
                 .state_dir

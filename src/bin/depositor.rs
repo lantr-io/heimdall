@@ -98,6 +98,14 @@ struct Cli {
     #[arg(long)]
     y_federation: String,
 
+    /// The CSV delay of the deposit tree's DEPOSITOR REFUND leaf, in blocks — the
+    /// bridge's Config `params.pegin_refund_timeout_blocks` ([CFG-9]).
+    ///
+    /// A flag for the same reason as the rest: it is hashed into the deposit address.
+    /// It must exceed `--federation-csv-blocks`.
+    #[arg(long)]
+    refund_timeout_blocks: u16,
+
     /// The CSV delay of the deposit tree's federation leaf, in blocks — the bridge's
     /// Config `params.federation_csv_blocks`.
     ///
@@ -169,7 +177,7 @@ fn run() -> Result<(), String> {
 
     let cfg = HeimdallConfig::from_file(&cli.config).map_err(|e| e.to_string())?;
     let network = cfg.bitcoin.parsed_network();
-    let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
+    let refund_timeout = cli.refund_timeout_blocks;
 
     let secp = Secp256k1::new();
 

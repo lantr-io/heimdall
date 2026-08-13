@@ -792,14 +792,14 @@ async fn collect_pegins_phase(
     // convention is `y_51`. A depositor builds against the key the Config PUBLISHES, so the
     // peg-in tree has to use that one or the two derive different addresses in silence.
     //
-    // `refund_timeout` is still local config — the one input here a node can get wrong on its
-    // own. See the note on `EpochConfig::pegin_refund_timeout_blocks`.
+    // All four inputs now come from the bridge, not from this node's file: [CFG-9] published
+    // the refund delay, which was the last one an operator could get wrong alone.
     let treasury = chain.query_treasury().await?;
     let pegin_tree = crate::bitcoin::taproot::PeginTreeParams {
         y_51: treasury.y_51,
         y_federation: treasury.config_y_fed,
         federation_csv_blocks: treasury.federation_csv_blocks,
-        refund_timeout: config.pegin_refund_timeout_blocks,
+        refund_timeout: treasury.pegin_refund_timeout_blocks,
     };
     // A refund window that opens before the federation's is a misconfiguration, not an
     // invariant: fail the phase with the reason instead of panicking inside the derivation.
