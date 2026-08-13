@@ -208,27 +208,28 @@ pub struct RegistryParams {
 
 /// Config #1–#6 — the bridge's contract identifiers.
 ///
-/// These are the AUTHORITATIVE copies. Everything heimdall carries in its own
-/// `[cardano]` section — `bridged_token_unit`, `pegin_policy_id`,
-/// `pegin_script_address`, `pegout_script_address`, `cpo_policy_id` — is an
-/// operator-typed duplicate of one of them, which is exactly the kind of copy
-/// that goes stale after a redeploy and is discovered at transaction time. The
-/// startup gate (WI-053 step 4) cross-checks the duplicates against these, so a
-/// wrong one is caught on first run instead.
+/// These are the ONLY copies since WI-070. They used to be duplicated by
+/// `[cardano]` keys an operator copied out of the bridge's deployment notes —
+/// `bridged_token_unit`, `pegin_policy_id`, `pegin_script_address`,
+/// `pegout_script_address`, `cpo_policy_id` — and a duplicate that can disagree
+/// is the whole problem: a mistyped script hash yields a well-formed address
+/// holding nothing, which reads as "no peg-ins pending" and "no peg-outs
+/// pending" while the node cheerfully keeps signing. The startup gate used to
+/// cross-check the copies; [`ConfigParams::bridge_contracts`] now derives them,
+/// so there is no second source to check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contracts {
-    /// #1
-    pub bridged_token_policy_id: Vec<u8>,
     /// #2
+    pub bridged_token_policy_id: Vec<u8>,
+    /// #3
     pub completed_peg_ins_policy_id: Vec<u8>,
-    /// #3 — the bridge-state singleton's NFT policy. heimdall's
-    /// `cardano.cpo_policy_id` names this policy since rev 5.4.
+    /// #4 — the bridge-state singleton's NFT policy.
     pub bridge_state_policy_id: Vec<u8>,
-    /// #5. One Aiken validator serves `mint`, `withdraw` and `spend`, so this
-    /// single hash is both heimdall's `pegin_policy_id` and the payment
-    /// credential of `pegin_script_address`.
+    /// #6. One Aiken validator serves `mint`, `withdraw` and `spend`, so this
+    /// single hash is both the peg-in NFT policy id and the payment credential
+    /// of the peg-in script address.
     pub peg_in_script_hash: Vec<u8>,
-    /// #6. Likewise the payment credential of `pegout_script_address`.
+    /// #7. Likewise the payment credential of the peg-out script address.
     pub peg_out_script_hash: Vec<u8>,
 }
 
@@ -243,6 +244,79 @@ impl Contracts {
             hex::encode(BRIDGED_TOKEN_ASSET_NAME)
         )
     }
+}
+
+/// The TM state token's asset name — empty, a protocol constant like
+/// [`BRIDGED_TOKEN_ASSET_NAME`]. The TreasuryMovementValidator counts the
+/// empty-name token under its own script hash, so there is nothing per-bridge
+/// about it and nothing for an operator to set.
+pub const TM_ASSET_NAME_HEX: &str = "";
+
+/// Every bridge identifier heimdall needs, derived from the Config datum
+/// (WI-070).
+///
+/// Each field used to be a `[cardano]` key. Deriving them from the one
+/// NFT-authenticated UTxO removes the second source rather than checking it —
+/// see [`Contracts`] for why checking was never enough.
+///
+/// The network tag is the sole local input, and
+/// [`crate::config::CardanoConfig::is_mainnet`] already cross-checks it against
+/// the Config address's own bech32 prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeContracts {
+    /// #6, hex. The peg-in NFT policy id.
+    pub pegin_policy_id: String,
+    /// #6 as a bech32 enterprise address — where PegInRequest UTxOs sit.
+    pub pegin_script_address: String,
+    /// #7 as a bech32 enterprise address — where PegOut UTxOs sit.
+    pub pegout_script_address: String,
+    /// #2 ‖ [`BRIDGED_TOKEN_ASSET_NAME`] — the fBTC unit whose quantity is a
+    /// PegOut request's locked amount.
+    pub bridged_token_unit: String,
+    /// #4, hex. The bridge-state singleton's NFT policy.
+    pub bridge_state_policy_id: String,
+    /// #5, hex. The TM validator script hash = the TM NFT policy id.
+    pub tm_policy_id: String,
+    /// #5 as a bech32 enterprise address — the TM validator address every
+    /// UnconfirmedTm/Confirmed record is posted to.
+    pub tm_address: String,
+}
+
+impl BridgeContracts {
+    /// The `(policy, asset name)` unit identifying a TM state token.
+    #[must_use]
+    pub fn tm_asset_unit(&self) -> String {
+        format!("{}{TM_ASSET_NAME_HEX}", self.tm_policy_id)
+    }
+}
+
+/// A Config hash that is not 28 bytes. Unreachable through
+/// [`parse_config_datum`], which length-checks every one — kept as a total
+/// function rather than a panic because these values decide addresses.
+#[derive(Debug)]
+pub struct BadContractHash {
+    pub field: &'static str,
+    pub len: usize,
+}
+
+impl std::fmt::Display for BadContractHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Config {} is {} bytes, not the 28 a script hash must be — this Config \
+             cannot name an address",
+            self.field, self.len
+        )
+    }
+}
+
+impl std::error::Error for BadContractHash {}
+
+fn hash28(bytes: &[u8], field: &'static str) -> Result<[u8; 28], BadContractHash> {
+    bytes.try_into().map_err(|_| BadContractHash {
+        field,
+        len: bytes.len(),
+    })
 }
 
 /// The Config datum as heimdall reads it: the fields it consumes, plus the raw
@@ -272,6 +346,38 @@ pub struct ConfigParams {
     pub y_federation: [u8; 32],
     /// #1 — always present in the rev-5.5 layout.
     pub tunables: Tunables,
+}
+
+impl ConfigParams {
+    /// Derive every bridge identifier from this Config datum (WI-070).
+    ///
+    /// `mainnet` decides only the bech32 network tag of the three derived
+    /// addresses; the hashes themselves are the datum's. It is the one local
+    /// input left, and it is cross-checked against the Config address's own
+    /// prefix by [`crate::config::CardanoConfig::is_mainnet`] — so a node cannot
+    /// derive testnet addresses for a mainnet bridge without being told.
+    pub fn bridge_contracts(&self, mainnet: bool) -> Result<BridgeContracts, BadContractHash> {
+        use crate::cardano::blueprint::script_enterprise_address;
+        let network = if mainnet {
+            pallas_addresses::Network::Mainnet
+        } else {
+            pallas_addresses::Network::Testnet
+        };
+        let peg_in = hash28(&self.contracts.peg_in_script_hash, "#6 peg_in_script_hash")?;
+        let peg_out = hash28(
+            &self.contracts.peg_out_script_hash,
+            "#6 peg_out_script_hash",
+        )?;
+        Ok(BridgeContracts {
+            pegin_policy_id: hex::encode(peg_in),
+            pegin_script_address: script_enterprise_address(&peg_in, network),
+            pegout_script_address: script_enterprise_address(&peg_out, network),
+            bridged_token_unit: self.contracts.bridged_token_unit(),
+            bridge_state_policy_id: hex::encode(self.bridge_state_policy),
+            tm_policy_id: hex::encode(self.tm_script_hash),
+            tm_address: script_enterprise_address(&self.tm_script_hash, network),
+        })
+    }
 }
 
 /// Which Config UTxO a [`ConfigParams`] was read from.

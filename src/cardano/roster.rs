@@ -1322,7 +1322,6 @@ mod tests {
         let cardano = crate::config::CardanoConfig {
             network: Some("preprod".to_string()),
             registry_blueprint: Some(path.to_string_lossy().into_owned()),
-            treasury_policy_id: Some(hex::encode([0x11; 28])),
             // Rev 5.5: compiling treasury_info needs its own one-shot outref and
             // the Config NFT policy, not the registry policy.
             treasury_bootstrap: Some(format!("{}:0", "aa".repeat(32))),
@@ -1378,7 +1377,6 @@ mod tests {
             crate::config::CardanoConfig {
                 network: Some("preprod".to_string()),
                 registry_blueprint: Some("/nonexistent/plutus.json".to_string()),
-                treasury_policy_id: Some(hex::encode([0x11; 28])),
                 ..Default::default()
             },
             // A blueprint that has no treasury_info validator at all (a newer or
@@ -1394,7 +1392,6 @@ mod tests {
                     .to_string_lossy()
                     .into_owned(),
                 ),
-                treasury_policy_id: Some(hex::encode([0x11; 28])),
                 ..Default::default()
             },
         ];
