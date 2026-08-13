@@ -1599,7 +1599,7 @@ async fn run_demo(
         bf_chain = bf_chain.with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked);
 
         // The bridge Config, read once at startup. It publishes the ban policy
-        // (#17-#20), so a node needs no ban keys of its own — and an unreadable
+        // (#8 and params[4..=6]), so a node needs no ban keys of its own — and an unreadable
         // one is fatal rather than a quiet fall back to whatever this operator
         // typed, which is how two nodes end up filtering different rosters.
         let bridge_config = match config_locator(&cfg) {
@@ -1649,7 +1649,7 @@ async fn run_demo(
                 } else {
                     warn!(
                         "on-chain key handoff:  NOT possible on this node — the roster comes \
-                         from the Config's published identity (#21-#23) and there is no \
+                         from the Config's published identity (#9-#10) and there is no \
                          compiled treasury_info script to spend the state UTxO with. DKG runs \
                          and the group key is derived, but if this node is elected leader the \
                          Update-Y FAILS and the treasury is not handed over. Set \
@@ -1727,7 +1727,7 @@ async fn run_demo(
 
         // Everything resolved above is what THIS PROCESS SAW AT BOOT. The
         // federation identity is chain state a governance Update can move, so
-        // hand the chain the config it needs to re-resolve #17/#21-#23 on every
+        // hand the chain the config it needs to re-resolve #8/#9-#10 on every
         // roster read — otherwise two honest nodes filter different rosters
         // according to when each was last restarted, which is the divergence
         // publishing those fields was meant to end. Startup keeps resolving them
@@ -2242,7 +2242,7 @@ async fn config_view_async(
 
 /// Resolve the treasury's federation identity (WI-069).
 ///
-/// Walks the whole chain from the one Config NFT: Config #12/#13 name the
+/// Walks the whole chain from the one Config NFT: Config #9/#10 name the
 /// `treasury_info` policy and state-NFT, its script hash gives the address, and
 /// that UTxO's datum carries `y_federation` (#2) and `federation_csv_blocks`
 /// (#3). No new field and no extra query — this is the same snapshot the roster
@@ -3089,7 +3089,7 @@ fn run_bootstrap_ban_list(
     {
         return Err(format!(
             "these parameters derive ban policy {} but the bridge Config publishes {} \
-             (field #17) — that bridge's ban list is already bootstrapped, and a root minted \
+             (field #8) — that bridge's ban list is already bootstrapped, and a root minted \
              here would sit at an address no SPO reads",
             spo_bans.hash_hex(),
             hex::encode(published.spo_bans_policy_id),
@@ -4559,9 +4559,10 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     // The ban a tx applies is computed from the SCHEDULE — its end time from
-    // #18/#19 and the validity interval from #20 — so those numbers must be the
-    // deployment's, not this operator's. Read them from the Config where the
-    // bridge publishes them; the derived policy is then checked against #17.
+    // params[4]/params[5] and the validity interval from params[6] — so those
+    // numbers must be the deployment's, not this operator's. Read them from the
+    // Config where the bridge publishes them; the derived policy is then checked
+    // against #8.
     let bridge_config = config_view(&rt, cfg)?;
     let params = BanPolicyParams::resolve(&cfg.cardano, bridge_config.as_ref().map(|v| &v.params))
         .map_err(|e| e.to_string())?;
@@ -4581,7 +4582,7 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     {
         return Err(format!(
             "this ban would be applied to policy {} but the bridge Config publishes {} \
-             (field #17) — it would confirm into a ban list no other SPO reads. Check \
+             (field #8) — it would confirm into a ban list no other SPO reads. Check \
              cardano.ban_bootstrap and cardano.fault_proof_policies against this bridge",
             spo_bans.hash_hex(),
             hex::encode(published.spo_bans_policy_id),
@@ -4908,7 +4909,7 @@ fn run_show_roster(
     let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
-    // Resolve the registry the way the daemon does — published identity (#21-#23)
+    // Resolve the registry the way the daemon does — published identity (#9-#10)
     // first, local keys only otherwise. This report is what the operator guide
     // sends people to in order to check their own registration, so it has to work
     // on a bridge where the guide has already told them to delete those keys.
@@ -4926,7 +4927,7 @@ fn run_show_roster(
         .map_err(|e| e.to_string())?
         .ok_or(
             "no registry to show: this bridge's Config publishes no registry identity \
-             (#21-#23), and cardano.registry_blueprint / registry_bootstrap / \
+             (#9-#10), and cardano.registry_blueprint / registry_bootstrap / \
              treasury_info_asset_name are unset. Pass --blueprint, --registry-bootstrap and \
              --treasury-nft-name, or point cardano.config_address at a bridge that \
              publishes them",
@@ -6134,7 +6135,7 @@ fn run_sweep_pegins(
     // nominally covered is already closed by the in-flight refusal above (`tip.in_flight`),
     // which stops a second sweep before the previous TM confirms and folds into the trie.
     // Freeze this batch's consensus inputs at one chain point (WI-040/WI-041): the
-    // operational parameters TM construction reads (Config #12-#14), the chain "now"
+    // operational parameters TM construction reads (Config `params[1..=3]`), the chain "now"
     // the freshness filter compares `created` against, and the batch opportunity whose
     // cutoff decides membership. Chain values, never this node's: each decides TM
     // bytes, and a divergent verdict means a divergent txid and a failed FROST round.

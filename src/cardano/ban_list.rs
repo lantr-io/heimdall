@@ -238,7 +238,7 @@ impl std::fmt::Display for BanListError {
                  bridge whose Config publishes the ban policy (#8) the root was minted at \
                  genesis, BEFORE the Config naming it — so this means the address is wrong, not \
                  the list empty: check cardano.network against the bridge (the network tag is \
-                 the only part of the address still taken from local config), and that #17 is \
+                 the only part of the address still taken from local config), and that #8 is \
                  not a placeholder. Otherwise mint the 'ban-root' anchor with bootstrap-ban-list"
             ),
             Self::MissingRoot => {
@@ -686,7 +686,7 @@ pub struct BanListSource {
 /// bridge's own published value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BanSourceOrigin {
-    /// Config #17 — this node configured nothing ban-related.
+    /// Config #8 (`spo_bans_policy_id`) — this node configured nothing ban-related.
     Config,
     /// The node's own `[cardano]` keys, on a Config predating the ban append.
     LocalKeys,
@@ -700,13 +700,13 @@ impl BanSourceOrigin {
     ///
     /// On the PUBLISHED route it may not. WI-068 mints both roots in the
     /// transaction BEFORE the one that mints the Config NFT naming them, so a
-    /// Config that publishes #17 at all publishes a policy whose root already
+    /// Config that publishes #8 at all publishes a policy whose root already
     /// exists. An empty address therefore means this node is looking at the
-    /// WRONG address — a placeholder or zero #17, or a `cardano.network` that
+    /// WRONG address — a placeholder or zero #8, or a `cardano.network` that
     /// disagrees with the bridge, since the network tag is the one part of the
     /// address that still comes from local config and is never checked against
     /// the Config. Reading that as "no bans" produces a fully unfiltered roster,
-    /// which is the exact failure publishing #17 exists to prevent.
+    /// which is the exact failure publishing #8 exists to prevent.
     #[must_use]
     pub fn tolerates_unbootstrapped(self) -> bool {
         matches!(self, Self::LocalKeys)
@@ -854,7 +854,7 @@ impl BanPolicyParams {
 
 impl BanListSource {
     /// The published route (WI-065): the ban script address is a pure function
-    /// of the `spo_bans` policy id the Config carries at #17.
+    /// of the `spo_bans` policy id the Config carries at #8.
     ///
     /// This is the whole read half. Nothing here reads a blueprint, an outref or
     /// a schedule number, so a node reading the ban list this way has NOTHING
@@ -978,7 +978,7 @@ impl BanListSource {
     /// ENFORCEMENT half builds its ApplyBan from [`BanPolicyParams::resolve`] —
     /// published schedule first. A cross-check derived from the LOCAL schedule
     /// instead computes a second, different hash in the same process, so a node
-    /// whose #18–#20 differ from its TOML is refused startup over a value nothing
+    /// whose params[4..=6] differ from its TOML is refused startup over a value nothing
     /// consumes while the value that IS consumed matches the bridge perfectly.
     /// One derivation per process: pass the same `config` both halves see.
     fn from_local_keys(
@@ -1042,7 +1042,7 @@ impl BanListSource {
     ///
     /// `config` is the decoded Config datum, or `None` when this node cannot
     /// locate one at all. Precedence is not a preference — the Config is
-    /// NFT-authenticated and identical for every SPO, so a node reading #17 and a
+    /// NFT-authenticated and identical for every SPO, so a node reading #8 and a
     /// node deriving from its own TOML must agree or one of them is filtering a
     /// roster nobody else has.
     ///
@@ -1063,24 +1063,24 @@ impl BanListSource {
 
         // Defence in depth, free wherever the local keys are still present: if
         // they derive a DIFFERENT policy than the bridge published, one of the
-        // two addresses holds no bans — and the whole reason to publish #17 is
+        // two addresses holds no bans — and the whole reason to publish #8 is
         // that neither the operator nor the node can tell which from the outside.
         //
         // Derived with the SAME params the enforcement half uses (published
         // schedule first), so this compares the one hash this process acts on
-        // against #17, not a second hash nothing consumes.
+        // against #8, not a second hash nothing consumes.
         //
         // A local derivation that FAILS is only a stale leftover, not a
-        // disagreement: #17 is authoritative and these keys are on their way out
+        // disagreement: #8 is authoritative and these keys are on their way out
         // (the enforcement path fails loudly on its own if it needs them). Say so
         // and carry on rather than bricking a node over config it no longer uses.
         if cardano.ban_bootstrap.is_some() {
             match Self::from_local_keys(cardano, config) {
                 Ok(Some(local)) if local.ban_policy_hex != source.ban_policy_hex => {
                     return Err(BanListError::Config(format!(
-                        "the bridge Config publishes ban policy {} (field #17) but this node's \
+                        "the bridge Config publishes ban policy {} (field #8) but this node's \
                          local ban keys derive {}. One of those addresses holds no bans at all. \
-                         The ban schedule is NOT the disagreement — #18–#20 are taken from the \
+                         The ban schedule is NOT the disagreement — params[4..=6] are taken from the \
                          Config here — so it is one of cardano.ban_bootstrap, \
                          cardano.registry_bootstrap, cardano.registry_blueprint or \
                          cardano.fault_proof_policies. Delete cardano.ban_bootstrap to read the \
@@ -1090,7 +1090,7 @@ impl BanListSource {
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(
-                    "[bans] the bridge Config publishes ban policy {} (field #17), so the local \
+                    "[bans] the bridge Config publishes ban policy {} (field #8), so the local \
                      ban keys are unused and could not be checked against it ({e}) — delete \
                      cardano.ban_bootstrap and cardano.fault_proof_policies",
                     source.ban_policy_hex
@@ -1920,7 +1920,7 @@ mod tests {
             published
                 .active_bans_from(Err(BanListError::NotBootstrapped), 0)
                 .is_err(),
-            "a published #17 whose address holds no root is a WRONG address — reading it \
+            "a published #8 whose address holds no root is a WRONG address — reading it \
              as 'no bans' publishes an unfiltered roster"
         );
         assert_eq!(

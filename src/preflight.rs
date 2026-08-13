@@ -570,7 +570,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     // `resolve` returns None only when NONE of the registry keys are set AND the
     // Config publishes no registry identity (the fixture-roster deployment, which
     // legitimately has no reference script), and an error when the local keys are
-    // half-set or when a local derivation contradicts the published #22.
+    // half-set or when a local derivation contradicts the published #10.
     //
     // NOT a startup gate. The registry reference script is what `register-spo`
     // spends against; a running daemon reads the roster from UTxOs and never
@@ -595,7 +595,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             format!("cannot derive the registry script: {e}"),
             "set all of cardano.registry_blueprint, cardano.registry_bootstrap and \
              cardano.treasury_info_asset_name — or none of them, to read the registry \
-             identity the bridge publishes at Config #21-#23",
+             identity the bridge publishes at Config #9-#10",
         ),
         Ok(Some(src)) => {
             let hash = &src.registry_policy_hex;
@@ -771,7 +771,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     // ── 8. Key handoff (Update-Y) — a capability, reported not assumed ────
     // A completed DKG only becomes consequential when `treasury_info` is rotated
     // to the new group key, and SPENDING that state UTxO needs the compiled
-    // script — not just the policy id the Config publishes at #22. Reading the
+    // script — not just the policy id the Config publishes at #10. Reading the
     // roster does not, so this is the one thing a fully published-route node
     // still cannot do, and the one thing whose absence is invisible until it
     // costs a whole ceremony: the leader fails at submission AFTER a full DKG and
@@ -803,7 +803,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             "no compiled treasury_info script — if this node is elected leader the \
              Update-Y fails after a full DKG and the treasury is not handed over",
             "set cardano.registry_blueprint and cardano.treasury_policy_id (treasury_info's \
-             two parameters). The derived hash is checked against the Config's #22, so a \
+             two parameters). The derived hash is checked against the Config's #10, so a \
              wrong one is refused rather than used",
         ),
     }

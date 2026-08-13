@@ -75,7 +75,7 @@ pub struct PegOutRequest {
 }
 
 /// The Config-resident operational parameters TM construction consumes —
-/// `ConfigDatum` fields #12, #13 and #14 — read **as of the batch snapshot slot**
+/// `ConfigDatum` `params[1]`, `params[2]` and `params[3]` — read **as of the batch snapshot slot**
 /// (spec §Operational parameters, determinism rule).
 ///
 /// Every field here is a consensus input: it decides either the transaction's
@@ -87,15 +87,15 @@ pub struct PegOutRequest {
 ///
 /// The *effective* per-peg-out protocol fee is NOT here: since rev 5.1 it is
 /// pinned per request in the peg-out datum (see [`PegOutRequest::per_pegout_fee`]),
-/// and #13 below is only the floor that fee must clear.
+/// and `params[2]` below is only the floor that fee must clear.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmParams {
-    /// Config #12 — the EXACT miner fee rate: `miner fee = vsize × rate`.
+    /// Config `params[1]` — the EXACT miner fee rate: `miner fee = vsize × rate`.
     pub fee_rate_sat_per_vb: u64,
-    /// Config #13 — the floor for a request's own datum-pinned `per_pegout_fee`.
+    /// Config `params[2]` — the floor for a request's own datum-pinned `per_pegout_fee`.
     /// A request paying less is skipped (it would under-pay the protocol).
     pub per_pegout_fee_floor: Amount,
-    /// Config #14 — the minimum fBTC a PegOut request may lock. A request
+    /// Config `params[3]` — the minimum fBTC a PegOut request may lock. A request
     /// locking less is skipped.
     pub min_peg_out_fbtc: Amount,
 }
@@ -392,11 +392,11 @@ pub enum SkipReason {
     /// The same `por_id` appeared earlier in this very batch. Paying it twice
     /// would move BTC that the (idempotent) trie insert never accounts for.
     DuplicateRequest,
-    /// The locked fBTC is below `min_peg_out_fbtc` (Config #14) at the batch
+    /// The locked fBTC is below `min_peg_out_fbtc` (Config `params[3]`) at the batch
     /// snapshot slot — a request smaller than the protocol accepts.
     BelowMinPegOut,
     /// The request's own datum `per_pegout_fee` is below the protocol floor
-    /// (Config #13) at the batch snapshot slot. `peg-out.ak` binds completion to
+    /// (Config `params[2]`) at the batch snapshot slot. `peg-out.ak` binds completion to
     /// the datum fee, so paying it would settle a withdrawal that never covered
     /// the protocol's cost.
     FeeBelowFloor,
@@ -626,8 +626,8 @@ pub fn build_tm(
     //      `margin_ms` of `created + PEG_OUT_CANCEL_TIMEOUT_MS`. A request the
     //      owner can cancel after taking the BTC is a treasury double spend.
     //  (5) Below an Operational-params floor: locked fBTC under `min_peg_out_fbtc`
-    //      (Config #14), or a datum `per_pegout_fee` under the protocol floor
-    //      (Config #13). Neither is checked when the request is created — anyone
+    //      (Config `params[3]`), or a datum `per_pegout_fee` under the protocol floor
+    //      (Config `params[2]`). Neither is checked when the request is created — anyone
     //      can write a `PegOutDatum` directly at the permissionless address — so
     //      this skip is where the two governance bounds are actually enforced.
     //
@@ -2158,7 +2158,7 @@ mod tests {
         );
     }
 
-    // Config #14: a request locking less fBTC than the protocol minimum is skipped,
+    // params[3]: a request locking less fBTC than the protocol minimum is skipped,
     // not paid. Nothing checks this when the request is created — the peg-out
     // address is permissionless — so the TM builder is where the bound bites.
     #[test]
@@ -2184,7 +2184,7 @@ mod tests {
         assert_eq!(tm.skipped_pegouts[0].reason, SkipReason::BelowMinPegOut);
     }
 
-    // Config #13: the floor is on the request's OWN datum-pinned fee, which is what
+    // params[2]: the floor is on the request's OWN datum-pinned fee, which is what
     // `peg-out.ak` binds completion to — so an under-paying request must not be
     // settled at all rather than settled at the floor.
     #[test]
