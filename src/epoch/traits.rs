@@ -106,6 +106,31 @@ pub struct TreasuryUtxo {
     pub btc_confirmed: bool,
 }
 
+impl TreasuryUtxo {
+    /// The peg-in Taproot tree this bridge publishes — the canonical answer to "what
+    /// address does a deposit land at", for every reader that can see the oracle.
+    ///
+    /// It exists because the mapping is not obvious and getting it wrong is silent. The
+    /// federation LEAF key is [`Self::config_y_fed`], the value the Config publishes and a
+    /// depositor builds against — NOT [`Self::y_fed`], which is whichever candidate
+    /// reproduces the treasury HEAD's scriptPubKey and is `y_51` on a bridge still using the
+    /// collapsed convention. Both are `UntweakedPublicKey`, so nothing but this function
+    /// stands between a caller and a well-formed address holding nothing.
+    ///
+    /// Fails when the published pair breaks the spec's ordering rule; that is a
+    /// misconfiguration of the bridge, not an invariant a node may assume.
+    pub fn pegin_tree(&self) -> Result<crate::bitcoin::taproot::PeginTreeParams, String> {
+        let tree = crate::bitcoin::taproot::PeginTreeParams {
+            y_51: self.y_51,
+            y_federation: self.config_y_fed,
+            federation_csv_blocks: self.federation_csv_blocks,
+            refund_timeout: self.pegin_refund_timeout_blocks,
+        };
+        tree.validate()?;
+        Ok(tree)
+    }
+}
+
 /// The consensus inputs a TM batch is frozen against, all read at ONE chain point
 /// (spec §Operational parameters, determinism rule; WI-040).
 ///
@@ -607,3 +632,51 @@ impl rand_core::RngCore for CycleRng {
 }
 
 impl rand_core::CryptoRng for CycleRng {}
+
+#[cfg(test)]
+mod pegin_tree_tests {
+    use super::*;
+
+    fn xonly(b: u8) -> bitcoin::key::UntweakedPublicKey {
+        use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[b; 32]).unwrap();
+        Keypair::from_secret_key(&secp, &sk).x_only_public_key().0
+    }
+
+    fn utxo(y_51: u8, head_y_fed: u8, published_y_fed: u8) -> TreasuryUtxo {
+        TreasuryUtxo {
+            outpoint: bitcoin::OutPoint::null(),
+            value: bitcoin::Amount::ZERO,
+            y_51: xonly(y_51),
+            y_fed: xonly(head_y_fed),
+            config_y_fed: xonly(published_y_fed),
+            federation_csv_blocks: 144,
+            pegin_refund_timeout_blocks: 720,
+            btc_confirmed: true,
+        }
+    }
+
+    /// The whole reason this constructor exists: the leaf key is the PUBLISHED federation
+    /// key, not the one the treasury head happens to be locked under. On a bridge
+    /// mid-rotation the two differ, and picking the wrong one derives an address every
+    /// depositor misses — silently, because both are valid keys.
+    #[test]
+    fn the_leaf_key_is_the_published_one_not_the_head_derived_one() {
+        let u = utxo(0x11, 0x22, 0x33);
+        let tree = u.pegin_tree().expect("valid");
+        assert_eq!(tree.y_federation, u.config_y_fed);
+        assert_ne!(tree.y_federation, u.y_fed);
+        assert_eq!(tree.y_51, u.y_51);
+    }
+
+    /// A bridge publishing a refund window that opens before its own sweep window is
+    /// refused, rather than each deriver rediscovering it one deposit at a time.
+    #[test]
+    fn a_bridge_whose_refund_opens_first_is_refused() {
+        let mut u = utxo(0x11, 0x22, 0x33);
+        u.pegin_refund_timeout_blocks = 100;
+        let err = u.pegin_tree().unwrap_err();
+        assert!(err.contains("must exceed federation_csv_blocks"), "{err}");
+    }
+}
