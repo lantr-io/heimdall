@@ -170,13 +170,7 @@ the TM validator and its state token, the bridge-state singleton, the registry a
 and the operational parameters and batch schedule. **The daemon will not start until all three are
 set** — the check in the next section reports a missing one as a hard failure, not a warning.
 
-**The registry and the ban list need nothing typed.** One exception: performing the DKG **key
-handoff** (Update-Y) spends the `treasury_info` state UTxO, and spending it needs the compiled
-script, not just its hash. A node that does handoffs sets `cardano.registry_blueprint`; a wrong one
-is a startup error, not a silent failure. Without it the node still runs DKG and signs — it just
-cannot be the one that rotates the key, and startup step 7 says which of the two you are.
-
-On an older bridge whose Config does not publish the ban policy, you also copy `ban_bootstrap` and
+On an older bridge whose Config does not publish the ban policy, copy `ban_bootstrap` and
 `fault_proof_policies` from the deployment notes — exactly, since they are inputs to the ban
 policy's own identifier and a wrong value yields a valid-looking address holding an empty list.
 
@@ -193,6 +187,43 @@ seed out of the file dpkg tracks and diffs on upgrade.
 
 The Blockfrost project id is also a credential. It lives in the TOML, which is why the package
 installs that file `0640 root:heimdall` rather than world-readable.
+
+### A complete config
+
+Everything above, in one file. This is the whole of what an SPO joining a bridge sets:
+
+```toml
+[protocol]
+state_dir = "/var/lib/heimdall"
+
+[bifrost]
+skey_path = "/var/lib/heimdall/bifrost.skey"
+
+[bitcoin]
+# The Bitcoin network the bridge settles on.
+network = "testnet4"
+
+[cardano]
+blockfrost_project_id = "preprod…"
+network = "preprod"
+
+# The bridge — from its deployment notes. Everything else about it is read
+# from the UTxO these three identify.
+config_address = "addr_test1…"
+config_nft_policy_id = "…"
+config_nft_asset_name = "424946434647"   # "BIFCFG"
+
+# Your own minimum-stake gate for registration, in lovelace.
+min_stake_lovelace = 1000000000
+
+[http]
+# 0.0.0.0 is the default; set listen_port only if the port peers connect to
+# differs from the one this process binds (a reverse proxy, a container map).
+bind_address = "0.0.0.0"
+listen_port = 18500
+```
+
+The mnemonic is deliberately absent — it comes from `$HEIMDALL_MNEMONIC`, as above.
 
 ### Running next to your own node
 
