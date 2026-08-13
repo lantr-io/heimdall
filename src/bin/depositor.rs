@@ -149,9 +149,9 @@ struct Cli {
     fee_sat: u64,
 
     /// Broadcast the signed tx to `bitcoin.rpc_url`. Opt-in: without this flag
-    /// the depositor only prints the raw tx / txid (dry run). This is a demo
-    /// tool, so it does NOT inherit the daemon's `bitcoin.submit` setting —
-    /// broadcasting a live peg-in requires explicit intent here.
+    /// the depositor only prints the raw tx / txid (dry run). The depositor is the
+    /// ONE component that talks to bitcoind (WI-086) — heimdall proper never sends
+    /// a transaction to Bitcoin — and even here it takes explicit intent.
     #[arg(long)]
     submit: bool,
 }

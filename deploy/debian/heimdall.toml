@@ -63,11 +63,15 @@ pegout_freshness_margin_ms = 604800000
 #y_fed_seed_hex = ""
 #federation_csv_blocks = 144
 
-# NO BITCOIN NODE IS REQUIRED. heimdall posts Treasury Movements to Cardano and
-# the watchtowers relay them to Bitcoin. Leave `submit` false and rpc_url unset:
-# a second broadcaster is not redundancy here, it is a way to publish a movement
-# the Cardano side has not recorded.
-submit = false
+# NO BITCOIN NODE IS REQUIRED, and heimdall cannot use one. It posts Treasury
+# Movements to Cardano; the watchtowers relay them to Bitcoin, which is what the
+# UnconfirmedTm record carries the signed transaction FOR. There is no setting
+# that changes this — `bitcoin.submit` was removed and is now REFUSED, because a
+# second broadcaster was never redundancy, only a way to move BTC that Cardano has
+# no record of.
+#
+# The keys below are read by the `depositor` tool alone, which needs to READ the
+# UTxO set to choose funding inputs. An SPO leaves them unset.
 #rpc_url = "http://127.0.0.1:8332"
 #rpc_user = ""
 #rpc_pass = ""

@@ -44,7 +44,6 @@ use pallas_wallet::PrivateKey;
 
 use crate::bitcoin::taproot::treasury_spend_info;
 use crate::bitcoin::tm_builder::TmParams;
-use crate::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
 use crate::cardano::config_params;
 use crate::cardano::fault_proof::FaultProofKind;
 use crate::cardano::publish::{WalletUtxo, build_oracle_update_tx};
@@ -507,12 +506,6 @@ pub struct BlockfrostCardanoChain {
     /// `query_treasury` returns this as Y_51 so the FROST group can
     /// sign the treasury input (same pattern as MockCardanoChain).
     treasury_y_51: Mutex<Option<bitcoin::key::UntweakedPublicKey>>,
-    /// Optional bitcoind JSON-RPC config for direct BTC tx broadcast.
-    btc_rpc: Option<BtcRpcConfig>,
-    /// DEV-ONLY: whether to broadcast the signed BTC tx to Bitcoin (requires
-    /// btc_rpc). Default false — production SPOs never broadcast; watchtowers
-    /// relay `signed_btc_tx` from the UnconfirmedTm record.
-    submit_btc: bool,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     submit_oracle: bool,
     /// Resolved Blockfrost base URL + project id, for raw-HTTP UTxO queries (lenient parsing).
@@ -742,8 +735,6 @@ impl BlockfrostCardanoChain {
             payment_key: None,
             wallet_base_address: None,
             treasury_y_51: Mutex::new(None),
-            btc_rpc: None,
-            submit_btc: false,
             submit_oracle: true,
             tm_script_cbor: None,
             validity_window_secs: 1800,
@@ -1018,27 +1009,10 @@ impl BlockfrostCardanoChain {
         self
     }
 
-    /// Override submission flags from config.
-    pub fn with_submit_config(mut self, submit_btc: bool, submit_oracle: bool) -> Self {
-        self.submit_btc = submit_btc;
+    /// Override the Cardano submission flag from config. There is no Bitcoin
+    /// counterpart: heimdall does not send transactions to Bitcoin (WI-086).
+    pub fn with_submit_config(mut self, submit_oracle: bool) -> Self {
         self.submit_oracle = submit_oracle;
-        self
-    }
-
-    /// Configure direct Bitcoin RPC broadcast. When set,
-    /// `submit_signed_tm` sends the signed BTC tx to bitcoind via
-    /// `sendrawtransaction` instead of posting to the Cardano oracle.
-    pub fn with_btc_rpc(
-        mut self,
-        url: impl Into<String>,
-        user: Option<String>,
-        pass: Option<String>,
-    ) -> Self {
-        self.btc_rpc = Some(BtcRpcConfig {
-            url: url.into(),
-            user,
-            pass,
-        });
         self
     }
 
@@ -1984,22 +1958,12 @@ impl CardanoChain for BlockfrostCardanoChain {
             hex::encode(tx_bytes)
         );
 
-        // DEV-ONLY broadcast. Production SPOs run no Bitcoin node: the watchtower
-        // relays `signed_btc_tx` from the UnconfirmedTm record posted below.
-        if self.submit_btc {
-            eprintln!(
-                "[submit] DEV-ONLY bitcoin.submit=true — broadcasting directly; production \
-                 SPOs leave this false (watchtowers relay from the UnconfirmedTm record)"
-            );
-            match &self.btc_rpc {
-                Some(rpc) => broadcast_btc_tx(rpc, tx_bytes).await?,
-                None => warn!(
-                    "[submit] bitcoin.submit=true but rpc_url not set — skipping BTC broadcast"
-                ),
-            }
-        } else {
-            info!("[submit] no BTC broadcast (bitcoin.submit=false) — the watchtower relays it");
-        }
+        // heimdall does not send this to Bitcoin, ever (WI-086). The bytes travel to
+        // the watchtower INSIDE the UnconfirmedTm record posted below — that is what
+        // the record is for — and the watchtower relays them. An SPO broadcasting its
+        // own copy would not be a second path to the same outcome: it moves BTC that
+        // Cardano has no record of. The hex is logged above for the operator who has
+        // to send one by hand.
 
         // Track our in-flight TM: query_treasury reports btc_confirmed=false until this
         // txid becomes the Confirmed chain tip, so the epoch machine waits for its own
