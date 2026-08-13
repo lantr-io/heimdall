@@ -956,8 +956,7 @@ fn main() {
             y51,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) = run_federation_spend(&cfg, &outpoint, amount_sat, y51.as_deref())
-            {
+            if let Err(e) = run_federation_spend(&cfg, &outpoint, amount_sat, y51.as_deref()) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -6430,10 +6429,12 @@ fn run_sweep_pegins(
     // shortcut that used to broadcast straight to Bitcoin is gone (WI-086) — it built a
     // movement that never landed on Cardano, so `confirm-tmtx` had nothing to confirm
     // and no watchtower could reconcile it. The signed bytes were printed above.
-    Err("cardano.blockfrost_project_id is unset, so the Treasury Movement cannot be posted \
+    Err(
+        "cardano.blockfrost_project_id is unset, so the Treasury Movement cannot be posted \
          to Cardano — and posting it is the only thing that makes it relayable. The signed \
          Bitcoin transaction was printed above."
-        .to_string())
+            .to_string(),
+    )
 }
 
 fn print_bootstrap_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
