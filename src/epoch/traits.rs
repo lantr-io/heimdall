@@ -153,7 +153,7 @@ pub struct BatchSnapshot {
     /// unused; `NoGrid` is the dev/mock case, where no cutoff is applied at all.
     /// FIFO order and the capacity caps are pure and apply in every case.
     pub batch: crate::epoch::batch::BatchWindow,
-    /// Operational parameters in force at the snapshot — Config #12–#14. (#16, the
+    /// Operational parameters in force at the snapshot — the Config's `params[1..=3]`. (`params[0]`, the
     /// schedule, is not here: nothing in TM construction consumes it. It is decoded
     /// by `cardano::config_params` and reported by `show-config-params` / the
     /// mover's startup banner, and drives the batch grid when plan N19 lands.)
@@ -297,7 +297,7 @@ pub trait CardanoChain: Send + Sync {
 
     /// Freeze this batch's consensus inputs: the chain time the peg-out freshness
     /// filter compares against, and the operational parameters TM construction
-    /// reads (Config #12–#14), both **as of one chain point**.
+    /// reads (the Config's `params[1..=3]`), both **as of one chain point**.
     ///
     /// Every field of the result feeds bytes that all SPOs must produce
     /// identically, so all of it is chain-derived and read once, together — see

@@ -38,16 +38,16 @@ pub struct StaticFixture {
     /// Peg-out requests waiting to be paid out.
     pub pegouts: Vec<StaticPegOut>,
     /// The mock bridge's operational parameters — what the Config UTxO's fields
-    /// #12–#14 are on a real chain (see `cardano::config_params`). One fixture is
+    /// `params[1..=3]` are on a real chain (see `cardano::config_params`). One fixture is
     /// shared by every node of a test, which is the property that matters: TM bytes
     /// must not depend on who built them.
     pub fee_rate_sat_per_vb: u64,
     /// The fee a fixture peg-out request pins in its (imaginary) datum — NOT the
-    /// Config #13 floor, which is [`Self::per_pegout_fee_floor`].
+    /// Config `params[2]` floor, which is [`Self::per_pegout_fee_floor`].
     pub per_pegout_fee: Amount,
-    /// Config #13 — floor for a request's datum fee. Zero disables the skip.
+    /// Config `params[2]` — floor for a request's datum fee. Zero disables the skip.
     pub per_pegout_fee_floor: Amount,
-    /// Config #14 — minimum fBTC a request may lock. Zero disables the skip.
+    /// Config `params[3]` — minimum fBTC a request may lock. Zero disables the skip.
     pub min_peg_out_fbtc: Amount,
     /// Per-SPO bifrost identity keypairs, so the HTTP demo can construct
     /// each `HttpPeerNetwork` with the secret matching the `bifrost_id_pk`

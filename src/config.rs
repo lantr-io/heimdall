@@ -185,7 +185,7 @@ pub struct BitcoinConfig {
     /// binds the completed-peg-outs trie value against THAT value, so a TM paying
     /// `gross − some_local_config` would produce an entry the Complete branch cannot
     /// match, spending BTC for a completion nobody can prove. The FLOOR that fee
-    /// must clear is Config datum field #13, read at the batch snapshot slot — a
+    /// must clear is the Config's `params[2]`, read at the batch snapshot slot — a
     /// skip rule, so it too must be identical across SPOs.
     pub per_pegout_fee_sat: u64,
     /// Relative-timelock delay (blocks) of the treasury's federation recovery

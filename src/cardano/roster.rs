@@ -85,7 +85,7 @@ pub enum RosterError {
     /// Bad blueprint/bootstrap configuration for the registry source.
     Config(String),
     /// This node's locally compiled `treasury_info` hash disagrees with the one
-    /// the bridge Config publishes at #12.
+    /// the bridge Config publishes at #10.
     ///
     /// Distinct from [`Self::Config`] because the two are opposites on the
     /// published route: a derivation that FAILS there costs only the Update-Y
@@ -426,7 +426,7 @@ pub struct RegistryRosterSource {
     /// policy above, but re-deriving the script elsewhere would mean a second
     /// blueprint read and a second copy of the parameterization rules.
     ///
-    /// `None` when the source came from the Config's published identity (#21–#23)
+    /// `None` when the source came from the Config's published identity (#9–#10)
     /// and this node has no blueprint to compile it from. That is the read/spend
     /// split: the published ids locate the roster, but a node that performs the
     /// key handoff must also be able to build the script. Update-Y says so
@@ -530,7 +530,7 @@ impl RegistryRosterSource {
     }
 
     /// The published route (WI-068): both addresses come from the policy ids the
-    /// Config carries at #11–#12, and the state NFT's name from #13.
+    /// Config carries at #9–#10; the state NFT's name is a protocol constant.
     ///
     /// This is also how the treasury's federation identity is reached (WI-069):
     /// the `treasury_info` UTxO located here carries `y_federation` and
@@ -574,10 +574,10 @@ impl RegistryRosterSource {
     /// Attach the compiled `treasury_info` script to a published source, so the
     /// node can also SPEND the state UTxO (Update-Y).
     ///
-    /// The derived hash must equal the published #12, and a mismatch is fatal:
+    /// The derived hash must equal the published #10, and a mismatch is fatal:
     /// the parameter this compiles from is exactly what a node can get wrong,
     /// and the consequence — a handoff written to an address no other SPO reads
-    /// — is the failure publishing #12 exists to prevent.
+    /// — is the failure publishing #10 exists to prevent.
     pub fn with_derived_script(
         mut self,
         blueprint_path: &str,
@@ -673,7 +673,7 @@ impl RegistryRosterSource {
     /// only the ability to SPEND the state UTxO, so a node with a moved
     /// `plutus.json` or a blueprint from a newer contracts release loses the
     /// handoff and keeps the bridge. A derivation that SUCCEEDS and disagrees
-    /// with #12 stays fatal: that one is a real conflict about where the handoff
+    /// with #10 stays fatal: that one is a real conflict about where the handoff
     /// goes.
     pub fn resolve(
         cardano: &crate::config::CardanoConfig,
@@ -687,7 +687,7 @@ impl RegistryRosterSource {
         };
         let mainnet = cardano.is_mainnet().map_err(RosterError::Config)?;
         // Rev 5.5 [CFG-4]: the state NFT's asset name is a protocol constant, not
-        // Config #13. Uniqueness comes from the one-shot outpoint baked into the
+        // a Config field of its own. Uniqueness comes from the one-shot outpoint baked into the
         // policy id, so the name had nothing left to say.
         let source = Self::from_policy_ids(
             &published.spos_registry_policy_id,
@@ -1346,7 +1346,7 @@ mod tests {
         let mut wrong = published.clone();
         wrong.registry.treasury_info_policy_id = [0xc2; 28];
         let err = RegistryRosterSource::resolve(&cardano, Some(&wrong))
-            .expect_err("a derived hash disagreeing with #12 must not be resolved by preference");
+            .expect_err("a derived hash disagreeing with #10 must not be resolved by preference");
         assert!(
             matches!(err, RosterError::DerivedMismatch { .. }),
             "{err:?}"

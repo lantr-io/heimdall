@@ -1801,7 +1801,7 @@ mod tests {
     }
 
     /// WI-040: the batch snapshot's Operational-params floors reach `build_tm` on the daemon
-    /// path. The mock serves them where a live chain serves Config #13/#14, so this pins the
+    /// path. The mock serves them where a live chain serves the Config's `params[2]`/`params[3]`, so this pins the
     /// wire `query_batch_snapshot → build_tm_phase → build_tm` — the plumbing whose absence
     /// was the reason the two skip rules could not be implemented at all.
     #[tokio::test]
@@ -1814,10 +1814,10 @@ mod tests {
         let too_small = p2wpkh(0x08);
         let now = now_ms();
 
-        // Config #14 = 40_000 sat: the 30_000-sat request is under the protocol minimum.
+        // params[3] = 40_000 sat: the 30_000-sat request is under the protocol minimum.
         fixture.min_peg_out_fbtc = Amount::from_sat(40_000);
-        // Config #13 = the fee the fixture requests pin, so they all clear the floor —
-        // isolating the #14 rule under test.
+        // params[2] = the fee the fixture requests pin, so they all clear the floor —
+        // isolating the params[3] rule under test.
         fixture.per_pegout_fee_floor = fixture.per_pegout_fee;
         fixture.pegouts.push(StaticPegOut {
             script_pubkey: payable.clone(),

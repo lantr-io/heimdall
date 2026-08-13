@@ -27,9 +27,14 @@ You need:
 | A host reachable from the internet | On one TCP port, for the SPO-to-SPO protocol. See [step 5](#5-make-your-endpoint-reachable). |
 | The bridge's deployment notes | Roughly twenty values identifying the bridge you are joining, from whoever deployed it. |
 
-You do **not** need a Bitcoin node. Heimdall posts Treasury Movements to Cardano and the
-watchtowers relay them to Bitcoin. `bitcoin.submit` stays `false`; a second broadcaster is not
-redundancy here, it is a way to publish a movement the Cardano side has not recorded.
+You do **not** need a Bitcoin node. Heimdall never *reads* Bitcoin at all — the treasury's
+outpoint and value come from the bridge-state singleton on Cardano — and it does not broadcast
+either: it posts Treasury Movements to Cardano and the watchtowers relay them to Bitcoin.
+
+`bitcoin.rpc_url` and `bitcoin.submit` exist for one reason, and `submit` defaults to `false`:
+they let a *test* deployment broadcast its own movement, which is how the end-to-end scenarios
+assert that a TM really spends its inputs. Leave them alone on a real node. A second broadcaster
+is not redundancy here — it is a way to publish a movement the Cardano side has not recorded.
 
 ---
 
@@ -122,31 +127,44 @@ the Config UTxO already knows. Step 4 checks what you typed against the chain, s
 caught at startup rather than by a failed transaction — but you still have to type them.
 
 **The registry and the ban list: usually nothing to type.** On a bridge deployed by
-`binocular deploy-bridge` at or after WI-068, the Config publishes the registry policy, the
-`treasury_info` policy and its state-NFT name (fields #21-#23) alongside the ban policy — so
-`registry_blueprint`, `registry_bootstrap` and `treasury_info_asset_name` are not needed either.
-Genesis mints both linked-list roots *before* the Config exists, so a bridge cannot exist without
-them; `heimdall bootstrap-registry` and `bootstrap-ban-list` are legacy, for bridges that predate
-that and for recovering a genesis that failed part-way.
+`binocular deploy-bridge` at or after WI-068, the Config publishes the ban policy (#8), the
+registry policy (#9) and the `treasury_info` policy (#10) — so `registry_blueprint`,
+`registry_bootstrap` and `treasury_info_asset_name` are not needed either. The `treasury_info`
+state NFT has no Config field: its name is the protocol constant `"BFRTRY"` ([CFG-4]), which is
+why `treasury_info_asset_name` is ignored on any bridge of this vintage. Genesis mints both
+linked-list roots *before* the Config exists, so a bridge cannot exist without them;
+`heimdall bootstrap-registry` and `bootstrap-ban-list` are legacy, for bridges that predate that
+and for recovering a genesis that failed part-way.
+
+> Field numbers here are the rev-5.5 datum: twelve fields, `params` nested at #1, identities at
+> #2-#11. Older notes number them differently — the datum was renumbered when `params` moved to
+> the front ([CFG-5]) — so trust `src/cardano/config_params.rs`, which is what actually parses it,
+> over any number written in prose.
 
 One thing the published ids do NOT cover: performing the DKG **key handoff** (Update-Y) spends the
 `treasury_info` state UTxO, and spending needs the compiled script rather than its hash. A node
-that does handoffs still needs a blueprint; what it derives is checked against the published #22,
+that does handoffs still needs a blueprint; what it derives is checked against the published #10,
 so a mismatch is a startup error instead of a handoff written where no one reads it.
 
 **The ban list specifically.** The eligible roster is the registry *minus* active bans,
 so a node that cannot read that list computes a different DKG participant set from everyone else —
 which is why the daemon refuses to start without one. But on a bridge whose Config publishes the
-ban policy (field #17), there is nothing to configure: the node reads the policy id from the
+ban policy (#8), there is nothing to configure: the node reads the policy id from the
 Config, and the ban script address follows from it. `show-config-params` prints the address it
 resolved, and startup step 6 names the source.
 
-Only on a bridge whose Config *predates* that field do you still copy `ban_bootstrap`,
-`fault_proof_policies` and the three `*_ban_*` schedule numbers from the deployment notes. Copy them
-exactly: they are inputs to the ban policy's own identifier, so a wrong value yields a valid-looking
-address holding an empty list — banned SPOs back in your roster with nothing in any log. On a bridge
-that *does* publish #17, leftover local keys are simply unused; if they happen to derive a different
-policy the daemon says so and stops rather than picking one.
+Only on a bridge whose Config *predates* that field do you still copy `ban_bootstrap` and
+`fault_proof_policies` from the deployment notes. Copy them exactly: they are inputs to the ban
+policy's own identifier, so a wrong value yields a valid-looking address holding an empty list —
+banned SPOs back in your roster with nothing in any log. On a bridge that *does* publish #8,
+leftover local keys are simply unused; if they happen to derive a different policy the daemon says
+so and stops rather than picking one.
+
+**Do not add the ban SCHEDULE to your config, on any bridge.** `base_ban_duration_ms`,
+`max_faults_before_permanent` and `max_validity_window_ms` under `[cardano]` are *refused*:
+heimdall names them and exits before it reads anything else, because a key that silently did
+nothing would leave you believing a value you typed was in force. They come from the Config's
+`params` on every bridge. Older deployment notes still list them — leave them out.
 
 **Secrets.** Two, and neither belongs in the TOML if you can avoid it:
 
@@ -217,13 +235,17 @@ dry run — it reads the chain and builds nothing.
 ```
 [1/8] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
 [2/8] cardano connectivity         PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
-[3/8] resolve the Config           PASS  2dce4027…#0 (24 fields, min_stake 0)
+[3/8] resolve the Config           PASS  2dce4027…#0 (12 fields, fee_rate 1 sat/vB)
 [4/8] verify the contract set      PASS  every configured contract identifier matches the Config UTxO
 [5/8] reference script             …
-[6/8] ban list                     PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (#17) (detection only)
+[6/8] ban list                     PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (detection only)
 [7/8] registration status          …
 [8/8] key handoff (Update-Y)       …
 ```
+
+Step 3's field count is the datum's, and **more than twelve is normal** — the Config grows by
+appending, and a reader decodes the twelve it knows and ignores the rest. Fewer than twelve is a
+bridge older than this build, and it fails.
 
 Step 4 is the one that earns its keep: it compares every contract identifier you typed against the
 Config UTxO on chain and names any that disagree, with both values. Step 6 confirms your roster is

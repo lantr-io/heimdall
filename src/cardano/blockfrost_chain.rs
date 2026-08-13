@@ -234,7 +234,7 @@ impl DkgFaultBanFlow {
         {
             return Err(format!(
                 "the fault-enforcement keys derive spo_bans policy {} but the bridge Config \
-                 publishes {} (field #17) — an ApplyBan built here would confirm into a ban \
+                 publishes {} (field #8) — an ApplyBan built here would confirm into a ban \
                  list no other SPO reads. Check cardano.ban_bootstrap, \
                  cardano.fault_proof_policies against this bridge — the schedule half comes \
                  from the Config itself (params[4..6]), so it cannot be what disagrees",
@@ -481,9 +481,9 @@ pub struct BlockfrostCardanoChain {
     /// `[cardano]`, kept so the federation identity can be RE-RESOLVED from the
     /// bridge Config on every roster read rather than pinned at startup.
     ///
-    /// The two fields above are what startup happened to see. Config #17 and
-    /// #21–#23 are chain state a governance Update can move, exactly like the
-    /// #12–#16 the batch snapshot re-reads every batch — so pinning them makes
+    /// The two fields above are what startup happened to see. Config #8 and
+    /// #9–#10 are chain state a governance Update can move, exactly like the
+    /// the `params` record the batch snapshot re-reads every batch — so pinning them makes
     /// two honest nodes disagree according to when each was last restarted, which
     /// is the divergence publishing them was supposed to end. `None` → nothing to
     /// refresh from (the fixture roster, or a Config predating the appends), and
@@ -838,7 +838,7 @@ impl BlockfrostCardanoChain {
 
     /// Locate the bridge Config UTxO (address + config NFT unit `policy_id ++ asset_name`).
     /// Its field #11 (initial_btc_treasury_utxo) anchors the Treasury Movement chain, and
-    /// its fields #12–#16 are the operational parameters every TM is built from.
+    /// its `params` record holds the operational parameters every TM is built from.
     pub fn with_config_utxo(mut self, address: &str, nft_unit: &str) -> Self {
         self.config_address = Some(address.to_string());
         self.config_nft_unit = Some(nft_unit.to_string());
@@ -897,7 +897,7 @@ impl BlockfrostCardanoChain {
         self
     }
 
-    /// Re-resolve the federation identity (Config #17, #21–#23) from the chain on
+    /// Re-resolve the federation identity (Config #8, #9–#10) from the chain on
     /// every roster read, instead of running forever on whatever startup saw.
     pub fn with_federation_refresh(mut self, cardano: crate::config::CardanoConfig) -> Self {
         self.federation_refresh = Some(cardano);
@@ -906,11 +906,11 @@ impl BlockfrostCardanoChain {
 
     /// The registry + ban sources AS OF NOW, re-read from the bridge Config.
     ///
-    /// The startup-resolved pair is the fallback, not the answer: #17 and #21–#23
+    /// The startup-resolved pair is the fallback, not the answer: #8 and #9–#10
     /// are chain state, and a node that pinned them at boot filters a different
     /// roster from a node booted after a governance Update — a divergence keyed on
     /// restart time, which no operator can see and no log records. The batch
-    /// snapshot already re-reads #12–#16 on the same reasoning.
+    /// snapshot already re-reads `params` on the same reasoning.
     ///
     /// Refreshing is skipped (and the pinned pair returned) when there is nothing
     /// to refresh from: no Config locator, or a Config that publishes neither
@@ -957,7 +957,7 @@ impl BlockfrostCardanoChain {
         .await
         .map_err(|e| {
             EpochError::Chain(format!(
-                "bridge Config (federation identity #17/#21-#23): {e}"
+                "bridge Config (federation identity #8/#9-#10): {e}"
             ))
         })?;
 
@@ -1475,7 +1475,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         epoch: u64,
         attempt: u32,
     ) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
-        // Re-read #17/#21-#23 rather than trusting the startup snapshot: this is
+        // Re-read #8/#9-#10 rather than trusting the startup snapshot: this is
         // the derivation whose inputs must be identical on every node, so it is
         // the last one that should run on a per-node copy of chain state.
         let (registry, bans) = self.current_federation().await?;
@@ -1662,7 +1662,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             warn!(
                 "[update-y] no treasury_info configured (cardano.registry_blueprint / \
                  registry_bootstrap / treasury_info_asset_name, or the Config's published \
-                 identity at #21-#23) — the derived group key stays LOCAL to this node and \
+                 identity at #9-#10) — the derived group key stays LOCAL to this node and \
                  the treasury is NOT handed over"
             );
             return Ok(None);
@@ -1755,7 +1755,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         let epoch_i64 = i64::try_from(plan.epoch)
             .map_err(|_| EpochError::Chain("epoch too large for Plutus Int".into()))?;
         // Spending the state UTxO needs the compiled script, not just the policy
-        // id the Config publishes (#22). A node reading the roster from the
+        // id the Config publishes (#10). A node reading the roster from the
         // published identity alone can still run every other phase, so say which
         // key is missing rather than failing at witness assembly.
         let treasury_script = registry.treasury_info_script.as_ref().ok_or_else(|| {

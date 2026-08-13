@@ -1,7 +1,7 @@
 //! The bridge **Config** UTxO, read off-chain (spec §Operational parameters).
 //!
 //! The Config UTxO is the NFT-authenticated singleton at `config.ak` that carries
-//! the bridge's wiring (script hashes, token identities) and — nested as field #14
+//! the bridge's wiring (script hashes, token identities) and — nested as field #1
 //! — the **operational parameters**: the tunables that no Aiken validator reads
 //! and every off-chain consumer must agree on. They are governance-updatable
 //! through an authorized Config `Update` (field #0, `update_auth`).
@@ -58,7 +58,7 @@
 //! `federation_csv_blocks` is `params[7]` and `pegin_refund_timeout_blocks`
 //! is `params[8]` ([CFG-9]).
 //!
-//! ## Why the policy ids are PUBLISHED rather than derived (#7, #11–#13)
+//! ## Why the policy ids are PUBLISHED rather than derived (#8–#10)
 //!
 //! Every other ban value an operator could type — the three schedule numbers, the
 //! fault-verifier policy set, the bootstrap outref — is an *input* to the
@@ -67,9 +67,9 @@
 //! derives a ban address no deployment has: a silently EMPTY ban list, and banned
 //! SPOs back in the roster with nothing in any log. Publishing the finished policy
 //! id breaks that cycle — a reader trusts the authenticated Config exactly as it
-//! already trusts the contract identifiers #1–#6, and needs no ban configuration
+//! already trusts the contract identifiers #2–#7, and needs no ban configuration
 //! whatsoever. A node that *does* still carry the local keys (for enforcement)
-//! cross-checks what it derives against #7 instead, so a stale copy is a startup
+//! cross-checks what it derives against #8 instead, so a stale copy is a startup
 //! error rather than an empty list.
 //!
 //! Gone from rev 5.1: `min_stake` (the register-spo R2 gate reads the local
@@ -112,7 +112,7 @@ pub struct ScheduleParams {
     pub stability_window: i64,
 }
 
-/// Config #14 — the nested operational-parameter record, positional:
+/// Config #1 — the nested operational-parameter record, positional:
 /// `[fee_rate_sat_per_vb, per_pegout_fee, min_peg_out_fbtc, schedule]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tunables {
@@ -161,16 +161,18 @@ pub const BRIDGED_TOKEN_ASSET_NAME: &[u8] = b"fSAT";
 pub const CONFIG_NFT_ASSET_NAME: &[u8] = b"BIFCFG";
 
 /// The `treasury_info` state NFT's asset name — the [CFG-4] protocol constant.
-/// Rev 5.5 removed Config #13, which carried it: uniqueness comes from the
+/// Rev 5.5 removed the Config field that carried it (#13 in that revision's
+/// numbering, before [CFG-5] renumbered the datum): uniqueness comes from the
 /// one-shot outpoint baked into the policy id, not from the name.
 pub const TREASURY_INFO_ASSET_NAME: &[u8] = b"BFRTRY";
 
-/// Config #7–#10 — the ban policy, published so no SPO has to configure one.
+/// Config #8 — the ban policy, published so no SPO has to configure one.
 ///
-/// Split by who needs what: #7 alone serves the MANDATORY read half (the roster
-/// is the registry minus active bans, so every node must read the same list), and
-/// #8–#10 serve the optional enforcement half — `apply_ban` computes a ban's end
-/// time from #8/#9 and bounds the ApplyBan validity interval by #10.
+/// One field, because that is all the MANDATORY read half needs: the roster is
+/// the registry minus active bans, so every node must read the same list, and the
+/// ban script address follows from the policy id alone. The enforcement half's
+/// three schedule numbers moved into `params[4..=6]` ([CFG-6] keeps identities
+/// top level and tunable numbers in `params`), where `apply_ban` reads them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BanParams {
     /// #8. The `spo_bans` policy id; the ban script address follows from it, so
@@ -180,7 +182,7 @@ pub struct BanParams {
     pub spo_bans_policy_id: [u8; 28],
 }
 
-/// Config #11–#13 — the SPO registry's identity, published for the same reason
+/// Config #9–#10 — the SPO registry's identity, published for the same reason
 /// as the ban policy: these are the values an SPO would otherwise hand-copy to
 /// locate the roster, and a wrong one yields a well-formed address holding
 /// nothing rather than an error.
@@ -188,7 +190,7 @@ pub struct BanParams {
 /// Same read/spend split as the ban policy. READING the roster needs only what
 /// is here — no blueprint and no bootstrap outref. SPENDING the `treasury_info`
 /// state UTxO (the Update-Y key handoff) still needs the compiled script, so a
-/// node that performs handoffs also needs the blueprint; #12 becomes the
+/// node that performs handoffs also needs the blueprint; #10 becomes the
 /// cross-check on what it derives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryParams {

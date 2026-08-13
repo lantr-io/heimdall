@@ -31,7 +31,7 @@
 use std::cmp::Ordering;
 
 /// The schedule geometry, in Cardano slots. Sourced from the Config datum's
-/// `schedule` (#16) — see [`crate::cardano::config_params::ScheduleParams`] — so
+/// `schedule` (`params[0]`) — see [`crate::cardano::config_params::ScheduleParams`] — so
 /// every SPO computes the same grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GridParams {
