@@ -665,9 +665,10 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             Status::Warn,
             "no compiled treasury_info script — if this node is elected leader the \
              Update-Y fails after a full DKG and the treasury is not handed over",
-            "set cardano.registry_blueprint and cardano.treasury_policy_id (treasury_info's \
-             two parameters). The derived hash is checked against the Config's #10, so a \
-             wrong one is refused rather than used",
+            "set cardano.treasury_bootstrap and cardano.config_nft_policy_id — treasury_info's \
+             two parameters, and the only ones left: the compiled code is embedded in this \
+             binary (WI-066). The derived hash is checked against the Config's #10, so a wrong \
+             one is refused rather than used",
         ),
     }
 

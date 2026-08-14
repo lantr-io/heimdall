@@ -303,10 +303,10 @@ often see one on:
 
 - **Step 4 (`reference script`)** warns when the registry reference script is not deployed at your
   wallet. That script is only needed to *register*; a running daemon reads the roster without it.
-- **Step 7 (`key handoff`)** warns when this node has no compiled `treasury_info` script. It still
-  runs DKG and signs — but if it is elected leader for an epoch, the Update-Y that hands the
+- **Step 7 (`key handoff`)** warns when this node cannot compile the `treasury_info` script. It
+  still runs DKG and signs — but if it is elected leader for an epoch, the Update-Y that hands the
   treasury to the new group key fails, and the handoff does not happen. Set
-  `cardano.registry_blueprint` to clear it.
+  `cardano.treasury_bootstrap` and `cardano.config_nft_policy_id` to clear it.
 - `protocol.state_dir is unset` is the one that silently costs money later.
 
 Do not continue until this passes.

@@ -189,14 +189,12 @@ stake_source = "blockfrost"
 # Set them ONLY for a bridge deployed before those fields existed (or for the
 # demo fixture roster, which sets none of them).
 #
-# One exception, and only if this node should perform the DKG key handoff:
-# spending the treasury_info state UTxO (Update-Y) needs the COMPILED script, not
-# just the policy id the Config publishes, so a handoff-capable node still sets
-# registry_blueprint. What it derives is checked against the published #10, so a
-# wrong blueprint is refused rather than used. Startup step 7 says which of the
-# two you are. Without it this node still runs DKG and signs; it just cannot be
-# the one that rotates the key.
-#registry_blueprint = "/var/lib/heimdall/plutus.json"
+# The contract blueprint is COMPILED INTO the binary (WI-066) and is not a key.
+# It is a build artifact of a contracts release, identical for every operator of
+# a given heimdall version — the opposite of a per-bridge value — and a stale
+# copy derived a policy id no deployment had, so the node read an empty registry
+# and said nothing. --blueprint overrides it for development, or for a bridge
+# built from a contracts release this heimdall predates.
 #registry_bootstrap = "<tx_hash>:<index>"
 
 # Ban list. LEAVE THIS UNSET on any bridge whose Config publishes the ban policy
