@@ -171,6 +171,40 @@ enum Commands {
         #[arg(long)]
         amount_sat: u64,
     },
+    /// Produce the four air-gapped registration values, on a machine that
+    /// touches no chain and no network (WI-092).
+    ///
+    /// `register-spo` accepts the cold and Bifrost signatures in place of the two
+    /// key files, so a pool's cold key never has to reach a networked block
+    /// producer — the key type exists for exactly that. Nothing could produce the
+    /// cold half, though: it is a RAW Ed25519 signature over the registration
+    /// message, `cardano-cli` has no raw-sign command, and the usual community
+    /// signer's CIP-8 mode signs a WRAPPED payload, so a signature made the
+    /// obvious way verifies nowhere and says nothing about why. This command is
+    /// the signer.
+    ///
+    /// Run it beside your cold key, copy the four printed flags to the node, and
+    /// pass them to `register-spo`. Both signatures are verified here before
+    /// printing, so a mistyped URL fails on the air-gapped machine rather than
+    /// after a fee is spent.
+    SignRegistration {
+        #[arg(long)]
+        config: Option<String>,
+        /// Pool cold SIGNING key: a `cold.skey` TextEnvelope, a path to one, or
+        /// raw 32-byte hex. Falls back to `cardano.cold_skey_path`.
+        #[arg(long)]
+        cold_skey: Option<String>,
+        /// Bifrost identity secret key: 32-byte hex or a path. Falls back to
+        /// `[bifrost].skey_path`.
+        #[arg(long)]
+        bifrost_skey: Option<String>,
+        /// This SPO's Bifrost endpoint URL. MUST be byte-identical to the
+        /// `--bifrost-url` given to `register-spo`: it is signed over, so any
+        /// difference — a trailing slash, a different port — invalidates both
+        /// signatures.
+        #[arg(long)]
+        bifrost_url: String,
+    },
     /// Print this node's Bifrost identity — the public half of
     /// `[bifrost].skey_path`. Read-only; touches no chain and no secret beyond
     /// reading the key file.
@@ -952,6 +986,58 @@ fn resolve_one_shot(cfg: &HeimdallConfig, arg: Option<&str>) -> Result<String, S
     Ok(view.params.federation_one_shot)
 }
 
+/// WI-092: the air-gapped half of `register-spo`, as a command that runs where
+/// the cold key lives.
+///
+/// Prints the four flags `register-spo` needs and nothing else, so the operator
+/// copies values rather than reproducing a signing scheme. Both signatures are
+/// verified here — the same check `spos_registry.ak` performs — so a wrong URL or
+/// a wrong key file fails on this machine, before a fee is spent on the other.
+fn run_sign_registration(
+    cfg: &HeimdallConfig,
+    cold_skey: Option<&str>,
+    bifrost_skey: Option<&str>,
+    bifrost_url: &str,
+) -> Result<(), String> {
+    use bitcoin::key::Secp256k1;
+    use bitcoin::secp256k1::Keypair;
+    use heimdall::cardano::register_spo::{sign_registration, verify_registration};
+    use pallas_crypto::key::ed25519;
+
+    let cold_src = cold_skey
+        .or(cfg.cardano.cold_skey_path.as_deref())
+        .ok_or("no cold key: pass --cold-skey or set cardano.cold_skey_path")?;
+    let cold = ed25519::SecretKey::from(parse_key32(cold_src, "--cold-skey")?);
+
+    let secp = Secp256k1::new();
+    let bifrost = match bifrost_skey {
+        Some(arg) => Keypair::from_seckey_slice(&secp, &parse_key32(arg, "--bifrost-skey")?)
+            .map_err(|e| format!("--bifrost-skey: {e}"))?,
+        None => cfg
+            .load_bifrost_keypair(&secp)
+            .map_err(|e| format!("no --bifrost-skey and [bifrost].skey_path: {e}"))?,
+    };
+
+    let sigs = sign_registration(&cold, &bifrost, bifrost_url.as_bytes());
+    let bifrost_id_pk = bifrost.x_only_public_key().0.serialize();
+    // The same verification spos_registry.ak runs. It cannot fail for keys this
+    // command just signed with, which is the point: if it ever does, the message
+    // construction here and there have diverged, and that must not reach a chain.
+    let pool_id = verify_registration(&sigs, &bifrost_id_pk, bifrost_url.as_bytes())
+        .map_err(|e| format!("self-check failed, refusing to print: {e}"))?;
+
+    println!("pool id:  {}", hex::encode(pool_id));
+    println!();
+    println!("Pass these to `register-spo` on the node, with the SAME --bifrost-url:");
+    println!();
+    println!("    --bifrost-url {bifrost_url} \\");
+    println!("    --cold-vkey {} \\", hex::encode(sigs.cold_vkey));
+    println!("    --cold-sig {} \\", hex::encode(sigs.cold_sig));
+    println!("    --bifrost-id-pk {} \\", hex::encode(bifrost_id_pk));
+    println!("    --bifrost-sig {}", hex::encode(sigs.bifrost_sig));
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     // Stashed before the match because `load_config` — which installs the
@@ -1055,6 +1141,23 @@ fn main() {
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_treasury_self_send(&cfg, &outpoint, amount_sat) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::SignRegistration {
+            config,
+            cold_skey,
+            bifrost_skey,
+            bifrost_url,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_sign_registration(
+                &cfg,
+                cold_skey.as_deref(),
+                bifrost_skey.as_deref(),
+                &bifrost_url,
+            ) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -4703,17 +4806,29 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     .map_err(|e| format!("parameterize spos_registry: {e}"))?;
 
     // ── identities: local secret keys, or the air-gapped halves ──
-    let cold_skey: Option<ed25519::SecretKey> = args
+    //
+    // `--cold-skey` falls back to `cardano.cold_skey_path`. There is no default
+    // location behind that: unset means the cold key is not on this machine,
+    // which is a legitimate state — the air-gapped halves below cover it — and
+    // not a setting someone forgot.
+    let cold_skey_src = args
         .cold_skey
         .as_deref()
+        .or(cfg.cardano.cold_skey_path.as_deref());
+    let cold_skey: Option<ed25519::SecretKey> = cold_skey_src
         .map(|arg| parse_key32(arg, "--cold-skey").map(ed25519::SecretKey::from))
         .transpose()?;
     let cold_vkey: [u8; 32] = match (&cold_skey, args.cold_vkey.as_deref()) {
         (Some(sk), None) => sk.public_key().into(),
-        (None, Some(vk)) => parse_hex_n(vk, "--cold-vkey")?,
+        // parse_key32, not raw hex: pool-cold.vkey is a Cardano TextEnvelope, so
+        // requiring hex here made the operator slice `cborHex` past its 5820
+        // prefix by hand — while --cold-skey accepted the file directly. A wrong
+        // slice yields a wrong pool_id, i.e. a well-formed registration for a
+        // pool that is not theirs.
+        (None, Some(vk)) => parse_key32(vk, "--cold-vkey")?,
         (Some(sk), Some(vk)) => {
             let derived: [u8; 32] = sk.public_key().into();
-            if parse_hex_n::<32>(vk, "--cold-vkey")? != derived {
+            if parse_key32(vk, "--cold-vkey")? != derived {
                 return Err("--cold-vkey does not match --cold-skey".into());
             }
             derived
@@ -7213,6 +7328,36 @@ mod tests {
         assert_eq!(parse_hex_n::<2>("a1b2", "x").unwrap(), [0xa1, 0xb2]);
         assert!(parse_hex_n::<2>("a1", "x").is_err());
         assert!(parse_hex_n::<2>("zz", "x").is_err());
+    }
+
+    /// WI-092: what `sign-registration` prints must be what `register-spo`
+    /// accepts, and the binding must be to THIS url. The self-check inside the
+    /// command cannot catch a divergence between the two sides on its own — it
+    /// signs and verifies with one message builder — so this pins the property
+    /// the operator actually depends on: signatures made for one url do not
+    /// verify for another, which is why the guide says byte-identical.
+    #[test]
+    fn air_gapped_signatures_verify_and_are_bound_to_the_url() {
+        use bitcoin::key::Secp256k1;
+        use bitcoin::secp256k1::Keypair;
+        use heimdall::cardano::register_spo::{sign_registration, verify_registration};
+        use pallas_crypto::key::ed25519;
+
+        let secp = Secp256k1::new();
+        let cold = ed25519::SecretKey::from([0x11u8; 32]);
+        let bifrost = Keypair::from_seckey_slice(&secp, &[0x22u8; 32]).unwrap();
+        let id_pk = bifrost.x_only_public_key().0.serialize();
+        let url = b"http://spo1.example.com:18500";
+
+        let sigs = sign_registration(&cold, &bifrost, url);
+        assert!(verify_registration(&sigs, &id_pk, url).is_ok());
+
+        // A trailing slash is a different url, and therefore a different message.
+        let slashed = b"http://spo1.example.com:18500/";
+        assert!(
+            verify_registration(&sigs, &id_pk, slashed).is_err(),
+            "signatures must not carry over to a different --bifrost-url"
+        );
     }
 
     #[test]

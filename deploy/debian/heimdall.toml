@@ -146,6 +146,17 @@ poll_interval_ms = 5000
 # variable. Left commented, the seed never enters a dpkg-tracked file.
 #mnemonic = ""
 
+# Path to this pool's Ed25519 COLD signing key, used by `register-spo` (and
+# revocation) when --cold-skey is not given. A Cardano TextEnvelope file
+# (pool-cold.skey) is accepted as-is; so is raw 32-byte hex.
+#
+# NO DEFAULT, deliberately. Unset does not mean "look in the usual place" — it
+# means the cold key is not on this machine, which is the state a careful
+# operator is in. The cold key signs registration and revocation and nothing
+# else, and the daemon never reads it under any flag.
+#cold_skey_path = "/etc/heimdall/pool-cold.skey"
+
+
 # Where the treasury movement is posted. Keep true: posting to the Cardano oracle
 # is how a movement reaches the watchtowers. 0 = post as Unconfirmed (a watchtower
 # marks it Confirmed later, after Bitcoin confirmations and oracle aging).

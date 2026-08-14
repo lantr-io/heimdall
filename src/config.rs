@@ -371,6 +371,20 @@ pub struct CardanoConfig {
     pub socket_path: Option<String>,
     pub network_magic: Option<u64>,
     pub mnemonic: Option<String>,
+    /// Path to this pool's Ed25519 COLD signing key, used by `register-spo`
+    /// (and revocation) when `--cold-skey` is not given.
+    ///
+    /// NO default, deliberately. The cold key's whole design is minimal exposure
+    /// — registration and revocation, nothing else — and heimdall can register
+    /// without it ever being on this machine at all (`--cold-vkey` +
+    /// `--cold-sig`, signed elsewhere). A well-known default path would make the
+    /// weaker route the normal one, and a default that RESOLVED would mean
+    /// heimdall silently signing with a key nobody named in this file.
+    ///
+    /// Unset therefore means "the cold key is not on this machine", which is the
+    /// state a careful operator is in, not a missing setting. The daemon never
+    /// reads it under any flag — only an explicit one-shot command does.
+    pub cold_skey_path: Option<String>,
     /// register_spo R2 min-stake threshold (lovelace). A registering pool's
     /// `active_stake` must be `>=` this to build register_spo / join the DKG
     /// candidate set. `None` → no gate configured.
@@ -473,6 +487,7 @@ impl Default for CardanoConfig {
             socket_path: None,
             network_magic: None,
             mnemonic: None,
+            cold_skey_path: None,
             min_stake_lovelace: None,
             stake_source: None,
             demo_exclude_unstaked: false,

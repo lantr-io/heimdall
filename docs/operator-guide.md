@@ -392,7 +392,24 @@ Nothing to copy: the script stays key-locked at your own wallet address, and the
 for it there. If you keep a reference script somewhere else — at another address of yours, or
 another SPO's — pass it as `--registry-ref <tx_hash>:<index>` and that is used instead.
 
-**2. Register.**
+**2. Register.** This step binds two keys together, and they are not the same kind of thing:
+
+- **your pool cold key** — the Cardano stake pool key you already have. Nothing bridge-specific and
+  nothing to generate: it is what `cardano-cli node key-gen --cold-verification-key-file cold.vkey
+  --cold-signing-key-file cold.skey --operational-certificate-issue-counter-file cold.counter`
+  produced when you created the pool, and it lives wherever you keep your pool's cold material. Your
+  pool ID *is* its hash, which is why it is the only key that can speak for your pool. If you need
+  the background, it is standard stake-pool operations material and not something this document
+  defines — see the Cardano Developer Portal's operator handbook,
+  <https://developers.cardano.org/docs/operators/>, whose pool-registration page
+  (<https://developers.cardano.org/docs/operators/block-producer/register-stake-pool/>) is where
+  `cold.vkey` / `cold.skey` come from and states the same thing this guide does: they live on your
+  air-gapped machine.
+- **your Bifrost identity key** — the new one from step 3, at `[bifrost].skey_path`. Every protocol
+  operation after this uses it, and it stays on this machine.
+
+Registration is the cold key signing *"this pool authorizes this Bifrost identity"*. That is the
+whole purpose of the step, and the only time the cold key is used.
 
 ```bash
 sudo -u heimdall heimdall register-spo \
@@ -403,7 +420,24 @@ sudo -u heimdall heimdall register-spo \
     --submit
 ```
 
-It prints which reference script it picked, so you can see it found the one step 1 made:
+`--cold-skey` takes the `cold.skey` file as cardano-cli wrote it — a TextEnvelope — or raw 32-byte
+hex. It can come from the config file instead, as `cardano.cold_skey_path`; there is no default
+location, and unset does not mean "look in the usual place", it means the cold key is not on this
+machine.
+
+**Check the pool ID it prints before you submit.** The command derives your pool ID from the cold
+key you gave it and prints it:
+
+```
+pool id:           <hex> (pool1...)
+```
+
+That must equal your pool's real ID — `cardano-cli stake-pool id --cold-verification-key-file
+cold.vkey --output-format hex`, or the ID on your pool's page. If it does not, you pointed at the wrong file, and what
+you are about to register is a Bifrost identity for a pool that is not yours. Nothing later catches
+this: the transaction is well formed, it just speaks for someone else.
+
+It also prints which reference script it picked, so you can see it found the one step 1 made:
 
 ```
 registry ref:      <tx_hash>#0 (discovered at this wallet)
@@ -419,9 +453,42 @@ port is the port your daemon will bind.
 Submission is gated on a minimum-stake check against your pool's epoch-snapshot active stake. If it
 fails, the command prints the dry-run transaction and refuses — it will not submit.
 
-Your cold key is used only here. For an air-gapped pool, omit `--cold-skey` and `--bifrost-skey`;
-the command prints the exact message to sign and takes `--cold-vkey`/`--cold-sig` and
-`--bifrost-id-pk`/`--bifrost-sig` on the next run.
+Your cold key is used only here, and by revocation. The daemon never reads it.
+
+**Keeping the cold key off this machine.** Preferred, and the reason the key type exists: the cold
+key signs registration and revocation and nothing else, so it has no business on a networked block
+producer. Sign beside the key instead, and carry four public values across.
+
+On the machine that holds `cold.skey`:
+
+```bash
+heimdall sign-registration \
+    --cold-skey /path/to/cold.skey \
+    --bifrost-skey /path/to/bifrost.skey \
+    --bifrost-url http://<your-host>:<your-port>
+```
+
+It touches no chain and no network. It prints the pool ID it derived — check that against your pool
+before going further — and then the four flags to copy:
+
+```
+    --bifrost-url http://<your-host>:<your-port> \
+    --cold-vkey <64 hex> \
+    --cold-sig <128 hex> \
+    --bifrost-id-pk <64 hex> \
+    --bifrost-sig <128 hex>
+```
+
+Pass those to `register-spo` on the node in place of `--cold-skey` and `--bifrost-skey`. The
+`--bifrost-url` must be **byte-identical** in both commands: it is signed over, so a trailing slash
+or a different port silently invalidates both signatures. `sign-registration` verifies them before
+printing — the same check the on-chain validator performs — so a mistake fails beside your cold key
+rather than after a fee is spent.
+
+Do not try to produce these signatures with a general-purpose signing tool. The cold half is a raw
+Ed25519 signature over exact bytes, and the usual community signer's CIP-8 mode signs a *wrapped*
+payload — different bytes, so the result verifies nowhere and nothing tells you why.
+
 
 **3. Confirm you are in the roster.**
 
