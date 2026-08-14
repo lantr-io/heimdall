@@ -342,7 +342,7 @@ enum Commands {
         /// still be unspent when the registry linked list itself is bootstrapped
         /// later — pick a wallet UTxO that will be left alone until then.
         #[arg(long)]
-        registry_bootstrap: String,
+        registry_bootstrap: Option<String>,
         /// 32-byte x-only key seeded into current_spos_frost_key. In Phase 1 this
         /// is Y_federation (the federation is the key-path signer until the first
         /// DKG), so it normally equals the Config's #11 y_federation.
@@ -378,7 +378,7 @@ enum Commands {
         /// <cardano_tx_hash>:<index>. Must still be an unspent wallet UTxO,
         /// and the same value that parameterized bootstrap-treasury-info.
         #[arg(long)]
-        registry_bootstrap: String,
+        registry_bootstrap: Option<String>,
         /// Actually submit via Blockfrost (default: build + print only).
         #[arg(long)]
         submit: bool,
@@ -395,9 +395,13 @@ enum Commands {
         /// predates; the embedded copy is the normal path.
         #[arg(long)]
         blueprint: Option<String>,
-        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        /// The federation one-shot outpoint (<tx_hash>:<index>) every federation
+        /// script is compile-parameterized by. OPTIONAL since WI-090: the bridge
+        /// publishes it at Config #12 and a node reads it from there. Pass it only
+        /// for a genesis command that runs before the Config exists, or to build
+        /// against a bridge whose Config this node is not reading.
         #[arg(long)]
-        registry_bootstrap: String,
+        registry_bootstrap: Option<String>,
         /// Actually submit via Blockfrost (default: build + print only).
         #[arg(long)]
         submit: bool,
@@ -414,9 +418,13 @@ enum Commands {
         /// predates; the embedded copy is the normal path.
         #[arg(long)]
         blueprint: Option<String>,
-        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        /// The federation one-shot outpoint (<tx_hash>:<index>) every federation
+        /// script is compile-parameterized by. OPTIONAL since WI-090: the bridge
+        /// publishes it at Config #12 and a node reads it from there. Pass it only
+        /// for a genesis command that runs before the Config exists, or to build
+        /// against a bridge whose Config this node is not reading.
         #[arg(long)]
-        registry_bootstrap: String,
+        registry_bootstrap: Option<String>,
         /// Which fault verifier: `round1` | `round2` | `equivocation`.
         #[arg(long)]
         kind: String,
@@ -437,9 +445,13 @@ enum Commands {
         /// predates; the embedded copy is the normal path.
         #[arg(long)]
         blueprint: Option<String>,
-        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        /// The federation one-shot outpoint (<tx_hash>:<index>) every federation
+        /// script is compile-parameterized by. OPTIONAL since WI-090: the bridge
+        /// publishes it at Config #12 and a node reads it from there. Pass it only
+        /// for a genesis command that runs before the Config exists, or to build
+        /// against a bridge whose Config this node is not reading.
         #[arg(long)]
-        registry_bootstrap: String,
+        registry_bootstrap: Option<String>,
         /// The ban-list one-shot bootstrap output ref (<tx_hash>:<index>).
         #[arg(long)]
         ban_bootstrap: String,
@@ -474,9 +486,13 @@ enum Commands {
         /// predates; the embedded copy is the normal path.
         #[arg(long)]
         blueprint: Option<String>,
-        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        /// The federation one-shot outpoint (<tx_hash>:<index>) every federation
+        /// script is compile-parameterized by. OPTIONAL since WI-090: the bridge
+        /// publishes it at Config #12 and a node reads it from there. Pass it only
+        /// for a genesis command that runs before the Config exists, or to build
+        /// against a bridge whose Config this node is not reading.
         #[arg(long)]
-        registry_bootstrap: String,
+        registry_bootstrap: Option<String>,
         /// The ban-list one-shot bootstrap output ref (<tx_hash>:<index>).
         #[arg(long)]
         ban_bootstrap: String,
@@ -514,7 +530,7 @@ enum Commands {
         /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
         /// that parameterizes the registry policy (and through it treasury_info).
         #[arg(long)]
-        registry_bootstrap: String,
+        registry_bootstrap: Option<String>,
         /// Pool cold signing key: 32-byte hex, or a path to a file holding that
         /// hex or a cardano-cli TextEnvelope (cborHex "5820" || 32 bytes).
         /// Omit for the air-gapped flow (--cold-vkey + --cold-sig).
@@ -571,7 +587,7 @@ enum Commands {
         /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
         /// that parameterizes the registry policy (and through it treasury_info).
         #[arg(long)]
-        registry_bootstrap: String,
+        registry_bootstrap: Option<String>,
         /// The incoming roster's x-only Y_51' (32-byte hex) — the new key.
         #[arg(long)]
         new_key: String,
@@ -616,7 +632,7 @@ enum Commands {
         /// The spos_registry one-shot bootstrap outref (<tx_hash>:<index>) —
         /// its policy hash is a spo_bans parameter.
         #[arg(long)]
-        registry_bootstrap: String,
+        registry_bootstrap: Option<String>,
         /// The spo_bans one-shot bootstrap outref (<tx_hash>:<index>). Must be an
         /// unspent wallet UTxO, and should match cardano.ban_bootstrap (the value
         /// apply-ban reads to re-derive the same ban policy).
@@ -647,9 +663,13 @@ enum Commands {
         /// predates; the embedded copy is the normal path.
         #[arg(long)]
         blueprint: Option<String>,
-        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        /// The federation one-shot outpoint (<tx_hash>:<index>) every federation
+        /// script is compile-parameterized by. OPTIONAL since WI-090: the bridge
+        /// publishes it at Config #12 and a node reads it from there. Pass it only
+        /// for a genesis command that runs before the Config exists, or to build
+        /// against a bridge whose Config this node is not reading.
         #[arg(long)]
-        registry_bootstrap: String,
+        registry_bootstrap: Option<String>,
         /// The accused pool id (28-byte hex).
         #[arg(long)]
         accused_pool_id: String,
@@ -682,7 +702,7 @@ enum Commands {
         /// fault_verifier policy is parameterized by the registry policy id (the
         /// EquivocationProof branch references registration nodes).
         #[arg(long)]
-        registry_bootstrap: String,
+        registry_bootstrap: Option<String>,
         /// Captured DKG evidence JSON file. Invalid-payload evidence must
         /// include the Halo2 proof bytes expected by the verifier policy.
         #[arg(long)]
@@ -908,6 +928,30 @@ fn resolve_bridge_contracts(
         .map_err(|e| e.to_string())
 }
 
+/// The federation one-shot outpoint for a one-shot CLI command: the explicit
+/// flag when given, otherwise Config #12.
+///
+/// The flag stays for the two cases the chain cannot serve — a GENESIS command
+/// that runs before the Config exists, and building against a bridge whose
+/// Config this node is not reading — but it is no longer something an operator
+/// types for ordinary work (WI-090).
+fn resolve_one_shot(cfg: &HeimdallConfig, arg: Option<&str>) -> Result<String, String> {
+    if let Some(s) = arg {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Ok(s.to_string());
+        }
+    }
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    let view = rt.block_on(config_view_async(cfg))?.ok_or(
+        "--registry-bootstrap was not given and there is no bridge Config to read it from. \
+         It is Config #12 since WI-090: set cardano.config_address and \
+         cardano.config_nft_policy_id, or pass the outpoint explicitly — which is what a \
+         genesis command does, since it runs before the Config exists",
+    )?;
+    Ok(view.params.federation_one_shot)
+}
+
 fn main() {
     let cli = Cli::parse();
     // Stashed before the match because `load_config` — which installs the
@@ -1107,7 +1151,7 @@ fn main() {
             if let Err(e) = run_bootstrap_treasury_info(
                 &cfg,
                 blueprint.as_deref(),
-                &registry_bootstrap,
+                registry_bootstrap.as_deref(),
                 &frost_key,
                 identity_root.as_deref(),
                 submit,
@@ -1123,9 +1167,12 @@ fn main() {
             submit,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) =
-                run_bootstrap_registry(&cfg, blueprint.as_deref(), &registry_bootstrap, submit)
-            {
+            if let Err(e) = run_bootstrap_registry(
+                &cfg,
+                blueprint.as_deref(),
+                registry_bootstrap.as_deref(),
+                submit,
+            ) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1137,9 +1184,12 @@ fn main() {
             submit,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) =
-                run_deploy_registry_ref(&cfg, blueprint.as_deref(), &registry_bootstrap, submit)
-            {
+            if let Err(e) = run_deploy_registry_ref(
+                &cfg,
+                blueprint.as_deref(),
+                registry_bootstrap.as_deref(),
+                submit,
+            ) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1155,7 +1205,7 @@ fn main() {
             if let Err(e) = run_deploy_fault_ref(
                 &cfg,
                 blueprint.as_deref(),
-                &registry_bootstrap,
+                registry_bootstrap.as_deref(),
                 &kind,
                 submit,
             ) {
@@ -1177,7 +1227,7 @@ fn main() {
             if let Err(e) = run_deploy_spo_bans_ref(
                 &cfg,
                 blueprint.as_deref(),
-                &registry_bootstrap,
+                registry_bootstrap.as_deref(),
                 &ban_bootstrap,
                 base_ban_duration_ms,
                 max_faults_before_permanent,
@@ -1203,7 +1253,7 @@ fn main() {
             if let Err(e) = run_init_scripts(
                 &cfg,
                 blueprint.as_deref(),
-                &registry_bootstrap,
+                registry_bootstrap.as_deref(),
                 &ban_bootstrap,
                 base_ban_duration_ms,
                 max_faults_before_permanent,
@@ -1289,7 +1339,7 @@ fn main() {
             if let Err(e) = run_bootstrap_ban_list(
                 &cfg,
                 blueprint.as_deref(),
-                &registry_bootstrap,
+                registry_bootstrap.as_deref(),
                 &ban_bootstrap,
                 (
                     base_ban_duration_ms,
@@ -3278,7 +3328,7 @@ fn parse_cardano_outref(s: &str) -> Result<([u8; 32], u32), String> {
 fn run_bootstrap_treasury_info(
     cfg: &HeimdallConfig,
     blueprint_path: Option<&str>,
-    registry_bootstrap: &str,
+    registry_bootstrap: Option<&str>,
     frost_key: &str,
     identity_root: Option<&str>,
     submit: bool,
@@ -3294,6 +3344,7 @@ fn run_bootstrap_treasury_info(
     let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
+    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     // Rev 5.5 derivation order: Config → treasury → registry ([PRE-3], [PRE-4]).
     let (treasury_bootstrap, config_policy_id) =
@@ -3486,7 +3537,7 @@ fn finish_tx(
 fn run_bootstrap_registry(
     cfg: &HeimdallConfig,
     blueprint_path: Option<&str>,
-    registry_bootstrap: &str,
+    registry_bootstrap: Option<&str>,
     submit: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
@@ -3500,6 +3551,7 @@ fn run_bootstrap_registry(
     let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
+    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
         heimdall::cardano::roster::treasury_derivation_inputs(
@@ -3573,7 +3625,7 @@ fn run_bootstrap_registry(
 fn run_bootstrap_ban_list(
     cfg: &HeimdallConfig,
     blueprint_path: Option<&str>,
-    registry_bootstrap: &str,
+    registry_bootstrap: Option<&str>,
     ban_bootstrap: &str,
     schedule_flags: (Option<i64>, Option<i64>, Option<i64>),
     submit: bool,
@@ -3594,6 +3646,7 @@ fn run_bootstrap_ban_list(
     // The ban policy is parameterized by the registry hash + the fault-policy
     // set + ban schedule + its own one-shot outref. Everything but the outref is
     // config-pinned (shared with apply-ban) so the derived policy id matches.
+    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
         heimdall::cardano::roster::treasury_derivation_inputs(
@@ -3741,7 +3794,7 @@ fn run_bootstrap_ban_list(
 fn run_deploy_registry_ref(
     cfg: &HeimdallConfig,
     blueprint_path: Option<&str>,
-    registry_bootstrap: &str,
+    registry_bootstrap: Option<&str>,
     submit: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
@@ -3755,6 +3808,7 @@ fn run_deploy_registry_ref(
     let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
+    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
         heimdall::cardano::roster::treasury_derivation_inputs(
@@ -3825,7 +3879,7 @@ fn run_deploy_registry_ref(
 fn run_deploy_fault_ref(
     cfg: &HeimdallConfig,
     blueprint_path: Option<&str>,
-    registry_bootstrap: &str,
+    registry_bootstrap: Option<&str>,
     kind: &str,
     submit: bool,
 ) -> Result<(), String> {
@@ -3839,6 +3893,7 @@ fn run_deploy_fault_ref(
     use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
+    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
         heimdall::cardano::roster::treasury_derivation_inputs(
@@ -3917,7 +3972,7 @@ fn run_deploy_fault_ref(
 fn run_deploy_spo_bans_ref(
     cfg: &HeimdallConfig,
     blueprint_path: Option<&str>,
-    registry_bootstrap: &str,
+    registry_bootstrap: Option<&str>,
     ban_bootstrap: &str,
     base_ban_duration_ms: i64,
     max_faults_before_permanent: i64,
@@ -3934,6 +3989,7 @@ fn run_deploy_spo_bans_ref(
     use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
+    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
         heimdall::cardano::roster::treasury_derivation_inputs(
@@ -4027,7 +4083,7 @@ fn run_deploy_spo_bans_ref(
 fn run_init_scripts(
     cfg: &HeimdallConfig,
     blueprint_path: Option<&str>,
-    registry_bootstrap: &str,
+    registry_bootstrap: Option<&str>,
     ban_bootstrap: &str,
     base_ban_duration_ms: i64,
     max_faults_before_permanent: i64,
@@ -4052,6 +4108,7 @@ fn run_init_scripts(
     // ids from the blueprint rather than reading cfg.fault_proof_policies, so
     // the credential we register cannot drift from the one ApplyBan withdraws.
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
+    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
         heimdall::cardano::roster::treasury_derivation_inputs(
@@ -4216,7 +4273,7 @@ fn run_init_scripts(
 /// register-spo CLI inputs, bundled (clap hands us a dozen options).
 struct RegisterSpoArgs {
     blueprint: Option<String>,
-    registry_bootstrap: String,
+    registry_bootstrap: Option<String>,
     cold_skey: Option<String>,
     cold_vkey: Option<String>,
     cold_sig: Option<String>,
@@ -4231,7 +4288,7 @@ struct RegisterSpoArgs {
 /// apply-ban CLI inputs.
 struct ApplyBanArgs {
     blueprint: Option<String>,
-    registry_bootstrap: String,
+    registry_bootstrap: Option<String>,
     accused_pool_id: String,
     evidence_hash: String,
     fault_kind: String,
@@ -4242,7 +4299,7 @@ struct ApplyBanArgs {
 /// fault-proof-mint CLI inputs.
 struct FaultProofMintArgs {
     blueprint: Option<String>,
-    registry_bootstrap: String,
+    registry_bootstrap: Option<String>,
     evidence_file: String,
     submit: bool,
 }
@@ -4622,10 +4679,11 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
         heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(&args.registry_bootstrap),
+            &cfg.cardano.with_one_shot(&registry_bootstrap),
         )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
@@ -4867,12 +4925,10 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
                      The ~12 KB registry script is needed for both the spend and the mint of \
                      this transaction, and embedding it twice exceeds the 16 KB limit, so it \
                      must be on chain first:\n\
-                     \x20 heimdall deploy-registry-ref --config <file> \
-                     --registry-bootstrap {} --submit\n\
+                     \x20 heimdall deploy-registry-ref --config <file> --submit\n\
                      (~55 ADA, reclaimable — it stays key-locked at this wallet, and this \
                      command then finds it on its own).\n\
                      If one is already deployed elsewhere, pass it as --registry-ref <txid:ix>.",
-                    args.registry_bootstrap,
                 )
             })?;
             println!("registry ref:      {found} (discovered at this wallet)");
@@ -4933,7 +4989,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
 
 struct UpdateYArgs {
     blueprint: Option<String>,
-    registry_bootstrap: String,
+    registry_bootstrap: Option<String>,
     new_key: String,
     epoch: u64,
     signer_skey: Option<String>,
@@ -4967,10 +5023,11 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
         heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(&args.registry_bootstrap),
+            &cfg.cardano.with_one_shot(&registry_bootstrap),
         )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
@@ -5139,10 +5196,11 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
         heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(&args.registry_bootstrap),
+            &cfg.cardano.with_one_shot(&registry_bootstrap),
         )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
@@ -5356,10 +5414,11 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
     let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
         heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(&args.registry_bootstrap),
+            &cfg.cardano.with_one_shot(&registry_bootstrap),
         )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
