@@ -35,7 +35,6 @@ y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 treasury_txid = "478b7ae50b71603aca16c97d3ee974f98e4ecc55b875fe34fe3cd6afc97f1317"
 treasury_vout = 0
 treasury_amount_sat = 9999887
-submit = false           # never broadcast — this is an offline demo
 
 [http]
 bind_address = "127.0.0.1"

@@ -1020,6 +1020,29 @@ mod tests {
         assert_eq!(cfg.cardano.network.as_deref(), Some("preprod"));
     }
 
+    /// Every config file COMMITTED to this repo must still load.
+    ///
+    /// Three of them had been unloadable since WI-086 retired `bitcoin.submit`,
+    /// and nothing noticed — a retired key is refused at load, so a config that
+    /// still sets one is not "slightly stale", it does not start at all. The
+    /// files are examples operators copy, so shipping a broken one teaches the
+    /// wrong thing at the worst moment.
+    #[test]
+    fn every_committed_config_still_loads() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for rel in [
+            "heimdall.toml",
+            "heimdall.localdkg.toml",
+            "heimdall.testnet4.toml",
+            "deploy/debian/heimdall.toml",
+        ] {
+            let path = root.join(rel);
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            HeimdallConfig::from_toml_str(&text)
+                .unwrap_or_else(|e| panic!("{rel} does not load:\n{e}"));
+        }
+    }
+
     #[test]
     fn empty_toml_uses_defaults() {
         let cfg: HeimdallConfig = toml::from_str("").unwrap();
