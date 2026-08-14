@@ -1935,7 +1935,9 @@ async fn run_demo(
                         match heimdall::cardano::blockfrost_chain::DkgFaultBanFlow::from_config(
                             &cfg.cardano,
                             bridge_config.as_ref().map(|v| &v.params),
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(Some(flow)) => {
                                 info!("automatic DKG fault banning: enabled");
                                 bf_chain = bf_chain.with_dkg_fault_ban_flow(flow);

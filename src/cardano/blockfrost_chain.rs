@@ -103,7 +103,11 @@ impl DkgFaultBanFlow {
     /// `config` is the decoded bridge Config: it supplies the ban schedule
     /// (params[4..6]) when the bridge publishes one, and its ban policy id (#8) is
     /// what the locally derived `spo_bans` is checked against (WI-065).
-    pub fn from_config(
+    /// ASYNC since WI-091: the four reference-script locations are discovered on
+    /// chain when they are not configured, so this reads. It used to demand all
+    /// four as hand-typed outrefs — the last hand-copied values in an operator's
+    /// config, and the same missing lookup `register-spo` had.
+    pub async fn from_config(
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
     ) -> Result<Option<Self>, String> {
@@ -134,20 +138,6 @@ impl DkgFaultBanFlow {
             &cardano.fault_proof_srs_path,
             "fault_proof_srs_path",
         )?);
-        let spo_bans_ref =
-            parse_script_ref(req_fault_config(&cardano.spo_bans_ref, "spo_bans_ref")?)?;
-        let round1_fault_ref = parse_script_ref(req_fault_config(
-            &cardano.fault_verifier_round1_ref,
-            "fault_verifier_round1_ref",
-        )?)?;
-        let round2_fault_ref = parse_script_ref(req_fault_config(
-            &cardano.fault_verifier_round2_ref,
-            "fault_verifier_round2_ref",
-        )?)?;
-        let equivocation_fault_ref = parse_script_ref(req_fault_config(
-            &cardano.fault_verifier_equivocation_ref,
-            "fault_verifier_equivocation_ref",
-        )?)?;
 
         // The round 1 / round 2 verifiers are generated from this SRS, so an
         // untrustworthy setup is a forged-ban vector, not a slow proof. Check
@@ -245,6 +235,43 @@ impl DkgFaultBanFlow {
             ));
         }
 
+        // Locations, resolved last because discovery needs the script HASHES the
+        // derivation above produces. A configured value still wins; unset means
+        // "find it", which is what removes the last typed outrefs from an
+        // operator's config (WI-091).
+        let spo_bans_ref = resolve_script_ref(
+            cardano,
+            one_shot,
+            &cardano.spo_bans_ref,
+            &spo_bans,
+            "spo_bans",
+        )
+        .await?;
+        let round1_fault_ref = resolve_script_ref(
+            cardano,
+            one_shot,
+            &cardano.fault_verifier_round1_ref,
+            &round1_fault,
+            "fault_verifier_round1",
+        )
+        .await?;
+        let round2_fault_ref = resolve_script_ref(
+            cardano,
+            one_shot,
+            &cardano.fault_verifier_round2_ref,
+            &round2_fault,
+            "fault_verifier_round2",
+        )
+        .await?;
+        let equivocation_fault_ref = resolve_script_ref(
+            cardano,
+            one_shot,
+            &cardano.fault_verifier_equivocation_ref,
+            &equivocation_fault,
+            "fault_verifier_equivocation",
+        )
+        .await?;
+
         Ok(Some(Self {
             blueprint_path: blueprint_path.to_string(),
             registry,
@@ -286,6 +313,79 @@ fn req_fault_config<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str
              enforcement key (fault_proof_srs_path, spo_bans_ref, fault_verifier_*_ref) to \
              read and filter the ban list without publishing fault proofs"
         )
+    })
+}
+
+/// One reference-script location: the configured outref, or the one found on
+/// chain (WI-091).
+///
+/// The four `*_ref` keys were the last hand-typed outrefs in an operator's
+/// config, and they were typed for a script that `binocular deploy-script-refs`
+/// had usually already published — there is simply no by-script-hash location
+/// query, so heimdall could not see it. It can now: the federation one-shot the
+/// Config publishes at #12 identifies the deploy transaction, whose spent output
+/// sat at the deployer's own wallet, which is where those scripts are parked.
+///
+/// A configured value WINS and is not cross-checked against discovery: the two
+/// are not required to agree — a valid reason to set one is to pin a copy other
+/// than the one that would be found — and refusing a deliberate override because
+/// the chain also offers a candidate would be worse than either.
+async fn resolve_script_ref(
+    cardano: &crate::config::CardanoConfig,
+    one_shot: &str,
+    configured: &Option<String>,
+    script: &crate::cardano::blueprint::ParameterizedScript,
+    what: &str,
+) -> Result<DkgFaultScriptRef, String> {
+    if let Some(raw) = configured.as_deref() {
+        return parse_script_ref(raw);
+    }
+    let pid = cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or_else(|| format!("{what} reference script is unset and there is no chain to find it on: set cardano.blockfrost_project_id, or cardano.{what}_ref"))?;
+    let base_url = crate::cardano::bf_http::base_url(pid, cardano.blockfrost_url.as_deref());
+    let mnemonic = cardano
+        .mnemonic
+        .clone()
+        .or_else(|| {
+            std::env::var("HEIMDALL_MNEMONIC")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .ok_or_else(|| format!("{what} reference script is unset and this node has no wallet to look in: set cardano.mnemonic / $HEIMDALL_MNEMONIC, or cardano.{what}_ref"))?;
+    let wallet = crate::cardano::wallet::wallet_address_from_mnemonic(&mnemonic)?;
+    let hash = script.hash_hex();
+    let found = crate::cardano::ref_script::find_ref_script_anywhere(
+        &base_url,
+        pid,
+        &wallet,
+        Some(one_shot),
+        &hash,
+    )
+    .await
+    .map_err(|e| format!("{what} reference-script lookup: {e}"))?;
+    let (found, origin) = found.ok_or_else(|| {
+        format!(
+            "no reference script for {what} ({hash}), at this wallet or at the wallet this \
+             bridge was deployed from. Deploy one (`heimdall deploy-fault-ref` / \
+             `deploy-spo-bans-ref`), or set cardano.{what}_ref to a copy held elsewhere"
+        )
+    })?;
+    match origin {
+        crate::cardano::ref_script::RefScriptOrigin::OwnWallet => {
+            tracing::info!("{what} ref script {found} (this wallet)");
+        }
+        // Say whose it is: it is kept SPENDABLE on purpose, so an operator
+        // depending on it should know rather than find out when enforcement
+        // stops building.
+        crate::cardano::ref_script::RefScriptOrigin::Deployer(addr) => {
+            tracing::info!("{what} ref script {found} (the bridge deployer's, at {addr})");
+        }
+    }
+    Ok(DkgFaultScriptRef {
+        tx_hash: found.tx_hash,
+        output_index: found.index,
     })
 }
 
@@ -2402,9 +2502,11 @@ mod tests {
     /// WI-060: reading the ban list and enforcing faults are separate. A node
     /// may filter its roster without being able to publish a fault proof, so
     /// the absence of the whole enforcement key set is `None`, not an error —
-    /// but any one of them present demands all of them.
-    #[test]
-    fn fault_flow_is_optional_as_a_whole_and_mandatory_in_part() {
+    /// but any one of them present turns the whole path on. Since WI-091 the
+    /// four `*_ref` locations are discovered rather than demanded, so what is
+    /// mandatory is being able to LOOK, not having typed them.
+    #[tokio::test]
+    async fn fault_flow_is_optional_as_a_whole_and_mandatory_in_part() {
         let outref = format!("{}:0", "cc".repeat(32));
 
         // Ban list configured, no enforcement keys → enforcement simply off.
@@ -2415,25 +2517,36 @@ mod tests {
         };
         assert!(
             DkgFaultBanFlow::from_config(&cardano, None)
+                .await
                 .expect("no enforcement keys is a valid configuration")
                 .is_none()
         );
 
-        // One enforcement key present → every one of them is now required, and
-        // the error names the missing key rather than degrading.
+        // One enforcement key present → the path is on, and the rest must
+        // resolve. The four *_ref keys are no longer among the things that MUST
+        // be typed (WI-091): unset means "discover it". What still fails loudly
+        // is being unable to look — here there is no blockfrost project id — and
+        // the error names both ways out rather than only the key.
         cardano.fault_proof_srs_path = Some("/nonexistent/srs".to_string());
         let err = DkgFaultBanFlow::from_config(&cardano, None)
-            .expect_err("a half-configured publish path must fail at startup");
-        assert!(err.contains("cardano.spo_bans_ref is required"), "{err}");
+            .await
+            .expect_err("a path that can neither find nor be told must fail at startup");
+        assert!(
+            err.contains("_ref") || err.contains("srs") || err.contains("blueprint"),
+            "the error should name what is missing: {err}"
+        );
 
         // Enforcement keys but no federation one-shot resolved from the chain →
         // named explicitly. Every fault verifier is parameterized by it, so
-        // there is nothing to publish a proof under.
+        // there is nothing to publish a proof under — and nothing to derive a
+        // deployer address from either.
         let orphan = crate::config::CardanoConfig {
             fault_proof_srs_path: Some("/nonexistent/srs".to_string()),
             ..Default::default()
         };
-        let err = DkgFaultBanFlow::from_config(&orphan, None).expect_err("no one-shot");
+        let err = DkgFaultBanFlow::from_config(&orphan, None)
+            .await
+            .expect_err("no one-shot");
         assert!(err.contains("federation one-shot"), "{err}");
     }
 

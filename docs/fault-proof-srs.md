@@ -111,10 +111,9 @@ contracts repo.
 
 **Swapping the SRS is a redeploy, not a file swap.** New constants change the
 compiled validators, so the script hashes change, so the policy IDs change. That
-means: publish new reference scripts, update `cardano.fault_verifier_round1_ref`
-and `cardano.fault_verifier_round2_ref` in every config, update any on-chain
-Config that names those policies, and re-run the `FaultProof` end-to-end check on
-chain. Budget for it.
+means: publish new reference scripts — heimdall discovers those, so there is no
+per-operator key to update — then update any on-chain Config that names those
+policies, and re-run the `FaultProof` end-to-end check on chain. Budget for it.
 
 Note also that this repo reads an SRS as `SerdeFormat::Processed` while
 `plutus-halo2-verifier-gen`'s own `read_params` uses `SerdeFormat::RawBytesUnchecked`.
