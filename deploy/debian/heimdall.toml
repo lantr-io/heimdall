@@ -208,11 +208,16 @@ stake_source = "blockfrost"
 # why the daemon refuses to start with the registry keys set and no ban list from
 # either source.
 #
-# Set these ONLY for a bridge deployed before #17 existed, and then copy them
-# exactly from the deployment notes: each is an input to the ban policy's own
+# Set ban_bootstrap ONLY for a bridge deployed before #8 existed, copying it
+# exactly from the deployment notes: it is an input to the ban policy's own
 # identifier, so one wrong value derives a valid-looking address holding no bans
-# at all. On that route the registry keys above are required too — the ban policy
-# is parameterized by the registry policy.
+# at all.
+#
+# fault_proof_policies is DERIVED (WI-066) — each id is hash(verifier code ++
+# registry policy), and heimdall has both. Leave it unset. Setting it still
+# overrides, for a bridge whose verifiers came from other contracts, but the
+# list is checked against what this build derives and a stale copy is refused
+# rather than used.
 #ban_bootstrap = "<tx_hash>:<index>"
 #fault_proof_policies = ["<28-byte hex>", "<28-byte hex>", "<28-byte hex>"]
 
