@@ -369,10 +369,15 @@ daemon.** Do it now, before enabling the service.
 Every command below prints the transaction and stops unless you add `--submit`. Run each without
 `--submit` first and read what it is about to do.
 
-**1. Deploy the registry reference script.** The registry script is ~12 KB and would not fit in the
-registration transaction twice, so it goes on chain once and is referenced. Both commands below
-compile that script from the outpoint the bridge publishes at Config #12, so there is nothing about
-it to type.
+**1. Deploy the registry reference script — only if your bridge has none.** The registry script is
+~12 KB and would not fit in the registration transaction twice, so it goes on chain once and is
+referenced. Both commands below compile that script from the outpoint the bridge publishes at Config
+#12, so there is nothing about it to type.
+
+Try step 2 first. `register-spo` looks for the script at your wallet and then at the wallet the
+bridge was deployed from — whoever ran `binocular deploy-script-refs` published it there for the
+whole bridge, and finding it means you deploy nothing and lock no ADA. It prints which one it used.
+Run this command only if it reports finding neither.
 
 ```bash
 sudo -u heimdall heimdall deploy-registry-ref \
@@ -443,9 +448,14 @@ It also prints which reference script it picked, so you can see it found the one
 registry ref:      <tx_hash>#0 (discovered at this wallet)
 ```
 
-If step 1 was skipped, this command stops before building anything and prints the
-`deploy-registry-ref` line to run — it does not build a transaction that would be too large to
-submit.
+If no reference script exists anywhere it can see, this command stops before building anything and
+prints the `deploy-registry-ref` line to run — it does not build a transaction that would be too
+large to submit.
+
+If it reports the deployer's copy rather than your own, note what you are depending on: that UTxO
+sits at their wallet and is deliberately kept spendable, so they can reclaim it. Nothing breaks
+retroactively — your registration is already on chain — but a later `register-spo` or `apply-ban`
+would have to fall back to deploying your own.
 
 `--bifrost-url` is what step 5 was about: it is published on chain, peers fetch from it, and its
 port is the port your daemon will bind.

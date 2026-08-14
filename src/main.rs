@@ -4832,6 +4832,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
     use heimdall::cardano::publish::WalletUtxo;
     use heimdall::cardano::ref_script::find_ref_script;
+    use heimdall::cardano::ref_script::{RefScriptOrigin, find_ref_script_anywhere};
     use heimdall::cardano::register_spo::{
         RegisterSpoRequest, RegistrationSignatures, build_register_spo_tx, pool_id_from_cold_vkey,
         registration_message, verify_registration,
@@ -5098,9 +5099,24 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         }
         None => {
             let hash = registry.hash_hex();
-            let found = find_ref_script(&wallet_raw, &hash).ok_or_else(|| {
+            // Look at this wallet first, then at the wallet the bridge was
+            // deployed from (WI-091). `deploy-script-refs` already published this
+            // script there for the whole bridge, so an SPO who finds it needs no
+            // deploy step and locks no ADA. The deployer's address is derived
+            // from the Config-published one-shot, not handed over by anyone.
+            let found = rt
+                .block_on(find_ref_script_anywhere(
+                    &base_url,
+                    pid,
+                    &wallet_addr,
+                    Some(&registry_bootstrap),
+                    &hash,
+                ))
+                .map_err(|e| format!("reference-script lookup: {e}"))?;
+            let (found, origin) = found.ok_or_else(|| {
                 format!(
-                    "no reference script for the registry ({hash}) at {wallet_addr}.\n\
+                    "no reference script for the registry ({hash}), at {wallet_addr} or at the \
+                     wallet this bridge was deployed from.\n\
                      The ~12 KB registry script is needed for both the spend and the mint of \
                      this transaction, and embedding it twice exceeds the 16 KB limit, so it \
                      must be on chain first:\n\
@@ -5110,7 +5126,21 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
                      If one is already deployed elsewhere, pass it as --registry-ref <txid:ix>.",
                 )
             })?;
-            println!("registry ref:      {found} (discovered at this wallet)");
+            match &origin {
+                RefScriptOrigin::OwnWallet => {
+                    println!("registry ref:      {found} (discovered at this wallet)");
+                }
+                RefScriptOrigin::Deployer(addr) => {
+                    // Say whose it is. It is kept SPENDABLE on purpose, so the
+                    // deployer can reclaim it and break this path for everyone
+                    // relying on it — an operator should know they depend on it
+                    // rather than discover it when a registration stops building.
+                    println!("registry ref:      {found} (the bridge deployer's, at {addr})");
+                    println!(
+                        "                   nothing to deploy — but that UTxO is theirs to spend"
+                    );
+                }
+            }
             Some(found.outref())
         }
     };
