@@ -46,6 +46,80 @@ impl fmt::Display for RefScriptUtxo {
     }
 }
 
+/// The address the bridge was deployed from, derived from the federation
+/// one-shot (WI-091).
+///
+/// `one_shot` is `<txid>:<index>` — Config #12 since WI-090 — and the deploy
+/// transaction SPENT that outpoint, so output `index` of `txid` sat at the
+/// deployer's own wallet. That is also where `binocular deploy-script-refs`
+/// parks the bridge's shared reference scripts, at an address it deliberately
+/// keeps spendable so the ADA can be reclaimed if the bridge is decommissioned.
+///
+/// This is what removes the last hand-copied value from an SPO's setup: no
+/// outpoint is handed over and nothing is typed, because the node already reads
+/// the one-shot from the chain.
+///
+/// Caveat, and it fails safe: this assumes `deploy-bridge` and
+/// `deploy-script-refs` ran from one wallet, which is true of the single-config
+/// flow. If they did not, the scan finds nothing — exactly the behaviour of a
+/// node that never looked — and the operator can still deploy their own copy.
+pub async fn deployer_address(
+    base_url: &str,
+    project_id: &str,
+    one_shot: &str,
+) -> Result<String, String> {
+    // parse_outref, not a hand-rolled split: it also checks the hash is 32
+    // bytes. A bare `split_once` accepted ":0" and went on to request
+    // `/txs//utxos`, turning a malformed value into a network error that reads
+    // like "the bridge has no reference scripts".
+    let (tx_id, index) = crate::cardano::roster::parse_outref(one_shot)
+        .map_err(|e| format!("federation one-shot: {e}"))?;
+    bf_http::fetch_tx_output_address(base_url, project_id, &hex::encode(tx_id), index).await
+}
+
+/// Find `script_hash`'s reference script at `wallet`, then — failing that — at
+/// the address the bridge was deployed from.
+///
+/// The second lookup is the point: `deploy-script-refs` already published these
+/// for the whole bridge, so an SPO who finds one there deploys nothing and locks
+/// no ADA. `Ok(None)` still means "nowhere we can see", which leaves the
+/// deploy-your-own path intact.
+pub async fn find_ref_script_anywhere(
+    base_url: &str,
+    project_id: &str,
+    wallet: &str,
+    one_shot: Option<&str>,
+    script_hash: &str,
+) -> Result<Option<(RefScriptUtxo, RefScriptOrigin)>, String> {
+    if let Some(found) = wallet_ref_script(base_url, project_id, wallet, script_hash).await? {
+        return Ok(Some((found, RefScriptOrigin::OwnWallet)));
+    }
+    let Some(one_shot) = one_shot else {
+        return Ok(None);
+    };
+    let deployer = deployer_address(base_url, project_id, one_shot).await?;
+    // A deployer who registers their own pool is their own wallet; do not report
+    // the same UTxO twice under a different name.
+    if deployer == wallet {
+        return Ok(None);
+    }
+    Ok(
+        wallet_ref_script(base_url, project_id, &deployer, script_hash)
+            .await?
+            .map(|u| (u, RefScriptOrigin::Deployer(deployer))),
+    )
+}
+
+/// Where a reference script was found, so the caller can say so — the two are
+/// not equivalent to an operator. One is theirs and reclaimable by them; the
+/// other is the deployer's, kept spendable on purpose, and can be reclaimed out
+/// from under every SPO relying on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefScriptOrigin {
+    OwnWallet,
+    Deployer(String),
+}
+
 /// Pick the UTxO carrying `script_hash` as its reference script.
 ///
 /// Split from the query so it is testable without a node. Script hashes are
@@ -151,5 +225,33 @@ mod tests {
             index: 1,
         };
         assert_eq!(r.to_string(), format!("{}#1", "77".repeat(32)));
+    }
+
+    /// WI-091: the deployer's address is derived from the one-shot, so a
+    /// malformed one must be a named error and never a silent "not found" —
+    /// that would read as "no reference script anywhere" and send the operator
+    /// to deploy a duplicate.
+    #[tokio::test]
+    async fn a_malformed_one_shot_is_an_error_not_an_empty_result() {
+        for bad in ["deadbeef", "deadbeef:", ":0", "deadbeef:notanumber"] {
+            let e = deployer_address("http://127.0.0.1:1", "pid", bad)
+                .await
+                .expect_err("must not resolve");
+            assert!(
+                e.contains("one-shot"),
+                "{bad} should name the one-shot: {e}"
+            );
+        }
+    }
+
+    /// The origins are not interchangeable to an operator: one UTxO is theirs,
+    /// the other is the deployer's and deliberately spendable by them. Keep them
+    /// distinguishable rather than collapsing to "found".
+    #[test]
+    fn the_two_origins_are_distinguishable() {
+        assert_ne!(
+            RefScriptOrigin::OwnWallet,
+            RefScriptOrigin::Deployer("addr_test1xyz".into())
+        );
     }
 }

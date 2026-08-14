@@ -180,6 +180,55 @@ pub async fn fetch_latest_block_slot_time(
     Ok((slot, time))
 }
 
+/// The address that OWNED output `index` of `tx_hash`, from `/txs/{hash}/utxos`.
+///
+/// Used to find the wallet a bridge was deployed from (WI-091). The federation
+/// one-shot is `<txid>:<ix>`, and the deploy transaction SPENT that outpoint —
+/// so output `ix` of `txid` sat at the deployer's own address, which is also
+/// where `deploy-script-refs` parks the shared reference scripts. There is no
+/// by-script-hash location query, so this is how a node finds them without being
+/// told an outpoint by a human.
+pub async fn fetch_tx_output_address(
+    base_url: &str,
+    project_id: &str,
+    tx_hash: &str,
+    index: u32,
+) -> Result<String, String> {
+    let url = format!("{base_url}/txs/{tx_hash}/utxos");
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("txs/{tx_hash}/utxos request: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("txs/{tx_hash}/utxos json: {e}"))?;
+    let outputs = v
+        .get("outputs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("txs/{tx_hash}/utxos: no `outputs` array"))?;
+    // Match on the reported output_index rather than trusting array order: the
+    // wrong output yields a well-formed address holding no reference script,
+    // which reads as "nothing deployed" instead of as an error.
+    outputs
+        .iter()
+        .find(|o| {
+            o.get("output_index")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|i| i == u64::from(index))
+        })
+        .and_then(|o| o.get("address"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "txs/{tx_hash}/utxos: no output #{index} (tx has {})",
+                outputs.len()
+            )
+        })
+}
+
 /// The POSIX block-time (seconds) of the Cardano tx `tx_hash`, from `/txs/{hash}`.
 /// The age of an Unconfirmed TM UTxO = chain-now − this.
 pub async fn fetch_tx_block_time(
