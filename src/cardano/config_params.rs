@@ -91,6 +91,11 @@ use tracing::{info, warn};
 /// legal evolution, so a reader accepts MORE fields and refuses fewer.
 pub const CONFIG_FIELDS: usize = 12;
 
+/// Slots of the nested `params` record ([`Tunables`]) this build knows. Like
+/// [`CONFIG_FIELDS`], a MINIMUM: the record evolves by appending, so a Config
+/// carrying more is read by a reader that ignores the extras.
+pub const CONFIG_PARAMS_FIELDS: usize = 9;
+
 /// `params[3]` — the tunable protocol schedule, E-relative slot values (spec
 /// §TM batches and the protocol schedule).
 ///
@@ -531,9 +536,15 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
 
     let params =
         plutus::constr_fields(&fields[1], 0).map_err(|e| format!("config #1 (params): {e}"))?;
-    if params.len() != 9 {
+    // Append-tolerant, exactly like the top-level `field_count` guard above and
+    // for the same reason: the nested record evolves by APPENDING, so a reader
+    // accepts MORE slots than it knows and refuses fewer. It used to demand
+    // EXACTLY nine, which would have made the next tunable break every deployed
+    // reader — the failure the positional getters exist to prevent on the Aiken
+    // side, reintroduced here.
+    if params.len() < CONFIG_PARAMS_FIELDS {
         return Err(format!(
-            "config #1 (params) has {} slots, expected 9 \
+            "config #1 (params) has {} slots, expected >= {CONFIG_PARAMS_FIELDS} \
              [schedule, fee_rate, per_pegout_fee, min_peg_out_fbtc, base_ban_duration_ms, \
              max_faults_before_permanent, max_validity_window_ms, federation_csv_blocks, \
              pegin_refund_timeout_blocks]",
@@ -1097,8 +1108,11 @@ mod tests {
         assert!(err.contains("predates"), "{err}");
     }
 
-    /// The nested params record's arity is exact: a fifth slot is a layout this
-    /// reader does not know, and half a record is a botched Update.
+    /// The nested params record is append-tolerant in one direction only: FEWER
+    /// slots than this build knows is a stale deployment and is refused, MORE is
+    /// a Config newer than this build and is read by ignoring the extras. The
+    /// asymmetry is the whole point — it is what lets a tunable be appended
+    /// without breaking every deployed reader.
     #[test]
     fn a_params_record_with_the_wrong_arity_is_rejected() {
         // A rev-5.4-shaped params record (4 slots) inside an otherwise valid
@@ -1121,7 +1135,21 @@ mod tests {
             ],
         ))
         .unwrap_err();
-        assert!(err.contains("expected 9"), "{err}");
+        assert!(err.contains("expected >= 9"), "{err}");
+    }
+
+    /// …and the other direction: a params record with a slot this build has
+    /// never heard of decodes fine, reading the nine it knows.
+    #[test]
+    fn a_params_record_grown_past_this_build_still_decodes() {
+        let full = config_datum(7, 1_000, 100_000);
+        let mut fields = plutus::constr_fields(&full, 0).unwrap().to_vec();
+        let mut params = plutus::constr_fields(&fields[1], 0).unwrap().to_vec();
+        params.push(int(999)); // a tunable appended after this build shipped
+        fields[1] = constr(0, params);
+        let parsed = parse_config_datum(&constr(0, fields)).expect("extra slots are ignored");
+        assert_eq!(parsed.tunables.fee_rate_sat_per_vb, 7);
+        assert_eq!(parsed.tunables.pegin_refund_timeout_blocks, 720);
     }
 
     /// A wrong-width script hash at #4/#5 is a wrong VALUE, not a shorter one.
@@ -1230,10 +1258,7 @@ mod tests {
                 vec![],
                 change,
                 params,
-                &Freshness {
-                    now_ms: 0,
-                    margin_ms: 0,
-                },
+                &Freshness::inert(),
                 &crate::bitcoin::tm_builder::FixedCpoRoot([0u8; 32]),
                 &crate::bitcoin::tm_builder::FixedSpiRoot([0u8; 32]),
             )

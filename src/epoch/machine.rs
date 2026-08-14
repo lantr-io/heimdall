@@ -1262,11 +1262,6 @@ async fn build_tm_phase(
         })
         .collect();
 
-    // The freshness margin is the one selection input that stays node-local: the
-    // spec makes it heimdall's own bound on the signed-but-unconfirmed race, not a
-    // Config tunable. `now_ms` it compares against is the snapshot's chain time.
-    let pegout_freshness_margin_ms = config.pegout_freshness_margin.as_millis() as i64;
-
     let unsigned = build_tm(
         TreasuryInput {
             outpoint: treasury.outpoint,
@@ -1277,10 +1272,10 @@ async fn build_tm_phase(
         pegout_requests,
         change_script,
         &snapshot.tm_params,
-        &Freshness {
-            now_ms: snapshot.now_ms,
-            margin_ms: pegout_freshness_margin_ms,
-        },
+        // The margin is a protocol constant, not a per-node setting (WI-071);
+        // `now_ms` is the snapshot's CHAIN time, so every co-signer classifies a
+        // borderline request identically.
+        &Freshness::at(snapshot.now_ms),
         &cpo_trie,
         &spi_trie,
     )

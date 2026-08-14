@@ -371,10 +371,7 @@ mod tests {
             vec![],
             treasury_spk,
             &TmParams::fee_rate_only(1),
-            &Freshness {
-                now_ms: 0,
-                margin_ms: 0,
-            },
+            &Freshness::inert(),
             &crate::cardano::cpo_trie::CpoTrie::empty(),
             &crate::cardano::spi_trie::SpiTrie::empty(),
         )

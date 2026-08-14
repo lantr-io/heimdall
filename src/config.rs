@@ -186,14 +186,6 @@ pub struct ProtocolConfig {
     /// the trie is rebuilt as empty on every start, which is correct only on a
     /// bridge that has completed no peg-outs — set this in any real deployment.
     pub state_dir: Option<String>,
-    /// Peg-out freshness margin (ms): a peg-out is payable only while at least
-    /// this far from its cancel deadline (`created + 30 days`). Paying one later
-    /// lets the owner take the BTC and then Cancel for the fBTC, so the treasury
-    /// pays twice. Default 7 days.
-    ///
-    /// MUST match across SPOs — it is a TM skip rule, and a divergent skip rule
-    /// produces divergent TM bytes and a failed FROST round.
-    pub pegout_freshness_margin_ms: u64,
 }
 
 impl Default for ProtocolConfig {
@@ -216,7 +208,6 @@ impl Default for ProtocolConfig {
             // 30-day cancel deadline before the TM confirms, even after a long
             // Bitcoin fee-market stall; small enough that a request stays payable
             // for most of its life.
-            pegout_freshness_margin_ms: 7 * 24 * 3600 * 1000,
         }
     }
 }
@@ -651,6 +642,16 @@ impl Default for DemoConfig {
 pub type RetiredKey = (&'static str, &'static str, &'static str);
 
 const RETIRED_KEYS: &[RetiredKey] = &[
+    // WI-071: a TM SELECTION rule, so it decides the TM bytes — two operators on
+    // different values freeze different peg-out sets and their FROST round never
+    // converges, with neither log able to say why. It is compiled in until the
+    // Config publishes it.
+    (
+        "protocol",
+        "pegout_freshness_margin_ms",
+        "the compiled-in PEG_OUT_FRESHNESS_MARGIN_MS (7 days) — a TM selection rule is not an \
+         operator setting",
+    ),
     // WI-070: the bridge's own identifiers. Every one was an operator-typed copy
     // of a Config field, and a copy that can disagree is the whole defect — a
     // mistyped script hash yields a well-formed address holding nothing, which
@@ -814,9 +815,6 @@ impl HeimdallConfig {
                 .state_dir
                 .as_deref()
                 .map(std::path::PathBuf::from),
-            pegout_freshness_margin: Duration::from_millis(
-                self.protocol.pegout_freshness_margin_ms,
-            ),
             // Only ever used if it turns out to BE the treasury's current key —
             // i.e. the bootstrap handoff. See `EpochConfig::y_fed_seed`.
             y_fed_seed: self
@@ -909,9 +907,10 @@ impl std::fmt::Display for ConfigError {
             Self::RetiredKeys(keys) => {
                 writeln!(
                     f,
-                    "this config sets {} key(s) the bridge Config now publishes. They are \
-                     refused rather than ignored, because a key that silently does nothing \
-                     leaves you believing a value you typed is in force:",
+                    "this config sets {} key(s) that no longer exist. They are refused rather \
+                     than ignored, because a key that silently does nothing leaves you \
+                     believing a value you typed is in force. Each is followed by what \
+                     replaced it:",
                     keys.len()
                 )?;
                 for (section, key, replacement) in keys {
@@ -919,12 +918,12 @@ impl std::fmt::Display for ConfigError {
                 }
                 write!(
                     f,
-                    "Delete them. Each names a value the bridge publishes in one \
-                     NFT-authenticated UTxO, and a second copy is not a convenience: it can \
-                     disagree, and a disagreement here is silent — the wrong script hash names \
-                     an address that holds nothing, which reads exactly like a bridge with no \
-                     pending work. `heimdall show-config-params` prints what this node resolves \
-                     from the chain"
+                    "Delete them. Each held a value every node must agree on, so a per-operator \
+                     copy was never a convenience: it can disagree, and disagreement here is \
+                     SILENT — a wrong contract identifier names an address that holds nothing \
+                     (which reads exactly like a bridge with no pending work), and a wrong \
+                     selection rule makes co-signers freeze different sets and never converge. \
+                     `heimdall show-config-params` prints what this node resolves from the chain"
                 )
             }
         }
@@ -961,8 +960,8 @@ mod tests {
         }
     }
 
-    /// WI-070: the bridge's own identifiers are refused too, each naming the
-    /// Config field that supersedes it.
+    /// WI-070/WI-071: the bridge's own identifiers, and the peg-out selection
+    /// rule, are refused too — each naming what supersedes it.
     ///
     /// Refusing rather than ignoring is the whole point. These decide which
     /// ADDRESSES the node scans, and a stale copy does not fail — it finds
@@ -991,6 +990,27 @@ mod tests {
                 "the diagnostic must name the key and what replaced it: {rendered}"
             );
         }
+    }
+
+    /// WI-071's key is in `[protocol]`, and what replaced it is a compiled-in
+    /// constant rather than a Config field — so this also pins that the refusal
+    /// is section-aware and does not claim everything is published.
+    #[test]
+    fn the_retired_freshness_margin_is_refused_and_names_the_constant() {
+        let err = HeimdallConfig::from_toml_str("[protocol]\npegout_freshness_margin_ms = 1\n")
+            .expect_err("a retired key must be refused, not ignored");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("pegout_freshness_margin_ms"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("PEG_OUT_FRESHNESS_MARGIN_MS"),
+            "{rendered}"
+        );
+        // The same key name under another section is NOT this key.
+        HeimdallConfig::from_toml_str("[cardano]\npegout_freshness_margin_ms = 1\n")
+            .expect("a stray key in another section is not the retired one");
     }
 
     /// ...and a config that sets none of them still loads.
