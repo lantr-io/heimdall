@@ -117,16 +117,19 @@ impl DkgFaultBanFlow {
         if enforcement_keys.iter().all(|k| k.is_none()) {
             return Ok(None);
         }
-        let Some(ban_bootstrap) = cardano.ban_bootstrap.as_deref() else {
+        let Some(one_shot) = cardano.federation_one_shot.as_deref() else {
             return Err(
-                "cardano.ban_bootstrap is required to publish a fault proof and apply a ban: \
-                 the spo_bans policy is parameterized by its bootstrap outref"
+                "the federation one-shot has not been read from the chain: publishing a fault \
+                 proof and applying a ban both need it, because spo_bans and the three fault \
+                 verifiers are all parameterized by it. It is Config #12 since WI-090, so set \
+                 cardano.config_address and cardano.config_nft_policy_id"
                     .to_string(),
             );
         };
+        // One outpoint parameterizes the registry, the ban list and the three
+        // fault verifiers alike — see `CardanoConfig::federation_one_shot`.
+        let (ban_bootstrap, registry_bootstrap) = (one_shot, one_shot);
         let blueprint_path = req_fault_config(&cardano.registry_blueprint, "registry_blueprint")?;
-        let registry_bootstrap =
-            req_fault_config(&cardano.registry_bootstrap, "registry_bootstrap")?;
         let srs_path = PathBuf::from(req_fault_config(
             &cardano.fault_proof_srs_path,
             "fault_proof_srs_path",
@@ -2406,9 +2409,8 @@ mod tests {
 
         // Ban list configured, no enforcement keys → enforcement simply off.
         let mut cardano = crate::config::CardanoConfig {
-            ban_bootstrap: Some(outref.clone()),
+            federation_one_shot: Some(outref.clone()),
             registry_blueprint: Some("plutus.json".to_string()),
-            registry_bootstrap: Some(outref.clone()),
             ..Default::default()
         };
         assert!(
@@ -2424,13 +2426,15 @@ mod tests {
             .expect_err("a half-configured publish path must fail at startup");
         assert!(err.contains("cardano.spo_bans_ref is required"), "{err}");
 
-        // Enforcement keys without a ban list bootstrap → named explicitly.
+        // Enforcement keys but no federation one-shot resolved from the chain →
+        // named explicitly. Every fault verifier is parameterized by it, so
+        // there is nothing to publish a proof under.
         let orphan = crate::config::CardanoConfig {
             fault_proof_srs_path: Some("/nonexistent/srs".to_string()),
             ..Default::default()
         };
-        let err = DkgFaultBanFlow::from_config(&orphan, None).expect_err("no ban bootstrap");
-        assert!(err.contains("cardano.ban_bootstrap is required"), "{err}");
+        let err = DkgFaultBanFlow::from_config(&orphan, None).expect_err("no one-shot");
+        assert!(err.contains("federation one-shot"), "{err}");
     }
 
     fn op(txid: u8, vout: u32) -> OutPoint {

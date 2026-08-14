@@ -3297,7 +3297,9 @@ fn run_bootstrap_treasury_info(
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     // Rev 5.5 derivation order: Config → treasury → registry ([PRE-3], [PRE-4]).
     let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(registry_bootstrap),
+        )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     let treasury = treasury_info_script(
         &blueprint_json,
@@ -3500,7 +3502,9 @@ fn run_bootstrap_registry(
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(registry_bootstrap),
+        )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
     let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
@@ -3592,7 +3596,9 @@ fn run_bootstrap_ban_list(
     // config-pinned (shared with apply-ban) so the derived policy id matches.
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(registry_bootstrap),
+        )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
     let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
@@ -3603,17 +3609,18 @@ fn run_bootstrap_ban_list(
     )
     .map_err(|e| format!("parameterize spos_registry: {e}"))?;
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
-    // apply-ban derives the ban policy id from `cardano.ban_bootstrap`. If config
-    // pins a different outref than the one bootstrapped here, `ban-root` is minted
+    // apply-ban derives the ban policy id from the one-shot the Config publishes
+    // at #12. If a different outref is bootstrapped here, `ban-root` is minted
     // under a policy apply-ban never queries — fail loudly instead of silently
     // bootstrapping an unreachable list.
-    if let Some(cfg_ban) = cfg.cardano.ban_bootstrap.as_deref() {
+    if let Some(cfg_ban) = cfg.cardano.federation_one_shot.as_deref() {
         let (cfg_tx_id, cfg_index) = parse_cardano_outref(cfg_ban)?;
         if (cfg_tx_id, cfg_index) != (ban_tx_id, ban_index) {
             return Err(format!(
-                "--ban-bootstrap ({ban_bootstrap}) does not match cardano.ban_bootstrap \
-                 ({cfg_ban}); apply-ban derives the ban policy from the config value, so \
-                 bootstrapping a different outref would mint ban-root under an unreachable policy"
+                "--ban-bootstrap ({ban_bootstrap}) does not match the bridge Config's \
+                 federation one-shot ({cfg_ban}); apply-ban derives the ban policy from the \
+                 published value, so bootstrapping a different outref would mint ban-root \
+                 under an unreachable policy"
             ));
         }
     }
@@ -3750,7 +3757,9 @@ fn run_deploy_registry_ref(
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(registry_bootstrap),
+        )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
     let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
@@ -3832,7 +3841,9 @@ fn run_deploy_fault_ref(
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(registry_bootstrap),
+        )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
     let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
@@ -3925,7 +3936,9 @@ fn run_deploy_spo_bans_ref(
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(registry_bootstrap),
+        )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
     let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
@@ -4041,7 +4054,9 @@ fn run_init_scripts(
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(registry_bootstrap),
+        )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
     let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
@@ -4609,7 +4624,9 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(&args.registry_bootstrap),
+        )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
     let treasury = treasury_info_script(
@@ -4952,7 +4969,9 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(&args.registry_bootstrap),
+        )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
     let treasury = treasury_info_script(
@@ -5122,7 +5141,9 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(&args.registry_bootstrap),
+        )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
     let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
@@ -5136,12 +5157,13 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let fault = fault_verifier_script(&blueprint_json, fault_kind, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
 
-    // The ban policy is config-pinned (ban bootstrap + fault-policy set + schedule).
+    // The ban policy is chain-pinned: the one-shot from Config #12, plus the
+    // fault-policy set and the schedule the Config also publishes.
     let ban_bootstrap = cfg
         .cardano
-        .ban_bootstrap
+        .federation_one_shot
         .as_deref()
-        .ok_or("cardano.ban_bootstrap required")?;
+        .ok_or("the federation one-shot (Config #12) has not been resolved from the chain")?;
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     // The ban a tx applies is computed from the SCHEDULE — its end time from
@@ -5336,7 +5358,9 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(&cfg.cardano)?;
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(&args.registry_bootstrap),
+        )?;
     let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
     // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
     let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
@@ -5502,7 +5526,7 @@ fn run_show_roster(
     let bridge_config = config_view(&rt, cfg)?;
     let cardano = heimdall::config::CardanoConfig {
         registry_blueprint: blueprint.or_else(|| cfg.cardano.registry_blueprint.clone()),
-        registry_bootstrap: registry_bootstrap.or_else(|| cfg.cardano.registry_bootstrap.clone()),
+        federation_one_shot: registry_bootstrap.or_else(|| cfg.cardano.federation_one_shot.clone()),
         ..cfg.cardano.clone()
     };
     let source = RegistryRosterSource::resolve(&cardano, bridge_config.as_ref().map(|v| &v.params))

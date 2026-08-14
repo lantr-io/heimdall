@@ -170,9 +170,6 @@ the TM validator and its state token, the bridge-state singleton, the registry a
 and the operational parameters and batch schedule. **The daemon will not start until all three are
 set** — the check in the next section reports a missing one as a hard failure, not a warning.
 
-On an older bridge whose Config does not publish the ban policy, copy `ban_bootstrap` and
-`fault_proof_policies` from the deployment notes — exactly, since they are inputs to the ban
-policy's own identifier and a wrong value yields a valid-looking address holding an empty list.
 
 **Secrets.** Two, and neither belongs in the TOML if you can avoid it:
 
@@ -306,7 +303,8 @@ often see one on:
 - **Step 7 (`key handoff`)** warns when this node cannot compile the `treasury_info` script. It
   still runs DKG and signs — but if it is elected leader for an epoch, the Update-Y that hands the
   treasury to the new group key fails, and the handoff does not happen. Set
-  `cardano.treasury_bootstrap` and `cardano.config_nft_policy_id` to clear it.
+  `cardano.config_nft_policy_id` to clear it — the one-shot the script compiles from is Config
+  #12, and the node reads it from there.
 - `protocol.state_dir is unset` is the one that silently costs money later.
 
 Do not continue until this passes.

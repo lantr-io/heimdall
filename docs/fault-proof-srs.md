@@ -61,14 +61,14 @@ Two things are **not** problems, and should not be "fixed" in a hurry:
   documented, and reachable only from `#[cfg(test)]` code.
 - `.dummy-srs.bin` is a 48-byte placeholder — literally the ASCII string
   `dummy srs (never read on the equivocation path)`. Configs point at it only
-  because setting `cardano.ban_bootstrap` makes every fault key mandatory, and
+  because a bridge whose Config resolves makes every fault key mandatory, and
   those configs exercise the equivocation path, which uses no SRS at all. It
   cannot yield a forged proof: it fails to parse.
 
 ## What heimdall enforces
 
 `circuits::srs_provenance::check_fault_srs` runs at startup, from
-`DkgFaultBanFlow::from_config`, whenever `cardano.ban_bootstrap` is set. It reads
+`DkgFaultBanFlow::from_config`, whenever the fault-enforcement keys are set. It reads
 two small pieces of the SRS file rather than parsing it — `k` from the first four
 bytes, `s_g2` from the last 96 — so the check costs nothing even for a ~400 MiB
 `k = 22` file.
