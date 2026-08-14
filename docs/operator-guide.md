@@ -370,12 +370,13 @@ Every command below prints the transaction and stops unless you add `--submit`. 
 `--submit` first and read what it is about to do.
 
 **1. Deploy the registry reference script.** The registry script is ~12 KB and would not fit in the
-registration transaction twice, so it goes on chain once and is referenced.
+registration transaction twice, so it goes on chain once and is referenced. Both commands below
+compile that script from the outpoint the bridge publishes at Config #12, so there is nothing about
+it to type.
 
 ```bash
 sudo -u heimdall heimdall deploy-registry-ref \
     --config /etc/heimdall/heimdall.toml \
-    --registry-bootstrap <tx_hash>:<index> \
     --submit
 ```
 
@@ -396,7 +397,6 @@ another SPO's — pass it as `--registry-ref <tx_hash>:<index>` and that is used
 ```bash
 sudo -u heimdall heimdall register-spo \
     --config /etc/heimdall/heimdall.toml \
-    --registry-bootstrap <tx_hash>:<index> \
     --cold-skey /path/to/pool-cold.skey \
     --bifrost-skey /var/lib/heimdall/bifrost.skey \
     --bifrost-url http://<your-host>:<your-port> \
