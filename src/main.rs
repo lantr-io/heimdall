@@ -515,9 +515,6 @@ enum Commands {
         /// that parameterizes the registry policy (and through it treasury_info).
         #[arg(long)]
         registry_bootstrap: String,
-        /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
-        #[arg(long)]
-        treasury_nft_name: String,
         /// Pool cold signing key: 32-byte hex, or a path to a file holding that
         /// hex or a cardano-cli TextEnvelope (cborHex "5820" || 32 bytes).
         /// Omit for the air-gapped flow (--cold-vkey + --cold-sig).
@@ -575,9 +572,6 @@ enum Commands {
         /// that parameterizes the registry policy (and through it treasury_info).
         #[arg(long)]
         registry_bootstrap: String,
-        /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
-        #[arg(long)]
-        treasury_nft_name: String,
         /// The incoming roster's x-only Y_51' (32-byte hex) — the new key.
         #[arg(long)]
         new_key: String,
@@ -1225,7 +1219,6 @@ fn main() {
             config,
             blueprint,
             registry_bootstrap,
-            treasury_nft_name,
             cold_skey,
             cold_vkey,
             cold_sig,
@@ -1240,7 +1233,6 @@ fn main() {
             let args = RegisterSpoArgs {
                 blueprint,
                 registry_bootstrap,
-                treasury_nft_name,
                 cold_skey,
                 cold_vkey,
                 cold_sig,
@@ -1260,7 +1252,6 @@ fn main() {
             config,
             blueprint,
             registry_bootstrap,
-            treasury_nft_name,
             new_key,
             epoch,
             signer_skey,
@@ -1272,7 +1263,6 @@ fn main() {
             let args = UpdateYArgs {
                 blueprint,
                 registry_bootstrap,
-                treasury_nft_name,
                 new_key,
                 epoch,
                 signer_skey,
@@ -4212,7 +4202,6 @@ fn run_init_scripts(
 struct RegisterSpoArgs {
     blueprint: Option<String>,
     registry_bootstrap: String,
-    treasury_nft_name: String,
     cold_skey: Option<String>,
     cold_vkey: Option<String>,
     cold_sig: Option<String>,
@@ -4883,7 +4872,12 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let req = RegisterSpoRequest {
         registry_script: &registry,
         treasury_script: &treasury,
-        treasury_asset_name_hex: &args.treasury_nft_name,
+        // [CFG-4]: the state NFT's name is a protocol constant, not a per-bridge
+        // value. It used to be `--treasury-nft-name`, which is how an operator
+        // could name a token no deployment mints and find no treasury state.
+        treasury_asset_name_hex: &hex::encode(
+            heimdall::cardano::config_params::TREASURY_INFO_ASSET_NAME,
+        ),
         config_ref: (config_view.utxo.tx_hash.clone(), config_view.utxo.index),
         registry_utxos: &registry_utxos,
         treasury_utxos: &treasury_utxos,
@@ -4923,7 +4917,6 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
 struct UpdateYArgs {
     blueprint: Option<String>,
     registry_bootstrap: String,
-    treasury_nft_name: String,
     new_key: String,
     epoch: u64,
     signer_skey: Option<String>,
@@ -5008,7 +5001,8 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     let state = find_treasury_state(
         &treasury_utxos,
         &treasury.hash_hex(),
-        &args.treasury_nft_name,
+        // [CFG-4] constant, not a flag — see run_register_spo.
+        &hex::encode(heimdall::cardano::config_params::TREASURY_INFO_ASSET_NAME),
     )
     .map_err(|e| format!("locate treasury state: {e}"))?;
 

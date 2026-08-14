@@ -377,7 +377,6 @@ registration transaction twice, so it goes on chain once and is referenced.
 ```bash
 sudo -u heimdall heimdall deploy-registry-ref \
     --config /etc/heimdall/heimdall.toml \
-    --blueprint /var/lib/heimdall/plutus.json \
     --registry-bootstrap <tx_hash>:<index> \
     --submit
 ```
@@ -399,9 +398,7 @@ another SPO's — pass it as `--registry-ref <tx_hash>:<index>` and that is used
 ```bash
 sudo -u heimdall heimdall register-spo \
     --config /etc/heimdall/heimdall.toml \
-    --blueprint /var/lib/heimdall/plutus.json \
     --registry-bootstrap <tx_hash>:<index> \
-    --treasury-nft-name <hex> \
     --cold-skey /path/to/pool-cold.skey \
     --bifrost-skey /var/lib/heimdall/bifrost.skey \
     --bifrost-url http://<your-host>:<your-port> \
