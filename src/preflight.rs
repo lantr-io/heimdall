@@ -456,9 +456,9 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             "reference script",
             Status::Fail,
             format!("cannot derive the registry script: {e}"),
-            "set all of cardano.registry_blueprint, cardano.registry_bootstrap and \
-             cardano.treasury_info_asset_name — or none of them, to read the registry \
-             identity the bridge publishes at Config #9-#10",
+            "set cardano.config_address + cardano.config_nft_policy_id — the registry \
+             identity is Config #9-#10 and the one-shot that rebuilds its script is #12, \
+             so there is nothing left to type",
         ),
         Ok(Some(src)) => {
             let hash = &src.registry_policy_hex;
@@ -540,7 +540,8 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 "ban list",
                 Status::Fail,
                 "the registry roster is configured but no ban list resolved".to_string(),
-                "set cardano.ban_bootstrap to the ban-list bootstrap outref",
+                "the ban policy comes from Config #8 and its one-shot from #12 — set \
+                 cardano.config_address + cardano.config_nft_policy_id",
             ),
             Err(e) => b.push_fix(
                 5,
@@ -593,7 +594,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 Status::Fail,
                 format!("registry unreadable: {e}"),
                 "the registry or its treasury_info state could not be read or verified — \
-                 check cardano.registry_bootstrap and cardano.treasury_info_asset_name",
+                 check cardano.config_nft_policy_id — the one-shot is Config #12",
             ),
             Ok(snapshot) => {
                 if snapshot.spos.iter().any(|s| s.bifrost_id_pk == pk) {
@@ -665,7 +666,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             Status::Warn,
             "no compiled treasury_info script — if this node is elected leader the \
              Update-Y fails after a full DKG and the treasury is not handed over",
-            "set cardano.treasury_bootstrap and cardano.config_nft_policy_id — treasury_info's \
+            "set cardano.config_nft_policy_id — treasury_info's \
              two parameters, and the only ones left: the compiled code is embedded in this \
              binary (WI-066). The derived hash is checked against the Config's #10, so a wrong \
              one is refused rather than used",

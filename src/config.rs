@@ -421,33 +421,25 @@ pub struct CardanoConfig {
     /// Config NFT asset name (hex). Required alongside `config_nft_policy_id`.
     pub config_nft_asset_name: Option<String>,
     /// Path to the bifrost Aiken blueprint (plutus.json) holding the compiled
-    /// spos_registry + treasury_info validators. Together with
-    /// `registry_bootstrap` and `treasury_info_asset_name` this switches
-    /// `query_roster` from the demo fixture to the on-chain SPO registry.
+    /// spos_registry + treasury_info validators. An OVERRIDE since WI-066: the
+    /// blueprint is embedded in the binary, so leaving this unset is normal.
     pub registry_blueprint: Option<String>,
-    /// The spos_registry one-shot bootstrap outref `<tx_hash>:<index>` that
-    /// parameterizes the registry policy.
-    pub registry_bootstrap: Option<String>,
-    /// The treasury_info one-shot bootstrap outref `<tx_hash>:<index>` that
-    /// parameterizes the treasury policy, together with the Config NFT policy id
-    /// ([PRE-3]).
+    /// The one-shot outpoint `<tx_hash>:<index>` that parameterizes EVERY
+    /// federation script — `spos_registry`, `spo_bans` and the three DKG fault
+    /// verifiers — together with the Config NFT policy id ([PRE-3]).
     ///
-    /// Rev 5.5 inverted the derivation. It used to run registry → treasury,
-    /// because `treasury_info` took `registry_policy_id`; that made the
-    /// dependency a cycle and so made the [REG-6] pin impossible. It now runs
-    /// Config → treasury → registry, and this key is the treasury's own half.
-    pub treasury_bootstrap: Option<String>,
-    /// The spo_bans one-shot bootstrap outref `<tx_hash>:<index>` that
-    /// parameterizes the ban-list policy (the policy is also parameterized
-    /// by the registry policy, so `registry_blueprint` + `registry_bootstrap`
-    /// must be set alongside).
+    /// NOT an operator key: `#[serde(skip)]`, so no TOML file can set it. It is
+    /// filled from Config #12 (WI-090). It used to be three separate typed keys
+    /// — `registry_bootstrap`, `treasury_bootstrap`, `ban_bootstrap` — which
+    /// were the SAME value on every bridge `deploy-bridge` stood up, since all
+    /// three genesis mints share one outpoint, so an operator typed one number
+    /// three times and any two of them could disagree.
     ///
-    /// **Only for a bridge whose Config predates the ban-policy append.** Where
-    /// the Config publishes the finished policy id (#8) that value wins and this
-    /// key is not needed at all — see [`crate::cardano::ban_list::BanListSource::resolve`].
-    /// Left set on such a bridge it is unused, and a startup error if it derives
-    /// a different policy than the one published.
-    pub ban_bootstrap: Option<String>,
+    /// Rev 5.5 runs the derivation Config → treasury → registry (it used to run
+    /// registry → treasury, which made the dependency a cycle and the [REG-6]
+    /// pin impossible), so this one value feeds every step.
+    #[serde(skip)]
+    pub federation_one_shot: Option<String>,
     /// The authorized fault-verifier policy ids (hex), in the exact order the
     /// deployed `spo_bans` was parameterized with. The contract's
     /// `ban_config_ok` requires **exactly 3 distinct** policies, and they are
@@ -491,9 +483,7 @@ impl Default for CardanoConfig {
             config_nft_policy_id: None,
             config_nft_asset_name: None,
             registry_blueprint: None,
-            registry_bootstrap: None,
-            treasury_bootstrap: None,
-            ban_bootstrap: None,
+            federation_one_shot: None,
             fault_proof_policies: Vec::new(),
             spo_bans_ref: None,
             fault_verifier_round1_ref: None,
@@ -505,6 +495,36 @@ impl Default for CardanoConfig {
 }
 
 impl CardanoConfig {
+    /// This config with [`Self::federation_one_shot`] filled in from `one_shot`,
+    /// unless it already carries one.
+    ///
+    /// Already-set WINS, so an explicit `--registry-bootstrap` still overrides
+    /// the chain — the one case that needs it is deriving a script for a bridge
+    /// whose Config you are not reading (recovery, or a deploy in progress).
+    #[must_use]
+    pub fn with_one_shot(&self, one_shot: &str) -> Self {
+        let mut out = self.clone();
+        if out.federation_one_shot.is_none() {
+            out.federation_one_shot = Some(one_shot.to_string());
+        }
+        out
+    }
+
+    /// This config with [`Self::federation_one_shot`] taken from an
+    /// AUTHENTICATED Config datum (#12). The ordinary path: every federation
+    /// script hash derives from this one value, and it reaches a node by being
+    /// published rather than typed (WI-090).
+    #[must_use]
+    pub fn with_published_one_shot(
+        &self,
+        config: Option<&crate::cardano::config_params::ConfigParams>,
+    ) -> Self {
+        match config {
+            Some(p) => self.with_one_shot(&p.federation_one_shot),
+            None => self.clone(),
+        }
+    }
+
     /// Whether this node is on Cardano mainnet.
     ///
     /// Explicit `cardano.network` is authoritative. Without it the network is
@@ -651,6 +671,25 @@ const RETIRED_KEYS: &[RetiredKey] = &[
         "pegout_freshness_margin_ms",
         "the compiled-in PEG_OUT_FRESHNESS_MARGIN_MS (7 days) — a TM selection rule is not an \
          operator setting",
+    ),
+    // WI-090: the federation one-shot outpoint, typed three times under three
+    // names. All three were the SAME value on any bridge `deploy-bridge` stood
+    // up — the genesis mints share one outpoint — so the only thing three keys
+    // could add was a disagreement between them. Config #12 publishes it.
+    (
+        "cardano",
+        "registry_bootstrap",
+        "Config #12 (federation_one_shot)",
+    ),
+    (
+        "cardano",
+        "treasury_bootstrap",
+        "Config #12 (federation_one_shot) — the same outpoint as registry_bootstrap",
+    ),
+    (
+        "cardano",
+        "ban_bootstrap",
+        "Config #12 (federation_one_shot) — the same outpoint again",
     ),
     // WI-070: the bridge's own identifiers. Every one was an operator-typed copy
     // of a Config field, and a copy that can disagree is the whole defect — a
@@ -1041,6 +1080,41 @@ mod tests {
             HeimdallConfig::from_toml_str(&text)
                 .unwrap_or_else(|e| panic!("{rel} does not load:\n{e}"));
         }
+    }
+
+    /// WI-090: all three bootstrap outrefs are refused, each naming Config #12.
+    ///
+    /// Refused rather than accepted-and-ignored, because they were the SAME
+    /// outpoint under three names — an operator who sets one has a mental model
+    /// in which these are three independent bridge inputs, and a node that
+    /// silently ignored them would read a bridge they did not mean.
+    #[test]
+    fn the_three_bootstrap_outrefs_are_refused_and_name_config_12() {
+        for key in ["registry_bootstrap", "treasury_bootstrap", "ban_bootstrap"] {
+            let toml = format!("[cardano]\n{key} = \"{}:0\"\n", "ab".repeat(32));
+            let err = HeimdallConfig::from_toml_str(&toml)
+                .expect_err("a retired key must refuse startup")
+                .to_string();
+            assert!(err.contains(key), "{key}: {err}");
+            assert!(
+                err.contains("#12"),
+                "{key} must name its replacement: {err}"
+            );
+        }
+    }
+
+    /// …and the field that replaced them cannot be set from TOML at all: it is
+    /// `#[serde(skip)]`, filled only from an authenticated Config datum. A file
+    /// that names it is ignored rather than honoured, so there is no back door
+    /// to the value every federation script hash derives from.
+    #[test]
+    fn the_federation_one_shot_cannot_come_from_a_file() {
+        let toml = format!(
+            "[cardano]\nfederation_one_shot = \"{}:7\"\n",
+            "ab".repeat(32)
+        );
+        let cfg = HeimdallConfig::from_toml_str(&toml).expect("an unknown key is not fatal");
+        assert_eq!(cfg.cardano.federation_one_shot, None);
     }
 
     #[test]

@@ -755,6 +755,7 @@ impl BanPolicyParams {
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
     ) -> Result<Self, BanListError> {
+        let cardano = &cardano.with_published_one_shot(config);
         let Some(published) = config.map(|c| &c.tunables) else {
             return Err(BanListError::Config(
                 "the ban schedule comes from the bridge Config (params[4..6]) and this node \
@@ -988,8 +989,11 @@ impl BanListSource {
     /// Parameterize `spo_bans` from the blueprint and derive its address. The
     /// ban policy id is the 7-param `spo_bans` hash, so `params` must carry the
     /// exact deployment values (see [`BanPolicyParams`]).
+    /// `blueprint_path` is an OVERRIDE, not an input: WI-066 embedded the
+    /// blueprint, so `None` is the ordinary case and a path is for testing a
+    /// contracts build that is not the one this binary shipped with.
     pub fn from_blueprint(
-        blueprint_path: &str,
+        blueprint_path: Option<&str>,
         registry_bootstrap: &str,
         treasury_bootstrap: &str,
         config_policy_id: &[u8; 28],
@@ -997,8 +1001,8 @@ impl BanListSource {
         params: &BanPolicyParams,
         mainnet: bool,
     ) -> Result<Self, BanListError> {
-        let blueprint_json = std::fs::read_to_string(blueprint_path)
-            .map_err(|e| BanListError::Config(format!("read blueprint {blueprint_path}: {e}")))?;
+        let blueprint_json =
+            blueprint::load_blueprint(blueprint_path).map_err(BanListError::Config)?;
         let (reg_tx_id, reg_index) = parse_outref(registry_bootstrap)
             .map_err(|e| BanListError::Config(format!("registry bootstrap outref: {e}")))?;
         let (ban_tx_id, ban_index) = parse_outref(ban_bootstrap)
@@ -1095,41 +1099,24 @@ impl BanListSource {
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
     ) -> Result<Option<Self>, BanListError> {
-        let Some(ban_bootstrap) = cardano.ban_bootstrap.as_deref() else {
-            // Ban filtering is consensus-relevant, not an operator preference
-            // (WI-060). `dkg_roster::filter_eligible` drops banned pools from
-            // the ELIGIBLE SET, so a node that cannot read the ban list
-            // enumerates a different candidate set from one that can: different
-            // participants, different lexicographic indices, and a DKG that
-            // cannot converge. Neither node's own log would show anything
-            // wrong. So once a real registry roster is configured, the ban list
-            // is required — refusing here beats diverging at ceremony time.
-            //
-            // The fixture-roster deployment has no registry and legitimately
-            // has no ban list, which is the `Ok(None)` below.
-            if cardano.registry_blueprint.is_some() || cardano.registry_bootstrap.is_some() {
-                return Err(BanListError::Config(
-                    "cardano.ban_bootstrap is required once the on-chain registry roster is \
-                     configured: the eligible roster is the registry MINUS active bans, so a \
-                     node that does not read the ban list computes a different participant \
-                     set — and a different DKG — from one that does. Set it to the ban-list \
-                     bootstrap outref, or remove the registry keys to run the fixture roster."
-                        .into(),
-                ));
-            }
+        // Ban filtering is consensus-relevant, not an operator preference
+        // (WI-060). `dkg_roster::filter_eligible` drops banned pools from the
+        // ELIGIBLE SET, so a node that cannot read the ban list enumerates a
+        // different candidate set from one that can: different participants,
+        // different lexicographic indices, and a DKG that cannot converge, with
+        // nothing wrong in either node's log.
+        //
+        // That used to need a guard here, because the registry and the ban list
+        // were configured by two separate outrefs and an operator could set one
+        // and not the other. Since WI-090 both derive from Config #12, so
+        // "registry configured, ban list not" is unrepresentable: either the
+        // one-shot is resolved and both follow, or neither is, which is the
+        // fixture-roster deployment that legitimately has no ban list.
+        let Some(one_shot) = cardano.federation_one_shot.as_deref() else {
             return Ok(None);
         };
-        let (Some(blueprint_path), Some(registry_bootstrap)) = (
-            cardano.registry_blueprint.as_deref(),
-            cardano.registry_bootstrap.as_deref(),
-        ) else {
-            return Err(BanListError::Config(
-                "cardano.ban_bootstrap is set but cardano.registry_blueprint / \
-                 cardano.registry_bootstrap are not — the ban policy is parameterized \
-                 by the registry policy"
-                    .into(),
-            ));
-        };
+        let (ban_bootstrap, registry_bootstrap) = (one_shot, one_shot);
+        let blueprint_path = cardano.registry_blueprint.as_deref();
         let params = BanPolicyParams::resolve(cardano, config)?;
         let mainnet = cardano.is_mainnet().map_err(BanListError::Config)?;
         let (treasury_bootstrap, config_policy_id) =
@@ -1165,6 +1152,9 @@ impl BanListSource {
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
     ) -> Result<Option<Self>, BanListError> {
+        // spo_bans and the three fault verifiers are all parameterized by the
+        // Config-published one-shot (#12), so take it from the same read.
+        let cardano = &cardano.with_published_one_shot(config);
         let Some(published) = config.map(|c| &c.bans) else {
             return Self::from_config(cardano);
         };
@@ -1184,7 +1174,7 @@ impl BanListSource {
         // disagreement: #8 is authoritative and these keys are on their way out
         // (the enforcement path fails loudly on its own if it needs them). Say so
         // and carry on rather than bricking a node over config it no longer uses.
-        if cardano.ban_bootstrap.is_some() {
+        if cardano.federation_one_shot.is_some() {
             match Self::from_local_keys(cardano, config) {
                 Ok(Some(local)) if local.ban_policy_hex != source.ban_policy_hex => {
                     return Err(BanListError::Config(format!(
@@ -1713,10 +1703,12 @@ mod tests {
     #[test]
     fn source_from_config_requires_registry_fields() {
         let mut cardano = crate::config::CardanoConfig::default();
-        // bans unconfigured → None
+        // no one-shot resolved → None (the fixture-roster deployment)
         assert!(BanListSource::from_config(&cardano).unwrap().is_none());
-        // ban_bootstrap without the registry fields → explicit error
-        cardano.ban_bootstrap = Some(format!("{}:0", "aa".repeat(32)));
+        // A one-shot WITHOUT the Config policy id cannot derive: rev 5.5 runs
+        // Config -> treasury -> registry -> bans, so the Config identity is the
+        // root of the whole chain of hashes.
+        cardano.federation_one_shot = Some(format!("{}:0", "aa".repeat(32)));
         assert!(matches!(
             BanListSource::from_config(&cardano),
             Err(BanListError::Config(_))
@@ -1725,41 +1717,44 @@ mod tests {
 
     /// WI-060: the eligible roster is the registry MINUS active bans, so a node
     /// that does not read the ban list computes a different DKG participant set
-    /// from one that does. Once the registry roster is configured, the ban list
-    /// is not optional.
+    /// from one that does. That USED to need a guard refusing "registry
+    /// configured, ban list not", because the two came from separate typed
+    /// outrefs.
+    ///
+    /// WI-090 removes the failure instead of guarding it: one Config-published
+    /// one-shot parameterizes both, so a node that can derive the registry can
+    /// always derive the ban list. This pins that — the two states are "both" and
+    /// "neither", never "one".
     #[test]
-    fn source_from_config_refuses_a_registry_roster_without_a_ban_list() {
+    fn one_shot_configures_the_registry_and_the_ban_list_together() {
+        // Both: the one-shot plus the Config identity derive a ban list.
         let cardano = crate::config::CardanoConfig {
             registry_blueprint: Some("plutus.json".to_string()),
-            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
-            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            federation_one_shot: Some(format!("{}:0", "bb".repeat(32))),
             config_nft_policy_id: Some("77".repeat(28)),
             ..Default::default()
         };
+        // It fails only on the blueprint path (this fixture names a file that is
+        // not there), never on "the ban list was not configured".
+        match BanListSource::from_config(&cardano) {
+            Err(BanListError::Config(msg)) => assert!(
+                !msg.contains("is required once"),
+                "the half-configured guard should be gone: {msg}"
+            ),
+            Ok(_) => {}
+            Err(e) => panic!("unexpected: {e}"),
+        }
 
-        let err = BanListSource::from_config(&cardano)
-            .expect_err("a registry roster without a ban list must not start");
-        let BanListError::Config(msg) = err else {
-            panic!("expected a config error");
-        };
-        assert!(msg.contains("cardano.ban_bootstrap is required"), "{msg}");
-
-        // Either registry key alone is enough to trip it — a half-configured
-        // registry is a fault, not a fixture.
-        let half = crate::config::CardanoConfig {
-            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
-            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
-            config_nft_policy_id: Some("77".repeat(28)),
-            ..Default::default()
-        };
-        assert!(matches!(
-            BanListSource::from_config(&half),
-            Err(BanListError::Config(_))
-        ));
-
-        // The fixture roster has no registry and legitimately has no ban list.
+        // Neither: no one-shot resolved is the fixture-roster deployment, which
+        // legitimately has no registry and no ban list.
         let fixture = crate::config::CardanoConfig::default();
         assert!(BanListSource::from_config(&fixture).unwrap().is_none());
+        assert!(
+            crate::cardano::roster::RegistryRosterSource::from_config(&fixture)
+                .unwrap()
+                .is_none(),
+            "the same input decides both sources, so both fall back together"
+        );
     }
 
     #[test]
@@ -1853,8 +1848,7 @@ mod tests {
     fn a_published_ban_policy_needs_no_ban_keys_at_all() {
         let cardano = crate::config::CardanoConfig {
             registry_blueprint: Some("plutus.json".to_string()),
-            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
-            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            federation_one_shot: Some(format!("{}:0", "bb".repeat(32))),
             config_nft_policy_id: Some("77".repeat(28)),
             network: Some("preprod".to_string()),
             ..Default::default()
@@ -1884,8 +1878,7 @@ mod tests {
         let published = config_publishing([0xcd; 28]);
         let bare = crate::config::CardanoConfig {
             registry_blueprint: Some("plutus.json".to_string()),
-            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
-            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            federation_one_shot: Some(format!("{}:0", "bb".repeat(32))),
             config_nft_policy_id: Some("77".repeat(28)),
             network: Some("preprod".to_string()),
             ..Default::default()
@@ -1893,7 +1886,7 @@ mod tests {
         // The second node still carries the pre-WI-065 keys — including the
         // stale fault-policy hashes that made its local derivation impossible.
         let with_stale_keys = crate::config::CardanoConfig {
-            ban_bootstrap: Some(format!("{}:1", "ee".repeat(32))),
+            federation_one_shot: Some(format!("{}:1", "ee".repeat(32))),
             fault_proof_policies: vec!["11".repeat(28), "22".repeat(28), "33".repeat(28)],
             ..bare.clone()
         };
@@ -1920,8 +1913,7 @@ mod tests {
     fn no_config_means_no_ban_list_at_all() {
         let cardano = crate::config::CardanoConfig {
             registry_blueprint: Some("plutus.json".to_string()),
-            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
-            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            federation_one_shot: Some(format!("{}:0", "bb".repeat(32))),
             config_nft_policy_id: Some("77".repeat(28)),
             ..Default::default()
         };
@@ -1930,7 +1922,14 @@ mod tests {
         let BanListError::Config(msg) = err else {
             panic!("expected a config error");
         };
-        assert!(msg.contains("cardano.ban_bootstrap is required"), "{msg}");
+        // The schedule is the thing with nothing to fall back to: it is
+        // params[4..6] of the Config, and ApplyBan must reproduce the
+        // deployment's values exactly. The ban POLICY is derivable from the
+        // one-shot; the SCHEDULE is not derivable from anything.
+        assert!(
+            msg.contains("ban schedule comes from the bridge Config"),
+            "{msg}"
+        );
 
         // …and the fixture roster still has no ban list.
         let fixture = crate::config::CardanoConfig::default();
@@ -1950,10 +1949,11 @@ mod tests {
 
         let cardano = crate::config::CardanoConfig {
             registry_blueprint: Some(path.to_string_lossy().into_owned()),
-            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
-            treasury_bootstrap: Some(TEST_TREASURY_BOOTSTRAP.to_string()),
+            // ONE outpoint parameterizes the registry AND the ban list since
+            // WI-090. This fixture used to carry two different ones, which is
+            // now unrepresentable.
+            federation_one_shot: Some(format!("{}:0", "bb".repeat(32))),
             config_nft_policy_id: Some("77".repeat(28)),
-            ban_bootstrap: Some(format!("{}:1", "ee".repeat(32))),
             // The blueprint's three fault verifiers share one compiled code, so
             // all three derive the same hash; `from_blueprint` only requires that
             // each of its own hashes appears in this (3-distinct) list.
@@ -2093,12 +2093,13 @@ mod tests {
         let json = std::fs::read_to_string(path).unwrap();
         // Must follow the SAME chain from_blueprint does, with the same inputs:
         // Config → treasury → registry. Deriving the registry directly would pin
-        // a policy no caller produces.
-        let (tsy_tx_id, tsy_index) = parse_outref(TEST_TREASURY_BOOTSTRAP).unwrap();
+        // a policy no caller produces. Since WI-090 the registry and treasury
+        // halves are ONE outpoint, so this passes `bb:0` twice rather than two
+        // different fixtures.
         let registry = blueprint::registry_policy_from_bootstraps(
             &json,
             (&[0xbb; 32], 0),
-            (&tsy_tx_id, u64::from(tsy_index)),
+            (&[0xbb; 32], 0),
             &[0x77; 28],
         )
         .unwrap();
@@ -2113,8 +2114,7 @@ mod derived_fault_policy_tests {
 
     fn bridge_keys() -> crate::config::CardanoConfig {
         crate::config::CardanoConfig {
-            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
-            treasury_bootstrap: Some(format!("{}:0", "aa".repeat(32))),
+            federation_one_shot: Some(format!("{}:0", "bb".repeat(32))),
             config_nft_policy_id: Some("77".repeat(28)),
             network: Some("preprod".to_string()),
             ..Default::default()

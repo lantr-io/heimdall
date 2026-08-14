@@ -195,7 +195,13 @@ stake_source = "blockfrost"
 # copy derived a policy id no deployment had, so the node read an empty registry
 # and said nothing. --blueprint overrides it for development, or for a bridge
 # built from a contracts release this heimdall predates.
-#registry_bootstrap = "<tx_hash>:<index>"
+#
+# The one-shot outpoint that REBUILDS those scripts is not a key either: it is
+# Config #12 (WI-090). It used to be three — registry_bootstrap,
+# treasury_bootstrap and ban_bootstrap — which were the same outpoint under
+# three names on every bridge deploy-bridge stood up, so the only thing three
+# keys could add was a disagreement between them. Setting any of the three now
+# refuses startup and names the field that replaced it.
 
 # Ban list. LEAVE THIS UNSET on any bridge whose Config publishes the ban policy
 # (#8) — the node reads it from there and there is nothing here to get
@@ -205,20 +211,15 @@ stake_source = "blockfrost"
 # registry MINUS active bans, so a node that does not read the list enumerates a
 # different set of DKG participants, assigns different indices, and cannot
 # converge with the others. Nothing in either node's log would say so — which is
-# why the daemon refuses to start with the registry keys set and no ban list from
-# either source.
-#
-# Set ban_bootstrap ONLY for a bridge deployed before #8 existed, copying it
-# exactly from the deployment notes: it is an input to the ban policy's own
-# identifier, so one wrong value derives a valid-looking address holding no bans
-# at all.
+# why the ban list is not optional. Since WI-090 it cannot be half-configured
+# either: one Config-published one-shot parameterizes the registry AND the ban
+# list, so a node that can derive one can always derive the other.
 #
 # fault_proof_policies is DERIVED (WI-066) — each id is hash(verifier code ++
 # registry policy), and heimdall has both. Leave it unset. Setting it still
 # overrides, for a bridge whose verifiers came from other contracts, but the
 # list is checked against what this build derives and a stale copy is refused
 # rather than used.
-#ban_bootstrap = "<tx_hash>:<index>"
 #fault_proof_policies = ["<28-byte hex>", "<28-byte hex>", "<28-byte hex>"]
 
 # The ban SCHEDULE is no longer settable here. base_ban_duration_ms,

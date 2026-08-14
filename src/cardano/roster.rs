@@ -461,10 +461,11 @@ pub fn parse_outref(s: &str) -> Result<([u8; 32], u32), String> {
 pub fn treasury_derivation_inputs(
     cardano: &crate::config::CardanoConfig,
 ) -> Result<(String, [u8; 28]), String> {
-    let bootstrap = cardano
-        .treasury_bootstrap
-        .clone()
-        .ok_or("cardano.treasury_bootstrap is required to derive the treasury policy (rev 5.5: it is a parameter of treasury_info)")?;
+    let bootstrap = cardano.federation_one_shot.clone().ok_or(
+        "the federation one-shot outpoint has not been read from the chain yet — it is Config \
+         #12 since WI-090, not a config key. A command that derives a federation script must \
+         resolve the Config first (cardano.config_address + cardano.config_nft_policy_id)",
+    )?;
     let hex_str = cardano.config_nft_policy_id.as_deref().ok_or(
         "cardano.config_nft_policy_id is required to derive the treasury policy (rev 5.5 [PRE-3])",
     )?;
@@ -621,22 +622,24 @@ impl RegistryRosterSource {
     ) -> Result<Option<Self>, RosterError> {
         // The blueprint is NOT among the required fields since WI-066: it is
         // embedded in the binary, so `registry_blueprint` is an override rather
-        // than an input. What still identifies the BRIDGE is the pair of
-        // bootstrap outrefs plus the Config policy.
+        // than an input. Since WI-090 the bootstrap outrefs are not fields
+        // either — registry and treasury are ONE outpoint, read from Config #12
+        // — so what identifies the BRIDGE is the Config policy alone.
         let blueprint_path = cardano.registry_blueprint.as_deref();
         let fields = (
-            cardano.registry_bootstrap.as_deref(),
-            cardano.treasury_bootstrap.as_deref(),
+            cardano.federation_one_shot.as_deref(),
             cardano.config_nft_policy_id.as_deref(),
         );
         let (bootstrap, treasury_bootstrap, config_policy_hex) = match fields {
-            (None, None, _) => return Ok(None),
-            (Some(r), Some(t), Some(c)) => (r, t, c),
-            _ => {
+            // No one-shot resolved yet: the caller falls back to its fixture
+            // roster, exactly as it did when neither outref was typed.
+            (None, _) => return Ok(None),
+            (Some(one_shot), Some(c)) => (one_shot, one_shot, c),
+            (Some(_), None) => {
                 return Err(RosterError::Config(
-                    "set all of cardano.registry_blueprint, cardano.registry_bootstrap, \
-                     cardano.treasury_bootstrap and cardano.config_nft_policy_id (or none of \
-                     the first three, for the fixture roster)"
+                    "cardano.config_nft_policy_id is required alongside the Config-published \
+                     one-shot: rev 5.5 derives Config -> treasury -> registry, so the Config \
+                     identity is the root of every federation script hash"
                         .into(),
                 ));
             }
@@ -683,6 +686,9 @@ impl RegistryRosterSource {
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
     ) -> Result<Option<Self>, RosterError> {
+        // Every federation script derives from Config #12, so take it from the
+        // same authenticated read the identities below come from (WI-090).
+        let cardano = &cardano.with_published_one_shot(config);
         // Since rev 5.4 the registry identity is MANDATORY in the datum, so
         // having a Config at all means having the identity. Rev 5.5 renumbered it
         // to #9 (registry) + #10 (treasury); the asset name became a constant.
@@ -707,7 +713,7 @@ impl RegistryRosterSource {
         // The derivation is checked against the published #10 either way.
         let blueprint_path = cardano.registry_blueprint.as_deref();
         let (Some(treasury_bootstrap), Some(config_policy_hex)) = (
-            cardano.treasury_bootstrap.as_deref(),
+            cardano.federation_one_shot.as_deref(),
             cardano.config_nft_policy_id.as_deref(),
         ) else {
             return Ok(Some(source));
@@ -1186,6 +1192,11 @@ mod tests {
             spos_registry_policy_id: [0xc1; 28],
             treasury_info_policy_id: [0xc2; 28],
         };
+        // #12 is what the local derivations in these tests compile against since
+        // WI-090: `resolve` takes the one-shot from the Config, not from
+        // `[cardano]`, so a fixture that publishes a different one derives a
+        // different treasury hash and trips the cross-check.
+        c.federation_one_shot = format!("{}:0", "aa".repeat(32));
         c
     }
 
@@ -1235,8 +1246,7 @@ mod tests {
     #[test]
     fn no_config_falls_back_to_local_keys_and_half_configured_keys_are_a_fault() {
         let complete = crate::config::CardanoConfig {
-            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
-            treasury_bootstrap: Some(format!("{}:0", "aa".repeat(32))),
+            federation_one_shot: Some(format!("{}:0", "bb".repeat(32))),
             config_nft_policy_id: Some("77".repeat(28)),
             ..Default::default()
         };
@@ -1246,7 +1256,7 @@ mod tests {
 
         // Genuinely half — the bridge's own identity is incomplete.
         let half = crate::config::CardanoConfig {
-            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            federation_one_shot: Some(format!("{}:0", "bb".repeat(32))),
             ..Default::default()
         };
         let err = RegistryRosterSource::resolve(&half, None)
@@ -1340,7 +1350,6 @@ mod tests {
             registry_blueprint: Some(path.to_string_lossy().into_owned()),
             // Rev 5.5: compiling treasury_info needs its own one-shot outref and
             // the Config NFT policy, not the registry policy.
-            treasury_bootstrap: Some(format!("{}:0", "aa".repeat(32))),
             config_nft_policy_id: Some("77".repeat(28)),
             ..Default::default()
         };
@@ -1442,8 +1451,7 @@ mod embedded_blueprint_roster_tests {
     #[test]
     fn a_node_with_no_blueprint_can_still_hand_off_the_key() {
         let cardano = crate::config::CardanoConfig {
-            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
-            treasury_bootstrap: Some(format!("{}:0", "aa".repeat(32))),
+            federation_one_shot: Some(format!("{}:0", "bb".repeat(32))),
             config_nft_policy_id: Some("77".repeat(28)),
             network: Some("preprod".to_string()),
             ..Default::default()

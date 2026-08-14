@@ -87,9 +87,9 @@ use crate::cardano::plutus;
 use crate::epoch::batch::{BatchWindow, GridParams};
 use tracing::{info, warn};
 
-/// Field count of the rev-5.4 Config datum (spec §Config datum). Appends are the
+/// Field count of the rev-5.5 Config datum (spec §Config datum). Appends are the
 /// legal evolution, so a reader accepts MORE fields and refuses fewer.
-pub const CONFIG_FIELDS: usize = 12;
+pub const CONFIG_FIELDS: usize = 13;
 
 /// Slots of the nested `params` record ([`Tunables`]) this build knows. Like
 /// [`CONFIG_FIELDS`], a MINIMUM: the record evolves by appending, so a Config
@@ -349,6 +349,18 @@ pub struct ConfigParams {
     /// different scriptPubKey and signs a sighash no other signer produced
     /// (WI-069). Reading it from the authenticated Config is what removes that.
     pub y_federation: [u8; 32],
+    /// #12 — the one-shot outpoint every federation script is compile-
+    /// parameterized by, as `<txid_hex>:<index>`, the form the builders and the
+    /// CLI already parse.
+    ///
+    /// #9/#10 above IDENTIFY those scripts; this REBUILDS them. A hash cannot be
+    /// inverted, so a node that must produce script bytes — deploying a
+    /// reference script, or spending `treasury_info`, which is embedded rather
+    /// than referenced — needed the compile input, and it used to arrive as a
+    /// hand-typed `cardano.registry_bootstrap` / `cardano.treasury_bootstrap`
+    /// pair. Both are one value on any bridge `deploy-bridge` stood up, and both
+    /// are now read from here (WI-090).
+    pub federation_one_shot: String,
     /// #1 — always present in the rev-5.5 layout.
     pub tunables: Tunables,
 }
@@ -491,8 +503,9 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
     let field_count = fields.len();
     if field_count < CONFIG_FIELDS {
         return Err(format!(
-            "config datum has {field_count} fields, expected >= {CONFIG_FIELDS} (rev 5.4) — \
-             this deployment predates the bridge-state singleton layout"
+            "config datum has {field_count} fields, expected >= {CONFIG_FIELDS} (rev 5.5) — \
+             this deployment predates the published federation one-shot (#12), so it is a \
+             different bridge instance: appending that field moved the config NFT policy id"
         ));
     }
 
@@ -533,6 +546,28 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
             y_federation_bytes.len()
         )
     })?;
+
+    // #12, the federation one-shot (WI-090). Aiken's `OutputReference` is
+    // `Constr(0, [B(transaction_id), I(output_index)])` in the Plutus V3
+    // encoding — the tx id as BARE bytes, with no `TxId` wrapper constructor.
+    let one_shot_fields = plutus::constr_fields(&fields[12], 0)
+        .map_err(|e| format!("config #12 (federation_one_shot): {e}"))?;
+    let one_shot_tx = plutus::field_bytes(one_shot_fields, 0)
+        .map_err(|e| format!("config #12 (federation_one_shot.transaction_id): {e}"))?;
+    if one_shot_tx.len() != 32 {
+        return Err(format!(
+            "config #12 (federation_one_shot.transaction_id) is {} bytes, expected 32",
+            one_shot_tx.len()
+        ));
+    }
+    let one_shot_ix = plutus::field_int(one_shot_fields, 1)
+        .map_err(|e| format!("config #12 (federation_one_shot.output_index): {e}"))?;
+    let one_shot_ix = u32::try_from(one_shot_ix).map_err(|_| {
+        format!("config #12 (federation_one_shot.output_index) is {one_shot_ix}, not a u32")
+    })?;
+    // `<txid>:<index>` — the same spelling `parse_outref` and the CLI take, so
+    // the value crosses from the chain into the builders without a second format.
+    let federation_one_shot = format!("{}:{one_shot_ix}", hex::encode(&one_shot_tx));
 
     let params =
         plutus::constr_fields(&fields[1], 0).map_err(|e| format!("config #1 (params): {e}"))?;
@@ -626,6 +661,7 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
         bans,
         registry,
         y_federation,
+        federation_one_shot,
         tunables,
     })
 }
@@ -657,6 +693,7 @@ pub(crate) fn test_config_params() -> ConfigParams {
             treasury_info_policy_id: [0; 28],
         },
         y_federation: [0xf9; 32],
+        federation_one_shot: format!("{}:0", "c3".repeat(32)),
         tunables: Tunables {
             schedule: ScheduleParams {
                 dkg_r1_deadline: 0,
@@ -977,6 +1014,9 @@ mod tests {
                 bytes(&[0xc1; 28]), // #9 spos_registry_policy_id
                 bytes(&[0xc2; 28]), // #10 treasury_info_policy_id
                 bytes(&[0xf9; 32]), // #11 y_federation
+                // #12 federation_one_shot. Aiken's V3 OutputReference:
+                // Constr(0, [B(txid), I(index)]) — bare bytes, no TxId wrapper.
+                constr(0, vec![bytes(&[0xc3; 32]), int(0)]),
             ],
         )
     }
@@ -1132,10 +1172,37 @@ mod tests {
                 bytes(&[0xc1; 28]),
                 bytes(&[0xc2; 28]),
                 bytes(&[0xf9; 32]),
+                constr(0, vec![bytes(&[0xc3; 32]), int(0)]),
             ],
         ))
         .unwrap_err();
         assert!(err.contains("expected >= 9"), "{err}");
+    }
+
+    /// #12 decodes to the `<txid>:<index>` spelling the builders take, from the
+    /// V3 `OutputReference` shape — `Constr(0, [B(txid), I(index)])`, the tx id
+    /// as BARE bytes. A `TxId`-wrapped encoding would nest one Constr deeper and
+    /// is what this pins against; binocular writes the same shape by hand in
+    /// `banBootstrapRedeemer`, so the two sides cannot drift silently.
+    #[test]
+    fn the_federation_one_shot_decodes_as_a_v3_output_reference() {
+        let p = parse_config_datum(&config_datum(7, 1_000, 100_000)).unwrap();
+        assert_eq!(p.federation_one_shot, format!("{}:0", "c3".repeat(32)));
+        // …and it is exactly what the builders parse back.
+        let (tx_id, index) = crate::cardano::roster::parse_outref(&p.federation_one_shot).unwrap();
+        assert_eq!(tx_id, [0xc3; 32]);
+        assert_eq!(index, 0);
+    }
+
+    /// A `TxId`-wrapped one-shot — `Constr(0, [Constr(0, [B(txid)]), I(ix)])` —
+    /// is REFUSED rather than read as some other value. This is the encoding a
+    /// PlutusV2-era mirror would emit, and reading it loosely would derive a
+    /// registry policy id that matches nothing on chain.
+    #[test]
+    fn a_v2_style_wrapped_one_shot_is_refused() {
+        let wrapped = constr(0, vec![constr(0, vec![bytes(&[0xc3; 32])]), int(0)]);
+        let err = parse_config_datum(&config_datum_with(12, wrapped)).unwrap_err();
+        assert!(err.contains("federation_one_shot"), "{err}");
     }
 
     /// …and the other direction: a params record with a slot this build has
