@@ -513,7 +513,8 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 let enforcement = crate::cardano::blockfrost_chain::DkgFaultBanFlow::from_config(
                     &cfg.cardano,
                     config.as_ref().map(|v| &v.params),
-                );
+                )
+                .await;
                 let (status, enforcement_note) = match &enforcement {
                     Ok(Some(_)) => (Status::Pass, "fault enforcement configured".to_string()),
                     Ok(None) => (

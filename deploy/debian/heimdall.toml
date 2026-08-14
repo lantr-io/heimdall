@@ -245,8 +245,16 @@ stake_source = "blockfrost"
 # something. Entirely OPTIONAL and off by default: faults are detected and the
 # offender excluded from the ceremony either way, with or without these.
 #
-# All of them or none. Setting one and omitting another is a startup error
-# rather than a half-working publish path.
+# In practice that means ONE key: fault_proof_srs_path. Setting it turns the
+# path on, and everything else is derived or discovered.
+#
+# The four *_ref keys below are reference-script LOCATIONS, and since WI-091 they
+# are found rather than typed: heimdall looks at this wallet, then at the wallet
+# the bridge was deployed from — which the Config's one-shot (#12) identifies,
+# and where `binocular deploy-script-refs` publishes them for the whole bridge.
+# Leave them unset. Set one only to pin a copy held somewhere else; a value here
+# WINS and is not cross-checked, because a deliberate override is a legitimate
+# reason to disagree with what discovery would find.
 #
 # Do not enable on mainnet yet — the deployed round1/round2 verifiers are
 # generated from a test setup and heimdall will refuse to start. See
