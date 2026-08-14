@@ -439,6 +439,11 @@ enum Commands {
         /// Actually submit via Blockfrost (default: build + print only).
         #[arg(long)]
         submit: bool,
+        /// Deploy even though this wallet already holds a reference script for
+        /// the same script. For replacing a copy that is about to be spent —
+        /// otherwise the duplicate just locks another ~55 ADA.
+        #[arg(long)]
+        force: bool,
     },
     /// Deploy a DKG fault-verifier as a CIP-33 reference script and print its
     /// policy id (hash) for `fault_proof_policies`. Dry-run (default) prints the
@@ -465,6 +470,11 @@ enum Commands {
         /// Actually submit via Blockfrost (default: build + print only).
         #[arg(long)]
         submit: bool,
+        /// Deploy even though this wallet already holds a reference script for
+        /// the same script. For replacing a copy that is about to be spent —
+        /// otherwise the duplicate just locks another ~55 ADA.
+        #[arg(long)]
+        force: bool,
     },
     /// Deploy the `spo_bans` validator as a CIP-33 reference script and print its
     /// policy id (the ban-list policy). `spo_bans` is parameterized by the registry
@@ -501,6 +511,11 @@ enum Commands {
         /// Actually submit via Blockfrost (default: build + print only).
         #[arg(long)]
         submit: bool,
+        /// Deploy even though this wallet already holds a reference script for
+        /// the same script. For replacing a copy that is about to be spent —
+        /// otherwise the duplicate just locks another ~55 ADA.
+        #[arg(long)]
+        force: bool,
     },
     /// Register the stake credential of every withdraw-using script heimdall
     /// deploys, so their withdraw-zero paths are admissible. Conway rejects a
@@ -1038,6 +1053,37 @@ fn run_sign_registration(
     Ok(())
 }
 
+/// Whether this wallet already holds a reference script for `script_hash_hex`.
+///
+/// The deploy commands are otherwise unconditional, so running one twice parks a
+/// SECOND copy of the same script and locks another ~55 ADA in it — for nothing,
+/// since every consumer finds the first one by scanning this same wallet. Report
+/// the existing UTxO and stop; `--force` is there for the one case that is not a
+/// mistake, replacing a copy that is about to be spent.
+fn ref_script_already_deployed(
+    utxos: &[heimdall::cardano::bf_http::BfUtxo],
+    script_hash_hex: &str,
+    what: &str,
+    force: bool,
+) -> bool {
+    use heimdall::cardano::ref_script::find_ref_script;
+    let Some(found) = find_ref_script(utxos, script_hash_hex) else {
+        return false;
+    };
+    if force {
+        println!(
+            "{what} reference script already at this wallet ({found}) — deploying another (--force)"
+        );
+        return false;
+    }
+    println!("{what} reference script already deployed at this wallet: {found}");
+    println!("  Nothing to do: the commands that need it discover it here on their own.");
+    println!(
+        "  Deploying again would lock another ~55 ADA in a duplicate. Pass --force to do it anyway."
+    );
+    true
+}
+
 fn main() {
     let cli = Cli::parse();
     // Stashed before the match because `load_config` — which installs the
@@ -1285,6 +1331,7 @@ fn main() {
             blueprint,
             registry_bootstrap,
             submit,
+            force,
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_deploy_registry_ref(
@@ -1292,6 +1339,7 @@ fn main() {
                 blueprint.as_deref(),
                 registry_bootstrap.as_deref(),
                 submit,
+                force,
             ) {
                 error!("Error: {e}");
                 std::process::exit(1);
@@ -1303,6 +1351,7 @@ fn main() {
             registry_bootstrap,
             kind,
             submit,
+            force,
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_deploy_fault_ref(
@@ -1311,6 +1360,7 @@ fn main() {
                 registry_bootstrap.as_deref(),
                 &kind,
                 submit,
+                force,
             ) {
                 error!("Error: {e}");
                 std::process::exit(1);
@@ -1325,6 +1375,7 @@ fn main() {
             max_faults_before_permanent,
             max_validity_window_ms,
             submit,
+            force,
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_deploy_spo_bans_ref(
@@ -1336,6 +1387,7 @@ fn main() {
                 max_faults_before_permanent,
                 max_validity_window_ms,
                 submit,
+                force,
             ) {
                 error!("Error: {e}");
                 std::process::exit(1);
@@ -3899,6 +3951,7 @@ fn run_deploy_registry_ref(
     blueprint_path: Option<&str>,
     registry_bootstrap: Option<&str>,
     submit: bool,
+    force: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::spos_registry_script;
@@ -3938,6 +3991,9 @@ fn run_deploy_registry_ref(
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
     let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    if ref_script_already_deployed(&raw, &registry.hash_hex(), "registry", force) {
+        return Ok(());
+    }
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
@@ -3985,6 +4041,7 @@ fn run_deploy_fault_ref(
     registry_bootstrap: Option<&str>,
     kind: &str,
     submit: bool,
+    force: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{
@@ -4047,6 +4104,9 @@ fn run_deploy_fault_ref(
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
     let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    if ref_script_already_deployed(&raw, &verifier.hash_hex(), "fault_verifier", force) {
+        return Ok(());
+    }
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
@@ -4081,6 +4141,7 @@ fn run_deploy_spo_bans_ref(
     max_faults_before_permanent: i64,
     max_validity_window_ms: i64,
     submit: bool,
+    force: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{
@@ -4157,6 +4218,9 @@ fn run_deploy_spo_bans_ref(
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
     let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    if ref_script_already_deployed(&raw, &spo_bans.hash_hex(), "spo_bans", force) {
+        return Ok(());
+    }
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
@@ -7301,7 +7365,9 @@ fn print_frost_treasury(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cardano_outref, parse_hex_n, parse_key32, pool_id_bech32};
+    use super::{
+        parse_cardano_outref, parse_hex_n, parse_key32, pool_id_bech32, ref_script_already_deployed,
+    };
 
     #[test]
     fn parse_cardano_outref_ok() {
@@ -7358,6 +7424,38 @@ mod tests {
             verify_registration(&sigs, &id_pk, slashed).is_err(),
             "signatures must not carry over to a different --bifrost-url"
         );
+    }
+
+    /// WI-091: the deploy commands used to park a second copy of a script this
+    /// wallet already holds, locking another ~55 ADA for nothing — every consumer
+    /// finds the first one by scanning this same wallet. The guard reports it and
+    /// stops, and `--force` is the deliberate override.
+    #[test]
+    fn a_second_copy_of_a_ref_script_is_refused_unless_forced() {
+        use heimdall::cardano::bf_http::BfUtxo;
+        let hash = "ab".repeat(28);
+        let holding = vec![BfUtxo {
+            tx_hash: "cd".repeat(32),
+            output_index: 0,
+            amount: Vec::new(),
+            inline_datum: None,
+            reference_script_hash: Some(hash.clone()),
+        }];
+        assert!(ref_script_already_deployed(
+            &holding, &hash, "registry", false
+        ));
+        assert!(
+            !ref_script_already_deployed(&holding, &hash, "registry", true),
+            "--force must deploy anyway"
+        );
+        // A wallet holding some OTHER script is not a duplicate.
+        assert!(!ref_script_already_deployed(
+            &holding,
+            &"ef".repeat(28),
+            "registry",
+            false
+        ));
+        assert!(!ref_script_already_deployed(&[], &hash, "registry", false));
     }
 
     #[test]
