@@ -156,6 +156,12 @@ poll_interval_ms = 5000
 # else, and the daemon never reads it under any flag.
 #cold_skey_path = "/etc/heimdall/pool-cold.skey"
 
+# Path to the pool cold VERIFICATION key (cold.vkey) — the public half, and the
+# one a node keeps in the air-gapped flow: the signature comes from the machine
+# holding cold.skey, and this is only used to derive the pool id and check what
+# was handed over. Not a secret, so setting it here costs nothing.
+#cold_vkey_path = "/etc/heimdall/pool-cold.vkey"
+
 
 # Where the treasury movement is posted. Keep true: posting to the Cardano oracle
 # is how a movement reaches the watchtowers. 0 = post as Unconfirmed (a watchtower
@@ -299,6 +305,18 @@ bind_address = "0.0.0.0"
 # leaking it means someone else can sign as you. Keep it inside state_dir, owned
 # by the heimdall user, and back it up somewhere the daemon cannot reach.
 #skey_path = "/var/lib/heimdall/bifrost.skey"
+
+# This node's own endpoint, where peers fetch its DKG and signing rounds. It is
+# an INPUT to registration, not a copy of a chain value: register-spo publishes
+# it and sign-registration signs over it, and after that the URL on chain is what
+# peers use and what the daemon's listen port comes from. Nothing reads this key
+# afterwards.
+#
+# Set it here rather than passing --bifrost-url twice. The registration message
+# commits to these EXACT bytes, so a trailing slash or a different port between
+# the two commands invalidates both signatures, and the only symptom is
+# "signature does not verify".
+#url = "http://spo1.example.com:18500"
 
 
 [log]
