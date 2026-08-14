@@ -1167,9 +1167,12 @@ fn main() {
             submit,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) =
-                run_bootstrap_registry(&cfg, blueprint.as_deref(), registry_bootstrap.as_deref(), submit)
-            {
+            if let Err(e) = run_bootstrap_registry(
+                &cfg,
+                blueprint.as_deref(),
+                registry_bootstrap.as_deref(),
+                submit,
+            ) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1181,9 +1184,12 @@ fn main() {
             submit,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) =
-                run_deploy_registry_ref(&cfg, blueprint.as_deref(), registry_bootstrap.as_deref(), submit)
-            {
+            if let Err(e) = run_deploy_registry_ref(
+                &cfg,
+                blueprint.as_deref(),
+                registry_bootstrap.as_deref(),
+                submit,
+            ) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
