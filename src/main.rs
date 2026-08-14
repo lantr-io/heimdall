@@ -198,12 +198,12 @@ enum Commands {
         /// `[bifrost].skey_path`.
         #[arg(long)]
         bifrost_skey: Option<String>,
-        /// This SPO's Bifrost endpoint URL. MUST be byte-identical to the
-        /// `--bifrost-url` given to `register-spo`: it is signed over, so any
-        /// difference — a trailing slash, a different port — invalidates both
-        /// signatures.
+        /// This SPO's Bifrost endpoint URL. MUST be byte-identical to the one
+        /// `register-spo` uses: it is signed over, so any difference — a
+        /// trailing slash, a different port — invalidates both signatures. Set
+        /// `[bifrost].url` instead and neither command can get it wrong.
         #[arg(long)]
-        bifrost_url: String,
+        bifrost_url: Option<String>,
     },
     /// Print this node's Bifrost identity — the public half of
     /// `[bifrost].skey_path`. Read-only; touches no chain and no secret beyond
@@ -604,8 +604,11 @@ enum Commands {
         #[arg(long)]
         bifrost_sig: Option<String>,
         /// This SPO's Bifrost endpoint URL (where DKG data is published).
+        /// Falls back to `[bifrost].url`, which is the better place for it: the
+        /// registration message commits to these exact bytes, so one value read
+        /// by both this and `sign-registration` cannot drift between them.
         #[arg(long)]
-        bifrost_url: String,
+        bifrost_url: Option<String>,
         /// Override the registry reference-script UTxO (<tx_hash>:<index>).
         /// Not needed for the usual case: the one `deploy-registry-ref` left
         /// key-locked at this wallet is discovered automatically. Pass this to
@@ -1012,13 +1015,14 @@ fn run_sign_registration(
     cfg: &HeimdallConfig,
     cold_skey: Option<&str>,
     bifrost_skey: Option<&str>,
-    bifrost_url: &str,
+    bifrost_url: Option<&str>,
 ) -> Result<(), String> {
     use bitcoin::key::Secp256k1;
     use bitcoin::secp256k1::Keypair;
     use heimdall::cardano::register_spo::{sign_registration, verify_registration};
     use pallas_crypto::key::ed25519;
 
+    let bifrost_url = &resolve_bifrost_url(cfg, bifrost_url)?;
     let cold_src = cold_skey
         .or(cfg.cardano.cold_skey_path.as_deref())
         .ok_or("no cold key: pass --cold-skey or set cardano.cold_skey_path")?;
@@ -1082,6 +1086,23 @@ fn ref_script_already_deployed(
         "  Deploying again would lock another ~55 ADA in a duplicate. Pass --force to do it anyway."
     );
     true
+}
+
+/// This node's Bifrost endpoint URL: the flag, else `[bifrost].url`.
+///
+/// One resolver for both `register-spo` and `sign-registration` because the
+/// registration message commits to these EXACT bytes — a trailing slash or a
+/// different port between the two invalidates both signatures, and the failure
+/// says only "signature does not verify".
+fn resolve_bifrost_url(cfg: &HeimdallConfig, arg: Option<&str>) -> Result<String, String> {
+    arg.or(cfg.bifrost.url.as_deref())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            "no Bifrost endpoint URL: pass --bifrost-url or set [bifrost].url. It is published \
+             on chain and peers fetch this node's DKG rounds from it, so its port is also the \
+             port the daemon binds"
+                .to_string()
+        })
 }
 
 fn main() {
@@ -1202,7 +1223,7 @@ fn main() {
                 &cfg,
                 cold_skey.as_deref(),
                 bifrost_skey.as_deref(),
-                &bifrost_url,
+                bifrost_url.as_deref(),
             ) {
                 error!("Error: {e}");
                 std::process::exit(1);
@@ -4449,7 +4470,7 @@ struct RegisterSpoArgs {
     bifrost_skey: Option<String>,
     bifrost_id_pk: Option<String>,
     bifrost_sig: Option<String>,
-    bifrost_url: String,
+    bifrost_url: Option<String>,
     registry_ref: Option<String>,
     submit: bool,
 }
@@ -4885,7 +4906,11 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let cold_skey: Option<ed25519::SecretKey> = cold_skey_src
         .map(|arg| parse_key32(arg, "--cold-skey").map(ed25519::SecretKey::from))
         .transpose()?;
-    let cold_vkey: [u8; 32] = match (&cold_skey, args.cold_vkey.as_deref()) {
+    let cold_vkey_src = args
+        .cold_vkey
+        .as_deref()
+        .or(cfg.cardano.cold_vkey_path.as_deref());
+    let cold_vkey: [u8; 32] = match (&cold_skey, cold_vkey_src) {
         (Some(sk), None) => sk.public_key().into(),
         // parse_key32, not raw hex: pool-cold.vkey is a Cardano TextEnvelope, so
         // requiring hex here made the operator slice `cborHex` past its 5820
@@ -4908,7 +4933,14 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     };
 
     let secp = Secp256k1::new();
-    let bifrost_keypair: Option<Keypair> = match args.bifrost_skey.as_deref() {
+    // `[bifrost].skey_path` is the same key the daemon runs on, so a node that
+    // signs its own registration need not name it twice. `None` still means the
+    // air-gapped halves below, which is why this is not an error when unset.
+    let bifrost_skey_src = args
+        .bifrost_skey
+        .as_deref()
+        .or(cfg.bifrost.skey_path.as_deref());
+    let bifrost_keypair: Option<Keypair> = match bifrost_skey_src {
         Some(arg) => Some(
             Keypair::from_seckey_slice(&secp, &parse_key32(arg, "--bifrost-skey")?)
                 .map_err(|e| format!("--bifrost-skey: {e}"))?,
@@ -4935,7 +4967,8 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     };
 
     let pool_id = pool_id_from_cold_vkey(&cold_vkey);
-    let message = registration_message(&pool_id, &bifrost_id_pk, args.bifrost_url.as_bytes());
+    let bifrost_url = resolve_bifrost_url(cfg, args.bifrost_url.as_deref())?;
+    let message = registration_message(&pool_id, &bifrost_id_pk, bifrost_url.as_bytes());
     let digest = sha256::Hash::hash(&message).to_byte_array();
 
     let cold_sig: [u8; 64] = match (&cold_skey, args.cold_sig.as_deref()) {
@@ -4972,7 +5005,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         cold_sig,
         bifrost_sig,
     };
-    verify_registration(&sigs, &bifrost_id_pk, args.bifrost_url.as_bytes())
+    verify_registration(&sigs, &bifrost_id_pk, bifrost_url.as_bytes())
         .map_err(|e| format!("registration signatures: {e}"))?;
 
     println!(
@@ -4981,7 +5014,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         pool_id_bech32(&pool_id)
     );
     println!("bifrost_id_pk:     {}", hex::encode(bifrost_id_pk));
-    println!("bifrost_url:       {}", args.bifrost_url);
+    println!("bifrost_url:       {bifrost_url}");
     println!("registry policy:   {}", registry.hash_hex());
     println!("treasury policy:   {}", treasury.hash_hex());
 
@@ -5170,7 +5203,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         key: &key,
         sigs: &sigs,
         bifrost_id_pk,
-        bifrost_url: args.bifrost_url.as_bytes().to_vec(),
+        bifrost_url: bifrost_url.as_bytes().to_vec(),
         invalid_before: Some(window.current_slot),
         invalid_hereafter: Some(window.epoch_end_slot),
         registry_ref,

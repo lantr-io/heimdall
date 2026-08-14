@@ -419,16 +419,25 @@ whole purpose of the step, and the only time the cold key is used.
 ```bash
 sudo -u heimdall heimdall register-spo \
     --config /etc/heimdall/heimdall.toml \
-    --cold-skey /path/to/pool-cold.skey \
-    --bifrost-skey /var/lib/heimdall/bifrost.skey \
-    --bifrost-url http://<your-host>:<your-port> \
     --submit
 ```
 
-`--cold-skey` takes the `cold.skey` file as cardano-cli wrote it — a TextEnvelope — or raw 32-byte
-hex. It can come from the config file instead, as `cardano.cold_skey_path`; there is no default
-location, and unset does not mean "look in the usual place", it means the cold key is not on this
-machine.
+Everything it needs is in the config file:
+
+| key | what |
+|---|---|
+| `bifrost.url` | your endpoint, published on chain |
+| `bifrost.skey_path` | your Bifrost identity key — the same one the daemon runs on |
+| `cardano.cold_skey_path` | your pool cold key, for the on-machine flow |
+| `cardano.cold_vkey_path` | the public half, for the air-gapped flow |
+
+Each has a `--flag` that overrides it. `bifrost.url` matters most: the registration message commits
+to those exact bytes, so a trailing slash or a different port between this command and
+`sign-registration` invalidates both signatures — one value, read by both, cannot drift.
+
+The cold-key paths take the `cold.skey` / `cold.vkey` files as cardano-cli wrote them — TextEnvelopes
+— or raw 32-byte hex. `cold_skey_path` has no default location, and unset does not mean "look in the
+usual place": it means the cold key is not on this machine.
 
 **Check the pool ID it prints before you submit.** The command derives your pool ID from the cold
 key you gave it and prints it:
@@ -472,10 +481,7 @@ producer. Sign beside the key instead, and carry four public values across.
 On the machine that holds `cold.skey`:
 
 ```bash
-heimdall sign-registration \
-    --cold-skey /path/to/cold.skey \
-    --bifrost-skey /path/to/bifrost.skey \
-    --bifrost-url http://<your-host>:<your-port>
+heimdall sign-registration --config /path/to/heimdall.toml
 ```
 
 It touches no chain and no network. It prints the pool ID it derived — check that against your pool

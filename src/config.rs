@@ -76,11 +76,27 @@ pub struct BifrostConfig {
     /// sign published DKG/signing payloads. Required for live participation;
     /// `None` is fine for read-only / air-gapped-registration commands.
     pub skey_path: Option<String>,
+    /// This node's own Bifrost endpoint URL — where peers fetch its DKG and
+    /// signing rounds from. Used by `register-spo`, which publishes it on chain,
+    /// and by `sign-registration`, which signs over it.
+    ///
+    /// It is an INPUT to registration, not a second copy of a chain value: once
+    /// registered, the URL on chain is what peers use and what this node's
+    /// listen port comes from. Nothing reads this afterwards.
+    ///
+    /// Having it here is what makes the two commands agree. The registration
+    /// message commits to these exact bytes, so a trailing slash or a different
+    /// port between `sign-registration` and `register-spo` silently invalidates
+    /// both signatures — one value typed once removes that entirely.
+    pub url: Option<String>,
 }
 
 impl Default for BifrostConfig {
     fn default() -> Self {
-        Self { skey_path: None }
+        Self {
+            skey_path: None,
+            url: None,
+        }
     }
 }
 
@@ -385,6 +401,17 @@ pub struct CardanoConfig {
     /// state a careful operator is in, not a missing setting. The daemon never
     /// reads it under any flag — only an explicit one-shot command does.
     pub cold_skey_path: Option<String>,
+    /// Path to this pool's Ed25519 cold VERIFICATION key (`cold.vkey`), used by
+    /// `register-spo` when `--cold-vkey` is not given.
+    ///
+    /// The public half, and the one a node keeps in the air-gapped flow: the
+    /// signature comes from the machine that holds `cold.skey`, while the node
+    /// needs only this to derive the pool id and check what it was handed. A
+    /// Cardano TextEnvelope is accepted as-is; so is raw 32-byte hex.
+    ///
+    /// Unlike [`Self::cold_skey_path`] this is not a secret, so setting it on a
+    /// networked node costs nothing.
+    pub cold_vkey_path: Option<String>,
     /// register_spo R2 min-stake threshold (lovelace). A registering pool's
     /// `active_stake` must be `>=` this to build register_spo / join the DKG
     /// candidate set. `None` → no gate configured.
@@ -488,6 +515,7 @@ impl Default for CardanoConfig {
             network_magic: None,
             mnemonic: None,
             cold_skey_path: None,
+            cold_vkey_path: None,
             min_stake_lovelace: None,
             stake_source: None,
             demo_exclude_unstaked: false,
