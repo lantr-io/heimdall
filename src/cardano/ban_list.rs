@@ -765,7 +765,7 @@ impl BanPolicyParams {
             ));
         };
         Ok(Self {
-            fault_proof_policies: Self::fault_policies_from_config(cardano)?,
+            fault_proof_policies: Self::fault_policies(cardano, config)?,
             base_ban_duration_ms: published.base_ban_duration_ms,
             max_faults_before_permanent: published.max_faults_before_permanent,
             max_validity_window_ms: published.max_validity_window_ms,
@@ -800,7 +800,10 @@ impl BanPolicyParams {
             Ok(v)
         };
         Ok(Self {
-            fault_proof_policies: Self::fault_policies_from_config(cardano)?,
+            // `None`: genesis is the moment BEFORE a Config exists, so the
+            // derivation falls back to the local registry keys, which genesis
+            // necessarily has.
+            fault_proof_policies: Self::fault_policies(cardano, None)?,
             base_ban_duration_ms: check(base_ban_duration_ms, "base-ban-duration-ms", 1)?,
             max_faults_before_permanent: check(
                 max_faults_before_permanent,
@@ -809,6 +812,113 @@ impl BanPolicyParams {
             )?,
             max_validity_window_ms: check(max_validity_window_ms, "max-validity-window-ms", 0)?,
         })
+    }
+
+    /// The authorized fault-verifier policy set: derived from the embedded
+    /// blueprint, or taken from `[cardano]` and cross-checked against it.
+    ///
+    /// These are not per-bridge values — each is
+    /// `hash(fault_verifier code ++ registry policy)`, so the code half is a
+    /// build artifact of a contracts release (WI-066) and the registry half is
+    /// already derived. Typing them by hand meant three more chances to name a
+    /// policy no deployment has, and the failure was silent: `spo_bans` bakes
+    /// the list into its own id, so a wrong entry yields a ban address nobody
+    /// writes to — a permanently EMPTY ban list, with banned SPOs back in the
+    /// roster and nothing in any log. Two checked-in configs still carry ids
+    /// from an older blueprint for exactly this reason.
+    ///
+    /// The list is ORDER-SENSITIVE for the same reason (`spo_bans_script` takes
+    /// it as an ordered array and does not sort), so the derivation fixes the
+    /// order — Round 1, Round 2, equivocation — rather than leaving it to
+    /// whoever typed the config.
+    fn fault_policies(
+        cardano: &crate::config::CardanoConfig,
+        config: Option<&crate::cardano::config_params::ConfigParams>,
+    ) -> Result<Vec<[u8; 28]>, BanListError> {
+        let derived = Self::derived_fault_policies(cardano, config)?;
+        if cardano.fault_proof_policies.is_empty() {
+            return derived.ok_or_else(|| {
+                BanListError::Config(
+                    "cannot derive the fault-verifier policies: they are \
+                     hash(verifier code ++ registry policy), and this node cannot resolve the \
+                     registry policy. Set cardano.registry_bootstrap, cardano.treasury_bootstrap \
+                     and cardano.config_nft_policy_id — or point this node at a bridge whose \
+                     Config publishes the registry identity"
+                        .into(),
+                )
+            });
+        }
+        // An explicit list still overrides — for a bridge whose verifiers were
+        // deployed from other code — but it is checked against what this build
+        // derives, so a stale copy is named instead of silently used.
+        let typed = Self::fault_policies_from_config(cardano)?;
+        if let Some(derived) = derived
+            && typed != derived
+        {
+            return Err(BanListError::Config(format!(
+                "cardano.fault_proof_policies does not match what this heimdall derives from \
+                 its embedded blueprint.\n  configured: {}\n  derived:    {}\nThe list is baked \
+                 into the spo_bans policy id, so the wrong one reads a ban address no \
+                 deployment writes to — an empty ban list, with banned SPOs back in your \
+                 roster. Delete the key to use the derived set, unless this bridge's verifiers \
+                 really were deployed from other contracts",
+                typed.iter().map(hex::encode).collect::<Vec<_>>().join(", "),
+                derived
+                    .iter()
+                    .map(hex::encode)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )));
+        }
+        Ok(typed)
+    }
+
+    /// The three policy ids this build's blueprint derives, when the registry
+    /// policy is resolvable. `None` means it is not — which is a configuration
+    /// problem only if nothing was typed.
+    fn derived_fault_policies(
+        cardano: &crate::config::CardanoConfig,
+        config: Option<&crate::cardano::config_params::ConfigParams>,
+    ) -> Result<Option<Vec<[u8; 28]>>, BanListError> {
+        use crate::cardano::blueprint;
+        let Ok(Some(source)) =
+            crate::cardano::roster::RegistryRosterSource::resolve(cardano, config)
+        else {
+            return Ok(None);
+        };
+        let Some(registry) = hex::decode(&source.registry_policy_hex)
+            .ok()
+            .and_then(|v| <[u8; 28]>::try_from(v).ok())
+        else {
+            return Ok(None);
+        };
+        let bp = blueprint::load_blueprint(cardano.registry_blueprint.as_deref())
+            .map_err(BanListError::Config)?;
+        let derive =
+            |f: fn(
+                &str,
+                &[u8; 28],
+            )
+                -> Result<blueprint::ParameterizedScript, blueprint::BlueprintError>,
+             what: &str| {
+                f(&bp, &registry)
+                    .map(|s| s.hash)
+                    .map_err(|e| BanListError::Config(format!("parameterize {what}: {e}")))
+            };
+        Ok(Some(vec![
+            derive(
+                blueprint::fault_verifier_round1_script,
+                "fault_verifier_round1",
+            )?,
+            derive(
+                blueprint::fault_verifier_round2_script,
+                "fault_verifier_round2",
+            )?,
+            derive(
+                blueprint::fault_verifier_equivocation_script,
+                "fault_verifier_equivocation",
+            )?,
+        ]))
     }
 
     /// The authorized fault-verifier policy set, parsed from `[cardano]`.
@@ -1994,5 +2104,91 @@ mod tests {
         .unwrap();
         let round1 = blueprint::fault_verifier_round1_script(&json, &registry.hash).unwrap();
         round1.hash_hex()
+    }
+}
+
+#[cfg(test)]
+mod derived_fault_policy_tests {
+    use super::*;
+
+    fn bridge_keys() -> crate::config::CardanoConfig {
+        crate::config::CardanoConfig {
+            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            treasury_bootstrap: Some(format!("{}:0", "aa".repeat(32))),
+            config_nft_policy_id: Some("77".repeat(28)),
+            network: Some("preprod".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// WI-066: the three fault-verifier ids are derived, not typed. Each is
+    /// `hash(verifier code ++ registry policy)` — both halves already known to
+    /// the node — so requiring them by hand was three more chances to name a
+    /// policy no deployment has.
+    #[test]
+    fn the_fault_policies_are_derived_when_the_config_names_none() {
+        let cardano = bridge_keys();
+        assert!(cardano.fault_proof_policies.is_empty(), "nothing typed");
+        let derived = BanPolicyParams::fault_policies(&cardano, None).expect("derives");
+        assert_eq!(derived.len(), 3);
+        let mut distinct = derived.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3, "ban_config_ok requires 3 DISTINCT ids");
+    }
+
+    /// The order is part of the value: `spo_bans_script` takes the list as an
+    /// ordered array and does not sort, so the derived order is fixed here
+    /// rather than left to whoever typed the config.
+    #[test]
+    fn the_derived_order_is_round1_round2_equivocation() {
+        let cardano = bridge_keys();
+        let derived = BanPolicyParams::fault_policies(&cardano, None).expect("derives");
+        let source = crate::cardano::roster::RegistryRosterSource::resolve(&cardano, None)
+            .unwrap()
+            .unwrap();
+        let registry: [u8; 28] = hex::decode(&source.registry_policy_hex)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let bp = crate::cardano::blueprint::load_blueprint(None).unwrap();
+        assert_eq!(
+            derived[0],
+            crate::cardano::blueprint::fault_verifier_round1_script(&bp, &registry)
+                .unwrap()
+                .hash
+        );
+        assert_eq!(
+            derived[2],
+            crate::cardano::blueprint::fault_verifier_equivocation_script(&bp, &registry)
+                .unwrap()
+                .hash
+        );
+    }
+
+    /// A typed list still overrides — but it is checked, so the stale copies
+    /// sitting in checked-in configs today are NAMED instead of quietly
+    /// deriving a ban address nobody writes to.
+    #[test]
+    fn a_typed_list_that_disagrees_with_the_derivation_is_refused() {
+        let mut cardano = bridge_keys();
+        cardano.fault_proof_policies = vec!["11".repeat(28), "22".repeat(28), "33".repeat(28)];
+        let err = BanPolicyParams::fault_policies(&cardano, None)
+            .expect_err("a stale list must be refused, not used");
+        let msg = err.to_string();
+        assert!(msg.contains("does not match"), "{msg}");
+        assert!(msg.contains("empty ban list"), "{msg}");
+
+        // …and one that agrees is accepted, so the override still works.
+        let derived = {
+            let mut c = bridge_keys();
+            c.fault_proof_policies.clear();
+            BanPolicyParams::fault_policies(&c, None).unwrap()
+        };
+        cardano.fault_proof_policies = derived.iter().map(hex::encode).collect();
+        assert_eq!(
+            BanPolicyParams::fault_policies(&cardano, None).unwrap(),
+            derived
+        );
     }
 }

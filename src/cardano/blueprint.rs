@@ -28,6 +28,41 @@ use pallas_primitives::{MaybeIndefArray, PlutusData};
 
 use crate::cardano::plutus::{array, bytes, int, int_from_u64};
 
+/// The contracts this build was compiled against (WI-066).
+///
+/// The blueprint is NOT a per-bridge value: a policy id is
+/// `hash(compiled code ++ bootstrap outref)`, so the code is a build artifact of
+/// a contracts RELEASE and the outref is what tells one bridge from another.
+/// Asking each operator for the file meant asking for a value with exactly one
+/// correct answer per heimdall version, whose wrong answers are silent — a stale
+/// blueprint derives a policy id no deployment has, so the node reads an empty
+/// registry and reports nothing. It has cost this project twice already.
+///
+/// Embedding also makes the upgrade atomic: there is no file to diverge from the
+/// binary, because it IS the binary. See `assets/README.md` for its provenance
+/// and the refresh procedure.
+pub const EMBEDDED_BLUEPRINT: &str = include_str!("../../assets/plutus.json");
+
+/// The upstream commit `EMBEDDED_BLUEPRINT` was taken from, for `--version` and
+/// for the startup report — so a node can say which contracts it speaks without
+/// anyone diffing a 400 kB file.
+pub const EMBEDDED_BLUEPRINT_COMMIT: &str = "4d5516e149d76893280d06d184250f57d3c43175";
+
+/// The blueprint to derive scripts from: the operator's file when one is named,
+/// the embedded copy otherwise.
+///
+/// `path` survives as a development escape hatch and for a bridge deployed from
+/// a contracts release this heimdall predates. It is no longer the normal path,
+/// and nothing requires it.
+pub fn load_blueprint(path: Option<&str>) -> Result<std::borrow::Cow<'static, str>, String> {
+    match path.map(str::trim).filter(|p| !p.is_empty()) {
+        None => Ok(std::borrow::Cow::Borrowed(EMBEDDED_BLUEPRINT)),
+        Some(p) => std::fs::read_to_string(p)
+            .map(std::borrow::Cow::Owned)
+            .map_err(|e| format!("read blueprint {p}: {e}")),
+    }
+}
+
 /// Blueprint title of the spos_registry minting policy (the membership-token
 /// policy; its hash is the `registry_policy_id`).
 pub const SPOS_REGISTRY_TITLE: &str = "bitcoin/spos_registry.spo_registry.mint";
@@ -647,6 +682,75 @@ mod tests {
         assert_eq!(
             treasury.hash_hex(),
             "691f2dd908d5e5dd18d7c8ed526caea8465757011ae20d7e6c308a21"
+        );
+    }
+}
+
+#[cfg(test)]
+mod embedded_blueprint_tests {
+    use super::*;
+
+    /// A bootstrap outref and Config policy with no meaning beyond being FIXED,
+    /// so the only variable left is the embedded blueprint itself.
+    const BOOTSTRAP_TX: [u8; 32] = [0x11; 32];
+    const CONFIG_POLICY: [u8; 28] = [0x22; 28];
+
+    /// The embedded blueprint decides every policy id heimdall derives, and a
+    /// refresh that moves them silently is exactly the failure embedding exists
+    /// to prevent — it has bitten this project twice (the preprod 3-pool DKG
+    /// needed a specific blueprint pin, and the scenario configs still carry
+    /// fault-verifier hashes from an older one).
+    ///
+    /// So the ids are pinned against fixed inputs. Replacing `assets/plutus.json`
+    /// then fails HERE, with a visible diff, making a contracts upgrade a
+    /// deliberate act rather than a quiet drift. Refreshing the blueprint means
+    /// updating these values in the same commit — see `assets/README.md`.
+    #[test]
+    fn the_embedded_blueprint_derives_pinned_policy_ids() {
+        let bp = EMBEDDED_BLUEPRINT;
+        let treasury = treasury_info_script(bp, &BOOTSTRAP_TX, 0, &CONFIG_POLICY).unwrap();
+        let registry = spos_registry_script(bp, &BOOTSTRAP_TX, 0, &treasury.hash).unwrap();
+        let r1 = fault_verifier_round1_script(bp, &registry.hash).unwrap();
+        let r2 = fault_verifier_round2_script(bp, &registry.hash).unwrap();
+        let eq = fault_verifier_equivocation_script(bp, &registry.hash).unwrap();
+
+        assert_eq!(
+            treasury.hash_hex(),
+            "1ee906cb4288e370dd3fe32bc02e96e147628034fdc3e5cc1d6e95f6",
+            "treasury_info"
+        );
+        assert_eq!(
+            registry.hash_hex(),
+            "739da7b8bb0974fd54ec353f126018e7830f18bbc0516c5c3b2f0f3b",
+            "spos_registry"
+        );
+        assert_eq!(
+            r1.hash_hex(),
+            "c8d0bbd6f6c06bcf03afd953c63af4cd3a01e4c41a7a04fa8a96867b",
+            "fault_verifier round1"
+        );
+        assert_eq!(
+            r2.hash_hex(),
+            "6e20809f597c883e9c59752964f51efa320db278f69f91284ec7a929",
+            "fault_verifier round2"
+        );
+        assert_eq!(
+            eq.hash_hex(),
+            "66cc08531fa362a08ced184141dae0f2f8b58bfad5adc218de72b6b9",
+            "fault_verifier equivocation"
+        );
+    }
+
+    /// The provenance recorded beside the file is what lets an operator answer
+    /// "which contracts does this binary speak?" without diffing 400 kB.
+    #[test]
+    fn the_embedded_blueprint_is_parseable_and_attributed() {
+        assert_eq!(EMBEDDED_BLUEPRINT_COMMIT.len(), 40, "a full git sha");
+        let v: serde_json::Value = serde_json::from_str(EMBEDDED_BLUEPRINT).expect("valid JSON");
+        assert_eq!(v["preamble"]["compiler"]["version"], "v1.1.23+8949565");
+        assert!(
+            v["validators"].as_array().is_some_and(|a| !a.is_empty()),
+            "the blueprint must carry validators"
         );
     }
 }

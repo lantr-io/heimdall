@@ -479,14 +479,14 @@ impl RegistryRosterSource {
     /// Parameterize the registry + `treasury_info` scripts from the blueprint
     /// and derive their addresses. `mainnet` picks the address network tag.
     pub fn from_blueprint(
-        blueprint_path: &str,
+        blueprint_path: Option<&str>,
         registry_bootstrap: &str,
         treasury_bootstrap: &str,
         config_policy_id: &[u8; 28],
         mainnet: bool,
     ) -> Result<Self, RosterError> {
-        let blueprint_json = std::fs::read_to_string(blueprint_path)
-            .map_err(|e| RosterError::Config(format!("read blueprint {blueprint_path}: {e}")))?;
+        let blueprint_json = crate::cardano::blueprint::load_blueprint(blueprint_path)
+            .map_err(RosterError::Config)?;
         let (reg_tx_id, reg_index) = parse_outref(registry_bootstrap)
             .map_err(|e| RosterError::Config(format!("registry bootstrap outref: {e}")))?;
         let (tsy_tx_id, tsy_index) = parse_outref(treasury_bootstrap)
@@ -580,12 +580,12 @@ impl RegistryRosterSource {
     /// — is the failure publishing #10 exists to prevent.
     pub fn with_derived_script(
         mut self,
-        blueprint_path: &str,
+        blueprint_path: Option<&str>,
         treasury_bootstrap: &str,
         config_policy_id: &[u8; 28],
     ) -> Result<Self, RosterError> {
-        let blueprint_json = std::fs::read_to_string(blueprint_path)
-            .map_err(|e| RosterError::Config(format!("read blueprint {blueprint_path}: {e}")))?;
+        let blueprint_json = crate::cardano::blueprint::load_blueprint(blueprint_path)
+            .map_err(RosterError::Config)?;
         let (tsy_tx_id, tsy_index) = parse_outref(treasury_bootstrap)
             .map_err(|e| RosterError::Config(format!("treasury bootstrap outref: {e}")))?;
         // Rev 5.5 [PRE-3]: the treasury script compiles from its OWN one-shot
@@ -619,15 +619,19 @@ impl RegistryRosterSource {
     pub fn from_config(
         cardano: &crate::config::CardanoConfig,
     ) -> Result<Option<Self>, RosterError> {
+        // The blueprint is NOT among the required fields since WI-066: it is
+        // embedded in the binary, so `registry_blueprint` is an override rather
+        // than an input. What still identifies the BRIDGE is the pair of
+        // bootstrap outrefs plus the Config policy.
+        let blueprint_path = cardano.registry_blueprint.as_deref();
         let fields = (
-            cardano.registry_blueprint.as_deref(),
             cardano.registry_bootstrap.as_deref(),
             cardano.treasury_bootstrap.as_deref(),
             cardano.config_nft_policy_id.as_deref(),
         );
-        let (blueprint_path, bootstrap, treasury_bootstrap, config_policy_hex) = match fields {
-            (None, None, None, _) => return Ok(None),
-            (Some(b), Some(r), Some(t), Some(c)) => (b, r, t, c),
+        let (bootstrap, treasury_bootstrap, config_policy_hex) = match fields {
+            (None, None, _) => return Ok(None),
+            (Some(r), Some(t), Some(c)) => (r, t, c),
             _ => {
                 return Err(RosterError::Config(
                     "set all of cardano.registry_blueprint, cardano.registry_bootstrap, \
@@ -695,12 +699,14 @@ impl RegistryRosterSource {
             crate::cardano::config_params::TREASURY_INFO_ASSET_NAME,
             mainnet,
         );
-        // The blueprint is a build artifact, not a per-bridge value, so a node
-        // may legitimately still have it while typing none of the identifiers.
-        // Where it does, compile the script for Update-Y — which also checks the
-        // derivation against #10.
-        let (Some(blueprint_path), Some(treasury_bootstrap), Some(config_policy_hex)) = (
-            cardano.registry_blueprint.as_deref(),
+        // The blueprint is embedded (WI-066), so every node can compile the
+        // treasury_info script and perform the Update-Y handoff — this used to
+        // require an operator-supplied file, which meant the handoff silently
+        // depended on whether someone had copied one. What is still needed is
+        // the bridge's own identity: its treasury one-shot and Config policy.
+        // The derivation is checked against the published #10 either way.
+        let blueprint_path = cardano.registry_blueprint.as_deref();
+        let (Some(treasury_bootstrap), Some(config_policy_hex)) = (
             cardano.treasury_bootstrap.as_deref(),
             cardano.config_nft_policy_id.as_deref(),
         ) else {
@@ -1221,16 +1227,26 @@ mod tests {
     /// A node with NO Config to read falls back to its local keys, and a
     /// half-configured set of them is a fault rather than a silent fixture.
     ///
-    /// Rev 5.4 removed the third case this once covered — a Config that predates
-    /// the registry append. The datum now carries the identity mandatorily, so
-    /// `parse_config_datum` refuses such a Config outright and no `ConfigParams`
-    /// can express it.
+    /// WI-066 took the blueprint OUT of that set: it is embedded in the binary,
+    /// so the three keys below are now a complete local configuration and the
+    /// same input that used to be a fault resolves. That is the point of the
+    /// change — the operator supplies what identifies the bridge, never a build
+    /// artifact — so it is asserted rather than assumed.
     #[test]
     fn no_config_falls_back_to_local_keys_and_half_configured_keys_are_a_fault() {
-        let half = crate::config::CardanoConfig {
+        let complete = crate::config::CardanoConfig {
             registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
             treasury_bootstrap: Some(format!("{}:0", "aa".repeat(32))),
             config_nft_policy_id: Some("77".repeat(28)),
+            ..Default::default()
+        };
+        RegistryRosterSource::resolve(&complete, None)
+            .expect("no blueprint needed: it is embedded")
+            .expect("the three bridge keys are a complete local configuration");
+
+        // Genuinely half — the bridge's own identity is incomplete.
+        let half = crate::config::CardanoConfig {
+            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
             ..Default::default()
         };
         let err = RegistryRosterSource::resolve(&half, None)
@@ -1270,7 +1286,7 @@ mod tests {
         let err = src
             .clone()
             .with_derived_script(
-                &path.to_string_lossy(),
+                Some(&path.to_string_lossy()),
                 &format!("{}:0", "aa".repeat(32)),
                 &[0x77; 28],
             )
@@ -1293,7 +1309,7 @@ mod tests {
         let agreeing =
             RegistryRosterSource::from_policy_ids(&[0xc1; 28], &derived.hash, b"TMTx", false)
                 .with_derived_script(
-                    &path.to_string_lossy(),
+                    Some(&path.to_string_lossy()),
                     &format!("{}:0", "aa".repeat(32)),
                     &[0x77; 28],
                 )
@@ -1408,5 +1424,40 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+}
+
+#[cfg(test)]
+mod embedded_blueprint_roster_tests {
+    use super::*;
+
+    /// WI-066's operator-visible win: a node that names the bridge but supplies
+    /// NO blueprint can still perform the Update-Y key handoff, because the
+    /// blueprint is in the binary.
+    ///
+    /// Before, `can_hand_off_key()` was false for such a node — so whether a
+    /// bridge could rotate its FROST key depended on whether its operators had
+    /// each copied a build artifact into place, and a node that had not said so
+    /// only in a startup warning.
+    #[test]
+    fn a_node_with_no_blueprint_can_still_hand_off_the_key() {
+        let cardano = crate::config::CardanoConfig {
+            registry_bootstrap: Some(format!("{}:0", "bb".repeat(32))),
+            treasury_bootstrap: Some(format!("{}:0", "aa".repeat(32))),
+            config_nft_policy_id: Some("77".repeat(28)),
+            network: Some("preprod".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            cardano.registry_blueprint.is_none(),
+            "the point of the test: nothing supplied"
+        );
+        let source = RegistryRosterSource::resolve(&cardano, None)
+            .expect("resolves")
+            .expect("configured");
+        assert!(
+            source.can_hand_off_key(),
+            "the embedded blueprint compiles treasury_info, so the handoff is available"
+        );
     }
 }

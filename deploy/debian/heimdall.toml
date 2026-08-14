@@ -189,14 +189,12 @@ stake_source = "blockfrost"
 # Set them ONLY for a bridge deployed before those fields existed (or for the
 # demo fixture roster, which sets none of them).
 #
-# One exception, and only if this node should perform the DKG key handoff:
-# spending the treasury_info state UTxO (Update-Y) needs the COMPILED script, not
-# just the policy id the Config publishes, so a handoff-capable node still sets
-# registry_blueprint. What it derives is checked against the published #10, so a
-# wrong blueprint is refused rather than used. Startup step 7 says which of the
-# two you are. Without it this node still runs DKG and signs; it just cannot be
-# the one that rotates the key.
-#registry_blueprint = "/var/lib/heimdall/plutus.json"
+# The contract blueprint is COMPILED INTO the binary (WI-066) and is not a key.
+# It is a build artifact of a contracts release, identical for every operator of
+# a given heimdall version — the opposite of a per-bridge value — and a stale
+# copy derived a policy id no deployment had, so the node read an empty registry
+# and said nothing. --blueprint overrides it for development, or for a bridge
+# built from a contracts release this heimdall predates.
 #registry_bootstrap = "<tx_hash>:<index>"
 
 # Ban list. LEAVE THIS UNSET on any bridge whose Config publishes the ban policy
@@ -210,11 +208,16 @@ stake_source = "blockfrost"
 # why the daemon refuses to start with the registry keys set and no ban list from
 # either source.
 #
-# Set these ONLY for a bridge deployed before #17 existed, and then copy them
-# exactly from the deployment notes: each is an input to the ban policy's own
+# Set ban_bootstrap ONLY for a bridge deployed before #8 existed, copying it
+# exactly from the deployment notes: it is an input to the ban policy's own
 # identifier, so one wrong value derives a valid-looking address holding no bans
-# at all. On that route the registry keys above are required too — the ban policy
-# is parameterized by the registry policy.
+# at all.
+#
+# fault_proof_policies is DERIVED (WI-066) — each id is hash(verifier code ++
+# registry policy), and heimdall has both. Leave it unset. Setting it still
+# overrides, for a bridge whose verifiers came from other contracts, but the
+# list is checked against what this build derives and a stale copy is refused
+# rather than used.
 #ban_bootstrap = "<tx_hash>:<index>"
 #fault_proof_policies = ["<28-byte hex>", "<28-byte hex>", "<28-byte hex>"]
 
