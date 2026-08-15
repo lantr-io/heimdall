@@ -503,10 +503,16 @@ pub struct EpochConfig {
     /// Upper bound on how long the batch loop sleeps between grid checks.
     ///
     /// NOT a protocol value and deliberately not an operator key: it decides read
-    /// rate, never TM bytes. The grid pitch is hours (`tm_batch_interval`), so the
-    /// loop sleeps `min(slots until B_i, this)` — the final hop is exact, and the
-    /// ceiling only bounds how stale this node's view of the grid may get while it
-    /// waits.
+    /// rate, never TM bytes. The loop sleeps `min(slots until the next
+    /// opportunity, this)` in BOTH waiting states — before `B_1` and after
+    /// serving one — and because that hop shrinks as the opportunity approaches,
+    /// the final sleep lands on it whatever this value is. The ceiling only bounds
+    /// how stale a waiting node's view of the grid may get.
+    ///
+    /// The distinction matters more than it looks: a flat poll here would have
+    /// each node notice `B_i` at its own offset past it, and `CollectPegins` reads
+    /// the peg-in source once at that moment — so the offsets would become
+    /// differences in what gets frozen.
     pub batch_poll_ceiling: Duration,
     /// Depositor refund timelock (BTC blocks) baked into the peg-in
     /// Taproot's depositor refund leaf. Spec default is 4320 (~30 days);

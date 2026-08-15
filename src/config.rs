@@ -166,11 +166,12 @@ pub struct FederationMemberConfig {
 /// Upper bound on how long the epoch machine's batch loop sleeps between grid
 /// checks ([`EpochConfig::batch_poll_ceiling`]).
 ///
-/// Not an operator key on purpose. It decides read rate and nothing else — the
-/// loop sleeps `min(slots until B_i, this)`, so the hop onto the opportunity is
-/// exact whatever this is — and every value an operator CAN type is a value two
-/// operators can differ on. Five minutes is ~70 grid reads over the spec's 6 h
-/// example pitch.
+/// Not an operator key on purpose. It decides read rate and nothing else: the
+/// loop sleeps `min(slots until the next opportunity, this)`, and that hop
+/// shrinks as the opportunity approaches, so the sleep that lands on it is exact
+/// whatever this value is. Every value an operator CAN type is a value two
+/// operators can differ on, and this one must not be able to move a freeze point.
+/// Five minutes is ~70 grid reads over the spec's 6 h example pitch.
 const BATCH_POLL_CEILING: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Deserialize)]

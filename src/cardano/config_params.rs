@@ -925,7 +925,13 @@ pub async fn batch_at(
         }
     };
     match grid.current(snapshot.slot) {
-        Some(b) => BatchWindow::Open(b),
+        // The following opportunity rides along: `current` answers the same B_i
+        // for the whole interval, so a node that has built for it needs the NEXT
+        // one to sleep towards or it can only poll blindly past B_{i+1}.
+        Some(b) => BatchWindow::Open {
+            batch: b,
+            next: grid.next(snapshot.slot),
+        },
         None => {
             let next = grid.next(snapshot.slot);
             info!(

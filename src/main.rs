@@ -6484,7 +6484,7 @@ fn run_mover(
         use heimdall::epoch::batch::BatchWindow;
         match probe.as_ref().map_or(BatchWindow::NoGrid, |p| p.batch) {
             // An opportunity is open and this process has not built for it yet.
-            BatchWindow::Open(b) if built_batch != Some(b.index) => {
+            BatchWindow::Open { batch: b, .. } if built_batch != Some(b.index) => {
                 built_batch = Some(b.index);
                 tick += 1;
                 info!(
@@ -6493,7 +6493,7 @@ fn run_mover(
                 );
             }
             // Already built for this opportunity: the grid says wait for the next one.
-            BatchWindow::Open(b) => {
+            BatchWindow::Open { batch: b, .. } => {
                 if once {
                     info!("[mover] batch B_{} already built — nothing to do", b.index);
                     return Ok(());

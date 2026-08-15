@@ -635,10 +635,18 @@ pub struct BlockfrostCardanoChain {
     /// (initial_btc_treasury_utxo) anchors the TM chain. Required for treasury resolution.
     config_address: Option<String>,
     config_nft_unit: Option<String>,
-    /// The txid of the last TM this process submitted. `query_treasury` reports
+    /// The last TM this process submitted, and when. `query_treasury` reports
     /// `btc_confirmed = false` until that txid becomes the Confirmed chain tip, so the
     /// epoch machine waits for its own in-flight TM instead of double-spending the tip.
-    last_submitted_txid: Mutex<Option<bitcoin::Txid>>,
+    ///
+    /// The instant is what releases it: the bridge's published `tm_recovery_window`
+    /// applies to this guard exactly as it does to the on-chain in-flight scan, and
+    /// without it the node that SUBMITTED a movement that never confirms is the one
+    /// node that can never recover — its peers time the record out and move on while
+    /// it blocks itself for ever. A local `Instant` is the right clock here because
+    /// this guard is itself process-local (a restart clears it, which is the case
+    /// the on-chain scan covers).
+    last_submitted_txid: Mutex<Option<(bitcoin::Txid, std::time::Instant)>>,
     /// Highest epoch `await_epoch_boundary` has already delivered, so a second
     /// call waits for the chain to move past it instead of firing again.
     last_boundary_epoch: Mutex<Option<u64>>,
@@ -1634,6 +1642,22 @@ impl CardanoChain for BlockfrostCardanoChain {
             "{}{}",
             self.treasury_policy_id, self.treasury_asset_name_hex
         );
+        // `tm_recovery_window`, the bridge's PUBLISHED recovery deadline (Config
+        // `params[0]`), finally acting on something. Without it a READABLE movement that
+        // never confirms blocks the tip permanently: every later batch opportunity sees a
+        // movement in flight and passes unused, for ever, with nothing in any log naming
+        // the cause. Past the window the record stops blocking, so the next opportunity
+        // builds a replacement spending the same head — the shape §Stuck-TM recovery
+        // describes ("the replacement and the stuck original both spend the same head;
+        // Bitcoin confirms exactly one").
+        //
+        // It comes from the CHAIN, not from a local key, for the usual reason: it decides
+        // which head a TM spends, so two operators on different values build different TM
+        // bytes. A bridge publishing 0 (no window) keeps the old block-for-ever behaviour
+        // rather than inventing a default.
+        let recovery_window = u64::try_from(config.params.tunables.schedule.tm_recovery_window)
+            .ok()
+            .filter(|secs| *secs > 0);
         let TmScan {
             in_flight_spends,
             parse_failures,
@@ -1644,22 +1668,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             &self.bf_project_id,
             &self.treasury_address,
             &asset_unit,
-            // `tm_recovery_window`, the bridge's PUBLISHED recovery deadline (Config
-            // `params[0]`), finally acting on something. Without it a movement that never
-            // confirms blocks the tip permanently: every later batch opportunity sees a
-            // movement in flight and passes unused, for ever, with nothing in any log
-            // naming the cause. Past the window the record stops blocking, so the next
-            // opportunity builds a replacement spending the same head — which is the
-            // shape §Stuck-TM recovery describes ("the replacement and the stuck original
-            // both spend the same head; Bitcoin confirms exactly one").
-            //
-            // It comes from the CHAIN, not from a local key, for the usual reason: it
-            // decides which head a TM spends, so two operators on different values build
-            // different TM bytes. A bridge publishing 0 (no window) keeps the old
-            // block-for-ever behaviour rather than inventing a default.
-            u64::try_from(config.params.tunables.schedule.tm_recovery_window)
-                .ok()
-                .filter(|secs| *secs > 0),
+            recovery_window,
         )
         .await
         .map_err(EpochError::Chain)?;
@@ -1795,10 +1804,31 @@ impl CardanoChain for BlockfrostCardanoChain {
         // Cardano post — the in-flight scan catches cross-process movements, this catches our
         // own). An unreadable datum at the NFT-gated TM address counts as possibly-in-flight
         // (fail closed, never double-post).
+        //
+        // `tm_recovery_window` releases this guard on the same terms as the
+        // on-chain scan below. Without that the node that SUBMITTED a movement
+        // that never confirms is the only one that never recovers: its peers time
+        // the record out and take the next opportunity, while it holds itself
+        // blocked for ever on its own bookkeeping.
         let own_pending = match *self.last_submitted_txid.lock().unwrap() {
             None => false,
-            Some(t) => outpoint.txid != t,
+            Some((t, _)) if outpoint.txid == t => false,
+            Some((t, at)) => match recovery_window {
+                Some(w) if at.elapsed().as_secs() > w => {
+                    warn!(
+                        "[blockfrost] our submitted movement {t} has not become the head in {}s \
+                         (> tm_recovery_window {w}s) — no longer treating it as in flight",
+                        at.elapsed().as_secs()
+                    );
+                    false
+                }
+                _ => true,
+            },
         };
+        // The other two terms have NO deadline and are not meant to: they mean
+        // "there is a movement at the TM address we could not read", so a node
+        // that timed them out would build while blind to what that movement swept.
+        // A movement heimdall CAN read is what `tm_recovery_window` governs.
         let btc_confirmed = !own_pending
             && !in_flight_spends.contains(&outpoint)
             && opaque_unconfirmed == 0
@@ -2180,7 +2210,8 @@ impl CardanoChain for BlockfrostCardanoChain {
         // txid becomes the Confirmed chain tip, so the epoch machine waits for its own
         // movement instead of double-spending the tip outpoint.
         if let Ok(tx) = deserialize::<Transaction>(tx_bytes) {
-            *self.last_submitted_txid.lock().unwrap() = Some(tx.compute_txid());
+            *self.last_submitted_txid.lock().unwrap() =
+                Some((tx.compute_txid(), std::time::Instant::now()));
         }
 
         // Publish the oracle update to Cardano if enabled.

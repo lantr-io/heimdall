@@ -40,6 +40,27 @@ use crate::epoch::traits::{
 };
 use crate::http::wire::{DkgNamespace, SignNamespace};
 
+/// The opportunity one interval after `b`, in the mock's own units: a real grid
+/// has a pitch of hours, but the loop only ever compares indices and subtracts
+/// slots, so a pitch of one slot keeps a test's waits at the poll floor.
+fn following(b: crate::epoch::batch::BatchSlot) -> crate::epoch::batch::BatchSlot {
+    crate::epoch::batch::BatchSlot {
+        index: b.index + 1,
+        slot: b.slot + 1,
+        cutoff_slot: b.cutoff_slot + 1,
+    }
+}
+
+/// An open window at `batch` that also names what follows it — the shape a real
+/// grid always produces, and the one the batch loop sleeps towards once it has
+/// built for `batch`.
+pub fn open_at(batch: crate::epoch::batch::BatchSlot) -> crate::epoch::batch::BatchWindow {
+    crate::epoch::batch::BatchWindow::Open {
+        batch,
+        next: Some(following(batch)),
+    }
+}
+
 /// A stand-in `por_id` for a fixture peg-out.
 ///
 /// A fixture peg-out has no Cardano UTxO, so it has no real
@@ -276,9 +297,7 @@ impl MockCardanoChain {
     /// Report an open TM batch opportunity, so the batch loop has one to take and
     /// `BuildTm` applies its membership cutoff.
     pub fn with_batch(self, batch: crate::epoch::batch::BatchSlot) -> Self {
-        self.with_batch_window(Arc::new(Mutex::new(
-            crate::epoch::batch::BatchWindow::Open(batch),
-        )))
+        self.with_batch_window(Arc::new(Mutex::new(open_at(batch))))
     }
 
     /// Share one grid position across several nodes' mock chains, so a test can
@@ -637,12 +656,8 @@ impl CardanoChain for MockCardanoChain {
         // node's batch loop waiting out the opportunity it just used.
         if self.advance_batch_on_submit {
             let mut w = self.batch.lock().unwrap();
-            if let crate::epoch::batch::BatchWindow::Open(b) = *w {
-                *w = crate::epoch::batch::BatchWindow::Open(crate::epoch::batch::BatchSlot {
-                    index: b.index + 1,
-                    slot: b.slot + 1,
-                    cutoff_slot: b.cutoff_slot + 1,
-                });
+            if let crate::epoch::batch::BatchWindow::Open { batch, .. } = *w {
+                *w = open_at(following(batch));
             }
         }
         if let Some(rpc) = &self.btc_rpc {

@@ -1194,9 +1194,15 @@ enum BatchTurn {
 /// of the batch. So every SPO waits for the same absolute `B_i` and reads the same
 /// chain state there.
 ///
-/// The wait is `min(slots until B_i, config.batch_poll_ceiling)`: the last hop is
-/// exact, and the ceiling keeps a node from sleeping hours on a grid it stopped
-/// re-reading.
+/// Every wait is the EXACT hop to the opportunity being waited for, bounded by
+/// `config.batch_poll_ceiling` — see [`hop_to_opportunity`]. That has to hold in
+/// both waiting states, not just before `B_1`: [`GridParams::current`] reports the
+/// same `B_i` for a whole interval, so a running node sees `Open` continuously and
+/// a blind poll would have each node notice `B_{i+1}` at its own offset past it.
+/// `collect_pegins_phase` reads the peg-in source once at that moment, so those
+/// offsets are differences in what gets frozen.
+///
+/// [`GridParams::current`]: crate::epoch::batch::GridParams::current
 async fn await_batch_opportunity(
     chain: &Arc<dyn CardanoChain>,
     config: &EpochConfig,
@@ -1209,7 +1215,7 @@ async fn await_batch_opportunity(
         let snapshot = chain.query_batch_snapshot().await?;
         let wait = match snapshot.batch {
             // An opportunity is open and this process has not built for it.
-            BatchWindow::Open(b) if !built.is(epoch, b.index) => {
+            BatchWindow::Open { batch: b, .. } if !built.is(epoch, b.index) => {
                 built.mark(epoch, b.index);
                 crate::epoch_log!(
                     me,
@@ -1221,40 +1227,6 @@ async fn await_batch_opportunity(
                 );
                 return Ok(BatchTurn::Build(Some(b)));
             }
-            // Already built for this one: the grid says wait for the next. Without
-            // the marker the node would rebuild the same batch on every poll for
-            // the whole interval.
-            BatchWindow::Open(b) => {
-                crate::epoch_debug!(
-                    me,
-                    epoch,
-                    "batch B_{} already built — waiting for the next opportunity",
-                    b.index
-                );
-                config.batch_poll_ceiling
-            }
-            // A grid exists but no opportunity is open — before B_1, or past
-            // `final_tm_cutoff` with more of the epoch to come. Sleep to the next
-            // one; building here would post a movement outside the schedule every
-            // SPO agreed on, which no co-signer would reproduce.
-            BatchWindow::Closed { next: Some(b) } => {
-                let slots = b.slot.saturating_sub(snapshot.slot);
-                crate::epoch_log!(
-                    me,
-                    epoch,
-                    "no batch opportunity open at slot {} — next is B_{} at slot {} ({slots} slot(s) away)",
-                    snapshot.slot,
-                    b.index,
-                    b.slot
-                );
-                // One slot is one second post-Shelley, which is the same identity
-                // `batch_at` uses to place the grid.
-                std::time::Duration::from_secs(slots.max(1)).min(config.batch_poll_ceiling)
-            }
-            // Nothing remains this epoch: the last opportunity is behind
-            // `final_tm_cutoff`, which is set to leave room for signing, posting,
-            // Bitcoin confirmation and the handoff before the boundary.
-            BatchWindow::Closed { next: None } => return Ok(BatchTurn::EpochOver),
             BatchWindow::NoGrid if !built.is(epoch, BuiltBatch::NO_GRID) => {
                 built.mark(epoch, BuiltBatch::NO_GRID);
                 return Ok(BatchTurn::Build(None));
@@ -1264,9 +1236,48 @@ async fn await_batch_opportunity(
             // would have two nodes freezing different sets), so this is the
             // pre-grid behaviour: one movement, then the next boundary.
             BatchWindow::NoGrid => return Ok(BatchTurn::EpochOver),
+            // Waiting, in either of its two forms: an opportunity is open but this
+            // node has served it, or none is open (before B_1, or past
+            // `final_tm_cutoff`). Both sleep towards the SAME thing — whatever
+            // follows — and both end the epoch when nothing does. Building at a
+            // closed window would post a movement outside the schedule every SPO
+            // agreed on, which no co-signer would reproduce.
+            ref window => {
+                let Some(b) = window.next() else {
+                    return Ok(BatchTurn::EpochOver);
+                };
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "waiting for batch B_{} at slot {} ({} slot(s) from slot {})",
+                    b.index,
+                    b.slot,
+                    b.slot.saturating_sub(snapshot.slot),
+                    snapshot.slot,
+                );
+                hop_to_opportunity(b.slot, snapshot.slot, config.batch_poll_ceiling)
+            }
         };
         tokio::time::sleep(wait).await;
     }
+}
+
+/// How long to sleep before re-reading the grid: the exact hop to `next_slot`,
+/// bounded by `ceiling`.
+///
+/// One slot is one second post-Shelley — the same identity `batch_at` uses to
+/// place the grid against a `(slot, time)` pair, and the reason the hop can be
+/// computed at all. The ceiling only bounds how stale a waiting node's view may
+/// get; because the hop shrinks as `B_i` approaches, the final sleep lands on the
+/// opportunity itself whatever the ceiling is, so the ceiling never decides WHEN a
+/// node freezes. The floor of one second keeps a slot arithmetic surprise (a tip
+/// already past the target) from becoming a spin.
+fn hop_to_opportunity(
+    next_slot: u64,
+    now_slot: u64,
+    ceiling: std::time::Duration,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(next_slot.saturating_sub(now_slot).max(1)).min(ceiling)
 }
 
 /// Wait for this epoch's next batch opportunity, then read the Cardano peg-in
@@ -3192,9 +3203,7 @@ mod tests {
         // opportunity, and a submitted movement moves the head and the grid on
         // together — which is what makes the second movement a different
         // transaction rather than a replay of the first.
-        let grid = Arc::new(std::sync::Mutex::new(
-            crate::epoch::batch::BatchWindow::Open(slot(1)),
-        ));
+        let grid = Arc::new(std::sync::Mutex::new(crate::epoch::mocks::open_at(slot(1))));
         let head = MockCardanoChain::tm_chain_head(&fixture);
 
         let mut handles = Vec::new();
@@ -3235,7 +3244,7 @@ mod tests {
                     &chain, &pegin, &peers, &clock, &rng, &config, resume, &mut built,
                 )
                 .await?;
-                Ok::<_, EpochError>((first, second))
+                Ok::<_, EpochError>((first, second, built))
             }));
         }
 
@@ -3259,8 +3268,17 @@ mod tests {
             movements[0].1.unsigned_tx.input[0].previous_output.txid, movements[0].0.txid,
             "each movement's treasury input is the previous movement's output"
         );
-        // Two opportunities used, so the grid stands at the third.
+        // Two opportunities used, so the grid stands at the third...
         assert_eq!(grid.lock().unwrap().open().unwrap().index, 3);
+        // ...and the second movement was built for the SECOND of them, on both
+        // nodes. Without that, "two movements" could be one opportunity served
+        // twice — the treasury self-move the marker exists to prevent.
+        for (_, _, built) in &movements {
+            assert!(
+                built.is(fixture.roster.epoch, 2),
+                "the second movement must belong to B_2, not to B_1 again"
+            );
+        }
         // ONE ceremony for both.
         assert_eq!(
             treasury_info.lock().unwrap().rotations.len(),
@@ -3359,6 +3377,56 @@ mod tests {
             .await
             .is_err(),
             "an opportunity still to come must be waited for, not treated as the end of the epoch"
+        );
+
+        // The same question in its other form. `current()` reports the LAST
+        // opportunity for its whole interval, so the end of the grid is normally
+        // seen as an OPEN window this node has already served — never as `Closed`.
+        // Reading only `Closed` there would poll out the rest of the epoch instead
+        // of parking for the boundary.
+        *window.lock().unwrap() = BatchWindow::Open {
+            batch: slot(9),
+            next: None,
+        };
+        let mut served = BuiltBatch::default();
+        served.mark(7, 9);
+        let turn = await_batch_opportunity(&chain, &config, me, 7, &mut served)
+            .await
+            .unwrap();
+        assert!(
+            matches!(turn, BatchTurn::EpochOver),
+            "an open-but-last opportunity, once served, is the end of the epoch"
+        );
+    }
+
+    /// The wait is the exact hop to the opportunity, and the ceiling only bounds
+    /// it. That distinction is the whole reason `batch_poll_ceiling` is not an
+    /// operator key: because the hop shrinks as `B_i` approaches, the final sleep
+    /// lands on the opportunity whatever the ceiling is, so no local value decides
+    /// WHEN a node freezes — and a flat poll instead of this would have each node
+    /// notice `B_i` at its own offset past it and freeze a different set.
+    #[test]
+    fn the_hop_is_exact_below_the_ceiling_and_clamped_above_it() {
+        let ceiling = Duration::from_secs(300);
+        assert_eq!(
+            hop_to_opportunity(5_000_100, 5_000_040, ceiling),
+            Duration::from_secs(60),
+            "a minute away is a minute's sleep"
+        );
+        assert_eq!(
+            hop_to_opportunity(5_021_600, 5_000_000, ceiling),
+            ceiling,
+            "six hours away is capped, so the grid is re-read on the way"
+        );
+        assert_eq!(
+            hop_to_opportunity(5_000_001, 5_000_000, ceiling),
+            Duration::from_secs(1),
+            "the last hop is the remaining distance, not the ceiling"
+        );
+        assert_eq!(
+            hop_to_opportunity(5_000_000, 5_000_009, ceiling),
+            Duration::from_secs(1),
+            "a tip already past the target sleeps the floor rather than spinning"
         );
     }
 
