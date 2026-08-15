@@ -586,11 +586,16 @@ subsystem.
 
 ### Quiet is normal
 
-**The bridge runs on multi-day cycles.** Treasury Movements span one or more Cardano epochs (5+
-days), peg-ins wait for ~100 Bitcoin confirmations (~12 hours), and the mover follows the
-protocol's on-chain **batch schedule** (the one from step 3) rather than a wall-clock interval — so
-it acts when that schedule opens an opportunity, not every `--interval-secs`. Shortening that interval produces more
-Blockfrost scans, not more movements.
+**The bridge runs on multi-day cycles.** Peg-ins wait for ~100 Bitcoin confirmations (~12 hours),
+and the daemon follows the protocol's on-chain **batch schedule** (the one from step 3) rather than
+a wall-clock interval: opportunities fall on a fixed slot grid, `B_i = epoch_start +
+i × tm_batch_interval`, and at each one every SPO applies the same test — is the treasury free, is
+anything in flight. An opportunity that fails it passes unused, and with a 6-hour grid against
+~17 hours to confirm a movement, most of them do. There is nothing to tune locally; the numbers are
+the bridge's, not the node's.
+
+The **ceremony** is the slower of the two clocks: the DKG and its Update-Y run once per Cardano
+epoch (5+ days), and every batch inside that epoch is signed by the roster it produced.
 
 A healthy idle node therefore says very little. Long silences are correct behaviour. What tells you
 it is alive is `systemctl status` and the absence of `-p err` output — **[will be improved —

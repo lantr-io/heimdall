@@ -163,6 +163,16 @@ pub struct FederationMemberConfig {
 
 // ── [protocol] ──────────────────────────────────────────────────────
 
+/// Upper bound on how long the epoch machine's batch loop sleeps between grid
+/// checks ([`EpochConfig::batch_poll_ceiling`]).
+///
+/// Not an operator key on purpose. It decides read rate and nothing else — the
+/// loop sleeps `min(slots until B_i, this)`, so the hop onto the opportunity is
+/// exact whatever this is — and every value an operator CAN type is a value two
+/// operators can differ on. Five minutes is ~70 grid reads over the spec's 6 h
+/// example pitch.
+const BATCH_POLL_CEILING: Duration = Duration::from_secs(300);
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ProtocolConfig {
@@ -193,8 +203,6 @@ pub struct ProtocolConfig {
     /// Maximum time to wait for the submitted treasury movement to become the
     /// confirmed chain tip before rebuilding from fresh chain state.
     pub tm_confirmation_timeout_secs: u64,
-    pub pegin_collection_window_secs: u64,
-    pub pegin_poll_interval_ms: u64,
     /// Directory for 0600 DKG-state persistence so the signing share survives
     /// restarts for the epoch (WI-014). Unset → in-memory only.
     ///
@@ -217,8 +225,6 @@ impl Default for ProtocolConfig {
             quorum51_timeout_secs: 300,
             leader_timeout_secs: 10000,
             tm_confirmation_timeout_secs: 1800,
-            pegin_collection_window_secs: 5,
-            pegin_poll_interval_ms: 1000,
             state_dir: None,
             // 7 days. Large enough that a request selected now cannot reach its
             // 30-day cancel deadline before the TM confirms, even after a long
@@ -705,6 +711,21 @@ impl Default for DemoConfig {
 pub type RetiredKey = (&'static str, &'static str, &'static str);
 
 const RETIRED_KEYS: &[RetiredKey] = &[
+    // WI-097: the peg-in freeze is the batch grid's, so a local timer in front of
+    // it could only be a second freeze rule that disagrees — two nodes entering
+    // the window at different moments accumulated different unions of the same
+    // source, and the later of the two also delayed every batch by its own value.
+    (
+        "protocol",
+        "pegin_collection_window_secs",
+        "the Config schedule's tm_batch_interval — the freeze point is the batch opportunity B_i, \
+         not a local timer",
+    ),
+    (
+        "protocol",
+        "pegin_poll_interval_ms",
+        "nothing — the peg-in source is read once, at the batch opportunity",
+    ),
     // WI-071: a TM SELECTION rule, so it decides the TM bytes — two operators on
     // different values freeze different peg-out sets and their FROST round never
     // converges, with neither log able to say why. It is compiled in until the
@@ -885,10 +906,7 @@ impl HeimdallConfig {
             ),
             identity,
             pegin_policy_id,
-            pegin_collection_window: Duration::from_secs(
-                self.protocol.pegin_collection_window_secs,
-            ),
-            pegin_poll_interval: Duration::from_millis(self.protocol.pegin_poll_interval_ms),
+            batch_poll_ceiling: BATCH_POLL_CEILING,
             // EpochConfig keeps a concrete value for the demo/mock paths; the daemon reads
             // the published one off the treasury oracle ([CFG-9]).
             pegin_refund_timeout_blocks: self.bitcoin.pegin_refund_timeout_blocks.unwrap_or(4320),
@@ -1307,8 +1325,7 @@ fee_rate_sat_per_vb = 5
         assert_eq!(epoch.quorum51_timeout, demo.quorum51_timeout);
         assert_eq!(epoch.leader_timeout, demo.leader_timeout);
         assert_eq!(epoch.pegin_policy_id, demo.pegin_policy_id);
-        assert_eq!(epoch.pegin_collection_window, demo.pegin_collection_window);
-        assert_eq!(epoch.pegin_poll_interval, demo.pegin_poll_interval);
+        assert_eq!(epoch.batch_poll_ceiling, demo.batch_poll_ceiling);
         assert_eq!(
             epoch.pegin_refund_timeout_blocks,
             demo.pegin_refund_timeout_blocks

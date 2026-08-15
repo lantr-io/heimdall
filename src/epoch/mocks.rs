@@ -163,10 +163,36 @@ pub struct MockCardanoChain {
     /// `None` (the default) is the unconfigured chain: `BuildTm` skips the
     /// cross-check instead of treating it as the empty tries.
     bridge_roots: Option<crate::epoch::traits::BridgeRoots>,
-    /// The TM batch opportunity the mock reports (N19). `None` (the default) is a
+    /// The TM batch opportunity the mock reports (N19). `NoGrid` (the default) is a
     /// chain with no grid, so `BuildTm` applies no membership cutoff — the behaviour
     /// of a deployment whose Config carries no `schedule`.
-    batch: crate::epoch::batch::BatchWindow,
+    ///
+    /// Behind a shared `Mutex` because the grid is CHAIN state: every node in a
+    /// multi-instance test must stand at the same opportunity, and the grid has to
+    /// be able to ADVANCE mid-test (WI-097) — a batch loop that never leaves `B_i`
+    /// can only ever make one movement.
+    batch: Arc<Mutex<crate::epoch::batch::BatchWindow>>,
+    /// When set, a submitted movement advances the mock grid to the next
+    /// opportunity — the mock's stand-in for chain time passing while a TM is
+    /// signed, posted and confirmed. Shared, so every node sees the same advance.
+    advance_batch_on_submit: bool,
+    /// The TM chain, when this mock models one: `submit_signed_tm` advances the
+    /// treasury head to the submitted movement's output 0, `query_treasury`
+    /// reports that head, and `is_tm_confirmed` answers "is this movement the
+    /// head". A real chain ties the three together, and the tie is what makes a
+    /// SECOND movement in an epoch a different transaction — it spends the first
+    /// one's change. Shared across a test's nodes, because there is one treasury.
+    ///
+    /// `None` keeps the static fixture head, where every movement spends the same
+    /// outpoint and two movements in one epoch are byte-identical.
+    tm_chain: Option<Arc<Mutex<(bitcoin::OutPoint, bitcoin::Amount)>>>,
+    /// Reported as `btc_confirmed = !this`: a movement already in flight against
+    /// the tip. Separate from [`Self::tm_confirmed`], which answers the different
+    /// question "is THIS movement confirmed".
+    treasury_busy: Arc<AtomicBool>,
+    /// How many further grid reads fail before the mock answers — a provider
+    /// hiccup on the batch loop's only regular chain read.
+    snapshot_failures: Arc<std::sync::atomic::AtomicU32>,
     /// In-memory stand-in for the `treasury_info` state UTxO. `None` (the
     /// default) is a chain with nothing to rotate, so `plan_update_y` reports
     /// no handoff.
@@ -201,7 +227,11 @@ impl MockCardanoChain {
             btc_rpc: None,
             dkg_faults: Arc::new(Mutex::new(Vec::new())),
             schedule_anchor_ms: None,
-            batch: crate::epoch::batch::BatchWindow::NoGrid,
+            batch: Arc::new(Mutex::new(crate::epoch::batch::BatchWindow::NoGrid)),
+            advance_batch_on_submit: false,
+            tm_chain: None,
+            treasury_busy: Arc::new(AtomicBool::new(false)),
+            snapshot_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             tm_confirmed: Arc::new(AtomicBool::new(true)),
             bridge_roots: None,
             treasury_info: None,
@@ -243,14 +273,70 @@ impl MockCardanoChain {
         self
     }
 
-    /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning
-    /// the ceremony window grid on for this mock chain.
-    /// Report a TM batch opportunity, so `BuildTm` applies the membership cutoff.
-    pub fn with_batch(mut self, batch: crate::epoch::batch::BatchSlot) -> Self {
-        self.batch = crate::epoch::batch::BatchWindow::Open(batch);
+    /// Report an open TM batch opportunity, so the batch loop has one to take and
+    /// `BuildTm` applies its membership cutoff.
+    pub fn with_batch(self, batch: crate::epoch::batch::BatchSlot) -> Self {
+        self.with_batch_window(Arc::new(Mutex::new(
+            crate::epoch::batch::BatchWindow::Open(batch),
+        )))
+    }
+
+    /// Share one grid position across several nodes' mock chains, so a test can
+    /// move every node to the next opportunity at once.
+    pub fn with_batch_window(
+        mut self,
+        window: Arc<Mutex<crate::epoch::batch::BatchWindow>>,
+    ) -> Self {
+        self.batch = window;
         self
     }
 
+    /// Advance the shared grid by one opportunity whenever a movement is
+    /// submitted — the mock's stand-in for the hours a real TM spends being
+    /// signed, posted and confirmed while the grid moves on.
+    pub fn advancing_batch_on_submit(mut self) -> Self {
+        self.advance_batch_on_submit = true;
+        self
+    }
+
+    /// The grid position this chain reports, for a test that wants to move it.
+    pub fn batch_window(&self) -> Arc<Mutex<crate::epoch::batch::BatchWindow>> {
+        Arc::clone(&self.batch)
+    }
+
+    /// A treasury head every node in a test shares, seeded from the fixture — the
+    /// handle for [`Self::with_tm_chain`].
+    pub fn tm_chain_head(
+        fixture: &crate::epoch::fixture::StaticFixture,
+    ) -> Arc<Mutex<(bitcoin::OutPoint, bitcoin::Amount)>> {
+        Arc::new(Mutex::new((
+            fixture.treasury_outpoint,
+            fixture.treasury_value,
+        )))
+    }
+
+    /// Model the TM chain: each submitted movement becomes the new treasury head,
+    /// and `is_tm_confirmed` is true only for the movement that IS the head.
+    pub fn with_tm_chain(mut self, head: Arc<Mutex<(bitcoin::OutPoint, bitcoin::Amount)>>) -> Self {
+        self.tm_chain = Some(head);
+        self
+    }
+
+    /// Report a movement already in flight against the tip
+    /// (`btc_confirmed = false`), so the batch gate has something to refuse.
+    pub fn with_movement_in_flight(self) -> Self {
+        self.treasury_busy.store(true, Ordering::Release);
+        self
+    }
+
+    /// Fail the next `n` batch-grid reads with a retriable chain error.
+    pub fn fail_next_snapshots(self, n: u32) -> Self {
+        self.snapshot_failures.store(n, Ordering::Release);
+        self
+    }
+
+    /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning the
+    /// ceremony window grid on for this mock chain.
     pub fn with_schedule_anchor_ms(mut self, anchor_ms: i64) -> Self {
         self.schedule_anchor_ms = Some(anchor_ms);
         self
@@ -345,9 +431,13 @@ impl CardanoChain for MockCardanoChain {
         let y_51 = maybe_key.unwrap_or(self.fixture.y_51);
         // After DKG: Y_fed = Y_51 = FROST group key (same key everywhere).
         let y_fed = maybe_key.unwrap_or(self.fixture.y_fed);
+        let (outpoint, value) = self.tm_chain.as_ref().map_or(
+            (self.fixture.treasury_outpoint, self.fixture.treasury_value),
+            |head| *head.lock().unwrap(),
+        );
         Ok(TreasuryUtxo {
-            outpoint: self.fixture.treasury_outpoint,
-            value: self.fixture.treasury_value,
+            outpoint,
+            value,
             y_51,
             y_fed,
             config_y_fed: y_fed,
@@ -358,7 +448,7 @@ impl CardanoChain for MockCardanoChain {
             federation_csv_blocks: self.fixture.federation_csv_blocks,
             // The mock's tree is self-consistent; 720 > the fixture's 144 federation delay.
             pegin_refund_timeout_blocks: 720,
-            btc_confirmed: true,
+            btc_confirmed: !self.treasury_busy.load(Ordering::Acquire),
         })
     }
 
@@ -367,6 +457,13 @@ impl CardanoChain for MockCardanoChain {
     /// property the real Config provides. `now_ms` stays the local clock (the trait
     /// default) — mock fixtures carry wall-clock `created` times.
     async fn query_batch_snapshot(&self) -> EpochResult<BatchSnapshot> {
+        if self
+            .snapshot_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(EpochError::Chain("mock: injected grid read failure".into()));
+        }
         let mut snapshot = BatchSnapshot::local_override(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -379,13 +476,21 @@ impl CardanoChain for MockCardanoChain {
             },
             "mock chain (StaticFixture)",
         );
-        snapshot.batch = self.batch;
-        snapshot.slot = self.batch.open().map_or(0, |b| b.slot);
+        let batch = *self.batch.lock().unwrap();
+        snapshot.batch = batch;
+        snapshot.slot = batch.open().map_or(0, |b| b.slot);
         Ok(snapshot)
     }
 
-    async fn is_tm_confirmed(&self, _txid: &bitcoin::Txid) -> EpochResult<bool> {
-        Ok(self.tm_confirmed.load(Ordering::Acquire))
+    /// With a TM chain, a movement is confirmed exactly when it IS the head —
+    /// the same test the Blockfrost impl applies, and the reason a follower
+    /// cannot start the next batch before the leader's submission lands.
+    /// Without one, the manual signal.
+    async fn is_tm_confirmed(&self, txid: &bitcoin::Txid) -> EpochResult<bool> {
+        match &self.tm_chain {
+            Some(head) => Ok(head.lock().unwrap().0.txid == *txid),
+            None => Ok(self.tm_confirmed.load(Ordering::Acquire)),
+        }
     }
 
     async fn query_bridge_roots(&self) -> EpochResult<Option<crate::epoch::traits::BridgeRoots>> {
@@ -509,6 +614,37 @@ impl CardanoChain for MockCardanoChain {
         _fulfilled_por_outpoints: &[[u8; 36]],
     ) -> EpochResult<()> {
         self.submitted_txs.lock().unwrap().push(tx_bytes.to_vec());
+        // Advance the TM chain: output 0 of a movement is the treasury change, so
+        // it becomes the head the NEXT movement spends.
+        if let Some(head) = &self.tm_chain {
+            let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(tx_bytes)
+                .map_err(|e| EpochError::Chain(format!("mock: undecodable movement: {e}")))?;
+            let out = tx
+                .output
+                .first()
+                .ok_or_else(|| EpochError::Chain("mock: movement has no outputs".into()))?;
+            *head.lock().unwrap() = (
+                bitcoin::OutPoint {
+                    txid: tx.compute_txid(),
+                    vout: 0,
+                },
+                out.value,
+            );
+        }
+        // Move the shared grid on, if this chain was built to. A real chain does
+        // this by itself — a movement takes hours to sign, post and confirm, and
+        // the grid keeps ticking — so a mock that stood still would leave every
+        // node's batch loop waiting out the opportunity it just used.
+        if self.advance_batch_on_submit {
+            let mut w = self.batch.lock().unwrap();
+            if let crate::epoch::batch::BatchWindow::Open(b) = *w {
+                *w = crate::epoch::batch::BatchWindow::Open(crate::epoch::batch::BatchSlot {
+                    index: b.index + 1,
+                    slot: b.slot + 1,
+                    cutoff_slot: b.cutoff_slot + 1,
+                });
+            }
+        }
         if let Some(rpc) = &self.btc_rpc {
             broadcast_btc_tx(rpc, tx_bytes).await?;
         }

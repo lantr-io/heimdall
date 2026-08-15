@@ -115,14 +115,6 @@ enum Commands {
         /// `2` preview). Required with `--cardano-socket`.
         #[arg(long)]
         cardano_magic: Option<u64>,
-        /// How long (seconds) `CollectPegins` polls the source before
-        /// freezing the observed set.
-        #[arg(long)]
-        pegin_window_secs: Option<u64>,
-        /// Interval (ms) between successive peg-in polls inside the
-        /// collection window.
-        #[arg(long)]
-        pegin_poll_ms: Option<u64>,
         /// BIP-39 mnemonic (12/15/24 words, space-separated) for the
         /// Cardano wallet that pays fees and signs the oracle-update tx.
         /// The payment key is derived at `m/1852'/1815'/0'/0/0`
@@ -1148,8 +1140,6 @@ fn main() {
             blockfrost_project_id,
             cardano_socket,
             cardano_magic,
-            pegin_window_secs,
-            pegin_poll_ms,
             cardano_mnemonic,
         } => {
             let mut cfg = load_config(config.as_deref());
@@ -1172,12 +1162,6 @@ fn main() {
             }
             if let Some(v) = cardano_magic {
                 cfg.cardano.network_magic = Some(v);
-            }
-            if let Some(v) = pegin_window_secs {
-                cfg.protocol.pegin_collection_window_secs = v;
-            }
-            if let Some(v) = pegin_poll_ms {
-                cfg.protocol.pegin_poll_interval_ms = v;
             }
             if let Some(ref v) = cardano_mnemonic {
                 cfg.cardano.mnemonic = Some(v.clone());
@@ -2286,24 +2270,29 @@ async fn run_spo(
     }
 
     let t0 = Instant::now();
-    // Cycle after cycle, for ever. `run_epoch_loop` completes ONE cycle and
-    // returns the movement it made; this node used to stop there and park on
-    // Ctrl-C, so it produced exactly one Treasury Movement per process start and
-    // then sat with its HTTP server answering while taking part in nothing. That
-    // is the same frozen-node shape the retry policy below exists to prevent,
-    // arrived at by succeeding rather than by failing.
+    // Movement after movement, for ever, paced by the protocol's batch grid
+    // (`B_i = epoch_start + i × tm_batch_interval`) rather than by the epoch
+    // boundary: the ceremony is once per epoch, the movements are not. This node
+    // used to stop after one movement and park on Ctrl-C, sitting with its HTTP
+    // server answering while taking part in nothing — the same frozen-node shape
+    // the retry policy below exists to prevent, arrived at by succeeding rather
+    // than by failing.
     //
-    // Errors never reach here: every retriable failure backs off and re-enters
-    // `Idle` inside the loop, which is what re-derives the roster from chain. An
-    // error return would mean that contract broke, so say so plainly and let the
-    // supervisor restart us rather than parking.
+    // Errors never reach here: every retriable failure backs off inside the loop
+    // and resumes — at the next batch opportunity while this epoch's ceremony is
+    // still in hand, otherwise at `Idle`, which re-derives the roster from chain.
+    // An error return would mean that contract broke, so say so plainly and let
+    // the supervisor restart us rather than parking.
     let mut cycles: u64 = 0;
     let err =
         heimdall::epoch::run_epoch_daemon(chain, pegin_source, peers, clock, rng, &config, |tm| {
             cycles += 1;
             info!("Cycle {cycles} complete ({:.2?} since start)", t0.elapsed());
             log_tm_summary(tm);
-            info!("=== SPO {spo_label} cycle {cycles} complete — waiting for the next epoch ===");
+            info!(
+                "=== SPO {spo_label} cycle {cycles} complete — waiting for the next batch \
+                 opportunity ==="
+            );
         })
         .await;
     match err {

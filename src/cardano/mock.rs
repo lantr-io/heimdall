@@ -1,16 +1,16 @@
 //! In-memory `CardanoPegInSource` for tests and the `--mock-pegin-source`
 //! demo mode. Peg-in requests are scheduled with a release `Instant`;
 //! `query_pegin_requests` only returns those whose release time has
-//! elapsed, so the collection window actually exercises its time-based
-//! polling behavior.
+//! elapsed, so a test can model a deposit landing part-way through a run.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
 
 use crate::cardano::pegin_source::{CardanoPegInRequest, CardanoPegInSource};
-use crate::epoch::state::EpochResult;
+use crate::epoch::state::{EpochError, EpochResult};
 
 #[derive(Debug)]
 struct Scheduled {
@@ -21,6 +21,10 @@ struct Scheduled {
 #[derive(Debug, Default)]
 pub struct MockCardanoPegInSource {
     scheduled: Mutex<Vec<Scheduled>>,
+    /// How many further queries fail before the source starts answering — the
+    /// stand-in for a provider hiccup, so a test can drive the epoch loop's
+    /// retriable-error path instead of only its happy one.
+    fail_next: AtomicU32,
 }
 
 impl MockCardanoPegInSource {
@@ -36,6 +40,11 @@ impl MockCardanoPegInSource {
             request,
         });
     }
+
+    /// Fail the next `n` queries with a retriable chain error.
+    pub fn fail_next(&self, n: u32) {
+        self.fail_next.store(n, Ordering::Release);
+    }
 }
 
 #[async_trait]
@@ -44,6 +53,13 @@ impl CardanoPegInSource for MockCardanoPegInSource {
         &self,
         _policy_id: &[u8; 28],
     ) -> EpochResult<Vec<CardanoPegInRequest>> {
+        if self
+            .fail_next
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(EpochError::Chain("mock peg-in source: injected".into()));
+        }
         // The mock ignores `policy_id` — the real impl filters by it.
         let now = Instant::now();
         let g = self.scheduled.lock().unwrap();

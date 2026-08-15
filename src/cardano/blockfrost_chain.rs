@@ -1617,7 +1617,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         // Rev 5.4: the current treasury is the bridge-state singleton's head — outpoint AND
         // satoshi amount straight from the BridgeState datum. There is no Confirmed chain to
         // walk: Confirm burns the TM record and advances the singleton instead.
-        let (_config, singleton) = self.query_config_singleton().await?;
+        let (config, singleton) = self.query_config_singleton().await?;
         let state = &singleton.state;
         use bitcoin::hashes::Hash;
         let txid_bytes: [u8; 32] = state.treasury_utxo_id[..32].try_into().unwrap();
@@ -1644,9 +1644,22 @@ impl CardanoChain for BlockfrostCardanoChain {
             &self.bf_project_id,
             &self.treasury_address,
             &asset_unit,
-            // Staleness deadline is applied on the mover/sweep path (run_sweep_pegins);
-            // the epoch-machine daemon does not thread it through TreasuryConfig yet.
-            None,
+            // `tm_recovery_window`, the bridge's PUBLISHED recovery deadline (Config
+            // `params[0]`), finally acting on something. Without it a movement that never
+            // confirms blocks the tip permanently: every later batch opportunity sees a
+            // movement in flight and passes unused, for ever, with nothing in any log
+            // naming the cause. Past the window the record stops blocking, so the next
+            // opportunity builds a replacement spending the same head — which is the
+            // shape §Stuck-TM recovery describes ("the replacement and the stuck original
+            // both spend the same head; Bitcoin confirms exactly one").
+            //
+            // It comes from the CHAIN, not from a local key, for the usual reason: it
+            // decides which head a TM spends, so two operators on different values build
+            // different TM bytes. A bridge publishing 0 (no window) keeps the old
+            // block-for-ever behaviour rather than inventing a default.
+            u64::try_from(config.params.tunables.schedule.tm_recovery_window)
+                .ok()
+                .filter(|secs| *secs > 0),
         )
         .await
         .map_err(EpochError::Chain)?;

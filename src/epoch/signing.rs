@@ -242,6 +242,7 @@ pub async fn sign_phase(
             Ok(EpochPhase::Submit {
                 epoch,
                 roster,
+                group_keys,
                 tm,
                 leader_attempt: 0,
             })
