@@ -790,9 +790,23 @@ the CSV delay has passed — is a signing session among the members, not one per
 ```bash
 # every participating member runs this, with the SAME arguments:
 heimdall federation-spend --config heimdall.toml \
-  --outpoint <txid>:<vout> --amount-sat <sats> --y51 <the treasury's current FROST key> \
+  --y51 <the treasury's current FROST key> \
   --signers 1,3,4
 ```
+
+There is no `--outpoint` or `--amount-sat` to look up: the treasury is read from the bridge state
+on Cardano, the same read `show-treasury` and the auto-mover use. You *can* pass both — for a
+treasury the bridge state does not know about — but a value that disagrees with the chain is
+refused rather than preferred. When you and the chain disagree about where the treasury is, one of
+you is wrong, and this is the command you run when the FROST group is dark and nobody is left to
+catch it.
+
+Before any signing starts, the command checks the CSV delay: the recovery leaf is a *relative*
+timelock, so the treasury UTxO must be `federation_csv_blocks` deep. Too shallow and it stops there
+and says how many blocks remain — otherwise a whole signing session among the members is spent
+before the network rejects the result. If `bitcoin.rpc_url` is unset heimdall cannot read Bitcoin
+from your machine, so it prints the requirement and continues rather than blocking recovery on a
+node an SPO is not expected to run.
 
 `--signers` names who will sign, by the numbering `bifrost-id` printed (it defaults to everyone).
 Every participant must pass the same list: FROST binds each share to the exact set of co-signers,
