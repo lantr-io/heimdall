@@ -294,13 +294,11 @@ pub trait CardanoChain: Send + Sync {
     /// Current treasury UTxO state, as reported by the Cardano oracle.
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo>;
 
-    /// Whether the specific treasury movement is now the confirmed chain tip.
-    /// Mock implementations use the default immediate-success behavior;
-    /// live implementations must verify the observed tip txid and its
-    /// confirmation state.
-    async fn is_tm_confirmed(&self, _txid: &bitcoin::Txid) -> EpochResult<bool> {
-        Ok(true)
-    }
+    // NOTE: there is deliberately no `is_tm_confirmed`. The machine used to block
+    // on one, which is why it wedged (WI-032): the answer is hours away and a
+    // waiting process is not what makes the answer arrive. What replaced it reads
+    // `query_treasury` — the head IS the confirmation, and a caller that has the
+    // head can also tell WHICH movement confirmed, which a bool cannot.
 
     /// Open peg-out requests at the `peg_out.ak` address — INCLUDING ones an earlier TM already
     /// paid (a request UTxO is spent by its owner's Complete tx, which lags the payment by hours or

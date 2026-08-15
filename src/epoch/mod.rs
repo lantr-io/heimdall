@@ -12,6 +12,7 @@ pub mod fixture;
 pub mod log;
 pub mod machine;
 pub mod mocks;
+pub mod pending_tm;
 pub mod persist;
 pub mod rotation;
 pub mod signing;

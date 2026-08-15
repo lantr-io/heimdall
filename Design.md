@@ -158,15 +158,26 @@ heimdall/
 
 The core of Heimdall is an epoch-driven state machine. Each Cardano epoch (~5 days) progresses through these phases:
 
+There are **two clocks**. The ceremony runs once per epoch; treasury movements run
+on a slot grid *within* the epoch. So there are two loops, not one:
+
 ```
                                 +---> [Error/Timeout] ---> [Federation Fallback]
                                 |
-[Idle] --> [EpochStart] --> [DKG] --> [BuildTM] --> [Sign] --> [Submit] --> [AwaitConfirm] --> [Idle]
-              |                                                                |
-              +-- read registry snapshot                                       +-- next epoch
-              +-- read stake distribution
-              +-- enumerate candidates
+[Idle] --> [EpochStart] --> [DKG] --> [PublishKeys] --+
+   ^          |                                       |
+   |          +-- read registry snapshot              v
+   |          +-- read stake distribution     +-->[CollectPegins]-->[BuildTM]-->[Sign]
+   |          +-- enumerate candidates        |         |                          |
+   |                                          |   grid exhausted                   v
+   +------------------------------------------|---------+                     [Submit]
+                                              |                                    |
+                                              +---[RecordMovement]<----------------+
 ```
+
+The inner loop is paced by the batch grid — `B_i = epoch_start + i × tm_batch_interval`
+— and carries the roster and group keys around, so no batch costs a second ceremony.
+It leaves for `Idle` only when the epoch's grid is exhausted.
 
 ### 4.1 Phase Details
 
@@ -175,23 +186,36 @@ The core of Heimdall is an epoch-driven state machine. Each Cardano epoch (~5 da
 | **EpochStart** | Epoch boundary slot detected | Snapshot registry, query stake distribution, compute threshold, order candidates | Minutes |
 | **DKG** | Candidate set ready | Run DKG rounds 1-3 via bifrost_url pull model. Produce $Y_{67}$, $Y_{51}$ | ~5 minutes (happy path) |
 | **PublishKeys** | DKG complete | Current roster leader posts new group keys to `treasury.ak` | Minutes |
-| **BuildTM** | Keys published | Read all confirmed PegInRequest + pending PegOut UTxOs, construct single deterministic TM transaction | Minutes |
-| **Sign** | TM constructed | Run FROST signing cascade: try 67% first, fall back to 51%, then federation | Minutes to hours |
+| **CollectPegins** | Keys published, or the previous movement posted | Sleep to the next grid opportunity `B_i`; there, fold any movement the chain has since confirmed into the local tries, then apply the spec's gate and freeze the peg-in set | Hours (the grid pitch) |
+| **BuildTM** | A batch was frozen | Read treasury + open PegOut UTxOs, construct single deterministic TM transaction | Minutes |
+| **Sign** | TM constructed | Run the FROST signing cascade: 51%, then federation | Minutes to hours |
 | **Submit** | Signing complete | Leader posts signed TM to `treasury_movement.ak` (timeout cascade for leader election) | Minutes |
-| **AwaitConfirm** | TM posted on Cardano | Wait for watchtowers to relay to Bitcoin and for Bitcoin confirmation | ~17 hours |
+| **RecordMovement** | TM posted on Cardano | Persist what the movement owes the two tries, and return to the batch loop | Instant |
 
-### 4.2 Single TM Per Epoch
+### 4.2 Movements run on the batch grid
 
-Each epoch produces exactly **one** Treasury Movement transaction. This TM:
-- Sweeps all confirmed peg-in UTxOs accumulated during the epoch
-- Fulfills all pending peg-out requests
-- Moves the treasury balance to the new roster's Taproot address
+An epoch produces **as many Treasury Movements as the grid offers opportunities for**.
+At each `B_i` every SPO evaluates the same gate: if the TM-chain tip is
+Binocular-confirmed and no TM is in flight, the batch is frozen and built; otherwise
+the opportunity passes unused. With a ~6 h pitch and ~17 h to confirm a movement,
+most opportunities pass by design — that is the schedule working, not a stall.
 
-Peg-in and peg-out requests that arrive after the pegs snapshot (stability window) roll over to the next epoch.
+Each movement chains off the previous one's change output, so a node must know which
+movements have confirmed. It does **not** learn that by waiting: the answer is ~17
+hours away, and a process that blocked on it made durable state depend on staying
+awake. `RecordMovement` writes the pending fold to `state_dir/pending-tm.json`, and
+`CollectPegins` performs it the first time it observes the head move — which works
+across restarts, and is the same code path for a node that was down.
 
-This simplifies the design: no chaining of treasury UTxOs within an epoch, no tracking which requests belong to which batch, and no dependency on intermediate Bitcoin confirmations.
+### 4.3 Stuck-TM recovery
 
-### 4.3 Signing Cascade
+A movement that has not confirmed within `tm_recovery_window` is treated as no longer
+in flight, so a later opportunity may rebuild the same frozen batch at a higher fee
+(RBF). Because the rebuild spends the same head and commits the same roots, its
+pending record simply replaces the original's, and whichever of the two confirms folds
+identically.
+
+### 4.4 Signing Cascade
 
 ```
 [Attempt 67% quorum]
@@ -434,6 +458,9 @@ Heimdall needs local persistent state for crash recovery:
 | Epoch state | Per-epoch | Current phase, collected payloads, progress |
 | Nonce commitments | Per-signing-round | Must not be reused (single-use nonces) |
 | Peer payload cache | Transient | Cached DKG/signing payloads from other SPOs |
+| `cpo-trie.json` | Cumulative | Completed peg-outs, keyed by `por_id` — the only record of what an earlier movement already paid |
+| `spi-trie.json` | Cumulative | Swept peg-ins ([SPI-1], [SPI-3]) |
+| `pending-tm.json` | Per-movement | What a posted-but-unconfirmed movement owes the two tries above. Written at `RecordMovement`, consumed when `CollectPegins` observes the head move — which is what lets the fold survive the ~17 h to confirmation, and the restarts inside it |
 
 **Storage backend**: `sled` (embedded key-value store, pure Rust, crash-safe) for simplicity. Evaluate `rocksdb` if performance demands it.
 

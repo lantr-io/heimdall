@@ -201,9 +201,6 @@ pub struct ProtocolConfig {
     pub poll_interval_ms: u64,
     pub quorum51_timeout_secs: u64,
     pub leader_timeout_secs: u64,
-    /// Maximum time to wait for the submitted treasury movement to become the
-    /// confirmed chain tip before rebuilding from fresh chain state.
-    pub tm_confirmation_timeout_secs: u64,
     /// Directory for 0600 DKG-state persistence so the signing share survives
     /// restarts for the epoch (WI-014). Unset → in-memory only.
     ///
@@ -225,7 +222,6 @@ impl Default for ProtocolConfig {
             poll_interval_ms: 5000,
             quorum51_timeout_secs: 300,
             leader_timeout_secs: 10000,
-            tm_confirmation_timeout_secs: 1800,
             state_dir: None,
             // 7 days. Large enough that a request selected now cannot reach its
             // 30-day cancel deadline before the TM confirms, even after a long
@@ -727,6 +723,18 @@ const RETIRED_KEYS: &[RetiredKey] = &[
         "pegin_poll_interval_ms",
         "nothing — the peg-in source is read once, at the batch opportunity",
     ),
+    // WI-032: the machine no longer waits for the confirmation, so there is no
+    // deadline to set. It could never be set correctly anyway — the confirmation
+    // is ~100 Bitcoin blocks plus the oracle's challenge-aging window away, so any
+    // workable value wedged the node and any honest one blocked the batch loop for
+    // most of a day. The wait it nominally guarded is redundant: the batch gate
+    // already refuses to build while a movement is in flight.
+    (
+        "protocol",
+        "tm_confirmation_timeout_secs",
+        "nothing — a posted movement is recorded in state_dir/pending-tm.json and folded into the \
+         tries when the chain shows the head has moved, however long that takes",
+    ),
     // WI-071: a TM SELECTION rule, so it decides the TM bytes — two operators on
     // different values freeze different peg-out sets and their FROST round never
     // converges, with neither log able to say why. It is compiled in until the
@@ -902,9 +910,6 @@ impl HeimdallConfig {
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
             quorum51_timeout: Duration::from_secs(self.protocol.quorum51_timeout_secs),
             leader_timeout: Duration::from_secs(self.protocol.leader_timeout_secs),
-            tm_confirmation_timeout: Duration::from_secs(
-                self.protocol.tm_confirmation_timeout_secs,
-            ),
             identity,
             pegin_policy_id,
             batch_poll_ceiling: BATCH_POLL_CEILING,
