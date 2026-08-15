@@ -502,6 +502,12 @@ pub struct EpochConfig {
     pub poll_interval: Duration,
     pub quorum51_timeout: Duration,
     pub leader_timeout: Duration,
+    /// Ceiling on the retriable-error backoff. Not an operator key: it paces
+    /// re-reads and nothing else, and a per-operator value could only make one
+    /// node give up on a handoff sooner than another. Compiled in via
+    /// `config::RETRY_BACKOFF_MAX`; tests shrink it so a bounded retry budget is
+    /// observable in milliseconds rather than minutes.
+    pub retry_backoff_max: Duration,
     pub identity: SpoIdentity,
     /// Cardano policy ID (script hash) identifying peg-in request UTxOs.
     pub pegin_policy_id: [u8; 28],
@@ -590,6 +596,7 @@ impl EpochConfig {
             poll_interval: Duration::from_millis(5000),
             quorum51_timeout: Duration::from_secs(300),
             leader_timeout: Duration::from_secs(10000),
+            retry_backoff_max: Duration::from_secs(60),
             identity,
             pegin_policy_id: [0u8; 28],
             batch_poll_ceiling: Duration::from_secs(300),

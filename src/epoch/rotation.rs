@@ -262,7 +262,11 @@ async fn frost_sign_message(
     // be replayed into another.
     let ns = SignNamespace::new(epoch, UPDATE_Y_SESSION, *msg);
 
-    let mut sign_rng = rng.rng(format!("update-y:epoch={epoch}").as_bytes());
+    // Never `rng.rng(..)`: the context would be `update-y:epoch={epoch}`, constant
+    // across the re-entries WI-047 introduced, so under `--deterministic` a retry
+    // would sign a second time under the same nonce and a different S1. See
+    // `RngSource::signing_nonce_rng`.
+    let mut sign_rng = rng.signing_nonce_rng();
     let (nonces, commitments) = participant::sign_round1(&keys.key_package, &mut sign_rng);
 
     let mut round1: BTreeMap<Identifier, frost::round1::SigningCommitments> = BTreeMap::new();
