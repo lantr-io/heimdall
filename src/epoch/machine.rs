@@ -1552,7 +1552,7 @@ async fn collect_pegins_phase(
         }
     }
 
-    let frozen_pegins: Vec<ParsedPegIn> = accepted.into_values().collect();
+    let frozen_pegins = freeze_pegins(accepted.into_values().collect(), batch, me, epoch);
     crate::epoch_log!(
         me,
         epoch,
@@ -1568,6 +1568,71 @@ async fn collect_pegins_phase(
         batch,
         frozen_pegins,
     })
+}
+
+/// Freeze the discovered peg-in set against this batch (spec §TM batches; WI-049).
+///
+/// The peg-out twin below states the three rules; peg-ins take the same three,
+/// with one difference the spec is explicit about: an unpicked peg-in **rolls
+/// over freely** to the next batch, so neither the cutoff nor the cap can strand
+/// one.
+///
+/// Until now peg-ins had NONE of the three. Membership was "whatever
+/// `query_pegin_requests` returned at the instant this node happened to scan",
+/// ordered by Cardano outpoint. That converges two SPOs only by luck — a request
+/// that lands between their scans is in one node's TM and not the other's, which
+/// is a different txid and a FROST round that cannot aggregate. It also had no
+/// capacity bound at all, so an oversubscribed set produced a transaction over
+/// the ~15 KB relay ceiling, taking that batch's peg-outs down with it.
+///
+/// The cap is `max_pegins`, which existed in [`Caps`] from the day it was written
+/// and was referenced nowhere.
+fn freeze_pegins(
+    pegins: Vec<ParsedPegIn>,
+    batch: Option<crate::epoch::batch::BatchSlot>,
+    me: frost::Identifier,
+    epoch: u64,
+) -> Vec<ParsedPegIn> {
+    use crate::epoch::batch::{Caps, FifoKey, SpendVariant, freeze};
+
+    let cap = Caps::for_variant(SpendVariant::KeyPath).max_pegins;
+    // The CARDANO outpoint, not the Bitcoin one: this orders REQUESTS, and the
+    // request is the Cardano UTxO. (The TM's input order is a separate, Bitcoin-
+    // side rule — lexicographic by (txid ‖ vout) — and is unaffected by this.)
+    let key = |p: &ParsedPegIn| FifoKey {
+        // Unresolved sorts last and, under a real cutoff, defers. Same reasoning
+        // as the peg-out side: a request this node cannot place in time must not
+        // be signed into a batch its peers would place differently.
+        created_slot: p.created_slot.unwrap_or(u64::MAX),
+        tx_hash: p.cardano_utxo.tx_hash,
+        output_index: p.cardano_utxo.output_index,
+    };
+
+    let Some(batch) = batch else {
+        // No grid: cap and order only. A mock chain, or a deployment whose Config
+        // carries no schedule.
+        let mut ordered = pegins;
+        ordered.sort_by_key(&key);
+        ordered.truncate(cap);
+        return ordered;
+    };
+
+    let frozen = freeze(pegins, batch, cap, key);
+    if frozen.deferred() > 0 {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  batch B_{} (slot {}, cutoff {}): {} peg-in(s) frozen, {} newer than the cutoff, \
+             {} over the {cap}-peg-in capacity — all roll over to a later batch",
+            batch.index,
+            batch.slot,
+            batch.cutoff_slot,
+            frozen.selected.len(),
+            frozen.too_new.len(),
+            frozen.over_cap.len(),
+        );
+    }
+    frozen.selected
 }
 
 /// Freeze the open peg-out set against this batch (spec §TM batches; plan N19).
@@ -2779,6 +2844,146 @@ mod tests {
             "a request locking less than the snapshot's min_peg_out_fbtc must be skipped"
         );
         assert_eq!(tms[1].txid, tms[0].txid);
+    }
+
+    /// A `ParsedPegIn` with only the fields the freeze reads. The taproot info and
+    /// the Bitcoin transaction are placeholders: `freeze_pegins` never looks at
+    /// them, and pinning that is part of the point — batch membership must be a
+    /// function of chain facts about the REQUEST, not of anything in the deposit.
+    fn parsed_pegin(created_slot: Option<u64>, tx_hash: u8, output_index: u32) -> ParsedPegIn {
+        let secp = Secp256k1::new();
+        let internal = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&[0x2bu8; 32]).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        ParsedPegIn {
+            btc_tx: bitcoin::Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![],
+                output: vec![],
+            },
+            btc_txid: bitcoin::Txid::from_byte_array([tx_hash; 32]),
+            btc_vout: output_index,
+            value: bitcoin::Amount::from_sat(100_000),
+            cardano_utxo: CardanoOutRef {
+                tx_hash: [tx_hash; 32],
+                output_index,
+            },
+            depositor_outputkey: internal,
+            spend_info: bitcoin::taproot::TaprootBuilder::new()
+                .finalize(&secp, internal)
+                .unwrap(),
+            created_slot,
+        }
+    }
+
+    /// WI-049: peg-ins get the three batch rules they never had — cutoff, FIFO
+    /// order, and a capacity bound.
+    ///
+    /// Before this, membership was whatever `query_pegin_requests` returned at the
+    /// instant a node happened to scan, ordered by Cardano outpoint. Two SPOs
+    /// scanning seconds apart across a new request built different transactions,
+    /// which is a different txid and a FROST round that cannot aggregate — the same
+    /// defect WI-041 closed on the peg-out side and left open here.
+    #[test]
+    fn pegins_are_frozen_at_the_cutoff_and_ordered_fifo() {
+        use crate::epoch::batch::BatchSlot;
+
+        let batch = BatchSlot {
+            index: 3,
+            slot: 5_000_000,
+            cutoff_slot: 4_900_000,
+        };
+        let me = Identifier::try_from(1u16).unwrap();
+        // Deliberately NOT in FIFO order, and deliberately in an outpoint order
+        // that contradicts it — the old code would have kept this order.
+        let pegins = vec![
+            parsed_pegin(Some(batch.cutoff_slot), 0x01, 0), // at the cutoff: in, second
+            parsed_pegin(Some(batch.cutoff_slot + 1), 0x02, 0), // one slot too new: out
+            parsed_pegin(Some(batch.cutoff_slot - 500), 0x03, 0), // oldest: in, first
+        ];
+
+        let frozen = freeze_pegins(pegins, Some(batch), me, 42);
+
+        let slots: Vec<Option<u64>> = frozen.iter().map(|p| p.created_slot).collect();
+        assert_eq!(
+            slots,
+            vec![Some(batch.cutoff_slot - 500), Some(batch.cutoff_slot)],
+            "the batch takes exactly the cutoff-eligible requests, oldest first — the request one \
+             slot past the cutoff rolls over"
+        );
+    }
+
+    /// An UNRESOLVED creation slot must defer, never admit.
+    ///
+    /// It fails in the safe direction on purpose: a request this node cannot place
+    /// in time must not be signed into a batch its peers would place differently.
+    /// The N2C peg-in source cannot resolve slots at all, so this is its entire
+    /// behaviour rather than an edge case.
+    #[test]
+    fn a_pegin_with_no_resolved_creation_slot_defers() {
+        use crate::epoch::batch::BatchSlot;
+
+        let batch = BatchSlot {
+            index: 1,
+            slot: 5_000_000,
+            cutoff_slot: 4_900_000,
+        };
+        let me = Identifier::try_from(1u16).unwrap();
+        let frozen = freeze_pegins(
+            vec![
+                parsed_pegin(None, 0x01, 0),
+                parsed_pegin(Some(batch.cutoff_slot), 0x02, 0),
+            ],
+            Some(batch),
+            me,
+            42,
+        );
+
+        assert_eq!(frozen.len(), 1, "the unresolved request must not be swept");
+        assert_eq!(frozen[0].cardano_utxo.tx_hash, [0x02; 32]);
+    }
+
+    /// The capacity bound exists and is applied. `Caps::max_pegins` was defined
+    /// with `Caps` itself and referenced NOWHERE, so an oversubscribed set built a
+    /// transaction past the ~15 KB relay ceiling — which takes that batch's
+    /// peg-outs down with it, since they ride the same movement.
+    ///
+    /// Overflow peg-ins roll over freely, so capping strands nothing.
+    #[test]
+    fn an_oversubscribed_pegin_set_is_capped_and_the_rest_roll_over() {
+        use crate::epoch::batch::{BatchSlot, Caps, SpendVariant};
+
+        let cap = Caps::for_variant(SpendVariant::KeyPath).max_pegins;
+        let batch = BatchSlot {
+            index: 1,
+            slot: 5_000_000,
+            cutoff_slot: 4_900_000,
+        };
+        let me = Identifier::try_from(1u16).unwrap();
+        // One more than fits, all eligible, in descending slot order so the cap
+        // cannot accidentally agree with the input order.
+        let pegins: Vec<ParsedPegIn> = (0..=cap)
+            .map(|i| {
+                parsed_pegin(
+                    Some(batch.cutoff_slot - i as u64),
+                    u8::try_from(i % 251).unwrap(),
+                    i as u32,
+                )
+            })
+            .collect();
+
+        let frozen = freeze_pegins(pegins, Some(batch), me, 42);
+
+        assert_eq!(frozen.len(), cap, "the batch takes at most max_pegins");
+        assert_eq!(
+            frozen[0].created_slot,
+            Some(batch.cutoff_slot - cap as u64),
+            "and takes the OLDEST ones: FIFO decides who is dropped, not arrival order"
+        );
     }
 
     /// WI-041's acceptance, end to end: batch membership is a function of the batch,

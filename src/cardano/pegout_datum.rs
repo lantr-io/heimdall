@@ -249,35 +249,12 @@ pub async fn resolve_created_slots(
     requests: &mut [PegOutRequestData],
     tip: Option<(u64, i64)>,
 ) {
-    let mut seen: std::collections::HashMap<String, Option<u64>> = std::collections::HashMap::new();
+    // Collected, not a borrowing iterator: held across the await it makes the
+    // closure's lifetime not general enough for `query_pegout_requests`.
+    let hashes: Vec<String> = requests.iter().map(|r| r.cardano_utxo.0.clone()).collect();
+    let resolved = bf_http::resolve_tx_slots(base_url, project_id, hashes, tip, "pegout").await;
     for req in requests.iter_mut() {
-        let tx_hash = req.cardano_utxo.0.clone();
-        let slot = match seen.get(&tx_hash) {
-            Some(cached) => *cached,
-            None => {
-                let resolved = match bf_http::fetch_tx_point(base_url, project_id, &tx_hash).await {
-                    Ok(point) => point.slot.or_else(|| {
-                        tip.map(|(ref_slot, ref_time_ms)| {
-                            bf_http::slot_at_time(
-                                ref_slot,
-                                ref_time_ms,
-                                point.block_time_secs.saturating_mul(1000),
-                            )
-                        })
-                    }),
-                    Err(e) => {
-                        warn!(
-                            "[pegout] could not resolve the creation slot of {tx_hash} ({e}) \
-                                 — deferring that request to a later batch"
-                        );
-                        None
-                    }
-                };
-                seen.insert(tx_hash, resolved);
-                resolved
-            }
-        };
-        req.created_slot = slot;
+        req.created_slot = resolved.get(&req.cardano_utxo.0).copied().flatten();
     }
 }
 

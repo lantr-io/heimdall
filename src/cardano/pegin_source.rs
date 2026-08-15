@@ -39,6 +39,17 @@ pub struct CardanoPegInRequest {
     /// matching the Aiken `PegInDatum` type and extracts the raw BTC
     /// tx from field index 1 (`source_chain_peg_in_raw_tx`).
     pub datum_cbor: Vec<u8>,
+    /// Slot of the Cardano transaction that CREATED this request — the chain
+    /// fact the batch's stability cutoff and FIFO order are computed from
+    /// (spec §TM batches; WI-049). `None` when the backend could not resolve
+    /// it, which every consumer MUST read as "defer to a later batch": a
+    /// request this node cannot place in time must not be signed into a batch
+    /// its peers would place differently.
+    ///
+    /// Deliberately NOT taken from the datum. A peg-in datum carries no
+    /// creation time, and if it did it would be requester-set — the same reason
+    /// `PegOutRequestData::created_slot` is chain-sourced.
+    pub created_slot: Option<u64>,
 }
 
 #[async_trait]

@@ -92,6 +92,7 @@ mod tests {
                 output_index: 0,
             },
             datum_cbor: vec![tag],
+            created_slot: Some(u64::from(tag)),
         }
     }
 

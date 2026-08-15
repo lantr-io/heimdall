@@ -78,7 +78,43 @@ impl CardanoPegInSource for BlockfrostPegInSource {
                     output_index: utxo.output_index as u32,
                 },
                 datum_cbor,
+                // Filled in below, once per DISTINCT creating transaction.
+                created_slot: None,
             });
+        }
+
+        // Batch membership needs the CREATION SLOT of each request (WI-049), and
+        // it is not in the UTxO listing. One `/txs/{hash}` per distinct creating
+        // transaction, hours apart — the cost the peg-out side already pays.
+        //
+        // The tip is this source's own read rather than the caller's: it is only
+        // consulted when the backend omits `slot` (yaci-devkit), and `slot_at_time`
+        // is exact for post-Shelley one-second slots, so two SPOs holding different
+        // reference pairs still derive the same slot for the same block. A tip we
+        // cannot read leaves the slots unresolved, which defers rather than admits.
+        //
+        // NOTE THE UNIT: `fetch_latest_block_slot_time` reports POSIX **seconds**
+        // and `slot_at_time` takes **milliseconds**. Passing it through unscaled
+        // is silent — every request lands thousands of slots in the future and is
+        // deferred for ever.
+        let tip = bf_http::fetch_latest_block_slot_time(&self.base_url, &self.project_id)
+            .await
+            .ok()
+            .map(|(slot, time_secs)| (slot, time_secs.saturating_mul(1000)));
+        // Collected rather than passed as a borrowing iterator: a `.iter().map(..)`
+        // held across the await makes the closure's lifetime not general enough for
+        // the async trait method.
+        let hashes: Vec<String> = out
+            .iter()
+            .map(|r| hex::encode(r.cardano_utxo.tx_hash))
+            .collect();
+        let resolved =
+            bf_http::resolve_tx_slots(&self.base_url, &self.project_id, hashes, tip, "pegin").await;
+        for req in &mut out {
+            req.created_slot = resolved
+                .get(&hex::encode(req.cardano_utxo.tx_hash))
+                .copied()
+                .flatten();
         }
 
         out.sort_by(|a, b| a.cardano_utxo.cmp(&b.cardano_utxo));

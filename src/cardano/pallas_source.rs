@@ -21,6 +21,8 @@ use pallas_network::miniprotocols::localstate::queries_v16::{
 };
 use tokio::sync::Mutex;
 
+use tracing::warn;
+
 use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInRequest, CardanoPegInSource};
 use crate::epoch::state::{EpochError, EpochResult};
 
@@ -147,12 +149,32 @@ impl CardanoPegInSource for PallasPegInSource {
                     output_index,
                 },
                 datum_cbor,
+                // `get_utxo_by_address` is a ledger-state query: it answers what
+                // is unspent NOW and carries no history, so there is no creation
+                // slot to read and no N2C query that would supply one without
+                // chain-following. Left unresolved, which DEFERS the request
+                // (WI-049) — see the warning below.
+                created_slot: None,
             });
         }
 
         // Deterministic order: the trait contract requires sort by
         // `cardano_utxo` so every SPO freezes the same set.
         out.sort_by(|a, b| a.cardano_utxo.cmp(&b.cardano_utxo));
+
+        // Say it plainly rather than let the batch quietly come up empty: with no
+        // creation slot every request is newer than any cutoff, so a node on this
+        // backend sweeps NOTHING once a Config schedule is in play. That is the
+        // safe direction — admitting them would make this node's batch differ from
+        // its peers' — but it is not a working deployment.
+        if !out.is_empty() {
+            warn!(
+                "[pegin] the N2C source cannot resolve creation slots, so all {} pending peg-in(s) \
+                 defer and this node will sweep none of them. Point `cardano.blockfrost_url` at a \
+                 Blockfrost-compatible endpoint (Dolos serves it) for the peg-in source.",
+                out.len()
+            );
+        }
         Ok(out)
     }
 }

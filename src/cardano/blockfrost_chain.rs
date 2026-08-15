@@ -2078,6 +2078,29 @@ impl CardanoChain for BlockfrostCardanoChain {
         .await
         .map_err(|e| EpochError::Chain(format!("fetch_pegout_requests: {e}")))?;
 
+        // Resolve each request's CREATION SLOT before it reaches the freeze.
+        // Without this every request carries `None`, `freeze_pegouts` maps that to
+        // `u64::MAX`, and the cutoff defers ALL of them — so a daemon with a Config
+        // schedule pays no peg-out, ever, and says nothing about it. The CLI sweep
+        // path resolved them from the start; the daemon path never did.
+        //
+        // POSIX ms, matching `slot_at_time` (`/blocks/latest` reports seconds).
+        let mut scan = scan;
+        let tip = crate::cardano::bf_http::fetch_latest_block_slot_time(
+            &self.bf_base_url,
+            &self.bf_project_id,
+        )
+        .await
+        .ok()
+        .map(|(slot, time_secs)| (slot, time_secs.saturating_mul(1000)));
+        crate::cardano::pegout_datum::resolve_created_slots(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            &mut scan.requests,
+            tip,
+        )
+        .await;
+
         if scan.malformed > 0 {
             warn!(
                 "[pegout] {} UTxO(s) at {} carry the bridged token but no decodable \

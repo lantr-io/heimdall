@@ -71,6 +71,10 @@ pub struct ParsedPegIn {
     /// drifting from) the spend info this parse already proved matches
     /// the on-chain scriptPubKey.
     pub spend_info: TaprootSpendInfo,
+    /// Creation slot of the Cardano transaction that minted this request,
+    /// carried through from [`CardanoPegInRequest::created_slot`] — the batch
+    /// cutoff and the FIFO total order read it. `None` means "defer".
+    pub created_slot: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -251,6 +255,7 @@ pub fn parse_pegin_request(
         cardano_utxo: req.cardano_utxo.clone(),
         depositor_outputkey,
         spend_info,
+        created_slot: req.created_slot,
     })
 }
 
@@ -411,6 +416,7 @@ mod tests {
                 output_index: 7,
             },
             datum_cbor: datum_bytes,
+            created_slot: Some(1_234),
         }
     }
 

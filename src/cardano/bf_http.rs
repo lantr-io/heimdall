@@ -308,6 +308,57 @@ pub fn slot_at_time(ref_slot: u64, ref_time_ms: i64, block_time_ms: i64) -> u64 
     }
 }
 
+/// Resolve the CREATION SLOT of each named transaction, one `/txs/{hash}` per
+/// DISTINCT hash.
+///
+/// The shared half of batch membership: the creation slot is the chain fact both
+/// the stability cutoff and the FIFO total order key off, for peg-outs (whose
+/// datum `created` is requester-set and backdatable) and for peg-ins alike.
+/// Several requests minted in one transaction cost one lookup, and batches are
+/// hours apart, so this is a handful of reads per movement.
+///
+/// `tip` is a known `(slot, time_ms)` pair on the same chain, consulted only when
+/// the backend omits `slot` (yaci-devkit). A hash that cannot be resolved maps to
+/// `None`, and callers MUST read that as "defer", never as "old enough": a flaky
+/// lookup then costs latency rather than a batch two SPOs disagree about.
+///
+/// `what` names the caller in the warning — the operator wants to know which
+/// side of the bridge is deferring.
+pub async fn resolve_tx_slots(
+    base_url: &str,
+    project_id: &str,
+    tx_hashes: impl IntoIterator<Item = String>,
+    tip: Option<(u64, i64)>,
+    what: &str,
+) -> std::collections::HashMap<String, Option<u64>> {
+    let mut seen: std::collections::HashMap<String, Option<u64>> = std::collections::HashMap::new();
+    for tx_hash in tx_hashes {
+        if seen.contains_key(&tx_hash) {
+            continue;
+        }
+        let resolved = match fetch_tx_point(base_url, project_id, &tx_hash).await {
+            Ok(point) => point.slot.or_else(|| {
+                tip.map(|(ref_slot, ref_time_ms)| {
+                    slot_at_time(
+                        ref_slot,
+                        ref_time_ms,
+                        point.block_time_secs.saturating_mul(1000),
+                    )
+                })
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    "[{what}] could not resolve the creation slot of {tx_hash} ({e}) — deferring \
+                     that request to a later batch"
+                );
+                None
+            }
+        };
+        seen.insert(tx_hash, resolved);
+    }
+    seen
+}
+
 /// Return whether a Cardano transaction is included in the indexed chain.
 /// Blockfrost returns 404 while a submitted transaction is still pending (or
 /// has expired from the mempool), so callers can distinguish pending from an
