@@ -74,13 +74,22 @@ impl Roster {
     }
 
     /// Designated leader for the given attempt. Today this is just the
-    /// lowest-identifier participant; future cuts will rotate on
-    /// `leader_attempt` so a stuck leader can be replaced.
+    /// lowest-identifier participant, which matches no attempt of the
+    /// published rule.
     ///
-    /// TODO: real leader rotation. The right rule is something like
-    /// `participants[(epoch + attempt) mod n]` so a stuck leader is
-    /// deterministically replaced after `leader_timeout`. The signature
-    /// already takes `attempt` so callers don't need to change.
+    /// TODO (WI-104): implement the rule the spec already publishes —
+    /// `leader_index = hash("bifrost-leader" ‖ prev_tm_txid ‖ tm_sequence)
+    /// mod roster_size` over the roster sorted by `pool_id`, with the cascade
+    /// hop `((i - leader_index) mod roster_size) × leader_slot_T` measured in
+    /// SLOTS from `signing_complete_slot`. `tm_sequence` is the literal `"dkg"`
+    /// for key publication, so Update-Y elects through this same function.
+    ///
+    /// Do NOT implement `participants[(epoch + attempt) mod n]`, which an
+    /// earlier note here proposed: it is deterministic but PREDICTABLE, and
+    /// the previous TM's Bitcoin txid is the entropy precisely because it
+    /// cannot be known before that TM is mined. `leader_slot_T` is on chain
+    /// already — `ScheduleParams::leader_slot_t` — and must not be taken from
+    /// `[protocol].leader_timeout_secs`, which is per-operator.
     pub fn leader(&self, _attempt: u8) -> Identifier {
         *self
             .participants
@@ -367,13 +376,13 @@ pub enum EpochPhase {
         /// followed by a fresh `EpochStart`.
         group_keys: GroupKeys,
         tm: TreasuryMovement,
-        /// Which leader-rotation attempt this is. `Roster::leader` maps
-        /// it to the designated submitter for the round.
+        /// Which cascade hop this is. `Roster::leader` maps it to the SPO
+        /// expected to post first; every other SPO holding the aggregate may
+        /// still post, since posting is permissionless on chain.
         ///
-        /// TODO: a `leader_timeout`-driven rotation is not implemented:
-        /// today the leader is always `Roster::leader(0)` and a stuck
-        /// leader is not replaced. Bumping `leader_attempt` is the
-        /// right knob, but nothing currently bumps it.
+        /// TODO (WI-104): nothing bumps this, and `Roster::leader` ignores it,
+        /// so a stuck leader is never replaced. The hop is slot arithmetic
+        /// against `leader_slot_T`, not a local timer.
         leader_attempt: u8,
     },
     /// Write down what was just posted, so the fold that a confirmation owes the

@@ -489,14 +489,20 @@ pub(crate) struct Quorum<'a> {
     min: usize,
     /// A peer the subset is worthless without, if there is one.
     ///
-    /// Threshold alone is not enough for a TM: `submit_phase` broadcasts only
-    /// from `Roster::leader`, and nothing bumps `leader_attempt`, so a subset
-    /// that excludes the leader signs a movement NOBODY posts — and does it
-    /// silently, consuming the batch opportunity while the log reads "posted and
-    /// awaiting confirmation". Requiring the leader keeps WI-047's win (any other
-    /// absentee is signed around) without opening that hole. The real fix is the
-    /// leader-timeout cascade the `submit_phase` TODO describes; until it exists,
-    /// this is the honest bound.
+    /// Threshold alone is not enough for a TM *as this daemon is built*:
+    /// `submit_phase` broadcasts only from `Roster::leader`, and nothing bumps
+    /// `leader_attempt`, so a subset that excludes the leader signs a movement
+    /// NOBODY posts — and does it silently, consuming the batch opportunity
+    /// while the log reads "posted and awaiting confirmation". Requiring the
+    /// leader keeps WI-047's win (any other absentee is signed around) without
+    /// opening that hole.
+    ///
+    /// It is a BOUND ON OUR OWN GATE, NOT A PROTOCOL RULE, and it is stricter
+    /// than the protocol: posting is permissionless, so every node holding the
+    /// aggregate can post and one absent member should cost a cascade hop, not
+    /// the round. WI-104 must DELETE this — implementing the leader cascade and
+    /// then re-pointing `requiring` at the current hop's leader would keep a
+    /// failure mode the spec does not have.
     required: Option<Identifier>,
 }
 
@@ -713,6 +719,10 @@ mod tests {
     ///
     /// Before the threshold poll this was unreachable — round 1 required every
     /// peer, so no aggregate could exist without the leader's commitment.
+    ///
+    /// THIS TEST IS EXPECTED TO DIE WITH WI-104. It pins a bound on our own
+    /// submit gate, not a protocol rule; once any node may post, a leaderless
+    /// subset SHOULD sign and the assertion inverts.
     #[tokio::test]
     async fn a_threshold_subset_without_the_leader_does_not_sign() {
         let hub = MockPeerHub::new();

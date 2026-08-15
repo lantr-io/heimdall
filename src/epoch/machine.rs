@@ -2053,10 +2053,18 @@ async fn build_tm_phase(
 // `chain.submit_signed_tm`. Today the leader is always
 // `Roster::leader(0)` (lowest identifier).
 //
-// TODO: leader-timeout cascade. If the leader stalls, `leader_attempt`
-// should increment and a new leader take over after `leader_timeout`.
-// Nothing currently bumps `leader_attempt`, so a stuck leader hangs the
-// cycle. The phase enum already plumbs the field for this.
+// That gate is stricter than the protocol. Posting a TM is PERMISSIONLESS on
+// chain — the head check gates record validity and Bitcoin gates correctness,
+// so an out-of-turn or duplicate post is inert. The leader rule is only the
+// off-chain convention for who goes first, and each SPO is meant to watch the
+// chain and stand down once a predecessor has posted.
+//
+// TODO (WI-104): implement the cascade — `Roster::leader` ignores its
+// `attempt`, nothing bumps `leader_attempt`, and the hop is slot arithmetic
+// against the on-chain `leader_slot_T`, not `[protocol].leader_timeout_secs`.
+// Landing it should also DROP `Quorum::requiring(leader)` in `sign_phase`
+// (see there): that bound exists only because this gate turns one absent
+// member into an unpostable movement.
 #[allow(clippy::too_many_arguments)]
 async fn submit_phase(
     chain: &Arc<dyn CardanoChain>,
