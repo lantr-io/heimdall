@@ -737,8 +737,10 @@ const RETIRED_KEYS: &[RetiredKey] = &[
     ),
     // WI-071: a TM SELECTION rule, so it decides the TM bytes — two operators on
     // different values freeze different peg-out sets and their FROST round never
-    // converges, with neither log able to say why. It is compiled in until the
-    // Config publishes it.
+    // converges, with neither log able to say why. Compiled in for good, not
+    // pending a Config field: publishing it was proposed and rejected, because
+    // nothing outside heimdall reads the value and divergence costs liveness
+    // rather than safety. The reasoning is beside the constant.
     (
         "protocol",
         "pegout_freshness_margin_ms",
