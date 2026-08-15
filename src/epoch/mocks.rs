@@ -218,6 +218,11 @@ pub struct MockCardanoChain {
     /// How many further grid reads fail before the mock answers — a provider
     /// hiccup on the batch loop's only regular chain read.
     snapshot_failures: Arc<std::sync::atomic::AtomicU32>,
+    /// How many further Update-Y plan reads fail before the mock answers — a
+    /// provider hiccup inside `PublishKeys`, which is the phase the rotation
+    /// lives in. Shared, so every node in a test fails the same rounds and they
+    /// stay in lockstep, exactly as a real chain outage would leave them.
+    update_y_failures: Arc<std::sync::atomic::AtomicU32>,
     /// In-memory stand-in for the `treasury_info` state UTxO. `None` (the
     /// default) is a chain with nothing to rotate, so `plan_update_y` reports
     /// no handoff.
@@ -257,6 +262,7 @@ impl MockCardanoChain {
             tm_chain: None,
             treasury_busy: Arc::new(AtomicBool::new(false)),
             snapshot_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            update_y_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             bridge_roots: None,
             treasury_info: None,
         }
@@ -377,6 +383,21 @@ impl MockCardanoChain {
     pub fn fail_next_snapshots(self, n: u32) -> Self {
         self.snapshot_failures.store(n, Ordering::Release);
         self
+    }
+
+    /// Fail the next `n` `plan_update_y` reads with a retriable chain error, on
+    /// the shared counter — so a test can make `PublishKeys` fail and watch where
+    /// the machine re-enters the epoch (WI-047).
+    pub fn fail_next_update_y_plans(
+        self,
+        shared: Arc<std::sync::atomic::AtomicU32>,
+        n: u32,
+    ) -> Self {
+        shared.store(n, Ordering::Release);
+        Self {
+            update_y_failures: shared,
+            ..self
+        }
     }
 
     /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning the
@@ -530,6 +551,15 @@ impl CardanoChain for MockCardanoChain {
         epoch: u64,
         new_y_51: bitcoin::key::UntweakedPublicKey,
     ) -> EpochResult<Option<UpdateYPlan>> {
+        if self
+            .update_y_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(EpochError::Chain(
+                "mock: injected Update-Y plan read failure".into(),
+            ));
+        }
         let Some(state) = &self.treasury_info else {
             return Ok(None);
         };

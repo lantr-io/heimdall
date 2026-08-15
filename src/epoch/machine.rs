@@ -230,21 +230,51 @@ async fn drive_to_movement(
     // when we are resuming a daemon's batch loop. It is not ours to give back; see
     // the error arm.
     let inherited = *built;
-    // This epoch's completed ceremony, kept so a transient failure inside the
-    // batch loop costs one batch rather than the epoch. `Idle` waits for the
-    // chain epoch to ADVANCE, so re-entering it mid-epoch parks the node for days
-    // — and a batch loop that cycles every few hours meets far more transient
-    // failures than one movement per epoch ever did.
-    let mut ceremony: Option<(u64, Roster, GroupKeys)> = None;
+    // Where to re-enter THIS epoch after a retriable failure, carrying the
+    // ceremony it already paid for. `Idle` waits for the chain epoch to ADVANCE,
+    // so re-entering it mid-epoch parks the node for days — and both phases below
+    // meet far more transient failures than one movement per epoch ever did.
+    //
+    // Two phases can be re-entered, and both are idempotent by construction:
+    //
+    //  - `PublishKeys` — the handoff has not landed yet. Re-running it is a no-op
+    //    once it has (`plan_update_y` returns None when the datum already names
+    //    the key), and a rotation that failed on a slow or absent peer deserves a
+    //    retry in minutes. Falling to `Idle` here costs the epoch's ENTIRE batch
+    //    grid, not just the rotation, because the batch loop sits downstream of
+    //    this phase (WI-047).
+    //  - `CollectPegins` — past the handoff, in the batch loop. A failure there
+    //    costs one batch rather than the epoch (WI-097).
+    let mut resume: Option<EpochPhase> = None;
     loop {
         crate::epoch_log!(me, current_epoch(&phase), "==> phase = {}", phase.name());
-        if let EpochPhase::CollectPegins {
-            epoch,
-            roster,
-            group_keys,
-        } = &phase
-        {
-            ceremony = Some((*epoch, roster.clone(), group_keys.clone()));
+        // Rebuilt rather than cloned: `EpochPhase` is not `Clone` (a `Sign` or
+        // `Submit` phase carries a whole `TreasuryMovement`), and only these two
+        // variants are ones we would ever want to re-enter.
+        match &phase {
+            EpochPhase::PublishKeys {
+                epoch,
+                roster,
+                group_keys,
+            } => {
+                resume = Some(EpochPhase::PublishKeys {
+                    epoch: *epoch,
+                    roster: roster.clone(),
+                    group_keys: group_keys.clone(),
+                });
+            }
+            EpochPhase::CollectPegins {
+                epoch,
+                roster,
+                group_keys,
+            } => {
+                resume = Some(EpochPhase::CollectPegins {
+                    epoch: *epoch,
+                    roster: roster.clone(),
+                    group_keys: group_keys.clone(),
+                });
+            }
+            _ => {}
         }
         match step_phase(
             phase,
@@ -326,25 +356,25 @@ async fn drive_to_movement(
                 if *built != inherited {
                     built.clear();
                 }
-                // Re-enter the BATCH loop when this epoch's ceremony is still in
-                // hand and the chain is still in that epoch; only otherwise fall
-                // back to `Idle`, which re-derives everything from chain. The
-                // ceremony is the expensive part and it is still valid: the spec's
-                // "no halt, no special state" is about a failed DKG, not about
-                // throwing away a good one because a peg-out query 502'd.
+                // Re-enter THIS epoch when its ceremony is still in hand and the
+                // chain is still in that epoch; only otherwise fall back to
+                // `Idle`, which re-derives everything from chain. The ceremony is
+                // the expensive part and it is still valid: the spec's "no halt,
+                // no special state" is about a failed DKG, not about throwing away
+                // a good one because a peg-out query 502'd or one outgoing member
+                // was slow to answer the rotation.
                 //
-                // An unreadable epoch counts as unchanged: the batch loop retries
-                // and backs off, whereas `Idle` would silently park for up to a
-                // full epoch on what may be a five-second outage.
-                phase = match ceremony.take() {
-                    Some((epoch, roster, group_keys))
-                        if chain.current_epoch().await.map_or(true, |now| now == epoch) =>
+                // An unreadable epoch counts as unchanged: re-entering retries and
+                // backs off, whereas `Idle` would silently park for up to a full
+                // epoch on what may be a five-second outage.
+                phase = match resume.take() {
+                    Some(p)
+                        if chain
+                            .current_epoch()
+                            .await
+                            .map_or(true, |now| now == current_epoch(&p)) =>
                     {
-                        EpochPhase::CollectPegins {
-                            epoch,
-                            roster,
-                            group_keys,
-                        }
+                        p
                     }
                     _ => EpochPhase::Idle,
                 };
@@ -3390,6 +3420,78 @@ mod tests {
             slot: 5_000_000 + index,
             cutoff_slot: 4_900_000 + index,
         }
+    }
+
+    /// WI-047, the loop half: a failed key handoff costs the ROTATION, not the
+    /// epoch's treasury movements.
+    ///
+    /// `PublishKeys` sits upstream of the whole batch loop, and the error arm used
+    /// to keep this epoch's ceremony only from `CollectPegins` onward — so any
+    /// failure inside the handoff dropped to `Idle`, which waits for the chain
+    /// epoch to ADVANCE. One slow Cardano read, and the node sat out every batch
+    /// opportunity of a five-day epoch.
+    ///
+    /// The mock's `await_epoch_boundary` fires once and then parks for ever, so a
+    /// machine that answers a failed rotation with `Idle` HANGS this test — which
+    /// is exactly what it does to a real node, only for days rather than seconds.
+    #[tokio::test]
+    async fn a_failed_key_handoff_costs_the_rotation_not_the_epoch() {
+        let seed = [0x21u8; 32];
+        let secp = Secp256k1::new();
+        let fed_xonly = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&seed).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, [0xe1u8; 32]);
+        // ONE shared counter: every node fails the same read, as a real chain
+        // outage would leave them, so they retry the handoff together.
+        let outage = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let fixture = demo_static_fixture(2, 2, 19_700);
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone())
+                    .with_treasury_info(treasury_info.clone())
+                    .fail_next_update_y_plans(Arc::clone(&outage), 2),
+            );
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let mut config = fast_config(id);
+            config.y_fed_seed = Some(seed);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        for h in handles {
+            tokio::time::timeout(Duration::from_secs(30), h)
+                .await
+                .expect(
+                    "a failed handoff must re-enter PublishKeys for the same epoch — falling to \
+                     Idle waits for the next boundary and loses the epoch's movements",
+                )
+                .unwrap()
+                .expect("the movement completes after the handoff retries");
+        }
+        // The retry was real: the handoff landed, on the epoch it belonged to.
+        assert_eq!(
+            treasury_info.lock().unwrap().rotations.len(),
+            1,
+            "the rotation must complete on the retry, not be skipped"
+        );
+        assert_eq!(
+            outage.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "both injected failures must have been consumed — otherwise the phase was never \
+             re-entered and this test proves nothing"
+        );
     }
 
     /// WI-097's acceptance. Two Treasury Movements in ONE epoch, off ONE ceremony,
