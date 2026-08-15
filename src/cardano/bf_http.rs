@@ -271,9 +271,16 @@ pub async fn fetch_tx_point(
     tx_hash: &str,
 ) -> Result<TxPoint, String> {
     let url = format!("{base_url}/txs/{tx_hash}");
+    // Bounded, unlike most of this module: `resolve_tx_slots` calls this once per
+    // distinct creating transaction, SEQUENTIALLY, on the movement's critical
+    // path, and nothing above it applies a timeout of its own. reqwest has no
+    // default, so one half-open connection (a NAT timeout, a load-balancer black
+    // hole) would hang `query_pegin_requests` — and with it the whole epoch loop —
+    // producing no error for the back-off policy to see and no log line.
     let v: serde_json::Value = reqwest::Client::new()
         .get(&url)
         .header("project_id", project_id)
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
         .map_err(|e| format!("txs/{tx_hash} request: {e}"))?
@@ -337,15 +344,30 @@ pub async fn resolve_tx_slots(
             continue;
         }
         let resolved = match fetch_tx_point(base_url, project_id, &tx_hash).await {
-            Ok(point) => point.slot.or_else(|| {
-                tip.map(|(ref_slot, ref_time_ms)| {
-                    slot_at_time(
-                        ref_slot,
-                        ref_time_ms,
-                        point.block_time_secs.saturating_mul(1000),
-                    )
-                })
-            }),
+            Ok(point) => {
+                let slot = point.slot.or_else(|| {
+                    tip.map(|(ref_slot, ref_time_ms)| {
+                        slot_at_time(
+                            ref_slot,
+                            ref_time_ms,
+                            point.block_time_secs.saturating_mul(1000),
+                        )
+                    })
+                });
+                // The other way to end up unresolved, and it used to be silent: the
+                // backend omits `slot` (yaci-devkit) AND the caller's tip read
+                // failed, so there is nothing to derive it from. Deferring every
+                // request with no line explaining why is the failure the sibling
+                // pallas warning exists to prevent.
+                if slot.is_none() {
+                    tracing::warn!(
+                        "[{what}] {tx_hash} has no `slot` and no chain tip to derive one from — \
+                         deferring that request. The tip read failed; without it this backend \
+                         cannot place any request in a batch."
+                    );
+                }
+                slot
+            }
             Err(e) => {
                 tracing::warn!(
                     "[{what}] could not resolve the creation slot of {tx_hash} ({e}) — deferring \

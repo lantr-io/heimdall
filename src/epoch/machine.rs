@@ -259,6 +259,11 @@ async fn drive_to_movement(
     // far short of an epoch.
     const HANDOFF_RETRIES: u32 = 6;
     let mut handoff_retries = 0u32;
+    // The epoch whose rotation round this node has already SPENT (published a
+    // commitment into and then failed). Set on the first such failure, which
+    // re-enters `PublishKeys` once — with the ceremony disabled — purely to see
+    // whether the rotation landed without this node.
+    let mut rotation_spent: Option<u64> = None;
     loop {
         crate::epoch_log!(me, current_epoch(&phase), "==> phase = {}", phase.name());
         // Rebuilt rather than cloned: `EpochPhase` is not `Clone` (a `Sign` or
@@ -303,6 +308,7 @@ async fn drive_to_movement(
             }
             _ => {}
         }
+        let spent_here = rotation_spent == Some(current_epoch(&phase));
         match step_phase(
             phase,
             chain,
@@ -313,6 +319,7 @@ async fn drive_to_movement(
             config,
             me,
             built,
+            spent_here,
         )
         .await
         {
@@ -360,14 +367,39 @@ async fn drive_to_movement(
                 // `EpochError::RoundSpent`.
                 let round_spent = e.round_is_spent();
                 if round_spent && matches!(resume, Some(EpochPhase::PublishKeys { .. })) {
-                    crate::epoch_warn!(
-                        me,
-                        current_epoch(&EpochPhase::Idle),
-                        "Update-Y: {e} — the commitments are already published, so this epoch's \
-                         rotation is over. The treasury keeps the current key and the outgoing \
-                         roster carries over; the next boundary retries."
-                    );
-                    resume = None;
+                    let ep = resume.as_ref().map_or(0, current_epoch);
+                    if rotation_spent == Some(ep) {
+                        // Second time round: the phase re-entered, found the
+                        // treasury still naming the old key, and refused to walk
+                        // the spent round again. Nothing more this node can do
+                        // until the boundary re-derives everything.
+                        crate::epoch_warn!(
+                            me,
+                            ep,
+                            "Update-Y: {e} — the rotation did not land and this node's round is \
+                             spent, so the epoch's handoff is over. The treasury keeps the \
+                             current key and the outgoing roster carries over."
+                        );
+                        resume = None;
+                    } else {
+                        // First time: the round is spent for THIS node, but the
+                        // threshold subset WI-047 exists to allow may well have
+                        // aggregated and posted without it — in which case the
+                        // treasury already names the key this node holds a share
+                        // of, `plan_update_y` returns None, and the phase walks
+                        // straight through to the batch loop. Dropping to `Idle`
+                        // here would throw away the whole epoch's grid over a
+                        // rotation that SUCCEEDED (machine.rs's own rule, above).
+                        // So re-enter once to look, with the ceremony disabled.
+                        crate::epoch_warn!(
+                            me,
+                            ep,
+                            "Update-Y: {e} — this node's round is spent. Re-reading the treasury \
+                             once in case the rotation landed without it; not re-running the \
+                             ceremony."
+                        );
+                        rotation_spent = Some(ep);
+                    }
                 }
                 // Post-ban recovery (chain-view reconcile): if this failure came
                 // with a detected chain-view disagreement on which we are the
@@ -463,6 +495,9 @@ async fn step_phase(
     config: &EpochConfig,
     me: frost::Identifier,
     built: &mut BuiltBatch,
+    // This epoch's rotation round is already spent (WI-048): re-enter to see
+    // whether it landed without us, but do NOT run the ceremony again.
+    rotation_spent: bool,
 ) -> EpochResult<Step> {
     let next = match phase {
         EpochPhase::Idle => idle_phase(chain).await?,
@@ -499,7 +534,18 @@ async fn step_phase(
             roster,
             group_keys,
         } => {
-            publish_keys_phase(chain, peers, clock, rng, config, epoch, roster, group_keys).await?
+            publish_keys_phase(
+                chain,
+                peers,
+                clock,
+                rng,
+                config,
+                epoch,
+                roster,
+                group_keys,
+                rotation_spent,
+            )
+            .await?
         }
 
         EpochPhase::CollectPegins {
@@ -1243,6 +1289,12 @@ async fn publish_keys_phase(
     epoch: u64,
     roster: Roster,
     group_keys: GroupKeys,
+    // This node already published a commitment for this epoch's rotation and
+    // the round failed (WI-048). Re-entering is worth it only to LOOK: if the
+    // threshold subset landed the Update-Y without us, `plan_update_y` returns
+    // None and this phase walks through to the batch loop. If it did not, the
+    // ceremony must not run a second time in the same namespace.
+    rotation_spent: bool,
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
     let group = group_xonly(&group_keys.verifying_key).map_err(EpochError::Frost)?;
@@ -1307,6 +1359,14 @@ async fn publish_keys_phase(
             epoch,
             "  no Update-Y needed (treasury_info already names this key, or no state to rotate)"
         ),
+        Some(_) if rotation_spent => {
+            return Err(EpochError::RoundSpent {
+                round: 1,
+                cause: format!(
+                    "the epoch-{epoch} rotation round is spent and treasury_info still names the                      old key, so the threshold subset did not land it either"
+                ),
+            });
+        }
         Some(plan) => {
             crate::epoch_log!(
                 me,
@@ -1611,7 +1671,18 @@ fn freeze_pegins(
     let Some(batch) = batch else {
         // No grid: cap and order only. A mock chain, or a deployment whose Config
         // carries no schedule.
-        let mut ordered = pegins;
+        //
+        // An unresolved slot is DROPPED here too, not merely sorted last. With no
+        // cutoff `truncate` would otherwise admit it, which contradicts
+        // `CardanoPegInRequest::created_slot`'s contract and is not harmless: two
+        // nodes with different resolution luck order the same set differently
+        // (every unresolved key collapses to `u64::MAX` and ties break on
+        // tx_hash), so above the cap they take a DIFFERENT hundred and their
+        // movements cannot aggregate.
+        let mut ordered: Vec<ParsedPegIn> = pegins
+            .into_iter()
+            .filter(|p| p.created_slot.is_some())
+            .collect();
         ordered.sort_by_key(&key);
         ordered.truncate(cap);
         return ordered;
@@ -3844,6 +3915,150 @@ mod tests {
         for h in handles {
             h.abort();
         }
+    }
+
+    /// A dealt `t`-of-`n` key set plus the group's x-only key, for phase tests
+    /// that need real FROST material without running a ceremony.
+    fn dealt_group_keys(
+        n: u16,
+        t: u16,
+    ) -> (
+        std::collections::BTreeMap<Identifier, GroupKeys>,
+        bitcoin::key::UntweakedPublicKey,
+    ) {
+        let mut rng = rand::thread_rng();
+        let (shares, pkp) =
+            frost::keys::generate_with_dealer(n, t, frost::keys::IdentifierList::Default, &mut rng)
+                .unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        for (id, share) in shares {
+            out.insert(
+                id,
+                GroupKeys {
+                    verifying_key: *pkp.verifying_key(),
+                    public_key_package: pkp.clone(),
+                    key_package: frost::keys::KeyPackage::try_from(share).unwrap(),
+                },
+            );
+        }
+        let xonly = crate::frost::xonly::group_xonly(pkp.verifying_key())
+            .unwrap()
+            .xonly;
+        (out, xonly)
+    }
+
+    fn roster_of(n: u16, t: u16) -> Roster {
+        let mut participants = std::collections::BTreeMap::new();
+        for i in 1..=n {
+            let id = Identifier::try_from(i).unwrap();
+            participants.insert(
+                id,
+                crate::epoch::state::SpoInfo {
+                    identifier: id,
+                    pool_id: vec![],
+                    bifrost_url: String::new(),
+                    bifrost_id_pk: vec![],
+                },
+            );
+        }
+        Roster {
+            epoch: 0,
+            min_signers: t,
+            max_signers: n,
+            participants,
+        }
+    }
+
+    /// WI-048 review: a node whose rotation round is SPENT must still discover
+    /// that the handoff landed WITHOUT it, and join the epoch's batch grid.
+    ///
+    /// This is the case a THRESHOLD rotation creates and a full-set one could not:
+    /// t of the outgoing roster aggregate and post the Update-Y while this node's
+    /// own round times out. The treasury then names the very key this node
+    /// completed the DKG for and holds a share of — it can co-sign every movement
+    /// of the epoch, and there is nothing left to retry. Parking on the spent
+    /// round throws all of that away for ~5 days over a rotation that SUCCEEDED,
+    /// which is what `resume = None` alone did.
+    ///
+    /// So a spent rotation re-enters exactly once with the ceremony DISABLED:
+    /// `plan_update_y` answering `None` is the proof it landed.
+    #[tokio::test]
+    async fn a_spent_rotation_that_landed_elsewhere_walks_through_to_the_batch_loop() {
+        let (keys, outgoing) = dealt_group_keys(2, 2);
+        let me = Identifier::try_from(1u16).unwrap();
+        // The treasury already names the key this node just derived, which is what
+        // a rotation posted by the threshold subset looks like from here.
+        let treasury_info = MockCardanoChain::treasury_info_state(outgoing, [0xe6u8; 32]);
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(demo_static_fixture(2, 2, 19_990))
+                .with_treasury_info(treasury_info),
+        );
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, MockPeerHub::new()));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let config = fast_config(me);
+
+        let next = publish_keys_phase(
+            &chain,
+            &peers,
+            &clock,
+            &rng,
+            &config,
+            7,
+            roster_of(2, 2),
+            keys.get(&me).unwrap().clone(),
+            true, // the round is spent
+        )
+        .await
+        .expect("a spent rotation whose handoff already landed must not fail");
+        assert!(
+            matches!(next, EpochPhase::CollectPegins { .. }),
+            "it must walk through to the batch loop, not park: the node holds a share of the key \
+             the treasury now names and can co-sign every movement of the epoch"
+        );
+    }
+
+    /// The other half: a spent rotation whose handoff did NOT land must refuse to
+    /// walk the round again, and say which of the two it is.
+    ///
+    /// Re-running the ceremony in the same namespace cannot converge — peers keep
+    /// serving their first commitment and `poll_sign_round` never re-fetches a
+    /// peer it already has — so the honest answer is to stop and let the boundary
+    /// re-derive everything.
+    #[tokio::test]
+    async fn a_spent_rotation_that_did_not_land_refuses_to_walk_the_round_again() {
+        let (keys, _outgoing) = dealt_group_keys(2, 2);
+        let me = Identifier::try_from(1u16).unwrap();
+        // A DIFFERENT key: the treasury still names the outgoing roster, so the
+        // rotation is still outstanding.
+        let stale = dealt_group_keys(2, 2).1;
+        let treasury_info = MockCardanoChain::treasury_info_state(stale, [0xe7u8; 32]);
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(demo_static_fixture(2, 2, 19_992))
+                .with_treasury_info(treasury_info),
+        );
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, MockPeerHub::new()));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let config = fast_config(me);
+
+        let err = publish_keys_phase(
+            &chain,
+            &peers,
+            &clock,
+            &rng,
+            &config,
+            7,
+            roster_of(2, 2),
+            keys.get(&me).unwrap().clone(),
+            true,
+        )
+        .await
+        .expect_err("a spent rotation with the handoff still outstanding must not re-run it");
+        assert!(
+            err.round_is_spent(),
+            "the loop reads this to park instead of re-entering a third time: {err:?}"
+        );
     }
 
     /// WI-098: a peer that answers with an ERROR is signed around, exactly like

@@ -27,26 +27,18 @@ use crate::epoch::traits::{Clock, PeerNetwork, RngSource};
 use crate::frost::participant;
 use crate::http::wire::SignNamespace;
 
-/// Drive one sub-round of the signing phase for all TM inputs.
-///
-/// TODO: signing cascade is not implemented. Today `sign_phase` only
-/// exercises `CascadeLevel::Quorum51`; on timeout it returns `PollTimeout`
-/// and the state machine aborts. A real implementation should catch
-/// `PollTimeout` from `poll_sign_round{1,2}` and fall through to
-/// `Federation` (script-path spend after `federation_csv_blocks`).
-///
-/// TODO: misbehavior detection. FROST errors here currently surface as
-/// `EpochError::Frost(String)` with the identity lost. The identifiable
-/// abort property means we can attribute a bad share to a specific
-/// `Identifier`. The on-chain fault-proof flow is currently implemented for
-/// DKG faults; signing-share fault proofs are still not wired up.
 /// Mark every failure from the first published commitment onward as
 /// [`EpochError::RoundSpent`], so the epoch loop rejoins its peers at the next
 /// synchronized entry instead of walking a round they have already left.
 ///
-/// Apply it to EVERY fallible step after `publish_sign_round1` — the marker is
-/// about what this node has already told its peers, not about what went wrong.
-/// It is idempotent, so wrapping an already-marked error is safe.
+/// Apply it to EVERY fallible step after a commitment has actually reached the
+/// store — the marker is about what this node has already told its peers, not
+/// about what went wrong. It is idempotent, so wrapping an already-marked error
+/// is safe.
+///
+/// It DOES flatten the underlying error to a string. Nothing on the signing path
+/// can match `PollTimeout` any more, which the signing cascade will need — see
+/// the TODO on [`sign_phase`].
 pub(crate) fn spent(round: u8) -> impl Fn(EpochError) -> EpochError {
     move |e| match e {
         already @ EpochError::RoundSpent { .. } => already,
@@ -57,6 +49,23 @@ pub(crate) fn spent(round: u8) -> impl Fn(EpochError) -> EpochError {
     }
 }
 
+/// Drive one sub-round of the signing phase for all TM inputs.
+///
+/// TODO: signing cascade is not implemented. Today `sign_phase` only
+/// exercises `CascadeLevel::Quorum51`; on timeout it returns `PollTimeout`
+/// and the state machine aborts. A real implementation should catch
+/// the timeout from `poll_sign_round{1,2}` and fall through to
+/// `Federation` (script-path spend after `federation_csv_blocks`).
+/// NOTE for whoever writes it: `matches!(e, EpochError::PollTimeout { .. })`
+/// will NOT fire — [`spent`] wraps every such error in `RoundSpent` with the
+/// cause flattened to a string, and the symptom of getting this wrong is
+/// indistinguishable from "no round ever times out".
+///
+/// TODO: misbehavior detection. FROST errors here currently surface as
+/// `EpochError::Frost(String)` with the identity lost. The identifiable
+/// abort property means we can attribute a bad share to a specific
+/// `Identifier`. The on-chain fault-proof flow is currently implemented for
+/// DKG faults; signing-share fault proofs are still not wired up.
 pub async fn sign_phase(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
@@ -124,6 +133,7 @@ pub async fn sign_phase(
                 num_inputs
             );
             // Generate and publish this SPO's nonce commitments for every input.
+            let mut published_any = false;
             for i in 0..num_inputs as u32 {
                 // Never `rng.rng(..)`: see `RngSource::signing_nonce_rng`. Under
                 // `--deterministic` that context is constant for the epoch, so a
@@ -139,12 +149,18 @@ pub async fn sign_phase(
                     .or_default()
                     .insert(me, commitments);
 
-                // From here on this node has told its peers something. Every
-                // later failure in this round is SPENT — see `spent`.
+                // The publish itself is only SPENT once an earlier one succeeded.
+                // It can fail before anything reaches the store (canonical-bytes
+                // build, serialization), and on input 0 that means no peer saw
+                // anything — a plain retry at the same opportunity is then correct
+                // and free, where marking it spent would skip the whole batch
+                // opportunity (and, on the rotation path, park for the epoch).
+                let mark = |e| if published_any { spent(1)(e) } else { e };
                 peers
                     .publish_sign_round1(input_namespace(epoch, &tm, i), me, commitments)
                     .await
-                    .map_err(spent(1))?;
+                    .map_err(mark)?;
+                published_any = true;
                 crate::epoch_debug!(me, epoch, "  -> published commitments for input {i}");
             }
 
@@ -683,7 +699,15 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                     out.insert(peer.identifier, value);
                     unreachable.remove(&peer.identifier);
                 }
-                Ok(None) => {}
+                // A clean 404 IS an answer: the peer is reachable and simply has
+                // not published yet. Clearing here as well as on success is what
+                // makes the deadline log's "up but erroring" list mean it — a peer
+                // that 503s while restarting and then serves 404s for the rest of
+                // the round has recovered, and naming it as unreachable is the
+                // false positive that teaches operators to ignore the line.
+                Ok(None) => {
+                    unreachable.remove(&peer.identifier);
+                }
                 Err(e) => {
                     // Once per peer per round, not once per poll: at a 10 ms
                     // interval against a 30-minute window the second form is tens
@@ -721,11 +745,14 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                 if unreachable.is_empty() {
                     String::new()
                 } else {
-                    let mut listed: Vec<String> = unreachable
+                    // Already in identifier order — it is a `BTreeMap`. Sorting
+                    // the RENDERED strings instead would order "10" before "2",
+                    // which is wrong exactly when the roster is big enough for
+                    // this line to be hard to read.
+                    let listed: Vec<String> = unreachable
                         .iter()
                         .map(|(id, why)| format!("{} ({why})", id_short(*id)))
                         .collect();
-                    listed.sort();
                     format!(" UNREACHABLE (up but erroring): {}.", listed.join(", "))
                 }
             };

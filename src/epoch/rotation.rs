@@ -276,10 +276,10 @@ async fn frost_sign_message(
     // pair a fresh commitment of ours with their first one. The rotation waits
     // for the next epoch boundary instead — the old key stays, the old roster
     // carries over, "no halt, no special state". See `signing::spent`, WI-048.
-    peers
-        .publish_sign_round1(ns, me, commitments)
-        .await
-        .map_err(spent(1))?;
+    // NOT `spent`: this is the one publish of the rotation, so a failure here
+    // means no peer saw anything and a retry is free. Everything AFTER it is
+    // spent.
+    peers.publish_sign_round1(ns, me, commitments).await?;
 
     let peer_infos = roster.peers_of(me);
     crate::epoch_log!(

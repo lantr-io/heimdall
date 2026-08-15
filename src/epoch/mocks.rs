@@ -38,7 +38,7 @@ use crate::epoch::traits::{
     BatchSnapshot, CardanoChain, Clock, CycleRng, DkgFaultEvidence, EpochBoundaryEvent,
     PeerNetwork, PegOutRequestUtxo, RngSource, TreasuryUtxo, UpdateYPlan,
 };
-use crate::http::wire::{DkgNamespace, SignNamespace};
+use crate::http::wire::{DkgNamespace, SignNamespace, UPDATE_Y_SESSION};
 
 /// The opportunity one interval after `b`, in the mock's own units: a real grid
 /// has a pitch of hours, but the loop only ever compares indices and subtracts
@@ -223,6 +223,11 @@ pub struct MockCardanoChain {
     /// lives in. Shared, so every node in a test fails the same rounds and they
     /// stay in lockstep, exactly as a real chain outage would leave them.
     update_y_failures: Arc<std::sync::atomic::AtomicU32>,
+    /// When set, the SECOND `plan_update_y` call adopts the requested key and
+    /// answers `None` from then on — the mock of "the threshold subset landed the
+    /// Update-Y while this node was failing its own round" (WI-048). Shared, so
+    /// every node observes the one external rotation.
+    external_rotation: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// In-memory stand-in for the `treasury_info` state UTxO. `None` (the
     /// default) is a chain with nothing to rotate, so `plan_update_y` reports
     /// no handoff.
@@ -263,6 +268,7 @@ impl MockCardanoChain {
             treasury_busy: Arc::new(AtomicBool::new(false)),
             snapshot_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             update_y_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            external_rotation: None,
             bridge_roots: None,
             treasury_info: None,
         }
@@ -396,12 +402,20 @@ impl MockCardanoChain {
         shared.store(n, Ordering::Release);
         Self {
             update_y_failures: shared,
+            external_rotation: self.external_rotation.clone(),
             ..self
         }
     }
 
     /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning the
     /// ceremony window grid on for this mock chain.
+    /// See [`MockCardanoChain::external_rotation`].
+    #[must_use]
+    pub fn with_external_rotation(mut self, plans: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        self.external_rotation = Some(plans);
+        self
+    }
+
     pub fn with_schedule_anchor_ms(mut self, anchor_ms: i64) -> Self {
         self.schedule_anchor_ms = Some(anchor_ms);
         self
@@ -563,6 +577,12 @@ impl CardanoChain for MockCardanoChain {
         let Some(state) = &self.treasury_info else {
             return Ok(None);
         };
+        // Someone else posted the rotation between this node's attempts.
+        if let Some(plans) = &self.external_rotation
+            && plans.fetch_add(1, Ordering::AcqRel) >= 1
+        {
+            state.lock().unwrap().current_key = new_y_51;
+        }
         let state = state.lock().unwrap();
         if state.current_key == new_y_51 {
             return Ok(None);
@@ -853,6 +873,11 @@ pub struct MockPeerNetwork {
     /// DKG normally. Models the peer that goes dark exactly at a signing round,
     /// which is what forces the round past its deadline on everyone else.
     mute_sign: bool,
+    /// This node publishes nothing for the ROTATION session only — it co-signs
+    /// treasury movements normally. Models the outgoing member that sits out the
+    /// Update-Y (banned, deregistered, restarted with a wiped state_dir) without
+    /// also removing it from the movement rounds.
+    mute_rotation: bool,
     /// Peers whose signing endpoints THIS node sees as erroring — a 502 from a
     /// reverse proxy, a 500 from a peer mid-restart. Per-observer on purpose: the
     /// case that matters is ASYMMETRIC, one node getting an error where another
@@ -866,6 +891,7 @@ impl MockPeerNetwork {
             me,
             hub,
             mute_sign: false,
+            mute_rotation: false,
             unreachable_sign: std::collections::BTreeSet::new(),
         }
     }
@@ -874,6 +900,13 @@ impl MockPeerNetwork {
     #[must_use]
     pub fn muting_sign_publishes(mut self) -> Self {
         self.mute_sign = true;
+        self
+    }
+
+    /// See [`MockPeerNetwork::mute_rotation`].
+    #[must_use]
+    pub fn muting_rotation_publishes(mut self) -> Self {
+        self.mute_rotation = true;
         self
     }
 
@@ -931,7 +964,7 @@ impl PeerNetwork for MockPeerNetwork {
         _identifier: Identifier,
         commitments: frost_secp256k1_tr::round1::SigningCommitments,
     ) -> EpochResult<()> {
-        if self.mute_sign {
+        if self.mute_sign || (self.mute_rotation && ns.session == UPDATE_Y_SESSION) {
             return Ok(());
         }
         with_slot(&self.hub, self.me, |s| {
@@ -950,7 +983,7 @@ impl PeerNetwork for MockPeerNetwork {
         _identifier: Identifier,
         share: frost_secp256k1_tr::round2::SignatureShare,
     ) -> EpochResult<()> {
-        if self.mute_sign {
+        if self.mute_sign || (self.mute_rotation && ns.session == UPDATE_Y_SESSION) {
             return Ok(());
         }
         with_slot(&self.hub, self.me, |s| {
