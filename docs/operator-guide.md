@@ -284,7 +284,7 @@ read paths against whatever you configured, so run it after the change and read 
 ## 4. Check it before going further
 
 ```bash
-sudo -u heimdall heimdall run-mover --config /etc/heimdall/heimdall.toml --once
+sudo -u heimdall heimdall run-spo --config /etc/heimdall/heimdall.toml --check
 ```
 
 Run it as the `heimdall` user: the config is `0640 root:heimdall` so you cannot read it as
