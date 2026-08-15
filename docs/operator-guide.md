@@ -195,6 +195,9 @@ state_dir = "/var/lib/heimdall"
 
 [bifrost]
 skey_path = "/var/lib/heimdall/bifrost.skey"
+# Your endpoint. Published on chain at registration, and — unless [http].listen_port
+# says otherwise — its port is the one this process binds.
+url = "http://spo1.example.com:18500"
 
 [bitcoin]
 # The Bitcoin network the bridge settles on.
@@ -213,6 +216,13 @@ config_nft_asset_name = "424946434647"   # "BIFCFG"
 # Your own minimum-stake gate for registration, in lovelace.
 min_stake_lovelace = 1000000000
 
+# Registration only, and only one of these. The cold key is your existing Cardano
+# stake-pool key: `cold_skey_path` signs here, `cold_vkey_path` is the public half
+# for the flow where the signature is made on the machine that holds the secret.
+# Neither has a default location — unset means "not on this machine".
+#cold_skey_path = "/etc/heimdall/pool-cold.skey"
+#cold_vkey_path = "/etc/heimdall/pool-cold.vkey"
+
 [http]
 # 0.0.0.0 is the default; set listen_port only if the port peers connect to
 # differs from the one this process binds (a reverse proxy, a container map).
@@ -221,6 +231,15 @@ listen_port = 18500
 ```
 
 The mnemonic is deliberately absent — it comes from `$HEIMDALL_MNEMONIC`, as above.
+
+**Running more than one instance on a machine.** Nothing prevents it — there is no lock file and no
+hardcoded path — but four values must differ per instance, and one of them fails quietly. Give each
+its own `--config`, its own `[http].listen_port`, its own `[bifrost].skey_path`, and above all its
+own `protocol.state_dir`: the filenames inside it are fixed (`cpo-trie.json`, `spi-trie.json`, the
+DKG share), so two instances pointed at one directory overwrite each other's state without saying
+so. Note also that `$HEIMDALL_MNEMONIC` is process-environment: exported once in a shell, every
+instance launched from it shares a wallet and they will contend for the same UTxOs. Set
+`cardano.mnemonic` per file, or give each process its own environment.
 
 ### Running next to your own node
 
