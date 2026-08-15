@@ -39,17 +39,29 @@
 //! gives the rotation its own session alongside the TM's per-input ones. The
 //! epoch is the INCOMING one, which every node agrees on.
 //!
-//! ## Known limits of the steady-state path
+//! ## Threshold, and the limit that remains
 //!
-//! The ceremony is driven from the incoming epoch's `PublishKeys`, so only
-//! outgoing-roster members that are ALSO in the incoming roster reach it. An
-//! SPO dropped at the boundary still holds a share but never contributes, and
-//! (like `sign_phase`) the poll waits for every peer rather than stopping at
-//! `min_signers` — so a roster that lost members between epochs times out
-//! instead of proceeding on a threshold subset. Both are the same missing
-//! piece: a threshold-aware poll. Until then a failed rotation is not fatal —
-//! no Update-Y is posted, the old roster carries over, and the next boundary
-//! retries, exactly as the spec prescribes for a failed ceremony.
+//! The ceremony proceeds on a THRESHOLD subset of the outgoing roster (WI-047).
+//! The subset is fixed by the round-1 deadline, not by whoever answered first —
+//! see [`crate::epoch::signing::poll_sign_round`] for why FROST forces that. A
+//! member of epoch N's roster who is absent at N+1 no longer stalls the handoff.
+//!
+//! What still limits it: the ceremony is driven from the INCOMING epoch's
+//! `PublishKeys`, so only outgoing members that are also in the incoming roster
+//! reach it at all. The rotation therefore needs `min_signers` of the outgoing
+//! roster to survive INTO the incoming one. A boundary that drops more than that
+//! — mass deregistration, a large pool banned — still stalls, and a node sitting
+//! the epoch out cannot help even though it holds a share, because it has no way
+//! to learn or validate the incoming group key it would be signing over. Letting
+//! it contribute needs an attested-key path, not just a phase change: a node that
+//! signs whatever `sig_msg` it is handed hands the treasury to whoever asked.
+//! That is WI-078.
+//!
+//! A failed rotation is not fatal either way — no Update-Y is posted, the old
+//! roster carries over, and the epoch retries, exactly as the spec prescribes for
+//! a failed ceremony. But note what carrying over MEANS after a ban: the treasury
+//! stays under the old key, whose share set still includes the banned member.
+//! Custody does not leave a misbehaving member until a rotation completes.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -59,7 +71,7 @@ use frost::Identifier;
 use frost_secp256k1_tr as frost;
 
 use crate::epoch::persist::{PersistedDkg, persisted_dkg_epochs, read_dkg_state};
-use crate::epoch::signing::poll_sign_round;
+use crate::epoch::signing::{Quorum, poll_sign_round};
 use crate::epoch::state::{EpochConfig, EpochError, EpochResult, GroupKeys, Roster};
 use crate::epoch::traits::{Clock, PeerNetwork, RngSource, UpdateYPlan};
 use crate::frost::participant;
@@ -250,7 +262,11 @@ async fn frost_sign_message(
     // be replayed into another.
     let ns = SignNamespace::new(epoch, UPDATE_Y_SESSION, *msg);
 
-    let mut sign_rng = rng.rng(format!("update-y:epoch={epoch}").as_bytes());
+    // Never `rng.rng(..)`: the context would be `update-y:epoch={epoch}`, constant
+    // across the re-entries WI-047 introduced, so under `--deterministic` a retry
+    // would sign a second time under the same nonce and a different S1. See
+    // `RngSource::signing_nonce_rng`.
+    let mut sign_rng = rng.signing_nonce_rng();
     let (nonces, commitments) = participant::sign_round1(&keys.key_package, &mut sign_rng);
 
     let mut round1: BTreeMap<Identifier, frost::round1::SigningCommitments> = BTreeMap::new();
@@ -261,11 +277,46 @@ async fn frost_sign_message(
     crate::epoch_log!(
         me,
         epoch,
-        "Update-Y round1: published commitments, waiting for {} outgoing peer(s)",
-        peer_infos.len()
+        "Update-Y round1: published commitments, waiting for up to {} outgoing peer(s) \
+         ({} required)",
+        peer_infos.len(),
+        roster.min_signers
     );
-    poll_sign_round(peers, clock, config, ns, me, &peer_infos, &mut round1).await?;
+    // WI-047: the rotation proceeds on a THRESHOLD subset of the outgoing roster,
+    // fixed at the round-1 deadline. Without this, one member of epoch N's roster
+    // who is not in epoch N+1's — banned, deregistered, stake-dropped — stalls the
+    // handoff, and a PERMANENT drop stalls it at every subsequent boundary. That
+    // leaves the treasury under the OLD key, whose share set still contains the
+    // member the ban was meant to remove: a security consequence, not only a
+    // liveness one.
+    let absent = poll_sign_round(
+        peers,
+        clock,
+        config,
+        ns,
+        me,
+        Quorum::of(&peer_infos, roster.min_signers),
+        &mut round1,
+    )
+    .await?;
+    if !absent.is_empty() {
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "Update-Y: signing the succession without {} outgoing member(s) — the rotation still \
+             hands the treasury to the incoming key, and any absentee that is also out of the \
+             incoming roster loses its share of the treasury, as intended",
+            absent.len()
+        );
+    }
 
+    // S1 is now fixed. Every signer must build THIS package or the binding factors
+    // differ and the shares do not aggregate.
+    let s1: Vec<&crate::epoch::state::SpoInfo> = peer_infos
+        .iter()
+        .copied()
+        .filter(|p| round1.contains_key(&p.identifier))
+        .collect();
     let package = frost::SigningPackage::new(round1, msg);
     let share = participant::sign_round2(&package, &nonces, &keys.key_package)
         .map_err(|e| EpochError::Frost(format!("update-y sign_round2: {e}")))?;
@@ -276,10 +327,12 @@ async fn frost_sign_message(
     crate::epoch_log!(
         me,
         epoch,
-        "Update-Y round2: published share, waiting for {} outgoing peer(s)",
-        peer_infos.len()
+        "Update-Y round2: published share, waiting for the {} other signer(s) of S1",
+        s1.len()
     );
-    poll_sign_round(peers, clock, config, ns, me, &peer_infos, &mut round2).await?;
+    // Exactly S1, all of it: `aggregate` needs a share from every signer in the
+    // package, so round 2 carries no threshold of its own.
+    poll_sign_round(peers, clock, config, ns, me, Quorum::all(&s1), &mut round2).await?;
 
     let signature = participant::sign_aggregate(&package, &round2, &keys.public_key_package)
         .map_err(|e| EpochError::Frost(format!("update-y aggregate: {e}")))?;
@@ -499,6 +552,110 @@ mod tests {
                 }
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WI-047's acceptance case: the rotation completes on a THRESHOLD subset of
+    /// the outgoing roster while a member is absent, and the aggregated signature
+    /// still verifies under the treasury's current key.
+    ///
+    /// This is the stall the item exists for. SPO 3 is in epoch N's roster and not
+    /// in N+1's — banned, deregistered, stake-dropped — so it never reaches
+    /// `PublishKeys` and never publishes a rotation payload. The poll used to wait
+    /// for it regardless, so the handoff timed out at every subsequent boundary,
+    /// leaving the treasury under the OLD key — whose share set still contains the
+    /// member the ban was meant to remove.
+    #[tokio::test]
+    async fn a_threshold_subset_of_the_outgoing_roster_authorizes_without_the_absentee() {
+        let (keys, outgoing_xonly) = dealt_keys(3, 2);
+        let roster = roster_of(3, 2);
+        let dir = tmp_dir("threshold");
+        for (id, k) in &keys {
+            let mut per_node = dir.clone();
+            per_node.push(format!("spo-{}", id_short(*id)));
+            write_dkg_state(
+                &per_node,
+                &PersistedDkg::from_output(9, 0, &roster, k).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let plan = plan_for(outgoing_xonly, xonly_of([0x77u8; 32]));
+        let hub = MockPeerHub::new();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let absent = Identifier::try_from(3u16).unwrap();
+
+        let mut handles = Vec::new();
+        for id in keys.keys().copied().filter(|id| *id != absent) {
+            let mut per_node = dir.clone();
+            per_node.push(format!("spo-{}", id_short(id)));
+            let mut config = config_with(Some(per_node), None);
+            config.identity.identifier = id;
+            // Short enough that the test does not sit out the whole quorum window
+            // waiting for a node that will never speak — the deadline IS the
+            // mechanism under test.
+            config.quorum51_timeout = std::time::Duration::from_millis(400);
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock = clock.clone();
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let plan = plan.clone();
+            handles.push(tokio::spawn(async move {
+                authorize_update_y(&peers, &clock, &rng, &config, id, &plan).await
+            }));
+        }
+
+        // `authorize_update_y` verifies the aggregate under `plan.current_key`
+        // before returning, so an Ok IS the signature check: 2 of 3 outgoing
+        // members produced a signature the treasury's current key accepts.
+        assert_eq!(handles.len(), 2);
+        for h in handles {
+            let (sig, authority) = h.await.unwrap().expect("a threshold subset authorizes");
+            assert_eq!(sig.len(), 64);
+            assert_eq!(
+                authority,
+                UpdateYAuthority::OutgoingRoster {
+                    epoch: 9,
+                    min_signers: 2
+                }
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Below the threshold the rotation must NOT proceed: one signer of a 2-of-3
+    /// roster is not authority to hand over a treasury, and a deadline that closes
+    /// on too few answers has to be a failure rather than a smaller signing set.
+    #[tokio::test]
+    async fn a_sub_threshold_subset_does_not_authorize() {
+        let (keys, outgoing_xonly) = dealt_keys(3, 2);
+        let roster = roster_of(3, 2);
+        let dir = tmp_dir("subthreshold");
+        let id1 = Identifier::try_from(1u16).unwrap();
+        let mut per_node = dir.clone();
+        per_node.push("spo-1");
+        write_dkg_state(
+            &per_node,
+            &PersistedDkg::from_output(9, 0, &roster, keys.get(&id1).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let plan = plan_for(outgoing_xonly, xonly_of([0x77u8; 32]));
+        let hub = MockPeerHub::new();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut config = config_with(Some(per_node), None);
+        config.identity.identifier = id1;
+        config.quorum51_timeout = std::time::Duration::from_millis(400);
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id1, hub.clone()));
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+
+        // Nobody else speaks, so the deadline closes on 1 of the 2 required.
+        let err = authorize_update_y(&peers, &clock, &rng, &config, id1, &plan)
+            .await
+            .expect_err("one signer of a 2-of-3 roster must not hand over the treasury");
+        assert!(
+            matches!(err, EpochError::PollTimeout { need: 2, got: 1 }),
+            "expected a sub-threshold PollTimeout, got {err:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -172,6 +172,12 @@ pub struct FederationMemberConfig {
 /// whatever this value is. Every value an operator CAN type is a value two
 /// operators can differ on, and this one must not be able to move a freeze point.
 /// Five minutes is ~70 grid reads over the spec's 6 h example pitch.
+/// Ceiling on the epoch loop's retriable-error backoff. Compiled in for the same
+/// reason as [`BATCH_POLL_CEILING`]: it decides a re-read cadence, not a protocol
+/// value, and a per-operator copy could only make one node abandon a key handoff
+/// sooner than its peers.
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
 const BATCH_POLL_CEILING: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Deserialize)]
@@ -912,6 +918,7 @@ impl HeimdallConfig {
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
             quorum51_timeout: Duration::from_secs(self.protocol.quorum51_timeout_secs),
             leader_timeout: Duration::from_secs(self.protocol.leader_timeout_secs),
+            retry_backoff_max: RETRY_BACKOFF_MAX,
             identity,
             pegin_policy_id,
             batch_poll_ceiling: BATCH_POLL_CEILING,

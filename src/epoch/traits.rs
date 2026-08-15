@@ -609,6 +609,24 @@ pub trait Clock: Send + Sync {
 /// `frost-secp256k1-tr`'s `round1::commit` requires `Sized`.
 pub trait RngSource: Send + Sync {
     fn rng(&self, context: &[u8]) -> CycleRng;
+
+    /// Randomness for a FROST SIGNING nonce. Always the OS, never the seed.
+    ///
+    /// A signing nonce may be used once. Sign twice under one `(d, e)` with
+    /// different challenges and the signing share is algebraically recoverable —
+    /// so a nonce that a second run, or a retry, can reproduce is a key-recovery
+    /// hazard rather than a reproducibility feature. `--deterministic` derives its
+    /// stream from `hash(seed || context)` with a context that is constant within
+    /// an epoch, and since WI-047 a phase can be re-entered inside that epoch, so
+    /// the two attempts would share a nonce and differ in their signing set.
+    ///
+    /// `--deterministic` loses nothing it is for: a Taproot key-path witness is
+    /// not covered by the txid, so the movement's bytes, the group key and every
+    /// derived address stay reproducible. Only the signature itself varies, which
+    /// is what it means for a signature to be safe.
+    fn signing_nonce_rng(&self) -> CycleRng {
+        CycleRng::Os(rand::rngs::OsRng)
+    }
 }
 
 /// Concrete RNG handed out by [`RngSource`]. Either wraps `OsRng`

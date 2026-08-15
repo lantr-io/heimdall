@@ -108,8 +108,11 @@ pub async fn sign_phase(
             );
             // Generate and publish this SPO's nonce commitments for every input.
             for i in 0..num_inputs as u32 {
-                let ctx = format!("sign1:epoch={epoch}:input={i}");
-                let mut sign_rng = rng.rng(ctx.as_bytes());
+                // Never `rng.rng(..)`: see `RngSource::signing_nonce_rng`. Under
+                // `--deterministic` that context is constant for the epoch, so a
+                // re-entered round would reuse this nonce under a different
+                // signing set and leak the share.
+                let mut sign_rng = rng.signing_nonce_rng();
                 let (nonces, commitments) =
                     participant::sign_round1(&group_keys.key_package, &mut sign_rng);
                 collected.nonces.insert(i, nonces);
@@ -127,6 +130,14 @@ pub async fn sign_phase(
 
             // Poll peers for round 1 commitments on every input.
             let peer_infos = roster.peers_of(me);
+            // Only the leader broadcasts (`submit_phase`), so a subset without it
+            // produces a movement that is signed and never posted.
+            let leader = roster.leader(0);
+            // Which peers missed which inputs. Each input is its own FROST
+            // session with its own deadline, so a peer can be in S1 for one and
+            // absent for another; the COUNT is what separates one slow answer
+            // from a member that has stopped answering at all.
+            let mut absent_signers: BTreeMap<Identifier, u32> = BTreeMap::new();
             for i in 0..num_inputs as u32 {
                 crate::epoch_log!(
                     me,
@@ -136,13 +147,47 @@ pub async fn sign_phase(
                 );
                 let ns = input_namespace(epoch, &tm, i);
                 let map = collected.round1.entry(i).or_default();
-                poll_sign_round(peers, clock, config, ns, me, &peer_infos, map).await?;
+                // S1 for this input: whoever published by the deadline, at least
+                // `min_signers` of them.
+                let absent = poll_sign_round(
+                    peers,
+                    clock,
+                    config,
+                    ns,
+                    me,
+                    Quorum::of(&peer_infos, roster.min_signers).requiring(leader),
+                    map,
+                )
+                .await?;
+                for id in absent {
+                    *absent_signers.entry(id).or_insert(0u32) += 1;
+                }
             }
-            crate::epoch_log!(
-                me,
-                epoch,
-                "  <- have all round1 commitments, advancing to round2"
-            );
+            // Say what actually happened. This used to log "have all round1
+            // commitments" unconditionally, which would now hide the member that
+            // never answers from anyone reading the logs — and the absentees are
+            // exactly what the cascade and the misbehaviour path need.
+            if absent_signers.is_empty() {
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "  <- have all round1 commitments, advancing to round2"
+                );
+            } else {
+                let mut listed: Vec<String> = absent_signers
+                    .iter()
+                    .map(|(id, missed)| format!("{} ({missed}/{num_inputs})", id_short(*id)))
+                    .collect();
+                listed.sort();
+                crate::epoch_warn!(
+                    me,
+                    epoch,
+                    "  <- round1 closed on a threshold subset: {} peer(s) missed inputs [{}]; \
+                     advancing to round2",
+                    absent_signers.len(),
+                    listed.join(", ")
+                );
+            }
 
             Ok(EpochPhase::Sign {
                 epoch,
@@ -207,16 +252,30 @@ pub async fn sign_phase(
                 peers.publish_sign_round2(ns, me, share).await?;
                 crate::epoch_debug!(me, epoch, "    -> published share for input {i}");
 
-                // Poll peers.
-                let peer_infos = roster.peers_of(me);
+                // Poll EXACTLY the round-1 subset, and require all of it. The
+                // signing package above was built from those commitments and
+                // `aggregate` needs a share from every signer in the package, so
+                // a smaller S2 does not aggregate — it fails. Round 2 therefore
+                // carries no threshold of its own: the threshold was applied when
+                // S1 closed. (It used to poll the whole roster, including peers
+                // whose commitments are not in the package.)
+                let s1: Vec<&crate::epoch::state::SpoInfo> = roster
+                    .peers_of(me)
+                    .into_iter()
+                    .filter(|p| {
+                        signing_package
+                            .signing_commitments()
+                            .contains_key(&p.identifier)
+                    })
+                    .collect();
                 crate::epoch_log!(
                     me,
                     epoch,
-                    "    waiting for round2 shares on input {i} from {} peer(s)...",
-                    peer_infos.len()
+                    "    waiting for round2 shares on input {i} from {} signer(s) of S1...",
+                    s1.len()
                 );
                 let shares = collected.round2.entry(i).or_default();
-                poll_sign_round(peers, clock, config, ns, me, &peer_infos, shares).await?;
+                poll_sign_round(peers, clock, config, ns, me, Quorum::all(&s1), shares).await?;
 
                 // Aggregate.
                 let signature = participant::sign_aggregate_with_tweak(
@@ -371,12 +430,6 @@ fn verify_spi_root(
     Ok(())
 }
 
-// FIXME: `poll_sign_round1` (and round2) waits for commitments from
-// *every* peer, not just a threshold. That means one missing SPO stalls
-// the whole cycle until the timeout fires, instead of proceeding as
-// soon as `min_signers` have responded. A real implementation should
-// proceed once it has `roster.min_signers` commitments and record the
-// absent peers so the cascade / misbehavior path can react.
 /// The signing domain for TM input `i`: the epoch, the input index, and the
 /// input's own BIP-341 sighash. Two TMs in one epoch share `(epoch, i)` but
 /// never the sighash, which is what stops a commitment captured from one from
@@ -422,11 +475,108 @@ impl SignRoundPayload for frost::round2::SignatureShare {
     }
 }
 
-/// Poll every peer for one signing round of `ns` until all have answered or the
-/// quorum deadline fires. Shared by the TM inputs and the Update-Y rotation
-/// ceremony ([`crate::epoch::rotation`]) — one session is one session, and the
-/// threshold-aware version of this loop (the FIXME above) must only ever be
-/// written once.
+/// Who a signing round polls, and how many of them it needs.
+///
+/// The two travel together because they are one decision — "this set, at least
+/// this many of it" — and splitting them is how a call site ends up polling one
+/// set while thresholding against another. Round 2 is the case that makes it
+/// worth a type: it must poll EXACTLY the round-1 subset and needs all of it, and
+/// [`Quorum::all`] says that where a bare `s1.len() + 1` made the reader derive
+/// it.
+pub(crate) struct Quorum<'a> {
+    peers: &'a [&'a crate::epoch::state::SpoInfo],
+    /// Answers required INCLUDING this node's own, which is already in `out`.
+    min: usize,
+    /// A peer the subset is worthless without, if there is one.
+    ///
+    /// Threshold alone is not enough for a TM: `submit_phase` broadcasts only
+    /// from `Roster::leader`, and nothing bumps `leader_attempt`, so a subset
+    /// that excludes the leader signs a movement NOBODY posts — and does it
+    /// silently, consuming the batch opportunity while the log reads "posted and
+    /// awaiting confirmation". Requiring the leader keeps WI-047's win (any other
+    /// absentee is signed around) without opening that hole. The real fix is the
+    /// leader-timeout cascade the `submit_phase` TODO describes; until it exists,
+    /// this is the honest bound.
+    required: Option<Identifier>,
+}
+
+impl<'a> Quorum<'a> {
+    /// `t` of the roster, self included — the round-1 rule.
+    pub(crate) fn of(peers: &'a [&'a crate::epoch::state::SpoInfo], min_signers: u16) -> Self {
+        Self {
+            peers,
+            min: min_signers as usize,
+            required: None,
+        }
+    }
+
+    /// The subset must also contain `id`, whatever the threshold says.
+    pub(crate) fn requiring(mut self, id: Identifier) -> Self {
+        self.required = Some(id);
+        self
+    }
+
+    /// Everyone in the set. Round 2 has no threshold of its own: `aggregate`
+    /// needs a share from every signer in the package, so a smaller S2 does not
+    /// aggregate, it fails. The threshold was applied when S1 closed.
+    pub(crate) fn all(peers: &'a [&'a crate::epoch::state::SpoInfo]) -> Self {
+        Self {
+            peers,
+            min: peers.len() + 1,
+            required: None,
+        }
+    }
+}
+
+/// Poll every peer for one signing round of `ns` until all have answered, or
+/// until the deadline — at which point `min` answers are enough to proceed, and
+/// the absentees are returned. Shared by the TM inputs and the Update-Y rotation
+/// ceremony ([`crate::epoch::rotation`]): one session is one session, and the
+/// threshold rule must only ever be written once.
+///
+/// ## Why a deadline, and NOT "stop as soon as `min` have answered" (WI-047)
+///
+/// Because FROST needs every signer to build the BYTE-IDENTICAL
+/// `SigningPackage`. The package IS the set of round-1 commitments, and the
+/// binding factors are a hash over it. A node that stopped at `{1,2}` and one
+/// that stopped at `{1,3}` compute different binding factors, so their shares do
+/// not aggregate — the round fails, having looked healthy on both nodes. Stopping
+/// early is precisely how you get that.
+///
+/// So the subset is fixed by a DEADLINE rather than by whoever answered first —
+/// spec §"all honest SPOs derive the same signing state": wait until the round-1
+/// deadline, let `S1` be whoever published before it, continue with EXACTLY
+/// `S1`, and fail if `S1` is under threshold. This function is that rule; callers
+/// pass the `min` that `S1` must clear, then pass exactly the members of `S1`
+/// back in for round 2.
+///
+/// ## The deadline is NOT yet a shared one, and that is the weak point
+///
+/// The rule wants a deadline every participant agrees on. What it gets is
+/// `config.quorum51_timeout` — `[protocol].quorum51_timeout_secs`, a per-operator
+/// TOML value that is never published, exchanged or cross-checked. It was
+/// harmless while the only set that could succeed was "everyone", which no two
+/// nodes can disagree about; it is not harmless now that it decides MEMBERSHIP.
+/// Two operators on different values disagree about a peer that answers between
+/// them, build different packages, and their shares never aggregate — the
+/// repo's own recurring defect, a must-match value set per operator diverging
+/// silently instead of erroring. It belongs on chain: `ScheduleParams` already
+/// decodes `sign_r1_window` / `sign_r2_window` and nothing reads them. WI-077.
+///
+/// The early return on a FULL set is safe, and is the common case: "everyone" is
+/// unambiguous, so no two nodes can disagree about it.
+///
+/// ## The residual race, and why it fails closed
+///
+/// Even with one agreed value the deadline would still be LOCAL — started when
+/// each node entered the round — so nodes that enter seconds apart have deadlines
+/// seconds apart, and a peer whose payload lands in that gap is in one node's
+/// `S1` and not the other's. Two things bound the damage. The case WI-047 exists
+/// for — a banned, deregistered or stake-dropped pool — never publishes at all,
+/// so every node's `S1` converges on the same present set. And a genuine split
+/// forges nothing: aggregation fails, the caller's own verification rejects, no
+/// transaction is posted, and the epoch retries. Both this and the unshared value
+/// above are closed by anchoring to the chain schedule — WI-077.
 ///
 /// Results are filed under the ROSTER's identifier for each peer, never one a
 /// payload claimed for itself: the transport has already verified the payload
@@ -437,9 +587,14 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
     config: &EpochConfig,
     ns: SignNamespace,
     me: Identifier,
-    peer_infos: &[&crate::epoch::state::SpoInfo],
+    quorum: Quorum<'_>,
     out: &mut BTreeMap<Identifier, T>,
-) -> EpochResult<()> {
+) -> EpochResult<Vec<Identifier>> {
+    let Quorum {
+        peers: peer_infos,
+        min,
+        required,
+    } = quorum;
     // Everyone = every peer plus self. NOT `out.len()`: `out` is resume state
     // (`collected.round1.entry(i).or_default()`), so a round retried after a
     // restart arrives with peers already in it, and counting them twice puts
@@ -448,7 +603,7 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
     // peers answered.
     let need = peer_infos.len() + 1;
     let deadline = clock.deadline(config.quorum51_timeout);
-    while out.len() < need {
+    loop {
         for peer in peer_infos {
             if out.contains_key(&peer.identifier) {
                 continue;
@@ -467,18 +622,66 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                 out.insert(peer.identifier, value);
             }
         }
+        // Everyone answered, so the set is unambiguous and no deadline is needed
+        // to agree on it.
         if out.len() >= need {
-            break;
+            return Ok(Vec::new());
         }
         if clock.now() >= deadline {
-            return Err(EpochError::PollTimeout {
-                got: out.len(),
+            // The deadline is what FIXES the subset. Below the threshold the
+            // round is simply unavailable; at or above it, proceed with exactly
+            // who answered and name who did not.
+            if out.len() < min {
+                return Err(EpochError::PollTimeout {
+                    got: out.len(),
+                    need: min,
+                });
+            }
+            // Threshold met but the set is unusable without `required`. Treated as
+            // a timeout, not as a smaller set: the alternative is a fully signed
+            // movement nobody broadcasts.
+            if let Some(id) = required.filter(|id| !out.contains_key(id) && *id != me) {
+                crate::epoch_warn!(
+                    me,
+                    ns.epoch,
+                    "     round{} for {} reached the threshold ({}/{}) but WITHOUT spo={}, whose \
+                     participation the round needs — failing the round rather than signing \
+                     something that cannot be acted on",
+                    T::ROUND,
+                    ns.session_label(),
+                    out.len(),
+                    need,
+                    id_short(id),
+                );
+                return Err(EpochError::PollTimeout {
+                    got: out.len(),
+                    need,
+                });
+            }
+            let absent: Vec<Identifier> = peer_infos
+                .iter()
+                .map(|p| p.identifier)
+                .filter(|id| !out.contains_key(id))
+                .collect();
+            crate::epoch_warn!(
+                me,
+                ns.epoch,
+                "     round{} for {} closed at the deadline with {}/{} — proceeding on the \
+                 threshold ({min} required). Absent: {}",
+                T::ROUND,
+                ns.session_label(),
+                out.len(),
                 need,
-            });
+                absent
+                    .iter()
+                    .map(|id| id_short(*id).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return Ok(absent);
         }
         tokio::time::sleep(config.poll_interval).await;
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -498,6 +701,119 @@ mod tests {
     use bitcoin::hashes::Hash;
     use bitcoin::key::{Secp256k1, UntweakedPublicKey};
     use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
+
+    /// WI-047 review: a threshold subset that excludes the LEADER must not sign.
+    ///
+    /// Only the leader broadcasts (`submit_phase`), and nothing bumps
+    /// `leader_attempt`, so a movement signed without it is one nobody posts —
+    /// and the machine would treat that as a completed cycle: the log reads
+    /// "posted and awaiting confirmation", `Step::Done` returns, and the batch
+    /// opportunity is consumed. Silent non-progress is worse than a failed round,
+    /// so the round fails.
+    ///
+    /// Before the threshold poll this was unreachable — round 1 required every
+    /// peer, so no aggregate could exist without the leader's commitment.
+    #[tokio::test]
+    async fn a_threshold_subset_without_the_leader_does_not_sign() {
+        let hub = MockPeerHub::new();
+        let me = Identifier::try_from(2u16).unwrap();
+        let leader = Identifier::try_from(1u16).unwrap();
+        let roster = make_roster(3, 2);
+        let mut config = EpochConfig::demo_default(SpoIdentity {
+            identifier: me,
+            bifrost_id_pk: Vec::new(),
+            port: 0,
+        });
+        config.poll_interval = std::time::Duration::from_millis(5);
+        config.quorum51_timeout = std::time::Duration::from_millis(200);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let ns = SignNamespace::new(7, 0, [0xa1u8; 32]);
+
+        // SPO 3 publishes; the leader (SPO 1) never does. That is a threshold
+        // subset {2,3} of a 2-of-3 roster — enough signers, wrong ones.
+        let three = Identifier::try_from(3u16).unwrap();
+        let peers3: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(three, hub.clone()));
+        let (_n3, c3) =
+            crate::frost::participant::sign_round1(&dealt_package(three), &mut rand::thread_rng());
+        peers3.publish_sign_round1(ns, three, c3).await.unwrap();
+
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub.clone()));
+        let peer_infos = roster.peers_of(me);
+        let mut out: BTreeMap<Identifier, frost::round1::SigningCommitments> = BTreeMap::new();
+        let (_n2, c2) =
+            crate::frost::participant::sign_round1(&dealt_package(me), &mut rand::thread_rng());
+        out.insert(me, c2);
+
+        let err = poll_sign_round(
+            &peers,
+            &clock,
+            &config,
+            ns,
+            me,
+            Quorum::of(&peer_infos, roster.min_signers).requiring(leader),
+            &mut out,
+        )
+        .await
+        .expect_err("a subset without the leader signs a movement nobody would post");
+        assert!(
+            matches!(err, EpochError::PollTimeout { .. }),
+            "expected the round to fail, got {err:?}"
+        );
+
+        // The control: the SAME subset is fine when the absentee is not the one
+        // the round needs — that is the whole point of WI-047.
+        let mut out2: BTreeMap<Identifier, frost::round1::SigningCommitments> = BTreeMap::new();
+        out2.insert(me, c2);
+        let absent = poll_sign_round(
+            &peers,
+            &clock,
+            &config,
+            ns,
+            me,
+            Quorum::of(&peer_infos, roster.min_signers).requiring(three),
+            &mut out2,
+        )
+        .await
+        .expect("a threshold subset holding the required member proceeds");
+        assert_eq!(absent, vec![leader], "the absentee must be named");
+    }
+
+    /// A key package for `id` from a throwaway 3-of-3 dealt keyset — enough to
+    /// produce well-formed round-1 commitments, which is all the poll inspects.
+    fn dealt_package(id: Identifier) -> frost::keys::KeyPackage {
+        use frost::keys::{IdentifierList, KeyPackage, generate_with_dealer};
+        let (shares, _pk) =
+            generate_with_dealer(3, 3, IdentifierList::Default, rand::thread_rng()).unwrap();
+        let secret = shares.get(&id).expect("dealt for this identifier").clone();
+        KeyPackage::try_from(secret).unwrap()
+    }
+
+    /// A FROST signing nonce may be used once. `--deterministic` derives its
+    /// stream from `hash(seed || context)` with a context that is constant within
+    /// an epoch, and since WI-047 a phase can be re-entered inside that epoch — so
+    /// a reproducible nonce would be signed twice under different signing sets,
+    /// and the signing share recovered from the pair.
+    #[test]
+    fn signing_nonces_are_never_reproducible_even_under_deterministic() {
+        use crate::epoch::mocks::SeededRngSource;
+        use rand_core::RngCore;
+
+        let seeded = SeededRngSource::new(*b"heimdall-demo-seed-v1-0123456789");
+        // The context-keyed stream IS reproducible — that is what --deterministic
+        // is for, and the DKG relies on it.
+        let mut a = seeded.rng(b"dkg1");
+        let mut b = seeded.rng(b"dkg1");
+        assert_eq!(a.next_u64(), b.next_u64(), "the DKG stream stays seeded");
+
+        // Signing nonces must not be.
+        let mut n1 = seeded.signing_nonce_rng();
+        let mut n2 = seeded.signing_nonce_rng();
+        assert_ne!(
+            n1.next_u64(),
+            n2.next_u64(),
+            "a reproducible signing nonce leaks the share when a retry signs under a different S1"
+        );
+    }
 
     fn make_roster(n: u16, t: u16) -> Roster {
         let mut participants = BTreeMap::new();

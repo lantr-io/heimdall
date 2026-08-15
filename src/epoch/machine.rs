@@ -82,7 +82,6 @@ use std::collections::BTreeMap;
 /// capped, so the node parks for the next boundary instead of dying or
 /// hot-looping (WI-010 / WI-014 error-handling feedback).
 const RETRY_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(2);
-const RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One dispatch step: advance to the next phase, or finish one movement. Both
 /// variants are large but the value is constructed and consumed immediately in
@@ -230,21 +229,79 @@ async fn drive_to_movement(
     // when we are resuming a daemon's batch loop. It is not ours to give back; see
     // the error arm.
     let inherited = *built;
-    // This epoch's completed ceremony, kept so a transient failure inside the
-    // batch loop costs one batch rather than the epoch. `Idle` waits for the
-    // chain epoch to ADVANCE, so re-entering it mid-epoch parks the node for days
-    // — and a batch loop that cycles every few hours meets far more transient
-    // failures than one movement per epoch ever did.
-    let mut ceremony: Option<(u64, Roster, GroupKeys)> = None;
+    // Where to re-enter THIS epoch after a retriable failure, carrying the
+    // ceremony it already paid for. `Idle` waits for the chain epoch to ADVANCE,
+    // so re-entering it mid-epoch parks the node for days — and both phases below
+    // meet far more transient failures than one movement per epoch ever did.
+    //
+    // Two phases can be re-entered, and both are idempotent by construction:
+    //
+    //  - `PublishKeys` — the handoff has not landed yet. Re-running it is a no-op
+    //    once it has (`plan_update_y` returns None when the datum already names
+    //    the key), and a rotation that failed on a slow or absent peer deserves a
+    //    retry in minutes. Falling to `Idle` here costs the epoch's ENTIRE batch
+    //    grid, not just the rotation, because the batch loop sits downstream of
+    //    this phase (WI-047).
+    //  - `CollectPegins` — past the handoff, in the batch loop. A failure there
+    //    costs one batch rather than the epoch (WI-097).
+    let mut resume: Option<EpochPhase> = None;
+    // How many times the handoff may be re-entered before this node accepts that
+    // the failure is not transient and parks.
+    //
+    // Retrying is right for a slow chain read or a peer that was a moment late.
+    // It is wrong for the reasons that never clear inside an epoch: a boundary
+    // that dropped more than `min_signers` of the outgoing roster, or a node newly
+    // registered this epoch, which holds no share of the outgoing key and gets a
+    // PERMANENT `load_outgoing_dkg` error. Those used to park in `Idle`; without a
+    // bound they would now re-enter every 2–60 s for the five days of an epoch,
+    // achieving nothing and spending an API quota to do it. At the capped backoff
+    // this spans roughly two minutes, which is far past any transient outage and
+    // far short of an epoch.
+    const HANDOFF_RETRIES: u32 = 6;
+    let mut handoff_retries = 0u32;
     loop {
         crate::epoch_log!(me, current_epoch(&phase), "==> phase = {}", phase.name());
-        if let EpochPhase::CollectPegins {
-            epoch,
-            roster,
-            group_keys,
-        } = &phase
-        {
-            ceremony = Some((*epoch, roster.clone(), group_keys.clone()));
+        // Rebuilt rather than cloned: `EpochPhase` is not `Clone` (a `Sign` or
+        // `Submit` phase carries a whole `TreasuryMovement`), and only these two
+        // variants are ones we would ever want to re-enter.
+        match &phase {
+            EpochPhase::PublishKeys {
+                epoch,
+                roster,
+                group_keys,
+            } if handoff_retries < HANDOFF_RETRIES => {
+                resume = Some(EpochPhase::PublishKeys {
+                    epoch: *epoch,
+                    roster: roster.clone(),
+                    group_keys: group_keys.clone(),
+                });
+            }
+            // Out of attempts: stop offering `PublishKeys` as a re-entry, so the
+            // next failure falls through to `Idle` and the node waits for a
+            // boundary that re-derives everything from chain.
+            EpochPhase::PublishKeys { epoch, .. } => {
+                crate::epoch_warn!(
+                    me,
+                    *epoch,
+                    "the key handoff has failed {HANDOFF_RETRIES} retries running this epoch — \
+                     treating it as non-transient and parking until the next boundary. The \
+                     treasury stays under the OUTGOING key until a rotation completes, so this \
+                     node signs no movement for this epoch."
+                );
+                resume = None;
+            }
+            EpochPhase::CollectPegins {
+                epoch,
+                roster,
+                group_keys,
+            } => {
+                resume = Some(EpochPhase::CollectPegins {
+                    epoch: *epoch,
+                    roster: roster.clone(),
+                    group_keys: group_keys.clone(),
+                });
+            }
+            _ => {}
         }
         match step_phase(
             phase,
@@ -260,12 +317,19 @@ async fn drive_to_movement(
         .await
         {
             Ok(Step::Next(next)) => {
+                // The handoff got through, so its budget is spent and reset: a
+                // later epoch on the same call must start from a full one.
+                if matches!(next, EpochPhase::CollectPegins { .. }) {
+                    handoff_retries = 0;
+                }
                 phase = next;
                 backoff = RETRY_BACKOFF_MIN; // progress → reset
             }
             Ok(Step::Done(tm, resume)) => return Ok((tm, resume)),
-            // EVERY in-loop error backs off and re-enters Idle. The loop never
-            // terminates.
+            // EVERY in-loop error backs off and re-enters the loop, which never
+            // terminates. WHERE it re-enters is `resume`'s decision above: this
+            // epoch's `PublishKeys` or `CollectPegins` while its ceremony is still
+            // in hand and the chain is still in that epoch, otherwise `Idle`.
             //
             // It used to exit on anything outside a small retriable allowlist,
             // and that allowlist was the bug: a peer on a different candidate
@@ -301,8 +365,9 @@ async fn drive_to_movement(
                         me,
                         current_epoch(&EpochPhase::Idle),
                         "chain read failed ({e}); STALE chain-view — settling back-off {:?} before re-read \
-                         (reconcile), then re-entering Idle",
-                        config.dkg_reconcile_backoff
+                         (reconcile), then re-entering {}",
+                        config.dkg_reconcile_backoff,
+                        resume.as_ref().map_or("Idle", EpochPhase::name)
                     );
                     backoff = RETRY_BACKOFF_MIN; // the settling wait replaces the ramp
                     config.dkg_reconcile_backoff
@@ -310,11 +375,12 @@ async fn drive_to_movement(
                     crate::epoch_warn!(
                         me,
                         current_epoch(&EpochPhase::Idle),
-                        "chain read failed ({e}); backing off {:?} then re-entering Idle",
-                        backoff
+                        "chain read failed ({e}); backing off {:?} then re-entering {}",
+                        backoff,
+                        resume.as_ref().map_or("Idle", EpochPhase::name)
                     );
                     let w = backoff;
-                    backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                    backoff = (backoff * 2).min(config.retry_backoff_max);
                     w
                 };
                 tokio::time::sleep(wait).await;
@@ -326,25 +392,32 @@ async fn drive_to_movement(
                 if *built != inherited {
                     built.clear();
                 }
-                // Re-enter the BATCH loop when this epoch's ceremony is still in
-                // hand and the chain is still in that epoch; only otherwise fall
-                // back to `Idle`, which re-derives everything from chain. The
-                // ceremony is the expensive part and it is still valid: the spec's
-                // "no halt, no special state" is about a failed DKG, not about
-                // throwing away a good one because a peg-out query 502'd.
+                // Re-enter THIS epoch when its ceremony is still in hand and the
+                // chain is still in that epoch; only otherwise fall back to
+                // `Idle`, which re-derives everything from chain. The ceremony is
+                // the expensive part and it is still valid: the spec's "no halt,
+                // no special state" is about a failed DKG, not about throwing away
+                // a good one because a peg-out query 502'd or one outgoing member
+                // was slow to answer the rotation.
                 //
-                // An unreadable epoch counts as unchanged: the batch loop retries
-                // and backs off, whereas `Idle` would silently park for up to a
-                // full epoch on what may be a five-second outage.
-                phase = match ceremony.take() {
-                    Some((epoch, roster, group_keys))
-                        if chain.current_epoch().await.map_or(true, |now| now == epoch) =>
+                // An unreadable epoch counts as unchanged: re-entering retries and
+                // backs off, whereas `Idle` would silently park for up to a full
+                // epoch on what may be a five-second outage.
+                // `resume` is re-set at the top of every iteration and only the
+                // two ceremony-bearing phases set it, so `Some(PublishKeys)` here
+                // means the failure WAS the handoff: nothing else runs between it
+                // and `CollectPegins`, which overwrites it.
+                if matches!(resume, Some(EpochPhase::PublishKeys { .. })) {
+                    handoff_retries += 1;
+                }
+                phase = match resume.take() {
+                    Some(p)
+                        if chain
+                            .current_epoch()
+                            .await
+                            .map_or(true, |now| now == current_epoch(&p)) =>
                     {
-                        EpochPhase::CollectPegins {
-                            epoch,
-                            roster,
-                            group_keys,
-                        }
+                        p
                     }
                     _ => EpochPhase::Idle,
                 };
@@ -2143,6 +2216,10 @@ mod tests {
         // production ceiling.
         config.batch_poll_ceiling = Duration::from_millis(20);
         config.quorum51_timeout = Duration::from_millis(500);
+        // The retry ramp still starts at RETRY_BACKOFF_MIN (2 s), but every wait
+        // after the first is this — enough to exhaust a bounded retry budget in a
+        // test rather than in minutes.
+        config.retry_backoff_max = Duration::from_millis(20);
         // BuildTm REQUIRES a state_dir: both tries are cumulative, and a node
         // that cannot persist them would commit roots covering only its own
         // movement.
@@ -3389,6 +3466,146 @@ mod tests {
             index,
             slot: 5_000_000 + index,
             cutoff_slot: 4_900_000 + index,
+        }
+    }
+
+    /// WI-047, the loop half: a failed key handoff costs the ROTATION, not the
+    /// epoch's treasury movements.
+    ///
+    /// `PublishKeys` sits upstream of the whole batch loop, and the error arm used
+    /// to keep this epoch's ceremony only from `CollectPegins` onward — so any
+    /// failure inside the handoff dropped to `Idle`, which waits for the chain
+    /// epoch to ADVANCE. One slow Cardano read, and the node sat out every batch
+    /// opportunity of a five-day epoch.
+    ///
+    /// The mock's `await_epoch_boundary` fires once and then parks for ever, so a
+    /// machine that answers a failed rotation with `Idle` HANGS this test — which
+    /// is exactly what it does to a real node, only for days rather than seconds.
+    #[tokio::test]
+    async fn a_failed_key_handoff_costs_the_rotation_not_the_epoch() {
+        let seed = [0x21u8; 32];
+        let secp = Secp256k1::new();
+        let fed_xonly = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&seed).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, [0xe1u8; 32]);
+        // ONE shared counter: every node fails the same read, as a real chain
+        // outage would leave them, so they retry the handoff together.
+        let outage = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let fixture = demo_static_fixture(2, 2, 19_700);
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone())
+                    .with_treasury_info(treasury_info.clone())
+                    .fail_next_update_y_plans(Arc::clone(&outage), 2),
+            );
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let mut config = fast_config(id);
+            config.y_fed_seed = Some(seed);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        for h in handles {
+            tokio::time::timeout(Duration::from_secs(30), h)
+                .await
+                .expect(
+                    "a failed handoff must re-enter PublishKeys for the same epoch — falling to \
+                     Idle waits for the next boundary and loses the epoch's movements",
+                )
+                .unwrap()
+                .expect("the movement completes after the handoff retries");
+        }
+        // The retry was real: the handoff landed, on the epoch it belonged to.
+        assert_eq!(
+            treasury_info.lock().unwrap().rotations.len(),
+            1,
+            "the rotation must complete on the retry, not be skipped"
+        );
+        assert_eq!(
+            outage.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "both injected failures must have been consumed — otherwise the phase was never \
+             re-entered and this test proves nothing"
+        );
+    }
+
+    /// The other side of the retry: a handoff that fails for a NON-transient
+    /// reason must give up and park, not re-enter for the whole epoch.
+    ///
+    /// Retrying is right for a slow chain read. It is wrong for the reasons that
+    /// never clear inside an epoch — a boundary that dropped more than
+    /// `min_signers` of the outgoing roster, or a node registered this epoch,
+    /// which holds no share of the outgoing key at all. Without a bound those
+    /// re-enter every 2–60 s for five days, achieving nothing and spending an API
+    /// quota to do it, where the old behaviour at least parked quietly.
+    ///
+    /// The mock's boundary fires once, so a node that gives up correctly parks in
+    /// `Idle` for ever — which is what this asserts by NOT completing.
+    #[tokio::test]
+    async fn a_permanently_failing_handoff_gives_up_instead_of_looping_all_epoch() {
+        let seed = [0x22u8; 32];
+        let secp = Secp256k1::new();
+        let fed_xonly = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&seed).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, [0xe2u8; 32]);
+        // Far more failures than the budget: the outage never clears.
+        let outage = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let fixture = demo_static_fixture(2, 2, 19_800);
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone())
+                    .with_treasury_info(treasury_info.clone())
+                    .fail_next_update_y_plans(Arc::clone(&outage), 10_000),
+            );
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let mut config = fast_config(id);
+            config.y_fed_seed = Some(seed);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        // The ramp is 2 s then 20 ms (fast_config), so five seconds is several
+        // times the budget's span — an unbounded retry would be well past 6.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            handles.iter().all(|h| !h.is_finished()),
+            "a node whose handoff cannot succeed must not report a completed movement"
+        );
+        // One run per node to discover the failure, then at most HANDOFF_RETRIES
+        // re-entries each — the phase has to RUN to fail, so the budget bounds
+        // re-entries rather than runs.
+        let spent = 10_000 - outage.load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            spent <= 2 * (6 + 1),
+            "the handoff must stop being re-entered after its retry budget: {spent} runs across \
+             2 nodes, where 6 retries each allows at most 14"
+        );
+        for h in handles {
+            h.abort();
         }
     }
 
