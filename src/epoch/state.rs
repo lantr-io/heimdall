@@ -649,6 +649,38 @@ pub enum EpochError {
     Chain(String),
     Transition(String),
     SignatureVerify(usize, String),
+    /// A signing round failed AFTER this node published its round-1 commitment,
+    /// so the round is SPENT: this node must not walk it again on its own.
+    ///
+    /// The signing namespace is `(epoch, session, message)` with no attempt
+    /// counter, and peers keep serving the payloads they published. A second
+    /// local pass therefore publishes a FRESH commitment and reads its peers'
+    /// FIRST one — and `poll_sign_round` never re-fetches a peer it already has,
+    /// so the retry does not race: it deterministically builds a `SigningPackage`
+    /// no peer built, and the binding factors guarantee it will not aggregate.
+    /// Retrying is not merely useless, it is indistinguishable from progress.
+    ///
+    /// The way back in is a SYNCHRONIZED entry, where every node republishes at
+    /// once: the next batch-grid opportunity for a TM, the next epoch boundary
+    /// for a rotation. Both are spec behaviour — an unused opportunity costs
+    /// latency, and a rotation that does not land leaves the old key in place
+    /// with "no halt, no special state". See WI-048; an attempt counter in the
+    /// namespace (WI-077's chain-anchored windows would supply an agreed one)
+    /// is what would make a local retry safe.
+    RoundSpent {
+        round: u8,
+        cause: String,
+    },
+}
+
+impl EpochError {
+    /// Whether this failure left published round-1 state behind, so the caller
+    /// must rejoin its peers at the next synchronized entry rather than walking
+    /// the same round again. See [`EpochError::RoundSpent`].
+    #[must_use]
+    pub fn round_is_spent(&self) -> bool {
+        matches!(self, Self::RoundSpent { .. })
+    }
 }
 
 impl std::fmt::Display for EpochError {
@@ -676,6 +708,10 @@ impl std::fmt::Display for EpochError {
             Self::SignatureVerify(i, s) => {
                 write!(f, "signature verification failed for input {i}: {s}")
             }
+            Self::RoundSpent { round, cause } => write!(
+                f,
+                "round {round} is spent (commitments already published): {cause}"
+            ),
         }
     }
 }

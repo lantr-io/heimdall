@@ -351,6 +351,24 @@ async fn drive_to_movement(
             // validation and must fail before the loop is entered — not here,
             // where the only correct answer is to keep trying.
             Err(e) => {
+                // A SPENT round has published commitments its peers are still
+                // serving, so this node may not walk it again alone: it has to
+                // rejoin them at the next SYNCHRONIZED entry. That is the next
+                // grid opportunity for a movement (so its own opportunity is NOT
+                // handed back below) and the next epoch boundary for a rotation
+                // (so the handoff is not re-entered at all). See
+                // `EpochError::RoundSpent`.
+                let round_spent = e.round_is_spent();
+                if round_spent && matches!(resume, Some(EpochPhase::PublishKeys { .. })) {
+                    crate::epoch_warn!(
+                        me,
+                        current_epoch(&EpochPhase::Idle),
+                        "Update-Y: {e} — the commitments are already published, so this epoch's \
+                         rotation is over. The treasury keeps the current key and the outgoing \
+                         roster carries over; the next boundary retries."
+                    );
+                    resume = None;
+                }
                 // Post-ban recovery (chain-view reconcile): if this failure came
                 // with a detected chain-view disagreement on which we are the
                 // STALE side (older blockchain read-time), a blind fast retry
@@ -389,7 +407,13 @@ async fn drive_to_movement(
                 // for the next opportunity leaves the marker of the movement that
                 // already succeeded, and clearing that one would build a second
                 // movement for a batch this node has already served.
-                if *built != inherited {
+                //
+                // A SPENT round is the exception: handing the opportunity back
+                // would rebuild the same frozen batch, hence the same sighashes
+                // and the same namespace, and republish into a round the peers
+                // have moved on from. Keeping the marker sends this node to the
+                // NEXT opportunity, which every node enters together.
+                if *built != inherited && !round_spent {
                     built.clear();
                 }
                 // Re-enter THIS epoch when its ceremony is still in hand and the
@@ -3611,6 +3635,86 @@ mod tests {
             spent <= 2 * (6 + 1),
             "the handoff must stop being re-entered after its retry budget: {spent} runs across \
              2 nodes, where 6 retries each allows at most 14"
+        );
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    /// WI-048: a movement whose round FAILED AFTER PUBLISHING does not rebuild
+    /// at the same opportunity.
+    ///
+    /// The contrast is with `a_failure_gives_back_its_own_opportunity_but_never_
+    /// a_served_one`, and both rules are right. A failure BEFORE any commitment
+    /// leaves the node — a peg-out query, a snapshot read — should hand the
+    /// opportunity back, because rebuilding is free and the batch is unchanged.
+    /// A failure AFTER must not: the batch is frozen, so the rebuild produces the
+    /// same sighashes and therefore the same signing namespace, and this node
+    /// would publish a FRESH commitment into a round its peers have left.
+    /// `poll_sign_round` never re-fetches a peer it already has, so that second
+    /// pass does not race — it deterministically builds a package no peer built.
+    ///
+    /// Counting publications is what makes this decisive: the store only ever
+    /// holds the newest value, so a node republishing into a spent round looks
+    /// identical to one that published once.
+    ///
+    /// (The rotation half of the same rule — `resume = None` for `PublishKeys` —
+    /// is pinned by `rotation::tests::a_sub_threshold_subset_does_not_authorize`,
+    /// which asserts the marker the loop reads. It cannot be reached from here:
+    /// `y_fed_seed` makes the first epoch's handoff a federation signature with
+    /// no FROST round at all.)
+    #[tokio::test]
+    async fn a_spent_signing_round_does_not_rebuild_at_the_same_opportunity() {
+        let seed = [0x24u8; 32];
+        let secp = Secp256k1::new();
+        let fed_xonly = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&seed).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, [0xe4u8; 32]);
+
+        let fixture = demo_static_fixture(2, 2, 19_900);
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone()).with_treasury_info(treasury_info.clone()),
+            );
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            // Node 2 completes the DKG and then goes dark for the signing rounds,
+            // so node 1's round-1 poll can never reach `min_signers = 2`.
+            let net = MockPeerNetwork::new(id, hub.clone());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(if i == 2 {
+                net.muting_sign_publishes()
+            } else {
+                net
+            });
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let mut config = fast_config(id);
+            config.y_fed_seed = Some(seed);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            handles.iter().all(|h| !h.is_finished()),
+            "a movement nobody can co-sign must not be reported as completed"
+        );
+        // Node 2 is muted, so every publication here is node 1's, and the frozen
+        // batch is ONE input: exactly one commitment. Five seconds is many times
+        // the 500 ms round deadline plus the 20 ms capped backoff, so a node that
+        // hands the opportunity back rebuilds and republishes repeatedly.
+        let published = hub.sign1_publish_count();
+        assert_eq!(
+            published, 1,
+            "a spent round must be published once and then left for the next \
+             opportunity: {published} round-1 publications"
         );
         for h in handles {
             h.abort();

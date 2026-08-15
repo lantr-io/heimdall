@@ -424,6 +424,23 @@ fn gc_dkg_blobs(
     dkg.retain(|k, _| k.0 >= ns.epoch && (k.0 > ns.epoch || k.2 >= keep_from));
 }
 
+/// Drop served signing blobs from epochs that can no longer have a live round.
+///
+/// The DKG sibling above prunes WITHIN an epoch too, because its namespace
+/// carries an attempt and a stale attempt is fetchable by a later one. The
+/// signing namespace has no attempt (see [`crate::epoch::state::EpochError`]'s
+/// `RoundSpent`), so same-epoch pruning is not this function's to do: within an
+/// epoch every entry belongs to a round that is either live or was replaced in
+/// place by its own republish.
+///
+/// The previous epoch is KEPT. Batches cross the boundary — the TM chain is
+/// allowed to, and a peer still polling round 2 of the last movement of epoch
+/// `E-1` must not be starved by this node rolling over to `E`. Two epochs is
+/// a bounded window, which is the point: the map used to have none.
+fn gc_sign_blobs(sign: &mut std::collections::BTreeMap<(u64, u32, RoundKey), String>, epoch: u64) {
+    sign.retain(|k, _| k.0 + 1 >= epoch);
+}
+
 #[async_trait]
 impl PeerNetwork for HttpPeerNetwork {
     async fn check_health(&self, peer: &SpoInfo) -> bool {
@@ -534,6 +551,7 @@ impl PeerNetwork for HttpPeerNetwork {
         let mut s = self.state.write().await;
         s.sign
             .insert((ns.epoch, ns.session, RoundKey::Round1), json);
+        gc_sign_blobs(&mut s.sign, ns.epoch);
         Ok(())
     }
 
@@ -556,6 +574,7 @@ impl PeerNetwork for HttpPeerNetwork {
         let mut s = self.state.write().await;
         s.sign
             .insert((ns.epoch, ns.session, RoundKey::Round2), json);
+        gc_sign_blobs(&mut s.sign, ns.epoch);
         Ok(())
     }
 
@@ -1115,6 +1134,81 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a share must not carry over to a different message under the same URL"
+        );
+    }
+
+    /// WI-048: the signing store is bounded. It used to grow for the lifetime of
+    /// the process — its DKG sibling was pruned from the day it was written, and
+    /// the signing rounds copied the storage half of that pattern without the
+    /// hygiene half.
+    ///
+    /// The retained window is TWO epochs, not one. Movements cross the boundary
+    /// by design, so a peer still polling round 2 of the last movement of `E-1`
+    /// must not be starved by this node rolling over to `E`.
+    #[test]
+    fn the_sign_store_keeps_two_epochs_and_drops_the_rest() {
+        let mut sign: std::collections::BTreeMap<(u64, u32, RoundKey), String> = [
+            ((6u64, 0u32, RoundKey::Round1), "ancient".to_string()),
+            ((7, 0, RoundKey::Round1), "previous".to_string()),
+            ((7, 1, RoundKey::Round2), "previous".to_string()),
+            ((8, 0, RoundKey::Round1), "current".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        gc_sign_blobs(&mut sign, 8);
+
+        assert!(
+            sign.contains_key(&(8, 0, RoundKey::Round1)),
+            "the epoch being published must survive its own GC"
+        );
+        assert_eq!(
+            sign.keys().filter(|k| k.0 == 7).count(),
+            2,
+            "the previous epoch is retained whole — a movement may still be signing across the \
+             boundary"
+        );
+        assert!(
+            !sign.contains_key(&(6, 0, RoundKey::Round1)),
+            "an epoch two behind can have no live round and must be dropped"
+        );
+    }
+
+    /// The GC is wired to publication, not merely defined. Both rounds prune, so
+    /// a node that only ever reaches round 1 still bounds its store.
+    #[tokio::test]
+    async fn publishing_a_signing_round_prunes_older_epochs() {
+        use crate::frost::participant;
+
+        let secp = Secp256k1::new();
+        let (kp1, pool1, _pk1) = identity(&secp, 1);
+        let net1 = HttpPeerNetwork::new(Secp256k1::new(), kp1, pool1);
+
+        let mut rng = rand::thread_rng();
+        let (shares, _pkp) = frost_secp256k1_tr::keys::generate_with_dealer(
+            2,
+            2,
+            frost_secp256k1_tr::keys::IdentifierList::Default,
+            &mut rng,
+        )
+        .unwrap();
+        let kp = frost_secp256k1_tr::keys::KeyPackage::try_from(shares[&id(1)].clone()).unwrap();
+        let (_nonces, commitments) = participant::sign_round1(&kp, &mut rng);
+
+        for epoch in [40u64, 41, 42] {
+            net1.publish_sign_round1(SignNamespace::new(epoch, 0, [0x11; 32]), id(1), commitments)
+                .await
+                .unwrap();
+        }
+
+        let epochs: Vec<u64> = {
+            let s = net1.state.read().await;
+            s.sign.keys().map(|k| k.0).collect()
+        };
+        assert_eq!(
+            epochs,
+            vec![41, 42],
+            "publishing at epoch 42 must leave exactly epochs 41 and 42 served"
         );
     }
 }

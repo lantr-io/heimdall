@@ -764,11 +764,25 @@ pub struct MockPeerHub {
     /// that don't stagger starts are unaffected); once any node registers via
     /// [`Self::set_online`], only registered nodes are healthy.
     online: Mutex<std::collections::BTreeSet<Identifier>>,
+    /// Round-1 signing commitments published across every node and namespace.
+    ///
+    /// The count, not the contents: a node that walks one signing round TWICE
+    /// bumps this twice while its peers still serve their first commitment, and
+    /// that second publication is exactly the WI-048 defect. Tests assert on it
+    /// because the store itself only shows the latest value.
+    sign1_publishes: std::sync::atomic::AtomicU32,
 }
 
 impl MockPeerHub {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// See [`MockPeerHub::sign1_publishes`].
+    #[must_use]
+    pub fn sign1_publish_count(&self) -> u32 {
+        self.sign1_publishes
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn push_round1_fault_evidence(
@@ -835,11 +849,26 @@ impl MockPeerHub {
 pub struct MockPeerNetwork {
     me: Identifier,
     hub: Arc<MockPeerHub>,
+    /// This node publishes nothing to the SIGNING namespaces — it still runs the
+    /// DKG normally. Models the peer that goes dark exactly at a signing round,
+    /// which is what forces the round past its deadline on everyone else.
+    mute_sign: bool,
 }
 
 impl MockPeerNetwork {
     pub fn new(me: Identifier, hub: Arc<MockPeerHub>) -> Self {
-        Self { me, hub }
+        Self {
+            me,
+            hub,
+            mute_sign: false,
+        }
+    }
+
+    /// See [`MockPeerNetwork::mute_sign`].
+    #[must_use]
+    pub fn muting_sign_publishes(mut self) -> Self {
+        self.mute_sign = true;
+        self
     }
 }
 
@@ -889,9 +918,15 @@ impl PeerNetwork for MockPeerNetwork {
         _identifier: Identifier,
         commitments: frost_secp256k1_tr::round1::SigningCommitments,
     ) -> EpochResult<()> {
+        if self.mute_sign {
+            return Ok(());
+        }
         with_slot(&self.hub, self.me, |s| {
             s.sign1.insert(ns, commitments);
         });
+        self.hub
+            .sign1_publishes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.hub.notify.notify_waiters();
         Ok(())
     }
@@ -902,6 +937,9 @@ impl PeerNetwork for MockPeerNetwork {
         _identifier: Identifier,
         share: frost_secp256k1_tr::round2::SignatureShare,
     ) -> EpochResult<()> {
+        if self.mute_sign {
+            return Ok(());
+        }
         with_slot(&self.hub, self.me, |s| {
             s.sign2.insert(ns, share);
         });

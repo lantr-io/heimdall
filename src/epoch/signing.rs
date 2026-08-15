@@ -40,6 +40,23 @@ use crate::http::wire::SignNamespace;
 /// abort property means we can attribute a bad share to a specific
 /// `Identifier`. The on-chain fault-proof flow is currently implemented for
 /// DKG faults; signing-share fault proofs are still not wired up.
+/// Mark every failure from the first published commitment onward as
+/// [`EpochError::RoundSpent`], so the epoch loop rejoins its peers at the next
+/// synchronized entry instead of walking a round they have already left.
+///
+/// Apply it to EVERY fallible step after `publish_sign_round1` — the marker is
+/// about what this node has already told its peers, not about what went wrong.
+/// It is idempotent, so wrapping an already-marked error is safe.
+pub(crate) fn spent(round: u8) -> impl Fn(EpochError) -> EpochError {
+    move |e| match e {
+        already @ EpochError::RoundSpent { .. } => already,
+        other => EpochError::RoundSpent {
+            round,
+            cause: other.to_string(),
+        },
+    }
+}
+
 pub async fn sign_phase(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
@@ -122,9 +139,12 @@ pub async fn sign_phase(
                     .or_default()
                     .insert(me, commitments);
 
+                // From here on this node has told its peers something. Every
+                // later failure in this round is SPENT — see `spent`.
                 peers
                     .publish_sign_round1(input_namespace(epoch, &tm, i), me, commitments)
-                    .await?;
+                    .await
+                    .map_err(spent(1))?;
                 crate::epoch_debug!(me, epoch, "  -> published commitments for input {i}");
             }
 
@@ -158,7 +178,8 @@ pub async fn sign_phase(
                     Quorum::of(&peer_infos, roster.min_signers).requiring(leader),
                     map,
                 )
-                .await?;
+                .await
+                .map_err(spent(1))?;
                 for id in absent {
                     *absent_signers.entry(id).or_insert(0u32) += 1;
                 }
@@ -210,93 +231,105 @@ pub async fn sign_phase(
             // For each input: build SigningPackage, compute this SPO's
             // tweaked share, publish, poll peers, then aggregate into a
             // final Schnorr signature written back to `tm.signatures`.
-            for i in 0..num_inputs as u32 {
-                let commitments = collected
-                    .round1
-                    .get(&(i))
-                    .ok_or_else(|| {
-                        EpochError::Transition(format!("missing round1 commitments for input {i}"))
-                    })?
-                    .clone();
-                let nonces = collected.nonces.get(&i).ok_or_else(|| {
-                    EpochError::Transition(format!("missing nonces for input {i}"))
-                })?;
+            //
+            // ROUND 1 IS ALREADY PUBLISHED by the time this arm runs, so every
+            // failure below is SPENT — see `spent`. The loop is wrapped once
+            // rather than each `?` tagged individually, so a fallible step added
+            // later inherits the marker instead of quietly escaping it.
+            let signed: EpochResult<()> = async {
+                for i in 0..num_inputs as u32 {
+                    let commitments = collected
+                        .round1
+                        .get(&(i))
+                        .ok_or_else(|| {
+                            EpochError::Transition(format!(
+                                "missing round1 commitments for input {i}"
+                            ))
+                        })?
+                        .clone();
+                    let nonces = collected.nonces.get(&i).ok_or_else(|| {
+                        EpochError::Transition(format!("missing nonces for input {i}"))
+                    })?;
 
-                let sighash = tm.sighashes[i as usize];
-                let signing_package = frost::SigningPackage::new(commitments, &sighash);
-                let merkle = tm.merkle_root_bytes(i as usize);
-                let merkle_ref = merkle.as_deref();
-                crate::epoch_debug!(
-                    me,
-                    epoch,
-                    "  input {i}: sighash={} merkle_root={}",
-                    hex::encode(sighash),
-                    merkle_ref
-                        .map(hex::encode)
-                        .unwrap_or_else(|| "<none>".to_string())
-                );
+                    let sighash = tm.sighashes[i as usize];
+                    let signing_package = frost::SigningPackage::new(commitments, &sighash);
+                    let merkle = tm.merkle_root_bytes(i as usize);
+                    let merkle_ref = merkle.as_deref();
+                    crate::epoch_debug!(
+                        me,
+                        epoch,
+                        "  input {i}: sighash={} merkle_root={}",
+                        hex::encode(sighash),
+                        merkle_ref
+                            .map(hex::encode)
+                            .unwrap_or_else(|| "<none>".to_string())
+                    );
 
-                // Compute our share.
-                let share = participant::sign_round2_with_tweak(
-                    &signing_package,
-                    nonces,
-                    &group_keys.key_package,
-                    merkle_ref,
-                )
-                .map_err(|e| EpochError::Frost(format!("sign_round2_with_tweak: {e}")))?;
-                crate::epoch_debug!(me, epoch, "    -> built tweaked signature share");
+                    // Compute our share.
+                    let share = participant::sign_round2_with_tweak(
+                        &signing_package,
+                        nonces,
+                        &group_keys.key_package,
+                        merkle_ref,
+                    )
+                    .map_err(|e| EpochError::Frost(format!("sign_round2_with_tweak: {e}")))?;
+                    crate::epoch_debug!(me, epoch, "    -> built tweaked signature share");
 
-                collected.round2.entry(i).or_default().insert(me, share);
+                    collected.round2.entry(i).or_default().insert(me, share);
 
-                let ns = input_namespace(epoch, &tm, i);
-                peers.publish_sign_round2(ns, me, share).await?;
-                crate::epoch_debug!(me, epoch, "    -> published share for input {i}");
+                    let ns = input_namespace(epoch, &tm, i);
+                    peers.publish_sign_round2(ns, me, share).await?;
+                    crate::epoch_debug!(me, epoch, "    -> published share for input {i}");
 
-                // Poll EXACTLY the round-1 subset, and require all of it. The
-                // signing package above was built from those commitments and
-                // `aggregate` needs a share from every signer in the package, so
-                // a smaller S2 does not aggregate — it fails. Round 2 therefore
-                // carries no threshold of its own: the threshold was applied when
-                // S1 closed. (It used to poll the whole roster, including peers
-                // whose commitments are not in the package.)
-                let s1: Vec<&crate::epoch::state::SpoInfo> = roster
-                    .peers_of(me)
-                    .into_iter()
-                    .filter(|p| {
-                        signing_package
-                            .signing_commitments()
-                            .contains_key(&p.identifier)
-                    })
-                    .collect();
-                crate::epoch_log!(
-                    me,
-                    epoch,
-                    "    waiting for round2 shares on input {i} from {} signer(s) of S1...",
-                    s1.len()
-                );
-                let shares = collected.round2.entry(i).or_default();
-                poll_sign_round(peers, clock, config, ns, me, Quorum::all(&s1), shares).await?;
+                    // Poll EXACTLY the round-1 subset, and require all of it. The
+                    // signing package above was built from those commitments and
+                    // `aggregate` needs a share from every signer in the package, so
+                    // a smaller S2 does not aggregate — it fails. Round 2 therefore
+                    // carries no threshold of its own: the threshold was applied when
+                    // S1 closed. (It used to poll the whole roster, including peers
+                    // whose commitments are not in the package.)
+                    let s1: Vec<&crate::epoch::state::SpoInfo> = roster
+                        .peers_of(me)
+                        .into_iter()
+                        .filter(|p| {
+                            signing_package
+                                .signing_commitments()
+                                .contains_key(&p.identifier)
+                        })
+                        .collect();
+                    crate::epoch_log!(
+                        me,
+                        epoch,
+                        "    waiting for round2 shares on input {i} from {} signer(s) of S1...",
+                        s1.len()
+                    );
+                    let shares = collected.round2.entry(i).or_default();
+                    poll_sign_round(peers, clock, config, ns, me, Quorum::all(&s1), shares).await?;
 
-                // Aggregate.
-                let signature = participant::sign_aggregate_with_tweak(
-                    &signing_package,
-                    shares,
-                    &group_keys.public_key_package,
-                    merkle_ref,
-                )
-                .map_err(|e| EpochError::Frost(format!("aggregate_with_tweak: {e}")))?;
-                let sig_bytes = signature
-                    .serialize()
-                    .map_err(|e| EpochError::Frost(format!("sig serialize: {e}")))?;
-                crate::epoch_debug!(
-                    me,
-                    epoch,
-                    "    <- aggregated input {i} signature: {}",
-                    hex::encode(&sig_bytes)
-                );
+                    // Aggregate.
+                    let signature = participant::sign_aggregate_with_tweak(
+                        &signing_package,
+                        shares,
+                        &group_keys.public_key_package,
+                        merkle_ref,
+                    )
+                    .map_err(|e| EpochError::Frost(format!("aggregate_with_tweak: {e}")))?;
+                    let sig_bytes = signature
+                        .serialize()
+                        .map_err(|e| EpochError::Frost(format!("sig serialize: {e}")))?;
+                    crate::epoch_debug!(
+                        me,
+                        epoch,
+                        "    <- aggregated input {i} signature: {}",
+                        hex::encode(&sig_bytes)
+                    );
 
-                tm.signatures[i as usize] = Some(signature);
+                    tm.signatures[i as usize] = Some(signature);
+                }
+                Ok(())
             }
+            .await;
+            signed.map_err(spent(2))?;
 
             Ok(EpochPhase::Submit {
                 epoch,

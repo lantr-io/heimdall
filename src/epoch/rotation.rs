@@ -71,7 +71,7 @@ use frost::Identifier;
 use frost_secp256k1_tr as frost;
 
 use crate::epoch::persist::{PersistedDkg, persisted_dkg_epochs, read_dkg_state};
-use crate::epoch::signing::{Quorum, poll_sign_round};
+use crate::epoch::signing::{Quorum, poll_sign_round, spent};
 use crate::epoch::state::{EpochConfig, EpochError, EpochResult, GroupKeys, Roster};
 use crate::epoch::traits::{Clock, PeerNetwork, RngSource, UpdateYPlan};
 use crate::frost::participant;
@@ -271,7 +271,15 @@ async fn frost_sign_message(
 
     let mut round1: BTreeMap<Identifier, frost::round1::SigningCommitments> = BTreeMap::new();
     round1.insert(me, commitments);
-    peers.publish_sign_round1(ns, me, commitments).await?;
+    // Everything from here on is SPENT if it fails: this node has published a
+    // commitment its peers will keep serving, and walking the round again would
+    // pair a fresh commitment of ours with their first one. The rotation waits
+    // for the next epoch boundary instead — the old key stays, the old roster
+    // carries over, "no halt, no special state". See `signing::spent`, WI-048.
+    peers
+        .publish_sign_round1(ns, me, commitments)
+        .await
+        .map_err(spent(1))?;
 
     let peer_infos = roster.peers_of(me);
     crate::epoch_log!(
@@ -298,7 +306,8 @@ async fn frost_sign_message(
         Quorum::of(&peer_infos, roster.min_signers),
         &mut round1,
     )
-    .await?;
+    .await
+    .map_err(spent(1))?;
     if !absent.is_empty() {
         crate::epoch_warn!(
             me,
@@ -319,10 +328,14 @@ async fn frost_sign_message(
         .collect();
     let package = frost::SigningPackage::new(round1, msg);
     let share = participant::sign_round2(&package, &nonces, &keys.key_package)
-        .map_err(|e| EpochError::Frost(format!("update-y sign_round2: {e}")))?;
+        .map_err(|e| EpochError::Frost(format!("update-y sign_round2: {e}")))
+        .map_err(spent(2))?;
     let mut round2: BTreeMap<Identifier, frost::round2::SignatureShare> = BTreeMap::new();
     round2.insert(me, share);
-    peers.publish_sign_round2(ns, me, share).await?;
+    peers
+        .publish_sign_round2(ns, me, share)
+        .await
+        .map_err(spent(2))?;
 
     crate::epoch_log!(
         me,
@@ -332,15 +345,23 @@ async fn frost_sign_message(
     );
     // Exactly S1, all of it: `aggregate` needs a share from every signer in the
     // package, so round 2 carries no threshold of its own.
-    poll_sign_round(peers, clock, config, ns, me, Quorum::all(&s1), &mut round2).await?;
+    poll_sign_round(peers, clock, config, ns, me, Quorum::all(&s1), &mut round2)
+        .await
+        .map_err(spent(2))?;
 
     let signature = participant::sign_aggregate(&package, &round2, &keys.public_key_package)
-        .map_err(|e| EpochError::Frost(format!("update-y aggregate: {e}")))?;
+        .map_err(|e| EpochError::Frost(format!("update-y aggregate: {e}")))
+        .map_err(spent(2))?;
     signature
         .serialize()
-        .map_err(|e| EpochError::Frost(format!("update-y sig serialize: {e}")))?
+        .map_err(|e| EpochError::Frost(format!("update-y sig serialize: {e}")))
+        .map_err(spent(2))?
         .try_into()
-        .map_err(|_| EpochError::Frost("update-y signature is not 64 bytes".into()))
+        .map_err(|_| {
+            spent(2)(EpochError::Frost(
+                "update-y signature is not 64 bytes".into(),
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -652,9 +673,23 @@ mod tests {
         let err = authorize_update_y(&peers, &clock, &rng, &config, id1, &plan)
             .await
             .expect_err("one signer of a 2-of-3 roster must not hand over the treasury");
+        // SPENT, not a bare `PollTimeout` (WI-048): this node published its
+        // commitment before the poll, so the caller must wait for the next
+        // boundary rather than walk the round again — a second pass would pair a
+        // fresh commitment of ours with whatever the peers published first, and
+        // could never aggregate. The counts stay in the cause, because "1 of 2
+        // answered" is the diagnosis an operator needs.
+        let EpochError::RoundSpent { round, cause } = &err else {
+            panic!("expected a spent round-1, got {err:?}");
+        };
+        assert_eq!(*round, 1);
         assert!(
-            matches!(err, EpochError::PollTimeout { need: 2, got: 1 }),
-            "expected a sub-threshold PollTimeout, got {err:?}"
+            cause.contains("got 1, need 2"),
+            "the spent marker must not swallow the sub-threshold counts: {cause}"
+        );
+        assert!(
+            err.round_is_spent(),
+            "the epoch loop reads this to decide it must not re-enter"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
