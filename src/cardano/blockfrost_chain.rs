@@ -58,6 +58,14 @@ use crate::epoch::traits::{
 };
 use tracing::{debug, info, warn};
 
+/// How often to re-read the chain epoch while waiting for the next boundary.
+///
+/// Cardano epochs are days long, so this only decides how promptly a node joins
+/// a new one — a minute of lag against a five-day epoch costs nothing, and the
+/// ceremony window grid realigns late joiners anyway. Kept short enough that a
+/// devnet with minute-long epochs still works.
+const EPOCH_BOUNDARY_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
 const FAULT_TOKEN_CONFIRM_POLL_SECS: u64 = 5;
 const FAULT_TOKEN_CONFIRM_TIMEOUT_SECS: u64 = 300;
 
@@ -631,6 +639,9 @@ pub struct BlockfrostCardanoChain {
     /// `btc_confirmed = false` until that txid becomes the Confirmed chain tip, so the
     /// epoch machine waits for its own in-flight TM instead of double-spending the tip.
     last_submitted_txid: Mutex<Option<bitcoin::Txid>>,
+    /// Highest epoch `await_epoch_boundary` has already delivered, so a second
+    /// call waits for the chain to move past it instead of firing again.
+    last_boundary_epoch: Mutex<Option<u64>>,
     /// `(head outpoint → its scriptPubKey)`, resolved from the head-creating TM's
     /// bytes in Cardano history. Cached because the head only moves at Confirm and
     /// `address_history` is O(chain length) on Blockfrost. `Ok(None)` (the bootstrap
@@ -844,6 +855,7 @@ impl BlockfrostCardanoChain {
             config_address: None,
             config_nft_unit: None,
             last_submitted_txid: Mutex::new(None),
+            last_boundary_epoch: Mutex::new(None),
             head_spk_cache: Mutex::new(None),
             fault_ban_flow: None,
             cpo_policy_id: None,
@@ -1507,12 +1519,29 @@ impl CardanoChain for BlockfrostCardanoChain {
         // 0 made every SPO publish under the wrong namespace. A chain-read
         // failure is a retriable Chain error (the idle phase backs off and
         // re-enters), never process death.
-        // TODO(WI-014): this returns the CURRENT epoch immediately rather than
-        // blocking until the next boundary; true boundary-waiting (poll until
-        // the epoch advances past the last-seen) lands with the loop hardening.
-        Ok(EpochBoundaryEvent {
-            epoch: self.current_epoch().await?,
-        })
+        //
+        // The FIRST call returns at once: a node starting mid-epoch must join
+        // that epoch, not sit out until the next boundary. Every call after it
+        // waits for the epoch to actually advance. That distinction did not
+        // matter while the machine ran a single cycle and stopped; once it
+        // cycles, returning the current epoch immediately would start a fresh
+        // ceremony the moment the previous one finished — a DKG and an Update-Y
+        // per movement, rotating the treasury key continuously.
+        loop {
+            let epoch = self.current_epoch().await?;
+            {
+                let mut last = self.last_boundary_epoch.lock().unwrap();
+                if last.is_none_or(|seen| epoch > seen) {
+                    *last = Some(epoch);
+                    return Ok(EpochBoundaryEvent { epoch });
+                }
+            }
+            debug!(
+                "[blockfrost] epoch {epoch} already run; waiting {}s for the next boundary",
+                EPOCH_BOUNDARY_POLL.as_secs()
+            );
+            tokio::time::sleep(EPOCH_BOUNDARY_POLL).await;
+        }
     }
 
     async fn current_epoch(&self) -> EpochResult<u64> {

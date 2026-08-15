@@ -25,9 +25,10 @@ Type=simple
 User=heimdall
 Group=heimdall
 
-# /var/lib/heimdall. Holds the per-epoch DKG signing share (written 0600) and the
-# completed-peg-outs trie, so it must be private: systemd's StateDirectoryMode
-# default is 0755, which is not good enough here.
+# /var/lib/heimdall. Holds the per-epoch DKG signing share and the federation
+# share (both written 0600) and the completed-peg-outs trie, so it must be
+# private: systemd's StateDirectoryMode default is 0755, which is not good
+# enough here.
 StateDirectory=heimdall
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/heimdall
@@ -39,16 +40,23 @@ EnvironmentFile=-/etc/default/heimdall
 # $HEIMDALL_ARGS is unquoted on purpose: systemd word-splits a bare $VAR, so the
 # operator can add flags (e.g. --broadcast) from /etc/default/heimdall without
 # editing this unit. ${VAR} would NOT split and would pass one giant argument.
-ExecStart=/usr/bin/heimdall run-mover --config /etc/heimdall/heimdall.toml $HEIMDALL_ARGS
+# `run-spo`, not `run-mover`. This unit calls itself the SPO daemon and must be
+# one: run-mover builds and signs a movement in a SINGLE process, from a signing
+# key reproduced off a constant seed, so on any bridge not deployed with that key
+# its signatures verify against nothing. run-spo is the epoch loop that joins the
+# DKG and co-signs with the rest of the roster (or, before the first DKG, with
+# the federation) — heimdall's only distributed signing path.
+ExecStart=/usr/bin/heimdall run-spo --config /etc/heimdall/heimdall.toml $HEIMDALL_ARGS
 
-# on-failure, not always: run-mover only exits 0 when it was asked to stop (an
-# operator putting --once in $HEIMDALL_ARGS), and restarting after a deliberate
-# clean exit would fight the operator. Crashes still restart.
+# on-failure, not always: the loop retries internally and does not return, so a
+# clean exit means it was asked to stop and restarting would fight the operator.
+# Crashes still restart.
 Restart=on-failure
 RestartSec=10
 
 # Hardening — mirrors deploy/nixos/heimdall-mover.nix rather than inventing a
-# second shape. ProtectSystem=strict makes the whole filesystem read-only except
+# second shape. (That module deploys the auto-MOVER, which is a different job
+# from this unit's; only the sandboxing is shared.) ProtectSystem=strict makes the whole filesystem read-only except
 # ReadWritePaths, so the state directory is the only thing the daemon can write.
 NoNewPrivileges=true
 ProtectSystem=strict

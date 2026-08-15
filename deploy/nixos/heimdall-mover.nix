@@ -1,5 +1,12 @@
 # NixOS module: Heimdall WI-028 auto-mover (run-mover) for the preprod BIP-322 bridge.
 #
+# THIS IS NOT THE SPO DAEMON. run-mover builds and signs a Treasury Movement in a
+# SINGLE process, from a signing key reproduced off a constant seed — it can only
+# ever spend a treasury deployed with that key, which is what makes it a devnet /
+# demo tool. An SPO node runs `heimdall run-spo` (see deploy/debian/heimdall.service),
+# the epoch loop that co-signs with the rest of the roster. This module is named for
+# the job it does, and does not do the other one.
+#
 # Import this into your host configuration and set the options under `services.heimdall-mover`.
 # The binary and config live OUT of the Nix store (they are deployed with deploy.sh):
 #   /var/lib/heimdall/heimdall              (static musl x86_64 binary; built on your Mac)

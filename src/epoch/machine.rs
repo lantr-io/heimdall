@@ -74,6 +74,46 @@ enum Step {
     Done(TreasuryMovement),
 }
 
+/// Run the epoch machine for as long as the process lives: one cycle after
+/// another, for ever.
+///
+/// [`run_epoch_loop`] completes ONE cycle and returns the movement it made — the
+/// right shape for a test and for a single-shot run, and the wrong one for a
+/// daemon. A service pointed at it produced exactly one Treasury Movement and
+/// exited, which under `Restart=on-failure` looks like a clean shutdown: the
+/// bridge moves once and then goes quiet with a green unit.
+///
+/// A completed cycle is a success, so it resets nothing and waits for nothing
+/// here — `Idle`'s `await_epoch_boundary` is what paces the next one. Errors keep
+/// their existing treatment inside `run_epoch_loop`, which never returns them.
+pub async fn run_epoch_daemon(
+    chain: Arc<dyn CardanoChain>,
+    pegin_source: Arc<dyn CardanoPegInSource>,
+    peers: Arc<dyn PeerNetwork>,
+    clock: Arc<dyn Clock>,
+    rng: Arc<dyn RngSource>,
+    config: &EpochConfig,
+    mut on_cycle: impl FnMut(&TreasuryMovement),
+) -> EpochResult<std::convert::Infallible> {
+    loop {
+        let tm = run_epoch_loop(
+            Arc::clone(&chain),
+            Arc::clone(&pegin_source),
+            Arc::clone(&peers),
+            Arc::clone(&clock),
+            Arc::clone(&rng),
+            config,
+        )
+        .await?;
+        on_cycle(&tm);
+    }
+}
+
+/// Run ONE full epoch cycle and return the Treasury Movement it produced.
+///
+/// Retriable failures never surface: they back off and re-enter `Idle`, so this
+/// returns only on a completed cycle. For a long-running node use
+/// [`run_epoch_daemon`], which repeats it.
 pub async fn run_epoch_loop(
     chain: Arc<dyn CardanoChain>,
     pegin_source: Arc<dyn CardanoPegInSource>,

@@ -18,7 +18,7 @@ pub mod signing;
 pub mod state;
 pub mod traits;
 
-pub use machine::run_epoch_loop;
+pub use machine::{run_epoch_daemon, run_epoch_loop};
 
 pub use state::{
     CascadeLevel, DkgCollected, DkgRound, EpochConfig, EpochError, EpochPhase, EpochResult,

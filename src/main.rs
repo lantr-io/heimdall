@@ -12,7 +12,6 @@ use heimdall::cardano::pegin_source::CardanoPegInSource;
 use heimdall::cardano::treasury_datum::TreasuryConfig;
 use heimdall::config::HeimdallConfig;
 use heimdall::epoch::mocks::{MockCardanoChain, OsRngSource, SeededRngSource, SystemClock};
-use heimdall::epoch::run_epoch_loop;
 use heimdall::epoch::state::SpoIdentity;
 use heimdall::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use heimdall::federation::roster::FederationMember;
@@ -74,6 +73,11 @@ enum Commands {
         /// compiled defaults. CLI flags override TOML values.
         #[arg(long)]
         config: Option<String>,
+        /// Run the startup checks, print the whole report, and exit — without
+        /// joining anything. The dry run to do after editing the config and
+        /// before enabling the service; exits non-zero if any check failed.
+        #[arg(long)]
+        check: bool,
         /// Legacy fallback: this SPO's 1-based roster index, used only for the
         /// config/mock fixture demo (whose roster carries no bifrost_id_pk). With
         /// a real on-chain roster the node identifies itself by its bifrost key.
@@ -970,7 +974,7 @@ fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
         Some(f) => Err(format!(
             "startup preflight failed at step {} ({}) — refusing to start. \
              Fix what is listed above and re-check with \
-             `heimdall run-mover --config <file> --once`.",
+             `heimdall run-spo --config <file> --check`.",
             f.n, f.title
         )),
     }
@@ -1134,6 +1138,7 @@ fn main() {
     match cli.command {
         Commands::RunSpo {
             config,
+            check,
             index,
             min_signers,
             max_signers,
@@ -1186,6 +1191,19 @@ fn main() {
                         cfg.cardano.mnemonic = Some(v);
                     }
                 }
+            }
+
+            // WI-053's startup gate, which used to run only in `run-mover`.
+            // This is the packaged daemon now, so it is the one that has to
+            // refuse to start on a misconfiguration rather than join a ceremony
+            // with a bridge view that disagrees with everyone else's.
+            if let Err(e) = run_preflight_gate(&cfg) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+            if check {
+                println!("\nstartup checks passed — this node is configured for the bridge above");
+                return;
             }
 
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -2268,24 +2286,38 @@ async fn run_spo(
     }
 
     let t0 = Instant::now();
-    // The epoch loop backs off and re-enters `Idle` on EVERY error, so it does
-    // not return Err at all today — this arm is unreachable by construction and
-    // kept only because the signature is still `EpochResult`. It must NOT go
-    // back to parking on Ctrl-C: that is exactly what froze an honest node on a
-    // stale roster (2026-07-22), because re-deriving the roster is something
-    // only the loop does. If a future change reintroduces an error exit, say so
-    // plainly and let the supervisor restart us.
-    let tm = match run_epoch_loop(chain, pegin_source, peers, clock, rng, &config).await {
-        Ok(tm) => tm,
+    // Cycle after cycle, for ever. `run_epoch_loop` completes ONE cycle and
+    // returns the movement it made; this node used to stop there and park on
+    // Ctrl-C, so it produced exactly one Treasury Movement per process start and
+    // then sat with its HTTP server answering while taking part in nothing. That
+    // is the same frozen-node shape the retry policy below exists to prevent,
+    // arrived at by succeeding rather than by failing.
+    //
+    // Errors never reach here: every retriable failure backs off and re-enters
+    // `Idle` inside the loop, which is what re-derives the roster from chain. An
+    // error return would mean that contract broke, so say so plainly and let the
+    // supervisor restart us rather than parking.
+    let mut cycles: u64 = 0;
+    let err =
+        heimdall::epoch::run_epoch_daemon(chain, pegin_source, peers, clock, rng, &config, |tm| {
+            cycles += 1;
+            info!("Cycle {cycles} complete ({:.2?} since start)", t0.elapsed());
+            log_tm_summary(tm);
+            info!("=== SPO {spo_label} cycle {cycles} complete — waiting for the next epoch ===");
+        })
+        .await;
+    match err {
+        Ok(never) => match never {},
         Err(e) => {
-            error!("[demo] epoch loop returned unexpectedly: {e}");
-            error!("[demo] this should not happen — the loop is meant to retry indefinitely.");
+            error!("[run-spo] epoch loop returned unexpectedly after {cycles} cycle(s): {e}");
+            error!("[run-spo] this should not happen — the loop is meant to retry indefinitely.");
             std::process::exit(1);
         }
-    };
-    info!("Cycle complete ({:.2?})", t0.elapsed());
+    }
+}
 
-    // ── Bitcoin TM transaction summary ──────────────────────────────────────
+/// Log one completed Treasury Movement: inputs, outputs, size and raw bytes.
+fn log_tm_summary(tm: &heimdall::epoch::state::TreasuryMovement) {
     info!("── Bitcoin Treasury Movement ──");
     info!("  txid:    {}", tm.txid);
     info!("  inputs:  {}", tm.unsigned_tx.input.len());
@@ -2317,11 +2349,6 @@ async fn run_spo(
     let signed_bytes = bitcoin::consensus::encode::serialize(&tm.unsigned_tx);
     info!("  size:    {} bytes", signed_bytes.len());
     info!("  hex:     {}", hex::encode(&signed_bytes));
-
-    info!("=== SPO {spo_label} cycle complete ===");
-
-    info!("Server still running on {bind_addr}:{port}; press Ctrl-C to exit.");
-    tokio::signal::ctrl_c().await.ok();
 }
 
 /// Build a `MockCardanoChain` from the fixture, wiring up the Bitcoin
