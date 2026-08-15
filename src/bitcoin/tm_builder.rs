@@ -184,10 +184,29 @@ pub const PEG_OUT_CANCEL_TIMEOUT_MS: i64 = 2_592_000_000;
 ///
 /// Compiling it in does not make the value *right*, it makes it uniform across
 /// every node running the same release — which turns an invisible per-operator
-/// divergence into a visible per-release one. The real fix is to publish it in
-/// the Config datum so it is uniform across the BRIDGE; that is WI-071's
-/// remaining half, deferred because widening the datum moves the config hash and
-/// with it every contract parameterized by it.
+/// divergence into a visible per-release one.
+///
+/// **A constant is the answer, not a stopgap.** Publishing it in the Config datum
+/// was proposed as WI-071's second half and REJECTED, on a corrected premise:
+///
+/// - Nothing outside heimdall reads the value. Checked across all three repos —
+///   ft mentions it only in comments, binocular not at all, and `peg_out.ak`
+///   knows `peg_out_cancel_timeout_ms` alone. Its Cancel branch merely *assumes*
+///   a margin exists ("the SPO freshness margin stops fulfillment long before the
+///   deadline"); it never checks one.
+/// - So divergence costs LIVENESS, not safety. Two SPOs on different values sign
+///   different messages and the round does not converge — nothing is paid, and
+///   nothing is paid twice. The safety property is that each SPO's margin be
+///   large ENOUGH, which a compiled-in constant guarantees outright and a datum
+///   field would not improve on.
+/// - The spec says off-chain twice: "a heimdall-configured value, default 7 days"
+///   and, in the parameter table, "heimdall config (off-chain, not on-chain) |
+///   operator-tunable, no Config field". One loose sentence lumps it in with the
+///   snapshot-read parameters, and that drafting is what the publish proposal
+///   rested on. Corrected upstream in ft 4432424.
+///
+/// The residual — two nodes on different heimdall *releases* — is a peer version
+/// check before a ceremony (WI-067), not a datum field.
 ///
 /// Sizing: large enough that a request selected now cannot reach its cancel
 /// deadline before the TM confirms, even after a long Bitcoin fee-market stall;
