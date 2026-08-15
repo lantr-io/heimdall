@@ -20,4 +20,4 @@ if [ ! -f "$BP" ]; then
     || { echo "need the b814cca blueprint at $BP"; exit 1; }
 fi
 
-exec ./target/debug/heimdall demo --config heimdall-spo1.toml --deterministic "$@"
+exec ./target/debug/heimdall run-spo --config heimdall-spo1.toml --deterministic "$@"

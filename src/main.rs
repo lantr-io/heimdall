@@ -50,17 +50,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run one SPO instance. Start `max-signers` of these in separate
-    /// terminals — each one points at the same chain and discovers the
-    /// roster (and thus its own listen port) from it.
+    /// Run this SPO's node: the epoch loop that participates in the DKG,
+    /// co-signs Treasury Movements with the rest of the roster, and drives
+    /// the key handoff at each boundary.
+    ///
+    /// Every registered SPO runs one of these. They point at the same chain,
+    /// discover the roster from it (and thus their own listen port and FROST
+    /// index), and reach each other over the authenticated HTTP transport —
+    /// this is the only distributed signing path heimdall has. Contrast
+    /// `run-mover`, which builds and signs movements in ONE process.
+    ///
+    /// Named `demo` until 2026-08-15, which was wrong in the way that
+    /// matters: it is the SPO daemon, and the name said not to run it.
     ///
     /// TODO: add a `--chain` flag (once a real `CardanoChain` impl
     /// exists) to select between `mock` and a live Cardano follower.
-    /// Today the demo is hardwired to `MockCardanoChain`, and the
+    /// Today the mock path is hardwired to `MockCardanoChain`, and the
     /// `--min-signers`, `--max-signers`, `--base-port` flags are only
     /// used to parameterize that mock chain — a real deployment would
     /// read none of those from the CLI.
-    Demo {
+    RunSpo {
         /// Path to a TOML configuration file. Omitted fields use
         /// compiled defaults. CLI flags override TOML values.
         #[arg(long)]
@@ -1112,7 +1121,7 @@ fn main() {
     // globals from where it is called.
     heimdall::logging::set_cli_overrides(cli.log_level, cli.log_format);
     match cli.command {
-        Commands::Demo {
+        Commands::RunSpo {
             config,
             index,
             min_signers,
@@ -1169,7 +1178,7 @@ fn main() {
             }
 
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_demo(cfg, index, deterministic, inject_fault));
+            rt.block_on(run_spo(cfg, index, deterministic, inject_fault));
         }
         Commands::BootstrapTreasury {
             config,
@@ -1743,7 +1752,7 @@ fn apply_tm_policy(
     }
 }
 
-async fn run_demo(
+async fn run_spo(
     cfg: HeimdallConfig,
     index: Option<u16>,
     deterministic: bool,
@@ -2224,6 +2233,27 @@ async fn run_demo(
     };
     if let Some(k) = config.inject_fault {
         warn!("[demo] ⚠ FAULT INJECTION ENABLED: {k:?} — this node will misbehave in DKG");
+    }
+
+    // Phase 1 (WI-095): before the first Update-Y the treasury is locked under
+    // y_federation and the federation — not a DKG roster — signs the movement's
+    // key path. Loaded unconditionally because WHICH phase the bridge is in is
+    // chain state the machine reads per epoch, not something to decide here: a
+    // node can start in Phase 1 and still be running when the first Update-Y
+    // makes it a Phase-2 node.
+    config.phase1_signer = match phase1_signer(&cfg) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("[demo] federation share: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(fed) = config.phase1_signer.as_ref() {
+        info!(
+            "[demo] federation share loaded: {}-of-{} (signs treasury movements while the \
+             bridge is in Phase 1)",
+            fed.roster.min_signers, fed.roster.max_signers
+        );
     }
 
     let t0 = Instant::now();
@@ -2908,6 +2938,40 @@ fn federation_share(cfg: &HeimdallConfig) -> Result<Option<FederationKeyState>, 
             .map_err(|e| e.to_string())?;
     }
     Ok(Some(state))
+}
+
+/// This node's federation signing material for the epoch machine (WI-095), or
+/// `None` if it is not a federation member.
+///
+/// The machine needs both halves together: the share to sign with, and the
+/// membership to address peers by. `federation_share` already refuses a share
+/// that does not match the configured roster; what is left is the case where
+/// there is no roster to match against.
+fn phase1_signer(
+    cfg: &HeimdallConfig,
+) -> Result<Option<heimdall::epoch::state::Phase1Signer>, String> {
+    let Some(state) = federation_share(cfg)? else {
+        return Ok(None);
+    };
+    if cfg.federation.members.is_empty() {
+        // A share with nobody to sign alongside. Refused rather than downgraded
+        // to "not a member": this node CAN sign, and on a Phase-1 bridge its
+        // silence stalls every treasury movement — a failure whose only symptom
+        // would be co-signers timing out on a peer that looks healthy.
+        return Err(format!(
+            "a federation share is persisted in {} but [federation].members is empty, so this \
+             node cannot tell who its co-signers are or where to reach them. The roster is \
+             typed in — Y_federation precedes the bridge, so there is nothing to read it from. \
+             Restore the member list the ceremony ran with",
+            cfg.protocol.state_dir.as_deref().unwrap_or("<state_dir>")
+        ));
+    }
+    let roster = federation_roster(cfg)?.to_roster();
+    let group_keys = state.to_group_keys().map_err(|e| e.to_string())?;
+    Ok(Some(heimdall::epoch::state::Phase1Signer {
+        roster,
+        group_keys,
+    }))
 }
 
 /// Start this node's ceremony endpoint and return the transport peers fetch from.

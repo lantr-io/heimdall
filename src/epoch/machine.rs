@@ -180,13 +180,32 @@ async fn step_phase(
     let next = match phase {
         EpochPhase::Idle => idle_phase(chain).await?,
 
-        EpochPhase::EpochStart { epoch } => epoch_start_phase(chain, peers, config, epoch).await?,
+        // The two DKG-bearing phases share one failure route: when the ceremony
+        // cannot deliver — an empty or sub-threshold registry, this node not
+        // eligible, or rounds that timed out — a bridge still in Phase 1 falls
+        // back to the federation rather than losing the batch. See
+        // [`phase1_fallback`]; on a Phase-2 bridge it re-raises untouched, so a
+        // failed ceremony stays a failed ceremony.
+        EpochPhase::EpochStart { epoch } => {
+            match epoch_start_phase(chain, peers, config, epoch).await {
+                Ok(next) => next,
+                Err(e) if dkg_unavailable(&e) => phase1_fallback(chain, config, epoch, e).await?,
+                Err(e) => return Err(e),
+            }
+        }
 
         EpochPhase::Dkg {
             round,
             ctx,
             collected,
-        } => dkg_phase(chain, peers, clock, rng, config, round, ctx, collected).await?,
+        } => {
+            let epoch = ctx.epoch;
+            match dkg_phase(chain, peers, clock, rng, config, round, ctx, collected).await {
+                Ok(next) => next,
+                Err(e) if dkg_unavailable(&e) => phase1_fallback(chain, config, epoch, e).await?,
+                Err(e) => return Err(e),
+            }
+        }
 
         EpochPhase::PublishKeys {
             epoch,
@@ -407,6 +426,187 @@ fn advance_spi_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> 
 async fn idle_phase(chain: &Arc<dyn CardanoChain>) -> EpochResult<EpochPhase> {
     let event = chain.await_epoch_boundary().await?;
     Ok(EpochPhase::EpochStart { epoch: event.epoch })
+}
+
+/// Did the DKG path fail in a way the federation could cover for?
+///
+/// `DkgAborted` is the ceremony giving up — no viable candidate set, or this node
+/// outside it. `PollTimeout` is the rounds running out of time waiting for peers,
+/// which on a genesis bridge is what "nobody is there" looks like. Both mean the
+/// epoch will produce no group key, which is precisely when the federation should
+/// be asked instead.
+///
+/// Everything else is deliberately excluded. A `Chain` error means we could not
+/// read the registry, not that it is empty — falling back on it would take the
+/// federation route every time the node's provider hiccuped. `Frost` means the
+/// ceremony produced something wrong, which is a fault to investigate, not a
+/// reason to route around.
+fn dkg_unavailable(e: &EpochError) -> bool {
+    matches!(
+        e,
+        EpochError::DkgAborted { .. } | EpochError::PollTimeout { .. }
+    )
+}
+
+/// The Phase-1 fallback: when the DKG path cannot deliver, sign the treasury's
+/// key path with the federation instead.
+///
+/// **Taken on failure, not on prediction.** The DKG is always attempted first —
+/// a bridge whose registry can produce a roster should produce one, and that
+/// ceremony's Update-Y *is* the Phase-2 transition. Only once the attempt has
+/// actually failed (an empty or sub-threshold registry, this node not eligible,
+/// or a ceremony that timed out) is the federation asked to sign. Predicting
+/// viability up front would race the registry and take the federation route on a
+/// bridge that was one late peer away from a real ceremony.
+///
+/// Declining returns the ORIGINAL DKG error, so a node that is not a federation
+/// member keeps the diagnostic that actually applies to it.
+///
+/// **The phase test is a comparison, not a flag.** §Rollout Phases is explicit
+/// that "there is no phase flag anywhere — the transition *is* the first
+/// Update-Y", and the TreasuryDatum table says `current_spos_frost_key` holds
+/// "$Y_{51}$ after the first successful DKG; **$Y_{federation}$ from K1 until
+/// then**". So `authorized_key == config_y_fed` is exactly the statement that no
+/// Update-Y has ever landed, and the two diverge for ever the moment one does.
+/// Nothing is configured and nothing is remembered across restarts: a node that
+/// joins a bridge mid-life reaches the same answer as one that watched it deploy.
+///
+/// Both halves come from ONE chain read — see [`TreasuryUtxo::authorized_key`]
+/// for why it is that field and not `y_51`.
+///
+/// [`TreasuryUtxo::authorized_key`]: crate::epoch::traits::TreasuryUtxo::authorized_key
+async fn phase1_fallback(
+    chain: &Arc<dyn CardanoChain>,
+    config: &EpochConfig,
+    epoch: u64,
+    dkg_err: EpochError,
+) -> EpochResult<EpochPhase> {
+    let log_id = config.identity.identifier;
+    let treasury = match chain.query_treasury().await {
+        Ok(t) => t,
+        // Could not establish the phase, so the DKG failure stands. Reported
+        // rather than swallowed: "the DKG failed" and "we could not check
+        // whether the federation should have covered for it" are different
+        // situations for an operator.
+        Err(e) => {
+            crate::epoch_warn!(
+                log_id,
+                epoch,
+                "  could not read the treasury to check for a Phase-1 fallback: {e}"
+            );
+            return Err(dkg_err);
+        }
+    };
+    if treasury.authorized_key != treasury.config_y_fed {
+        // Phase 2: a DKG key owns the treasury, so a failed ceremony is just a
+        // failed ceremony. The old roster carries over and the next boundary
+        // retries — the spec's "no halt, no special state".
+        return Err(dkg_err);
+    }
+
+    let Some(signer) = config.phase1_signer.as_ref() else {
+        // Not a federation member. On a Phase-1 bridge that is simply idle: the
+        // movements are the federation's to make, and this node has nothing to
+        // contribute until the first Update-Y hands the treasury to a roster.
+        crate::epoch_log!(
+            log_id,
+            epoch,
+            "  the bridge is still in Phase 1 (treasury key == Config y_federation {}), so \
+             treasury movements are the FEDERATION's to sign. This node holds no federation \
+             share, so it has nothing to contribute until the first Update-Y hands the \
+             treasury to an SPO roster",
+            hex::encode(treasury.config_y_fed.serialize())
+        );
+        return Err(dkg_err);
+    };
+
+    // The share must be a share OF the key the treasury is actually locked
+    // under. A federation that re-ran its ceremony produces a DIFFERENT
+    // Y_federation — and therefore a different treasury address — so a stale
+    // share would sign perfectly valid signatures for a key that owns nothing.
+    // Checked against the group package, not against any stored label.
+    let share_y = group_xonly(&signer.group_keys.verifying_key)
+        .map_err(EpochError::Frost)?
+        .xonly;
+    if share_y != treasury.y_51 {
+        return Err(EpochError::Transition(format!(
+            "this node's federation share is a share of {}, but the treasury is locked under {} \
+             (Config y_federation {}). A share only signs for the key its own ceremony produced, \
+             so this one cannot move the treasury. Either this node holds a share from a \
+             superseded ceremony, or it is configured against a different bridge",
+            hex::encode(share_y.serialize()),
+            hex::encode(treasury.y_51.serialize()),
+            hex::encode(treasury.config_y_fed.serialize()),
+        )));
+    }
+
+    // The FROST identifier the ceremony assigned is authoritative — the same
+    // rule the post-DKG phases follow — and the roster must contain it, because
+    // that is how peers address this node's published payloads.
+    let mut roster = signer.roster.clone();
+    let me = *signer.group_keys.key_package.identifier();
+    let Some(own) = roster.participants.get(&me) else {
+        return Err(EpochError::Transition(format!(
+            "this node's federation share carries FROST identifier {} but the configured \
+             [federation] roster has no member at that index ({} member(s)). The share was \
+             generated for a different membership than the one configured now",
+            crate::frost::identifier_u16(me),
+            roster.participants.len(),
+        )));
+    };
+    // ...and it must be THIS node's entry. The identifier is positional, so a
+    // roster edited after the ceremony can leave the share pointing at a member
+    // whose key is somebody else's — which would publish payloads signed by the
+    // wrong identity under an index peers expect to be another member's.
+    if !config.identity.bifrost_id_pk.is_empty()
+        && own.bifrost_id_pk != config.identity.bifrost_id_pk
+    {
+        return Err(EpochError::Transition(format!(
+            "this node's federation share sits at roster index {}, which the configured \
+             [federation] roster says is member {} — not this node ({}). The roster changed \
+             after the ceremony ran",
+            crate::frost::identifier_u16(me),
+            hex::encode(&own.bifrost_id_pk),
+            hex::encode(&config.identity.bifrost_id_pk),
+        )));
+    }
+    roster.epoch = epoch;
+
+    crate::epoch_log!(
+        log_id,
+        epoch,
+        "Phase 1: no Update-Y has landed (treasury key == Config y_federation {}), so the \
+         FEDERATION signs this movement's key path — {}-of-{}, this node at index {}. Skipping \
+         DKG: there is no roster to run one over and no key to rotate to",
+        hex::encode(treasury.config_y_fed.serialize()),
+        roster.min_signers,
+        roster.max_signers,
+        crate::frost::identifier_u16(me),
+    );
+    if roster.min_signers < roster.max_signers {
+        // Honest about a limitation that is not Phase-1-specific: the signing
+        // rounds poll EVERY peer rather than the first `t` to answer
+        // (`poll_sign_round`'s `need = peers + 1`), so a `t`-of-`n` federation
+        // still needs all `n` up to produce a movement. Worth saying out loud
+        // here because `t = n - 1` is the recommended federation threshold, so
+        // an operator has explicit reason to expect otherwise.
+        crate::epoch_warn!(
+            log_id,
+            epoch,
+            "  note: the federation threshold is {}-of-{}, but the signing rounds currently \
+             require ALL {} members to respond — a dark member stalls the movement rather than \
+             being signed around",
+            roster.min_signers,
+            roster.max_signers,
+            roster.max_signers,
+        );
+    }
+
+    Ok(EpochPhase::CollectPegins {
+        epoch,
+        roster,
+        group_keys: signer.group_keys.clone(),
+    })
 }
 
 async fn epoch_start_phase(
@@ -1517,6 +1717,177 @@ mod tests {
             std::env::temp_dir().join(format!("heimdall-epoch-test-{}-{seq}", std::process::id(),)),
         );
         config
+    }
+
+    // ── Phase-1 federation fallback (WI-095) ────────────────────────────
+
+    /// A federation share + the matching roster entry, keyed so the roster's
+    /// `bifrost_id_pk` and the share's FROST index agree — which is what
+    /// `phase1_fallback` cross-checks.
+    fn phase1_signer_for(
+        min_signers: u16,
+        max_signers: u16,
+    ) -> (crate::epoch::state::Phase1Signer, GroupKeys) {
+        use crate::epoch::state::SpoInfo;
+        let mut rng = rand::thread_rng();
+        let (shares, pkp) = frost::keys::generate_with_dealer(
+            max_signers,
+            min_signers,
+            frost::keys::IdentifierList::Default,
+            &mut rng,
+        )
+        .unwrap();
+        let key_packages: BTreeMap<Identifier, frost::keys::KeyPackage> = shares
+            .into_iter()
+            .map(|(id, s)| (id, frost::keys::KeyPackage::try_from(s).unwrap()))
+            .collect();
+        let participants: BTreeMap<Identifier, SpoInfo> = key_packages
+            .keys()
+            .enumerate()
+            .map(|(i, id)| {
+                (
+                    *id,
+                    SpoInfo {
+                        identifier: *id,
+                        pool_id: vec![i as u8 + 1; 28],
+                        bifrost_url: format!("http://127.0.0.1:{}", 9000 + i),
+                        bifrost_id_pk: vec![i as u8 + 1; 32],
+                    },
+                )
+            })
+            .collect();
+        let group_keys = GroupKeys {
+            verifying_key: *pkp.verifying_key(),
+            public_key_package: pkp,
+            key_package: key_packages.into_values().next().unwrap(),
+        };
+        (
+            crate::epoch::state::Phase1Signer {
+                roster: Roster {
+                    epoch: 0,
+                    min_signers,
+                    max_signers,
+                    participants,
+                },
+                group_keys: group_keys.clone(),
+            },
+            group_keys,
+        )
+    }
+
+    fn aborted() -> EpochError {
+        EpochError::DkgAborted {
+            epoch: 7,
+            attempt: 0,
+            qualified: 0,
+            eligible: 0,
+            reason: "no eligible SPOs".into(),
+        }
+    }
+
+    /// The classifier decides which failures the federation may cover for. A
+    /// chain read that failed says nothing about whether a roster exists, so
+    /// falling back on it would route around every provider hiccup.
+    #[test]
+    fn only_a_failed_ceremony_opens_the_phase1_route() {
+        assert!(dkg_unavailable(&aborted()));
+        assert!(dkg_unavailable(&EpochError::PollTimeout {
+            got: 1,
+            need: 3
+        }));
+        assert!(!dkg_unavailable(&EpochError::Chain(
+            "blockfrost 502".into()
+        )));
+        assert!(!dkg_unavailable(&EpochError::Frost("bad share".into())));
+    }
+
+    /// Phase 1 + a federation share → the cycle continues at `CollectPegins`
+    /// carrying the FEDERATION's roster and group keys, with no DKG in between.
+    #[tokio::test]
+    async fn phase1_fallback_signs_with_the_federation() {
+        let (signer, group_keys) = phase1_signer_for(2, 3);
+        let me = *group_keys.key_package.identifier();
+        let y_fed = group_xonly(&group_keys.verifying_key).unwrap().xonly;
+        // A genesis bridge: the treasury is locked under Y_federation and the
+        // datum authorizes it, which is what the K1 bootstrap seeds. The mock
+        // reports `authorized_key == config_y_fed` from these, so the phase test
+        // says Phase 1.
+        let mut fixture = demo_static_fixture(2, 2, 19100);
+        fixture.y_fed = y_fed;
+        fixture.y_51 = y_fed;
+        let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture));
+        let mut config = fast_config(Identifier::try_from(1).unwrap());
+        // Adopt the roster's identity for this index, as a real member's config
+        // would: the share and the configured identity must name the same member.
+        config.identity.bifrost_id_pk = signer.roster.participants[&me].bifrost_id_pk.clone();
+        config.phase1_signer = Some(signer.clone());
+
+        let next = phase1_fallback(&chain, &config, 7, aborted())
+            .await
+            .expect("Phase 1 with a share must continue, not re-raise");
+        match next {
+            EpochPhase::CollectPegins {
+                epoch,
+                roster,
+                group_keys: gk,
+            } => {
+                assert_eq!(epoch, 7);
+                // The FEDERATION's membership, stamped with this epoch.
+                assert_eq!(roster.epoch, 7);
+                assert_eq!(roster.max_signers, 3);
+                assert_eq!(roster.min_signers, 2);
+                // ...and the federation's key, not a DKG one.
+                assert_eq!(
+                    group_xonly(&gk.verifying_key).unwrap().xonly,
+                    group_xonly(&group_keys.verifying_key).unwrap().xonly
+                );
+            }
+            other => panic!("expected CollectPegins, got {}", other.name()),
+        }
+    }
+
+    /// No share → the ORIGINAL DKG error is re-raised. A node that is not a
+    /// federation member must keep the diagnostic that applies to it rather than
+    /// be told something about a federation it is not in.
+    #[tokio::test]
+    async fn a_non_member_keeps_the_dkg_error() {
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(demo_static_fixture(2, 2, 19100)));
+        let config = fast_config(Identifier::try_from(1).unwrap());
+        assert!(config.phase1_signer.is_none());
+
+        let err = phase1_fallback(&chain, &config, 7, aborted())
+            .await
+            .expect_err("a non-member has nothing to fall back to");
+        assert!(
+            matches!(err, EpochError::DkgAborted { .. }),
+            "expected the original DKG error, got {err}"
+        );
+    }
+
+    /// A share of a DIFFERENT key than the treasury is locked under must not
+    /// sign. It would produce perfectly valid signatures for a key that owns
+    /// nothing — the failure mode a re-run ceremony creates.
+    #[tokio::test]
+    async fn a_share_of_the_wrong_key_is_refused() {
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(demo_static_fixture(2, 2, 19100)));
+        let mut config = fast_config(Identifier::try_from(1).unwrap());
+        // `phase1_signer_for` generates a fresh key, which is not the fixture's
+        // y_fed — exactly the stale-share situation.
+        let (signer, _) = phase1_signer_for(2, 3);
+        config.phase1_signer = Some(signer);
+
+        let err = phase1_fallback(&chain, &config, 7, aborted())
+            .await
+            .expect_err("a share of the wrong key must be refused");
+        match err {
+            EpochError::Transition(m) => assert!(
+                m.contains("cannot move the treasury"),
+                "unexpected message: {m}"
+            ),
+            other => panic!("expected Transition, got {other}"),
+        }
     }
 
     /// WI-014 acceptance: N instances run the FULL epoch loop (DKG → finalize →

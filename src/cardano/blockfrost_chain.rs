@@ -1622,10 +1622,45 @@ impl CardanoChain for BlockfrostCardanoChain {
         .await
         .map_err(EpochError::Chain)?;
 
-        // The treasury's Taproot internal key (Y_51). After DKG, publish_group_key
-        // stores the FROST group key here; at bootstrap it is the config Y_51.
+        // The key the bridge AUTHORIZES right now: `current_spos_frost_key` from
+        // the treasury_info datum. Read from the chain rather than assumed, which
+        // it used to be — `treasury_config.y_51` is seeded from the fixture as
+        // `y_fed` on every process start, so before this read a restarted node
+        // could not tell a genesis bridge from one that had already rotated. That
+        // is what decides the rollout phase (spec §Rollout Phases: the Phase-2
+        // transition IS the first Update-Y, so `authorized == y_federation` is
+        // exactly the statement that none has landed).
+        //
+        // DISTINCT from `y_51` below, which is what the head UTxO is LOCKED
+        // under. The two agree except in the window between an Update-Y and the
+        // handoff movement that acts on it: Cardano rotates the datum, but the
+        // BTC stays under the old key until a movement spends it there and pays
+        // the change to the new address.
+        let authorized_key = match self.current_federation().await?.0 {
+            Some(registry) => {
+                let state = self.find_treasury_info_state(&registry).await?;
+                Some(
+                    bitcoin::key::UntweakedPublicKey::from_slice(
+                        &state.datum.current_spos_frost_key,
+                    )
+                    .map_err(|e| {
+                        EpochError::Chain(format!(
+                            "treasury_info current_spos_frost_key ({}) is not an x-only key: {e}",
+                            hex::encode(&state.datum.current_spos_frost_key)
+                        ))
+                    })?,
+                )
+            }
+            // No treasury_info to read: there is nothing that could have rotated,
+            // so the head's own key stands in. Keeps the mock and the
+            // no-registry demo on their existing behaviour.
+            None => None,
+        };
+
+        // The treasury's Taproot internal key (Y_51) — what the head is locked
+        // under. After DKG, publish_group_key stores the FROST group key here;
+        // at bootstrap it is the config Y_51.
         let maybe_key = *self.treasury_y_51.lock().unwrap();
-        let y_51 = maybe_key.unwrap_or(self.treasury_config.y_51);
         let csv = self.treasury_config.federation_csv_blocks;
 
         // Which taproot tree is the head locked under? The singleton records the outpoint and
@@ -1647,18 +1682,45 @@ impl CardanoChain for BlockfrostCardanoChain {
         // to be a `u32` that every consumer cast, so a value above 65535
         // truncated into a different Taproot tree.
         let csv_u16 = csv;
-        let mut leaf_candidates = vec![self.treasury_config.y_fed];
-        if y_51 != self.treasury_config.y_fed {
-            leaf_candidates.push(y_51);
+        // The INTERNAL key is a candidate too, not a given. It used to be fixed
+        // to the configured value, which meant a node restarted after an Update-Y
+        // had exactly one guess and it was the wrong one — the match failed and
+        // the node could not read the treasury at all. The head can legitimately
+        // be under either the authorized key (steady state) or the key it
+        // superseded (the handoff window, where Cardano has rotated but the BTC
+        // has not moved yet), so both are offered and the chain decides.
+        let mut internal_candidates = vec![maybe_key.unwrap_or(self.treasury_config.y_51)];
+        for cand in authorized_key
+            .into_iter()
+            .chain([self.treasury_config.y_fed])
+        {
+            if !internal_candidates.contains(&cand) {
+                internal_candidates.push(cand);
+            }
         }
+        // Leaves to try for a given internal key: the PUBLISHED federation key,
+        // then the internal key itself (the demo's collapsed Y_fed = Y_51
+        // convention).
+        let leaves_for = |internal: bitcoin::key::UntweakedPublicKey| {
+            let mut leaves = vec![self.treasury_config.y_fed];
+            if internal != self.treasury_config.y_fed {
+                leaves.push(internal);
+            }
+            leaves
+        };
         let head_spk = self.head_spk(&outpoint).await?;
-        let y_fed = match &head_spk {
-            Some(actual_spk) => leaf_candidates
+        let (y_51, y_fed) = match &head_spk {
+            Some(actual_spk) => internal_candidates
                 .iter()
                 .copied()
-                .find(|&cand| {
+                .flat_map(|internal| {
+                    leaves_for(internal)
+                        .into_iter()
+                        .map(move |leaf| (internal, leaf))
+                })
+                .find(|&(internal, leaf)| {
                     let spk = bitcoin::ScriptBuf::new_p2tr_tweaked(
-                        treasury_spend_info(&secp, y_51, cand, csv_u16).output_key(),
+                        treasury_spend_info(&secp, internal, leaf, csv_u16).output_key(),
                     );
                     spk == *actual_spk
                 })
@@ -1671,7 +1733,8 @@ impl CardanoChain for BlockfrostCardanoChain {
                     ))
                 })?,
             None => {
-                let y_fed = leaf_candidates[0];
+                let internal = internal_candidates[0];
+                let y_fed = self.treasury_config.y_fed;
                 eprintln!(
                     "[blockfrost] no TM record creates head {outpoint} — treating it as the \
                      BOOTSTRAP anchor and trusting the configured keys (y_fed {}) for the \
@@ -1679,7 +1742,7 @@ impl CardanoChain for BlockfrostCardanoChain {
                      it simply fail",
                     hex::encode(y_fed.serialize()),
                 );
-                y_fed
+                (internal, y_fed)
             }
         };
 
@@ -1716,6 +1779,9 @@ impl CardanoChain for BlockfrostCardanoChain {
             // under: a depositor builds against what the Config names, so the peg-in tree
             // must too (`leaf_candidates[0]` above is this same value).
             config_y_fed: self.treasury_config.y_fed,
+            // With no treasury_info configured there is nothing that could have
+            // rotated, so the head's own key stands in.
+            authorized_key: authorized_key.unwrap_or(y_51),
             federation_csv_blocks: csv,
             pegin_refund_timeout_blocks: self.treasury_config.pegin_refund_timeout_blocks,
             btc_confirmed,

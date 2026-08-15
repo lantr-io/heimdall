@@ -106,6 +106,36 @@ pub struct GroupKeys {
     pub key_package: frost::keys::KeyPackage,
 }
 
+/// This node's federation signing material: the typed-in membership plus its
+/// share of `Y_federation`.
+///
+/// Phase 1 of the rollout runs with no DKG at all. The K1 bootstrap seeds the
+/// Treasury state's `current_spos_frost_key` with `Y_federation` (spec §Rollout
+/// Phases), so the treasury is locked under the federation key and the
+/// federation is the **key-path** signer — an ordinary movement, no CSV wait, no
+/// script path. There is no registry to run a ceremony over yet and no key to
+/// rotate to, so the epoch machine skips `Dkg`/`PublishKeys` and signs with
+/// this. See [`crate::epoch::machine`].
+///
+/// Deliberately the same shape the DKG produces, which is why no phase below
+/// `EpochStart` needs to know which phase it is in: `CollectPegins`, `BuildTm`
+/// and `Sign` take a [`GroupKeys`] and a [`Roster`] and cannot tell the two
+/// apart. Phase 1 is an entry condition, not a mode.
+///
+/// Not to be confused with [`crate::federation::spend`], which signs with the
+/// same key on the **script** path (the CSV recovery leaf) and therefore uses
+/// the untweaked rounds. Same key, different spend path, different tweak.
+#[derive(Debug, Clone)]
+pub struct Phase1Signer {
+    /// The federation membership in the shape the transport and the FROST
+    /// rounds consume ([`crate::federation::roster::FederationRoster::to_roster`]).
+    /// Addressed by `blake2b_224(bifrost_id_pk)` rather than a Cardano pool id,
+    /// since a federation member need not be an SPO.
+    pub roster: Roster,
+    /// This node's share of `Y_federation`, as `federation-dkg` produced it.
+    pub group_keys: GroupKeys,
+}
+
 // ---------------------------------------------------------------------------
 // Treasury Movement (output of BuildTm)
 // ---------------------------------------------------------------------------
@@ -463,6 +493,14 @@ pub struct EpochConfig {
     /// treasury's `current_spos_frost_key`. After the first handoff the key is
     /// the roster's and this seed stops matching, permanently.
     pub y_fed_seed: Option<[u8; 32]>,
+    /// This node's federation share + membership, when it has run
+    /// `federation-dkg` and the share is on disk ([`FederationSigner`]).
+    ///
+    /// `None` is not an error on its own: a node that is not a federation member
+    /// is perfectly normal on a Phase-2 bridge, and merely idle on a Phase-1 one.
+    /// Which of those it is depends on chain state, so the machine decides, not
+    /// the loader.
+    pub phase1_signer: Option<Phase1Signer>,
     /// Demo-only DKG fault injection (never set in production). Makes THIS node
     /// misbehave so the fault-detection + ban flow can be exercised live.
     pub inject_fault: Option<InjectFault>,
@@ -516,6 +554,7 @@ impl EpochConfig {
             pegin_refund_timeout_blocks: 4320,
             state_dir: None,
             y_fed_seed: None,
+            phase1_signer: None,
             inject_fault: None,
         }
     }
