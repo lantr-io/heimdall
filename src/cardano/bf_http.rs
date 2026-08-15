@@ -325,12 +325,26 @@ pub fn slot_at_time(ref_slot: u64, ref_time_ms: i64, block_time_ms: i64) -> u64 
 /// hours apart, so this is a handful of reads per movement.
 ///
 /// `tip` is a known `(slot, time_ms)` pair on the same chain, consulted only when
-/// the backend omits `slot` (yaci-devkit). A hash that cannot be resolved maps to
-/// `None`, and callers MUST read that as "defer", never as "old enough": a flaky
-/// lookup then costs latency rather than a batch two SPOs disagree about.
+/// the backend omits `slot` (yaci-devkit).
 ///
-/// `what` names the caller in the warning — the operator wants to know which
-/// side of the bridge is deferring.
+/// # An unresolved hash is not safe in EITHER direction (WI-106)
+///
+/// A hash that cannot be resolved maps to `None`. This used to be documented as
+/// the safe outcome — "a flaky lookup costs latency rather than a batch two SPOs
+/// disagree about" — and that was wrong in a way worth recording, because it is
+/// the natural sentence to write again. Batch membership is a CONSENSUS decision,
+/// so a per-node HTTP outcome must not change it either way: node A resolving a
+/// request that node B does not gives them different sets, different sighashes
+/// and no aggregate, whether B's answer is "include" or "defer".
+///
+/// Deferring is in fact the worse of the two, because it looks like success. The
+/// nodes that resolved nothing build a movement that omits the request, sign it,
+/// and burn the batch opportunity on it. So: this function retries, and callers
+/// MUST REFUSE to build a batch that still holds an unresolved request rather
+/// than quietly building a smaller one (`machine::freeze_pegins`). Refusing is
+/// self-healing — the epoch loop backs off, re-queries, and the transient clears.
+///
+/// `what` names the caller in the warnings.
 pub async fn resolve_tx_slots(
     base_url: &str,
     project_id: &str,
@@ -343,7 +357,31 @@ pub async fn resolve_tx_slots(
         if seen.contains_key(&tx_hash) {
             continue;
         }
-        let resolved = match fetch_tx_point(base_url, project_id, &tx_hash).await {
+        let resolved = resolve_one(base_url, project_id, &tx_hash, tip, what).await;
+        seen.insert(tx_hash, resolved);
+    }
+    seen
+}
+
+/// One hash, with a bounded retry.
+///
+/// A 429 or a 502 from a shared endpoint is the common failure and clears in
+/// milliseconds; it is not worth refusing a whole batch over. The attempts are
+/// few and the pause short because the caller sits on the movement's critical
+/// path — a failure that survives them is handed back for the epoch loop's own
+/// back-off, which re-queries everything from scratch.
+async fn resolve_one(
+    base_url: &str,
+    project_id: &str,
+    tx_hash: &str,
+    tip: Option<(u64, i64)>,
+    what: &str,
+) -> Option<u64> {
+    const ATTEMPTS: u32 = 3;
+    const PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+
+    for attempt in 1..=ATTEMPTS {
+        match fetch_tx_point(base_url, project_id, tx_hash).await {
             Ok(point) => {
                 let slot = point.slot.or_else(|| {
                     tip.map(|(ref_slot, ref_time_ms)| {
@@ -354,31 +392,37 @@ pub async fn resolve_tx_slots(
                         )
                     })
                 });
-                // The other way to end up unresolved, and it used to be silent: the
-                // backend omits `slot` (yaci-devkit) AND the caller's tip read
-                // failed, so there is nothing to derive it from. Deferring every
-                // request with no line explaining why is the failure the sibling
-                // pallas warning exists to prevent.
+                // The other way to end up unresolved, and retrying cannot help it:
+                // the backend omits `slot` (yaci-devkit) AND the caller's tip read
+                // failed, so there is nothing to derive one from. The lookup itself
+                // succeeded, so answer now rather than spending the attempts.
                 if slot.is_none() {
                     tracing::warn!(
-                        "[{what}] {tx_hash} has no `slot` and no chain tip to derive one from — \
-                         deferring that request. The tip read failed; without it this backend \
-                         cannot place any request in a batch."
+                        "[{what}] {tx_hash} has no `slot` and no chain tip to derive one from. \
+                         The tip read failed; without it this backend cannot place any request \
+                         in a batch, so no batch will be built."
                     );
                 }
-                slot
+                return slot;
+            }
+            Err(e) if attempt < ATTEMPTS => {
+                tracing::debug!(
+                    "[{what}] creation slot of {tx_hash} unresolved ({e}), \
+                     attempt {attempt}/{ATTEMPTS} — retrying"
+                );
+                tokio::time::sleep(PAUSE).await;
             }
             Err(e) => {
                 tracing::warn!(
-                    "[{what}] could not resolve the creation slot of {tx_hash} ({e}) — deferring \
-                     that request to a later batch"
+                    "[{what}] could not resolve the creation slot of {tx_hash} after {ATTEMPTS} \
+                     attempts ({e}). No batch will be built at this opportunity: a request one \
+                     node can place and another cannot is what breaks a FROST round, so this \
+                     node refuses rather than building a set its peers would not."
                 );
-                None
             }
-        };
-        seen.insert(tx_hash, resolved);
+        }
     }
-    seen
+    None
 }
 
 /// Return whether a Cardano transaction is included in the indexed chain.

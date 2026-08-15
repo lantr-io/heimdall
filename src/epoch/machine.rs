@@ -1612,7 +1612,7 @@ async fn collect_pegins_phase(
         }
     }
 
-    let frozen_pegins = freeze_pegins(accepted.into_values().collect(), batch, me, epoch);
+    let frozen_pegins = freeze_pegins(accepted.into_values().collect(), batch, me, epoch)?;
     crate::epoch_log!(
         me,
         epoch,
@@ -1652,17 +1652,41 @@ fn freeze_pegins(
     batch: Option<crate::epoch::batch::BatchSlot>,
     me: frost::Identifier,
     epoch: u64,
-) -> Vec<ParsedPegIn> {
+) -> EpochResult<Vec<ParsedPegIn>> {
     use crate::epoch::batch::{Caps, FifoKey, SpendVariant, freeze};
+
+    // WI-106: an unresolved creation slot REFUSES the batch; it is not sorted
+    // last, and it is not dropped.
+    //
+    // Both of those were tried and both are wrong, for the same reason: batch
+    // membership is a consensus decision, so a per-node HTTP outcome must not
+    // change it in EITHER direction. Whether this node includes a request its
+    // peers exclude, or excludes one they include, the result is a different set,
+    // a different sighash and a round that cannot aggregate. Deferring is the
+    // worse of the two because it looks like success — the node builds a movement
+    // omitting the request, signs it, and burns the opportunity on it.
+    //
+    // Refusing is self-healing: `resolve_tx_slots` has already retried, and the
+    // error is retriable, so the epoch loop backs off and re-queries. It costs
+    // latency on a flaky provider and nothing at all on a healthy one.
+    let unresolved = pegins.iter().filter(|p| p.created_slot.is_none()).count();
+    if unresolved > 0 {
+        return Err(EpochError::Chain(format!(
+            "{unresolved} of {} peg-in request(s) have no resolved creation slot, so this node \
+             cannot compute the batch its peers will compute — refusing to build. Retrying at the \
+             next tick; if it persists the peg-in source cannot supply creation slots at all (the \
+             N2C source never can) and the batch grid is unusable with it.",
+            pegins.len()
+        )));
+    }
 
     let cap = Caps::for_variant(SpendVariant::KeyPath).max_pegins;
     // The CARDANO outpoint, not the Bitcoin one: this orders REQUESTS, and the
     // request is the Cardano UTxO. (The TM's input order is a separate, Bitcoin-
     // side rule — lexicographic by (txid ‖ vout) — and is unaffected by this.)
     let key = |p: &ParsedPegIn| FifoKey {
-        // Unresolved sorts last and, under a real cutoff, defers. Same reasoning
-        // as the peg-out side: a request this node cannot place in time must not
-        // be signed into a batch its peers would place differently.
+        // Every entry is resolved by the refusal above, so the fallback is
+        // unreachable rather than a policy.
         created_slot: p.created_slot.unwrap_or(u64::MAX),
         tx_hash: p.cardano_utxo.tx_hash,
         output_index: p.cardano_utxo.output_index,
@@ -1671,21 +1695,10 @@ fn freeze_pegins(
     let Some(batch) = batch else {
         // No grid: cap and order only. A mock chain, or a deployment whose Config
         // carries no schedule.
-        //
-        // An unresolved slot is DROPPED here too, not merely sorted last. With no
-        // cutoff `truncate` would otherwise admit it, which contradicts
-        // `CardanoPegInRequest::created_slot`'s contract and is not harmless: two
-        // nodes with different resolution luck order the same set differently
-        // (every unresolved key collapses to `u64::MAX` and ties break on
-        // tx_hash), so above the cap they take a DIFFERENT hundred and their
-        // movements cannot aggregate.
-        let mut ordered: Vec<ParsedPegIn> = pegins
-            .into_iter()
-            .filter(|p| p.created_slot.is_some())
-            .collect();
+        let mut ordered = pegins;
         ordered.sort_by_key(&key);
         ordered.truncate(cap);
-        return ordered;
+        return Ok(ordered);
     };
 
     let frozen = freeze(pegins, batch, cap, key);
@@ -1703,7 +1716,7 @@ fn freeze_pegins(
             frozen.over_cap.len(),
         );
     }
-    frozen.selected
+    Ok(frozen.selected)
 }
 
 /// Freeze the open peg-out set against this batch (spec §TM batches; plan N19).
@@ -1725,17 +1738,27 @@ fn freeze_pegouts(
     batch: Option<crate::epoch::batch::BatchSlot>,
     me: frost::Identifier,
     epoch: u64,
-) -> Vec<crate::epoch::traits::PegOutRequestUtxo> {
+) -> EpochResult<Vec<crate::epoch::traits::PegOutRequestUtxo>> {
     use crate::epoch::batch::{Caps, FifoKey, SpendVariant, freeze};
+
+    // WI-106, exactly as on the peg-in side: an unresolved creation slot refuses
+    // the batch rather than being deferred into a set this node's peers would not
+    // compute. See `freeze_pegins` for why neither direction is safe.
+    let unresolved = pegouts.iter().filter(|p| p.created_slot.is_none()).count();
+    if unresolved > 0 {
+        return Err(EpochError::Chain(format!(
+            "{unresolved} of {} peg-out request(s) have no resolved creation slot, so this node \
+             cannot compute the batch its peers will compute — refusing to build. Retrying at \
+             the next tick.",
+            pegouts.len()
+        )));
+    }
 
     // heimdall builds key-path (51% FROST) movements; the federation script path is
     // the emergency spend, which carries no peg-outs.
     let cap = Caps::for_variant(SpendVariant::KeyPath).max_pegouts;
     let key = |p: &crate::epoch::traits::PegOutRequestUtxo| FifoKey {
-        // An unresolved creation slot sorts last and — under a real cutoff — is
-        // deferred by `u64::MAX > C_i`. Failing closed is the right way round: a
-        // request we cannot place in time must not be signed into a batch our peers
-        // would place differently.
+        // Unreachable: the refusal above leaves every entry resolved.
         created_slot: p.created_slot.unwrap_or(u64::MAX),
         tx_hash: p.outpoint[..32].try_into().unwrap_or([0u8; 32]),
         output_index: u32::from_le_bytes(p.outpoint[32..].try_into().unwrap_or([0u8; 4])),
@@ -1746,7 +1769,7 @@ fn freeze_pegouts(
         let mut ordered = pegouts;
         ordered.sort_by_key(&key);
         ordered.truncate(cap);
-        return ordered;
+        return Ok(ordered);
     };
 
     let frozen = freeze(pegouts, batch, cap, key);
@@ -1764,7 +1787,7 @@ fn freeze_pegouts(
             frozen.over_cap.len(),
         );
     }
-    frozen.selected
+    Ok(frozen.selected)
 }
 
 // ---------------------------------------------------------------------------
@@ -2117,7 +2140,7 @@ async fn build_tm_phase(
     // The batch cutoff makes membership a function of the opportunity instead —
     // the one `CollectPegins` froze at (WI-097), not whichever one the snapshot
     // above happens to fall in.
-    let pegouts = freeze_pegouts(pegouts, batch, me, epoch);
+    let pegouts = freeze_pegouts(pegouts, batch, me, epoch)?;
 
     let pegout_requests: Vec<PegOutRequest> = pegouts
         .into_iter()
@@ -2977,7 +3000,7 @@ mod tests {
             parsed_pegin(Some(batch.cutoff_slot - 500), 0x03, 0), // oldest: in, first
         ];
 
-        let frozen = freeze_pegins(pegins, Some(batch), me, 42);
+        let frozen = freeze_pegins(pegins, Some(batch), me, 42).expect("all slots resolved");
 
         let slots: Vec<Option<u64>> = frozen.iter().map(|p| p.created_slot).collect();
         assert_eq!(
@@ -2988,14 +3011,18 @@ mod tests {
         );
     }
 
-    /// An UNRESOLVED creation slot must defer, never admit.
+    /// WI-106: an UNRESOLVED creation slot REFUSES the batch. It is not deferred,
+    /// and it is not admitted.
     ///
-    /// It fails in the safe direction on purpose: a request this node cannot place
-    /// in time must not be signed into a batch its peers would place differently.
-    /// The N2C peg-in source cannot resolve slots at all, so this is its entire
-    /// behaviour rather than an edge case.
+    /// Both of those were written here before, and both are wrong for one reason:
+    /// batch membership is a consensus decision, so a per-node HTTP outcome must
+    /// not move it in EITHER direction. A node that defers what its peers include
+    /// builds a different set, a different sighash and a round that cannot
+    /// aggregate — and deferring is the worse half, because it looks like success:
+    /// the node signs a movement omitting the request and burns the opportunity on
+    /// it. Refusing costs one tick of latency and is self-healing.
     #[test]
-    fn a_pegin_with_no_resolved_creation_slot_defers() {
+    fn a_pegin_with_no_resolved_creation_slot_refuses_the_batch() {
         use crate::epoch::batch::BatchSlot;
 
         let batch = BatchSlot {
@@ -3004,7 +3031,7 @@ mod tests {
             cutoff_slot: 4_900_000,
         };
         let me = Identifier::try_from(1u16).unwrap();
-        let frozen = freeze_pegins(
+        let err = freeze_pegins(
             vec![
                 parsed_pegin(None, 0x01, 0),
                 parsed_pegin(Some(batch.cutoff_slot), 0x02, 0),
@@ -3012,10 +3039,23 @@ mod tests {
             Some(batch),
             me,
             42,
+        )
+        .expect_err("one unresolved request must stop the batch, not shrink it");
+        assert!(
+            matches!(err, EpochError::Chain(ref m) if m.contains("1 of 2")),
+            "the refusal must name how many could not be placed: {err}"
         );
+    }
 
-        assert_eq!(frozen.len(), 1, "the unresolved request must not be swept");
-        assert_eq!(frozen[0].cardano_utxo.tx_hash, [0x02; 32]);
+    /// The same rule with no grid. There is no cutoff to defer past, but ordering
+    /// and the cap still decide membership: every unresolved key collapses to the
+    /// same sort position, so above the cap two nodes with different resolution
+    /// luck take a different hundred.
+    #[test]
+    fn an_unresolved_pegin_refuses_the_batch_even_with_no_grid() {
+        let me = Identifier::try_from(1u16).unwrap();
+        freeze_pegins(vec![parsed_pegin(None, 0x01, 0)], None, me, 42)
+            .expect_err("the no-grid path must refuse too");
     }
 
     /// The capacity bound exists and is applied. `Caps::max_pegins` was defined
@@ -3047,7 +3087,7 @@ mod tests {
             })
             .collect();
 
-        let frozen = freeze_pegins(pegins, Some(batch), me, 42);
+        let frozen = freeze_pegins(pegins, Some(batch), me, 42).expect("all slots resolved");
 
         assert_eq!(frozen.len(), cap, "the batch takes at most max_pegins");
         assert_eq!(

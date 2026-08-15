@@ -162,16 +162,17 @@ impl CardanoPegInSource for PallasPegInSource {
         // `cardano_utxo` so every SPO freezes the same set.
         out.sort_by(|a, b| a.cardano_utxo.cmp(&b.cardano_utxo));
 
-        // Say it plainly rather than let the batch quietly come up empty: with no
-        // creation slot every request is newer than any cutoff, so a node on this
-        // backend sweeps NOTHING once a Config schedule is in play. That is the
-        // safe direction — admitting them would make this node's batch differ from
-        // its peers' — but it is not a working deployment.
+        // Say it plainly rather than let the failure look transient. With no
+        // creation slot this node cannot compute the batch its peers compute, so
+        // since WI-106 `freeze_pegins` REFUSES to build rather than quietly
+        // shrinking the set — which means a node on this backend builds no
+        // movement at all, and says so once per scan instead of once per batch.
         if !out.is_empty() {
             warn!(
-                "[pegin] the N2C source cannot resolve creation slots, so all {} pending peg-in(s) \
-                 defer and this node will sweep none of them. Point `cardano.blockfrost_url` at a \
-                 Blockfrost-compatible endpoint (Dolos serves it) for the peg-in source.",
+                "[pegin] the N2C source cannot resolve creation slots, so none of the {} pending \
+                 peg-in(s) can be placed in a batch and this node will build NO movement. Point \
+                 `cardano.blockfrost_url` at a Blockfrost-compatible endpoint (Dolos serves it) \
+                 for the peg-in source.",
                 out.len()
             );
         }
