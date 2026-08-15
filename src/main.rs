@@ -306,12 +306,23 @@ enum Commands {
     FederationSpend {
         #[arg(long)]
         config: Option<String>,
-        /// Treasury outpoint to spend, as <txid>:<vout>.
+        /// Treasury outpoint to spend, as <txid>:<vout>. OMIT IT: the treasury
+        /// is chain-sourced from the bridge-state singleton, the same read
+        /// `show-treasury` and the auto-mover use.
+        ///
+        /// Passing it is an override for the case the chain view cannot serve —
+        /// a treasury the bridge state does not know about, or a deliberately
+        /// different outpoint mid-recovery. A value that DISAGREES with the
+        /// chain is refused rather than preferred: at that point the operator
+        /// and the chain disagree about where the treasury is, and this command
+        /// runs when the FROST group is dark and nobody is around to notice.
         #[arg(long)]
-        outpoint: String,
-        /// Treasury input amount in satoshis.
+        outpoint: Option<String>,
+        /// Treasury input amount in satoshis. Omit it — see `--outpoint`; the
+        /// amount is chain-sourced from the same singleton read, and a
+        /// disagreeing value is refused.
         #[arg(long)]
-        amount_sat: u64,
+        amount_sat: Option<u64>,
         /// The treasury's current internal key (32-byte x-only hex = its FROST
         /// group key Y_51), needed to rebuild the treasury Taproot tree + the
         /// leaf control block. Omit for the bootstrap treasury, where Y_51 =
@@ -1284,7 +1295,7 @@ fn main() {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_federation_spend(
                 &cfg,
-                &outpoint,
+                outpoint.as_deref(),
                 amount_sat,
                 y51.as_deref(),
                 &signers,
@@ -3313,10 +3324,210 @@ fn run_federation_sign(
 /// different tree, and the session would stall with every member waiting for the
 /// others. Local values are the source only before genesis, when there is
 /// genuinely no Config to read.
+/// The `--outpoint` / `--amount-sat` pair, or `None` for "chain-source it".
+///
+/// The two are inseparable: an outpoint spent for the wrong amount pays the
+/// difference to the miner, so half an override is never usable.
+fn parse_treasury_override(
+    outpoint: Option<&str>,
+    amount_sat: Option<u64>,
+) -> Result<Option<(bitcoin::OutPoint, u64)>, String> {
+    match (outpoint, amount_sat) {
+        (Some(o), Some(a)) => Ok(Some((parse_outpoint(o)?, a))),
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(
+            "--outpoint without --amount-sat: an outpoint spent for the wrong \
+                                amount pays the difference to the miner. Pass both, or neither \
+                                and let the treasury be chain-sourced"
+                .to_string(),
+        ),
+        (None, Some(_)) => Err(
+            "--amount-sat without --outpoint: pass both, or neither and let \
+                                the treasury be chain-sourced"
+                .to_string(),
+        ),
+    }
+}
+
+/// Refuse a passed treasury that disagrees with the chain's.
+///
+/// Not "prefer one": when the operator and the chain disagree about where the
+/// treasury is, one of them is wrong and nothing here can tell which. Preferring
+/// the flag would let a stale copied outpoint sign away the wrong UTxO with no
+/// second party to notice — this command runs when the FROST group is dark.
+fn cross_check_treasury(
+    chain: (bitcoin::OutPoint, u64),
+    passed: (bitcoin::OutPoint, u64),
+) -> Result<(), String> {
+    if chain == passed {
+        return Ok(());
+    }
+    Err(format!(
+        "the treasury passed on the command line disagrees with the chain.\n  passed: {} — {} \
+         sat\n  chain:  {} — {} sat\nOne of them is wrong and nothing here can tell which. \
+         Re-run with no --outpoint/--amount-sat to use the chain's answer, or confirm with \
+         `show-treasury` first",
+        passed.0, passed.1, chain.0, chain.1
+    ))
+}
+
+/// Report — and where possible enforce — the CSV depth the recovery leaf needs.
+///
+/// heimdall runs no Bitcoin node in the normal case (`bitcoin.rpc_url` is unset
+/// by default and the daemon needs none), so the depth is often unknowable from
+/// here. That gives three outcomes, and they must stay distinguishable:
+///
+/// - **deep enough** — say so and continue.
+/// - **too shallow** — refuse, naming the deficit. This is the case worth having:
+///   it costs a `t`-of-`n` session otherwise.
+/// - **cannot tell** — print the requirement and continue. Refusing here would
+///   make the recovery path depend on a Bitcoin node that the architecture says
+///   an SPO does not run, which is exactly backwards for the command that exists
+///   for when things have gone wrong.
+fn check_federation_csv_depth(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+    outpoint: &bitcoin::OutPoint,
+    csv: u16,
+) -> Result<(), String> {
+    let Ok(rpc) = btc_rpc_config(cfg) else {
+        println!(
+            "  CSV requirement: the treasury UTxO must be {csv} block(s) deep for this \
+             script-path spend to be valid — NOT checked (bitcoin.rpc_url is unset, so heimdall \
+             cannot read Bitcoin from here)"
+        );
+        return Ok(());
+    };
+    let depth = match rt.block_on(heimdall::cardano::btc_rpc::fetch_tx_confirmations(
+        &rpc,
+        &outpoint.txid,
+    )) {
+        Ok(d) => d,
+        Err(e) => {
+            println!(
+                "  CSV requirement: {csv} block(s) — NOT checked, the Bitcoin RPC did not \
+                 answer: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let note = csv_depth_verdict(depth, csv, &outpoint.txid.to_string())?;
+    println!("  {note}");
+    Ok(())
+}
+
+/// The CSV verdict for a known (or unknown) confirmation depth.
+///
+/// Pure so the refusal can be pinned by a test: it is the branch that saves a
+/// whole `t`-of-`n` signing session, and it is also the branch nobody exercises
+/// by hand, because reproducing it means a real too-shallow treasury.
+///
+/// `Ok(note)` continues and `Err` refuses. `None` depth is "cannot tell" and must
+/// NOT read as zero — treating unknown as shallow would block a valid recovery on
+/// a node that simply has no transaction index.
+fn csv_depth_verdict(depth: Option<u64>, csv: u16, txid: &str) -> Result<String, String> {
+    match depth {
+        Some(d) if d >= u64::from(csv) => Ok(format!(
+            "CSV: {d} confirmation(s) ≥ {csv} required — the timelock is satisfied"
+        )),
+        Some(d) => Err(format!(
+            "the treasury UTxO is {d} block(s) deep but the federation recovery leaf needs {csv} \
+             — {} more. A transaction signed now is not relayable, and finding that out would \
+             cost the whole t-of-n signing session. Wait for the remaining blocks and re-run",
+            u64::from(csv).saturating_sub(d)
+        )),
+        None => Ok(format!(
+            "CSV requirement: {csv} block(s) — the node reports no confirmation count for \
+             {txid} (unconfirmed, or not in its index — a pruned node, or txindex=0). NOT checked"
+        )),
+    }
+}
+
+/// Resolve `federation-spend`'s treasury input: chain first, flags as override,
+/// disagreement refused.
+///
+/// The refusal is the point. A flag that merely *wins* would let a stale copied
+/// outpoint sign away the wrong UTxO silently — and this command exists for the
+/// case where the FROST group is dark, so there is no second party to notice.
+/// When the operator and the chain disagree about where the treasury is, one of
+/// them is wrong and neither this code nor the operator can tell which from here.
+///
+/// Both flags must be given together when overriding: an outpoint with someone
+/// else's amount produces a transaction whose fee is wrong by the difference,
+/// and Bitcoin's answer to that is to hand it to the miner.
+fn resolve_federation_spend_treasury(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+    outpoint: Option<&str>,
+    amount_sat: Option<u64>,
+) -> Result<(bitcoin::OutPoint, u64), String> {
+    let passed = parse_treasury_override(outpoint, amount_sat)?;
+
+    // The in-flight scan is best-effort: it needs the TM address, which a
+    // recovery-time config may not resolve. Its absence costs a warning, not the
+    // spend.
+    let scan = resolve_bridge_contracts(cfg).ok().and_then(|bridge| {
+        let pid = cfg.cardano.blockfrost_project_id.as_deref()?;
+        let base_url =
+            heimdall::cardano::bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+        rt.block_on(heimdall::cardano::blockfrost_chain::scan_tm_utxos(
+            &base_url,
+            pid,
+            &bridge.tm_address,
+            &bridge.tm_asset_unit(),
+            cfg.bitcoin.inflight_deadline_secs,
+        ))
+        .ok()
+    });
+
+    match (singleton_chain_tip(rt, cfg, scan.as_ref()), passed) {
+        (Ok(tip), None) => {
+            println!(
+                "treasury (chain-sourced): {} — {} sat",
+                tip.outpoint,
+                tip.value.to_sat()
+            );
+            if tip.in_flight {
+                // Reported, not refused. A movement in flight means the head may
+                // be about to move — but this command runs precisely when the
+                // group that would have posted it is dark, so a stale record must
+                // not block the recovery it exists for.
+                println!(
+                    "  ⚠ a movement is already in flight against this outpoint (or an unreadable \
+                     record might be). If it confirms, this spend becomes invalid — check with \
+                     `show-treasury` before circulating the signed transaction"
+                );
+            }
+            Ok((tip.outpoint, tip.value.to_sat()))
+        }
+        (Ok(tip), Some((op, amt))) => {
+            cross_check_treasury((tip.outpoint, tip.value.to_sat()), (op, amt))?;
+            println!(
+                "treasury: {} — {} sat (passed, and the chain agrees)",
+                op, amt
+            );
+            Ok((op, amt))
+        }
+        (Err(e), Some((op, amt))) => {
+            // The documented override: no chain view, an explicit input. Say
+            // which one is in force, because nothing downstream will.
+            println!("treasury: {op} — {amt} sat (from --outpoint/--amount-sat)");
+            println!("  ⚠ NOT cross-checked against the chain: {e}");
+            Ok((op, amt))
+        }
+        (Err(e), None) => Err(format!(
+            "could not chain-source the treasury ({e}), and no --outpoint/--amount-sat was \
+             passed. Either fix the Config locator (cardano.config_address + \
+             cardano.config_nft_policy_id) so the bridge state can be read, or pass both flags \
+             to spend an outpoint the bridge state does not know about"
+        )),
+    }
+}
+
 fn run_federation_spend(
     cfg: &HeimdallConfig,
-    outpoint: &str,
-    amount_sat: u64,
+    outpoint: Option<&str>,
+    amount_sat: Option<u64>,
     y51_hex: Option<&str>,
     signers: &[u16],
     timeout_secs: Option<u64>,
@@ -3328,8 +3539,15 @@ fn run_federation_spend(
     use heimdall::bitcoin::tm_builder::{TreasuryInput, build_tm, federation_leaf_spend};
 
     let secp = Secp256k1::new();
-    let outpoint = parse_outpoint(outpoint)?;
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    // Where the treasury is, and how much is in it, come from the chain — the
+    // same bridge-state singleton read `show-treasury` and the auto-mover use.
+    // They used to be REQUIRED flags, which sent the operator hunting on Bitcoin
+    // for what heimdall already sources from Cardano, and offered no protection
+    // against naming an outpoint that is not the treasury at all. On the one
+    // command run under real pressure — the FROST group is dark and the
+    // federation is recovering funds — that was the worst place to keep it.
+    let (outpoint, amount_sat) = resolve_federation_spend_treasury(&rt, cfg, outpoint, amount_sat)?;
     // Published-wins, and a local key that disagrees with the published one is
     // fatal here rather than quietly preferred — this node would otherwise sign
     // for an address the other members are not using.
@@ -3351,6 +3569,13 @@ fn run_federation_spend(
         }
         None => y_fed,
     };
+
+    // The recovery leaf is a RELATIVE timelock, so the treasury UTxO must be
+    // `federation_csv_blocks` deep before this spend is even relayable. Checked
+    // here — before the signing session, not after — because the alternative is
+    // to burn a full t-of-n FROST session among members coordinating out of band
+    // and learn the answer from a network rejection.
+    check_federation_csv_depth(&rt, cfg, &outpoint, csv)?;
 
     // Real treasury tree: Y_51 internal (key-path = 51%), y_fed CSV leaf (federation).
     let spend_info = treasury_spend_info(&secp, y51, y_fed, csv);
@@ -7495,7 +7720,8 @@ fn print_frost_treasury(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_cardano_outref, parse_hex_n, parse_key32, pool_id_bech32, ref_script_already_deployed,
+        cross_check_treasury, csv_depth_verdict, parse_cardano_outref, parse_hex_n, parse_key32,
+        parse_treasury_override, pool_id_bech32, ref_script_already_deployed,
     };
 
     #[test]
@@ -7553,6 +7779,70 @@ mod tests {
             verify_registration(&sigs, &id_pk, slashed).is_err(),
             "signatures must not carry over to a different --bifrost-url"
         );
+    }
+
+    // ── federation-spend: chain-sourced treasury + CSV gate (WI-094) ────
+
+    fn op(byte: u8, vout: u32) -> bitcoin::OutPoint {
+        use bitcoin::hashes::Hash;
+        bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([byte; 32]),
+            vout,
+        }
+    }
+
+    /// Half an override is never usable: an outpoint spent for the wrong amount
+    /// pays the difference to the miner, so the pair has to arrive together.
+    #[test]
+    fn a_treasury_override_needs_both_halves() {
+        assert!(parse_treasury_override(None, None).unwrap().is_none());
+        let both = parse_treasury_override(Some(&format!("{}:1", "ab".repeat(32))), Some(500))
+            .unwrap()
+            .expect("both given");
+        assert_eq!(both.1, 500);
+        assert_eq!(both.0.vout, 1);
+
+        let e = parse_treasury_override(Some(&format!("{}:0", "ab".repeat(32))), None)
+            .expect_err("outpoint alone must be refused");
+        assert!(e.contains("--amount-sat"), "{e}");
+        let e = parse_treasury_override(None, Some(500)).expect_err("amount alone must be refused");
+        assert!(e.contains("--outpoint"), "{e}");
+    }
+
+    /// A passed treasury that disagrees with the chain is REFUSED, not preferred.
+    /// Preferring the flag would let a stale copied outpoint sign away the wrong
+    /// UTxO — and this command runs when the FROST group is dark, so there is no
+    /// co-signer to notice.
+    #[test]
+    fn a_treasury_that_disagrees_with_the_chain_is_refused() {
+        cross_check_treasury((op(0xaa, 0), 1_000), (op(0xaa, 0), 1_000))
+            .expect("agreement continues");
+
+        let e = cross_check_treasury((op(0xaa, 0), 1_000), (op(0xbb, 0), 1_000))
+            .expect_err("a different outpoint must be refused");
+        assert!(e.contains("disagrees with the chain"), "{e}");
+        // Same outpoint, wrong amount: the difference would go to the miner.
+        let e = cross_check_treasury((op(0xaa, 0), 1_000), (op(0xaa, 0), 999))
+            .expect_err("a different amount must be refused");
+        assert!(e.contains("disagrees with the chain"), "{e}");
+    }
+
+    /// The CSV gate: refuse when provably too shallow, continue when deep enough,
+    /// and continue when the depth is UNKNOWN. Unknown must not read as zero —
+    /// heimdall runs no Bitcoin node in the normal case, so treating "cannot tell"
+    /// as "too shallow" would make the recovery path depend on infrastructure an
+    /// SPO is not expected to have.
+    #[test]
+    fn the_csv_gate_refuses_only_a_provably_shallow_treasury() {
+        let txid = "ab".repeat(32);
+        assert!(csv_depth_verdict(Some(144), 144, &txid).is_ok());
+        assert!(csv_depth_verdict(Some(500), 144, &txid).is_ok());
+
+        let e = csv_depth_verdict(Some(100), 144, &txid).expect_err("100 < 144 must refuse");
+        assert!(e.contains("44 more"), "should name the deficit: {e}");
+
+        let note = csv_depth_verdict(None, 144, &txid).expect("unknown depth must not refuse");
+        assert!(note.contains("NOT checked"), "{note}");
     }
 
     /// WI-091: the deploy commands used to park a second copy of a script this
