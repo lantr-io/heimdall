@@ -82,8 +82,7 @@ async fn full_cycle_3_spos_over_http() {
                 bifrost_id_pk: Vec::new(),
                 port,
             });
-            config.pegin_collection_window = Duration::from_millis(100);
-            config.pegin_poll_interval = Duration::from_millis(20);
+            config.batch_poll_ceiling = Duration::from_millis(20);
             // BuildTm requires a state_dir: both tries are cumulative, and a
             // node that cannot persist them would commit roots covering only
             // its own movement. One directory per NODE per process, so the

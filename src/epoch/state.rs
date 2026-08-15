@@ -314,8 +314,15 @@ pub enum EpochPhase {
         roster: Roster,
         group_keys: GroupKeys,
     },
-    /// Poll the Cardano peg-in source over a collection window, then
-    /// freeze the observed set and advance to `BuildTm`.
+    /// Wait for this epoch's next TM batch opportunity `B_i`, then freeze the
+    /// observed peg-in set and advance to `BuildTm`.
+    ///
+    /// This is where the epoch's *batch* loop begins and ends: a confirmed
+    /// movement returns here rather than to `Idle`, because the ceremony that
+    /// produced `group_keys` runs once per EPOCH while the spec puts treasury
+    /// movements on a slot grid *within* it (§TM batches and the protocol
+    /// schedule). Re-entering `EpochStart` per movement would run a DKG and an
+    /// Update-Y per batch, rotating the treasury key continuously.
     CollectPegins {
         epoch: u64,
         roster: Roster,
@@ -325,6 +332,17 @@ pub enum EpochPhase {
         epoch: u64,
         roster: Roster,
         group_keys: GroupKeys,
+        /// The batch opportunity `CollectPegins` froze at, and therefore the
+        /// membership cutoff `C_i` this TM's peg-outs are selected against.
+        ///
+        /// Carried rather than re-derived: `BuildTm` reads its own chain snapshot
+        /// (for the fee parameters and chain "now"), and a node that took the
+        /// batch from THAT read would select against whichever opportunity was
+        /// open by then — a different one whenever the read lands after `B_i`'s
+        /// interval ends. One opportunity, decided once.
+        ///
+        /// `None` is a chain with no grid: no cutoff applies, as before N19.
+        batch: Option<crate::epoch::batch::BatchSlot>,
         /// Frozen peg-in set from `CollectPegins`. Every SPO consumes
         /// the same list to build byte-identical unsigned TM bytes.
         frozen_pegins: Vec<ParsedPegIn>,
@@ -341,6 +359,13 @@ pub enum EpochPhase {
     Submit {
         epoch: u64,
         roster: Roster,
+        /// Carried, not used: `Submit` and `AwaitConfirm` are the last two hops
+        /// before the machine returns to `CollectPegins` for the epoch's next
+        /// batch, and it must arrive there holding the same ceremony output. The
+        /// two phases used to drop it (`Submit` the keys, `AwaitConfirm` the
+        /// roster as well), which is why a completed movement could only be
+        /// followed by a fresh `EpochStart`.
+        group_keys: GroupKeys,
         tm: TreasuryMovement,
         /// Which leader-rotation attempt this is. `Roster::leader` maps
         /// it to the designated submitter for the round.
@@ -353,6 +378,10 @@ pub enum EpochPhase {
     },
     AwaitConfirm {
         epoch: u64,
+        /// See [`EpochPhase::Submit::group_keys`] — both ride through to the next
+        /// batch's `CollectPegins`.
+        roster: Roster,
+        group_keys: GroupKeys,
         tm: TreasuryMovement,
         cardano_tx_id: Vec<u8>,
     },
@@ -471,10 +500,20 @@ pub struct EpochConfig {
     pub identity: SpoIdentity,
     /// Cardano policy ID (script hash) identifying peg-in request UTxOs.
     pub pegin_policy_id: [u8; 28],
-    /// How long `CollectPegins` polls the peg-in source before freezing.
-    pub pegin_collection_window: Duration,
-    /// Interval between successive peg-in polls inside the window.
-    pub pegin_poll_interval: Duration,
+    /// Upper bound on how long the batch loop sleeps between grid checks.
+    ///
+    /// NOT a protocol value and deliberately not an operator key: it decides read
+    /// rate, never TM bytes. The loop sleeps `min(slots until the next
+    /// opportunity, this)` in BOTH waiting states — before `B_1` and after
+    /// serving one — and because that hop shrinks as the opportunity approaches,
+    /// the final sleep lands on it whatever this value is. The ceiling only bounds
+    /// how stale a waiting node's view of the grid may get.
+    ///
+    /// The distinction matters more than it looks: a flat poll here would have
+    /// each node notice `B_i` at its own offset past it, and `CollectPegins` reads
+    /// the peg-in source once at that moment — so the offsets would become
+    /// differences in what gets frozen.
+    pub batch_poll_ceiling: Duration,
     /// Depositor refund timelock (BTC blocks) baked into the peg-in
     /// Taproot's depositor refund leaf. Spec default is 4320 (~30 days);
     /// testnet4/preprod typically use a smaller value.
@@ -549,8 +588,7 @@ impl EpochConfig {
             tm_confirmation_timeout: Duration::from_secs(1800),
             identity,
             pegin_policy_id: [0u8; 28],
-            pegin_collection_window: Duration::from_secs(5),
-            pegin_poll_interval: Duration::from_millis(1000),
+            batch_poll_ceiling: Duration::from_secs(300),
             pegin_refund_timeout_blocks: 4320,
             state_dir: None,
             y_fed_seed: None,

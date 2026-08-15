@@ -144,7 +144,19 @@ impl GridParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchWindow {
     /// An opportunity is open at this slot: freeze and build.
-    Open(BatchSlot),
+    ///
+    /// `next` matters to a node that has ALREADY built for this one, which is not
+    /// a rare state: [`GridParams::current`] reports the same opportunity for the
+    /// whole `tm_batch_interval`, so from `B_1` onward a running node sees `Open`
+    /// continuously and never returns to `Closed` until the grid ends. Without the
+    /// following opportunity here such a node has nothing to sleep towards and can
+    /// only poll blindly — and then each node notices `B_{i+1}` at its own offset
+    /// past it, which is exactly the freeze-anchor wobble the grid exists to
+    /// remove.
+    Open {
+        batch: BatchSlot,
+        next: Option<BatchSlot>,
+    },
     /// The grid exists but no opportunity is open — before `B_1`, or past
     /// `final_tm_cutoff`. Wait; `next` is the following opportunity, if any remain
     /// this epoch.
@@ -158,8 +170,19 @@ impl BatchWindow {
     #[must_use]
     pub fn open(&self) -> Option<BatchSlot> {
         match self {
-            Self::Open(b) => Some(*b),
+            Self::Open { batch, .. } => Some(*batch),
             _ => None,
+        }
+    }
+
+    /// The opportunity AFTER the one in force — what a node sleeps towards, in
+    /// both waiting states. `None` means the epoch's grid is exhausted, whether or
+    /// not one is open right now.
+    #[must_use]
+    pub fn next(&self) -> Option<BatchSlot> {
+        match self {
+            Self::Open { next, .. } | Self::Closed { next } => *next,
+            Self::NoGrid => None,
         }
     }
 }
@@ -376,9 +399,45 @@ mod tests {
     #[test]
     fn batch_window_exposes_only_the_open_opportunity() {
         let b = grid().opportunity(2);
-        assert_eq!(BatchWindow::Open(b).open(), Some(b));
+        assert_eq!(
+            BatchWindow::Open {
+                batch: b,
+                next: None
+            }
+            .open(),
+            Some(b)
+        );
         assert_eq!(BatchWindow::Closed { next: Some(b) }.open(), None);
         assert_eq!(BatchWindow::NoGrid.open(), None);
+    }
+
+    /// Both waiting states answer "what do I sleep towards" the same way, because
+    /// a node that has already built for the open opportunity is waiting exactly
+    /// as much as one before `B_1`. `None` from either is the end of the epoch's
+    /// grid.
+    #[test]
+    fn both_waiting_states_name_the_following_opportunity() {
+        let g = grid();
+        let (b2, b3) = (g.opportunity(2), g.opportunity(3));
+        assert_eq!(
+            BatchWindow::Open {
+                batch: b2,
+                next: Some(b3)
+            }
+            .next(),
+            Some(b3)
+        );
+        assert_eq!(BatchWindow::Closed { next: Some(b3) }.next(), Some(b3));
+        assert_eq!(
+            BatchWindow::Open {
+                batch: b2,
+                next: None
+            }
+            .next(),
+            None,
+            "an open-but-last opportunity ends the epoch once it is used"
+        );
+        assert_eq!(BatchWindow::NoGrid.next(), None);
     }
 
     // --- selection ---

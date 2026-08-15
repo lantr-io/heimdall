@@ -7,21 +7,34 @@
 //! - `idle_phase`          — block until the chain reports an epoch boundary
 //! - `epoch_start_phase`   — snapshot the roster
 //! - `publish_keys_phase`  — publish the group key: BIP-340 x-only + Update-Y handoff
-//! - `collect_pegins_phase`— poll the Cardano peg-in source over a
-//!                           configured collection window, parse each
-//!                           datum into a validated `ParsedPegIn`, and
-//!                           freeze the set for `BuildTm`
+//! - `collect_pegins_phase`— wait for this epoch's next batch opportunity
+//!                           `B_i`, then read the Cardano peg-in source
+//!                           once, parse each datum into a validated
+//!                           `ParsedPegIn`, and freeze the set for `BuildTm`
 //! - `build_tm_phase`      — pull treasury + pegouts (frozen pegins
 //!                           come from `CollectPegins`) and build the
 //!                           unsigned Bitcoin tx + sighashes
 //! - `submit_phase`        — assemble the witnessed tx, verify each
 //!                           per-input signature under the on-chain
 //!                           output key, hand bytes to the chain
-//! - `await_confirm_phase` — terminal for the first cycle: returns the
-//!                           signed `TreasuryMovement` to the caller
+//! - `await_confirm_phase` — end of ONE movement: returns the signed
+//!                           `TreasuryMovement`, and the machine resumes at
+//!                           the epoch's NEXT batch opportunity
 //!
 //! `Dkg` and `Sign` are dispatched to `dkg::dkg_phase` and
 //! `signing::sign_phase` respectively.
+//!
+//! ## Two clocks, not one
+//!
+//! The ceremony runs once per EPOCH; treasury movements run on a slot grid
+//! *within* the epoch — `B_i = epoch_start + i × tm_batch_interval`, spec §TM
+//! batches and the protocol schedule. So the machine has two loops. The outer one
+//! is `Idle → EpochStart → Dkg → PublishKeys`, paced by
+//! [`CardanoChain::await_epoch_boundary`]. The inner one is
+//! `CollectPegins → BuildTm → Sign → Submit → AwaitConfirm → CollectPegins`,
+//! paced by the grid, and it carries the roster and group keys around so no batch
+//! costs a second ceremony. It leaves for `Idle` only when the epoch's grid is
+//! exhausted (`BatchWindow::Closed { next: None }`).
 //!
 //! Note: peg-ins returned by the `CardanoPegInSource` are guaranteed
 //! ≥100 Bitcoin blocks deep because they come from oracle-owned
@@ -65,27 +78,67 @@ use std::collections::BTreeMap;
 const RETRY_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(2);
 const RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// One dispatch step: advance to the next phase, or finish the cycle. Both
+/// One dispatch step: advance to the next phase, or finish one movement. Both
 /// variants are large but the value is constructed and consumed immediately in
 /// the loop (never stored), so boxing would only add an allocation.
 #[allow(clippy::large_enum_variant)]
 enum Step {
     Next(EpochPhase),
-    Done(TreasuryMovement),
+    /// The movement is confirmed. The phase is where the machine RESUMES — the
+    /// epoch's next batch opportunity, carrying this epoch's roster and group
+    /// keys — so a daemon runs the grid without re-running the ceremony.
+    Done(TreasuryMovement, EpochPhase),
 }
 
-/// Run the epoch machine for as long as the process lives: one cycle after
-/// another, for ever.
+/// Which batch opportunity this process has already built for, as
+/// `(epoch, index)`.
 ///
-/// [`run_epoch_loop`] completes ONE cycle and returns the movement it made — the
-/// right shape for a test and for a single-shot run, and the wrong one for a
-/// daemon. A service pointed at it produced exactly one Treasury Movement and
-/// exited, which under `Restart=on-failure` looks like a clean shutdown: the
-/// bridge moves once and then goes quiet with a green unit.
+/// The grid holds an opportunity open for a whole `tm_batch_interval`, so without
+/// this marker a node that completed a movement inside the interval would
+/// immediately build a second one for the SAME `B_i` — a fee per poll on a
+/// treasury self-move. `run-mover` carries the identical guard as a local
+/// (`built_batch`); the machine has to thread it because the movement it protects
+/// completes five phases later.
 ///
-/// A completed cycle is a success, so it resets nothing and waits for nothing
-/// here — `Idle`'s `await_epoch_boundary` is what paces the next one. Errors keep
-/// their existing treatment inside `run_epoch_loop`, which never returns them.
+/// Index [`BuiltBatch::NO_GRID`] marks a build on a chain with no grid at all.
+/// The real grid is 1-based, so the two can never collide, and it gives the
+/// no-grid case the one-movement-per-epoch bound the machine had before the grid.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BuiltBatch(Option<(u64, u64)>);
+
+impl BuiltBatch {
+    const NO_GRID: u64 = 0;
+
+    fn is(self, epoch: u64, index: u64) -> bool {
+        self.0 == Some((epoch, index))
+    }
+
+    fn mark(&mut self, epoch: u64, index: u64) {
+        self.0 = Some((epoch, index));
+    }
+
+    /// Forget the marker after a FAILED attempt: a build that produced no
+    /// movement must not consume its opportunity, so the next poll retries the
+    /// same `B_i` instead of waiting out the interval. (A posted-but-unconfirmed
+    /// movement is caught by the in-flight gate, not by this.)
+    fn clear(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// Run the epoch machine for as long as the process lives: movement after
+/// movement, for ever.
+///
+/// [`run_epoch_loop`] completes ONE movement and returns it — the right shape for
+/// a test and for a single-shot run, and the wrong one for a daemon. A service
+/// pointed at it produced exactly one Treasury Movement and exited, which under
+/// `Restart=on-failure` looks like a clean shutdown: the bridge moves once and
+/// then goes quiet with a green unit.
+///
+/// Each movement resumes where the last one ended — the epoch's next batch
+/// opportunity — so the DKG runs once per epoch and the grid paces the movements.
+/// Errors keep their existing treatment inside [`drive_to_movement`], which never
+/// returns them.
 pub async fn run_epoch_daemon(
     chain: Arc<dyn CardanoChain>,
     pegin_source: Arc<dyn CardanoPegInSource>,
@@ -95,25 +148,33 @@ pub async fn run_epoch_daemon(
     config: &EpochConfig,
     mut on_cycle: impl FnMut(&TreasuryMovement),
 ) -> EpochResult<std::convert::Infallible> {
+    // Outlives the movements, which is the whole point: the marker says which
+    // opportunity was consumed, and the next movement starts inside the same
+    // interval.
+    let mut built = BuiltBatch::default();
+    let mut phase = EpochPhase::Idle;
     loop {
-        let tm = run_epoch_loop(
-            Arc::clone(&chain),
-            Arc::clone(&pegin_source),
-            Arc::clone(&peers),
-            Arc::clone(&clock),
-            Arc::clone(&rng),
+        let (tm, resume) = drive_to_movement(
+            &chain,
+            &pegin_source,
+            &peers,
+            &clock,
+            &rng,
             config,
+            phase,
+            &mut built,
         )
         .await?;
         on_cycle(&tm);
+        phase = resume;
     }
 }
 
-/// Run ONE full epoch cycle and return the Treasury Movement it produced.
+/// Run until ONE Treasury Movement is confirmed and return it.
 ///
-/// Retriable failures never surface: they back off and re-enter `Idle`, so this
-/// returns only on a completed cycle. For a long-running node use
-/// [`run_epoch_daemon`], which repeats it.
+/// Retriable failures never surface: they back off and re-enter the loop, so this
+/// returns only on a completed movement. For a long-running node use
+/// [`run_epoch_daemon`], which repeats it and keeps the batch-grid position.
 pub async fn run_epoch_loop(
     chain: Arc<dyn CardanoChain>,
     pegin_source: Arc<dyn CardanoPegInSource>,
@@ -122,20 +183,66 @@ pub async fn run_epoch_loop(
     rng: Arc<dyn RngSource>,
     config: &EpochConfig,
 ) -> EpochResult<TreasuryMovement> {
+    drive_to_movement(
+        &chain,
+        &pegin_source,
+        &peers,
+        &clock,
+        &rng,
+        config,
+        EpochPhase::Idle,
+        &mut BuiltBatch::default(),
+    )
+    .await
+    .map(|(tm, _resume)| tm)
+}
+
+/// The phase driver: step from `start` until a movement completes, and report
+/// both it and where to resume.
+#[allow(clippy::too_many_arguments)]
+async fn drive_to_movement(
+    chain: &Arc<dyn CardanoChain>,
+    pegin_source: &Arc<dyn CardanoPegInSource>,
+    peers: &Arc<dyn PeerNetwork>,
+    clock: &Arc<dyn Clock>,
+    rng: &Arc<dyn RngSource>,
+    config: &EpochConfig,
+    start: EpochPhase,
+    built: &mut BuiltBatch,
+) -> EpochResult<(TreasuryMovement, EpochPhase)> {
     let me = config.identity.identifier;
-    let mut phase = EpochPhase::Idle;
+    let mut phase = start;
     let mut backoff = RETRY_BACKOFF_MIN;
+    // The opportunity this call INHERITED — the one the previous movement used,
+    // when we are resuming a daemon's batch loop. It is not ours to give back; see
+    // the error arm.
+    let inherited = *built;
+    // This epoch's completed ceremony, kept so a transient failure inside the
+    // batch loop costs one batch rather than the epoch. `Idle` waits for the
+    // chain epoch to ADVANCE, so re-entering it mid-epoch parks the node for days
+    // — and a batch loop that cycles every few hours meets far more transient
+    // failures than one movement per epoch ever did.
+    let mut ceremony: Option<(u64, Roster, GroupKeys)> = None;
     loop {
         crate::epoch_log!(me, current_epoch(&phase), "==> phase = {}", phase.name());
+        if let EpochPhase::CollectPegins {
+            epoch,
+            roster,
+            group_keys,
+        } = &phase
+        {
+            ceremony = Some((*epoch, roster.clone(), group_keys.clone()));
+        }
         match step_phase(
             phase,
-            &chain,
-            &pegin_source,
-            &peers,
-            &clock,
-            &rng,
+            chain,
+            pegin_source,
+            peers,
+            clock,
+            rng,
             config,
             me,
+            built,
         )
         .await
         {
@@ -143,7 +250,7 @@ pub async fn run_epoch_loop(
                 phase = next;
                 backoff = RETRY_BACKOFF_MIN; // progress → reset
             }
-            Ok(Step::Done(tm)) => return Ok(tm),
+            Ok(Step::Done(tm, resume)) => return Ok((tm, resume)),
             // EVERY in-loop error backs off and re-enters Idle. The loop never
             // terminates.
             //
@@ -198,14 +305,43 @@ pub async fn run_epoch_loop(
                     w
                 };
                 tokio::time::sleep(wait).await;
-                phase = EpochPhase::Idle;
+                // A failed attempt must not consume its batch opportunity — but
+                // only when the attempt was THIS call's. A failure while waiting
+                // for the next opportunity leaves the marker of the movement that
+                // already succeeded, and clearing that one would build a second
+                // movement for a batch this node has already served.
+                if *built != inherited {
+                    built.clear();
+                }
+                // Re-enter the BATCH loop when this epoch's ceremony is still in
+                // hand and the chain is still in that epoch; only otherwise fall
+                // back to `Idle`, which re-derives everything from chain. The
+                // ceremony is the expensive part and it is still valid: the spec's
+                // "no halt, no special state" is about a failed DKG, not about
+                // throwing away a good one because a peg-out query 502'd.
+                //
+                // An unreadable epoch counts as unchanged: the batch loop retries
+                // and backs off, whereas `Idle` would silently park for up to a
+                // full epoch on what may be a five-second outage.
+                phase = match ceremony.take() {
+                    Some((epoch, roster, group_keys))
+                        if chain.current_epoch().await.map_or(true, |now| now == epoch) =>
+                    {
+                        EpochPhase::CollectPegins {
+                            epoch,
+                            roster,
+                            group_keys,
+                        }
+                    }
+                    _ => EpochPhase::Idle,
+                };
             }
         }
     }
 }
 
 /// Dispatch one phase to its handler. Pure routing — the retry/backoff policy
-/// lives in [`run_epoch_loop`].
+/// lives in [`drive_to_movement`].
 #[allow(clippy::too_many_arguments)]
 async fn step_phase(
     phase: EpochPhase,
@@ -216,6 +352,7 @@ async fn step_phase(
     rng: &Arc<dyn RngSource>,
     config: &EpochConfig,
     me: frost::Identifier,
+    built: &mut BuiltBatch,
 ) -> EpochResult<Step> {
     let next = match phase {
         EpochPhase::Idle => idle_phase(chain).await?,
@@ -263,11 +400,11 @@ async fn step_phase(
             collect_pegins_phase(
                 chain,
                 pegin_source,
-                clock,
                 config,
                 epoch,
                 roster,
                 group_keys,
+                built,
             )
             .await?
         }
@@ -276,8 +413,20 @@ async fn step_phase(
             epoch,
             roster,
             group_keys,
+            batch,
             frozen_pegins,
-        } => build_tm_phase(chain, config, epoch, roster, group_keys, frozen_pegins).await?,
+        } => {
+            build_tm_phase(
+                chain,
+                config,
+                epoch,
+                roster,
+                group_keys,
+                batch,
+                frozen_pegins,
+            )
+            .await?
+        }
 
         EpochPhase::Sign {
             epoch,
@@ -297,13 +446,31 @@ async fn step_phase(
         EpochPhase::Submit {
             epoch,
             roster,
+            group_keys,
             tm,
             leader_attempt,
-        } => submit_phase(chain, me, epoch, roster, tm, leader_attempt).await?,
+        } => submit_phase(chain, me, epoch, roster, group_keys, tm, leader_attempt).await?,
 
-        EpochPhase::AwaitConfirm { epoch, tm, .. } => {
+        EpochPhase::AwaitConfirm {
+            epoch,
+            roster,
+            group_keys,
+            tm,
+            ..
+        } => {
             await_confirm_phase(chain, config, epoch, &tm).await?;
-            return Ok(Step::Done(tm));
+            // Back to the epoch's batch loop, not out of it. The movement is done;
+            // the EPOCH is not, and the roster + keys that signed this one sign
+            // every remaining batch — `CollectPegins` decides whether any
+            // opportunity is left and returns `Idle` when none is.
+            return Ok(Step::Done(
+                tm,
+                EpochPhase::CollectPegins {
+                    epoch,
+                    roster,
+                    group_keys,
+                },
+            ));
         }
     };
     Ok(Step::Next(next))
@@ -1007,76 +1174,214 @@ async fn publish_keys_phase(
 // collect_pegins
 // ---------------------------------------------------------------------------
 
-/// Poll the Cardano peg-in source over `config.pegin_collection_window`,
-/// parsing each observed request against the spec-derived peg-in
-/// Taproot for the current Y_51 internal key, the Y_fed emergency leaf and Q_auth.
-/// Parse failures are logged and dropped. The deduped, parsed set is
-/// frozen into the next `BuildTm` phase.
+/// Whether the machine may build at the opportunity it just reached.
+enum BatchTurn {
+    /// Freeze and build. `None` is a chain with no grid at all (a mock, or a
+    /// deployment whose Config carries no `schedule`) — there is no opportunity to
+    /// respect, so the machine falls back to its pre-grid cadence.
+    Build(Option<crate::epoch::batch::BatchSlot>),
+    /// The epoch's grid is exhausted: every remaining slot is past
+    /// `final_tm_cutoff`. Wait for the next boundary.
+    EpochOver,
+}
+
+/// Sleep until this epoch's next batch opportunity, and report whether to build
+/// at it (spec §TM batches and the protocol schedule).
+///
+/// The grid is slot-anchored rather than event-driven — "freeze when the previous
+/// TM confirms" would hang the freeze anchor off a Confirm transaction's inclusion
+/// slot, which wavers during Cardano rollbacks and flips boundary items in and out
+/// of the batch. So every SPO waits for the same absolute `B_i` and reads the same
+/// chain state there.
+///
+/// Every wait is the EXACT hop to the opportunity being waited for, bounded by
+/// `config.batch_poll_ceiling` — see [`hop_to_opportunity`]. That has to hold in
+/// both waiting states, not just before `B_1`: [`GridParams::current`] reports the
+/// same `B_i` for a whole interval, so a running node sees `Open` continuously and
+/// a blind poll would have each node notice `B_{i+1}` at its own offset past it.
+/// `collect_pegins_phase` reads the peg-in source once at that moment, so those
+/// offsets are differences in what gets frozen.
+///
+/// [`GridParams::current`]: crate::epoch::batch::GridParams::current
+async fn await_batch_opportunity(
+    chain: &Arc<dyn CardanoChain>,
+    config: &EpochConfig,
+    me: frost::Identifier,
+    epoch: u64,
+    built: &mut BuiltBatch,
+) -> EpochResult<BatchTurn> {
+    use crate::epoch::batch::BatchWindow;
+    loop {
+        let snapshot = chain.query_batch_snapshot().await?;
+        let wait = match snapshot.batch {
+            // An opportunity is open and this process has not built for it.
+            BatchWindow::Open { batch: b, .. } if !built.is(epoch, b.index) => {
+                built.mark(epoch, b.index);
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "═══ batch B_{} @ slot {} (membership cutoff: created at or before slot {}) ═══",
+                    b.index,
+                    b.slot,
+                    b.cutoff_slot
+                );
+                return Ok(BatchTurn::Build(Some(b)));
+            }
+            BatchWindow::NoGrid if !built.is(epoch, BuiltBatch::NO_GRID) => {
+                built.mark(epoch, BuiltBatch::NO_GRID);
+                return Ok(BatchTurn::Build(None));
+            }
+            // No grid and this epoch's movement is already made. There is no
+            // schedule to follow and no local cadence to invent (a wall-clock one
+            // would have two nodes freezing different sets), so this is the
+            // pre-grid behaviour: one movement, then the next boundary.
+            BatchWindow::NoGrid => return Ok(BatchTurn::EpochOver),
+            // Waiting, in either of its two forms: an opportunity is open but this
+            // node has served it, or none is open (before B_1, or past
+            // `final_tm_cutoff`). Both sleep towards the SAME thing — whatever
+            // follows — and both end the epoch when nothing does. Building at a
+            // closed window would post a movement outside the schedule every SPO
+            // agreed on, which no co-signer would reproduce.
+            ref window => {
+                let Some(b) = window.next() else {
+                    return Ok(BatchTurn::EpochOver);
+                };
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "waiting for batch B_{} at slot {} ({} slot(s) from slot {})",
+                    b.index,
+                    b.slot,
+                    b.slot.saturating_sub(snapshot.slot),
+                    snapshot.slot,
+                );
+                hop_to_opportunity(b.slot, snapshot.slot, config.batch_poll_ceiling)
+            }
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// How long to sleep before re-reading the grid: the exact hop to `next_slot`,
+/// bounded by `ceiling`.
+///
+/// One slot is one second post-Shelley — the same identity `batch_at` uses to
+/// place the grid against a `(slot, time)` pair, and the reason the hop can be
+/// computed at all. The ceiling only bounds how stale a waiting node's view may
+/// get; because the hop shrinks as `B_i` approaches, the final sleep lands on the
+/// opportunity itself whatever the ceiling is, so the ceiling never decides WHEN a
+/// node freezes. The floor of one second keeps a slot arithmetic surprise (a tip
+/// already past the target) from becoming a spin.
+fn hop_to_opportunity(
+    next_slot: u64,
+    now_slot: u64,
+    ceiling: std::time::Duration,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(next_slot.saturating_sub(now_slot).max(1)).min(ceiling)
+}
+
+/// Wait for this epoch's next batch opportunity, then read the Cardano peg-in
+/// source ONCE and freeze what it holds, parsing each request against the
+/// spec-derived peg-in Taproot for the current Y_51 internal key, the Y_fed
+/// emergency leaf and Q_auth. Parse failures are logged and dropped. The deduped,
+/// parsed set is frozen into the next `BuildTm` phase.
+///
+/// The read used to be a poll over a local `pegin_collection_window` — a second,
+/// node-local freeze rule sitting in front of the batch's. Under the grid the
+/// freeze point is the opportunity and membership is the cutoff's to decide, so
+/// two freeze rules could only disagree: nodes that entered the window at
+/// different moments accumulated different unions of the same source.
+///
+/// Residual, stated rather than implied: the peg-in side of the cutoff itself is
+/// WI-049. `ParsedPegIn` carries no creation slot yet, so peg-in membership here
+/// is "what the source held at `B_i`" — aligned across nodes by the grid, but not
+/// yet pinned to `C_i` the way peg-outs are in `freeze_pegouts`.
 async fn collect_pegins_phase(
     chain: &Arc<dyn CardanoChain>,
     pegin_source: &Arc<dyn CardanoPegInSource>,
-    clock: &Arc<dyn Clock>,
     config: &EpochConfig,
     epoch: u64,
     roster: Roster,
     group_keys: GroupKeys,
+    built: &mut BuiltBatch,
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
+
+    // The gate the spec states at each `B_i`: "if the TM-chain tip is
+    // Binocular-confirmed and no TM is currently in flight, the batch is frozen
+    // and built; otherwise the opportunity passes unused". Passing it is not a
+    // failure — with a ~6 h grid pitch and ~17 h to confirm a movement, most
+    // opportunities pass by design.
+    let (batch, treasury) = loop {
+        let BatchTurn::Build(batch) =
+            await_batch_opportunity(chain, config, me, epoch, built).await?
+        else {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "CollectPegins: no batch opportunity remains this epoch — waiting for the next \
+                 boundary"
+            );
+            return Ok(EpochPhase::Idle);
+        };
+        let treasury = chain.query_treasury().await?;
+        // With no grid there is no opportunity to pass, so the tip wait inside
+        // `build_tm_phase` stands as it did before the grid.
+        let Some(b) = batch else {
+            break (None, treasury);
+        };
+        if treasury.btc_confirmed {
+            break (Some(b), treasury);
+        }
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  batch B_{} passes UNUSED: a treasury movement is still in flight against the \
+             current tip {}",
+            b.index,
+            treasury.outpoint
+        );
+    };
 
     // The bridge's peg-in tree, straight from the oracle. `TreasuryUtxo::pegin_tree` owns
     // the field mapping — notably that the federation LEAF key is the PUBLISHED
     // `config_y_fed`, not the head-derived `y_fed` — so no call site re-decides it.
-    let treasury = chain.query_treasury().await?;
     let pegin_tree = treasury.pegin_tree().map_err(EpochError::Chain)?;
 
-    let deadline = clock.deadline(config.pegin_collection_window);
     let mut accepted: BTreeMap<CardanoOutRef, ParsedPegIn> = BTreeMap::new();
-
-    crate::epoch_log!(
-        me,
-        epoch,
-        "CollectPegins: polling source for {:?} (poll interval {:?})",
-        config.pegin_collection_window,
-        config.pegin_poll_interval
-    );
-
-    loop {
-        let batch = pegin_source
-            .query_pegin_requests(&config.pegin_policy_id)
-            .await?;
-        for req in batch {
-            if accepted.contains_key(&req.cardano_utxo) {
-                continue;
+    for req in pegin_source
+        .query_pegin_requests(&config.pegin_policy_id)
+        .await?
+    {
+        if accepted.contains_key(&req.cardano_utxo) {
+            continue;
+        }
+        // Peg-in internal key is Y_51 (the FROST group key); Y_fed is a LEAF key —
+        // see parse_pegin_request / commit 6af7c67.
+        match parse_pegin_request(&req, &pegin_tree) {
+            Ok(parsed) => {
+                accepted.insert(req.cardano_utxo.clone(), parsed);
             }
-            // Peg-in internal key is Y_51 (the FROST group key); Y_fed is a LEAF key —
-            // see parse_pegin_request / commit 6af7c67.
-            match parse_pegin_request(&req, &pegin_tree) {
-                Ok(parsed) => {
-                    accepted.insert(req.cardano_utxo.clone(), parsed);
-                }
-                Err(e) => {
-                    crate::epoch_warn!(me, epoch, "  dropped peg-in {:?}: {}", req.cardano_utxo, e);
-                }
+            Err(e) => {
+                crate::epoch_warn!(me, epoch, "  dropped peg-in {:?}: {}", req.cardano_utxo, e);
             }
         }
-        if clock.now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(config.pegin_poll_interval).await;
     }
 
     let frozen_pegins: Vec<ParsedPegIn> = accepted.into_values().collect();
     crate::epoch_log!(
         me,
         epoch,
-        "  -> froze {} peg-in(s) for BuildTm",
-        frozen_pegins.len()
+        "  -> froze {} peg-in(s) for BuildTm{}",
+        frozen_pegins.len(),
+        batch.map_or_else(String::new, |b| format!(" at batch B_{}", b.index))
     );
 
     Ok(EpochPhase::BuildTm {
         epoch,
         roster,
         group_keys,
+        batch,
         frozen_pegins,
     })
 }
@@ -1090,14 +1395,14 @@ async fn collect_pegins_phase(
 /// since rev 5.1 retired the peg-out treasury-outpoint pin, an unpicked peg-out is
 /// merely delayed, not stranded.
 ///
-/// Without a grid (`snapshot.batch == None`: mock chains, and deployments whose
-/// Config predates the `schedule` append) the cutoff cannot be computed and is
-/// skipped, which is the pre-N19 behaviour. The FIFO order and the capacity cap are
-/// pure and apply regardless — they cost nothing and remove the last dependence on
+/// Without a grid (`batch == None`: mock chains, and deployments whose Config
+/// predates the `schedule` append) the cutoff cannot be computed and is skipped,
+/// which is the pre-N19 behaviour. The FIFO order and the capacity cap are pure
+/// and apply regardless — they cost nothing and remove the last dependence on
 /// the order the chain query happened to answer in.
 fn freeze_pegouts(
     pegouts: Vec<crate::epoch::traits::PegOutRequestUtxo>,
-    snapshot: &crate::epoch::traits::BatchSnapshot,
+    batch: Option<crate::epoch::batch::BatchSlot>,
     me: frost::Identifier,
     epoch: u64,
 ) -> Vec<crate::epoch::traits::PegOutRequestUtxo> {
@@ -1116,7 +1421,7 @@ fn freeze_pegouts(
         output_index: u32::from_le_bytes(p.outpoint[32..].try_into().unwrap_or([0u8; 4])),
     };
 
-    let Some(batch) = snapshot.batch.open() else {
+    let Some(batch) = batch else {
         // No grid: cap and order only.
         let mut ordered = pegouts;
         ordered.sort_by_key(&key);
@@ -1309,12 +1614,14 @@ enum CpoTrust {
     Unverified,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_tm_phase(
     chain: &Arc<dyn CardanoChain>,
     config: &EpochConfig,
     epoch: u64,
     roster: Roster,
     group_keys: GroupKeys,
+    batch: Option<crate::epoch::batch::BatchSlot>,
     frozen_pegins: Vec<ParsedPegIn>,
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
@@ -1487,8 +1794,10 @@ async fn build_tm_phase(
     // node's wall clock. `query_pegout_requests` above answers "open right now",
     // and "now" differs by seconds between SPOs — a request locked inside that skew
     // gives one node an extra output, a different txid, and an invalid aggregate.
-    // The batch cutoff makes membership a function of the snapshot slot instead.
-    let pegouts = freeze_pegouts(pegouts, &snapshot, me, epoch);
+    // The batch cutoff makes membership a function of the opportunity instead —
+    // the one `CollectPegins` froze at (WI-097), not whichever one the snapshot
+    // above happens to fall in.
+    let pegouts = freeze_pegouts(pegouts, batch, me, epoch);
 
     let pegout_requests: Vec<PegOutRequest> = pegouts
         .into_iter()
@@ -1588,11 +1897,13 @@ async fn build_tm_phase(
 // should increment and a new leader take over after `leader_timeout`.
 // Nothing currently bumps `leader_attempt`, so a stuck leader hangs the
 // cycle. The phase enum already plumbs the field for this.
+#[allow(clippy::too_many_arguments)]
 async fn submit_phase(
     chain: &Arc<dyn CardanoChain>,
     me: frost_secp256k1_tr::Identifier,
     epoch: u64,
     roster: Roster,
+    group_keys: GroupKeys,
     mut tm: TreasuryMovement,
     leader_attempt: u8,
 ) -> EpochResult<EpochPhase> {
@@ -1691,6 +2002,8 @@ async fn submit_phase(
 
     Ok(EpochPhase::AwaitConfirm {
         epoch,
+        roster,
+        group_keys,
         tm,
         cardano_tx_id: vec![],
     })
@@ -1739,8 +2052,10 @@ mod tests {
         });
         config.dkg_round_timeout = Duration::from_millis(500);
         config.poll_interval = Duration::from_millis(10);
-        config.pegin_collection_window = Duration::from_millis(40);
-        config.pegin_poll_interval = Duration::from_millis(10);
+        // The batch loop's only sleep. Short so a test that waits out an
+        // opportunity finishes in milliseconds rather than the 5-minute
+        // production ceiling.
+        config.batch_poll_ceiling = Duration::from_millis(20);
         config.quorum51_timeout = Duration::from_millis(500);
         // BuildTm REQUIRES a state_dir: both tries are cumulative, and a node
         // that cannot persist them would commit roots covering only its own
@@ -2844,6 +3159,408 @@ mod tests {
             fulfilled: vec![],
             cpo_root: [0u8; 32],
             spi_root,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // WI-097: the batch grid paces the movements, the boundary paces the ceremony
+    // -----------------------------------------------------------------------
+
+    fn slot(index: u64) -> crate::epoch::batch::BatchSlot {
+        crate::epoch::batch::BatchSlot {
+            index,
+            slot: 5_000_000 + index,
+            cutoff_slot: 4_900_000 + index,
+        }
+    }
+
+    /// WI-097's acceptance. Two Treasury Movements in ONE epoch, off ONE ceremony,
+    /// paced by the batch grid.
+    ///
+    /// The mock's `await_epoch_boundary` fires once and then parks for ever, so a
+    /// second movement can only complete if the machine resumed at
+    /// `CollectPegins`. A machine that answered a completed movement by
+    /// re-entering `Idle` hangs this test — which is precisely what it does to a
+    /// real node, for the five days until the next Cardano epoch.
+    ///
+    /// `treasury_info` counts the ceremonies: a DKG per movement would post a
+    /// second Update-Y and rotate the treasury key under a live batch.
+    #[tokio::test]
+    async fn a_second_movement_runs_off_the_grid_without_a_second_ceremony() {
+        let seed = [0x77u8; 32];
+        let secp = Secp256k1::new();
+        let fed_xonly = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&seed).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, [0xd4u8; 32]);
+
+        let fixture = demo_static_fixture(2, 2, 19_200);
+        let hub = MockPeerHub::new();
+        // ONE grid and ONE treasury, shared: every node stands at the same
+        // opportunity, and a submitted movement moves the head and the grid on
+        // together — which is what makes the second movement a different
+        // transaction rather than a replay of the first.
+        let grid = Arc::new(std::sync::Mutex::new(crate::epoch::mocks::open_at(slot(1))));
+        let head = MockCardanoChain::tm_chain_head(&fixture);
+
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone())
+                    .with_treasury_info(treasury_info.clone())
+                    .with_batch_window(Arc::clone(&grid))
+                    .with_tm_chain(Arc::clone(&head))
+                    .advancing_batch_on_submit(),
+            );
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let mut config = fast_config(id);
+            config.y_fed_seed = Some(seed);
+            handles.push(tokio::spawn(async move {
+                let mut built = BuiltBatch::default();
+                let (first, resume) = drive_to_movement(
+                    &chain,
+                    &pegin,
+                    &peers,
+                    &clock,
+                    &rng,
+                    &config,
+                    EpochPhase::Idle,
+                    &mut built,
+                )
+                .await?;
+                assert!(
+                    matches!(resume, EpochPhase::CollectPegins { .. }),
+                    "a confirmed movement must resume in the batch loop, not at {}",
+                    resume.name()
+                );
+                let (second, _) = drive_to_movement(
+                    &chain, &pegin, &peers, &clock, &rng, &config, resume, &mut built,
+                )
+                .await?;
+                Ok::<_, EpochError>((first, second, built))
+            }));
+        }
+
+        let mut movements = Vec::new();
+        for h in handles {
+            movements.push(
+                tokio::time::timeout(Duration::from_secs(30), h)
+                    .await
+                    .expect("the second movement must not wait for the next epoch boundary")
+                    .unwrap()
+                    .expect("both movements complete"),
+            );
+        }
+
+        // Both nodes made both movements, and agreed on each.
+        assert_eq!(movements[0].0.txid, movements[1].0.txid);
+        assert_eq!(movements[0].1.txid, movements[1].1.txid);
+        // The second is a genuine second movement: it spends the first's change.
+        assert_ne!(movements[0].0.txid, movements[0].1.txid);
+        assert_eq!(
+            movements[0].1.unsigned_tx.input[0].previous_output.txid, movements[0].0.txid,
+            "each movement's treasury input is the previous movement's output"
+        );
+        // Two opportunities used, so the grid stands at the third...
+        assert_eq!(grid.lock().unwrap().open().unwrap().index, 3);
+        // ...and the second movement was built for the SECOND of them, on both
+        // nodes. Without that, "two movements" could be one opportunity served
+        // twice — the treasury self-move the marker exists to prevent.
+        for (_, _, built) in &movements {
+            assert!(
+                built.is(fixture.roster.epoch, 2),
+                "the second movement must belong to B_2, not to B_1 again"
+            );
+        }
+        // ONE ceremony for both.
+        assert_eq!(
+            treasury_info.lock().unwrap().rotations.len(),
+            1,
+            "the DKG runs once per EPOCH — a second movement must not rotate the treasury key"
+        );
+    }
+
+    /// The gate the spec states at each `B_i`: with a movement already in flight
+    /// against the tip the opportunity passes UNUSED. It must not wait inside the
+    /// opportunity for the tip to free up (that would build off a stale freeze),
+    /// and it must not build a second movement off a head that is already being
+    /// spent.
+    #[tokio::test]
+    async fn an_open_opportunity_passes_unused_while_a_movement_is_in_flight() {
+        let (signer, group_keys) = phase1_signer_for(2, 3);
+        let config = fast_config(Identifier::try_from(1u16).unwrap());
+        let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+
+        let busy: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(demo_static_fixture(2, 2, 19_300))
+                .with_batch(slot(4))
+                .with_movement_in_flight(),
+        );
+        let mut built = BuiltBatch::default();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            collect_pegins_phase(
+                &busy,
+                &pegin,
+                &config,
+                7,
+                signer.roster.clone(),
+                group_keys.clone(),
+                &mut built,
+            ),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "a busy tip must produce no batch at this opportunity"
+        );
+        assert!(
+            built.is(7, 4),
+            "the opportunity is CONSUMED, not retried until the tip frees up"
+        );
+
+        // The same grid position with a free tip does build.
+        let free: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(demo_static_fixture(2, 2, 19_300)).with_batch(slot(4)));
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            collect_pegins_phase(
+                &free,
+                &pegin,
+                &config,
+                7,
+                signer.roster,
+                group_keys,
+                &mut BuiltBatch::default(),
+            ),
+        )
+        .await
+        .expect("a free tip builds at the opportunity")
+        .expect("collect_pegins");
+        assert!(matches!(next, EpochPhase::BuildTm { .. }));
+    }
+
+    /// `Closed { next: None }` is the epoch's TM work being over — everything left
+    /// is past `final_tm_cutoff`. `Closed { next: Some(_) }` is not: the machine
+    /// waits for that opportunity rather than ending the epoch, which is the
+    /// distinction WI-041 kept `Closed` separate from `NoGrid` to preserve.
+    #[tokio::test]
+    async fn an_exhausted_grid_ends_the_epoch_but_a_pending_one_does_not() {
+        use crate::epoch::batch::BatchWindow;
+        let chain = MockCardanoChain::new(demo_static_fixture(2, 2, 19_400));
+        let window = chain.batch_window();
+        let chain: Arc<dyn CardanoChain> = Arc::new(chain);
+        let config = fast_config(Identifier::try_from(1u16).unwrap());
+        let me = config.identity.identifier;
+
+        *window.lock().unwrap() = BatchWindow::Closed { next: None };
+        let turn = await_batch_opportunity(&chain, &config, me, 7, &mut BuiltBatch::default())
+            .await
+            .unwrap();
+        assert!(matches!(turn, BatchTurn::EpochOver));
+
+        *window.lock().unwrap() = BatchWindow::Closed {
+            next: Some(slot(2)),
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                await_batch_opportunity(&chain, &config, me, 7, &mut BuiltBatch::default()),
+            )
+            .await
+            .is_err(),
+            "an opportunity still to come must be waited for, not treated as the end of the epoch"
+        );
+
+        // The same question in its other form. `current()` reports the LAST
+        // opportunity for its whole interval, so the end of the grid is normally
+        // seen as an OPEN window this node has already served — never as `Closed`.
+        // Reading only `Closed` there would poll out the rest of the epoch instead
+        // of parking for the boundary.
+        *window.lock().unwrap() = BatchWindow::Open {
+            batch: slot(9),
+            next: None,
+        };
+        let mut served = BuiltBatch::default();
+        served.mark(7, 9);
+        let turn = await_batch_opportunity(&chain, &config, me, 7, &mut served)
+            .await
+            .unwrap();
+        assert!(
+            matches!(turn, BatchTurn::EpochOver),
+            "an open-but-last opportunity, once served, is the end of the epoch"
+        );
+    }
+
+    /// The wait is the exact hop to the opportunity, and the ceiling only bounds
+    /// it. That distinction is the whole reason `batch_poll_ceiling` is not an
+    /// operator key: because the hop shrinks as `B_i` approaches, the final sleep
+    /// lands on the opportunity whatever the ceiling is, so no local value decides
+    /// WHEN a node freezes — and a flat poll instead of this would have each node
+    /// notice `B_i` at its own offset past it and freeze a different set.
+    #[test]
+    fn the_hop_is_exact_below_the_ceiling_and_clamped_above_it() {
+        let ceiling = Duration::from_secs(300);
+        assert_eq!(
+            hop_to_opportunity(5_000_100, 5_000_040, ceiling),
+            Duration::from_secs(60),
+            "a minute away is a minute's sleep"
+        );
+        assert_eq!(
+            hop_to_opportunity(5_021_600, 5_000_000, ceiling),
+            ceiling,
+            "six hours away is capped, so the grid is re-read on the way"
+        );
+        assert_eq!(
+            hop_to_opportunity(5_000_001, 5_000_000, ceiling),
+            Duration::from_secs(1),
+            "the last hop is the remaining distance, not the ceiling"
+        );
+        assert_eq!(
+            hop_to_opportunity(5_000_000, 5_000_009, ceiling),
+            Duration::from_secs(1),
+            "a tip already past the target sleeps the floor rather than spinning"
+        );
+    }
+
+    /// With no grid to follow there is no schedule to obey and no local cadence to
+    /// invent, so the machine keeps its pre-grid bound: one movement, then the next
+    /// boundary. The marker is keyed by epoch, so the next one gets its own.
+    #[tokio::test]
+    async fn without_a_grid_the_machine_makes_one_movement_per_epoch() {
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(demo_static_fixture(2, 2, 19_500)));
+        let config = fast_config(Identifier::try_from(1u16).unwrap());
+        let me = config.identity.identifier;
+        let mut built = BuiltBatch::default();
+
+        let first = await_batch_opportunity(&chain, &config, me, 7, &mut built)
+            .await
+            .unwrap();
+        assert!(matches!(first, BatchTurn::Build(None)));
+        let second = await_batch_opportunity(&chain, &config, me, 7, &mut built)
+            .await
+            .unwrap();
+        assert!(matches!(second, BatchTurn::EpochOver));
+        let next_epoch = await_batch_opportunity(&chain, &config, me, 8, &mut built)
+            .await
+            .unwrap();
+        assert!(matches!(next_epoch, BatchTurn::Build(None)));
+    }
+
+    /// A failure decides which opportunity to retry, and the two cases differ.
+    ///
+    /// A failed BUILD must give its opportunity back — no movement came of it, so
+    /// the next poll retries the same `B_i` rather than waiting out the interval.
+    /// A failure while WAITING for the next opportunity must not: the marker then
+    /// belongs to the movement that already succeeded, and handing it back builds
+    /// a second movement for a batch this node has already served — a fee spent
+    /// moving the treasury to itself.
+    #[tokio::test]
+    async fn a_failure_gives_back_its_own_opportunity_but_never_a_served_one() {
+        let (signer, group_keys) = phase1_signer_for(2, 3);
+        let config = fast_config(Identifier::try_from(1u16).unwrap());
+        let fixture = demo_static_fixture(2, 2, 19_700);
+
+        // Waiting: B_1 was served by a completed movement, and the grid read
+        // fails. The marker must survive.
+        let waiting: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture.clone())
+                .with_batch(slot(1))
+                .fail_next_snapshots(1),
+        );
+        let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(
+            Identifier::try_from(1u16).unwrap(),
+            MockPeerHub::new(),
+        ));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let mut built = BuiltBatch::default();
+        built.mark(7, 1);
+        let resume = EpochPhase::CollectPegins {
+            epoch: 7,
+            roster: signer.roster.clone(),
+            group_keys: group_keys.clone(),
+        };
+        // It never reaches another movement (B_1 is spent and the grid does not
+        // advance), so the wait is what we are timing out of.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(4),
+            drive_to_movement(
+                &waiting, &pegin, &peers, &clock, &rng, &config, resume, &mut built,
+            ),
+        )
+        .await;
+        assert!(
+            built.is(7, 1),
+            "a served opportunity must not be handed back by an unrelated failure"
+        );
+
+        // Building: this call takes B_2 and then fails, so B_2 is retried.
+        let building: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(fixture).with_batch(slot(2)));
+        let failing = MockCardanoPegInSource::new();
+        failing.fail_next(u32::MAX);
+        let failing: Arc<dyn CardanoPegInSource> = Arc::new(failing);
+        let resume = EpochPhase::CollectPegins {
+            epoch: 7,
+            roster: signer.roster,
+            group_keys,
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(4),
+            drive_to_movement(
+                &building, &failing, &peers, &clock, &rng, &config, resume, &mut built,
+            ),
+        )
+        .await;
+        assert!(
+            !built.is(7, 2),
+            "an opportunity whose build failed must be retried, not consumed"
+        );
+    }
+
+    /// A transient chain failure inside the batch loop costs one batch, not the
+    /// epoch. `Idle` waits for the chain epoch to ADVANCE, so answering a
+    /// five-second provider outage by re-entering it parks the node for days —
+    /// and a loop that cycles per batch meets far more of them than one movement
+    /// per epoch ever did. Here the mock parks in `await_epoch_boundary` after the
+    /// first call, so that failure mode hangs the test.
+    #[tokio::test]
+    async fn a_transient_failure_costs_one_batch_not_the_epoch() {
+        let fixture = demo_static_fixture(2, 2, 19_600);
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let source = MockCardanoPegInSource::new();
+            // Both nodes fail the same query, so they stay in step; one node
+            // failing alone would merely time the other out of its signing round.
+            source.fail_next(1);
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(source);
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        for h in handles {
+            tokio::time::timeout(Duration::from_secs(30), h)
+                .await
+                .expect("a failed peg-in query must not cost the epoch")
+                .unwrap()
+                .expect("the movement completes after the retry");
         }
     }
 
