@@ -2289,9 +2289,14 @@ async fn run_spo(
             cycles += 1;
             info!("Cycle {cycles} complete ({:.2?} since start)", t0.elapsed());
             log_tm_summary(tm);
+            // POSTED, not confirmed. The Bitcoin confirmation is ~100 blocks plus
+            // the oracle's challenge-aging window away; the node does not wait for
+            // it (it would be waiting most of a day, and waiting is not what makes
+            // it arrive). It records what the movement owes its tries and returns
+            // to the grid, where opportunities pass unused until the tip frees up.
             info!(
-                "=== SPO {spo_label} cycle {cycles} complete — waiting for the next batch \
-                 opportunity ==="
+                "=== SPO {spo_label} cycle {cycles} complete — movement posted, awaiting \
+                 confirmation; waiting for the next batch opportunity ==="
             );
         })
         .await;

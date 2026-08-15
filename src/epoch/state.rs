@@ -359,10 +359,10 @@ pub enum EpochPhase {
     Submit {
         epoch: u64,
         roster: Roster,
-        /// Carried, not used: `Submit` and `AwaitConfirm` are the last two hops
+        /// Carried, not used: `Submit` and `RecordMovement` are the last two hops
         /// before the machine returns to `CollectPegins` for the epoch's next
         /// batch, and it must arrive there holding the same ceremony output. The
-        /// two phases used to drop it (`Submit` the keys, `AwaitConfirm` the
+        /// two phases used to drop it (`Submit` the keys, `RecordMovement` the
         /// roster as well), which is why a completed movement could only be
         /// followed by a fresh `EpochStart`.
         group_keys: GroupKeys,
@@ -376,14 +376,22 @@ pub enum EpochPhase {
         /// right knob, but nothing currently bumps it.
         leader_attempt: u8,
     },
-    AwaitConfirm {
+    /// Write down what was just posted, so the fold that a confirmation owes the
+    /// two tries survives this process.
+    ///
+    /// It does NOT wait for the confirmation. That wait is hours long — ~100
+    /// Bitcoin confirmations plus the oracle's challenge-aging window — and
+    /// blocking here made the fold depend on one process staying awake for all of
+    /// it (WI-032). The waiting the protocol actually calls for is the batch
+    /// gate's: at each `B_i`, an in-flight movement means the opportunity passes
+    /// unused. The fold happens where the head is OBSERVED, in `CollectPegins`.
+    RecordMovement {
         epoch: u64,
         /// See [`EpochPhase::Submit::group_keys`] — both ride through to the next
         /// batch's `CollectPegins`.
         roster: Roster,
         group_keys: GroupKeys,
         tm: TreasuryMovement,
-        cardano_tx_id: Vec<u8>,
     },
 }
 
@@ -417,7 +425,7 @@ impl EpochPhase {
                 ..
             } => "Sign(Round2)",
             EpochPhase::Submit { .. } => "Submit",
-            EpochPhase::AwaitConfirm { .. } => "AwaitConfirm",
+            EpochPhase::RecordMovement { .. } => "RecordMovement",
         }
     }
 }
@@ -494,9 +502,6 @@ pub struct EpochConfig {
     pub poll_interval: Duration,
     pub quorum51_timeout: Duration,
     pub leader_timeout: Duration,
-    /// Maximum time to wait for the submitted treasury movement to become the
-    /// confirmed chain tip before rebuilding from fresh chain state.
-    pub tm_confirmation_timeout: Duration,
     pub identity: SpoIdentity,
     /// Cardano policy ID (script hash) identifying peg-in request UTxOs.
     pub pegin_policy_id: [u8; 28],
@@ -585,7 +590,6 @@ impl EpochConfig {
             poll_interval: Duration::from_millis(5000),
             quorum51_timeout: Duration::from_secs(300),
             leader_timeout: Duration::from_secs(10000),
-            tm_confirmation_timeout: Duration::from_secs(1800),
             identity,
             pegin_policy_id: [0u8; 28],
             batch_poll_ceiling: Duration::from_secs(300),

@@ -1860,11 +1860,6 @@ impl CardanoChain for BlockfrostCardanoChain {
         })
     }
 
-    async fn is_tm_confirmed(&self, txid: &bitcoin::Txid) -> EpochResult<bool> {
-        let treasury = self.query_treasury().await?;
-        Ok(treasury.btc_confirmed && treasury.outpoint.txid == *txid)
-    }
-
     async fn plan_update_y(
         &self,
         epoch: u64,

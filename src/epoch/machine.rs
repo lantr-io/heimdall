@@ -17,12 +17,18 @@
 //! - `submit_phase`        — assemble the witnessed tx, verify each
 //!                           per-input signature under the on-chain
 //!                           output key, hand bytes to the chain
-//! - `await_confirm_phase` — end of ONE movement: returns the signed
-//!                           `TreasuryMovement`, and the machine resumes at
-//!                           the epoch's NEXT batch opportunity
+//! - `record_movement_phase`— end of ONE movement: persist what it owes the
+//!                           tries, return it, resume at the NEXT batch
+//!                           opportunity — it does NOT await the confirmation
 //!
 //! `Dkg` and `Sign` are dispatched to `dkg::dkg_phase` and
 //! `signing::sign_phase` respectively.
+//!
+//! The fold a confirmation owes the completed-peg-outs and swept-peg-ins tries is
+//! NOT done by the phase that posts the movement. It is done by
+//! `settle_pending_tm`, from inside `collect_pegins_phase`, the moment the chain
+//! shows the treasury head has moved off the outpoint the movement spends — see
+//! [`crate::epoch::pending_tm`] for why a wait cannot do that job.
 //!
 //! ## Two clocks, not one
 //!
@@ -31,7 +37,7 @@
 //! batches and the protocol schedule. So the machine has two loops. The outer one
 //! is `Idle → EpochStart → Dkg → PublishKeys`, paced by
 //! [`CardanoChain::await_epoch_boundary`]. The inner one is
-//! `CollectPegins → BuildTm → Sign → Submit → AwaitConfirm → CollectPegins`,
+//! `CollectPegins → BuildTm → Sign → Submit → RecordMovement → CollectPegins`,
 //! paced by the grid, and it carries the roster and group keys around so no batch
 //! costs a second ceremony. It leaves for `Idle` only when the epoch's grid is
 //! exhausted (`BatchWindow::Closed { next: None }`).
@@ -65,10 +71,10 @@ use crate::frost::xonly::group_xonly;
 use std::collections::BTreeMap;
 
 /// Run the epoch state machine for one full cycle and return the
-/// witnessed `TreasuryMovement` once the cycle reaches `AwaitConfirm`.
+/// witnessed `TreasuryMovement` once the cycle reaches `RecordMovement`.
 ///
 /// The first-cycle scope: `await_epoch_boundary` fires once, the loop
-/// runs DKG → BuildTm → Sign → Submit → AwaitConfirm and then exits.
+/// runs DKG → BuildTm → Sign → Submit → RecordMovement and then exits.
 /// Future cuts will instead loop back to `Idle` and wait for the next
 /// boundary.
 /// Backoff bounds for retriable phase errors (chain/peer/DKG). A persistent
@@ -170,11 +176,18 @@ pub async fn run_epoch_daemon(
     }
 }
 
-/// Run until ONE Treasury Movement is confirmed and return it.
+/// Run until ONE Treasury Movement has been built, signed and posted, and return
+/// it.
+///
+/// Posted, not confirmed — the confirmation is hours away and nothing is gained by
+/// waiting for it here (WI-032). The movement's fold into the two tries is
+/// persisted, and performed by whichever later pass through `CollectPegins`
+/// observes the head move; a single-shot run simply exits before that happens.
 ///
 /// Retriable failures never surface: they back off and re-enter the loop, so this
-/// returns only on a completed movement. For a long-running node use
-/// [`run_epoch_daemon`], which repeats it and keeps the batch-grid position.
+/// returns only on a posted movement. For a long-running node use
+/// [`run_epoch_daemon`], which repeats it, keeps the batch-grid position, and does
+/// carry out the fold.
 pub async fn run_epoch_loop(
     chain: Arc<dyn CardanoChain>,
     pegin_source: Arc<dyn CardanoPegInSource>,
@@ -451,18 +464,17 @@ async fn step_phase(
             leader_attempt,
         } => submit_phase(chain, me, epoch, roster, group_keys, tm, leader_attempt).await?,
 
-        EpochPhase::AwaitConfirm {
+        EpochPhase::RecordMovement {
             epoch,
             roster,
             group_keys,
             tm,
-            ..
         } => {
-            await_confirm_phase(chain, config, epoch, &tm).await?;
-            // Back to the epoch's batch loop, not out of it. The movement is done;
-            // the EPOCH is not, and the roster + keys that signed this one sign
-            // every remaining batch — `CollectPegins` decides whether any
-            // opportunity is left and returns `Idle` when none is.
+            record_movement_phase(config, epoch, &tm)?;
+            // Back to the epoch's batch loop, not out of it. This movement is
+            // posted; the EPOCH is not over, and the roster + keys that signed
+            // this one sign every remaining batch — `CollectPegins` decides
+            // whether any opportunity is left and returns `Idle` when none is.
             return Ok(Step::Done(
                 tm,
                 EpochPhase::CollectPegins {
@@ -476,36 +488,112 @@ async fn step_phase(
     Ok(Step::Next(next))
 }
 
-/// Wait for every SPO to observe this exact movement as the confirmed
-/// treasury tip. The leader has already waited for Cardano oracle inclusion;
-/// followers use this chain-level check to converge on the same result.
-async fn await_confirm_phase(
-    chain: &Arc<dyn CardanoChain>,
+/// Write down the movement just posted, so the fold it owes the two tries can
+/// happen whenever the chain gets round to confirming it.
+///
+/// This phase used to BLOCK until it observed the confirmation, and then fold.
+/// Both halves were wrong (WI-032). The wait was redundant — "do not build while
+/// a movement is in flight" is already enforced twice and independently, by the
+/// batch gate in [`collect_pegins_phase`] and again by [`build_tm_phase`], both
+/// on `TreasuryUtxo::btc_confirmed` — and it could not succeed anyway: the
+/// confirmation is ~100 Bitcoin blocks plus the oracle's challenge-aging window
+/// away, against a 30-minute timeout. And tying the fold to it made durable state
+/// depend on one process staying awake for that whole window, so a restart, a
+/// crash or the timeout left the tries permanently behind the chain with no path
+/// back but `reconstruct-cpo-trie`.
+///
+/// A node with no `state_dir` has nowhere to record it. That node cannot BUILD
+/// either (`build_tm_phase` refuses), so it is here as a co-signer only — but it
+/// is co-signing movements whose effects it is not tracking, and its tries fall
+/// further behind with every one. This is the once-per-movement place to say so,
+/// and the only one: the fold reads the record, so with no record there is
+/// nothing downstream left to warn about.
+fn record_movement_phase(
     config: &EpochConfig,
     epoch: u64,
     tm: &TreasuryMovement,
 ) -> EpochResult<()> {
-    let deadline = tokio::time::Instant::now() + config.tm_confirmation_timeout;
-    loop {
-        if chain.is_tm_confirmed(&tm.txid).await? {
-            crate::epoch_log!(
-                config.identity.identifier,
-                epoch,
-                "AwaitConfirm: treasury movement {} is confirmed",
-                tm.txid
-            );
-            advance_cpo_trie(config, epoch, tm)?;
-            advance_spi_trie(config, epoch, tm)?;
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(EpochError::Chain(format!(
-                "treasury movement {} was not confirmed before timeout ({:?})",
-                tm.txid, config.tm_confirmation_timeout
-            )));
-        }
-        tokio::time::sleep(config.poll_interval).await;
+    let me = config.identity.identifier;
+    let Some(dir) = config.state_dir.as_deref() else {
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  treasury movement {} NOT recorded: protocol.state_dir is not configured, so this \
+             node tracks neither the completed-peg-outs nor the swept-peg-ins trie and cannot \
+             build or co-sign a later Treasury Movement",
+            tm.txid
+        );
+        return Ok(());
+    };
+    let pending = crate::epoch::pending_tm::PendingTm::from_movement(epoch, tm)
+        .map_err(|e| EpochError::TmBuild(format!("pending treasury movement: {e}")))?;
+    pending
+        .save(dir)
+        .map_err(|e| EpochError::TmBuild(format!("pending treasury movement: {e}")))?;
+    crate::epoch_log!(
+        me,
+        epoch,
+        "RecordMovement: treasury movement {} is posted and awaiting confirmation; recorded in \
+         {} — the tries advance when the chain shows it as the head, however long that takes and \
+         across restarts",
+        tm.txid,
+        crate::epoch::pending_tm::PendingTm::state_path(dir).display(),
+    );
+    Ok(())
+}
+
+/// Fold a recorded movement into both tries once the chain has moved on from the
+/// head it spent — the settlement half of [`record_movement_phase`].
+///
+/// The trigger is the HEAD, not the txid: while `treasury.outpoint` is still the
+/// outpoint the pending movement spends, nothing has landed on top of it and
+/// there is nothing to fold. Once the head has moved, something built on that tip
+/// confirmed, and folding the record either reproduces the two roots it committed
+/// — proving it was this movement — or does not, and is refused. That refusal is
+/// the existing discipline in [`advance_cpo_trie`] / [`advance_spi_trie`], and
+/// keying on the head rather than the txid is what lets it cover the fee-bumped
+/// rebuild too (spec §Stuck-TM recovery): an RBF twin of the same frozen batch
+/// has a different txid and identical roots, so it folds cleanly.
+///
+/// Called wherever the head is READ — which is why it takes a `TreasuryUtxo` the
+/// caller already has rather than querying: this costs no extra chain traffic.
+fn settle_pending_tm(
+    config: &EpochConfig,
+    treasury: &crate::epoch::traits::TreasuryUtxo,
+) -> EpochResult<()> {
+    use crate::epoch::pending_tm::PendingTm;
+
+    let me = config.identity.identifier;
+    let Some(dir) = config.state_dir.as_deref() else {
+        return Ok(());
+    };
+    let Some(pending) = PendingTm::load(dir)
+        .map_err(|e| EpochError::TmBuild(format!("pending treasury movement: {e}")))?
+    else {
+        return Ok(());
+    };
+    if treasury.outpoint == pending.spends {
+        crate::epoch_debug!(
+            me,
+            pending.epoch,
+            "  treasury movement {} is still unconfirmed (the head is still the {} it spends)",
+            pending.txid,
+            pending.spends
+        );
+        return Ok(());
     }
+    crate::epoch_log!(
+        me,
+        pending.epoch,
+        "  treasury head advanced to {} — folding the movement recorded against {} into both tries",
+        treasury.outpoint,
+        pending.spends,
+    );
+    advance_cpo_trie(config, dir, &pending)?;
+    advance_spi_trie(config, dir, &pending)?;
+    PendingTm::clear(dir)
+        .map_err(|e| EpochError::TmBuild(format!("pending treasury movement: {e}")))?;
+    Ok(())
 }
 
 /// Fold a CONFIRMED TM's peg-outs into this node's persisted completed-peg-outs
@@ -518,43 +606,41 @@ async fn await_confirm_phase(
 /// The post-insert root MUST equal the root the TM committed. If it does not, the
 /// node's view and the quorum's have diverged and the trie is NOT written: a wrong
 /// trie is worse than a stale one, because the stale one fails loudly at the next
-/// signing round while the wrong one signs confidently wrong roots.
+/// signing round while the wrong one signs confidently wrong roots. Since WI-032
+/// this is also the check that decides WHICH movement confirmed — see
+/// [`settle_pending_tm`] — so a mismatch means "the chain moved on without this
+/// node", and the fix it names is the same one.
 ///
-/// A node without `state_dir` keeps no trie, so there is nothing to advance.
-fn advance_cpo_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> EpochResult<()> {
-    use crate::cardano::cpo_trie::{CpoEntry, CpoTrie};
+/// `dir` is the caller's: only [`settle_pending_tm`] calls this, and it has
+/// already established that this node keeps tries at all.
+fn advance_cpo_trie(
+    config: &EpochConfig,
+    dir: &std::path::Path,
+    pending: &crate::epoch::pending_tm::PendingTm,
+) -> EpochResult<()> {
+    use crate::cardano::cpo_trie::CpoTrie;
 
     let me = config.identity.identifier;
-    let Some(dir) = config.state_dir.as_deref() else {
-        // BuildTm refuses without a state_dir, so this node never PROPOSES a
-        // root. It can still observe someone else's Confirm, and skipping the
-        // advance leaves its trie behind the chain — say so rather than pass
-        // silently, because the divergence surfaces much later.
-        crate::epoch_warn!(
-            me,
-            epoch,
-            "  swept peg-ins trie NOT advanced: protocol.state_dir is not configured, so this \
-             node is not tracking the trie and cannot build or co-sign a Treasury Movement"
-        );
-        return Ok(());
-    };
+    let epoch = pending.epoch;
     let mut trie = CpoTrie::load(dir)
         .map_err(|e| EpochError::TmBuild(format!("completed-peg-outs trie: {e}")))?
         .unwrap_or_default();
 
-    let entries: Vec<CpoEntry> = tm.fulfilled.iter().map(CpoEntry::from).collect();
     let new_root = trie
-        .insert_batch(&entries)
+        .insert_batch(&pending.fulfilled)
         .map_err(|e| EpochError::TmBuild(format!("completed-peg-outs trie: {e}")))?;
-    if new_root != tm.cpo_root {
+    if new_root != pending.cpo_root {
         return Err(EpochError::TmBuild(format!(
             "completed-peg-outs trie diverged: TM {} committed root {} but this node's trie \
-             reaches {} after inserting its {} fulfilled peg-out(s) — NOT persisting; run \
-             `reconstruct-cpo-trie`",
-            tm.txid,
-            hex::encode(tm.cpo_root),
+             reaches {} after inserting its {} fulfilled peg-out(s) — NOT persisting. Either the \
+             chain confirmed a DIFFERENT movement on top of {}, or this node's trie was already \
+             behind; both are repaired the same way — run `reconstruct-cpo-trie`, which rebuilds \
+             from chain history and refuses any movement it cannot explain.",
+            pending.txid,
+            hex::encode(pending.cpo_root),
             hex::encode(new_root),
-            entries.len(),
+            pending.fulfilled.len(),
+            pending.spends,
         )));
     }
     trie.save(dir)
@@ -574,44 +660,39 @@ fn advance_cpo_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> 
 /// valued with the TM's own input-0 outpoint [SPI-3].
 ///
 /// Same discipline as [`advance_cpo_trie`], for the same reasons: only after
-/// confirmation, and only if the post-insert root equals `tm.spi_root` – on a
-/// divergence the file is NOT written, because a wrong trie signs confidently
-/// wrong roots while a stale one fails loudly at the next [SPI-2] gate.
+/// confirmation, and only if the post-insert root equals the movement's
+/// `spi_root` – on a divergence the file is NOT written, because a wrong trie
+/// signs confidently wrong roots while a stale one fails loudly at the next
+/// [SPI-2] gate.
 ///
-/// A node without `state_dir` keeps no trie, so there is nothing to advance.
-fn advance_spi_trie(config: &EpochConfig, epoch: u64, tm: &TreasuryMovement) -> EpochResult<()> {
+/// `dir` is the caller's, as in [`advance_cpo_trie`].
+fn advance_spi_trie(
+    config: &EpochConfig,
+    dir: &std::path::Path,
+    pending: &crate::epoch::pending_tm::PendingTm,
+) -> EpochResult<()> {
     use crate::cardano::spi_trie::SpiTrie;
 
     let me = config.identity.identifier;
-    let Some(dir) = config.state_dir.as_deref() else {
-        // BuildTm refuses without a state_dir, so this node never PROPOSES a
-        // root. It can still observe someone else's Confirm, and skipping the
-        // advance leaves its trie behind the chain — say so rather than pass
-        // silently, because the divergence surfaces much later.
-        crate::epoch_warn!(
-            me,
-            epoch,
-            "  swept peg-ins trie NOT advanced: protocol.state_dir is not configured, so this \
-             node is not tracking the trie and cannot build or co-sign a Treasury Movement"
-        );
-        return Ok(());
-    };
+    let epoch = pending.epoch;
     let mut trie = SpiTrie::load(dir)
         .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?
         .unwrap_or_default();
 
-    let inputs = tm.input_outpoints();
     let new_root = trie
-        .insert_for_confirmed_tm(&inputs)
+        .insert_for_confirmed_tm(&pending.swept)
         .map_err(|e| EpochError::TmBuild(format!("swept peg-ins trie: {e}")))?;
-    if new_root != tm.spi_root {
+    if new_root != pending.spi_root {
         return Err(EpochError::TmBuild(format!(
             "swept peg-ins trie diverged: TM {} carries root {} but this node's trie reaches \
-             {} after inserting its {} swept input(s) – NOT persisting",
-            tm.txid,
-            hex::encode(tm.spi_root),
+             {} after inserting its {} swept input(s) – NOT persisting. Either the chain \
+             confirmed a DIFFERENT movement on top of {}, or this node's trie was already \
+             behind; both are repaired by `reconstruct-spi-trie`.",
+            pending.txid,
+            hex::encode(pending.spi_root),
             hex::encode(new_root),
-            inputs.len().saturating_sub(1),
+            pending.swept.len().saturating_sub(1),
+            pending.spends,
         )));
     }
     trie.save(dir)
@@ -1325,6 +1406,12 @@ async fn collect_pegins_phase(
             return Ok(EpochPhase::Idle);
         };
         let treasury = chain.query_treasury().await?;
+        // The one place the head is read on a regular cadence, and therefore the
+        // place a movement this node posted earlier gets folded into the tries
+        // (WI-032). It runs BEFORE the gate below and before every build, so
+        // `build_tm_phase`'s cross-check against the on-chain singleton never
+        // sees a trie that this node already had the means to advance.
+        settle_pending_tm(config, &treasury)?;
         // With no grid there is no opportunity to pass, so the tip wait inside
         // `build_tm_phase` stands as it did before the grid.
         let Some(b) = batch else {
@@ -2000,12 +2087,11 @@ async fn submit_phase(
     // Persist the witnessed tx back into `tm` so callers can inspect it.
     tm.unsigned_tx = signed_tx;
 
-    Ok(EpochPhase::AwaitConfirm {
+    Ok(EpochPhase::RecordMovement {
         epoch,
         roster,
         group_keys,
         tm,
-        cardano_tx_id: vec![],
     })
 }
 
@@ -2021,7 +2107,7 @@ fn current_epoch(phase: &EpochPhase) -> u64 {
         | EpochPhase::BuildTm { epoch, .. }
         | EpochPhase::Sign { epoch, .. }
         | EpochPhase::Submit { epoch, .. }
-        | EpochPhase::AwaitConfirm { epoch, .. } => *epoch,
+        | EpochPhase::RecordMovement { epoch, .. } => *epoch,
     }
 }
 
@@ -2793,55 +2879,163 @@ mod tests {
         );
     }
 
+    /// WI-032, the headline: posting a movement does NOT block on its
+    /// confirmation.
+    ///
+    /// This mock chain never advances its head, so the movement is never
+    /// confirmed — which is precisely the state a real bridge is in for the ~17
+    /// hours after a post. The cycle must still complete, and it must leave the
+    /// fold recorded on disk rather than losing it.
+    ///
+    /// Before this change the machine parked in `AwaitConfirm` polling
+    /// `is_tm_confirmed` and, after `tm_confirmation_timeout` (30 min by
+    /// default, against a condition hours away), failed the cycle with the
+    /// tries never advanced and no way back but `reconstruct-cpo-trie`.
     #[tokio::test]
-    async fn followers_wait_in_await_confirm_until_chain_confirms() {
+    async fn a_posted_movement_completes_the_cycle_and_leaves_its_fold_recorded() {
+        use crate::epoch::pending_tm::PendingTm;
+
+        let dir = std::env::temp_dir().join(format!("wi032-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let fixture = demo_static_fixture(2, 2, 18_650);
         let hub = MockPeerHub::new();
         let mut handles = Vec::new();
-        let mut signals = Vec::new();
-        let mut submitted = Vec::new();
 
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
-            let chain = Arc::new(MockCardanoChain::new(fixture.clone()));
-            let signal = chain.confirmation_signal();
-            signal.store(false, std::sync::atomic::Ordering::Release);
-            submitted.push(chain.submitted_txs());
-            signals.push(signal);
+            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
-            let config = fast_config(id);
+            let mut config = fast_config(id);
+            // One directory per node would be the deployment shape; here they
+            // build byte-identical movements, so one is enough to assert on and
+            // the last writer wins with the same bytes.
+            config.state_dir = Some(dir.join(format!("node{i}")));
             handles.push(tokio::spawn(async move {
                 run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
             }));
         }
 
-        // Wait until the leader has submitted and both nodes should be parked
-        // in AwaitConfirm rather than returning from the cycle.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if submitted.iter().any(|txs| !txs.lock().unwrap().is_empty()) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("leader submits before confirmation test timeout");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(handles.iter().any(|h| !h.is_finished()));
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(
+                tokio::time::timeout(Duration::from_secs(30), h)
+                    .await
+                    .expect("the cycle must not block on a confirmation that never comes")
+                    .unwrap()
+                    .expect("epoch cycle completes"),
+            );
+        }
 
-        for signal in signals {
-            signal.store(true, std::sync::atomic::Ordering::Release);
-        }
-        for handle in handles {
-            handle
-                .await
+        for i in 1..=2u16 {
+            let recorded = PendingTm::load(&dir.join(format!("node{i}")))
                 .unwrap()
-                .expect("cycle completes after confirmation");
+                .expect("every node records what its posted movement owes the tries");
+            assert_eq!(recorded.txid, tms[0].txid);
+            assert_eq!(
+                recorded.spends, fixture.treasury_outpoint,
+                "the record must name the head the movement spends — that is what the fold \
+                 watches for"
+            );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The settlement half: the fold is due when the chain moves off the head
+    /// the recorded movement spends, and NOT before.
+    ///
+    /// Nothing is carried in memory between the two calls — `settle_pending_tm`
+    /// reads the file — so this is also the restart case: a node that posted a
+    /// movement, died, and came back folds it the first time it sees the head.
+    #[test]
+    fn a_recorded_movement_folds_when_the_head_moves_and_not_before() {
+        use crate::cardano::spi_trie::SpiTrie;
+        use crate::epoch::pending_tm::PendingTm;
+
+        let dir = std::env::temp_dir().join(format!("wi032-settle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = fast_config(Identifier::try_from(1u16).unwrap());
+        config.state_dir = Some(dir.clone());
+
+        let spent = spi_op(0xaa, 0);
+        let a = spi_op(0x01, 0);
+        let root = SpiTrie::empty().root_after(&[spent, a]).unwrap();
+        let tm = spi_tm(&[spent, a], root);
+        record_movement_phase(&config, 7, &tm).expect("the movement is recorded");
+
+        // The head is still the outpoint the movement spends: it has not
+        // confirmed, so there is nothing to fold.
+        let mut treasury = treasury_at(outpoint(spent));
+        settle_pending_tm(&config, &treasury).expect("an unconfirmed movement is not an error");
+        assert!(
+            SpiTrie::load(&dir).unwrap().is_none(),
+            "nothing may be folded while the movement is still in flight"
+        );
+        assert!(
+            PendingTm::load(&dir).unwrap().is_some(),
+            "the record must survive until the fold actually happens"
+        );
+
+        // The head advances to the movement's own change output.
+        treasury.outpoint = bitcoin::OutPoint {
+            txid: tm.txid,
+            vout: 0,
+        };
+        settle_pending_tm(&config, &treasury).expect("the fold succeeds");
+        let trie = SpiTrie::load(&dir)
+            .unwrap()
+            .expect("the trie is now persisted");
+        assert_eq!(trie.root(), root);
+        assert!(trie.contains(&a));
+        assert!(
+            PendingTm::load(&dir).unwrap().is_none(),
+            "a folded record is cleared, so the next movement's cannot be confused with it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A head that moved to a movement this node did NOT record reaches the same
+    /// root check `advance_*_trie` has always applied — the trie is not written,
+    /// the record is not cleared, and the message names the repair.
+    ///
+    /// This is what a node that was down across someone else's movement sees,
+    /// and it is the one case the fold cannot resolve by itself.
+    #[test]
+    fn a_head_this_node_cannot_explain_is_refused_and_names_the_repair() {
+        use crate::cardano::spi_trie::SpiTrie;
+        use crate::epoch::pending_tm::PendingTm;
+
+        let dir = std::env::temp_dir().join(format!("wi032-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = fast_config(Identifier::try_from(1u16).unwrap());
+        config.state_dir = Some(dir.clone());
+
+        let spent = spi_op(0xaa, 0);
+        // A movement whose committed spi_root is not the one this node's trie
+        // reaches — i.e. not the movement the chain actually confirmed.
+        let tm = spi_tm(&[spent, spi_op(0x01, 0)], [9u8; 32]);
+        record_movement_phase(&config, 7, &tm).expect("the movement is recorded");
+
+        let mut treasury = treasury_at(outpoint(spent));
+        treasury.outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_slice(&[0x77; 32]).unwrap(),
+            vout: 0,
+        };
+        let err =
+            settle_pending_tm(&config, &treasury).expect_err("an unexplained head is refused");
+        let msg = err.to_string();
+        assert!(msg.contains("reconstruct-spi-trie"), "{msg}");
+        assert!(
+            SpiTrie::load(&dir).unwrap().is_none(),
+            "a refused fold must not write the trie"
+        );
+        assert!(
+            PendingTm::load(&dir).unwrap().is_some(),
+            "a refused fold must keep the record — dropping it would hide the divergence"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// WI-014 #5 restart recovery: with a persisted DKG for the epoch,
@@ -3162,6 +3356,30 @@ mod tests {
         }
     }
 
+    /// The record a posted movement leaves behind — the only thing the fold ever
+    /// sees, in the machine as in these tests.
+    fn pending(tm: &TreasuryMovement) -> crate::epoch::pending_tm::PendingTm {
+        crate::epoch::pending_tm::PendingTm::from_movement(0, tm).expect("a movement has inputs")
+    }
+
+    /// A treasury head at `outpoint`. Only the outpoint decides whether a
+    /// recorded movement is due to be folded, so the keys are the fixture's and
+    /// nothing here depends on them.
+    fn treasury_at(outpoint: bitcoin::OutPoint) -> crate::epoch::traits::TreasuryUtxo {
+        let f = demo_static_fixture(2, 2, 19_900);
+        crate::epoch::traits::TreasuryUtxo {
+            outpoint,
+            value: f.treasury_value,
+            y_51: f.y_51,
+            y_fed: f.y_fed,
+            config_y_fed: f.y_fed,
+            authorized_key: f.y_51,
+            federation_csv_blocks: f.federation_csv_blocks,
+            pegin_refund_timeout_blocks: 720,
+            btc_confirmed: true,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // WI-097: the batch grid paces the movements, the boundary paces the ceremony
     // -----------------------------------------------------------------------
@@ -3285,6 +3503,148 @@ mod tests {
             1,
             "the DKG runs once per EPOCH — a second movement must not rotate the treasury key"
         );
+    }
+
+    /// WI-032 end to end, and the reason the fold matters at all: the peg-out the
+    /// FIRST movement paid must be in this node's completed-peg-outs trie by the
+    /// time it builds the SECOND, or it pays the same withdrawal twice.
+    ///
+    /// The request UTxO is still open at the second movement — that is the normal
+    /// state, since completing it needs the Bitcoin confirmation plus a membership
+    /// proof, hours later or never — so the trie is the ONLY thing that can tell
+    /// the two apart (WI-031). Which makes this the test that covers the whole
+    /// path: `RecordMovement` persists, the batch loop's `settle_pending_tm` folds
+    /// on observing the head move, and `build_tm` reads the result.
+    ///
+    /// Before this change the fold ran only inside a blocking wait that could not
+    /// succeed, so the second movement re-paid the first's peg-out.
+    #[tokio::test]
+    async fn the_second_movement_does_not_re_pay_what_the_first_one_paid() {
+        use crate::cardano::cpo_trie::CpoTrie;
+        use crate::epoch::fixture::StaticPegOut;
+        use crate::epoch::pending_tm::PendingTm;
+        use bitcoin::Amount;
+
+        let dir = std::env::temp_dir().join(format!("wi032-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut fixture = demo_static_fixture(2, 2, 19_500);
+        let dest = p2wpkh(0x09);
+        let gross = Amount::from_sat(50_000);
+        fixture.pegouts.push(StaticPegOut {
+            script_pubkey: dest.clone(),
+            amount: gross,
+            created_slot: 0,
+            created: now_ms(),
+        });
+
+        let hub = MockPeerHub::new();
+        // One grid, one treasury, one bridge-state singleton — all shared, as on
+        // chain. The singleton starts at the empty roots (a bridge with no
+        // history) and advances with each submitted movement.
+        let grid = Arc::new(std::sync::Mutex::new(crate::epoch::mocks::open_at(slot(1))));
+        let head = MockCardanoChain::tm_chain_head(&fixture);
+        let roots = MockCardanoChain::bridge_roots_state(
+            crate::cardano::spi_trie::SpiTrie::empty().root(),
+            CpoTrie::empty().root(),
+        );
+
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone())
+                    .with_batch_window(Arc::clone(&grid))
+                    .with_tm_chain(Arc::clone(&head))
+                    .with_shared_bridge_roots(Arc::clone(&roots))
+                    .advancing_batch_on_submit(),
+            );
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let mut config = fast_config(id);
+            let node_dir = dir.join(format!("node{i}"));
+            config.state_dir = Some(node_dir.clone());
+            handles.push(tokio::spawn(async move {
+                let mut built = BuiltBatch::default();
+                let (first, resume) = drive_to_movement(
+                    &chain,
+                    &pegin,
+                    &peers,
+                    &clock,
+                    &rng,
+                    &config,
+                    EpochPhase::Idle,
+                    &mut built,
+                )
+                .await?;
+                // The first movement is posted, not yet folded: it is recorded,
+                // and nothing has touched the tries.
+                assert!(
+                    PendingTm::load(&node_dir).unwrap().is_some(),
+                    "a posted movement must be recorded before anything waits on it"
+                );
+                assert!(
+                    CpoTrie::load(&node_dir).unwrap().is_none(),
+                    "an unconfirmed movement must not advance the trie"
+                );
+                let (second, _) = drive_to_movement(
+                    &chain, &pegin, &peers, &clock, &rng, &config, resume, &mut built,
+                )
+                .await?;
+                Ok::<_, EpochError>((first, second, node_dir))
+            }));
+        }
+
+        let mut movements = Vec::new();
+        for h in handles {
+            movements.push(
+                tokio::time::timeout(Duration::from_secs(30), h)
+                    .await
+                    .expect("neither movement may block on a confirmation")
+                    .unwrap()
+                    .expect("both movements complete"),
+            );
+        }
+
+        let payments = |tm: &TreasuryMovement| -> Vec<bitcoin::TxOut> {
+            tm.unsigned_tx
+                .output
+                .iter()
+                .filter(|o| !o.script_pubkey.is_op_return() && !o.script_pubkey.is_p2tr())
+                .cloned()
+                .collect()
+        };
+        let (first, second, node_dir) = &movements[0];
+        assert_eq!(
+            payments(first).len(),
+            1,
+            "the first movement pays the request"
+        );
+        assert_eq!(payments(first)[0].script_pubkey, dest);
+        assert!(
+            payments(second).is_empty(),
+            "the second movement must not re-pay a request the first already paid — the \
+             completed-peg-outs trie is the only record that can tell them apart, and it only \
+             holds the payment if the fold happened: got {:?}",
+            payments(second)
+        );
+
+        // ...and it holds it because the fold ran, on both nodes.
+        for (_, _, node_dir) in &movements {
+            let trie = CpoTrie::load(node_dir)
+                .unwrap()
+                .expect("the confirmed movement was folded into the trie");
+            assert!(trie.contains(&crate::epoch::mocks::fixture_por_id(&dest, gross)));
+        }
+        // The record now names the SECOND movement: the first was cleared when it
+        // was folded, so the two can never be confused.
+        assert_eq!(
+            PendingTm::load(node_dir).unwrap().map(|p| p.txid),
+            Some(second.txid)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The gate the spec states at each `B_i`: with a movement already in flight
@@ -3581,8 +3941,8 @@ mod tests {
         let a = spi_op(0x01, 0);
         let b = spi_op(0x02, 3);
         let root = SpiTrie::empty().root_after(&[t, a, b]).unwrap();
-        let tm = spi_tm(&[t, a, b], root);
-        advance_spi_trie(&config, 0, &tm).expect("a matching root advances the trie");
+        let tm = pending(&spi_tm(&[t, a, b], root));
+        advance_spi_trie(&config, &dir, &tm).expect("a matching root advances the trie");
 
         let trie = SpiTrie::load(&dir).unwrap().expect("trie persisted");
         assert_eq!(trie.root(), root);
@@ -3592,8 +3952,8 @@ mod tests {
         assert_eq!(trie.get(&a), Some(t.as_slice()));
 
         // A divergent spi_root is refused, and the persisted trie stays put.
-        let tm_bad = spi_tm(&[spi_op(0xbb, 0), spi_op(0x03, 1)], [9u8; 32]);
-        advance_spi_trie(&config, 0, &tm_bad).expect_err("a divergent root must be refused");
+        let tm_bad = pending(&spi_tm(&[spi_op(0xbb, 0), spi_op(0x03, 1)], [9u8; 32]));
+        advance_spi_trie(&config, &dir, &tm_bad).expect_err("a divergent root must be refused");
         let untouched = SpiTrie::load(&dir).unwrap().expect("trie still present");
         assert_eq!(
             untouched.root(),
@@ -3601,10 +3961,36 @@ mod tests {
             "a refused TM must not change the file"
         );
 
-        // No state_dir → nothing to advance, and no error.
-        config.state_dir = None;
-        advance_spi_trie(&config, 0, &tm).expect("no state_dir keeps no trie");
-
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node with no `state_dir` tracks no tries, so a movement it co-signs
+    /// leaves nothing behind and neither half of the fold errors on it.
+    ///
+    /// It does WARN, once per movement — its tries fall further behind with each
+    /// one and the divergence surfaces much later, as a refusal to build — but
+    /// this asserts the state, not the log line; the warning's rationale lives in
+    /// `record_movement_phase`'s doc.
+    #[test]
+    fn a_node_without_a_state_dir_records_nothing() {
+        use crate::cardano::spi_trie::SpiTrie;
+        use crate::epoch::pending_tm::PendingTm;
+
+        let dir = std::env::temp_dir().join(format!("wi032-nostate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = fast_config(Identifier::try_from(1u16).unwrap());
+        config.state_dir = None;
+
+        let tm = spi_tm(&[spi_op(0xaa, 0)], SpiTrie::empty().root());
+        record_movement_phase(&config, 7, &tm).expect("an untracking node is not an error");
+        settle_pending_tm(&config, &treasury_at(outpoint(spi_op(0xbb, 0))))
+            .expect("with no record there is nothing to fold");
+        assert!(
+            !dir.exists(),
+            "a node with no state_dir must not write state anywhere"
+        );
+        // And nothing was recorded for a directory it does not have.
+        config.state_dir = Some(dir.clone());
+        assert_eq!(PendingTm::load(&dir).unwrap(), None);
     }
 }

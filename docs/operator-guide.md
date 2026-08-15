@@ -604,9 +604,22 @@ WI-058]**, which adds a periodic heartbeat and a `heimdall status` command, beca
 
 ### State
 
-`/var/lib/heimdall` (`0700`) holds your bifrost identity key and the current epoch's DKG signing
-share. Losing it means the node cannot resume the epoch it was in and must sit out until the next
-one; losing the identity key means re-registering. Back it up.
+`/var/lib/heimdall` (`0700`) holds four things, and they are not equally replaceable:
+
+| file | losing it costs |
+|---|---|
+| bifrost identity key | re-registration |
+| DKG signing share | the current epoch — the node sits out until the next boundary |
+| `cpo-trie.json`, `spi-trie.json` | a rebuild: `heimdall reconstruct-cpo-trie` / `reconstruct-spi-trie` walk chain history and refuse anything they cannot explain |
+| `pending-tm.json` | the fold for one posted movement, which then needs the same rebuild |
+
+Back the directory up. The two tries are **cumulative** — they are the bridge's record of what has
+already been paid and already been swept — so a node whose tries are behind the chain refuses to
+build rather than sign a root the chain does not hold. That refusal is loud and it names the
+command; it is not a state you can wait out.
+
+`pending-tm.json` is the movement this node has posted and not yet folded. It exists because
+confirmation takes ~17 hours, and the node must be free to restart during them.
 
 ### Upgrades
 
@@ -647,6 +660,7 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 | peers seem not to see you | step 5 — is the registered port open and reachable *from outside*? |
 | `[3/8] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
 | a key you set is `refused` at load | it names a value the Config publishes; delete it, and `show-config-params` prints what the chain says |
+| `trie diverged` or `trie is out of sync with the chain` | this node's cumulative state is behind the bridge's — run the `reconstruct-…` command the message names; it rebuilds from chain history and refuses anything it cannot explain |
 | a transaction is refused | read the whole message: the min-stake gate and the preflight both refuse loudly rather than submitting something wrong |
 | it refuses to start over `cardano.fault_proof_srs_path` | you have DKG fault enforcement configured on mainnet against a setup that is not trustworthy — see [the fault-proof trusted setup](fault-proof-srs.md) |
 
