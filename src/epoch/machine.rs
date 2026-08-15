@@ -3846,6 +3846,74 @@ mod tests {
         }
     }
 
+    /// WI-098: a peer that answers with an ERROR is signed around, exactly like
+    /// one that stays silent — and two nodes seeing the same peer differently
+    /// still close the same S1.
+    ///
+    /// This is the sharper half of WI-047's stall. A 404 and a refused connection
+    /// already reached the poll as `Ok(None)`; a 502 from a reverse proxy or a 500
+    /// from a peer mid-restart arrived as `Err` and aborted the whole round before
+    /// any deadline or threshold code ran — which is precisely the peer the
+    /// threshold poll exists to survive, one that is up and unhealthy rather than
+    /// down.
+    ///
+    /// The asymmetry is what makes it worse than a race: node 2 sees spo 3 as
+    /// erroring while node 1 sees the same peer as merely silent, at the same
+    /// instant, with no timing skew involved at all. Before this, node 1 closed S1
+    /// on {1,2} and signed while node 2 unwound into backoff — so the two could not
+    /// aggregate even though nothing was wrong with either of them.
+    #[tokio::test]
+    async fn a_peer_that_errors_is_signed_around_like_one_that_is_silent() {
+        let fixture = demo_static_fixture(2, 3, 19_950);
+        let hub = MockPeerHub::new();
+        let spo3 = Identifier::try_from(3u16).unwrap();
+        let mut handles = Vec::new();
+        for i in 1..=3u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let net = MockPeerNetwork::new(id, hub.clone());
+            // spo 3 goes dark for signing: silent to everyone. spo 2 additionally
+            // gets a 502 where spo 1 gets that silence — same peer, same moment,
+            // different observation.
+            let net = match i {
+                3 => net.muting_sign_publishes(),
+                2 => net.seeing_unreachable(spo3),
+                _ => net,
+            };
+            let peers: Arc<dyn PeerNetwork> = Arc::new(net);
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        let spo3_handle = handles.pop().expect("three nodes");
+
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(
+                tokio::time::timeout(Duration::from_secs(30), h)
+                    .await
+                    .expect(
+                        "a peer answering 502 must be counted absent, not abort the round — the \
+                         node that saw the error would otherwise never finish",
+                    )
+                    .unwrap()
+                    .expect("the movement completes on the threshold subset"),
+            );
+        }
+        assert_eq!(
+            tms[0].txid, tms[1].txid,
+            "the node that saw a 502 and the node that saw silence must close the SAME S1: a \
+             different subset is a different SigningPackage, and their shares would not aggregate"
+        );
+        // spo 3 published nothing and cannot complete; it is the absentee, not a
+        // participant.
+        spo3_handle.abort();
+    }
+
     /// WI-048: a movement whose round FAILED AFTER PUBLISHING does not rebuild
     /// at the same opportunity.
     ///

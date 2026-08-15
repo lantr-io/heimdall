@@ -853,6 +853,11 @@ pub struct MockPeerNetwork {
     /// DKG normally. Models the peer that goes dark exactly at a signing round,
     /// which is what forces the round past its deadline on everyone else.
     mute_sign: bool,
+    /// Peers whose signing endpoints THIS node sees as erroring — a 502 from a
+    /// reverse proxy, a 500 from a peer mid-restart. Per-observer on purpose: the
+    /// case that matters is ASYMMETRIC, one node getting an error where another
+    /// gets a clean 404 for the same peer at the same instant (WI-098).
+    unreachable_sign: std::collections::BTreeSet<Identifier>,
 }
 
 impl MockPeerNetwork {
@@ -861,6 +866,7 @@ impl MockPeerNetwork {
             me,
             hub,
             mute_sign: false,
+            unreachable_sign: std::collections::BTreeSet::new(),
         }
     }
 
@@ -868,6 +874,13 @@ impl MockPeerNetwork {
     #[must_use]
     pub fn muting_sign_publishes(mut self) -> Self {
         self.mute_sign = true;
+        self
+    }
+
+    /// See [`MockPeerNetwork::unreachable_sign`].
+    #[must_use]
+    pub fn seeing_unreachable(mut self, peer: Identifier) -> Self {
+        self.unreachable_sign.insert(peer);
         self
     }
 }
@@ -999,6 +1012,11 @@ impl PeerNetwork for MockPeerNetwork {
         ns: SignNamespace,
         peer: &SpoInfo,
     ) -> EpochResult<Option<frost_secp256k1_tr::round1::SigningCommitments>> {
+        if self.unreachable_sign.contains(&peer.identifier) {
+            return Err(EpochError::Peer(
+                "mock: HTTP 502 from the peer's signing endpoint".into(),
+            ));
+        }
         Ok(with_slot(&self.hub, peer.identifier, |s| {
             s.sign1.get(&ns).copied()
         }))
@@ -1009,16 +1027,15 @@ impl PeerNetwork for MockPeerNetwork {
         ns: SignNamespace,
         peer: &SpoInfo,
     ) -> EpochResult<Option<frost_secp256k1_tr::round2::SignatureShare>> {
+        if self.unreachable_sign.contains(&peer.identifier) {
+            return Err(EpochError::Peer(
+                "mock: HTTP 502 from the peer's signing endpoint".into(),
+            ));
+        }
         Ok(with_slot(&self.hub, peer.identifier, |s| {
             s.sign2.get(&ns).copied()
         }))
     }
-}
-
-// Suppress unused-field warning when no test exercises errors.
-#[allow(dead_code)]
-fn _assert_error_used() -> EpochError {
-    EpochError::Peer("unused".into())
 }
 
 // ---------------------------------------------------------------------------

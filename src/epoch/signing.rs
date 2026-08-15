@@ -642,23 +642,66 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
     // peers answered.
     let need = peer_infos.len() + 1;
     let deadline = clock.deadline(config.quorum51_timeout);
+    // Peers whose fetch is currently FAILING, and why (WI-098). Cleared for a
+    // peer the moment it answers, so a blip that recovers inside the round is
+    // never reported.
+    let mut unreachable: BTreeMap<Identifier, String> = BTreeMap::new();
     loop {
         for peer in peer_infos {
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            if let Some(value) = T::fetch(peers, ns, peer).await? {
-                crate::epoch_debug!(
-                    me,
-                    ns.epoch,
-                    "     received round{} for {} from spo={} ({}/{})",
-                    T::ROUND,
-                    ns.session_label(),
-                    id_short(peer.identifier),
-                    out.len() + 1,
-                    need
-                );
-                out.insert(peer.identifier, value);
+            // A per-peer fetch failure is THIS PEER HAS NOT PUBLISHED, never a
+            // failure of the round (WI-098). `fetch_raw` already maps a refused
+            // connection and a 404 to `Ok(None)`; a 502 from a reverse proxy, a
+            // 500 from a peer mid-restart and a truncated body arrive here as
+            // `Err` instead, and propagating them aborted the round before any
+            // deadline or threshold code ran — exactly the case the threshold
+            // poll exists to survive.
+            //
+            // It is also the sharper divergence: node A getting a 404 from peer C
+            // closes S1 without it while node B getting a 503 from the same C at
+            // the same instant unwinds into backoff. Different S1, no aggregation,
+            // and unlike the WI-077 race it needs no timing skew at all. The spec's
+            // rule is one bucket — unreachable, unparseable and silent are all
+            // "not published before the deadline" (§Failure handling).
+            //
+            // Scoped to the round on purpose: a fetch error in the DKG or a chain
+            // read still means what it means.
+            match T::fetch(peers, ns, peer).await {
+                Ok(Some(value)) => {
+                    crate::epoch_debug!(
+                        me,
+                        ns.epoch,
+                        "     received round{} for {} from spo={} ({}/{})",
+                        T::ROUND,
+                        ns.session_label(),
+                        id_short(peer.identifier),
+                        out.len() + 1,
+                        need
+                    );
+                    out.insert(peer.identifier, value);
+                    unreachable.remove(&peer.identifier);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // Once per peer per round, not once per poll: at a 10 ms
+                    // interval against a 30-minute window the second form is tens
+                    // of thousands of identical lines.
+                    if unreachable.insert(peer.identifier, e.to_string()).is_none() {
+                        crate::epoch_warn!(
+                            me,
+                            ns.epoch,
+                            "     round{} for {}: spo={} is UNREACHABLE ({e}) — counting it \
+                             absent for this round and continuing. A peer that answers with an \
+                             error is not the same fault as one that stays silent; it is up and \
+                             unhealthy",
+                            T::ROUND,
+                            ns.session_label(),
+                            id_short(peer.identifier),
+                        );
+                    }
+                }
             }
         }
         // Everyone answered, so the set is unambiguous and no deadline is needed
@@ -667,10 +710,43 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
             return Ok(Vec::new());
         }
         if clock.now() >= deadline {
+            // Who was merely silent, and who answered with an error. The absentee
+            // list treats them alike — the spec requires that, or two nodes would
+            // close different subsets — but the OPERATOR needs them apart: silence
+            // is a peer that is down or not participating, an error is a peer that
+            // is up and broken, and only the second is worth paging about. WI-103
+            // carries this distinction out of the round as data; here it reaches
+            // the log, which is where it is needed when a round has just failed.
+            let unreachable_note = || {
+                if unreachable.is_empty() {
+                    String::new()
+                } else {
+                    let mut listed: Vec<String> = unreachable
+                        .iter()
+                        .map(|(id, why)| format!("{} ({why})", id_short(*id)))
+                        .collect();
+                    listed.sort();
+                    format!(" UNREACHABLE (up but erroring): {}.", listed.join(", "))
+                }
+            };
             // The deadline is what FIXES the subset. Below the threshold the
             // round is simply unavailable; at or above it, proceed with exactly
             // who answered and name who did not.
             if out.len() < min {
+                // Say WHY before failing. Since a fetch error no longer aborts the
+                // round, an all-peers-erroring outage would otherwise surface as a
+                // bare "got 1, need 2" with nothing pointing at the cause.
+                crate::epoch_warn!(
+                    me,
+                    ns.epoch,
+                    "     round{} for {} closed at the deadline with {}/{}, below the {min} \
+                     required — the round is unavailable.{}",
+                    T::ROUND,
+                    ns.session_label(),
+                    out.len(),
+                    need,
+                    unreachable_note(),
+                );
                 return Err(EpochError::PollTimeout {
                     got: out.len(),
                     need: min,
@@ -685,12 +761,13 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                     ns.epoch,
                     "     round{} for {} reached the threshold ({}/{}) but WITHOUT spo={}, whose \
                      participation the round needs — failing the round rather than signing \
-                     something that cannot be acted on",
+                     something that cannot be acted on.{}",
                     T::ROUND,
                     ns.session_label(),
                     out.len(),
                     need,
                     id_short(id),
+                    unreachable_note(),
                 );
                 return Err(EpochError::PollTimeout {
                     got: out.len(),
@@ -706,7 +783,7 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                 me,
                 ns.epoch,
                 "     round{} for {} closed at the deadline with {}/{} — proceeding on the \
-                 threshold ({min} required). Absent: {}",
+                 threshold ({min} required). Absent: {}.{}",
                 T::ROUND,
                 ns.session_label(),
                 out.len(),
@@ -715,7 +792,8 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                     .iter()
                     .map(|id| id_short(*id).to_string())
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                unreachable_note(),
             );
             return Ok(absent);
         }
