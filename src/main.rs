@@ -12,7 +12,6 @@ use heimdall::cardano::pegin_source::CardanoPegInSource;
 use heimdall::cardano::treasury_datum::TreasuryConfig;
 use heimdall::config::HeimdallConfig;
 use heimdall::epoch::mocks::{MockCardanoChain, OsRngSource, SeededRngSource, SystemClock};
-use heimdall::epoch::run_epoch_loop;
 use heimdall::epoch::state::SpoIdentity;
 use heimdall::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use heimdall::federation::roster::FederationMember;
@@ -74,6 +73,11 @@ enum Commands {
         /// compiled defaults. CLI flags override TOML values.
         #[arg(long)]
         config: Option<String>,
+        /// Run the startup checks, print the whole report, and exit — without
+        /// joining anything. The dry run to do after editing the config and
+        /// before enabling the service; exits non-zero if any check failed.
+        #[arg(long)]
+        check: bool,
         /// Legacy fallback: this SPO's 1-based roster index, used only for the
         /// config/mock fixture demo (whose roster carries no bifrost_id_pk). With
         /// a real on-chain roster the node identifies itself by its bifrost key.
@@ -970,7 +974,7 @@ fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
         Some(f) => Err(format!(
             "startup preflight failed at step {} ({}) — refusing to start. \
              Fix what is listed above and re-check with \
-             `heimdall run-mover --config <file> --once`.",
+             `heimdall run-spo --config <file> --check`.",
             f.n, f.title
         )),
     }
@@ -1134,6 +1138,7 @@ fn main() {
     match cli.command {
         Commands::RunSpo {
             config,
+            check,
             index,
             min_signers,
             max_signers,
@@ -1186,6 +1191,19 @@ fn main() {
                         cfg.cardano.mnemonic = Some(v);
                     }
                 }
+            }
+
+            // WI-053's startup gate, which used to run only in `run-mover`.
+            // This is the packaged daemon now, so it is the one that has to
+            // refuse to start on a misconfiguration rather than join a ceremony
+            // with a bridge view that disagrees with everyone else's.
+            if let Err(e) = run_preflight_gate(&cfg) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+            if check {
+                println!("\nstartup checks passed — this node is configured for the bridge above");
+                return;
             }
 
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -2268,24 +2286,38 @@ async fn run_spo(
     }
 
     let t0 = Instant::now();
-    // The epoch loop backs off and re-enters `Idle` on EVERY error, so it does
-    // not return Err at all today — this arm is unreachable by construction and
-    // kept only because the signature is still `EpochResult`. It must NOT go
-    // back to parking on Ctrl-C: that is exactly what froze an honest node on a
-    // stale roster (2026-07-22), because re-deriving the roster is something
-    // only the loop does. If a future change reintroduces an error exit, say so
-    // plainly and let the supervisor restart us.
-    let tm = match run_epoch_loop(chain, pegin_source, peers, clock, rng, &config).await {
-        Ok(tm) => tm,
+    // Cycle after cycle, for ever. `run_epoch_loop` completes ONE cycle and
+    // returns the movement it made; this node used to stop there and park on
+    // Ctrl-C, so it produced exactly one Treasury Movement per process start and
+    // then sat with its HTTP server answering while taking part in nothing. That
+    // is the same frozen-node shape the retry policy below exists to prevent,
+    // arrived at by succeeding rather than by failing.
+    //
+    // Errors never reach here: every retriable failure backs off and re-enters
+    // `Idle` inside the loop, which is what re-derives the roster from chain. An
+    // error return would mean that contract broke, so say so plainly and let the
+    // supervisor restart us rather than parking.
+    let mut cycles: u64 = 0;
+    let err =
+        heimdall::epoch::run_epoch_daemon(chain, pegin_source, peers, clock, rng, &config, |tm| {
+            cycles += 1;
+            info!("Cycle {cycles} complete ({:.2?} since start)", t0.elapsed());
+            log_tm_summary(tm);
+            info!("=== SPO {spo_label} cycle {cycles} complete — waiting for the next epoch ===");
+        })
+        .await;
+    match err {
+        Ok(never) => match never {},
         Err(e) => {
-            error!("[demo] epoch loop returned unexpectedly: {e}");
-            error!("[demo] this should not happen — the loop is meant to retry indefinitely.");
+            error!("[run-spo] epoch loop returned unexpectedly after {cycles} cycle(s): {e}");
+            error!("[run-spo] this should not happen — the loop is meant to retry indefinitely.");
             std::process::exit(1);
         }
-    };
-    info!("Cycle complete ({:.2?})", t0.elapsed());
+    }
+}
 
-    // ── Bitcoin TM transaction summary ──────────────────────────────────────
+/// Log one completed Treasury Movement: inputs, outputs, size and raw bytes.
+fn log_tm_summary(tm: &heimdall::epoch::state::TreasuryMovement) {
     info!("── Bitcoin Treasury Movement ──");
     info!("  txid:    {}", tm.txid);
     info!("  inputs:  {}", tm.unsigned_tx.input.len());
@@ -2317,11 +2349,6 @@ async fn run_spo(
     let signed_bytes = bitcoin::consensus::encode::serialize(&tm.unsigned_tx);
     info!("  size:    {} bytes", signed_bytes.len());
     info!("  hex:     {}", hex::encode(&signed_bytes));
-
-    info!("=== SPO {spo_label} cycle complete ===");
-
-    info!("Server still running on {bind_addr}:{port}; press Ctrl-C to exit.");
-    tokio::signal::ctrl_c().await.ok();
 }
 
 /// Build a `MockCardanoChain` from the fixture, wiring up the Bitcoin
@@ -2633,6 +2660,116 @@ async fn resolve_federation(
         .transpose()?;
     heimdall::cardano::federation::resolve(&cfg.bitcoin, share, config.as_ref().map(|v| &v.params))
         .map_err(|e| format!("{e}\n{}", e.fix()))
+}
+
+/// Substring identifying [`assert_mover_key_owns_treasury`]'s refusal, so the
+/// unattended loop can tell a permanent misconfiguration from a transient tick
+/// failure.
+///
+/// A marker rather than a typed error because the sweep's whole surface is
+/// `Result<(), String>`; threading a variant through it would touch every caller
+/// to distinguish one case. The cost of getting this wrong is bounded and in the
+/// safe direction — a missed match means the loop keeps retrying, which is what
+/// it did before.
+const MOVER_KEY_MISMATCH: &str = "signs with the DETERMINISTIC DEMO key";
+
+/// Refuse to sweep a treasury this node's key cannot spend.
+///
+/// `sweep-pegins` / `run-mover` sign with a key reproduced from a CONSTANT — the
+/// deterministic demo DKG seed, every share held in one process. On any bridge
+/// not deployed with that key, the signature they produce verifies against
+/// nothing. Nothing checked it, so the failure surfaced as a Treasury Movement
+/// posted to Cardano carrying a Bitcoin transaction no watchtower could relay:
+/// valid-looking, structurally correct, unspendable. The mover would then keep
+/// producing them, one per batch opportunity, each burning a Cardano fee.
+///
+/// The test is against the treasury_info datum's `current_spos_frost_key` — the
+/// key the bridge AUTHORIZES — rather than the head's scriptPubKey, which would
+/// be exact but costs a full TM-address history walk per tick. The gap between
+/// them is the handoff window (Cardano rotated, the BTC has not moved yet), and
+/// in that window a demo-keyed mover is wrong either way, so the cheaper read
+/// loses nothing that matters here.
+///
+/// Silent when the datum cannot be read: a fixture/mock deployment has no
+/// treasury_info at all, and that is the one configuration where the demo key IS
+/// the treasury's. Refusing there would break the demos this command exists for.
+fn assert_mover_key_owns_treasury(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+    y_51: bitcoin::key::UntweakedPublicKey,
+) -> Result<(), String> {
+    use heimdall::cardano::roster::RegistryRosterSource;
+
+    let config = rt.block_on(config_view_async(cfg)).ok().flatten();
+    let Ok(Some(source)) =
+        RegistryRosterSource::resolve(&cfg.cardano, config.as_ref().map(|v| &v.params))
+    else {
+        info!(
+            "  [mover] no on-chain treasury_info to check the signing key against — assuming the \
+             fixture deployment, where the demo key IS the treasury's"
+        );
+        return Ok(());
+    };
+    let utxos = match rt.block_on(heimdall::cardano::bf_http::fetch_address_utxos(
+        &heimdall::cardano::bf_http::base_url(
+            cfg.cardano.blockfrost_project_id.as_deref().unwrap_or(""),
+            cfg.cardano.blockfrost_url.as_deref(),
+        ),
+        cfg.cardano.blockfrost_project_id.as_deref().unwrap_or(""),
+        &source.treasury_info_address,
+    )) {
+        Ok(u) => u,
+        Err(e) => {
+            warn!("  [mover] could not read treasury_info to check the signing key: {e}");
+            return Ok(());
+        }
+    };
+    let state = match heimdall::cardano::treasury_spend::find_treasury_state(
+        &utxos,
+        &source.treasury_info_policy_hex,
+        &source.treasury_info_asset_name_hex,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("  [mover] could not locate the treasury_info state: {e}");
+            return Ok(());
+        }
+    };
+    let authorized = bitcoin::key::UntweakedPublicKey::from_slice(
+        &state.datum.current_spos_frost_key,
+    )
+    .map_err(|e| {
+        format!(
+            "treasury_info current_spos_frost_key ({}) is not an x-only key: {e}",
+            hex::encode(&state.datum.current_spos_frost_key)
+        )
+    })?;
+    if authorized == y_51 {
+        return Ok(());
+    }
+    Err(mover_key_mismatch_error(y_51, authorized))
+}
+
+/// The refusal message, separated so a test can pin it against
+/// [`MOVER_KEY_MISMATCH`] — the coupling between a marker and the text it is
+/// meant to find is exactly the kind that rots silently when someone improves
+/// the wording.
+fn mover_key_mismatch_error(
+    y_51: bitcoin::key::UntweakedPublicKey,
+    authorized: bitcoin::key::UntweakedPublicKey,
+) -> String {
+    format!(
+        "this command signs with the DETERMINISTIC DEMO key ({}), but the bridge authorizes {} \
+         to move the treasury. Every signature it produced would verify against nothing, and the \
+         Treasury Movement posted to Cardano would carry a Bitcoin transaction no watchtower can \
+         relay — one dead movement and one wasted fee per batch.\n\nThis command is a demo and \
+         devnet tool: it holds every FROST share in one process, from a constant seed, so it can \
+         only ever spend a treasury deployed with that key. Moving a real bridge's treasury is \
+         `heimdall run-spo`, which co-signs with the other SPOs (or, before the first DKG, with \
+         the federation).",
+        hex::encode(y_51.serialize()),
+        hex::encode(authorized.serialize()),
+    )
 }
 
 /// Freeze the scanned peg-outs against `batch` — the CLI sweep's half of the rule
@@ -6418,6 +6555,15 @@ fn run_mover(
             return result;
         }
         if let Err(e) = result {
+            // A key that cannot move this treasury never becomes able to. Left to
+            // the normal retry it would log the same fatal misconfiguration once
+            // per batch for ever, which reads exactly like a healthy idle loop —
+            // and under systemd it never trips StartLimitBurst, so `systemctl
+            // --failed` stays empty while the daemon does nothing at all.
+            if e.contains(MOVER_KEY_MISMATCH) {
+                error!("[mover] {e}");
+                return Err(e);
+            }
             error!("[mover] tick #{tick} error (continuing): {e}");
             // A failed build must not consume its opportunity: clear the marker so the
             // next poll retries the same batch rather than waiting for the next one.
@@ -7015,6 +7161,11 @@ fn run_sweep_pegins(
     );
     let y_51 = group_xonly(dkg.public_key_package.verifying_key())?.xonly;
     info!("  FROST group key Y_51: {}", hex::encode(y_51.serialize()));
+    // Before ANY scanning, building or signing: can this key move this treasury
+    // at all? Checked first because everything below it is wasted otherwise, and
+    // because the mover runs unattended — a wrong answer here is not a failed
+    // command an operator sees, it is a dead movement per batch, indefinitely.
+    assert_mover_key_owns_treasury(&rt, cfg, y_51)?;
     // Same tree, resolved from the federation identity because this path derives Y_51 from
     // the demo DKG above rather than reading it off the oracle. The other three values are
     // the bridge's, and the mapping lives in one place.
@@ -7720,8 +7871,9 @@ fn print_frost_treasury(
 #[cfg(test)]
 mod tests {
     use super::{
-        cross_check_treasury, csv_depth_verdict, parse_cardano_outref, parse_hex_n, parse_key32,
-        parse_treasury_override, pool_id_bech32, ref_script_already_deployed,
+        MOVER_KEY_MISMATCH, cross_check_treasury, csv_depth_verdict, mover_key_mismatch_error,
+        parse_cardano_outref, parse_hex_n, parse_key32, parse_treasury_override, pool_id_bech32,
+        ref_script_already_deployed,
     };
 
     #[test]
@@ -7779,6 +7931,35 @@ mod tests {
             verify_registration(&sigs, &id_pk, slashed).is_err(),
             "signatures must not carry over to a different --bifrost-url"
         );
+    }
+
+    // ── the mover refuses a treasury its key cannot spend (WI-096) ─────
+
+    /// The unattended loop tells a permanent misconfiguration from a transient
+    /// tick failure by matching [`MOVER_KEY_MISMATCH`] in the error text. If the
+    /// wording drifts the match silently stops working, the mover goes back to
+    /// retrying for ever, and — under systemd — it never trips StartLimitBurst,
+    /// so the unit looks healthy while doing nothing. Cheap to pin, invisible
+    /// when it breaks.
+    #[test]
+    fn the_mover_stop_marker_matches_the_message_it_identifies() {
+        use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let key = |b: u8| {
+            Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[b; 32]).unwrap())
+                .x_only_public_key()
+                .0
+        };
+        let msg = mover_key_mismatch_error(key(0x11), key(0x22));
+        assert!(
+            msg.contains(MOVER_KEY_MISMATCH),
+            "the loop's stop condition no longer matches its own message: {msg}"
+        );
+        // Both keys named: "it does not match" is useless without which is which.
+        assert!(msg.contains(&hex::encode(key(0x11).serialize())), "{msg}");
+        assert!(msg.contains(&hex::encode(key(0x22).serialize())), "{msg}");
+        // And it must point at the command that CAN move a real treasury.
+        assert!(msg.contains("run-spo"), "{msg}");
     }
 
     // ── federation-spend: chain-sourced treasury + CSV gate (WI-094) ────

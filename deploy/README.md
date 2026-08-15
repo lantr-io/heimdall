@@ -1,7 +1,10 @@
 # Deploying Heimdall
 
-Two supported shapes, both running `heimdall run-mover` as a systemd service off the same static
-musl binary:
+Two shapes off the same static musl binary. They run DIFFERENT commands, because they are
+different jobs: the Debian package runs the SPO daemon (`heimdall run-spo`), which joins the DKG
+and co-signs Treasury Movements with the rest of the roster; the NixOS module runs the WI-028
+auto-mover (`heimdall run-mover`), a single-process devnet/demo tool that cannot sign a real
+bridge's treasury.
 
 - **[Debian package](#debian-package)** — `heimdall.service`, config in `/etc/heimdall`. The
   general-purpose route, published on each release.
@@ -57,7 +60,7 @@ every fresh machine. After configuring:
 # One dry-run tick, AS THE SERVICE USER: the config is 0640 root:heimdall and
 # /var/lib/heimdall is 0700 heimdall, so running this as yourself cannot read the
 # config, and running it as root would leave root-owned files in the state dir.
-sudo -u heimdall heimdall run-mover --config /etc/heimdall/heimdall.toml --once
+sudo -u heimdall heimdall run-spo --config /etc/heimdall/heimdall.toml --check
 
 sudo systemctl enable --now heimdall
 journalctl -u heimdall -f
