@@ -76,9 +76,12 @@ Notes:
   `$HEIMDALL_MNEMONIC` only when `cardano.mnemonic` is absent from the config file, so leaving that
   key commented out is what activates the environment variable — and keeps the seed out of a file
   dpkg tracks and diffs on upgrade.
-- **Extra CLI flags go in `$HEIMDALL_ARGS`,** so `--broadcast` and `--interval-secs` can change
-  without editing the unit. A fresh install runs *without* `--broadcast`: every tick is a dry run
-  until you add it.
+- **`$HEIMDALL_ARGS` ships empty, and for a normal node it stays empty.** `run-spo` has no
+  cadence flag — movements fall on the bridge's on-chain batch grid, which is not a local
+  setting — and no `--broadcast`: a configured, registered node participates from its first
+  start. The way to look before enabling is `--check` above, which joins nothing. (`--broadcast`
+  and `--interval-secs` are `run-mover` flags; `run-spo` rejects unknown arguments, so leaving one
+  in this file stops the unit before any check runs.)
 - **No Bitcoin node is needed.** The unit orders after `network-online.target` only. heimdall posts
   Treasury Movements to Cardano; the watchtowers relay them to Bitcoin.
 - **`apt purge` leaves `/var/lib/heimdall` and the `heimdall` user alone** — the directory holds the

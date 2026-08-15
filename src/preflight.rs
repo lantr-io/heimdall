@@ -141,6 +141,34 @@ impl Builder {
     }
 }
 
+/// What to do about step 6 when this node is simply not registered yet.
+///
+/// Named rather than inline because this is the failure an operator is MOST
+/// likely to meet — it is the state of every node between installing the package
+/// and running `register-spo` — and the words are the whole point. It has to open
+/// by saying the node is fine, or the reader goes hunting for a misconfiguration
+/// they have not made; it has to give the command; and it has to name the one
+/// other thing the same symptom can mean, because "registered, wrong skey_path"
+/// is repaired by editing a path, and re-registering to fix it costs a deposit
+/// attempt and is refused anyway.
+const NOT_REGISTERED_FIX: &str = "Expected on a node that has not been registered. It is the \
+     last install step, and not one the daemon does for you: it locks a security deposit and is \
+     signed with your pool's COLD key. Until it lands this node is in no roster and would \
+     contribute nothing, so startup stops here rather than running an idle process that looks \
+     healthy.\n\
+     \n\
+     heimdall register-spo --config <file> --blueprint <plutus.json> \
+     --registry-bootstrap <txid:ix> --treasury-nft-name <hex> --cold-skey <pool-cold.skey> \
+     --bifrost-skey <bifrost.skey> --bifrost-url http://<host>:<port> --submit\n\
+     \n\
+     Run it without --submit first — it prints the transaction and stops. The registry reference \
+     script it needs is found automatically once deploy-registry-ref has put one at this wallet; \
+     see step 5.\n\
+     \n\
+     If you HAVE already registered this pool, then [bifrost].skey_path points at a different key \
+     than the one you registered with — fix the path rather than registering again, which would \
+     be refused and would cost a second deposit attempt.";
+
 /// The three `[cardano]` keys that together locate the Config UTxO. Missing any
 /// one of them is what makes `config_locator` return `None`, which is what drops
 /// the mover onto a wall-clock cadence.
@@ -610,23 +638,24 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                         ),
                     );
                 } else {
+                    // Not a misconfiguration, and the message must not read like
+                    // one: this is the state EVERY node is in until its operator
+                    // registers it, and registering is a deliberate one-time act
+                    // that locks a deposit and needs the pool's COLD key. An
+                    // operator working through a fresh install reaches this on
+                    // purpose. Say what is left to do, and only then how the same
+                    // line could instead mean a key mismatch.
                     b.push_fix(
                         6,
                         "registration status",
                         Status::Fail,
                         format!(
-                            "bifrost_id_pk {} is not among the {} registered SPOs",
+                            "NOT REGISTERED YET — this node's bifrost_id_pk {} is not one of \
+                             the {} in the registry",
                             hex::encode(pk),
                             snapshot.spos.len()
                         ),
-                        "heimdall register-spo --config <file> --blueprint <plutus.json> \
-                         --registry-bootstrap <txid:ix> --treasury-nft-name <hex> \
-                         --cold-skey <pool-cold.skey> --bifrost-skey <bifrost.skey> \
-                         --bifrost-url http://<host>:<port> --submit\n\
-                         (run it without --submit first — it prints the transaction and stops. \
-                         The registry reference script it needs is found automatically once \
-                         deploy-registry-ref has put one at this wallet; see step 5.)\n\
-                         Locks a security deposit — the daemon will not do this for you.",
+                        NOT_REGISTERED_FIX,
                     );
                 }
             }
@@ -910,5 +939,46 @@ mod tests {
         let out = r.render();
         assert!(out.contains("FAIL"));
         assert!(out.contains("-> heimdall deploy-registry-ref"));
+    }
+
+    /// An unregistered node is the state of EVERY node between installing the
+    /// package and running `register-spo`. What it reads must therefore be a next
+    /// step, not a diagnosis — an operator sent looking for a misconfiguration
+    /// they have not made will start editing a config that is already right.
+    ///
+    /// Three things have to survive any rewording: it says the state is expected,
+    /// it gives the command, and it names the one other thing this same symptom
+    /// can mean.
+    #[test]
+    fn the_not_registered_fix_reads_as_a_next_step_not_a_misconfiguration() {
+        let r = Report {
+            steps: vec![Step {
+                n: 6,
+                title: "registration status",
+                status: Status::Fail,
+                detail: "NOT REGISTERED YET — this node's bifrost_id_pk ab.. is not one of the 3 \
+                         in the registry"
+                    .into(),
+                fix: Some(NOT_REGISTERED_FIX.into()),
+            }],
+        };
+        let out = r.render();
+        assert!(
+            out.contains("Expected on a node that has not been registered"),
+            "the fix must open by saying the node is fine:\n{out}"
+        );
+        assert!(out.contains("heimdall register-spo"), "{out}");
+        assert!(
+            out.contains("[bifrost].skey_path"),
+            "the fix must name the key-mismatch reading, which is repaired differently:\n{out}"
+        );
+        // Every line of a multi-line fix is indented under its step, or the wall
+        // of text stops looking like it belongs to step 6.
+        for line in out.lines().skip(1) {
+            assert!(
+                line.starts_with("         ->"),
+                "unindented fix line: {line:?}"
+            );
+        }
     }
 }

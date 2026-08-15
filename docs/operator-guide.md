@@ -532,7 +532,11 @@ sudo -u heimdall heimdall show-roster --config /etc/heimdall/heimdall.toml
 ```
 
 Read-only. Your pool id and `bifrost_url` should appear. Re-running the step-4 check now should
-show `[7/8] registration status` satisfied.
+show `[6/8] registration status` satisfied.
+
+Before you register, that step FAILS and the daemon refuses to start. That is expected, not a
+misconfiguration: an unregistered node is in no roster and would contribute nothing, so it says so
+rather than running as an idle process that looks healthy. The check names the command.
 
 ---
 
@@ -545,9 +549,14 @@ sudo systemctl enable --now heimdall
 systemctl status heimdall
 ```
 
-A fresh install runs **without** `--broadcast`: every tick is a dry run. That is the right way to
-watch a new node for a cycle. When you are satisfied, add `--broadcast` to `HEIMDALL_ARGS` in
-`/etc/default/heimdall` and restart.
+**There is no dry-run mode to enable it in.** Once started, a registered node participates: it
+joins the DKG, co-signs Treasury Movements, and posts them. `HEIMDALL_ARGS` in
+`/etc/default/heimdall` ships empty and should stay that way — `run-spo` has no `--broadcast` and
+no `--interval-secs` (movements fall on the bridge's on-chain batch grid, which is not a local
+setting), and it rejects unknown arguments, so a stray flag there stops the unit outright.
+
+The look-before-you-leap step is the `--check` run above, which performs every startup check and
+exits without joining anything. Do that; then enable the service.
 
 **Docker:**
 
@@ -659,6 +668,7 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 | starts, then nothing happens for days | expected; see *Quiet is normal* |
 | peers seem not to see you | step 5 — is the registered port open and reachable *from outside*? |
 | `[3/8] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
+| `[6/8] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
 | a key you set is `refused` at load | it names a value the Config publishes; delete it, and `show-config-params` prints what the chain says |
 | `trie diverged` or `trie is out of sync with the chain` | this node's cumulative state is behind the bridge's — run the `reconstruct-…` command the message names; it rebuilds from chain history and refuses anything it cannot explain |
 | a transaction is refused | read the whole message: the min-stake gate and the preflight both refuse loudly rather than submitting something wrong |

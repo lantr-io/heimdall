@@ -12,8 +12,8 @@
 # SECRETS: keep the wallet mnemonic OUT of this file and in
 # /etc/default/heimdall as $HEIMDALL_MNEMONIC (see cardano.mnemonic below).
 #
-# After editing:  heimdall run-mover --config /etc/heimdall/heimdall.toml --once
-# to watch one dry-run tick, then `systemctl enable --now heimdall`.
+# After editing:  heimdall run-spo --config /etc/heimdall/heimdall.toml --check
+# to run every startup check and exit, then `systemctl enable --now heimdall`.
 
 
 [protocol]

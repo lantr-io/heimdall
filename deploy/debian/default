@@ -5,16 +5,27 @@
 # dpkg does not diff it against a shipped version on upgrade.
 
 # Extra arguments appended to:
-#   /usr/bin/heimdall run-mover --config /etc/heimdall/heimdall.toml $HEIMDALL_ARGS
+#   /usr/bin/heimdall run-spo --config /etc/heimdall/heimdall.toml $HEIMDALL_ARGS
 #
-# --interval-secs is the poll CEILING, not the movement cadence: the mover follows
-# the protocol's on-chain batch grid, so a shorter interval does not produce more
-# movements, only more Blockfrost scans. 900 (15 min) matches the NixOS default.
+# Empty is the right default, and there is deliberately nothing to put here for a
+# normal node. `run-spo` takes no cadence flag and no dry-run flag:
 #
-# --broadcast is what makes the daemon actually POST the Treasury Movement it
-# builds. Without it every tick is a dry run — which is the right way to watch a
-# fresh install for a cycle before letting it spend.
-HEIMDALL_ARGS="--interval-secs 900"
+#   * there is no --interval-secs. Movements fall on the protocol's on-chain batch
+#     grid (B_i = epoch_start + i x tm_batch_interval), which every SPO reads from
+#     the bridge Config, so there is no local cadence to set. This file used to
+#     carry `--interval-secs 900` — a `run-mover` flag — and `run-spo` rejects
+#     unknown arguments, so the unit died on startup before reaching any check.
+#
+#   * there is no --broadcast. That is a `run-mover` flag too. A configured,
+#     registered node participates from its first start; the way to watch an
+#     install before enabling it is the dry run below, which joins nothing.
+#
+#       sudo -u heimdall heimdall run-spo --config /etc/heimdall/heimdall.toml --check
+#
+# What DOES belong here, if anything: --log-level / --log-format. Prefer $RUST_LOG
+# at the bottom of this file for verbosity — it is finer-grained and needs no
+# restart argument.
+HEIMDALL_ARGS=""
 
 # Cardano wallet mnemonic. Precedence is: cardano.mnemonic in heimdall.toml >
 # $HEIMDALL_MNEMONIC — so setting it here only takes effect while cardano.mnemonic
