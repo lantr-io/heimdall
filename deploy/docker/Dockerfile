@@ -15,7 +15,7 @@
 #      (https://cardano-preprod.blockfrost.io/api/v0/epochs/latest)". So a scratch
 #      image needs ca-certificates copied in regardless.
 #   2. An SPO has to diagnose this daemon in production. `docker exec -it … sh` to
-#      inspect /var/lib/heimdall, or to re-run `heimdall run-mover --once` against
+#      inspect /var/lib/heimdall, or to re-run `heimdall run-spo --check` against
 #      the live config, is worth more than the bytes it costs.
 #
 # Which makes the real choice "ca-certificates on scratch" versus "alpine", and

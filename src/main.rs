@@ -963,9 +963,16 @@ fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
     print!("{}", report.render());
     match report.first_failure() {
         None => Ok(()),
+        // Deliberately says "not yet ready", not "you misconfigured something".
+        // The commonest failure here by far is step 6 on a fresh install — the
+        // node is correct and simply has not been registered — and telling that
+        // operator to "fix what is listed above" sends them looking for a mistake
+        // they have not made. The step's own `->` lines say which it is; this line
+        // only has to say that startup stopped and where to look.
         Some(f) => Err(format!(
-            "startup preflight failed at step {} ({}) — refusing to start. \
-             Fix what is listed above and re-check with \
+            "not ready to start: preflight stopped at step {} ({}). The `->` lines under it say \
+             what to do — some steps are a misconfiguration to correct, others are simply an \
+             install step not done yet. Re-run the checks with \
              `heimdall run-spo --config <file> --check`.",
             f.n, f.title
         )),
@@ -7869,6 +7876,62 @@ mod tests {
         parse_cardano_outref, parse_hex_n, parse_key32, parse_treasury_override, pool_id_bech32,
         ref_script_already_deployed,
     };
+
+    /// The packaged unit must actually START.
+    ///
+    /// `/etc/default/heimdall` shipped `HEIMDALL_ARGS="--interval-secs 900"` while
+    /// `heimdall.service` ran `run-spo`, which does not take that flag — it was a
+    /// `run-mover` flag left behind when the daemon was renamed. clap rejects
+    /// unknown arguments, so the unit died on argv before reaching a single
+    /// startup check, and `--check` could not reveal it because an operator runs
+    /// `--check` by hand without `$HEIMDALL_ARGS`.
+    ///
+    /// So parse the two shipped files and assert the argv they compose is one the
+    /// CLI accepts. A packaging file that names a flag the binary does not have is
+    /// exactly as broken as code that does not compile, and nothing else in the
+    /// build would notice.
+    #[test]
+    fn the_packaged_service_invocation_parses() {
+        use clap::Parser;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let unit = std::fs::read_to_string(root.join("deploy/debian/heimdall.service"))
+            .expect("the packaged unit");
+        let env = std::fs::read_to_string(root.join("deploy/debian/default"))
+            .expect("the packaged environment file");
+
+        let exec = unit
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("ExecStart="))
+            .expect("the unit has an ExecStart");
+        // systemd word-splits a bare $VAR, so this is the argv it builds.
+        let args = env
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .find_map(|l| l.trim().strip_prefix("HEIMDALL_ARGS="))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .unwrap_or_default();
+
+        let argv: Vec<&str> = exec
+            .split_whitespace()
+            .flat_map(|w| {
+                if w == "$HEIMDALL_ARGS" {
+                    args.split_whitespace().collect::<Vec<_>>()
+                } else {
+                    vec![w]
+                }
+            })
+            .collect();
+        assert_eq!(argv[0], "/usr/bin/heimdall", "argv[0] is the binary");
+
+        super::Cli::try_parse_from(&argv).unwrap_or_else(|e| {
+            panic!(
+                "the packaged service cannot start — systemd would run\n  {}\nand the CLI \
+                 refuses it:\n{e}\nFix deploy/debian/default or deploy/debian/heimdall.service.",
+                argv.join(" ")
+            )
+        });
+    }
 
     #[test]
     fn parse_cardano_outref_ok() {

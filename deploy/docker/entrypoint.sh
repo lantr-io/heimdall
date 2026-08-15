@@ -6,7 +6,7 @@
 # has been told which bridge to join, and a container has no equivalent —
 # `docker run` IS the start — so the failure has to be legible in the first lines
 # of `docker logs`. Second, default the command, so `docker run <image>` runs the
-# mover. Third, warn about the one networking mistake that is specific to
+# SPO daemon. Third, warn about the one networking mistake that is specific to
 # containers and silent when made.
 set -eu
 
@@ -24,7 +24,7 @@ case "${1:-}" in
     *)
         # Anything that names a real executable is one — `sh`, `/usr/bin/heimdall`,
         # or any tool an operator reaches for while diagnosing. heimdall's own
-        # subcommands (run-mover, show-treasury, …) are not on PATH, so they fall
+        # subcommands (run-spo, show-treasury, …) are not on PATH, so they fall
         # through to the config check, which is what should happen: they all need
         # the config too.
         if command -v "$1" >/dev/null 2>&1; then
@@ -78,10 +78,19 @@ if grep -Eq '^[[:space:]]*bind_address[[:space:]]*=[[:space:]]*"(127\.|localhost
 fi
 
 if [ "$#" -eq 0 ]; then
+    # `run-spo`, matching the .deb's unit — this image is the same binary doing
+    # the same job, and every note in deploy/README.md about it (DKG rounds, the
+    # registered bifrost_url, resuming an epoch from the state volume) describes
+    # the SPO daemon. It defaulted to `run-mover` until 2026-08-15, which is a
+    # different program: run-mover builds and signs a movement in a SINGLE
+    # process from a key reproduced off a constant seed, so on any bridge not
+    # deployed with that key its signatures verify against nothing. Pass it
+    # explicitly if that is really what you want.
+    #
     # Unquoted on purpose: HEIMDALL_ARGS carries multiple words, exactly as it
     # does in /etc/default/heimdall for the systemd unit.
     # shellcheck disable=SC2086
-    set -- run-mover --config "$CONFIG" ${HEIMDALL_ARGS:-}
+    set -- run-spo --config "$CONFIG" ${HEIMDALL_ARGS:-}
 fi
 
 exec /usr/bin/heimdall "$@"

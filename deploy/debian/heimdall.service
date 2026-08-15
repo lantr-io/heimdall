@@ -38,8 +38,12 @@ WorkingDirectory=/var/lib/heimdall
 EnvironmentFile=-/etc/default/heimdall
 
 # $HEIMDALL_ARGS is unquoted on purpose: systemd word-splits a bare $VAR, so the
-# operator can add flags (e.g. --broadcast) from /etc/default/heimdall without
-# editing this unit. ${VAR} would NOT split and would pass one giant argument.
+# operator can add flags (e.g. --log-format json) from /etc/default/heimdall
+# without editing this unit. ${VAR} would NOT split and would pass one giant
+# argument. It ships EMPTY, and must: `run-spo` rejects unknown arguments, so a
+# leftover flag from the command below's predecessor stops the unit outright,
+# before any check gets to run and say something useful.
+#
 # `run-spo`, not `run-mover`. This unit calls itself the SPO daemon and must be
 # one: run-mover builds and signs a movement in a SINGLE process, from a signing
 # key reproduced off a constant seed, so on any bridge not deployed with that key
