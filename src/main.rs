@@ -50,17 +50,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run one SPO instance. Start `max-signers` of these in separate
-    /// terminals — each one points at the same chain and discovers the
-    /// roster (and thus its own listen port) from it.
+    /// Run this SPO's node: the epoch loop that participates in the DKG,
+    /// co-signs Treasury Movements with the rest of the roster, and drives
+    /// the key handoff at each boundary.
+    ///
+    /// Every registered SPO runs one of these. They point at the same chain,
+    /// discover the roster from it (and thus their own listen port and FROST
+    /// index), and reach each other over the authenticated HTTP transport —
+    /// this is the only distributed signing path heimdall has. Contrast
+    /// `run-mover`, which builds and signs movements in ONE process.
+    ///
+    /// Named `demo` until 2026-08-15, which was wrong in the way that
+    /// matters: it is the SPO daemon, and the name said not to run it.
     ///
     /// TODO: add a `--chain` flag (once a real `CardanoChain` impl
     /// exists) to select between `mock` and a live Cardano follower.
-    /// Today the demo is hardwired to `MockCardanoChain`, and the
+    /// Today the mock path is hardwired to `MockCardanoChain`, and the
     /// `--min-signers`, `--max-signers`, `--base-port` flags are only
     /// used to parameterize that mock chain — a real deployment would
     /// read none of those from the CLI.
-    Demo {
+    RunSpo {
         /// Path to a TOML configuration file. Omitted fields use
         /// compiled defaults. CLI flags override TOML values.
         #[arg(long)]
@@ -1112,7 +1121,7 @@ fn main() {
     // globals from where it is called.
     heimdall::logging::set_cli_overrides(cli.log_level, cli.log_format);
     match cli.command {
-        Commands::Demo {
+        Commands::RunSpo {
             config,
             index,
             min_signers,
@@ -1169,7 +1178,7 @@ fn main() {
             }
 
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_demo(cfg, index, deterministic, inject_fault));
+            rt.block_on(run_spo(cfg, index, deterministic, inject_fault));
         }
         Commands::BootstrapTreasury {
             config,
@@ -1743,7 +1752,7 @@ fn apply_tm_policy(
     }
 }
 
-async fn run_demo(
+async fn run_spo(
     cfg: HeimdallConfig,
     index: Option<u16>,
     deterministic: bool,

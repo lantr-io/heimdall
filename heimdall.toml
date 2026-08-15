@@ -88,7 +88,7 @@ submit_oracle = true   # publish oracle-update UTxO to Cardano after signing
 bind_address = "0.0.0.0"
 #listen_port = 18500
 
-# [demo] takes its defaults (2-of-3 from port 18500). `heimdall demo` overrides
+# [demo] takes its defaults (2-of-3 from port 18500). `heimdall run-spo` overrides
 # them with --min-signers / --max-signers / --base-port.
 
 [log]

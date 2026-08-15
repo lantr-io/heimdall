@@ -1,7 +1,7 @@
 # Heimdall — LOCAL multi-process DKG demo config (WI-023).
 #
 # Deliberately has NO [cardano] section: with neither cardano.blockfrost_project_id
-# nor cardano.socket_path set, `heimdall demo` runs the full MockCardanoChain path
+# nor cardano.socket_path set, `heimdall run-spo` runs the full MockCardanoChain path
 # (no live chain, no Blockfrost, no bitcoind). The roster comes from the keyed
 # fixture built from [demo] + [http] below, so three instances that share THIS file
 # and differ only by `--index {1,2,3}` discover each other on 127.0.0.1:18500-18502,
