@@ -833,24 +833,58 @@ async fn poll_dkg_round1(
     out: &mut BTreeMap<Identifier, frost::keys::dkg::round1::Package>,
 ) -> EpochResult<()> {
     let need = peer_infos.len() + out.len(); // out already holds self
+    // WI-108: a per-peer fetch failure is "this peer has not published", exactly
+    // as in the signing rounds. `fetch_raw` maps a refused connection and a 404
+    // to `Ok(None)` but a 502/500/truncated body to `Err`, and propagating that
+    // aborted the whole ceremony for one unhealthy peer — worse here than in
+    // signing, because `dkg_unavailable` excludes `EpochError::Peer` so no
+    // Phase-1 fallback fires, and the `Dkg` phase sets no resume, so the node
+    // falls to `Idle` and sits out the epoch while its peers derive a `Y_51` it
+    // holds no share of.
+    let mut unreachable = crate::epoch::log::Unreachable::default();
     loop {
         for peer in peer_infos {
             if out.contains_key(&peer.identifier) {
                 continue;
             }
-            if let Some(pkg) = peers.fetch_dkg_round1(ns, peer).await? {
-                crate::epoch_debug!(
-                    me,
-                    ns.epoch,
-                    "     received round1 package from spo={} ({}/{})",
-                    id_short(peer.identifier),
-                    out.len() + 1,
-                    need
-                );
-                out.insert(peer.identifier, pkg);
+            match peers.fetch_dkg_round1(ns, peer).await {
+                Ok(Some(pkg)) => {
+                    crate::epoch_debug!(
+                        me,
+                        ns.epoch,
+                        "     received round1 package from spo={} ({}/{})",
+                        id_short(peer.identifier),
+                        out.len() + 1,
+                        need
+                    );
+                    out.insert(peer.identifier, pkg);
+                    unreachable.answered(peer.identifier);
+                }
+                Ok(None) => unreachable.answered(peer.identifier),
+                Err(e) => {
+                    if unreachable.record(peer.identifier, &e) {
+                        crate::epoch_warn!(
+                            me,
+                            ns.epoch,
+                            "     DKG round1: spo={} is UNREACHABLE ({e}) — excluding it from \
+                             this attempt's qualified subset and continuing",
+                            id_short(peer.identifier),
+                        );
+                    }
+                }
             }
         }
         if out.len() >= need || clock.now() >= deadline {
+            if out.len() < need {
+                crate::epoch_warn!(
+                    me,
+                    ns.epoch,
+                    "     DKG round1 closed with {}/{}.{}",
+                    out.len(),
+                    need,
+                    unreachable.note()
+                );
+            }
             break;
         }
         tokio::time::sleep(config.poll_interval).await;
@@ -894,6 +928,7 @@ async fn poll_dkg_round2(
     out: &mut BTreeMap<Identifier, frost::keys::dkg::round2::Package>,
 ) -> EpochResult<()> {
     let need = peer_infos.len();
+    let mut unreachable = crate::epoch::log::Unreachable::default();
     loop {
         for peer in peer_infos {
             if out.contains_key(&peer.identifier) {
@@ -904,22 +939,49 @@ async fn poll_dkg_round2(
             };
             let (sender_commitments, _sigma_i) = frost_bridge::round1_fields(sender_round1)
                 .map_err(|e| EpochError::Frost(format!("round1 fields: {e}")))?;
-            if let Some(pkg) = peers
+            match peers
                 .fetch_dkg_round2(ns, peer, me, &sender_commitments)
-                .await?
+                .await
             {
-                crate::epoch_debug!(
-                    me,
-                    ns.epoch,
-                    "     received round2 share from spo={} ({}/{})",
-                    id_short(peer.identifier),
-                    out.len() + 1,
-                    need
-                );
-                out.insert(peer.identifier, pkg);
+                Ok(Some(pkg)) => {
+                    crate::epoch_debug!(
+                        me,
+                        ns.epoch,
+                        "     received round2 share from spo={} ({}/{})",
+                        id_short(peer.identifier),
+                        out.len() + 1,
+                        need
+                    );
+                    out.insert(peer.identifier, pkg);
+                    unreachable.answered(peer.identifier);
+                }
+                Ok(None) => unreachable.answered(peer.identifier),
+                // Same rule as round 1 (WI-108): the peer drops out of the
+                // qualified subset, the ceremony does not.
+                Err(e) => {
+                    if unreachable.record(peer.identifier, &e) {
+                        crate::epoch_warn!(
+                            me,
+                            ns.epoch,
+                            "     DKG round2: spo={} is UNREACHABLE ({e}) — excluding it from \
+                             the qualified subset and continuing",
+                            id_short(peer.identifier),
+                        );
+                    }
+                }
             }
         }
         if out.len() >= need || clock.now() >= deadline {
+            if out.len() < need {
+                crate::epoch_warn!(
+                    me,
+                    ns.epoch,
+                    "     DKG round2 closed with {}/{}.{}",
+                    out.len(),
+                    need,
+                    unreachable.note()
+                );
+            }
             break;
         }
         tokio::time::sleep(config.poll_interval).await;

@@ -878,11 +878,19 @@ pub struct MockPeerNetwork {
     /// Update-Y (banned, deregistered, restarted with a wiped state_dir) without
     /// also removing it from the movement rounds.
     mute_rotation: bool,
-    /// Peers whose signing endpoints THIS node sees as erroring — a 502 from a
-    /// reverse proxy, a 500 from a peer mid-restart. Per-observer on purpose: the
-    /// case that matters is ASYMMETRIC, one node getting an error where another
-    /// gets a clean 404 for the same peer at the same instant (WI-098).
-    unreachable_sign: std::collections::BTreeSet<Identifier>,
+    /// Peers whose endpoints THIS node sees as erroring — a 502 from a reverse
+    /// proxy, a 500 from a peer mid-restart. Per-observer on purpose: the case
+    /// that matters is ASYMMETRIC, one node getting an error where another gets a
+    /// clean 404 for the same peer at the same instant (WI-098). Covers the DKG
+    /// fetches as well as the signing ones (WI-108) — an unhealthy host answers
+    /// every path the same way, and the DKG half was untestable while this gated
+    /// only `fetch_sign_round{1,2}`.
+    unreachable: std::collections::BTreeSet<Identifier>,
+    /// Peers seen as erroring at SIGNING time only — their DKG fetches are fine.
+    /// A host that was healthy at the epoch boundary and unhealthy hours later,
+    /// when the batch grid reaches its first movement, which is the ordinary
+    /// shape of the WI-098 case.
+    unreachable_sign_only: std::collections::BTreeSet<Identifier>,
 }
 
 impl MockPeerNetwork {
@@ -892,7 +900,8 @@ impl MockPeerNetwork {
             hub,
             mute_sign: false,
             mute_rotation: false,
-            unreachable_sign: std::collections::BTreeSet::new(),
+            unreachable: std::collections::BTreeSet::new(),
+            unreachable_sign_only: std::collections::BTreeSet::new(),
         }
     }
 
@@ -910,11 +919,28 @@ impl MockPeerNetwork {
         self
     }
 
-    /// See [`MockPeerNetwork::unreachable_sign`].
+    /// See [`MockPeerNetwork::unreachable`].
     #[must_use]
     pub fn seeing_unreachable(mut self, peer: Identifier) -> Self {
-        self.unreachable_sign.insert(peer);
+        self.unreachable.insert(peer);
         self
+    }
+
+    /// See [`MockPeerNetwork::unreachable_sign_only`].
+    #[must_use]
+    pub fn seeing_unreachable_at_signing(mut self, peer: Identifier) -> Self {
+        self.unreachable_sign_only.insert(peer);
+        self
+    }
+
+    fn dkg_err<T>(&self, peer: &SpoInfo) -> Option<EpochResult<T>> {
+        self.unreachable.contains(&peer.identifier).then(err_502)
+    }
+
+    fn sign_err<T>(&self, peer: &SpoInfo) -> Option<EpochResult<T>> {
+        (self.unreachable.contains(&peer.identifier)
+            || self.unreachable_sign_only.contains(&peer.identifier))
+        .then(err_502)
     }
 }
 
@@ -922,6 +948,12 @@ fn with_slot<R>(hub: &MockPeerHub, id: Identifier, f: impl FnOnce(&mut PeerSlot)
     let mut slots = hub.slots.lock().unwrap();
     let slot = slots.entry(id).or_default();
     f(slot)
+}
+
+fn err_502<T>() -> EpochResult<T> {
+    Err(EpochError::Peer(
+        "mock: HTTP 502 from the peer's endpoint".into(),
+    ))
 }
 
 #[async_trait]
@@ -998,6 +1030,9 @@ impl PeerNetwork for MockPeerNetwork {
         ns: DkgNamespace,
         peer: &SpoInfo,
     ) -> EpochResult<Option<round1::Package>> {
+        if let Some(e) = self.dkg_err(peer) {
+            return e;
+        }
         Ok(with_slot(&self.hub, peer.identifier, |s| {
             s.dkg1
                 .as_ref()
@@ -1013,6 +1048,9 @@ impl PeerNetwork for MockPeerNetwork {
         _recipient_identifier: Identifier,
         _sender_commitments: &[[u8; crate::http::canonical::POINT_LEN]],
     ) -> EpochResult<Option<round2::Package>> {
+        if let Some(e) = self.dkg_err(peer) {
+            return e;
+        }
         // Return the share `peer` addressed to us (self.me) in this namespace.
         Ok(with_slot(&self.hub, peer.identifier, |s| {
             s.dkg2
@@ -1045,10 +1083,8 @@ impl PeerNetwork for MockPeerNetwork {
         ns: SignNamespace,
         peer: &SpoInfo,
     ) -> EpochResult<Option<frost_secp256k1_tr::round1::SigningCommitments>> {
-        if self.unreachable_sign.contains(&peer.identifier) {
-            return Err(EpochError::Peer(
-                "mock: HTTP 502 from the peer's signing endpoint".into(),
-            ));
+        if let Some(e) = self.sign_err(peer) {
+            return e;
         }
         Ok(with_slot(&self.hub, peer.identifier, |s| {
             s.sign1.get(&ns).copied()
@@ -1060,10 +1096,8 @@ impl PeerNetwork for MockPeerNetwork {
         ns: SignNamespace,
         peer: &SpoInfo,
     ) -> EpochResult<Option<frost_secp256k1_tr::round2::SignatureShare>> {
-        if self.unreachable_sign.contains(&peer.identifier) {
-            return Err(EpochError::Peer(
-                "mock: HTTP 502 from the peer's signing endpoint".into(),
-            ));
+        if let Some(e) = self.sign_err(peer) {
+            return e;
         }
         Ok(with_slot(&self.hub, peer.identifier, |s| {
             s.sign2.get(&ns).copied()

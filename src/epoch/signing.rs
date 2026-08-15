@@ -658,10 +658,7 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
     // peers answered.
     let need = peer_infos.len() + 1;
     let deadline = clock.deadline(config.quorum51_timeout);
-    // Peers whose fetch is currently FAILING, and why (WI-098). Cleared for a
-    // peer the moment it answers, so a blip that recovers inside the round is
-    // never reported.
-    let mut unreachable: BTreeMap<Identifier, String> = BTreeMap::new();
+    let mut unreachable = crate::epoch::log::Unreachable::default();
     loop {
         for peer in peer_infos {
             if out.contains_key(&peer.identifier) {
@@ -697,7 +694,7 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                         need
                     );
                     out.insert(peer.identifier, value);
-                    unreachable.remove(&peer.identifier);
+                    unreachable.answered(peer.identifier);
                 }
                 // A clean 404 IS an answer: the peer is reachable and simply has
                 // not published yet. Clearing here as well as on success is what
@@ -705,14 +702,12 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                 // that 503s while restarting and then serves 404s for the rest of
                 // the round has recovered, and naming it as unreachable is the
                 // false positive that teaches operators to ignore the line.
-                Ok(None) => {
-                    unreachable.remove(&peer.identifier);
-                }
+                Ok(None) => unreachable.answered(peer.identifier),
                 Err(e) => {
                     // Once per peer per round, not once per poll: at a 10 ms
                     // interval against a 30-minute window the second form is tens
                     // of thousands of identical lines.
-                    if unreachable.insert(peer.identifier, e.to_string()).is_none() {
+                    if unreachable.record(peer.identifier, &e) {
                         crate::epoch_warn!(
                             me,
                             ns.epoch,
@@ -741,21 +736,6 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
             // is up and broken, and only the second is worth paging about. WI-103
             // carries this distinction out of the round as data; here it reaches
             // the log, which is where it is needed when a round has just failed.
-            let unreachable_note = || {
-                if unreachable.is_empty() {
-                    String::new()
-                } else {
-                    // Already in identifier order — it is a `BTreeMap`. Sorting
-                    // the RENDERED strings instead would order "10" before "2",
-                    // which is wrong exactly when the roster is big enough for
-                    // this line to be hard to read.
-                    let listed: Vec<String> = unreachable
-                        .iter()
-                        .map(|(id, why)| format!("{} ({why})", id_short(*id)))
-                        .collect();
-                    format!(" UNREACHABLE (up but erroring): {}.", listed.join(", "))
-                }
-            };
             // The deadline is what FIXES the subset. Below the threshold the
             // round is simply unavailable; at or above it, proceed with exactly
             // who answered and name who did not.
@@ -772,7 +752,7 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                     ns.session_label(),
                     out.len(),
                     need,
-                    unreachable_note(),
+                    unreachable.note(),
                 );
                 return Err(EpochError::PollTimeout {
                     got: out.len(),
@@ -794,7 +774,7 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                     out.len(),
                     need,
                     id_short(id),
-                    unreachable_note(),
+                    unreachable.note(),
                 );
                 return Err(EpochError::PollTimeout {
                     got: out.len(),
@@ -820,7 +800,7 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                     .map(|id| id_short(*id).to_string())
                     .collect::<Vec<_>>()
                     .join(", "),
-                unreachable_note(),
+                unreachable.note(),
             );
             return Ok(absent);
         }

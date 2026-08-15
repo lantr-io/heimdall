@@ -90,3 +90,53 @@ macro_rules! epoch_error {
         );
     }};
 }
+
+/// Peers whose fetch is CURRENTLY failing in a round, and why.
+///
+/// Every poll in this crate treats a per-peer fetch failure as "this peer has
+/// not published" — unreachable, unparseable and silent are one bucket, because
+/// exclusion has to be deterministic or two nodes close different subsets
+/// (WI-098, spec §Failure handling). The operator still needs them apart:
+/// silence is a peer that is down or not participating, an error is a peer that
+/// is up and broken, and only the second is worth paging about.
+///
+/// Shared rather than re-implemented per poll because the easy half to get wrong
+/// is [`Self::answered`] — a clean 404 IS an answer, so a peer that errors once
+/// and then serves 404s for the rest of the round has RECOVERED. Reporting it as
+/// unreachable is the false positive that teaches operators to skip the line.
+#[derive(Debug, Default)]
+pub struct Unreachable {
+    peers: std::collections::BTreeMap<Identifier, String>,
+}
+
+impl Unreachable {
+    /// Record a failing fetch. Returns `true` the FIRST time this peer fails in
+    /// this round, which is when to log: at a 10 ms poll interval against a
+    /// 30-minute window, logging every failure is tens of thousands of identical
+    /// lines.
+    pub fn record(&mut self, id: Identifier, why: impl std::fmt::Display) -> bool {
+        self.peers.insert(id, why.to_string()).is_none()
+    }
+
+    /// Note that this peer answered — with a payload OR with a clean "nothing
+    /// published yet". Both mean it is reachable.
+    pub fn answered(&mut self, id: Identifier) {
+        self.peers.remove(&id);
+    }
+
+    /// A clause for the round's closing line, empty when every peer was
+    /// reachable. Already in identifier order: it is a `BTreeMap`, and sorting
+    /// the rendered strings instead would put "10" before "2".
+    #[must_use]
+    pub fn note(&self) -> String {
+        if self.peers.is_empty() {
+            return String::new();
+        }
+        let listed: Vec<String> = self
+            .peers
+            .iter()
+            .map(|(id, why)| format!("{} ({why})", id_short(*id)))
+            .collect();
+        format!(" UNREACHABLE (up but erroring): {}.", listed.join(", "))
+    }
+}

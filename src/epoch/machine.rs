@@ -4061,6 +4061,63 @@ mod tests {
         );
     }
 
+    /// WI-108: a peer that answers with an ERROR during the DKG is EXCLUDED from
+    /// the ceremony, not a reason to abort it.
+    ///
+    /// The signing half (WI-098) left this untouched, and the consequence here is
+    /// worse than there. `dkg_phase`'s error is `EpochError::Peer`, which
+    /// `dkg_unavailable` deliberately excludes, so no Phase-1 fallback fires; and
+    /// the `Dkg` phase sets no `resume`, so `drive_to_movement` falls to `Idle`
+    /// and the node sits out the whole epoch — while its peers, if they saw the
+    /// same host as merely silent, went on to derive a `Y_51` it holds no share
+    /// of. One unhealthy host taking the roster down was reachable through the
+    /// same `fetch_raw` that the signing rounds were just taught to tolerate.
+    ///
+    /// Modelled SYMMETRICALLY — the dead host 502s at everyone — because that is
+    /// what an unhealthy endpoint actually does. The asymmetric case does not
+    /// converge even with this fix: two nodes that exclude different members
+    /// derive different group keys, which is WI-105's territory, not this one's.
+    #[tokio::test]
+    async fn a_peer_that_errors_during_the_dkg_is_excluded_not_fatal() {
+        let fixture = demo_static_fixture(2, 3, 19_960);
+        let hub = MockPeerHub::new();
+        let spo3 = Identifier::try_from(3u16).unwrap();
+        let mut handles = Vec::new();
+        // Only spo 1 and spo 2 run. spo 3 never starts, and both survivors see its
+        // endpoint answering 502 rather than going quietly unanswered.
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> =
+                Arc::new(MockPeerNetwork::new(id, hub.clone()).seeing_unreachable(spo3));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(
+                tokio::time::timeout(Duration::from_secs(60), h)
+                    .await
+                    .expect(
+                        "one 502-ing member must not abort the ceremony — the node would \
+                         otherwise fall to Idle and sit out the whole epoch",
+                    )
+                    .unwrap()
+                    .expect("the ceremony completes on the reachable members"),
+            );
+        }
+        assert_eq!(
+            tms[0].txid, tms[1].txid,
+            "both survivors must exclude the same member and derive the same key"
+        );
+    }
+
     /// WI-098: a peer that answers with an ERROR is signed around, exactly like
     /// one that stays silent — and two nodes seeing the same peer differently
     /// still close the same S1.
@@ -4093,7 +4150,7 @@ mod tests {
             // different observation.
             let net = match i {
                 3 => net.muting_sign_publishes(),
-                2 => net.seeing_unreachable(spo3),
+                2 => net.seeing_unreachable_at_signing(spo3),
                 _ => net,
             };
             let peers: Arc<dyn PeerNetwork> = Arc::new(net);
