@@ -167,8 +167,10 @@ pub fn treasury_from_btc_tx_bytes(
         y_51: config.y_51,
         y_fed: config.y_fed,
         // This reader takes the treasury tree straight from the config, so the head-derived
-        // and published keys are the same value here by construction.
+        // and published keys are the same value here by construction — and with no
+        // treasury_info read here, so is the authorized one.
         config_y_fed: config.y_fed,
+        authorized_key: config.y_51,
         federation_csv_blocks: config.federation_csv_blocks,
         pegin_refund_timeout_blocks: config.pegin_refund_timeout_blocks,
         btc_confirmed,
@@ -233,8 +235,10 @@ pub fn parse_treasury_datum(
         y_51: config.y_51,
         y_fed: config.y_fed,
         // This reader takes the treasury tree straight from the config, so the head-derived
-        // and published keys are the same value here by construction.
+        // and published keys are the same value here by construction — and with no
+        // treasury_info read here, so is the authorized one.
         config_y_fed: config.y_fed,
+        authorized_key: config.y_51,
         federation_csv_blocks: config.federation_csv_blocks,
         pegin_refund_timeout_blocks: config.pegin_refund_timeout_blocks,
         btc_confirmed,

@@ -93,6 +93,22 @@ pub struct TreasuryUtxo {
     /// tree's emergency-sweep leaf must use. Equal to `y_fed` on a bridge whose treasury
     /// head is locked under the published key; different while one is mid-rotation.
     pub config_y_fed: bitcoin::key::UntweakedPublicKey,
+    /// `current_spos_frost_key` from the treasury_info datum — the key the bridge
+    /// AUTHORIZES to move the treasury right now.
+    ///
+    /// Distinct from [`Self::y_51`], which is what the head UTxO is LOCKED under.
+    /// The two agree except in the window between an Update-Y and the handoff
+    /// movement that acts on it: Cardano rotates the datum immediately, but the
+    /// BTC stays under the old key until a movement spends it there and pays the
+    /// change to the new address.
+    ///
+    /// This is the field that decides the ROLLOUT PHASE, and only this one.
+    /// §Rollout Phases: "there is no phase flag anywhere — the transition *is*
+    /// the first Update-Y", so `authorized_key == config_y_fed` is precisely the
+    /// statement that no Update-Y has ever landed and the federation is still the
+    /// key-path signer. Comparing `y_51` instead would answer a different
+    /// question and get it wrong for a whole movement's worth of the handoff.
+    pub authorized_key: bitcoin::key::UntweakedPublicKey,
     pub federation_csv_blocks: u16,
     /// The peg-in refund leaf's CSV delay, Config `params[8]` ([CFG-9]) — carried
     /// beside the federation delay because the peg-in tree needs both, and both
@@ -651,6 +667,7 @@ mod pegin_tree_tests {
             y_51: xonly(y_51),
             y_fed: xonly(head_y_fed),
             config_y_fed: xonly(published_y_fed),
+            authorized_key: xonly(y_51),
             federation_csv_blocks: 144,
             pegin_refund_timeout_blocks: 720,
             btc_confirmed: true,

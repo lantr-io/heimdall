@@ -907,6 +907,11 @@ impl HeimdallConfig {
                 .filter(|s| !s.is_empty())
                 .and_then(|h| hex::decode(h).ok())
                 .and_then(|b| <[u8; 32]>::try_from(b).ok()),
+            // Set by the caller, like `inject_fault`: loading it reads the
+            // persisted share off disk and cross-checks it against the typed-in
+            // `[federation]` roster, either of which can fail — and this
+            // conversion has no way to report that.
+            phase1_signer: None,
             // Demo-only; the harness/CLI sets this after building the config.
             inject_fault: None,
         }

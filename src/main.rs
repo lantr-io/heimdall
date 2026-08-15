@@ -2226,6 +2226,27 @@ async fn run_demo(
         warn!("[demo] ⚠ FAULT INJECTION ENABLED: {k:?} — this node will misbehave in DKG");
     }
 
+    // Phase 1 (WI-095): before the first Update-Y the treasury is locked under
+    // y_federation and the federation — not a DKG roster — signs the movement's
+    // key path. Loaded unconditionally because WHICH phase the bridge is in is
+    // chain state the machine reads per epoch, not something to decide here: a
+    // node can start in Phase 1 and still be running when the first Update-Y
+    // makes it a Phase-2 node.
+    config.phase1_signer = match phase1_signer(&cfg) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("[demo] federation share: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(fed) = config.phase1_signer.as_ref() {
+        info!(
+            "[demo] federation share loaded: {}-of-{} (signs treasury movements while the \
+             bridge is in Phase 1)",
+            fed.roster.min_signers, fed.roster.max_signers
+        );
+    }
+
     let t0 = Instant::now();
     // The epoch loop backs off and re-enters `Idle` on EVERY error, so it does
     // not return Err at all today — this arm is unreachable by construction and
@@ -2908,6 +2929,40 @@ fn federation_share(cfg: &HeimdallConfig) -> Result<Option<FederationKeyState>, 
             .map_err(|e| e.to_string())?;
     }
     Ok(Some(state))
+}
+
+/// This node's federation signing material for the epoch machine (WI-095), or
+/// `None` if it is not a federation member.
+///
+/// The machine needs both halves together: the share to sign with, and the
+/// membership to address peers by. `federation_share` already refuses a share
+/// that does not match the configured roster; what is left is the case where
+/// there is no roster to match against.
+fn phase1_signer(
+    cfg: &HeimdallConfig,
+) -> Result<Option<heimdall::epoch::state::Phase1Signer>, String> {
+    let Some(state) = federation_share(cfg)? else {
+        return Ok(None);
+    };
+    if cfg.federation.members.is_empty() {
+        // A share with nobody to sign alongside. Refused rather than downgraded
+        // to "not a member": this node CAN sign, and on a Phase-1 bridge its
+        // silence stalls every treasury movement — a failure whose only symptom
+        // would be co-signers timing out on a peer that looks healthy.
+        return Err(format!(
+            "a federation share is persisted in {} but [federation].members is empty, so this \
+             node cannot tell who its co-signers are or where to reach them. The roster is \
+             typed in — Y_federation precedes the bridge, so there is nothing to read it from. \
+             Restore the member list the ceremony ran with",
+            cfg.protocol.state_dir.as_deref().unwrap_or("<state_dir>")
+        ));
+    }
+    let roster = federation_roster(cfg)?.to_roster();
+    let group_keys = state.to_group_keys().map_err(|e| e.to_string())?;
+    Ok(Some(heimdall::epoch::state::Phase1Signer {
+        roster,
+        group_keys,
+    }))
 }
 
 /// Start this node's ceremony endpoint and return the transport peers fetch from.

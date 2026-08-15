@@ -351,6 +351,10 @@ impl CardanoChain for MockCardanoChain {
             y_51,
             y_fed,
             config_y_fed: y_fed,
+            // The mock has no treasury_info datum: whatever key the head is
+            // under is also the authorized one, which is the bootstrap
+            // (Phase-1) reading its fixture already models.
+            authorized_key: y_51,
             federation_csv_blocks: self.fixture.federation_csv_blocks,
             // The mock's tree is self-consistent; 720 > the fixture's 144 federation delay.
             pegin_refund_timeout_blocks: 720,
