@@ -183,6 +183,15 @@ pub struct BatchSnapshot {
     /// deployment (chiefly whether the TM validator rides inline), not
     /// configured — see [`crate::epoch::batch::TmBudget`].
     pub post_tm_envelope: u64,
+    /// `leader_slot_T` — the cascade hop, in slots (Config `params[0].leader_slot_t`,
+    /// spec §Cardano submission and leader reward; WI-104).
+    ///
+    /// Here rather than in `[protocol]` because every SPO must step through the
+    /// roster together: a per-operator hop would have each node decide on its own
+    /// when its turn began, so two of them would post at once and one would burn a
+    /// fee. It rides in this snapshot for the same reason the fee rate does — it is
+    /// a published value read at one chain point.
+    pub leader_slot_t: u64,
     /// Config UTxO the parameters came from, or the local-override reason.
     pub source: crate::cardano::config_params::ParamSource,
 }
@@ -211,6 +220,7 @@ impl BatchSnapshot {
             tm_params,
             max_tx_size: DEFAULT_MAX_TX_SIZE,
             post_tm_envelope: POST_TM_ENVELOPE_WITHOUT_SCRIPT,
+            leader_slot_t: DEFAULT_LEADER_SLOT_T,
             source: crate::cardano::config_params::ParamSource::LocalOverride(why),
         }
     }
@@ -244,6 +254,10 @@ pub const DEFAULT_MAX_TX_SIZE: u64 = 16_384;
 /// rejects. The script is added on top by the chain adapter, because its size is
 /// a deployment fact — inline or reference script — and it dominates.
 pub const POST_TM_ENVELOPE_WITHOUT_SCRIPT: u64 = 1_024;
+
+/// `leader_slot_T` where no Config publishes one — mocks and offline CLI paths.
+/// The spec's own worked example (60 slots ≈ 1 minute).
+pub const DEFAULT_LEADER_SLOT_T: u64 = 60;
 
 /// Everything the epoch machine needs to authorize an on-chain Update-Y — the
 /// key handoff that makes a completed DKG the treasury's actual controller.

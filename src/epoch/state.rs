@@ -73,29 +73,29 @@ impl Roster {
             .map(|(id, info)| (*id, info))
     }
 
-    /// Designated leader for the given attempt. Today this is just the
-    /// lowest-identifier participant, which matches no attempt of the
-    /// published rule.
+    /// This roster's submission order for one posting (spec §Cardano submission
+    /// and leader reward) — see [`crate::epoch::leader::Cascade`].
     ///
-    /// TODO (WI-104): implement the rule the spec already publishes —
-    /// `leader_index = hash("bifrost-leader" ‖ prev_tm_txid ‖ tm_sequence)
-    /// mod roster_size` over the roster sorted by `pool_id`, with the cascade
-    /// hop `((i - leader_index) mod roster_size) × leader_slot_T` measured in
-    /// SLOTS from `signing_complete_slot`. `tm_sequence` is the literal `"dkg"`
-    /// for key publication, so Update-Y elects through this same function.
+    /// Which roster you call this on is load-bearing, and getting it wrong was
+    /// WI-099: the Update-Y is authorized by the OUTGOING roster's key, so its
+    /// cascade must be over the outgoing roster. Electing over the incoming one
+    /// names nodes that cannot produce the signature at all, because FROST
+    /// identifiers are positional ranks over each epoch's own candidate set.
     ///
-    /// Do NOT implement `participants[(epoch + attempt) mod n]`, which an
-    /// earlier note here proposed: it is deterministic but PREDICTABLE, and
-    /// the previous TM's Bitcoin txid is the entropy precisely because it
-    /// cannot be known before that TM is mined. `leader_slot_T` is on chain
-    /// already — `ScheduleParams::leader_slot_t` — and must not be taken from
-    /// `[protocol].leader_timeout_secs`, which is per-operator.
-    pub fn leader(&self, _attempt: u8) -> Identifier {
-        *self
-            .participants
-            .keys()
-            .next()
-            .expect("roster has at least one participant")
+    /// `None` only for an empty roster.
+    #[must_use]
+    pub fn cascade(
+        &self,
+        prev_tm_txid: &[u8; 32],
+        sequence: crate::epoch::leader::TmSequence,
+    ) -> Option<crate::epoch::leader::Cascade> {
+        crate::epoch::leader::Cascade::elect(
+            self.participants
+                .iter()
+                .map(|(id, info)| (*id, info.pool_id.as_slice())),
+            prev_tm_txid,
+            sequence,
+        )
     }
 }
 
@@ -364,6 +364,9 @@ pub enum EpochPhase {
         tm: TreasuryMovement,
         round: SigningRound,
         collected: SignCollected,
+        /// Carried to `Submit`, which elects the submission cascade with it.
+        /// See [`EpochPhase::Submit::tm_sequence`].
+        tm_sequence: u64,
     },
     Submit {
         epoch: u64,
@@ -377,13 +380,16 @@ pub enum EpochPhase {
         group_keys: GroupKeys,
         tm: TreasuryMovement,
         /// Which cascade hop this is. `Roster::leader` maps it to the SPO
-        /// expected to post first; every other SPO holding the aggregate may
-        /// still post, since posting is permissionless on chain.
+        /// This movement's 0-indexed sequence within the epoch — the third
+        /// input to the leader election (spec §Cardano submission and leader
+        /// reward), taken from the batch grid index so every SPO derives the
+        /// same value from the same chain state.
         ///
-        /// TODO (WI-104): nothing bumps this, and `Roster::leader` ignores it,
-        /// so a stuck leader is never replaced. The hop is slot arithmetic
-        /// against `leader_slot_T`, not a local timer.
-        leader_attempt: u8,
+        /// It separates the two elections that would otherwise collide: after a
+        /// DKG the Update-Y and the epoch's first movement hash against the same
+        /// `prev_tm_txid`, and the spec gives key publication the literal
+        /// `"dkg"` here so they elect independently.
+        tm_sequence: u64,
     },
     /// Write down what was just posted, so the fold that a confirmation owes the
     /// two tries survives this process.
@@ -510,7 +516,6 @@ pub struct EpochConfig {
     pub dkg_reconcile_backoff: Duration,
     pub poll_interval: Duration,
     pub quorum51_timeout: Duration,
-    pub leader_timeout: Duration,
     /// Ceiling on the retriable-error backoff. Not an operator key: it paces
     /// re-reads and nothing else, and a per-operator value could only make one
     /// node give up on a handoff sooner than another. Compiled in via
@@ -604,7 +609,6 @@ impl EpochConfig {
             dkg_reconcile_backoff: Duration::from_secs(30),
             poll_interval: Duration::from_millis(5000),
             quorum51_timeout: Duration::from_secs(300),
-            leader_timeout: Duration::from_secs(10000),
             retry_backoff_max: Duration::from_secs(60),
             identity,
             pegin_policy_id: [0u8; 28],
@@ -669,7 +673,16 @@ pub enum EpochError {
     /// is what would make a local retry safe.
     RoundSpent {
         round: u8,
-        cause: String,
+        /// What actually went wrong, kept AS AN ERROR rather than as its
+        /// `Display` (WI-104 review).
+        ///
+        /// "I already published" is orthogonal to "what failed", so it sits
+        /// beside the cause instead of replacing it. Flattening it to a string
+        /// silently disabled every `matches!(e, EpochError::PollTimeout { .. })`
+        /// on the signing path — and the symptom of that is indistinguishable
+        /// from "no round ever times out", which is exactly the kind of bug the
+        /// signing cascade would have inherited.
+        cause: Box<EpochError>,
     },
 }
 
@@ -680,6 +693,17 @@ impl EpochError {
     #[must_use]
     pub fn round_is_spent(&self) -> bool {
         matches!(self, Self::RoundSpent { .. })
+    }
+
+    /// This error with any `RoundSpent` wrapper removed — what actually went
+    /// wrong. Match on THIS, never on the outer error, when the question is the
+    /// failure and not whether this node has already published.
+    #[must_use]
+    pub fn cause(&self) -> &Self {
+        match self {
+            Self::RoundSpent { cause, .. } => cause.cause(),
+            other => other,
+        }
     }
 }
 

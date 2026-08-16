@@ -553,6 +553,10 @@ impl CardanoChain for MockCardanoChain {
         let batch = *self.batch.lock().unwrap();
         snapshot.batch = batch;
         snapshot.slot = batch.open().map_or(0, |b| b.slot);
+        // One slot per cascade hop. The real value is a Config parameter around a
+        // minute; here it only has to be non-zero, because what the tests exercise
+        // is the ORDER the cascade imposes, never how long a hop lasts.
+        snapshot.leader_slot_t = 1;
         Ok(snapshot)
     }
 

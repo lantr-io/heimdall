@@ -83,21 +83,33 @@ pub use crate::http::wire::UPDATE_Y_SESSION;
 /// How the authorizing signature was obtained — reported so the operator can
 /// see, in the log, whether a handoff was federation-authorized (bootstrap) or
 /// roster-authorized (steady state).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateYAuthority {
     /// Signed locally with the configured federation seed, which matched the
     /// treasury's current key. Only possible while the treasury is still keyed
     /// to `y_federation`.
     Federation,
-    /// Signed by a FROST ceremony among the outgoing roster of `epoch`.
-    OutgoingRoster { epoch: u64, min_signers: u16 },
+    /// Signed by a FROST ceremony among the outgoing roster of `epoch`, which is
+    /// carried because it is also the ELECTORATE for posting the result.
+    ///
+    /// WI-099: the two must be the same roster. Only outgoing members can produce
+    /// this signature, so electing a submitter from the incoming one names nodes
+    /// that cannot — and roster churn, which is routine, is exactly when the two
+    /// diverge.
+    OutgoingRoster {
+        epoch: u64,
+        min_signers: u16,
+        roster: Box<crate::epoch::state::Roster>,
+    },
 }
 
 impl std::fmt::Display for UpdateYAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Federation => write!(f, "federation seed (bootstrap handoff)"),
-            Self::OutgoingRoster { epoch, min_signers } => write!(
+            Self::OutgoingRoster {
+                epoch, min_signers, ..
+            } => write!(
                 f,
                 "outgoing roster of epoch {epoch} ({min_signers}-of-n FROST)"
             ),
@@ -123,6 +135,7 @@ pub async fn authorize_update_y(
             let authority = UpdateYAuthority::OutgoingRoster {
                 epoch: outgoing.epoch,
                 min_signers: outgoing.roster.min_signers,
+                roster: Box::new(outgoing.roster.clone()),
             };
             crate::epoch_log!(
                 me,
@@ -565,12 +578,18 @@ mod tests {
         // key — i.e. one the outgoing roster genuinely produced.
         for h in handles {
             let (_sig, authority) = h.await.unwrap().unwrap();
-            assert_eq!(
-                authority,
-                UpdateYAuthority::OutgoingRoster {
-                    epoch: 9,
-                    min_signers: 3
-                }
+            assert!(
+                matches!(
+                    &authority,
+                    UpdateYAuthority::OutgoingRoster {
+                        epoch: 9,
+                        min_signers: 3,
+                        // WI-099: the OUTGOING roster travels with the authority
+                        // because it is also the electorate for posting the result.
+                        roster,
+                    } if roster.participants.len() == 3
+                ),
+                "got {authority:?}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -632,12 +651,18 @@ mod tests {
         for h in handles {
             let (sig, authority) = h.await.unwrap().expect("a threshold subset authorizes");
             assert_eq!(sig.len(), 64);
-            assert_eq!(
-                authority,
-                UpdateYAuthority::OutgoingRoster {
-                    epoch: 9,
-                    min_signers: 2
-                }
+            assert!(
+                matches!(
+                    &authority,
+                    UpdateYAuthority::OutgoingRoster {
+                        epoch: 9,
+                        min_signers: 2,
+                        // WI-099: the OUTGOING roster travels with the authority
+                        // because it is also the electorate for posting the result.
+                        roster,
+                    } if roster.participants.len() == 3
+                ),
+                "got {authority:?}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -679,13 +704,16 @@ mod tests {
         // fresh commitment of ours with whatever the peers published first, and
         // could never aggregate. The counts stay in the cause, because "1 of 2
         // answered" is the diagnosis an operator needs.
-        let EpochError::RoundSpent { round, cause } = &err else {
+        let EpochError::RoundSpent { round, .. } = &err else {
             panic!("expected a spent round-1, got {err:?}");
         };
         assert_eq!(*round, 1);
+        // The spent marker sits BESIDE the cause, not in place of it: since the
+        // WI-104 review the underlying error survives as an error, so this can
+        // match on its shape instead of grepping a formatted string.
         assert!(
-            cause.contains("got 1, need 2"),
-            "the spent marker must not swallow the sub-threshold counts: {cause}"
+            matches!(err.cause(), EpochError::PollTimeout { got: 1, need: 2 }),
+            "the spent marker must not swallow the sub-threshold counts: {err:?}"
         );
         assert!(
             err.round_is_spent(),

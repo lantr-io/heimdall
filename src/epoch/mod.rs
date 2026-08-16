@@ -9,6 +9,7 @@
 pub mod batch;
 pub mod dkg;
 pub mod fixture;
+pub mod leader;
 pub mod log;
 pub mod machine;
 pub mod mocks;

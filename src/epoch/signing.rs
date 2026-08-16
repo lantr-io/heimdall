@@ -36,15 +36,16 @@ use crate::http::wire::SignNamespace;
 /// about what went wrong. It is idempotent, so wrapping an already-marked error
 /// is safe.
 ///
-/// It DOES flatten the underlying error to a string. Nothing on the signing path
-/// can match `PollTimeout` any more, which the signing cascade will need — see
-/// the TODO on [`sign_phase`].
+/// It keeps the underlying error INTACT — `EpochError::cause()` unwraps it — so
+/// `matches!(e.cause(), EpochError::PollTimeout { .. })` still works on the
+/// signing path. It used to flatten it to a string, which disabled every such
+/// match silently.
 pub(crate) fn spent(round: u8) -> impl Fn(EpochError) -> EpochError {
     move |e| match e {
         already @ EpochError::RoundSpent { .. } => already,
         other => EpochError::RoundSpent {
             round,
-            cause: other.to_string(),
+            cause: Box::new(other),
         },
     }
 }
@@ -56,10 +57,9 @@ pub(crate) fn spent(round: u8) -> impl Fn(EpochError) -> EpochError {
 /// and the state machine aborts. A real implementation should catch
 /// the timeout from `poll_sign_round{1,2}` and fall through to
 /// `Federation` (script-path spend after `federation_csv_blocks`).
-/// NOTE for whoever writes it: `matches!(e, EpochError::PollTimeout { .. })`
-/// will NOT fire — [`spent`] wraps every such error in `RoundSpent` with the
-/// cause flattened to a string, and the symptom of getting this wrong is
-/// indistinguishable from "no round ever times out".
+/// NOTE for whoever writes it: match on `e.cause()`, not on `e` — [`spent`]
+/// wraps a timeout in `RoundSpent`, and `EpochError::cause()` is what sees
+/// through it.
 ///
 /// TODO: misbehavior detection. FROST errors here currently surface as
 /// `EpochError::Frost(String)` with the identity lost. The identifiable
@@ -78,6 +78,8 @@ pub async fn sign_phase(
     mut tm: TreasuryMovement,
     round: SigningRound,
     mut collected: SignCollected,
+    // Carried through to `Submit`, which elects the submission cascade with it.
+    tm_sequence: u64,
 ) -> EpochResult<EpochPhase> {
     // The identifier the DKG actually produced for us — authoritative for
     // signing, and consistent with the other post-DKG phases (PublishKeys,
@@ -166,9 +168,12 @@ pub async fn sign_phase(
 
             // Poll peers for round 1 commitments on every input.
             let peer_infos = roster.peers_of(me);
-            // Only the leader broadcasts (`submit_phase`), so a subset without it
-            // produces a movement that is signed and never posted.
-            let leader = roster.leader(0);
+            // No member is required (WI-104). Posting is permissionless, so any
+            // node holding the aggregate can post it and an absent member costs a
+            // cascade hop, not the round. This used to require the leader,
+            // because `submit_phase` broadcast from one hardcoded node and a
+            // subset without it signed a movement nobody would post.
+            //
             // Which peers missed which inputs. Each input is its own FROST
             // session with its own deadline, so a peer can be in S1 for one and
             // absent for another; the COUNT is what separates one slow answer
@@ -191,7 +196,7 @@ pub async fn sign_phase(
                     config,
                     ns,
                     me,
-                    Quorum::of(&peer_infos, roster.min_signers).requiring(leader),
+                    Quorum::of(&peer_infos, roster.min_signers),
                     map,
                 )
                 .await
@@ -229,6 +234,7 @@ pub async fn sign_phase(
             Ok(EpochPhase::Sign {
                 epoch,
                 roster,
+                tm_sequence,
                 cascade,
                 group_keys,
                 tm,
@@ -352,7 +358,7 @@ pub async fn sign_phase(
                 roster,
                 group_keys,
                 tm,
-                leader_attempt: 0,
+                tm_sequence,
             })
         }
     }
@@ -535,24 +541,13 @@ impl SignRoundPayload for frost::round2::SignatureShare {
 pub(crate) struct Quorum<'a> {
     peers: &'a [&'a crate::epoch::state::SpoInfo],
     /// Answers required INCLUDING this node's own, which is already in `out`.
+    ///
+    /// A threshold and nothing else. There used to be a second field naming a
+    /// member the subset was worthless without — the node elected to post —
+    /// which was a bound on heimdall's own submit gate rather than a protocol
+    /// rule, and stricter than the protocol: posting is permissionless, so one
+    /// absent member costs a cascade hop and never the round (WI-104).
     min: usize,
-    /// A peer the subset is worthless without, if there is one.
-    ///
-    /// Threshold alone is not enough for a TM *as this daemon is built*:
-    /// `submit_phase` broadcasts only from `Roster::leader`, and nothing bumps
-    /// `leader_attempt`, so a subset that excludes the leader signs a movement
-    /// NOBODY posts — and does it silently, consuming the batch opportunity
-    /// while the log reads "posted and awaiting confirmation". Requiring the
-    /// leader keeps WI-047's win (any other absentee is signed around) without
-    /// opening that hole.
-    ///
-    /// It is a BOUND ON OUR OWN GATE, NOT A PROTOCOL RULE, and it is stricter
-    /// than the protocol: posting is permissionless, so every node holding the
-    /// aggregate can post and one absent member should cost a cascade hop, not
-    /// the round. WI-104 must DELETE this — implementing the leader cascade and
-    /// then re-pointing `requiring` at the current hop's leader would keep a
-    /// failure mode the spec does not have.
-    required: Option<Identifier>,
 }
 
 impl<'a> Quorum<'a> {
@@ -561,14 +556,7 @@ impl<'a> Quorum<'a> {
         Self {
             peers,
             min: min_signers as usize,
-            required: None,
         }
-    }
-
-    /// The subset must also contain `id`, whatever the threshold says.
-    pub(crate) fn requiring(mut self, id: Identifier) -> Self {
-        self.required = Some(id);
-        self
     }
 
     /// Everyone in the set. Round 2 has no threshold of its own: `aggregate`
@@ -578,7 +566,6 @@ impl<'a> Quorum<'a> {
         Self {
             peers,
             min: peers.len() + 1,
-            required: None,
         }
     }
 }
@@ -648,7 +635,6 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
     let Quorum {
         peers: peer_infos,
         min,
-        required,
     } = quorum;
     // Everyone = every peer plus self. NOT `out.len()`: `out` is resume state
     // (`collected.round1.entry(i).or_default()`), so a round retried after a
@@ -759,28 +745,6 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                     need: min,
                 });
             }
-            // Threshold met but the set is unusable without `required`. Treated as
-            // a timeout, not as a smaller set: the alternative is a fully signed
-            // movement nobody broadcasts.
-            if let Some(id) = required.filter(|id| !out.contains_key(id) && *id != me) {
-                crate::epoch_warn!(
-                    me,
-                    ns.epoch,
-                    "     round{} for {} reached the threshold ({}/{}) but WITHOUT spo={}, whose \
-                     participation the round needs — failing the round rather than signing \
-                     something that cannot be acted on.{}",
-                    T::ROUND,
-                    ns.session_label(),
-                    out.len(),
-                    need,
-                    id_short(id),
-                    unreachable.note(),
-                );
-                return Err(EpochError::PollTimeout {
-                    got: out.len(),
-                    need,
-                });
-            }
             let absent: Vec<Identifier> = peer_infos
                 .iter()
                 .map(|p| p.identifier)
@@ -826,23 +790,20 @@ mod tests {
     use bitcoin::key::{Secp256k1, UntweakedPublicKey};
     use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
 
-    /// WI-047 review: a threshold subset that excludes the LEADER must not sign.
+    /// The assertion this test used to make, INVERTED by WI-104.
     ///
-    /// Only the leader broadcasts (`submit_phase`), and nothing bumps
-    /// `leader_attempt`, so a movement signed without it is one nobody posts —
-    /// and the machine would treat that as a completed cycle: the log reads
-    /// "posted and awaiting confirmation", `Step::Done` returns, and the batch
-    /// opportunity is consumed. Silent non-progress is worse than a failed round,
-    /// so the round fails.
+    /// It required the elected leader to be present or the round failed — a
+    /// bound on heimdall's own submit gate, never a protocol rule, and one the
+    /// spec contradicts: posting is permissionless, so every node holding the
+    /// aggregate can post it. Requiring one named member made a single dark node
+    /// cost the round, and after WI-048 made such a failure `RoundSpent` it cost
+    /// the whole batch opportunity, every opportunity, since the elected node
+    /// never changed.
     ///
-    /// Before the threshold poll this was unreachable — round 1 required every
-    /// peer, so no aggregate could exist without the leader's commitment.
-    ///
-    /// THIS TEST IS EXPECTED TO DIE WITH WI-104. It pins a bound on our own
-    /// submit gate, not a protocol rule; once any node may post, a leaderless
-    /// subset SHOULD sign and the assertion inverts.
+    /// A threshold subset is now a threshold subset whoever is missing, and the
+    /// absentee is reported so the cascade and the misbehaviour path can see it.
     #[tokio::test]
-    async fn a_threshold_subset_without_the_leader_does_not_sign() {
+    async fn a_threshold_subset_signs_whoever_is_missing() {
         let hub = MockPeerHub::new();
         let me = Identifier::try_from(2u16).unwrap();
         let leader = Identifier::try_from(1u16).unwrap();
@@ -872,38 +833,26 @@ mod tests {
             crate::frost::participant::sign_round1(&dealt_package(me), &mut rand::thread_rng());
         out.insert(me, c2);
 
-        let err = poll_sign_round(
-            &peers,
-            &clock,
-            &config,
-            ns,
-            me,
-            Quorum::of(&peer_infos, roster.min_signers).requiring(leader),
-            &mut out,
-        )
-        .await
-        .expect_err("a subset without the leader signs a movement nobody would post");
-        assert!(
-            matches!(err, EpochError::PollTimeout { .. }),
-            "expected the round to fail, got {err:?}"
-        );
-
-        // The control: the SAME subset is fine when the absentee is not the one
-        // the round needs — that is the whole point of WI-047.
-        let mut out2: BTreeMap<Identifier, frost::round1::SigningCommitments> = BTreeMap::new();
-        out2.insert(me, c2);
         let absent = poll_sign_round(
             &peers,
             &clock,
             &config,
             ns,
             me,
-            Quorum::of(&peer_infos, roster.min_signers).requiring(three),
-            &mut out2,
+            Quorum::of(&peer_infos, roster.min_signers),
+            &mut out,
         )
         .await
-        .expect("a threshold subset holding the required member proceeds");
-        assert_eq!(absent, vec![leader], "the absentee must be named");
+        .expect("a threshold subset proceeds even without the node elected to post");
+        assert_eq!(
+            absent,
+            vec![leader],
+            "the absentee is reported, not turned into a failure"
+        );
+        assert!(
+            out.contains_key(&three) && out.contains_key(&me),
+            "S1 is the subset that answered: {out:?}"
+        );
     }
 
     /// A key package for `id` from a throwaway 3-of-3 dealt keyset — enough to
@@ -1127,6 +1076,7 @@ mod tests {
             sign_handles.push(tokio::spawn(async move {
                 let mut phase = EpochPhase::Sign {
                     epoch: 0,
+                    tm_sequence: 0,
                     roster,
                     cascade: CascadeLevel::Quorum51,
                     group_keys: gk,
@@ -1140,13 +1090,24 @@ mod tests {
                             epoch,
                             roster,
                             cascade,
+                            tm_sequence,
                             group_keys,
                             tm,
                             round,
                             collected,
                         } => sign_phase(
-                            &peers, &clock, &rng, &config, epoch, roster, cascade, group_keys, tm,
-                            round, collected,
+                            &peers,
+                            &clock,
+                            &rng,
+                            &config,
+                            epoch,
+                            roster,
+                            cascade,
+                            group_keys,
+                            tm,
+                            round,
+                            collected,
+                            tm_sequence,
                         )
                         .await
                         .unwrap(),

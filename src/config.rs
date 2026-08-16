@@ -206,7 +206,6 @@ pub struct ProtocolConfig {
     pub dkg_reconcile_backoff_secs: u64,
     pub poll_interval_ms: u64,
     pub quorum51_timeout_secs: u64,
-    pub leader_timeout_secs: u64,
     /// Directory for 0600 DKG-state persistence so the signing share survives
     /// restarts for the epoch (WI-014). Unset → in-memory only.
     ///
@@ -227,7 +226,6 @@ impl Default for ProtocolConfig {
             dkg_reconcile_backoff_secs: 30,
             poll_interval_ms: 5000,
             quorum51_timeout_secs: 300,
-            leader_timeout_secs: 10000,
             state_dir: None,
             // 7 days. Large enough that a request selected now cannot reach its
             // 30-day cancel deadline before the TM confirms, even after a long
@@ -844,6 +842,13 @@ const RETIRED_KEYS: &[RetiredKey] = &[
         "max_validity_window_ms",
         "Config params[6] (max_validity_window_ms)",
     ),
+    (
+        "protocol",
+        "leader_timeout_secs",
+        "Config params[0].leader_slot_t — the cascade hop is slot arithmetic on a value the \
+         bridge publishes, and every SPO must step through the roster together. A per-operator \
+         timeout would have each node decide on its own when its turn began (WI-104)",
+    ),
 ];
 
 /// The retired keys this document still sets, in the order listed above.
@@ -917,7 +922,6 @@ impl HeimdallConfig {
             dkg_reconcile_backoff: Duration::from_secs(self.protocol.dkg_reconcile_backoff_secs),
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
             quorum51_timeout: Duration::from_secs(self.protocol.quorum51_timeout_secs),
-            leader_timeout: Duration::from_secs(self.protocol.leader_timeout_secs),
             retry_backoff_max: RETRY_BACKOFF_MAX,
             identity,
             pegin_policy_id,
@@ -1338,7 +1342,6 @@ fee_rate_sat_per_vb = 5
         assert_eq!(epoch.dkg_round_timeout, demo.dkg_round_timeout);
         assert_eq!(epoch.poll_interval, demo.poll_interval);
         assert_eq!(epoch.quorum51_timeout, demo.quorum51_timeout);
-        assert_eq!(epoch.leader_timeout, demo.leader_timeout);
         assert_eq!(epoch.pegin_policy_id, demo.pegin_policy_id);
         assert_eq!(epoch.batch_poll_ceiling, demo.batch_poll_ceiling);
         assert_eq!(

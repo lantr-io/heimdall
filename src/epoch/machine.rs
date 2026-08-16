@@ -588,13 +588,25 @@ async fn step_phase(
             epoch,
             roster,
             cascade,
+            tm_sequence,
             group_keys,
             tm,
             round,
             collected,
         } => {
             sign_phase(
-                peers, clock, rng, config, epoch, roster, cascade, group_keys, tm, round, collected,
+                peers,
+                clock,
+                rng,
+                config,
+                epoch,
+                roster,
+                cascade,
+                group_keys,
+                tm,
+                round,
+                collected,
+                tm_sequence,
             )
             .await?
         }
@@ -604,8 +616,8 @@ async fn step_phase(
             roster,
             group_keys,
             tm,
-            leader_attempt,
-        } => submit_phase(chain, me, epoch, roster, group_keys, tm, leader_attempt).await?,
+            tm_sequence,
+        } => submit_phase(chain, me, epoch, roster, group_keys, tm, tm_sequence).await?,
 
         EpochPhase::RecordMovement {
             epoch,
@@ -1362,9 +1374,10 @@ async fn publish_keys_phase(
         Some(_) if rotation_spent => {
             return Err(EpochError::RoundSpent {
                 round: 1,
-                cause: format!(
-                    "the epoch-{epoch} rotation round is spent and treasury_info still names the                      old key, so the threshold subset did not land it either"
-                ),
+                cause: Box::new(EpochError::Chain(format!(
+                    "the epoch-{epoch} rotation round is spent and treasury_info still names \
+                     the old key, so the threshold subset did not land it either"
+                ))),
             });
         }
         Some(plan) => {
@@ -1380,22 +1393,85 @@ async fn publish_keys_phase(
                 rotation::authorize_update_y(peers, clock, rng, config, me, &plan).await?;
             crate::epoch_log!(me, epoch, "  Update-Y authorized by {authority}");
 
-            // The signature IS the authorization, so one submission suffices and
-            // a second would only burn a fee losing the race for the same input.
-            // Everyone else holds a verified signature and would take over on a
-            // leader cascade.
-            let leader = roster.leader(0);
-            if me == leader {
-                let tx_id = chain.submit_update_y(&plan, &signature).await?;
-                crate::epoch_log!(me, epoch, "  Update-Y submitted: cardano tx {tx_id}");
-            } else {
+            // WI-099: the cascade runs over the roster that PRODUCED the
+            // signature, which is the outgoing one — only its members hold a
+            // share of the key the plan is authorized under. This used to elect
+            // from the incoming roster, and the two diverge exactly when roster
+            // churn makes a rotation matter: a newly registered SPO, one that
+            // restarted with a wiped state_dir, or one banned and rejoined can be
+            // the incoming roster's leader while holding no outgoing share at
+            // all. That node failed in `authorize_update_y` before ever reaching
+            // the election, while every node that COULD post saw `me != leader`
+            // and stood down — so a valid Update-Y was computed and discarded,
+            // including after a ban, which is the case the rotation exists for.
+            //
+            // On the federation path there is no roster and no cascade: whoever
+            // holds the seed is the only party that can sign, so it posts.
+            let electorate = match &authority {
+                rotation::UpdateYAuthority::OutgoingRoster { roster, .. } => Some(roster.as_ref()),
+                rotation::UpdateYAuthority::Federation => None,
+            };
+            let mut cascade = None;
+            // `prev_tm_txid` is the same value the movement cascade uses — the
+            // txid of the current treasury outpoint — and `tm_sequence` is the
+            // spec's literal "dkg", which is what stops this election collapsing
+            // onto the same node as the epoch's first movement.
+            let wait = match electorate {
+                Some(_) => {
+                    let head = chain.query_treasury().await?.outpoint.txid.to_byte_array();
+                    let snapshot = chain.query_batch_snapshot().await?;
+                    cascade = electorate
+                        .and_then(|r| r.cascade(&head, crate::epoch::leader::TmSequence::Dkg));
+                    cascade.as_ref().and_then(|c| {
+                        cascade_wait(c, me, snapshot.slot, snapshot.slot, snapshot.leader_slot_t)
+                    })
+                }
+                None => None,
+            };
+            if let Some(wait) = wait {
+                let c = cascade.as_ref().expect("wait implies a cascade");
+                // "Each SPO monitors the chain — if a predecessor has already
+                // submitted, it does nothing." A completed rotation leaves
+                // nothing to plan, so `plan_update_y` answering `None` IS that
+                // check. Asked BEFORE the sleep as well as after, so a follower
+                // whose leader has already posted rejoins the batch loop at once
+                // instead of arriving a hop behind its peers.
+                let stand_down = |me: frost::Identifier, why: &str| {
+                    crate::epoch_log!(
+                        me,
+                        epoch,
+                        "  Update-Y: {why} — standing down, as the cascade intends"
+                    );
+                };
+                if chain.plan_update_y(epoch, y_51).await?.is_none() {
+                    stand_down(me, "already on chain");
+                    return Ok(EpochPhase::CollectPegins {
+                        epoch,
+                        roster,
+                        group_keys,
+                    });
+                }
                 crate::epoch_log!(
                     me,
                     epoch,
-                    "  Update-Y: follower (leader = {:?}) — signature verified, not submitting",
-                    leader
+                    "  Update-Y: hop {} of the cascade behind {:?}, nothing posted yet — holding \
+                     the signature for {}s",
+                    c.hops_before(me).unwrap_or(0),
+                    c.leader(),
+                    wait.as_secs(),
                 );
+                tokio::time::sleep(wait).await;
+                if chain.plan_update_y(epoch, y_51).await?.is_none() {
+                    stand_down(me, "a predecessor posted while this node waited");
+                    return Ok(EpochPhase::CollectPegins {
+                        epoch,
+                        roster,
+                        group_keys,
+                    });
+                }
             }
+            let tx_id = chain.submit_update_y(&plan, &signature).await?;
+            crate::epoch_log!(me, epoch, "  Update-Y submitted: cardano tx {tx_id}");
         }
     }
 
@@ -2321,6 +2397,11 @@ async fn build_tm_phase(
         tm,
         round: SigningRound::Round1,
         collected: SignCollected::default(),
+        // The batch grid index IS the movement's sequence within the epoch: it is
+        // 1-based and every SPO derives it from the same chain state, which is
+        // what the election needs. A deployment with no grid has one movement per
+        // epoch, hence 0.
+        tm_sequence: batch.map_or(0, |b| b.index),
     })
 }
 
@@ -2328,23 +2409,69 @@ async fn build_tm_phase(
 // submit
 // ---------------------------------------------------------------------------
 
-// All SPOs verify and assemble the witnessed transaction, but only the
-// designated leader for `leader_attempt` actually broadcasts it via
-// `chain.submit_signed_tm`. Today the leader is always
-// `Roster::leader(0)` (lowest identifier).
+/// How long this node waits for its turn in a submission cascade, or `None` if
+/// its turn is now — because it was elected, or because its slot has passed
+/// while it was busy (spec §Cardano submission and leader reward).
+///
+/// One slot is one second post-Shelley, the same identity [`hop_to_opportunity`]
+/// uses to turn a grid slot into a sleep.
+///
+/// `anchor_slot` is the spec's `signing_complete_slot`, observed locally. Nodes
+/// finish signing within seconds of one another, so their anchors differ by
+/// seconds against a hop of `leader_slot_T` — and the cost of any disagreement
+/// is bounded by permissionlessness: two nodes that both post lose one fee, they
+/// do not lose the movement. That is why the anchor does not have to be a value
+/// they negotiate.
+///
+/// A node outside the cascade gets `None`, which means "post now". It should not
+/// be there at all — see [`Roster::cascade`] — but if it is holding a valid
+/// aggregate, withholding it would be the worse of the two mistakes.
+/// Whether somebody has already posted a movement this node no longer needs to.
+///
+/// Two signals, and both are needed. `btc_confirmed = false` means an Unconfirmed
+/// record already stands against this head — the ordinary case, since a posted
+/// movement takes hours to confirm. The head having moved OFF the outpoint this
+/// movement spends is the other: a predecessor's movement already confirmed, so
+/// this one could not be mined anyway.
+///
+/// Keying on the HEAD rather than on a txid is the same rule the trie fold uses
+/// (WI-032), and it is what makes an RBF rebuild stand down too.
+async fn predecessor_posted(
+    chain: &Arc<dyn CardanoChain>,
+    tm: &TreasuryMovement,
+) -> EpochResult<bool> {
+    let treasury = chain.query_treasury().await?;
+    let head_moved = treasury.outpoint != tm.unsigned_tx.input[0].previous_output;
+    Ok(head_moved || !treasury.btc_confirmed)
+}
+
+fn cascade_wait(
+    cascade: &crate::epoch::leader::Cascade,
+    me: frost_secp256k1_tr::Identifier,
+    anchor_slot: u64,
+    now_slot: u64,
+    leader_slot_t: u64,
+) -> Option<std::time::Duration> {
+    let eligible = cascade.eligible_slot(me, anchor_slot, leader_slot_t)?;
+    let hop = eligible.checked_sub(now_slot).filter(|s| *s > 0)?;
+    Some(std::time::Duration::from_secs(hop))
+}
+
+// All SPOs verify and assemble the witnessed transaction; the submission
+// CASCADE decides who posts it first (spec §Cardano submission and leader
+// reward, WI-104).
 //
-// That gate is stricter than the protocol. Posting a TM is PERMISSIONLESS on
-// chain — the head check gates record validity and Bitcoin gates correctness,
-// so an out-of-turn or duplicate post is inert. The leader rule is only the
-// off-chain convention for who goes first, and each SPO is meant to watch the
-// chain and stand down once a predecessor has posted.
+// Posting is PERMISSIONLESS on chain — the head check gates record validity and
+// Bitcoin gates correctness, so an out-of-turn or duplicate post is inert. So
+// this is a stagger, not a gate: the elected node goes at once, and every other
+// holder of the aggregate becomes eligible one `leader_slot_T` hop later, in
+// roster order, re-reading the chain first and standing down if a predecessor
+// already posted.
 //
-// TODO (WI-104): implement the cascade — `Roster::leader` ignores its
-// `attempt`, nothing bumps `leader_attempt`, and the hop is slot arithmetic
-// against the on-chain `leader_slot_T`, not `[protocol].leader_timeout_secs`.
-// Landing it should also DROP `Quorum::requiring(leader)` in `sign_phase`
-// (see there): that bound exists only because this gate turns one absent
-// member into an unpostable movement.
+// It used to be a gate, and always on the same node: `Roster::leader` returned
+// the lowest identifier and nothing moved off it. One dark node therefore cost
+// the roster its ability to post at all — and cost it every batch opportunity,
+// since the election never changed.
 #[allow(clippy::too_many_arguments)]
 async fn submit_phase(
     chain: &Arc<dyn CardanoChain>,
@@ -2353,7 +2480,7 @@ async fn submit_phase(
     roster: Roster,
     group_keys: GroupKeys,
     mut tm: TreasuryMovement,
-    leader_attempt: u8,
+    tm_sequence: u64,
 ) -> EpochResult<EpochPhase> {
     let secp = Secp256k1::new();
 
@@ -2419,31 +2546,95 @@ async fn submit_phase(
         hex::encode(&tx_bytes)
     );
 
-    // Only the designated leader broadcasts. Everyone else assembles
-    // the witnessed tx, holds it, and waits — they'd take over on a
-    // future leader-timeout cascade.
-    let leader = roster.leader(leader_attempt);
-    if me == leader {
-        crate::epoch_log!(
-            me,
-            epoch,
-            "Submit: leader (attempt {leader_attempt}) — broadcasting signed tx; \
-             txid = {} ({} bytes)",
-            tm.txid,
-            tx_bytes.len()
-        );
-        let hint: Vec<[u8; 36]> = tm.fulfilled.iter().map(|f| f.outpoint).collect();
-        chain.submit_signed_tm(&tx_bytes, &hint).await?;
-    } else {
-        crate::epoch_log!(
-            me,
-            epoch,
-            "Submit: follower (leader = {:?}, attempt {leader_attempt}); \
-             holding witnessed tx ({} bytes), not broadcasting",
-            leader,
-            tx_bytes.len()
-        );
+    // The cascade. `prev_tm_txid` is the treasury outpoint this movement SPENDS
+    // — the head every SPO reads from the singleton — so all of them elect the
+    // same node without exchanging anything, and the entropy is unpredictable
+    // until that previous movement was mined.
+    let prev_tm_txid = tm.unsigned_tx.input[0].previous_output.txid.to_byte_array();
+    let snapshot = chain.query_batch_snapshot().await?;
+    let cascade = roster
+        .cascade(
+            &prev_tm_txid,
+            crate::epoch::leader::TmSequence::Tm(tm_sequence),
+        )
+        .ok_or_else(|| EpochError::Transition("empty roster at Submit".into()))?;
+
+    match cascade_wait(
+        &cascade,
+        me,
+        snapshot.slot,
+        snapshot.slot,
+        snapshot.leader_slot_t,
+    ) {
+        None => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "Submit: elected to post first (sequence {tm_sequence}, roster of {}) — \
+                 broadcasting signed tx; txid = {} ({} bytes)",
+                cascade.len(),
+                tm.txid,
+                tx_bytes.len()
+            );
+        }
+        Some(wait) => {
+            let hops = cascade.hops_before(me).unwrap_or(0);
+            // Look BEFORE sleeping. "Each SPO monitors the chain — if a
+            // predecessor has already submitted, it does nothing", and by the
+            // time a follower gets here the leader has usually already posted:
+            // sleeping first would hold this node a hop behind its peers for no
+            // reason, and the next batch opportunity is what it would be late for.
+            if predecessor_posted(chain, &tm).await? {
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "Submit: hop {hops} of the cascade, and {:?} has already posted — standing \
+                     down without waiting, as the cascade intends",
+                    cascade.leader()
+                );
+                return Ok(EpochPhase::RecordMovement {
+                    epoch,
+                    roster,
+                    group_keys,
+                    tm,
+                });
+            }
+            crate::epoch_log!(
+                me,
+                epoch,
+                "Submit: hop {hops} of the cascade behind {:?} (T={} slots), nothing posted yet \
+                 — holding the witnessed tx ({} bytes) for {}s",
+                cascade.leader(),
+                snapshot.leader_slot_t,
+                tx_bytes.len(),
+                wait.as_secs(),
+            );
+            tokio::time::sleep(wait).await;
+            if predecessor_posted(chain, &tm).await? {
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "Submit: a predecessor posted while this node waited — standing down"
+                );
+                return Ok(EpochPhase::RecordMovement {
+                    epoch,
+                    roster,
+                    group_keys,
+                    tm,
+                });
+            }
+            crate::epoch_warn!(
+                me,
+                epoch,
+                "Submit: nobody posted within {hops} hop(s) of the cascade — taking over and \
+                 broadcasting; txid = {} ({} bytes)",
+                tm.txid,
+                tx_bytes.len()
+            );
+        }
     }
+    let hint: Vec<[u8; 36]> = tm.fulfilled.iter().map(|f| f.outpoint).collect();
+    chain.submit_signed_tm(&tx_bytes, &hint).await?;
 
     // Persist the witnessed tx back into `tm` so callers can inspect it.
     tm.unsigned_tx = signed_tx;
@@ -4381,6 +4572,137 @@ mod tests {
         // spo 3 published nothing and cannot complete; it is the absentee, not a
         // participant.
         spo3_handle.abort();
+    }
+
+    /// WI-104's acceptance case: the roster completes a movement when the node
+    /// the election picked never runs at all.
+    ///
+    /// This is what the cascade is FOR. The old rule elected the lowest
+    /// identifier, never moved off it, and made every other node decline to post
+    /// — so one dark node cost the roster its ability to post anything. Worse
+    /// after WI-048: `Quorum::requiring(leader)` turned the same absence into a
+    /// `RoundSpent`, which deliberately keeps the opportunity marker, so no node
+    /// retried until the next grid slot and throughput went to zero at one
+    /// interval per attempt.
+    ///
+    /// The leader here is computed with the REAL election over the fixture's own
+    /// roster, not assumed — the point is that whoever it names can be missing.
+    #[tokio::test]
+    async fn a_dark_leader_costs_a_cascade_hop_not_the_movement() {
+        let fixture = demo_static_fixture(2, 3, 19_970);
+        let head = MockCardanoChain::tm_chain_head(&fixture);
+        let probe: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+        let roster = probe.query_roster(0).await.expect("fixture roster");
+        // The movement spends the fixture's treasury outpoint, so that is the
+        // election's `prev_tm_txid` — the same value every node reads.
+        let prev = head.lock().unwrap().0.txid.to_byte_array();
+        let elected = roster
+            .cascade(&prev, crate::epoch::leader::TmSequence::Tm(0))
+            .expect("a roster elects")
+            .leader();
+
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        // Every node runs, so the elected leader is a full participant in the
+        // ceremony — this is a leader that SIGNS and then fails to post, not one
+        // that was absent all epoch (an absent node is simply not in the roster
+        // the election runs over, so it can never be elected).
+        //
+        // Its post vanishing is modelled by giving it no share of the chain head:
+        // it broadcasts into its own copy, and nothing the others can see ever
+        // changes. That is what a crash between signing and posting looks like to
+        // the rest of the roster, and it is the case the cascade exists for.
+        for (_, info) in roster.participants.iter() {
+            let id = info.identifier;
+            let mock = MockCardanoChain::new(fixture.clone());
+            let mock = if id == elected {
+                mock
+            } else {
+                mock.with_tm_chain(Arc::clone(&head))
+            };
+            let chain: Arc<dyn CardanoChain> = Arc::new(mock);
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        let mut tms = Vec::new();
+        for h in handles {
+            tms.push(
+                tokio::time::timeout(Duration::from_secs(30), h)
+                    .await
+                    .expect(
+                        "a movement must not wait on the elected node: posting is permissionless, \
+                         so an absent leader costs a cascade hop and nothing more",
+                    )
+                    .unwrap()
+                    .expect("the threshold subset completes the movement"),
+            );
+        }
+        assert_eq!(tms.len(), 3, "every node finished");
+        assert!(
+            tms.windows(2).all(|w| w[0].txid == w[1].txid),
+            "all three built the same movement"
+        );
+        // The movement reached the shared chain — so a node that was NOT elected
+        // posted it. Under the rule this replaces, every such node held its copy
+        // and the head never moved.
+        assert_ne!(
+            head.lock().unwrap().0,
+            fixture.treasury_outpoint,
+            "the elected node's post vanished, so a later hop had to take over"
+        );
+    }
+
+    /// The other half of the same rule: the cascade STAGGERS rather than
+    /// duplicating. Once a predecessor's movement is on the chain, a later hop
+    /// stands down instead of burning a fee posting the same bytes again.
+    #[tokio::test]
+    async fn a_later_hop_stands_down_once_a_predecessor_has_posted() {
+        let fixture = demo_static_fixture(2, 2, 19_971);
+        let head = MockCardanoChain::tm_chain_head(&fixture);
+        let hub = MockPeerHub::new();
+        // Separate chain objects so each node's submissions are counted on its
+        // own, but ONE shared head — which is what lets a follower see that a
+        // predecessor already posted.
+        let chains: Vec<Arc<MockCardanoChain>> = (1..=2u16)
+            .map(|_| {
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_tm_chain(Arc::clone(&head)))
+            })
+            .collect();
+        let mut handles = Vec::new();
+        for (i, mock) in chains.iter().enumerate() {
+            let id = Identifier::try_from(u16::try_from(i).unwrap() + 1).unwrap();
+            let chain: Arc<dyn CardanoChain> = mock.clone();
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        for h in handles {
+            tokio::time::timeout(Duration::from_secs(30), h)
+                .await
+                .expect("both nodes finish")
+                .unwrap()
+                .expect("the movement completes");
+        }
+        let posts: usize = chains
+            .iter()
+            .map(|c| c.submitted_txs().lock().unwrap().len())
+            .sum();
+        assert_eq!(
+            posts, 1,
+            "exactly one node posts: the cascade is a stagger, not a race"
+        );
     }
 
     /// WI-048: a movement whose round FAILED AFTER PUBLISHING does not rebuild

@@ -2226,6 +2226,8 @@ impl CardanoChain for BlockfrostCardanoChain {
             tm_params,
             max_tx_size,
             post_tm_envelope: self.post_tm_envelope(),
+            leader_slot_t: u64::try_from(snapshot.config.params.tunables.schedule.leader_slot_t)
+                .unwrap_or(crate::epoch::traits::DEFAULT_LEADER_SLOT_T),
             source,
         })
     }
