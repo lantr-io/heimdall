@@ -66,6 +66,11 @@ pub(crate) fn spent(round: u8) -> impl Fn(EpochError) -> EpochError {
 /// abort property means we can attribute a bad share to a specific
 /// `Identifier`. The on-chain fault-proof flow is currently implemented for
 /// DKG faults; signing-share fault proofs are still not wired up.
+// Every argument is a distinct thing the round is bound to — the roster it polls,
+// the movement it signs, the round it is on, the window it closes at — and
+// bundling them into a struct would only move the list, since each still has to
+// be threaded here from the phase that fixed it.
+#[allow(clippy::too_many_arguments)]
 pub async fn sign_phase(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
@@ -80,6 +85,10 @@ pub async fn sign_phase(
     mut collected: SignCollected,
     // Carried through to `Submit`, which elects the submission cascade with it.
     tm_sequence: u64,
+    // When each round closes, from the chain schedule (WI-077). Read ONCE here
+    // and passed to every input, which is what stops the per-input deadlines
+    // compounding down a multi-input movement.
+    window: crate::epoch::state::SigningWindow,
 ) -> EpochResult<EpochPhase> {
     // The identifier the DKG actually produced for us — authoritative for
     // signing, and consistent with the other post-DKG phases (PublishKeys,
@@ -197,6 +206,7 @@ pub async fn sign_phase(
                     ns,
                     me,
                     Quorum::of(&peer_infos, roster.min_signers),
+                    window.close_of(SigningRound::Round1),
                     map,
                 )
                 .await
@@ -235,6 +245,7 @@ pub async fn sign_phase(
                 epoch,
                 roster,
                 tm_sequence,
+                window,
                 cascade,
                 group_keys,
                 tm,
@@ -326,7 +337,17 @@ pub async fn sign_phase(
                         s1.len()
                     );
                     let shares = collected.round2.entry(i).or_default();
-                    poll_sign_round(peers, clock, config, ns, me, Quorum::all(&s1), shares).await?;
+                    poll_sign_round(
+                        peers,
+                        clock,
+                        config,
+                        ns,
+                        me,
+                        Quorum::all(&s1),
+                        window.close_of(SigningRound::Round2),
+                        shares,
+                    )
+                    .await?;
 
                     // Aggregate.
                     let signature = participant::sign_aggregate_with_tweak(
@@ -592,37 +613,27 @@ impl<'a> Quorum<'a> {
 /// pass the `min` that `S1` must clear, then pass exactly the members of `S1`
 /// back in for round 2.
 ///
-/// ## The deadline is NOT yet a shared one, and that is the weak point
+/// ## The deadline is the caller's, and it comes from the chain (WI-077)
 ///
-/// The rule wants a deadline every participant agrees on. What it gets is
-/// `config.quorum51_timeout` — `[protocol].quorum51_timeout_secs`, a per-operator
-/// TOML value that is never published, exchanged or cross-checked. It was
-/// harmless while the only set that could succeed was "everyone", which no two
-/// nodes can disagree about; it is not harmless now that it decides MEMBERSHIP.
-/// Two operators on different values disagree about a peer that answers between
-/// them, build different packages, and their shares never aggregate — the
-/// repo's own recurring defect, a must-match value set per operator diverging
-/// silently instead of erroring. It belongs on chain: `ScheduleParams` already
-/// decodes `sign_r1_window` / `sign_r2_window` and nothing reads them. WI-077.
+/// `deadline` is an absolute moment derived from the batch opportunity and the
+/// Config's `sign_r1_window` / `sign_r2_window` — see [`SigningWindow`]. This
+/// function must NOT invent one, and in particular must not fall back to a local
+/// timeout: the deadline decides MEMBERSHIP of `S1`, so a value each node picks
+/// for itself is a value two nodes disagree about, and disagreement here is
+/// shares that never aggregate rather than an error anyone can see.
+///
+/// It used to compute `clock.deadline(config.quorum51_timeout)` itself, from a
+/// per-operator TOML key, started when this node entered the round — wrong on
+/// both counts, and wrong once per input because `sign_phase` calls this in a
+/// serial loop.
 ///
 /// The early return on a FULL set is safe, and is the common case: "everyone" is
 /// unambiguous, so no two nodes can disagree about it.
 ///
-/// ## The residual race, and why it fails closed
-///
-/// Even with one agreed value the deadline would still be LOCAL — started when
-/// each node entered the round — so nodes that enter seconds apart have deadlines
-/// seconds apart, and a peer whose payload lands in that gap is in one node's
-/// `S1` and not the other's. Two things bound the damage. The case WI-047 exists
-/// for — a banned, deregistered or stake-dropped pool — never publishes at all,
-/// so every node's `S1` converges on the same present set. And a genuine split
-/// forges nothing: aggregation fails, the caller's own verification rejects, no
-/// transaction is posted, and the epoch retries. Both this and the unshared value
-/// above are closed by anchoring to the chain schedule — WI-077.
-///
 /// Results are filed under the ROSTER's identifier for each peer, never one a
 /// payload claimed for itself: the transport has already verified the payload
 /// was signed by that peer under exactly that identifier.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
@@ -630,6 +641,9 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
     ns: SignNamespace,
     me: Identifier,
     quorum: Quorum<'_>,
+    // The absolute moment this round closes. Chain-derived and shared; never a
+    // local timeout. See the note above.
+    deadline: std::time::Instant,
     out: &mut BTreeMap<Identifier, T>,
 ) -> EpochResult<Vec<Identifier>> {
     let Quorum {
@@ -643,7 +657,6 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
     // `out.len() < need` and the round always ends in `PollTimeout`, however many
     // peers answered.
     let need = peer_infos.len() + 1;
-    let deadline = clock.deadline(config.quorum51_timeout);
     let mut unreachable = crate::epoch::log::Unreachable::default();
     loop {
         for peer in peer_infos {
@@ -774,6 +787,19 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
 
 #[cfg(test)]
 mod tests {
+    /// A signing window closing `ms` from now. Production windows are absolute
+    /// slots off the chain schedule (WI-077); a unit test has no chain to read
+    /// one from, and only needs the round to end.
+    fn test_window(ms: u64) -> crate::epoch::state::SigningWindow {
+        let now = std::time::Instant::now();
+        crate::epoch::state::SigningWindow {
+            round1_close: now + std::time::Duration::from_millis(ms),
+            // Strictly after round 1, as a real window is — see the twin helper
+            // in `rotation`.
+            round2_close: now + std::time::Duration::from_millis(2 * ms),
+        }
+    }
+
     use super::*;
     use crate::bitcoin::taproot::treasury_spend_info;
     use crate::bitcoin::tm_builder::{
@@ -814,7 +840,6 @@ mod tests {
             port: 0,
         });
         config.poll_interval = std::time::Duration::from_millis(5);
-        config.quorum51_timeout = std::time::Duration::from_millis(200);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let ns = SignNamespace::new(7, 0, [0xa1u8; 32]);
 
@@ -840,6 +865,7 @@ mod tests {
             ns,
             me,
             Quorum::of(&peer_infos, roster.min_signers),
+            test_window(200).round1_close,
             &mut out,
         )
         .await
@@ -954,18 +980,80 @@ mod tests {
     }
 
     /// Drive 3 SPOs through DKG then sign_phase for a 2-input TM; every
-    /// aggregated Schnorr signature must verify under the tweaked output
-    /// key of its input.
+    /// The plumbing test: `sign_phase` closes round 1 at the window it was HANDED,
+    /// not at a deadline of its own.
+    ///
+    /// The window is already past and one member of a 2-of-2 roster never
+    /// publishes, so the round must fail immediately. A `sign_phase` that computed
+    /// its own timeout would instead sit through it — which is precisely the
+    /// regression WI-077 removes, and the only part of the change that a unit test
+    /// of `SigningWindow` alone cannot see.
     #[tokio::test]
-    async fn sign_3_of_3_two_inputs_verifies_taproot() {
+    async fn sign_phase_honours_the_window_it_is_given() {
+        let (roster, group_keys_all, tm, hub) = dkg_and_movement(2, 2).await;
+        let me_keys = group_keys_all.into_iter().next().expect("two nodes");
+        let me = *me_keys.key_package.identifier();
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let config = EpochConfig::demo_default(SpoIdentity {
+            identifier: me,
+            bifrost_id_pk: Vec::new(),
+            port: 0,
+        });
+
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let expired = crate::epoch::state::SigningWindow {
+            round1_close: past,
+            round2_close: past,
+        };
+        let started = std::time::Instant::now();
+        let err = sign_phase(
+            &peers,
+            &clock,
+            &rng,
+            &config,
+            0,
+            roster,
+            CascadeLevel::Quorum51,
+            me_keys,
+            tm,
+            SigningRound::Round1,
+            SignCollected::default(),
+            0,
+            expired,
+        )
+        .await
+        .expect_err("a closed window leaves this node alone, below a 2-of-2 threshold");
+        assert!(
+            matches!(err.cause(), EpochError::PollTimeout { got: 1, need: 2 }),
+            "got {err:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the round must close on the window it was given, not run its own timer"
+        );
+    }
+
+    /// A finished DKG plus a two-input movement built against its group key —
+    /// everything `sign_phase` needs, and the same setup for every test that
+    /// drives it.
+    ///
+    /// Extracted so the happy path and the window tests share one fixture: they
+    /// must exercise the SAME movement, or "the round closed differently" could
+    /// be a difference in what was being signed.
+    async fn dkg_and_movement(
+        n: u16,
+        t: u16,
+    ) -> (Roster, Vec<GroupKeys>, TreasuryMovement, Arc<MockPeerHub>) {
         let secp = Secp256k1::new();
 
         // DKG so all SPOs share one group key.
         let hub = MockPeerHub::new();
-        let roster = make_roster(3, 2);
+        let roster = make_roster(n, t);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let mut dkg_handles = Vec::new();
-        for i in 1..=3u16 {
+        for i in 1..=n {
             let id = Identifier::try_from(i).unwrap();
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock = clock.clone();
@@ -1058,6 +1146,72 @@ mod tests {
         tm_template.spi_root = crate::cardano::spi_trie::SpiTrie::empty()
             .root_after(&tm_template.input_outpoints())
             .unwrap();
+        (roster, group_keys_all, tm_template, hub)
+    }
+
+    /// WI-077 wiring: `sign_phase` closes round 1 at the WINDOW it was given, not
+    /// at a timer of its own.
+    ///
+    /// The window here is already past, so the round must close at once on whoever
+    /// has answered — nobody — and fail below threshold. If `sign_phase` invented
+    /// its own deadline instead, this would sit waiting it out; the assertion is
+    /// therefore that it finishes quickly as well as that it fails, and the gap
+    /// between "immediately" and any plausible invented timeout is large.
+    ///
+    /// A closed window is the real case a late node meets. Extending it would be
+    /// the whole defect back: this node would hold a different `S1` open than its
+    /// peers already closed.
+    #[tokio::test]
+    async fn an_expired_window_closes_round_one_at_once_instead_of_waiting() {
+        let hub = MockPeerHub::new();
+        let roster = make_roster(2, 2);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let me = Identifier::try_from(1u16).unwrap();
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub.clone()));
+        let peer_infos = roster.peers_of(me);
+        let mut out: BTreeMap<Identifier, frost::round1::SigningCommitments> = BTreeMap::new();
+        let (_n, c) =
+            crate::frost::participant::sign_round1(&dealt_package(me), &mut rand::thread_rng());
+        out.insert(me, c);
+
+        // A window whose round-1 close is in the PAST.
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let config = EpochConfig::demo_default(SpoIdentity {
+            identifier: me,
+            bifrost_id_pk: Vec::new(),
+            port: 0,
+        });
+        let started = std::time::Instant::now();
+        let err = poll_sign_round(
+            &peers,
+            &clock,
+            &config,
+            SignNamespace::new(7, 0, [0xc3u8; 32]),
+            me,
+            Quorum::of(&peer_infos, roster.min_signers),
+            expired,
+            &mut out,
+        )
+        .await
+        .expect_err("a closed window with one answer is below a 2-of-2 threshold");
+        assert!(
+            matches!(err, EpochError::PollTimeout { got: 1, need: 2 }),
+            "got {err:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a past deadline must close the round at once, not run a timer of its own"
+        );
+    }
+
+    /// aggregated Schnorr signature must verify under the tweaked output
+    /// key of its input.
+    #[tokio::test]
+    async fn sign_3_of_3_two_inputs_verifies_taproot() {
+        let (roster, group_keys_all, tm_template, hub) = dkg_and_movement(3, 2).await;
+        let num_inputs = tm_template.sighashes.len();
+        let secp = Secp256k1::new();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
         // Drive sign_phase for every SPO in parallel.
         let mut sign_handles = Vec::new();
@@ -1077,6 +1231,7 @@ mod tests {
                 let mut phase = EpochPhase::Sign {
                     epoch: 0,
                     tm_sequence: 0,
+                    window: test_window(60_000),
                     roster,
                     cascade: CascadeLevel::Quorum51,
                     group_keys: gk,
@@ -1091,6 +1246,7 @@ mod tests {
                             roster,
                             cascade,
                             tm_sequence,
+                            window,
                             group_keys,
                             tm,
                             round,
@@ -1108,6 +1264,7 @@ mod tests {
                             round,
                             collected,
                             tm_sequence,
+                            window,
                         )
                         .await
                         .unwrap(),

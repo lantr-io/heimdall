@@ -7,7 +7,7 @@
 //! nonces) is deliberately excluded from that contract.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
@@ -250,6 +250,81 @@ pub enum SigningRound {
     Round2,
 }
 
+/// When each FROST round closes, as wall-clock instants derived from the CHAIN
+/// schedule rather than from when this node happened to enter the round (WI-077).
+///
+/// ## Why this is not a `Duration`
+///
+/// The rule the signing rounds implement is: wait to a deadline, let `S1` be
+/// whoever published before it, proceed with EXACTLY `S1`. That only works if
+/// every participant means the same moment by "the deadline" — the binding
+/// factors are a hash over the `SigningPackage`, so two nodes with different `S1`
+/// produce shares that never aggregate.
+///
+/// A local timeout fails that twice over. It starts when each node ENTERS the
+/// round, so nodes entering seconds apart close seconds apart; and its value came
+/// from `[protocol].quorum51_timeout_secs`, a per-operator TOML key never
+/// exchanged or cross-checked, so even two nodes entering together diverged if
+/// their operators typed different numbers. Anchoring to an absolute slot fixes
+/// both: `B_i + sign_r1_window` is one moment, computed identically by everyone
+/// from values the bridge publishes.
+///
+/// ## Why one deadline per ROUND, not per input
+///
+/// It used to be per input — `poll_sign_round` computed a fresh timeout on every
+/// call and `sign_phase` called it once per input in a serial loop, so input `i`
+/// closed at roughly `entry + (i+1) × timeout` and the skew between two nodes
+/// ACCUMULATED down the inputs. A ten-input movement had ten chances to diverge
+/// instead of one, and one absent peer cost ten full timeouts in series. The spec
+/// has exactly one round-1 publication per pool (an array indexed by input under
+/// a single signature), hence exactly one deadline; heimdall still publishes per
+/// input — that layout change is WI-042 — but the DEADLINE is now per round,
+/// which is what removes the compounding.
+#[derive(Debug, Clone, Copy)]
+pub struct SigningWindow {
+    pub round1_close: Instant,
+    pub round2_close: Instant,
+}
+
+impl SigningWindow {
+    /// Build from absolute close SLOTS and the slot this node observed when it
+    /// fixed the window.
+    ///
+    /// One slot is one second post-Shelley — the identity the batch grid already
+    /// uses to turn a slot into a sleep. Two nodes reading different `anchor_slot`
+    /// values get durations differing by exactly their entry skew, so their
+    /// deadlines land on the same absolute moment, which is the whole point.
+    ///
+    /// A close slot already in the past yields a deadline of NOW, and that is
+    /// correct rather than a bug to smooth over: a node that reached the round
+    /// after its window closed must not hold a different `S1` open than its peers
+    /// did. It will close on whoever has answered and, if that is under
+    /// threshold, fail — which is the honest outcome for having missed the window.
+    #[must_use]
+    pub fn from_slots(
+        now: Instant,
+        anchor_slot: u64,
+        round1_close_slot: u64,
+        round2_close_slot: u64,
+    ) -> Self {
+        let after = |slot: u64| now + Duration::from_secs(slot.saturating_sub(anchor_slot));
+        Self {
+            round1_close: after(round1_close_slot),
+            // Never before round 1: a Config whose windows are degenerate must not
+            // give round 2 less room than the round it follows.
+            round2_close: after(round2_close_slot.max(round1_close_slot)),
+        }
+    }
+
+    #[must_use]
+    pub fn close_of(&self, round: SigningRound) -> Instant {
+        match round {
+            SigningRound::Round1 => self.round1_close,
+            SigningRound::Round2 => self.round2_close,
+        }
+    }
+}
+
 /// The active SPO threshold path for a signing session.
 ///
 /// One variant on purpose, and it is not a stub. The spec keeps `mode` in the
@@ -367,6 +442,11 @@ pub enum EpochPhase {
         /// Carried to `Submit`, which elects the submission cascade with it.
         /// See [`EpochPhase::Submit::tm_sequence`].
         tm_sequence: u64,
+        /// When each FROST round closes — fixed once at `BuildTm` from the batch
+        /// opportunity and the Config's signing windows, so Round1 and Round2
+        /// measure against the same chain-derived moments this node computed
+        /// then, not against whenever it happened to enter each round.
+        window: SigningWindow,
     },
     Submit {
         epoch: u64,
@@ -515,7 +595,6 @@ pub struct EpochConfig {
     /// once views reconcile there is no disagreement to re-arm it.
     pub dkg_reconcile_backoff: Duration,
     pub poll_interval: Duration,
-    pub quorum51_timeout: Duration,
     /// Ceiling on the retriable-error backoff. Not an operator key: it paces
     /// re-reads and nothing else, and a per-operator value could only make one
     /// node give up on a handoff sooner than another. Compiled in via
@@ -608,7 +687,6 @@ impl EpochConfig {
             dkg_round2_offset: Duration::from_secs(240),
             dkg_reconcile_backoff: Duration::from_secs(30),
             poll_interval: Duration::from_millis(5000),
-            quorum51_timeout: Duration::from_secs(300),
             retry_backoff_max: Duration::from_secs(60),
             identity,
             pegin_policy_id: [0u8; 28],
@@ -760,6 +838,67 @@ pub type EpochResult<T> = Result<T, EpochError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE property WI-077 exists for: two nodes that enter the round at
+    /// different moments must close it at the SAME moment.
+    ///
+    /// Node B starts 30 s after node A, and reads a chain slot 30 s further on.
+    /// Both compute their wait from the same absolute close slot, so the two
+    /// waits differ by exactly the entry skew and the deadlines coincide. A local
+    /// timeout — the same duration started at each node's own entry — would put
+    /// them 30 s apart, and a peer answering in that gap would be in one node's
+    /// `S1` and not the other's.
+    #[test]
+    fn nodes_entering_apart_close_the_round_together() {
+        let t_a = Instant::now();
+        let t_b = t_a + Duration::from_secs(30);
+        let a = SigningWindow::from_slots(t_a, 100, 200, 260);
+        let b = SigningWindow::from_slots(t_b, 130, 200, 260);
+        assert_eq!(a.round1_close, b.round1_close);
+        assert_eq!(a.round2_close, b.round2_close);
+        // …and it is the slot arithmetic that put them there, not luck.
+        assert_eq!(a.round1_close, t_a + Duration::from_secs(100));
+        assert_eq!(a.round2_close, t_a + Duration::from_secs(160));
+    }
+
+    /// A node that arrives after its window closed does NOT get a fresh one.
+    ///
+    /// Extending it would be the whole bug back again: it would hold a different
+    /// `S1` open than its peers closed. Closing immediately means it proceeds on
+    /// whoever has already answered, and fails below threshold — the honest
+    /// outcome for having missed the window.
+    #[test]
+    fn a_window_already_past_closes_now_rather_than_restarting() {
+        let now = Instant::now();
+        let w = SigningWindow::from_slots(now, 500, 200, 260);
+        assert_eq!(w.round1_close, now);
+        assert_eq!(w.round2_close, now);
+    }
+
+    /// Round 2 never closes before round 1, whatever a Config says.
+    #[test]
+    fn round_two_is_never_before_round_one() {
+        let now = Instant::now();
+        let w = SigningWindow::from_slots(now, 100, 200, 150);
+        assert_eq!(w.round2_close, w.round1_close);
+        assert!(w.round2_close >= w.round1_close);
+    }
+
+    /// `close_of` maps the round to its own deadline — the two must not be
+    /// swapped, which a bare tuple would have made easy.
+    #[test]
+    fn each_round_gets_its_own_close() {
+        let now = Instant::now();
+        let w = SigningWindow::from_slots(now, 0, 10, 20);
+        assert_eq!(
+            w.close_of(SigningRound::Round1),
+            now + Duration::from_secs(10)
+        );
+        assert_eq!(
+            w.close_of(SigningRound::Round2),
+            now + Duration::from_secs(20)
+        );
+    }
 
     #[test]
     fn roster_roundtrip_serde() {

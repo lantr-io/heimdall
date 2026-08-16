@@ -2219,6 +2219,16 @@ impl CardanoChain for BlockfrostCardanoChain {
         let batch =
             config_params::batch_at(&self.bf_base_url, &self.bf_project_id, &snapshot).await;
         let max_tx_size = self.max_tx_size().await?;
+        let schedule = &snapshot.config.params.tunables.schedule;
+        // `B_i = epoch_start + i × interval`, so the anchor comes back out of any
+        // opportunity the grid resolved — cheaper and exactly as accurate as
+        // re-reading it, and `batch_at` has already paid for the read.
+        let interval = u64::try_from(schedule.tm_batch_interval).unwrap_or(0);
+        let epoch_start_slot = batch
+            .open()
+            .or_else(|| batch.next())
+            .filter(|_| interval > 0)
+            .map(|b| b.slot.saturating_sub(b.index.saturating_mul(interval)));
         Ok(BatchSnapshot {
             now_ms: snapshot.time_ms,
             slot: snapshot.slot,
@@ -2226,8 +2236,20 @@ impl CardanoChain for BlockfrostCardanoChain {
             tm_params,
             max_tx_size,
             post_tm_envelope: self.post_tm_envelope(),
-            leader_slot_t: u64::try_from(snapshot.config.params.tunables.schedule.leader_slot_t)
+            leader_slot_t: u64::try_from(schedule.leader_slot_t)
                 .unwrap_or(crate::epoch::traits::DEFAULT_LEADER_SLOT_T),
+            sign_r1_window: u64::try_from(schedule.sign_r1_window)
+                .unwrap_or(crate::epoch::traits::DEFAULT_SIGN_WINDOW),
+            sign_r2_window: u64::try_from(schedule.sign_r2_window)
+                .unwrap_or(crate::epoch::traits::DEFAULT_SIGN_WINDOW),
+            // E-relative in the Config; absolute here, so every SPO's rotation
+            // ceremony closes against the same slot. `None` where the deployment
+            // has no epoch anchor to add it to.
+            update_y_close_slot: epoch_start_slot.and_then(|e| {
+                u64::try_from(schedule.update_y_deadline)
+                    .ok()
+                    .map(|d| e + d)
+            }),
             source,
         })
     }

@@ -192,6 +192,23 @@ pub struct BatchSnapshot {
     /// fee. It rides in this snapshot for the same reason the fee rate does — it is
     /// a published value read at one chain point.
     pub leader_slot_t: u64,
+    /// `sign_r1_window` / `sign_r2_window` — the FROST round deadlines, in slots,
+    /// measured from the batch opportunity `B_i` (Config `params[0]`, spec §TM
+    /// batches; WI-077).
+    ///
+    /// These decide MEMBERSHIP of the signing subset `S1`, so they cannot be a
+    /// per-operator timeout: two operators on different values disagree about a
+    /// peer that answers between them, build different `SigningPackage`s, and
+    /// their shares never aggregate. That is exactly why they are read here and
+    /// not from `[protocol].quorum51_timeout_secs`.
+    pub sign_r1_window: u64,
+    pub sign_r2_window: u64,
+    /// Absolute slot of this epoch's `update_y_deadline`, when the deployment has
+    /// an epoch anchor to measure it from.
+    ///
+    /// The rotation ceremony is not per-batch and has no `B_i`, so this is what
+    /// it closes against instead. `None` where there is no grid at all.
+    pub update_y_close_slot: Option<u64>,
     /// Config UTxO the parameters came from, or the local-override reason.
     pub source: crate::cardano::config_params::ParamSource,
 }
@@ -221,6 +238,9 @@ impl BatchSnapshot {
             max_tx_size: DEFAULT_MAX_TX_SIZE,
             post_tm_envelope: POST_TM_ENVELOPE_WITHOUT_SCRIPT,
             leader_slot_t: DEFAULT_LEADER_SLOT_T,
+            sign_r1_window: DEFAULT_SIGN_WINDOW,
+            sign_r2_window: DEFAULT_SIGN_WINDOW,
+            update_y_close_slot: None,
             source: crate::cardano::config_params::ParamSource::LocalOverride(why),
         }
     }
@@ -258,6 +278,12 @@ pub const POST_TM_ENVELOPE_WITHOUT_SCRIPT: u64 = 1_024;
 /// `leader_slot_T` where no Config publishes one — mocks and offline CLI paths.
 /// The spec's own worked example (60 slots ≈ 1 minute).
 pub const DEFAULT_LEADER_SLOT_T: u64 = 60;
+
+/// `sign_r1_window` / `sign_r2_window` where no Config publishes them — mocks and
+/// offline CLI paths. The spec's worked example is 30 minutes each; this is far
+/// shorter because the only deployments that reach it have no schedule to respect
+/// and no peers to stay in step with.
+pub const DEFAULT_SIGN_WINDOW: u64 = 300;
 
 /// Everything the epoch machine needs to authorize an on-chain Update-Y — the
 /// key handoff that makes a completed DKG the treasury's actual controller.

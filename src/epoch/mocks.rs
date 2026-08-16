@@ -557,6 +557,12 @@ impl CardanoChain for MockCardanoChain {
         // minute; here it only has to be non-zero, because what the tests exercise
         // is the ORDER the cascade imposes, never how long a hop lasts.
         snapshot.leader_slot_t = 1;
+        // Signing windows in slots, i.e. seconds (WI-077). The real values are
+        // half-hour Config parameters; a test only needs the round to END, and it
+        // must end in test time. Non-zero so a round still has a window to close
+        // at rather than closing the instant it opens.
+        snapshot.sign_r1_window = 1;
+        snapshot.sign_r2_window = 1;
         Ok(snapshot)
     }
 

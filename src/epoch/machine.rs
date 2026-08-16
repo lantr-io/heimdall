@@ -574,6 +574,7 @@ async fn step_phase(
         } => {
             build_tm_phase(
                 chain,
+                clock,
                 config,
                 epoch,
                 roster,
@@ -589,6 +590,7 @@ async fn step_phase(
             roster,
             cascade,
             tm_sequence,
+            window,
             group_keys,
             tm,
             round,
@@ -607,6 +609,7 @@ async fn step_phase(
                 round,
                 collected,
                 tm_sequence,
+                window,
             )
             .await?
         }
@@ -1389,8 +1392,21 @@ async fn publish_keys_phase(
                 hex::encode(plan.current_key.serialize()),
                 hex::encode(plan.new_key.serialize())
             );
-            let (signature, authority) =
-                rotation::authorize_update_y(peers, clock, rng, config, me, &plan).await?;
+            // One snapshot for both chain-derived quantities this phase needs:
+            // when the ceremony's rounds close, and where the submission cascade
+            // starts. Read once, before the ceremony, so the deadline is fixed
+            // before any nonce is published rather than after.
+            let snapshot = chain.query_batch_snapshot().await?;
+            let (signature, authority) = rotation::authorize_update_y(
+                peers,
+                clock,
+                rng,
+                config,
+                me,
+                &plan,
+                rotation_window(clock, &snapshot),
+            )
+            .await?;
             crate::epoch_log!(me, epoch, "  Update-Y authorized by {authority}");
 
             // WI-099: the cascade runs over the roster that PRODUCED the
@@ -1419,7 +1435,6 @@ async fn publish_keys_phase(
             let wait = match electorate {
                 Some(_) => {
                     let head = chain.query_treasury().await?.outpoint.txid.to_byte_array();
-                    let snapshot = chain.query_batch_snapshot().await?;
                     cascade = electorate
                         .and_then(|r| r.cascade(&head, crate::epoch::leader::TmSequence::Dkg));
                     cascade.as_ref().and_then(|c| {
@@ -2092,6 +2107,7 @@ enum CpoTrust {
 #[allow(clippy::too_many_arguments)]
 async fn build_tm_phase(
     chain: &Arc<dyn CardanoChain>,
+    clock: &Arc<dyn Clock>,
     config: &EpochConfig,
     epoch: u64,
     roster: Roster,
@@ -2397,6 +2413,10 @@ async fn build_tm_phase(
         tm,
         round: SigningRound::Round1,
         collected: SignCollected::default(),
+        // The signing windows are fixed HERE, off the same snapshot the batch was
+        // frozen against, so both rounds measure from the batch opportunity every
+        // SPO agrees on rather than from whenever each node reaches them.
+        window: signing_window(clock, &snapshot, batch),
         // The batch grid index IS the movement's sequence within the epoch: it is
         // 1-based and every SPO derives it from the same chain state, which is
         // what the election needs. A deployment with no grid has one movement per
@@ -2426,6 +2446,54 @@ async fn build_tm_phase(
 /// A node outside the cascade gets `None`, which means "post now". It should not
 /// be there at all — see [`Roster::cascade`] — but if it is holding a valid
 /// aggregate, withholding it would be the worse of the two mistakes.
+/// Fix the ROTATION ceremony's round deadlines (WI-077).
+///
+/// The rotation is not per-batch and has no `B_i`, so it closes against the
+/// epoch's published `update_y_deadline` instead: round 2 ends there — that being
+/// the moment by which the Update-Y is meant to exist — and round 1 ends one
+/// `sign_r2_window` earlier, leaving the second round its published room. Both
+/// are absolute slots every SPO derives from the same Config.
+///
+/// The same fallback as [`signing_window`] applies where the deployment publishes
+/// no schedule.
+fn rotation_window(
+    clock: &Arc<dyn Clock>,
+    snapshot: &crate::epoch::traits::BatchSnapshot,
+) -> crate::epoch::state::SigningWindow {
+    let r2 = snapshot.update_y_close_slot.unwrap_or_else(|| {
+        snapshot
+            .slot
+            .saturating_add(snapshot.sign_r1_window)
+            .saturating_add(snapshot.sign_r2_window)
+    });
+    let r1 = r2.saturating_sub(snapshot.sign_r2_window);
+    crate::epoch::state::SigningWindow::from_slots(clock.now(), snapshot.slot, r1, r2)
+}
+
+/// Fix this movement's signing windows from the chain schedule (WI-077).
+///
+/// With a grid, both rounds close at absolute slots off the batch opportunity:
+/// `B_i + sign_r1_window` and `B_i + sign_r1_window + sign_r2_window`. Every SPO
+/// computes `B_i` identically and reads the two windows from the same Config, so
+/// the deadlines are one shared moment rather than each node's own stopwatch.
+///
+/// WITHOUT a grid — a mock, or a deployment whose Config carries no schedule —
+/// there is no `B_i` to measure from, so the windows are laid off this node's own
+/// snapshot slot. That is the pre-WI-077 shape and it does NOT converge across
+/// nodes; it is the honest fallback for a deployment that has published no
+/// schedule to converge on, and `BatchSnapshot::source` already records that the
+/// parameters were local.
+fn signing_window(
+    clock: &Arc<dyn Clock>,
+    snapshot: &crate::epoch::traits::BatchSnapshot,
+    batch: Option<crate::epoch::batch::BatchSlot>,
+) -> crate::epoch::state::SigningWindow {
+    let anchor = batch.map_or(snapshot.slot, |b| b.slot);
+    let r1 = anchor.saturating_add(snapshot.sign_r1_window);
+    let r2 = r1.saturating_add(snapshot.sign_r2_window);
+    crate::epoch::state::SigningWindow::from_slots(clock.now(), snapshot.slot, r1, r2)
+}
+
 /// Whether somebody has already posted a movement this node no longer needs to.
 ///
 /// Two signals, and both are needed. `btc_confirmed = false` means an Unconfirmed
@@ -2694,7 +2762,6 @@ mod tests {
         // opportunity finishes in milliseconds rather than the 5-minute
         // production ceiling.
         config.batch_poll_ceiling = Duration::from_millis(20);
-        config.quorum51_timeout = Duration::from_millis(500);
         // The retry ramp still starts at RETRY_BACKOFF_MIN (2 s), but every wait
         // after the first is this — enough to exhaust a bounded retry budget in a
         // test rather than in minutes.
@@ -4572,6 +4639,96 @@ mod tests {
         // spo 3 published nothing and cannot complete; it is the absentee, not a
         // participant.
         spo3_handle.abort();
+    }
+
+    fn snapshot_at(slot: u64) -> crate::epoch::traits::BatchSnapshot {
+        let mut s = crate::epoch::traits::BatchSnapshot::local_override(
+            0,
+            crate::bitcoin::tm_builder::TmParams::fee_rate_only(1),
+            "test",
+        );
+        s.slot = slot;
+        s.sign_r1_window = 60;
+        s.sign_r2_window = 30;
+        s
+    }
+
+    /// WI-077's acceptance case at this level: the window is anchored on the
+    /// BATCH OPPORTUNITY, so a node's own position only shortens its wait.
+    ///
+    /// A node reading 40 slots after `B_i` waits 40 fewer seconds — and because
+    /// reading 40 slots later means BEING 40 seconds later, the two deadlines land
+    /// on the same absolute moment. (That composition is proved directly in
+    /// `epoch::state`; what is checked here is the anchor choice that feeds it,
+    /// since anchoring on the reader's own slot would give every node the same
+    /// wait from a different start, which is the local timeout again.)
+    #[test]
+    fn the_signing_window_is_anchored_on_the_batch_not_on_the_reader() {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let batch = crate::epoch::batch::BatchSlot {
+            index: 1,
+            slot: 5_000_000,
+            cutoff_slot: 4_900_000,
+        };
+        let wait_of = |read_at: u64| {
+            let before = clock.now();
+            let w = signing_window(&clock, &snapshot_at(read_at), Some(batch));
+            (w.round1_close - before, w.round2_close - before)
+        };
+        let (at_bi, _) = wait_of(batch.slot);
+        let (later, later_r2) = wait_of(batch.slot + 40);
+        assert_eq!(at_bi.as_secs(), 60, "sign_r1_window from B_i");
+        assert_eq!(
+            later.as_secs(),
+            20,
+            "40 slots later is 40 seconds less to wait"
+        );
+        assert_eq!(
+            later_r2.as_secs(),
+            50,
+            "round 2 keeps its own window on top"
+        );
+    }
+
+    /// Without a grid there is no `B_i` to anchor on, so every node waits the same
+    /// duration from its OWN read — which does not converge across nodes. That is
+    /// the honest fallback for a deployment publishing no schedule to converge on,
+    /// and it is pinned here so it is never mistaken for the real rule.
+    #[test]
+    fn without_a_grid_the_window_falls_back_to_this_nodes_own_slot() {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let wait_of = |read_at: u64| {
+            let before = clock.now();
+            signing_window(&clock, &snapshot_at(read_at), None).round1_close - before
+        };
+        assert_eq!(wait_of(5_000_000).as_secs(), 60);
+        assert_eq!(
+            wait_of(5_000_040).as_secs(),
+            60,
+            "the same wait from a different start — no shared moment exists here"
+        );
+    }
+
+    /// The rotation has no batch opportunity, so it closes against the epoch's
+    /// published `update_y_deadline` — round 2 AT it, round 1 one `sign_r2_window`
+    /// earlier so the second round keeps its published room.
+    #[test]
+    fn the_rotation_window_closes_on_the_update_y_deadline() {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut s = snapshot_at(5_000_000);
+        s.update_y_close_slot = Some(5_000_300);
+        let before = clock.now();
+        let w = rotation_window(&clock, &s);
+        assert_eq!(
+            (w.round2_close - before).as_secs(),
+            300,
+            "ends at update_y_deadline"
+        );
+        assert_eq!(
+            (w.round1_close - before).as_secs(),
+            270,
+            "round 1 leaves sign_r2_window"
+        );
     }
 
     /// WI-104's acceptance case: the roster completes a movement when the node

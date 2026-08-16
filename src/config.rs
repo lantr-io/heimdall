@@ -205,7 +205,6 @@ pub struct ProtocolConfig {
     /// Devnet-tight by default; mainnet wants it near the settlement depth.
     pub dkg_reconcile_backoff_secs: u64,
     pub poll_interval_ms: u64,
-    pub quorum51_timeout_secs: u64,
     /// Directory for 0600 DKG-state persistence so the signing share survives
     /// restarts for the epoch (WI-014). Unset → in-memory only.
     ///
@@ -225,7 +224,6 @@ impl Default for ProtocolConfig {
             dkg_round2_offset_secs: 240,
             dkg_reconcile_backoff_secs: 30,
             poll_interval_ms: 5000,
-            quorum51_timeout_secs: 300,
             state_dir: None,
             // 7 days. Large enough that a request selected now cannot reach its
             // 30-day cancel deadline before the TM confirms, even after a long
@@ -844,6 +842,14 @@ const RETIRED_KEYS: &[RetiredKey] = &[
     ),
     (
         "protocol",
+        "quorum51_timeout_secs",
+        "Config params[0].sign_r1_window / sign_r2_window — the FROST round deadlines are absolute \
+         slots off the batch opportunity, so that every SPO closes the signing subset S1 at the \
+         same moment. A per-operator timeout decided MEMBERSHIP of S1 once WI-047 made the round \
+         proceed on a threshold, and two operators on different values disagree silently (WI-077)",
+    ),
+    (
+        "protocol",
         "leader_timeout_secs",
         "Config params[0].leader_slot_t — the cascade hop is slot arithmetic on a value the \
          bridge publishes, and every SPO must step through the roster together. A per-operator \
@@ -921,7 +927,6 @@ impl HeimdallConfig {
             dkg_round2_offset: Duration::from_secs(self.protocol.dkg_round2_offset_secs),
             dkg_reconcile_backoff: Duration::from_secs(self.protocol.dkg_reconcile_backoff_secs),
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
-            quorum51_timeout: Duration::from_secs(self.protocol.quorum51_timeout_secs),
             retry_backoff_max: RETRY_BACKOFF_MAX,
             identity,
             pegin_policy_id,
@@ -1341,7 +1346,6 @@ fee_rate_sat_per_vb = 5
 
         assert_eq!(epoch.dkg_round_timeout, demo.dkg_round_timeout);
         assert_eq!(epoch.poll_interval, demo.poll_interval);
-        assert_eq!(epoch.quorum51_timeout, demo.quorum51_timeout);
         assert_eq!(epoch.pegin_policy_id, demo.pegin_policy_id);
         assert_eq!(epoch.batch_poll_ceiling, demo.batch_poll_ceiling);
         assert_eq!(

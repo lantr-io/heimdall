@@ -127,6 +127,11 @@ pub async fn authorize_update_y(
     config: &EpochConfig,
     me: Identifier,
     plan: &UpdateYPlan,
+    // When this ceremony's rounds close (WI-077) — the caller derives it from the
+    // epoch's published `update_y_deadline`, because the rotation has no batch
+    // opportunity to measure from. Unused on the federation path, which runs no
+    // rounds at all.
+    window: crate::epoch::state::SigningWindow,
 ) -> EpochResult<([u8; 64], UpdateYAuthority)> {
     let (signature, authority) = match federation_signature(config, plan)? {
         Some(sig) => (sig, UpdateYAuthority::Federation),
@@ -145,8 +150,17 @@ pub async fn authorize_update_y(
                 outgoing.epoch,
                 outgoing.roster.participants.len()
             );
-            let sig = frost_sign_message(peers, clock, rng, config, plan, &outgoing.roster, &keys)
-                .await?;
+            let sig = frost_sign_message(
+                peers,
+                clock,
+                rng,
+                config,
+                plan,
+                &outgoing.roster,
+                &keys,
+                window,
+            )
+            .await?;
             (sig, authority)
         }
     };
@@ -255,6 +269,7 @@ fn load_outgoing_dkg(
 /// Mirrors `sign_phase`'s structure for a single session, minus the Taproot
 /// tweak: the Update-Y message is signed under the group key as-is, which is
 /// what `verify_schnorr_signature(current_spos_frost_key, …)` checks on-chain.
+#[allow(clippy::too_many_arguments)]
 async fn frost_sign_message(
     peers: &Arc<dyn PeerNetwork>,
     clock: &Arc<dyn Clock>,
@@ -263,6 +278,12 @@ async fn frost_sign_message(
     plan: &UpdateYPlan,
     roster: &Roster,
     keys: &GroupKeys,
+    // When each round of THIS ceremony closes (WI-077). The rotation is not
+    // per-batch and has no `B_i`, so its anchor is the epoch's published
+    // `update_y_deadline` rather than a batch opportunity — but it is the same
+    // rule and the same type, because `poll_sign_round` must not grow a second
+    // notion of when a round ends.
+    window: crate::epoch::state::SigningWindow,
 ) -> EpochResult<[u8; 64]> {
     // Everything the session is bound to comes from the plan, so none of it can
     // drift from the rotation actually being authorized.
@@ -317,6 +338,7 @@ async fn frost_sign_message(
         ns,
         me,
         Quorum::of(&peer_infos, roster.min_signers),
+        window.close_of(crate::epoch::state::SigningRound::Round1),
         &mut round1,
     )
     .await
@@ -358,9 +380,18 @@ async fn frost_sign_message(
     );
     // Exactly S1, all of it: `aggregate` needs a share from every signer in the
     // package, so round 2 carries no threshold of its own.
-    poll_sign_round(peers, clock, config, ns, me, Quorum::all(&s1), &mut round2)
-        .await
-        .map_err(spent(2))?;
+    poll_sign_round(
+        peers,
+        clock,
+        config,
+        ns,
+        me,
+        Quorum::all(&s1),
+        window.close_of(crate::epoch::state::SigningRound::Round2),
+        &mut round2,
+    )
+    .await
+    .map_err(spent(2))?;
 
     let signature = participant::sign_aggregate(&package, &round2, &keys.public_key_package)
         .map_err(|e| EpochError::Frost(format!("update-y aggregate: {e}")))
@@ -379,6 +410,21 @@ async fn frost_sign_message(
 
 #[cfg(test)]
 mod tests {
+    /// A signing window closing `ms` from now, for tests that only need the
+    /// round to END — the production windows are absolute slots off the chain
+    /// schedule (WI-077), which a unit test has no chain to read.
+    fn test_window(ms: u64) -> crate::epoch::state::SigningWindow {
+        let now = std::time::Instant::now();
+        crate::epoch::state::SigningWindow {
+            round1_close: now + std::time::Duration::from_millis(ms),
+            // Strictly after round 1, as a real window is: round 2 closes at
+            // `B_i + sign_r1_window + sign_r2_window`. Giving both rounds the
+            // same instant leaves round 2 no window at all and it times out
+            // having polled nobody.
+            round2_close: now + std::time::Duration::from_millis(2 * ms),
+        }
+    }
+
     use super::*;
     use crate::cardano::treasury_info::update_y_sig_msg;
     use crate::epoch::log::id_short;
@@ -451,7 +497,6 @@ mod tests {
         cfg.state_dir = state_dir;
         cfg.y_fed_seed = seed;
         cfg.poll_interval = std::time::Duration::from_millis(10);
-        cfg.quorum51_timeout = std::time::Duration::from_secs(10);
         cfg
     }
 
@@ -495,6 +540,7 @@ mod tests {
             &config,
             config.identity.identifier,
             &plan,
+            test_window(10_000),
         )
         .await
         .unwrap();
@@ -525,6 +571,7 @@ mod tests {
             &config,
             config.identity.identifier,
             &plan,
+            test_window(10_000),
         )
         .await
         .unwrap_err();
@@ -569,7 +616,7 @@ mod tests {
             let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
             let plan = plan.clone();
             handles.push(tokio::spawn(async move {
-                authorize_update_y(&peers, &clock, &rng, &config, id, &plan).await
+                authorize_update_y(&peers, &clock, &rng, &config, id, &plan, test_window(400)).await
             }));
         }
 
@@ -634,13 +681,12 @@ mod tests {
             // Short enough that the test does not sit out the whole quorum window
             // waiting for a node that will never speak — the deadline IS the
             // mechanism under test.
-            config.quorum51_timeout = std::time::Duration::from_millis(400);
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock = clock.clone();
             let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
             let plan = plan.clone();
             handles.push(tokio::spawn(async move {
-                authorize_update_y(&peers, &clock, &rng, &config, id, &plan).await
+                authorize_update_y(&peers, &clock, &rng, &config, id, &plan, test_window(400)).await
             }));
         }
 
@@ -690,12 +736,11 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let mut config = config_with(Some(per_node), None);
         config.identity.identifier = id1;
-        config.quorum51_timeout = std::time::Duration::from_millis(400);
         let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id1, hub.clone()));
         let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
 
         // Nobody else speaks, so the deadline closes on 1 of the 2 required.
-        let err = authorize_update_y(&peers, &clock, &rng, &config, id1, &plan)
+        let err = authorize_update_y(&peers, &clock, &rng, &config, id1, &plan, test_window(400))
             .await
             .expect_err("one signer of a 2-of-3 roster must not hand over the treasury");
         // SPENT, not a bare `PollTimeout` (WI-048): this node published its
