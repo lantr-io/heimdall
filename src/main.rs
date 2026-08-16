@@ -2099,10 +2099,37 @@ async fn run_spo(
         .current_epoch()
         .await
         .expect("query current chain epoch");
-    let roster = chain
-        .query_roster(epoch)
-        .await
-        .expect("query initial roster");
+    // A registry too small to run a ceremony is not a startup failure on a
+    // Phase-1 bridge (WI-098): it is the state every bridge is in between
+    // genesis and its operators registering, and during it the treasury moves on
+    // the FEDERATION's signature. `query_roster` now reports that as an aborted
+    // ceremony rather than a chain fault, so substitute the roster this node
+    // actually operates in. The machine re-queries the chain every epoch and
+    // takes the same route there, so this only decides identity and logging.
+    //
+    // Any other error is still fatal: a node that cannot READ the registry must
+    // not proceed as though it were empty.
+    let roster = match chain.query_roster(epoch).await {
+        Ok(r) => r,
+        Err(e) if matches!(e, heimdall::epoch::state::EpochError::DkgAborted { .. }) => {
+            let fed = federation_roster(&cfg).unwrap_or_else(|fe| {
+                panic!(
+                    "{e}\n\nand no federation to fall back on: {fe}. A bridge whose registry \
+                     cannot yet produce a roster is moved by its federation, so this node needs \
+                     either a registry seat or a [federation] membership"
+                )
+            });
+            warn!(
+                "no eligible SPO roster yet ({e}) — running as a Phase-1 FEDERATION member \
+                 ({}-of-{}). Treasury movements are signed by the federation until SPOs \
+                 register and the first Update-Y hands the treasury to a roster",
+                fed.min_signers,
+                fed.members.len()
+            );
+            fed.to_epoch_roster(epoch)
+        }
+        Err(e) => panic!("query initial roster: {e}"),
+    };
 
     let (id, me, keypair) = match configured_keypair {
         // A [bifrost].skey_path was configured: locate ourselves by that key.

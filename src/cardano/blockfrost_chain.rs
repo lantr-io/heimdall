@@ -1576,6 +1576,48 @@ fn lovelace_of(utxo: &crate::cardano::bf_http::BfUtxo) -> u64 {
         .unwrap_or(0)
 }
 
+/// Classify a failure to derive the eligible roster.
+///
+/// `TooFew` is not a chain fault: it is the registry saying there are not enough
+/// eligible SPOs to run a ceremony, which is precisely the state a bridge is in
+/// from genesis until its operators register. Reporting it as `Chain` made it
+/// fatal, and that stranded the one route built for exactly this state –
+/// `phase1_fallback` keys off `dkg_unavailable`, which matches `DkgAborted`, so
+/// an under-populated registry has to arrive as an ABORTED CEREMONY for the
+/// federation to be asked to sign (WI-095/WI-098).
+///
+/// Everything else stays `Chain`. A failed fetch, a root mismatch or a duplicate
+/// key are real faults, and a node that cannot READ the registry must never
+/// conclude that the registry is empty.
+fn eligible_roster_error(
+    epoch: u64,
+    attempt: u32,
+) -> impl Fn(crate::cardano::dkg_roster::DkgFetchError) -> EpochError {
+    use crate::cardano::dkg_roster::{DkgFetchError, DkgRosterError};
+    use crate::cardano::roster::RosterError;
+    move |e| {
+        // Both spellings of "not enough": `Registry` counts what is REGISTERED,
+        // `Derive` counts what survives bans and URL filtering. A bridge at
+        // genesis hits the first; one whose whole roster is banned hits the
+        // second. Neither is a fault to abort startup on.
+        let too_few = match &e {
+            DkgFetchError::Registry(RosterError::TooFew { got })
+            | DkgFetchError::Derive(DkgRosterError::TooFew { got }) => Some(*got),
+            _ => None,
+        };
+        match too_few {
+            Some(got) => EpochError::DkgAborted {
+                epoch,
+                attempt,
+                qualified: got,
+                eligible: got,
+                reason: format!("eligible roster: {e}"),
+            },
+            None => EpochError::Chain(format!("eligible roster: {e}")),
+        }
+    }
+}
+
 #[async_trait]
 impl CardanoChain for BlockfrostCardanoChain {
     async fn await_epoch_boundary(&self) -> EpochResult<EpochBoundaryEvent> {
@@ -1637,7 +1679,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             self.demo_exclude_unstaked,
         )
         .await
-        .map_err(|e| EpochError::Chain(format!("eligible roster: {e}")))?;
+        .map_err(eligible_roster_error(epoch, 0))?;
         Ok(ctx.to_roster())
     }
 
@@ -1665,7 +1707,7 @@ impl CardanoChain for BlockfrostCardanoChain {
                 self.demo_exclude_unstaked,
             )
             .await
-            .map_err(|e| EpochError::Chain(format!("eligible roster: {e}"))),
+            .map_err(eligible_roster_error(epoch, attempt)),
             // No registry configured → fall back to the static roster with equal
             // stake (the quorum gate degrades to a >51%-by-count majority).
             None => Ok(

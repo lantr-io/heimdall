@@ -282,6 +282,45 @@ impl FederationRoster {
             .find(|m| &m.bifrost_id_pk == bifrost_id_pk)
     }
 
+    /// This federation, in the shape the epoch machine speaks: an [`Roster`] of
+    /// [`SpoInfo`].
+    ///
+    /// For a Phase-1 bridge, whose registry cannot yet produce a roster, this IS
+    /// the set of nodes that moves the treasury. Each member's [`
+    /// FederationMember::address`] takes the `pool_id` slot, which below the
+    /// roster is a 28-byte member address and nothing more – the same
+    /// substitution the ceremony transport already relies on.
+    ///
+    /// `min_signers` carries the federation's own threshold rather than a
+    /// stake-weighted one: there is no stake to weigh, and this key's threshold
+    /// was fixed when the ceremony generated it.
+    ///
+    /// It decides IDENTITY, not authority. The machine re-queries the chain each
+    /// epoch, and what it does with the result is unaffected by this.
+    #[must_use]
+    pub fn to_epoch_roster(&self, epoch: u64) -> Roster {
+        Roster {
+            epoch,
+            min_signers: self.min_signers,
+            max_signers: u16::try_from(self.members.len()).unwrap_or(u16::MAX),
+            participants: self
+                .members
+                .iter()
+                .map(|m| {
+                    (
+                        m.identifier,
+                        SpoInfo {
+                            identifier: m.identifier,
+                            pool_id: m.address().to_vec(),
+                            bifrost_url: m.bifrost_url.clone(),
+                            bifrost_id_pk: m.bifrost_id_pk.to_vec(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
     #[must_use]
     pub fn member(&self, identifier: Identifier) -> Option<&FederationMember> {
         self.members.iter().find(|m| m.identifier == identifier)
@@ -631,5 +670,66 @@ mod tests {
         assert!(too_few.contains("2-of-3"), "{too_few}");
         let unknown = roster.signers_from_indices(&[1, 9]).unwrap_err();
         assert!(unknown.contains("not a federation member"), "{unknown}");
+    }
+
+    /// The epoch machine addresses peers by `pool_id`, and a federation member
+    /// has no Cardano pool. The member address takes that slot, which is the
+    /// substitution the ceremony transport already relies on – so a Phase-1 node
+    /// is reachable under exactly the bytes its peers already fetch from.
+    #[test]
+    fn the_epoch_roster_addresses_members_by_their_member_address() {
+        let fed = FederationRoster::from_config(&cfg(
+            Some(2),
+            vec![
+                member(0x11, "http://a:1"),
+                member(0x22, "http://b:2"),
+                member(0x33, "http://c:3"),
+            ],
+        ))
+        .unwrap();
+
+        let roster = fed.to_epoch_roster(307);
+
+        assert_eq!(roster.epoch, 307);
+        assert_eq!(
+            roster.min_signers, 2,
+            "the ceremony threshold, not a stake-weighted one"
+        );
+        assert_eq!(roster.max_signers, 3);
+        assert_eq!(roster.participants.len(), 3);
+        for m in &fed.members {
+            let seat = roster
+                .participants
+                .get(&m.identifier)
+                .expect("every member gets a seat");
+            assert_eq!(
+                seat.pool_id,
+                m.address().to_vec(),
+                "pool_id slot holds the member address"
+            );
+            assert_eq!(seat.bifrost_id_pk, m.bifrost_id_pk.to_vec());
+            assert_eq!(seat.bifrost_url, m.bifrost_url);
+        }
+    }
+
+    /// `own_participant` is how both the machine and startup locate this node, so
+    /// a converted roster has to answer it under the member's own identity key.
+    #[test]
+    fn a_member_finds_itself_in_the_converted_roster() {
+        let fed = FederationRoster::from_config(&cfg(
+            Some(2),
+            vec![member(0x11, "http://a:1"), member(0x22, "http://b:2")],
+        ))
+        .unwrap();
+        let me = fed.members[1].clone();
+
+        let (id, info) = fed
+            .to_epoch_roster(1)
+            .own_participant(&me.bifrost_id_pk)
+            .map(|(i, s)| (i, s.clone()))
+            .expect("a member locates itself");
+
+        assert_eq!(id, me.identifier);
+        assert_eq!(info.pool_id, me.address().to_vec());
     }
 }
