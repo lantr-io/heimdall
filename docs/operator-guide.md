@@ -284,14 +284,20 @@ read paths against whatever you configured, so run it after the change and read 
 ## 4. Check it before going further
 
 ```bash
-sudo -u heimdall heimdall run-spo --config /etc/heimdall/heimdall.toml --check
+sudo -u heimdall heimdall doctor --config /etc/heimdall/heimdall.toml
 ```
 
 Run it as the `heimdall` user: the config is `0640 root:heimdall` so you cannot read it as
 yourself, and running as root would leave root-owned files in the state directory.
 
-This runs eight startup checks and prints all of them, then refuses to start if any failed. It is a
-dry run — it reads the chain and builds nothing.
+This runs eight startup checks and prints all of them with the exact command that fixes each one,
+then exits non-zero if any failed. It reads the chain and **posts nothing** — a missing reference
+script and an unregistered SPO are both reported, never deployed or registered for you.
+
+`heimdall doctor` runs the same checks the daemon runs when it starts, by calling the same code, so
+the two cannot disagree about what is wrong. `run-spo --check` is the same thing reached from the
+other direction, if you would rather not type a second command name. When something goes wrong
+later, `heimdall doctor` is the first output to capture.
 
 ```
 [1/8] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
@@ -555,8 +561,8 @@ joins the DKG, co-signs Treasury Movements, and posts them. `HEIMDALL_ARGS` in
 no `--interval-secs` (movements fall on the bridge's on-chain batch grid, which is not a local
 setting), and it rejects unknown arguments, so a stray flag there stops the unit outright.
 
-The look-before-you-leap step is the `--check` run above, which performs every startup check and
-exits without joining anything. Do that; then enable the service.
+The look-before-you-leap step is the `heimdall doctor` run above, which performs every startup check
+and exits without joining anything. Do that; then enable the service.
 
 **Docker:**
 

@@ -873,6 +873,25 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read-only: run every startup check and print pass/fail with the exact
+    /// remediation for each (WI-054).
+    ///
+    /// The pre-flight to run after editing the config and before enabling the
+    /// service, and the first thing to ask for when an operator reports a
+    /// problem. Exits non-zero if any check failed.
+    ///
+    /// It runs the SAME checks the daemon runs at startup — literally the same
+    /// function — so it cannot develop its own opinion of what "healthy" means.
+    /// `run-spo --check` is the same thing reached from the other direction.
+    ///
+    /// Posts nothing, ever. A missing reference script and an unregistered SPO
+    /// are both REPORTED with the command that fixes them: deploying a reference
+    /// script parks around 55 ADA and registering locks a deposit, and neither
+    /// belongs to a diagnostic.
+    Doctor {
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Read-only: chain-source the current Bitcoin treasury from Cardano state
     /// (rev 5.4). Reads the bridge-state singleton's head and amount, checks the
     /// head's scriptPubKey against the candidate treasury trees, and prints its
@@ -956,7 +975,8 @@ fn load_config(path: Option<&str>) -> HeimdallConfig {
 ///
 /// Prints the whole report either way — an operator watching a fresh install needs
 /// to see WHICH bridge and WHICH contracts this node resolved, not merely that it
-/// started. Nothing here spends: steps 5 and 6 name the command and stop.
+/// started. Nothing here spends: steps 4 and 6 — the reference script and the
+/// registration — name the command and stop.
 fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let report = rt.block_on(heimdall::preflight::preflight(cfg));
@@ -972,8 +992,8 @@ fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
         Some(f) => Err(format!(
             "not ready to start: preflight stopped at step {} ({}). The `->` lines under it say \
              what to do — some steps are a misconfiguration to correct, others are simply an \
-             install step not done yet. Re-run the checks with \
-             `heimdall run-spo --config <file> --check`.",
+             install step not done yet. Re-run these checks any time with `heimdall doctor \
+             --config <file>`.",
             f.n, f.title
         )),
     }
@@ -1193,7 +1213,10 @@ fn main() {
                 std::process::exit(1);
             }
             if check {
-                println!("\nstartup checks passed — this node is configured for the bridge above");
+                // Same words as `heimdall doctor`, because it is the same check.
+                println!(
+                    "\nall startup checks passed — this node is configured for the bridge above"
+                );
                 return;
             }
 
@@ -1694,6 +1717,21 @@ fn main() {
             ) {
                 error!("Error: {e}");
                 std::process::exit(1);
+            }
+        }
+        Commands::Doctor { config } => {
+            let cfg = load_config(config.as_deref());
+            // Exactly the daemon's gate. `Err` here has already printed the whole
+            // report, so this only has to set the exit code and say the one thing
+            // the report cannot: that these were the startup checks.
+            match run_preflight_gate(&cfg) {
+                Ok(()) => println!(
+                    "\nall startup checks passed — this node is configured for the bridge above"
+                ),
+                Err(e) => {
+                    error!("{e}");
+                    std::process::exit(1);
+                }
             }
         }
         Commands::ShowTreasury { config } => {

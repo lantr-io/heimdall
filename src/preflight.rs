@@ -6,15 +6,16 @@
 //! locator keys silently dropped to a wall-clock cadence instead of the protocol's
 //! batch grid, which does not agree with the other SPOs, and nothing said so.
 //!
-//! This module runs nine checks in order and reports each one. It is the single
-//! state reader behind the startup gate; `heimdall doctor` (WI-054) and
-//! `heimdall status` (WI-058) are meant to render the same [`Report`] rather than
-//! grow their own opinion of what "healthy" means, because three readers that can
-//! disagree is worse than none.
+//! This module runs eight checks in order and reports each one (nine until
+//! WI-070 removed the contract-set check — there are no operator copies left to
+//! verify). It is the single state reader behind the startup gate; `heimdall
+//! doctor` (WI-054) renders this same [`Report`] by calling this same function,
+//! and `heimdall status` (WI-058) is meant to as well, because three readers that
+//! can disagree about what "healthy" means is worse than none.
 //!
 //! ## It never spends
 //!
-//! Steps 5 and 7 discover and *report*. A missing reference script and an
+//! Steps 4 and 6 discover and *report*. A missing reference script and an
 //! unregistered SPO both name the exact command to run and stop. Deploying the
 //! `spos_registry` reference script parks ~55 ADA and registering locks a security
 //! deposit; neither belongs to a service start, however convenient. That rule is
@@ -881,6 +882,68 @@ async fn wallet_ref_script(
 
 #[cfg(test)]
 mod tests {
+
+    /// WI-054 acceptance: `heimdall doctor` and the daemon's startup gate are the
+    /// SAME reader, so they cannot disagree about what is wrong.
+    ///
+    /// Both call [`preflight`] and render its [`Report`]; nothing renders a
+    /// second opinion. This test is the guard on that — if `doctor` ever grows
+    /// its own checks, two runs over one config stop matching.
+    #[tokio::test]
+    async fn doctor_and_the_startup_gate_read_the_same_state() {
+        let cfg = HeimdallConfig::default();
+        let a = preflight(&cfg).await;
+        let b = preflight(&cfg).await;
+        assert_eq!(a.render(), b.render(), "one config, one verdict");
+        assert_eq!(a.ok(), b.ok());
+    }
+
+    /// WI-054 acceptance: the checks perform NO transaction.
+    ///
+    /// Enforced by reading this module's own source, which is unusual and
+    /// deliberate. The rule is stated at the top of the file as binding on the
+    /// module, and the cost of breaking it is real money — deploying the
+    /// `spos_registry` reference script parks around 55 ADA, and registering
+    /// locks a security deposit. A behavioural test cannot prove the absence of a
+    /// submit on every path; naming the forbidden calls can.
+    #[test]
+    fn no_check_can_submit_a_transaction() {
+        let src = include_str!("preflight.rs");
+        // The functions that put a transaction on a chain. If a new one appears,
+        // add it here — a list that is checked is worth more than a comment.
+        for forbidden in [
+            "transactions_submit",
+            "submit_signed_tm",
+            "submit_update_y",
+            "publish_group_key",
+            "sign_and_submit",
+            "broadcast_btc_tx",
+        ] {
+            // Skip this test's own list when scanning.
+            let hits = src.matches(forbidden).count();
+            assert!(
+                hits <= 1,
+                "preflight must never submit: found `{forbidden}` {hits} times, and the only \
+                 permitted occurrence is this test's own list"
+            );
+        }
+    }
+
+    /// Every failing step carries a remediation, because "something is wrong" is
+    /// not actionable output and this command exists to be actionable.
+    #[tokio::test]
+    async fn every_failure_names_its_fix() {
+        let cfg = HeimdallConfig::default();
+        let report = preflight(&cfg).await;
+        for s in report.steps.iter().filter(|s| s.status == Status::Fail) {
+            assert!(
+                s.fix.as_ref().is_some_and(|f| !f.trim().is_empty()),
+                "step {} ({}) failed with no remediation",
+                s.n,
+                s.title
+            );
+        }
+    }
     use super::*;
     use crate::config::HeimdallConfig;
 
