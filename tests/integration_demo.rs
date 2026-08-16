@@ -83,6 +83,16 @@ async fn full_cycle_3_spos_over_http() {
                 port,
             });
             config.batch_poll_ceiling = Duration::from_millis(20);
+            // MUST be well inside the signing window, or this test cannot pass
+            // on a busy machine (WI-112). `demo_default` carries PRODUCTION
+            // timings — a 5 s poll interval, sized against the spec's half-hour
+            // `sign_r1_window` — while the mock chain reports a 1 s window so the
+            // rounds finish in test time. Left at 5 s the round is sampled ONCE:
+            // every node that has already published is in `S1` and every node a
+            // few hundred milliseconds behind is not, which is fine on an idle
+            // machine and a coin flip on a loaded one. The daemon now warns when
+            // the two are this far apart; see `poll_sign_round`.
+            config.poll_interval = Duration::from_millis(50);
             // BuildTm requires a state_dir: both tries are cumulative, and a
             // node that cannot persist them would commit roots covering only
             // its own movement. One directory per NODE per process, so the

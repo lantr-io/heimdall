@@ -657,6 +657,30 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
     // `out.len() < need` and the round always ends in `PollTimeout`, however many
     // peers answered.
     let need = peer_infos.len() + 1;
+    // A poll interval that does not fit inside the round's window means the
+    // round is sampled ONCE: whoever published before this node's first fetch is
+    // in `S1`, and whoever is a moment behind is not. That is not a timeout an
+    // operator can read off a log — it looks exactly like peers who did not
+    // answer, and it turns a healthy roster into a coin flip under load. It is
+    // reachable in production whenever a bridge publishes a short window or an
+    // operator raises `[protocol].poll_interval_ms`, so it is worth saying
+    // rather than leaving to be re-diagnosed (WI-112).
+    let window = deadline.saturating_duration_since(clock.now());
+    if !window.is_zero() && window < config.poll_interval {
+        crate::epoch_warn!(
+            me,
+            ns.epoch,
+            "     round{} for {} has a {}ms window but polls every {}ms — it will be sampled \
+             ONCE, so a peer that answers a moment late is excluded and the round fails as \
+             though it were absent. Lower [protocol].poll_interval_ms, or the bridge's \
+             sign_r{}_window is too short to co-sign under.",
+            T::ROUND,
+            ns.session_label(),
+            window.as_millis(),
+            config.poll_interval.as_millis(),
+            T::ROUND,
+        );
+    }
     let mut unreachable = crate::epoch::log::Unreachable::default();
     loop {
         for peer in peer_infos {
@@ -781,7 +805,15 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
             );
             return Ok(absent);
         }
-        tokio::time::sleep(config.poll_interval).await;
+        // Never sleep PAST the deadline. The deadline is what fixes `S1`, so
+        // overshooting it means the round closes late on a set nobody else
+        // closed at that moment — and with a window shorter than the poll
+        // interval the loop would wake, find the deadline long gone, and close
+        // on whoever had answered before its single fetch. That is what made
+        // `integration_demo` hang under load (WI-112): not a timeout anyone
+        // could read, but a subset decided by scheduling luck.
+        let until_deadline = deadline.saturating_duration_since(clock.now());
+        tokio::time::sleep(config.poll_interval.min(until_deadline)).await;
     }
 }
 
@@ -980,6 +1012,57 @@ mod tests {
     }
 
     /// Drive 3 SPOs through DKG then sign_phase for a 2-input TM; every
+    /// WI-112: a round whose window is shorter than the poll interval is sampled
+    /// ONCE, which is a coin flip rather than a threshold rule — and it says so.
+    ///
+    /// This is what made `integration_demo` hang under load: the demo inherited a
+    /// 5-second production poll interval while the mock reported a 1-second
+    /// window, so `S1` was whoever happened to have published by the first fetch.
+    /// The warning exists because the symptom is indistinguishable from peers
+    /// simply not answering, which is what sent me looking at the wrong thing.
+    #[tokio::test]
+    async fn a_window_shorter_than_the_poll_interval_closes_at_the_deadline() {
+        let hub = MockPeerHub::new();
+        let roster = make_roster(2, 2);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let me = Identifier::try_from(1u16).unwrap();
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub));
+        let peer_infos = roster.peers_of(me);
+        let mut out: BTreeMap<Identifier, frost::round1::SigningCommitments> = BTreeMap::new();
+        let (_n, c) =
+            crate::frost::participant::sign_round1(&dealt_package(me), &mut rand::thread_rng());
+        out.insert(me, c);
+
+        let mut config = EpochConfig::demo_default(SpoIdentity {
+            identifier: me,
+            bifrost_id_pk: Vec::new(),
+            port: 0,
+        });
+        // A 5-second poll against a 100ms window — the demo's exact shape.
+        config.poll_interval = std::time::Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let err = poll_sign_round(
+            &peers,
+            &clock,
+            &config,
+            SignNamespace::new(7, 0, [0xd4u8; 32]),
+            me,
+            Quorum::of(&peer_infos, roster.min_signers),
+            std::time::Instant::now() + std::time::Duration::from_millis(100),
+            &mut out,
+        )
+        .await
+        .expect_err("one answer is below a 2-of-2 threshold");
+        assert!(matches!(err, EpochError::PollTimeout { .. }), "{err:?}");
+        // It closes AT the deadline rather than sleeping to the next poll — which
+        // is what makes a short window fail fast instead of hanging, and is the
+        // half of this an operator can act on once the warning names it.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the round closed at its deadline, not at the next poll"
+        );
+    }
+
     /// The plumbing test: `sign_phase` closes round 1 at the window it was HANDED,
     /// not at a deadline of its own.
     ///
