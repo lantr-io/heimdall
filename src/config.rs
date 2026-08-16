@@ -19,6 +19,7 @@ pub struct HeimdallConfig {
     pub bitcoin: BitcoinConfig,
     pub cardano: CardanoConfig,
     pub http: HttpConfig,
+    pub health: HealthConfig,
     pub demo: DemoConfig,
     pub bifrost: BifrostConfig,
     pub federation: FederationConfig,
@@ -32,6 +33,7 @@ impl Default for HeimdallConfig {
             bitcoin: BitcoinConfig::default(),
             cardano: CardanoConfig::default(),
             http: HttpConfig::default(),
+            health: HealthConfig::default(),
             demo: DemoConfig::default(),
             bifrost: BifrostConfig::default(),
             federation: FederationConfig::default(),
@@ -643,6 +645,33 @@ impl CardanoConfig {
 
 // ── [http] ──────────────────────────────────────────────────────────
 
+/// The OPERATOR-facing health surface (WI-058).
+///
+/// Separate from [`HttpConfig`] on purpose, and the separation is the point:
+/// that one is the peer protocol, its address is on chain, and everyone can
+/// reach it. This one reports operator state — registration, ceremony
+/// participation, grid position — and defaults to loopback so it is reachable by
+/// the machine's own monitoring and nobody else.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct HealthConfig {
+    /// `address:port` for the operator surface. Loopback by default; point it at
+    /// a LAN address only if you mean to, since nothing here authenticates.
+    pub bind: String,
+    /// Turn the surface off entirely. `heimdall status` then reports only the
+    /// static half — the startup checks — and says the live half is unavailable.
+    pub enabled: bool,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:18580".to_string(),
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct HttpConfig {
@@ -920,6 +949,7 @@ impl HeimdallConfig {
     /// no bridge and nothing to scan for.
     pub fn to_epoch_config(&self, identity: SpoIdentity, pegin_policy_id: [u8; 28]) -> EpochConfig {
         EpochConfig {
+            health: crate::health::HealthHandle::new(),
             dkg_round_timeout: Duration::from_secs(self.protocol.dkg_round_timeout_secs),
             dkg_window: Duration::from_secs(self.protocol.dkg_window_secs),
             dkg_join_wait: Duration::from_secs(self.protocol.dkg_join_wait_secs),

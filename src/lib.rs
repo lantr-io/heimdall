@@ -5,6 +5,7 @@ pub mod config;
 pub mod epoch;
 pub mod federation;
 pub mod frost;
+pub mod health;
 pub mod http;
 pub mod logging;
 pub mod preflight;

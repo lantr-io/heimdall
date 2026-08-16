@@ -365,6 +365,17 @@ async fn drive_to_movement(
                 // handed back below) and the next epoch boundary for a rotation
                 // (so the handoff is not re-entered at all). See
                 // `EpochError::RoundSpent`.
+                // The negative half of the DKG answer, recorded where the loop
+                // actually learns it. A node dropped from the qualified set keeps
+                // running and looks fine, so this is the thing it hurts most to
+                // learn late — and a warn line scrolls away where a queryable
+                // field does not.
+                if matches!(e, EpochError::DkgAborted { .. }) {
+                    config.health.update(|h| {
+                        h.dkg_qualified = Some(false);
+                        h.activity = "DKG did not complete for this node".into();
+                    });
+                }
                 let round_spent = e.round_is_spent();
                 if round_spent && matches!(resume, Some(EpochPhase::PublishKeys { .. })) {
                     let ep = resume.as_ref().map_or(0, current_epoch);
@@ -1292,6 +1303,14 @@ async fn wait_for_roster_health(
                      lagging node to rejoin.",
                     crate::epoch::log::id_short(info.identifier),
                 );
+                // Also on the operator surface: this is the one failure invisible
+                // from the excluded node's chain state — registered, unbanned,
+                // reachable, and simply not being talked to.
+                let line = format!(
+                    "spo={}: {reason}",
+                    crate::epoch::log::id_short(info.identifier)
+                );
+                config.health.update(|h| h.excluded_peers.push(line));
             }
         }
         if down.is_empty() {
@@ -1569,6 +1588,15 @@ async fn publish_keys_phase(
         }
     }
 
+    // This node finished the ceremony holding a share — the affirmative half of
+    // the question an operator most wants answered, and the one a log line
+    // scrolls away.
+    config.health.update(|h| {
+        h.epoch = Some(epoch);
+        h.dkg_qualified = Some(true);
+        h.activity = "keys published".into();
+    });
+
     chain.publish_group_key(y_51).await?;
 
     Ok(EpochPhase::CollectPegins {
@@ -1625,6 +1653,16 @@ async fn await_batch_opportunity(
             // An opportunity is open and this process has not built for it.
             BatchWindow::Open { batch: b, .. } if !built.is(epoch, b.index) => {
                 built.mark(epoch, b.index);
+                config.health.update(|h| {
+                    h.epoch = Some(epoch);
+                    h.activity = format!("building batch B_{}", b.index);
+                    h.last_progress_ms = Some(snapshot.now_ms);
+                    h.grid = Some(crate::health::GridPosition {
+                        slot: snapshot.slot,
+                        batch: Some(b.index),
+                        next_slot: snapshot.batch.next().map(|n| n.slot),
+                    });
+                });
                 crate::epoch_log!(
                     me,
                     epoch,
@@ -1637,6 +1675,15 @@ async fn await_batch_opportunity(
             }
             BatchWindow::NoGrid if !built.is(epoch, BuiltBatch::NO_GRID) => {
                 built.mark(epoch, BuiltBatch::NO_GRID);
+                // No grid to report a position on, but the loop still reached a
+                // build — and "when did this node last get somewhere" is the
+                // field an operator alerts on, so it must move here too.
+                config.health.update(|h| {
+                    h.epoch = Some(epoch);
+                    h.activity = "building (no batch grid configured)".into();
+                    h.last_progress_ms = Some(snapshot.now_ms);
+                    h.grid = None;
+                });
                 return Ok(BatchTurn::Build(None));
             }
             // No grid and this epoch's movement is already made. There is no
@@ -1654,6 +1701,13 @@ async fn await_batch_opportunity(
                 let Some(b) = window.next() else {
                     return Ok(BatchTurn::EpochOver);
                 };
+                // This IS the heartbeat WI-058 asks for, and it already existed:
+                // the loop re-reads the grid at most `batch_poll_ceiling` apart
+                // (5 min), so a healthy idle node says where it is and what it is
+                // waiting for on that cadence rather than going silent between
+                // opportunities. What was missing is the same facts somewhere an
+                // operator can query instead of grepping, which is the update
+                // below.
                 crate::epoch_log!(
                     me,
                     epoch,
@@ -1663,6 +1717,16 @@ async fn await_batch_opportunity(
                     b.slot.saturating_sub(snapshot.slot),
                     snapshot.slot,
                 );
+                config.health.update(|h| {
+                    h.epoch = Some(epoch);
+                    h.activity = format!("waiting for batch B_{}", b.index);
+                    h.last_progress_ms = Some(snapshot.now_ms);
+                    h.grid = Some(crate::health::GridPosition {
+                        slot: snapshot.slot,
+                        batch: snapshot.batch.open().map(|o| o.index),
+                        next_slot: Some(b.slot),
+                    });
+                });
                 hop_to_opportunity(b.slot, snapshot.slot, config.batch_poll_ceiling)
             }
         };
@@ -3490,6 +3554,68 @@ mod tests {
         let me = Identifier::try_from(1u16).unwrap();
         freeze_pegins(vec![parsed_pegin(None, 0x01, 0)], None, me, 42)
             .expect_err("the no-grid path must refuse too");
+    }
+
+    // ── WI-058: the operator surface ──────────────────────────────────
+
+    /// The loop actually WRITES the state the operator surface serves.
+    ///
+    /// The surface itself is tested in `crate::health`; what this pins is the
+    /// wiring — that the phases call through to the handle on the config, so a
+    /// running node reports something rather than an empty page. A test of the
+    /// handle alone would pass with nothing connected to it.
+    #[tokio::test]
+    async fn the_loop_reports_its_progress_to_the_operator_surface() {
+        let health = crate::health::HealthHandle::new();
+        assert_eq!(
+            health.snapshot(),
+            crate::health::NodeState::default(),
+            "nothing has run yet"
+        );
+
+        let fixture = demo_static_fixture(2, 2, 19_980);
+        let hub = MockPeerHub::new();
+        let head = MockCardanoChain::tm_chain_head(&fixture);
+        let mut handles = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_tm_chain(Arc::clone(&head)));
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let mut config = fast_config(id);
+            // Only the first node reports; the second is here to co-sign.
+            if i == 1 {
+                config.health = health.clone();
+            }
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        for h in handles {
+            tokio::time::timeout(Duration::from_secs(30), h)
+                .await
+                .expect("the movement completes")
+                .unwrap()
+                .expect("ok");
+        }
+
+        let state = health.snapshot();
+        assert!(
+            state.last_progress_ms.is_some(),
+            "a node that completed a movement must have recorded progress: {state:?}"
+        );
+        assert!(
+            !state.activity.is_empty(),
+            "and must say what it was doing: {state:?}"
+        );
+        assert_eq!(
+            state.dkg_qualified,
+            Some(true),
+            "it published keys, so it qualified: {state:?}"
+        );
     }
 
     // ── WI-067: the pre-ceremony build gate ───────────────────────────

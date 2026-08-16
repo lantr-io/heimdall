@@ -892,6 +892,23 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Read-only: what this node reports about ITSELF — "am I healthy?", where
+    /// `doctor` answers "can I start?" (WI-058).
+    ///
+    /// Prints two halves. The STATIC half is the same startup report `doctor`
+    /// renders, from the same function: registration, the bridge this node
+    /// resolved, the ban list, the Cardano provider and the key material. The
+    /// LIVE half is what only a running daemon knows — the epoch, whether this
+    /// node qualified in the ceremony, where it stands on the batch grid, and any
+    /// peer excluded for running incompatible software — read from the operator
+    /// surface on `health.bind`.
+    ///
+    /// A node that is not running is reported as exactly that, not as an error.
+    /// Posts nothing.
+    Status {
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Read-only: chain-source the current Bitcoin treasury from Cardano state
     /// (rev 5.4). Reads the bridge-state singleton's head and amount, checks the
     /// head's scriptPubKey against the candidate treasury trees, and prints its
@@ -969,6 +986,68 @@ fn load_config(path: Option<&str>) -> HeimdallConfig {
     };
     heimdall::logging::init(&cfg.log);
     cfg
+}
+
+/// `heimdall status` (WI-058): the startup report plus the running daemon's own
+/// account of itself.
+///
+/// The two halves answer different questions and neither replaces the other. The
+/// static half is computed here, from the same [`heimdall::preflight::preflight`]
+/// the daemon's gate and `heimdall doctor` call — one reader, so the three can
+/// never disagree about what is wrong. The live half is fetched from the
+/// operator surface, because a separate process cannot know whether THIS node
+/// qualified in the ceremony.
+///
+/// Exit status follows the checks, not the daemon: a stopped node is a fact to
+/// report, and making it an error would mean `status` could not be used to find
+/// out whether the node is stopped.
+fn run_status(cfg: &HeimdallConfig) -> Result<(), String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    println!("── startup checks ──────────────────────────────────────────");
+    let report = rt.block_on(heimdall::preflight::preflight(cfg));
+    print!("{}", report.render());
+
+    println!("\n── this node, right now ────────────────────────────────────");
+    if !cfg.health.enabled {
+        println!("the operator surface is disabled (health.enabled = false), so the live half of");
+        println!("this report is unavailable. Enable it to see ceremony and grid state.");
+    } else {
+        match rt.block_on(fetch_node_state(&cfg.health.bind)) {
+            Ok(state) => print!("{}", heimdall::health::render(&state)),
+            Err(e) => {
+                println!(
+                    "no answer from the operator surface at {} ({e}).",
+                    cfg.health.bind
+                );
+                println!(
+                    "That means the daemon is not running, or is bound elsewhere — the checks"
+                );
+                println!("above still describe how it WOULD start.");
+            }
+        }
+    }
+
+    match report.first_failure() {
+        None => Ok(()),
+        Some(f) => Err(format!(
+            "startup checks would stop at step {} ({}) — see the `->` lines above",
+            f.n, f.title
+        )),
+    }
+}
+
+async fn fetch_node_state(bind: &str) -> Result<heimdall::health::NodeState, String> {
+    let url = format!("http://{bind}/");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    resp.json::<heimdall::health::NodeState>()
+        .await
+        .map_err(|e| format!("unreadable answer: {e}"))
 }
 
 /// Run the WI-053 startup checks and refuse to start if any of them failed.
@@ -1719,6 +1798,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Status { config } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_status(&cfg) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::Doctor { config } => {
             let cfg = load_config(config.as_deref());
             // Exactly the daemon's gate. `Err` here has already printed the whole
@@ -2312,6 +2398,20 @@ async fn run_spo(
         axum::serve(listener, app).await.unwrap();
     });
 
+    // The OPERATOR surface (WI-058), on its own listener. Separate from the one
+    // above on purpose: that one's address is on chain and every SPO fetches
+    // from it, so node-operator state does not belong there. Loopback by
+    // default; see `[health]`.
+    let health = heimdall::health::HealthHandle::new();
+    if cfg.health.enabled {
+        tokio::spawn(heimdall::health::serve(
+            cfg.health.bind.clone(),
+            health.clone(),
+        ));
+    } else {
+        info!("[health] operator surface disabled (health.enabled = false)");
+    }
+
     info!(
         "=== Heimdall SPO {spo_label} ({}-of-{}) ===",
         roster.min_signers, roster.max_signers
@@ -2348,6 +2448,8 @@ async fn run_spo(
         },
         pegin_policy_id,
     );
+    // The loop reports through the same handle the surface serves.
+    config.health = health;
     // DEMO-ONLY fault injection (--inject-fault); parse-and-die on a bad kind.
     config.inject_fault = match inject_fault.as_deref() {
         None => None,

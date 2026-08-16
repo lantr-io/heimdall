@@ -298,6 +298,33 @@ bind_address = "0.0.0.0"
 #listen_port = 18500
 
 
+[health]
+# THE OPERATOR SURFACE, and deliberately NOT the one above. That one is the
+# SPO-to-SPO protocol: its address is on chain, every other SPO fetches from it,
+# and anyone can reach it. This one reports what YOU need to know about your own
+# node — whether it qualified in this epoch's ceremony, where it stands on the
+# batch grid, which peers it excluded for running incompatible software — so it
+# binds separately and to loopback, and nothing on it authenticates.
+#
+# `heimdall status` reads it. Point your monitoring at http://127.0.0.1:18580/
+# and alert on `last_progress_ms` failing to advance: that is the field that
+# separates a node doing its job from one that is up and wedged, which systemd
+# cannot tell you (see below).
+#
+# Move `bind` off loopback only if you mean to expose operator state to whatever
+# can reach that address.
+bind = "127.0.0.1:18580"
+#enabled = false
+
+# ON THE SYSTEMD WATCHDOG, since the question comes up: this unit deliberately
+# sets no WatchdogSec/sd_notify. A watchdog proves the process is scheduling and
+# calling home; it cannot tell a node that is co-signing movements from one stuck
+# in a loop, because the same code answers either way. Adding one would turn
+# `active (running)` into a green light meaning no more than it does now — and a
+# false signal gets trusted where a missing one does not. Alert on the health
+# surface instead.
+
+
 [bifrost]
 # This SPO's long-lived secp256k1 bifrost identity secret key: a 0600 file holding
 # 32 bytes as hex. It is bound on-chain at registration, and the daemon signs every

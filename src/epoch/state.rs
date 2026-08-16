@@ -618,6 +618,12 @@ pub struct EpochConfig {
     /// the peg-in source once at that moment — so the offsets would become
     /// differences in what gets frozen.
     pub batch_poll_ceiling: Duration,
+    /// Where the loop reports what it is doing, for the operator surface
+    /// (WI-058). Carried on the config because the config already reaches every
+    /// phase, and threading a second handle through all of them would buy
+    /// nothing. Default is an unread handle, so a caller that wants no surface
+    /// simply never serves it.
+    pub health: crate::health::HealthHandle,
     /// Depositor refund timelock (BTC blocks) baked into the peg-in
     /// Taproot's depositor refund leaf. Spec default is 4320 (~30 days);
     /// testnet4/preprod typically use a smaller value.
@@ -680,6 +686,7 @@ impl EpochConfig {
     /// round-trip times, not arbitrary 30s picks.
     pub fn demo_default(identity: SpoIdentity) -> Self {
         Self {
+            health: crate::health::HealthHandle::new(),
             dkg_round_timeout: Duration::from_secs(300),
             dkg_window: Duration::from_secs(600),
             dkg_join_wait: Duration::from_secs(300),

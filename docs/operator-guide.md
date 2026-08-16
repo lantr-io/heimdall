@@ -583,6 +583,41 @@ without it comes back unable to resume.
 
 ## 8. Operating it
 
+### Is it healthy?
+
+```bash
+sudo -u heimdall heimdall status --config /etc/heimdall/heimdall.toml
+```
+
+`status` answers **"am I healthy?"** where `doctor` answers **"can I start?"**, and it prints two
+halves. The first is the same startup report `doctor` renders, from the same code — registration,
+the bridge this node resolved, the ban list, the provider, the key material. The second is what only
+a running daemon knows: the epoch, whether this node **qualified in the ceremony**, where it stands
+on the batch grid, and any peer excluded for running incompatible software.
+
+If the daemon is not running, `status` says so and still prints the first half. That is a fact worth
+reporting, not an error.
+
+The live half comes from the operator surface on `health.bind` (loopback, `127.0.0.1:18580` by
+default). It is **not** the peer endpoint from step 5 — that one's address is on chain and every SPO
+fetches from it, so your own node's state does not belong there. Point your monitoring at
+`http://127.0.0.1:18580/` and **alert on `last_progress_ms` failing to advance**.
+
+> **Why there is no systemd watchdog.** `WatchdogSec`/`sd_notify` would prove the process is
+> scheduling and calling home. It cannot distinguish a node co-signing movements from one stuck in a
+> loop, because the same code answers either way — so it would turn `active (running)` into a green
+> light that means no more than it already does, and a false signal gets trusted where a missing one
+> does not. `last_progress_ms` is the honest version of that check.
+
+The two failures worth knowing about early, because the node keeps running and looks fine through
+both:
+
+* **`dkg NOT in the qualified set`** — this node is up but not signing. Usually its endpoint was
+  unreachable from outside when the ceremony ran (step 5), so peers could not fetch its round-1
+  payload.
+* **`peers excluded`** — a peer is running software this node will not run a ceremony with.
+  Both sides log it, so the operator on the other end sees the same line. Upgrade the lagging node.
+
 ### Reading the log
 
 Every line carries a level, and journald files it at the matching priority:
