@@ -219,7 +219,7 @@ impl PartialOrd for FifoKey {
 }
 
 /// Which treasury spend path a TM uses. It decides how big the witness is, hence
-/// how many inputs and outputs fit under the ~15 KB raw-transaction ceiling.
+/// how many inputs and outputs fit under the Post-TM byte budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendVariant {
     /// The 51% FROST key path — one 64-byte Schnorr signature per input.
@@ -229,32 +229,199 @@ pub enum SpendVariant {
     Federation,
 }
 
-/// Per-batch capacity, derived from the ~15 KB raw-TM ceiling (spec §TM batches).
-///
-/// NOT a Config tunable and NOT node-local: these numbers decide batch membership,
-/// so they are consensus values like the grid itself. They are a function of the
-/// spend variant alone, which every SPO derives identically from the treasury it
-/// is spending.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Caps {
-    pub max_pegins: usize,
-    pub max_pegouts: usize,
-}
-
-impl Caps {
+impl SpendVariant {
+    /// Bytes one swept peg-in adds to the raw TM: 41 non-witness (outpoint 36 +
+    /// scriptSig length 1 + sequence 4) plus the witness.
+    ///
+    /// Key path: 66 = witness item count 1 + a 65-byte signature item.
+    /// Federation: 173 = item count 1 + signature 65 + revealed leaf ≈41 +
+    /// control block 66. The deposit tree has TWO leaves — the federation sweep
+    /// and the depositor refund — so its control block carries one sibling hash
+    /// (33 + 32), unlike the treasury's own single-leaf tree.
     #[must_use]
-    pub fn for_variant(variant: SpendVariant) -> Self {
-        match variant {
-            SpendVariant::KeyPath => Self {
-                max_pegins: 100,
-                max_pegouts: 100,
-            },
-            SpendVariant::Federation => Self {
-                max_pegins: 57,
-                max_pegouts: 57,
-            },
+    pub const fn pegin_input_bytes(self) -> u64 {
+        match self {
+            Self::KeyPath => 107,
+            Self::Federation => 214,
         }
     }
+
+    /// Bytes the TM costs before any peg-in or peg-out: version/marker/flag/
+    /// locktime 10, one byte for each of the two count varints, the treasury
+    /// input, the treasury change output (43) and the BTMR1 `OP_RETURN` (80 —
+    /// value 8 + length 1 + a 71-byte scriptPubKey).
+    ///
+    /// The federation figure uses 182 for the treasury input, not the 214 a
+    /// peg-in costs: the treasury tree has a single leaf, so its control block
+    /// carries no sibling.
+    #[must_use]
+    pub const fn base_bytes(self) -> u64 {
+        match self {
+            Self::KeyPath => 242,
+            Self::Federation => 317,
+        }
+    }
+}
+
+/// Bytes one peg-out payment adds to the raw TM: an 8-byte value, a 1-byte
+/// script length, and a scriptPubKey of at most 34 (P2TR and P2WSH; every other
+/// standard form is smaller). An upper bound, never an underestimate — which is
+/// the direction that keeps a movement inside the budget rather than one byte
+/// over it.
+pub const PEGOUT_OUTPUT_BYTES: u64 = 43;
+
+/// Bytes one peg-out adds to the **Cardano** Post-TM on top of its Bitcoin
+/// output: one 36-byte outpoint in the `UnconfirmedTm` datum's
+/// `fulfilled_por_outpoints` list, CBOR-encoded as a 2-byte header plus 36 bytes.
+///
+/// This is the term the pre-rev-5.6 model missed entirely, and it is very nearly
+/// as large as the Bitcoin output it accompanies — which is why a ceiling on the
+/// raw Bitcoin transaction could never have bounded the real constraint.
+pub const POR_HINT_BYTES: u64 = 38;
+
+/// Extra bytes a CBOR/Bitcoin count varint costs above the one byte
+/// [`SpendVariant::base_bytes`] already budgets for.
+const fn extra_count_varint_bytes(n: u64) -> u64 {
+    if n < 0xFD {
+        0
+    } else if n <= 0xFFFF {
+        2
+    } else {
+        4
+    }
+}
+
+/// Size in bytes of the raw signed Bitcoin TM carrying `p` peg-ins and `q`
+/// peg-outs (spec §Treasury Movement (Bitcoin), *Size (est.)*).
+#[must_use]
+pub fn raw_tm_bytes(variant: SpendVariant, p: u64, q: u64) -> u64 {
+    variant.base_bytes()
+        + variant.pegin_input_bytes() * p
+        + PEGOUT_OUTPUT_BYTES * q
+        // +1 input for the treasury, +2 outputs for the change and the BTMR1.
+        + extra_count_varint_bytes(p + 1)
+        + extra_count_varint_bytes(q + 2)
+}
+
+/// Bytes a `n`-byte string occupies as Plutus `bounded_bytes` — the encoding the
+/// raw TM travels in, inside the Post-TM datum's `signed_btc_tx` field.
+///
+/// The ledger encodes any Plutus byte string longer than 64 bytes as an
+/// indefinite-length CBOR byte string of 64-byte chunks (pallas' `plutus_data.rs`
+/// says outright that it "matches the haskell implementation"): a `begin` byte, a
+/// 2-byte header per chunk, and a `break` byte. On a ~15 kB transaction that is
+/// ≈3.2 % — real bytes that no ceiling on the raw transaction ever counted.
+///
+/// Rounds UP when the final chunk is under 24 bytes and would take a 1-byte
+/// header. Over-estimating shrinks the batch; under-estimating posts a movement
+/// the chain rejects.
+#[must_use]
+pub fn plutus_chunked(n: u64) -> u64 {
+    if n <= 64 {
+        n + if n < 24 { 1 } else { 2 }
+    } else {
+        n + 2 * n.div_ceil(64) + 2
+    }
+}
+
+/// Per-batch capacity: ONE byte budget over the assembled Cardano Post-TM
+/// transaction (spec §TM batches, *Ordering, capacity, and the split rule*,
+/// rev 5.6).
+///
+/// It replaces two independent per-class counts, which could not express a
+/// capacity limit at all: each was satisfiable while their sum was not, and
+/// nothing in the rule ever measured the assembly. The pair heimdall shipped —
+/// 100 peg-ins and 100 peg-outs, applied independently to the same movement — is
+/// 15 242 raw bytes, past the ~15 kB ceiling it was documented as deriving from.
+/// And that ceiling was itself the wrong quantity: the limit is `max_tx_size` on
+/// the **Post-TM**, where the raw TM is one of three batch-scaling terms, the
+/// other two being the `bounded_bytes` chunking above and [`POR_HINT_BYTES`].
+///
+/// Every field here is a consensus input. Two SPOs with different budgets freeze
+/// different batches, and that does not produce a bad signature — it produces
+/// **no** signature, because the FROST binding factors commit to the signing
+/// package. So none of it may come from operator configuration; `max_tx_size` is
+/// read from the chain and `envelope` is derived from the deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TmBudget {
+    /// The host Cardano protocol parameter, read per epoch — never hardcoded,
+    /// because Conway governance can change it.
+    pub max_tx_size: u64,
+    /// `E`: Post-TM bytes that do NOT scale with the batch — body, redeemer,
+    /// collateral, witness, the datum's non-batch fields, and the TM validator
+    /// script when it rides inline rather than as a reference script.
+    pub envelope: u64,
+    /// Which spend path the movement will use, which sets the per-peg-in weight.
+    pub variant: SpendVariant,
+}
+
+impl TmBudget {
+    /// Size of the assembled Post-TM for `p` peg-ins and `q` peg-outs.
+    #[must_use]
+    pub fn post_tm_bytes(&self, p: u64, q: u64) -> u64 {
+        self.envelope + plutus_chunked(raw_tm_bytes(self.variant, p, q)) + POR_HINT_BYTES * q
+    }
+
+    /// Whether that movement fits.
+    #[must_use]
+    pub fn fits(&self, p: u64, q: u64) -> bool {
+        self.post_tm_bytes(p, q) <= self.max_tx_size
+    }
+
+    /// The largest number of peg-outs that fits with no peg-ins — the first half
+    /// of the fill rule, since peg-outs are taken first.
+    #[must_use]
+    pub fn max_pegouts(&self) -> usize {
+        largest(|q| self.fits(0, q))
+    }
+
+    /// The largest number of peg-ins that fits alongside `q` peg-outs — the
+    /// second half, spending whatever room the peg-outs left.
+    #[must_use]
+    pub fn max_pegins_with(&self, q: u64) -> usize {
+        largest(|p| self.fits(p, q))
+    }
+
+    /// Reject a budget that cannot carry even an empty movement.
+    ///
+    /// An `Err` here is a deployment fault, not a busy batch: the treasury still
+    /// has to move at the epoch handoff whether or not anything is pending, so a
+    /// budget this small would silently produce nothing for ever. Loud beats a
+    /// permanently empty batch.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.fits(0, 0) {
+            return Ok(());
+        }
+        Err(format!(
+            "TM byte budget cannot carry even an empty movement: a bare treasury move needs {} \
+             bytes of Post-TM but max_tx_size is {} (non-batch overhead {}). Either the TM \
+             validator script is too large to ride inline — deploy it as a reference script — or \
+             max_tx_size was read from the wrong chain.",
+            self.post_tm_bytes(0, 0),
+            self.max_tx_size,
+            self.envelope,
+        ))
+    }
+}
+
+/// Largest `n` for which `fits(n)` holds, given that `fits` is monotone
+/// decreasing. Binary search rather than a scan, so a large budget cannot turn
+/// the freeze into a long loop.
+fn largest(fits: impl Fn(u64) -> bool) -> usize {
+    if !fits(0) {
+        return 0;
+    }
+    let (mut lo, mut hi) = (0u64, 1u64);
+    // Grow until it stops fitting; the ceiling is a backstop against a budget so
+    // large the doubling would run away, not a capacity limit anyone reaches.
+    while hi < (1 << 20) && fits(hi) {
+        hi *= 2;
+    }
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) { lo = mid } else { hi = mid }
+    }
+    usize::try_from(lo).unwrap_or(usize::MAX)
 }
 
 /// The outcome of freezing one class of request against a batch.
@@ -528,9 +695,141 @@ mod tests {
         assert_eq!(frozen.deferred(), 1);
     }
 
+    // ── The byte budget (WI-107) ──────────────────────────────────────────
+
+    /// A budget with no TM validator script inline: `max_tx_size` as every
+    /// Cardano network has carried it since Alonzo, and the non-batch overhead
+    /// alone.
+    fn budget() -> TmBudget {
+        TmBudget {
+            max_tx_size: 16_384,
+            envelope: 1_024,
+            variant: SpendVariant::KeyPath,
+        }
+    }
+
+    /// The arithmetic that killed the two-count rule, kept as a test so it cannot
+    /// quietly come back: the published key-path pair does not fit the raw ceiling
+    /// it was documented as deriving from, while the federation pair does.
     #[test]
-    fn caps_follow_the_spend_variant() {
-        assert_eq!(Caps::for_variant(SpendVariant::KeyPath).max_pegouts, 100);
-        assert_eq!(Caps::for_variant(SpendVariant::Federation).max_pegouts, 57);
+    fn the_withdrawn_key_path_pair_overshot_its_own_raw_ceiling() {
+        assert_eq!(raw_tm_bytes(SpendVariant::KeyPath, 100, 100), 15_242);
+        assert_eq!(raw_tm_bytes(SpendVariant::KeyPath, 98, 98), 14_942);
+        assert_eq!(raw_tm_bytes(SpendVariant::Federation, 57, 57), 14_966);
+        // 98 + 98 is the largest symmetric key-path pair under ~15 kB; 99 + 99 is not.
+        assert!(raw_tm_bytes(SpendVariant::KeyPath, 99, 99) > 15_000);
+    }
+
+    /// The ledger's 64-byte chunking of a Plutus byte string — ≈3.2 % that the
+    /// pre-rev-5.6 model never counted.
+    #[test]
+    fn plutus_chunking_is_charged() {
+        assert_eq!(plutus_chunked(15_242), 15_722);
+        assert_eq!(plutus_chunked(64), 66, "a 64-byte string is not chunked");
+        assert_eq!(plutus_chunked(0), 1);
+        // Never an underestimate: the encoding can only be smaller than the model.
+        for n in [1u64, 23, 24, 65, 128, 1_000, 9_999] {
+            assert!(plutus_chunked(n) > n, "n = {n}");
+        }
+    }
+
+    /// The other missed term: a peg-out costs Cardano bytes as well as Bitcoin
+    /// bytes, and the two are the same order of magnitude.
+    #[test]
+    fn a_pegout_costs_cardano_bytes_too() {
+        let b = budget();
+        let step = b.post_tm_bytes(0, 11) - b.post_tm_bytes(0, 10);
+        assert!(
+            step >= PEGOUT_OUTPUT_BYTES + POR_HINT_BYTES,
+            "a peg-out costs its Bitcoin output AND its datum hint, got {step}"
+        );
+    }
+
+    /// Why a fixed pair of counts can never be right: the two classes have
+    /// different weights, so any pair is either wasteful or over the limit.
+    ///
+    /// Note WHERE the weights are compared. On the raw Bitcoin transaction a
+    /// peg-in costs ≈2.5× a peg-out (107 vs 43) — but the budget measures the
+    /// Post-TM, and there [`POR_HINT_BYTES`] nearly doubles the peg-out while the
+    /// peg-in only picks up chunking, leaving a ratio closer to 4:3. The
+    /// conclusion is unchanged and the intuition is not: peg-outs are far more
+    /// expensive than the Bitcoin-side numbers suggest.
+    #[test]
+    fn the_two_classes_have_different_weights() {
+        let b = budget();
+        let pegin = b.post_tm_bytes(11, 0) - b.post_tm_bytes(10, 0);
+        let pegout = b.post_tm_bytes(0, 11) - b.post_tm_bytes(0, 10);
+        assert!(pegin > pegout, "{pegin} vs {pegout}");
+        // The Bitcoin-side ratio, for contrast with the Post-TM one below.
+        assert_eq!(
+            SpendVariant::KeyPath.pegin_input_bytes(),
+            PEGOUT_OUTPUT_BYTES * 2 + 21
+        );
+        assert!(
+            pegin * 2 < pegout * 3,
+            "on the Post-TM the gap is far narrower than 2.5x: {pegin} vs {pegout}"
+        );
+    }
+
+    /// THE regression test. Under the old rule each class took its own full cap
+    /// and the sum was never checked; here the two maxima are each valid alone
+    /// and hopeless together, which is exactly the defect.
+    #[test]
+    fn the_two_maxima_do_not_fit_together() {
+        let b = budget();
+        let (max_q, max_p) = (b.max_pegouts() as u64, b.max_pegins_with(0) as u64);
+        assert!(b.fits(0, max_q), "each is fine alone");
+        assert!(b.fits(max_p, 0));
+        assert!(
+            !b.fits(max_p, max_q),
+            "{max_p} peg-ins and {max_q} peg-outs must NOT fit together"
+        );
+        // …and the joint rule does hold: peg-outs first, peg-ins in what is left.
+        assert!(b.fits(b.max_pegins_with(max_q) as u64, max_q));
+    }
+
+    /// Each maximum is the largest that fits — not one less, and not one more.
+    #[test]
+    fn the_maxima_are_tight() {
+        let b = budget();
+        let q = b.max_pegouts() as u64;
+        assert!(b.fits(0, q) && !b.fits(0, q + 1));
+        let p = b.max_pegins_with(0) as u64;
+        assert!(b.fits(p, 0) && !b.fits(p + 1, 0));
+        // A named case, so a change in the weights or the encoding is visible in
+        // the diff rather than only in a ratio.
+        assert_eq!((q, p), (183, 136));
+    }
+
+    /// A budget too small for a bare treasury move is a deployment fault, and it
+    /// must say so rather than produce an empty movement for ever.
+    #[test]
+    fn a_budget_below_the_empty_movement_is_rejected() {
+        assert!(budget().validate().is_ok());
+        let tiny = TmBudget {
+            max_tx_size: 1_000,
+            ..budget()
+        };
+        let err = tiny.validate().expect_err("cannot carry an empty movement");
+        assert!(err.contains("reference script"), "{err}");
+    }
+
+    /// The TM validator riding inline rather than as a reference script is worth
+    /// roughly ten pairs of capacity — the claim the spec makes, checked.
+    #[test]
+    fn an_inline_validator_script_costs_real_capacity() {
+        let with_script = TmBudget {
+            envelope: 1_024 + 2_500,
+            ..budget()
+        };
+        let (a, b) = (
+            symmetric_max(&budget()) as i64,
+            symmetric_max(&with_script) as i64,
+        );
+        assert!((8..=20).contains(&(a - b)), "{a} vs {b}");
+    }
+
+    fn symmetric_max(b: &TmBudget) -> u64 {
+        (0..500).take_while(|n| b.fits(*n, *n)).last().unwrap_or(0)
     }
 }

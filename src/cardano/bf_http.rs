@@ -697,6 +697,78 @@ pub async fn fetch_account_registered(
     }
 }
 
+/// Cardano's `max_tx_size` **for a named epoch** — the bound the TM batch byte
+/// budget is measured against (WI-107, spec §TM batches rev 5.6).
+///
+/// Named, not `latest`, and the difference is the point. Protocol-parameter
+/// changes take effect only at epoch boundaries, so the value for a given epoch
+/// is a chain fact every SPO derives identically; two SPOs reading `latest`
+/// either side of a boundary would get two budgets, freeze two different batches
+/// and produce no signature at all — the FROST binding factors commit to the
+/// signing package, so a membership disagreement is not a bad signature but the
+/// absence of one.
+///
+/// Same direct-then-fallback shape as [`fetch_epoch_start_ms`], and for the same
+/// reason: yaci-store serves no per-number `/epochs/{n}/parameters` route, and a
+/// `latest` that turns out to be a different epoch stays an error rather than
+/// silently answering for the wrong one.
+pub async fn fetch_max_tx_size(
+    base_url: &str,
+    project_id: &str,
+    epoch: u64,
+) -> Result<u64, String> {
+    let fetch = |path: String| async move {
+        let resp = reqwest::Client::new()
+            .get(format!("{base_url}/{path}"))
+            .header("project_id", project_id)
+            .send()
+            .await
+            .map_err(|e| format!("{path} request: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "{path} http {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            ));
+        }
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("{path} json: {e}"))
+    };
+    let v = match fetch(format!("epochs/{epoch}/parameters")).await {
+        Ok(v) => v,
+        Err(direct_err) => {
+            let latest = fetch("epochs/latest/parameters".to_string())
+                .await
+                .map_err(|e| format!("{direct_err}; epochs/latest/parameters fallback: {e}"))?;
+            match latest.get("epoch").and_then(serde_json::Value::as_u64) {
+                Some(e) if e == epoch => latest,
+                other => {
+                    return Err(format!(
+                        "{direct_err}; epochs/latest/parameters is epoch {other:?}, want {epoch}"
+                    ));
+                }
+            }
+        }
+    };
+    // Blockfrost spells it `max_tx_size`; some yaci-store builds echo the ledger's
+    // `maxTxSize`. Accept either rather than fail on a spelling.
+    let n = v
+        .get("max_tx_size")
+        .or_else(|| v.get("maxTxSize"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("epochs/{epoch}/parameters: missing/non-numeric `max_tx_size`"))?;
+    // A zero or absurd value would silently empty every batch (or overflow one).
+    // The floor is well under any real network's; the ceiling is 1 MB.
+    if !(1_024..=1_048_576).contains(&n) {
+        return Err(format!(
+            "epochs/{epoch}/parameters: max_tx_size {n} is outside any plausible range — \
+             refusing to size TM batches against it"
+        ));
+    }
+    Ok(n)
+}
+
 /// Fetch the network's live Plutus cost models (ordered int arrays) from
 /// `/epochs/latest/parameters`, returned as `[PlutusV1, PlutusV2, PlutusV3]`.
 ///

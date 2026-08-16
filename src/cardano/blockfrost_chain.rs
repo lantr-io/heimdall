@@ -635,6 +635,15 @@ pub struct BlockfrostCardanoChain {
     /// (initial_btc_treasury_utxo) anchors the TM chain. Required for treasury resolution.
     config_address: Option<String>,
     config_nft_unit: Option<String>,
+    /// `(epoch, max_tx_size)` for the epoch it was read in (WI-107).
+    ///
+    /// Cached because `query_batch_snapshot` runs on every turn of the
+    /// batch-opportunity poll, not once per batch, and two extra HTTP requests
+    /// per turn is real load on a shared Blockfrost. Caching is exactly sound
+    /// here and nowhere else: a protocol parameter is constant WITHIN an epoch by
+    /// the ledger's own rules, which is the same property that makes reading it
+    /// per epoch deterministic across SPOs in the first place.
+    max_tx_size_by_epoch: Mutex<Option<(u64, u64)>>,
     /// The last TM this process submitted, and when. `query_treasury` reports
     /// `btc_confirmed = false` until that txid becomes the Confirmed chain tip, so the
     /// epoch machine waits for its own in-flight TM instead of double-spending the tip.
@@ -865,6 +874,7 @@ impl BlockfrostCardanoChain {
             last_submitted_txid: Mutex::new(None),
             last_boundary_epoch: Mutex::new(None),
             head_spk_cache: Mutex::new(None),
+            max_tx_size_by_epoch: Mutex::new(None),
             fault_ban_flow: None,
             cpo_policy_id: None,
             kupo_url: None,
@@ -901,6 +911,53 @@ impl BlockfrostCardanoChain {
     pub fn with_tm_policy(mut self, script_cbor: &str) -> Self {
         self.tm_script_cbor = Some(script_cbor.to_string());
         self
+    }
+
+    /// Cardano's `max_tx_size` for the current epoch, cached per epoch (WI-107).
+    ///
+    /// An error here refuses the batch rather than falling back to a default: a
+    /// guessed budget is a guessed *consensus* value, and a node freezing against
+    /// one computes a set no peer reproduces. Failing loudly costs one tick of
+    /// back-off; guessing costs a signing round that cannot aggregate, with
+    /// nothing in the logs pointing at why.
+    async fn max_tx_size(&self) -> EpochResult<u64> {
+        let epoch = self.current_epoch().await?;
+        if let Some((cached_epoch, value)) = *self.max_tx_size_by_epoch.lock().unwrap()
+            && cached_epoch == epoch
+        {
+            return Ok(value);
+        }
+        let value = crate::cardano::bf_http::fetch_max_tx_size(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            epoch,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("max_tx_size for epoch {epoch}: {e}")))?;
+        *self.max_tx_size_by_epoch.lock().unwrap() = Some((epoch, value));
+        Ok(value)
+    }
+
+    /// `E` for the TM batch budget: the Post-TM bytes that do not scale with the
+    /// batch (WI-107).
+    ///
+    /// The TM validator script is the dominant and the only variable part, and
+    /// this adapter is the one place that knows it — `submit_signed_tm` hands it
+    /// to whisky as a `ProvidedScriptSource`, so it rides INLINE in the witness
+    /// set of every Post-TM. Deploying it as a reference script instead would
+    /// give the batch roughly ten more peg-in/peg-out pairs; until then its bytes
+    /// are honestly charged to the budget rather than assumed away.
+    ///
+    /// Deterministic across SPOs because the script is the bridge's, not the
+    /// operator's: a node with different bytes here is minting under a different
+    /// policy and is not on this bridge at all.
+    fn post_tm_envelope(&self) -> u64 {
+        let script_bytes = self
+            .tm_script_cbor
+            .as_deref()
+            // Hex in, bytes out; +8 for the witness-set entry that wraps it.
+            .map_or(0, |hex| (hex.len() as u64) / 2 + 8);
+        crate::epoch::traits::POST_TM_ENVELOPE_WITHOUT_SCRIPT + script_bytes
     }
 
     /// Override the TM-tx validity window (seconds). Use a small value on short-epoch
@@ -2161,11 +2218,14 @@ impl CardanoChain for BlockfrostCardanoChain {
             config_params::resolve_tm_params(Some(&snapshot), self.local_fee_rate_sat_per_vb);
         let batch =
             config_params::batch_at(&self.bf_base_url, &self.bf_project_id, &snapshot).await;
+        let max_tx_size = self.max_tx_size().await?;
         Ok(BatchSnapshot {
             now_ms: snapshot.time_ms,
             slot: snapshot.slot,
             batch,
             tm_params,
+            max_tx_size,
+            post_tm_envelope: self.post_tm_envelope(),
             source,
         })
     }
@@ -2332,10 +2392,35 @@ impl CardanoChain for BlockfrostCardanoChain {
         let cardano_tx_cbor = hex::decode(&signed_tx_hex)
             .map_err(|e| EpochError::Chain(format!("tx hex decode: {e}")))?;
 
+        // WI-107: the assembled Post-TM, measured rather than modelled. The batch
+        // was already sized to fit and the built movement re-checked before
+        // signing, so this is the ground truth those two were predicting — and the
+        // only place `E` can be calibrated from real bytes instead of a derivation.
+        //
+        // Reporting the observed overhead every time is the point: the spec asks
+        // implementations to measure it, and a number that arrives with each
+        // movement never goes stale the way a one-off measurement would.
+        let predicted_batch_bytes = crate::epoch::batch::plutus_chunked(tx_bytes.len() as u64)
+            + crate::epoch::batch::POR_HINT_BYTES * fulfilled_por_outpoints.len() as u64;
+        let observed_envelope =
+            (cardano_tx_cbor.len() as u64).saturating_sub(predicted_batch_bytes);
         info!(
-            "[submit] submitting Cardano oracle-update tx ({} bytes CBOR) via Blockfrost",
-            cardano_tx_cbor.len()
+            "[submit] submitting Cardano oracle-update tx ({} bytes CBOR) via Blockfrost — \
+             observed non-batch overhead {} B against the {} B this node budgeted",
+            cardano_tx_cbor.len(),
+            observed_envelope,
+            self.post_tm_envelope(),
         );
+        if observed_envelope > self.post_tm_envelope() {
+            warn!(
+                "[submit] the Post-TM's non-batch overhead ({observed_envelope} B) EXCEEDS the \
+                 budgeted {} B. Nothing is wrong with this movement, but the batch sizing is \
+                 optimistic by {} B and a fuller batch could overshoot max_tx_size — raise \
+                 POST_TM_ENVELOPE_WITHOUT_SCRIPT.",
+                self.post_tm_envelope(),
+                observed_envelope - self.post_tm_envelope(),
+            );
+        }
 
         let tx_hash = self
             .api

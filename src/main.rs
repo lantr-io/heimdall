@@ -2504,6 +2504,63 @@ struct SweepBatch {
     tip: Option<(u64, i64)>,
     /// The batch opportunity in force, when this deployment has a grid.
     batch: heimdall::epoch::batch::BatchWindow,
+    /// The byte budget this batch's capacity is measured against (WI-107). The
+    /// CLI and the daemon must reach the SAME set from the same chain state, so
+    /// both size their batch the same way — a CLI on its own cap would sweep a
+    /// set no co-signer reproduces.
+    budget: heimdall::epoch::batch::TmBudget,
+}
+
+/// The batch byte budget for the CLI drivers, mirroring
+/// `BlockfrostChain::post_tm_envelope` / `query_batch_snapshot`.
+///
+/// `loc` is `None` when there is no Config UTxO to read, in which case
+/// `max_tx_size` falls back to the post-Alonzo value and says so — the same
+/// local-override shape the fee parameters already take on that path.
+fn sweep_budget(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+    loc: Option<&ConfigLocator>,
+) -> heimdall::epoch::batch::TmBudget {
+    use heimdall::epoch::traits::{DEFAULT_MAX_TX_SIZE, POST_TM_ENVELOPE_WITHOUT_SCRIPT};
+
+    // The TM validator rides inline in every Post-TM, so its bytes are the
+    // dominant non-batch term and are charged honestly rather than assumed away.
+    let envelope = POST_TM_ENVELOPE_WITHOUT_SCRIPT
+        + cfg
+            .cardano
+            .tm_script_cbor
+            .as_deref()
+            .map_or(0, |hex| (hex.len() as u64) / 2 + 8);
+    let max_tx_size = loc
+        .and_then(|l| {
+            let epoch = rt
+                .block_on(heimdall::cardano::bf_http::fetch_current_epoch(
+                    &l.base_url,
+                    &l.project_id,
+                ))
+                .ok()?;
+            rt.block_on(heimdall::cardano::bf_http::fetch_max_tx_size(
+                &l.base_url,
+                &l.project_id,
+                epoch,
+            ))
+            .map_err(|e| warn!("[params] max_tx_size for epoch {epoch}: {e}"))
+            .ok()
+        })
+        .unwrap_or_else(|| {
+            warn!(
+                "[params] sizing TM batches against the default max_tx_size of \
+                 {DEFAULT_MAX_TX_SIZE} — no chain answer available. Co-signers reading the live \
+                 parameter would freeze a different batch if it has ever been changed."
+            );
+            DEFAULT_MAX_TX_SIZE
+        });
+    heimdall::epoch::batch::TmBudget {
+        max_tx_size,
+        envelope,
+        variant: heimdall::epoch::batch::SpendVariant::KeyPath,
+    }
 }
 
 fn batch_params(
@@ -2521,6 +2578,7 @@ fn batch_params(
             now_ms: None,
             tip: None,
             batch: heimdall::epoch::batch::BatchWindow::NoGrid,
+            budget: sweep_budget(rt, cfg, None),
         });
     };
     let snapshot = rt.block_on(fetch_param_snapshot(
@@ -2565,6 +2623,7 @@ fn batch_params(
         now_ms: Some(time_ms),
         tip: Some((snapshot.slot, time_ms)),
         batch,
+        budget: sweep_budget(rt, cfg, Some(&loc)),
     })
 }
 
@@ -2781,13 +2840,17 @@ fn mover_key_mismatch_error(
 /// grid (no Config schedule, or an unreadable epoch anchor) the cutoff is skipped and
 /// only the FIFO order and the capacity cap apply — the pre-N19 behaviour, minus the
 /// dependence on whatever order the chain query answered in.
+///
+/// `cap` is the peg-out half of the joint byte budget (WI-107). Peg-outs get first
+/// claim on it because they are the class that expires; the CLI sweep carries no
+/// peg-ins, so here the whole budget is theirs.
 fn freeze_sweep_pegouts(
     requests: Vec<heimdall::cardano::pegout_datum::PegOutRequestData>,
     batch: Option<heimdall::epoch::batch::BatchSlot>,
+    cap: usize,
 ) -> Vec<heimdall::cardano::pegout_datum::PegOutRequestData> {
-    use heimdall::epoch::batch::{Caps, FifoKey, SpendVariant, freeze};
+    use heimdall::epoch::batch::{FifoKey, freeze};
 
-    let cap = Caps::for_variant(SpendVariant::KeyPath).max_pegouts;
     let key = |r: &heimdall::cardano::pegout_datum::PegOutRequestData| FifoKey {
         // Unresolved sorts last and is deferred under a real cutoff: a request whose
         // place in time we cannot establish must not be signed into a batch our
@@ -2808,7 +2871,7 @@ fn freeze_sweep_pegouts(
     if frozen.deferred() > 0 {
         info!(
             "  batch freeze: {} peg-out(s) in, {} created after the cutoff (slot {}), {} over \
-             the {cap}-peg-out capacity — deferred to a later batch",
+             the {cap}-peg-out byte budget — deferred to a later batch",
             frozen.selected.len(),
             frozen.too_new.len(),
             batch.cutoff_slot,
@@ -7454,6 +7517,7 @@ fn run_sweep_pegins(
     pegout_data.requests = freeze_sweep_pegouts(
         std::mem::take(&mut pegout_data.requests),
         sweep_batch.batch.open(),
+        sweep_batch.budget.max_pegouts(),
     );
 
     let mut pegout_requests: Vec<PegOutRequest> = Vec::new();

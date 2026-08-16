@@ -1632,28 +1632,29 @@ async fn collect_pegins_phase(
 
 /// Freeze the discovered peg-in set against this batch (spec §TM batches; WI-049).
 ///
-/// The peg-out twin below states the three rules; peg-ins take the same three,
-/// with one difference the spec is explicit about: an unpicked peg-in **rolls
-/// over freely** to the next batch, so neither the cutoff nor the cap can strand
-/// one.
+/// Two of the three rules: drop anything created after the batch's stability
+/// cutoff `C_i`, and order the survivors by the FIFO total order. The third —
+/// capacity — is NOT applied here, because since WI-107 it is a joint byte budget
+/// over the assembled movement, so it cannot be decided without the peg-out count
+/// and the two classes are frozen in different phases. `build_tm_phase` applies it
+/// to this list, which arrives already ordered, by truncation.
 ///
-/// Until now peg-ins had NONE of the three. Membership was "whatever
+/// Peg-ins differ from peg-outs in one way the spec is explicit about: an unpicked
+/// peg-in **rolls over freely** to the next batch, so neither the cutoff nor the
+/// budget can strand one.
+///
+/// Until WI-049 peg-ins had none of the three. Membership was "whatever
 /// `query_pegin_requests` returned at the instant this node happened to scan",
 /// ordered by Cardano outpoint. That converges two SPOs only by luck — a request
 /// that lands between their scans is in one node's TM and not the other's, which
-/// is a different txid and a FROST round that cannot aggregate. It also had no
-/// capacity bound at all, so an oversubscribed set produced a transaction over
-/// the ~15 KB relay ceiling, taking that batch's peg-outs down with it.
-///
-/// The cap is `max_pegins`, which existed in [`Caps`] from the day it was written
-/// and was referenced nowhere.
+/// is a different txid and a FROST round that cannot aggregate.
 fn freeze_pegins(
     pegins: Vec<ParsedPegIn>,
     batch: Option<crate::epoch::batch::BatchSlot>,
     me: frost::Identifier,
     epoch: u64,
 ) -> EpochResult<Vec<ParsedPegIn>> {
-    use crate::epoch::batch::{Caps, FifoKey, SpendVariant, freeze};
+    use crate::epoch::batch::{FifoKey, freeze};
 
     // WI-106: an unresolved creation slot REFUSES the batch; it is not sorted
     // last, and it is not dropped.
@@ -1680,7 +1681,6 @@ fn freeze_pegins(
         )));
     }
 
-    let cap = Caps::for_variant(SpendVariant::KeyPath).max_pegins;
     // The CARDANO outpoint, not the Bitcoin one: this orders REQUESTS, and the
     // request is the Cardano UTxO. (The TM's input order is a separate, Bitcoin-
     // side rule — lexicographic by (txid ‖ vout) — and is unaffected by this.)
@@ -1693,27 +1693,28 @@ fn freeze_pegins(
     };
 
     let Some(batch) = batch else {
-        // No grid: cap and order only. A mock chain, or a deployment whose Config
-        // carries no schedule.
+        // No grid: order only. A mock chain, or a deployment whose Config carries
+        // no schedule. The budget still applies in `build_tm_phase`.
         let mut ordered = pegins;
         ordered.sort_by_key(&key);
-        ordered.truncate(cap);
         return Ok(ordered);
     };
 
-    let frozen = freeze(pegins, batch, cap, key);
+    // `usize::MAX` because the capacity rule is not this function's any more; the
+    // cutoff is. Passing a real cap here would be a SECOND capacity bound that the
+    // joint budget could not see, which is the exact defect WI-107 removed.
+    let frozen = freeze(pegins, batch, usize::MAX, key);
     if frozen.deferred() > 0 {
         crate::epoch_log!(
             me,
             epoch,
-            "  batch B_{} (slot {}, cutoff {}): {} peg-in(s) frozen, {} newer than the cutoff, \
-             {} over the {cap}-peg-in capacity — all roll over to a later batch",
+            "  batch B_{} (slot {}, cutoff {}): {} peg-in(s) eligible, {} newer than the cutoff \
+             — the latter roll over to a later batch",
             batch.index,
             batch.slot,
             batch.cutoff_slot,
             frozen.selected.len(),
             frozen.too_new.len(),
-            frozen.over_cap.len(),
         );
     }
     Ok(frozen.selected)
@@ -1723,23 +1724,30 @@ fn freeze_pegins(
 ///
 /// Three rules, in the order the spec states them: drop anything created after the
 /// batch's stability cutoff `C_i`, order the survivors by the FIFO total order
-/// `(creation slot, creating txid, output index)`, and take the first
-/// `max_pegouts_per_tm`. Everything held back is a candidate for a later batch —
-/// since rev 5.1 retired the peg-out treasury-outpoint pin, an unpicked peg-out is
-/// merely delayed, not stranded.
+/// `(creation slot, creating txid, output index)`, and take the first `cap`.
+/// Everything held back is a candidate for a later batch — since rev 5.1 retired
+/// the peg-out treasury-outpoint pin, an unpicked peg-out is merely delayed, not
+/// stranded.
+///
+/// `cap` is the peg-out half of the joint byte budget, and peg-outs get FIRST
+/// claim on it (spec rev 5.6): they are the class that expires, since a peg-out
+/// that keeps missing batches falls out of the fulfillment freshness filter and
+/// ends at *Cancel PegOut request*, whereas a peg-in rolls over indefinitely and
+/// pays only latency. Peg-ins then take what is left.
 ///
 /// Without a grid (`batch == None`: mock chains, and deployments whose Config
 /// predates the `schedule` append) the cutoff cannot be computed and is skipped,
-/// which is the pre-N19 behaviour. The FIFO order and the capacity cap are pure
-/// and apply regardless — they cost nothing and remove the last dependence on
-/// the order the chain query happened to answer in.
+/// which is the pre-N19 behaviour. The FIFO order and the cap are pure and apply
+/// regardless — they cost nothing and remove the last dependence on the order the
+/// chain query happened to answer in.
 fn freeze_pegouts(
     pegouts: Vec<crate::epoch::traits::PegOutRequestUtxo>,
     batch: Option<crate::epoch::batch::BatchSlot>,
+    cap: usize,
     me: frost::Identifier,
     epoch: u64,
 ) -> EpochResult<Vec<crate::epoch::traits::PegOutRequestUtxo>> {
-    use crate::epoch::batch::{Caps, FifoKey, SpendVariant, freeze};
+    use crate::epoch::batch::{FifoKey, freeze};
 
     // WI-106, exactly as on the peg-in side: an unresolved creation slot refuses
     // the batch rather than being deferred into a set this node's peers would not
@@ -1754,9 +1762,6 @@ fn freeze_pegouts(
         )));
     }
 
-    // heimdall builds key-path (51% FROST) movements; the federation script path is
-    // the emergency spend, which carries no peg-outs.
-    let cap = Caps::for_variant(SpendVariant::KeyPath).max_pegouts;
     let key = |p: &crate::epoch::traits::PegOutRequestUtxo| FifoKey {
         // Unreachable: the refusal above leaves every entry resolved.
         created_slot: p.created_slot.unwrap_or(u64::MAX),
@@ -1778,7 +1783,7 @@ fn freeze_pegouts(
             me,
             epoch,
             "  batch B_{} (slot {}, cutoff {}): {} peg-out(s) frozen, {} newer than the cutoff, \
-             {} over the {cap}-peg-out capacity — all deferred to a later batch",
+             {} over the {cap}-peg-out byte budget — all deferred to a later batch",
             batch.index,
             batch.slot,
             batch.cutoff_slot,
@@ -1788,6 +1793,57 @@ fn freeze_pegouts(
         );
     }
     Ok(frozen.selected)
+}
+
+/// Take as many of the (already cutoff-filtered, already FIFO-ordered) peg-ins as
+/// the byte budget still holds once `pegouts` peg-outs have claimed their share
+/// (WI-107, spec rev 5.6).
+///
+/// Truncation is the whole operation: `freeze_pegins` established the order, and
+/// dropping from the tail is what makes the survivors the OLDEST — the same rule
+/// every co-signer applies to the same list.
+fn fit_pegins_to_budget<T>(
+    mut pegins: Vec<T>,
+    budget: &crate::epoch::batch::TmBudget,
+    pegouts: usize,
+    me: frost::Identifier,
+    epoch: u64,
+) -> Vec<T> {
+    let room = budget.max_pegins_with(pegouts as u64);
+    if pegins.len() <= room {
+        return pegins;
+    }
+    if room == 0 {
+        // Strict peg-out priority is the spec's rule and it is the right one —
+        // peg-outs expire, peg-ins do not — but a peg-out backlog large enough to
+        // fill a whole movement stops peg-ins being swept entirely, and that is
+        // worth seeing rather than inferring from a batch that swept nothing.
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  {} eligible peg-in(s) get NO room: {} peg-out(s) fill the movement on their own \
+             ({} of {} Post-TM bytes). They roll over — nothing is stranded — but no deposit is \
+             swept until the peg-out backlog drains.",
+            pegins.len(),
+            pegouts,
+            budget.post_tm_bytes(0, pegouts as u64),
+            budget.max_tx_size,
+        );
+    } else {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  {} of {} eligible peg-in(s) are over the byte budget left by {} peg-out(s) \
+             ({} of {} Post-TM bytes) — they roll over to a later batch",
+            pegins.len() - room,
+            pegins.len(),
+            pegouts,
+            budget.post_tm_bytes(room as u64, pegouts as u64),
+            budget.max_tx_size,
+        );
+    }
+    pegins.truncate(room);
+    pegins
 }
 
 // ---------------------------------------------------------------------------
@@ -2032,16 +2088,28 @@ async fn build_tm_phase(
     // nothing else; in particular the fee rate is the Config's, so two operators
     // with different `bitcoin.fee_rate_sat_per_vb` still build identical bytes.
     let snapshot = chain.query_batch_snapshot().await?;
+    // WI-107: the batch capacity rule, and every input to it read from the same
+    // snapshot as the rest of the consensus inputs. `validate` rejects a budget
+    // too small to carry even a bare treasury move, which is a deployment fault
+    // and not a busy batch — without it a node would produce nothing, for ever,
+    // and look merely idle.
+    let budget = snapshot.budget();
+    budget.validate().map_err(EpochError::Chain)?;
     crate::epoch_log!(
         me,
         epoch,
-        "  chain query: treasury={} sat, {} frozen pegins, {} open pegouts, fee_rate={}sat/vb \
-         (params: {})",
+        "  chain query: treasury={} sat, {} eligible pegins, {} open pegouts, fee_rate={}sat/vb \
+         (params: {}); byte budget: max_tx_size={}, non-batch overhead={} → at most {} peg-outs, \
+         or {} peg-ins with none",
         treasury.value.to_sat(),
         frozen_pegins.len(),
         pegouts.len(),
         snapshot.tm_params.fee_rate_sat_per_vb,
         snapshot.source,
+        budget.max_tx_size,
+        budget.envelope,
+        budget.max_pegouts(),
+        budget.max_pegins_with(0),
     );
 
     let secp = Secp256k1::new();
@@ -2068,23 +2136,6 @@ async fn build_tm_phase(
         treasury.federation_csv_blocks,
     );
     let change_script = bitcoin::ScriptBuf::new_p2tr_tweaked(change_spend.output_key());
-
-    // Each peg-in input is locked under its own per-depositor peg-in script
-    // tree (internal key Y_fed + refund leaf), NOT the treasury tree. Reuse the
-    // `TaprootSpendInfo` `parse_pegin_request` already proved matches the
-    // on-chain deposit scriptPubKey, so the TM sighash commits to the correct
-    // prevout and the signature validates.
-    let pegin_inputs: Vec<PegInInput> = frozen_pegins
-        .into_iter()
-        .map(|p| PegInInput {
-            outpoint: bitcoin::OutPoint {
-                txid: p.btc_txid,
-                vout: p.btc_vout,
-            },
-            value: p.value,
-            spend_info: p.spend_info,
-        })
-        .collect();
 
     // The completed-peg-outs trie: this node's own copy, which decides both which
     // requests are still owed a payment and the root this TM will commit.
@@ -2140,7 +2191,31 @@ async fn build_tm_phase(
     // The batch cutoff makes membership a function of the opportunity instead —
     // the one `CollectPegins` froze at (WI-097), not whichever one the snapshot
     // above happens to fall in.
-    let pegouts = freeze_pegouts(pegouts, batch, me, epoch)?;
+    //
+    // WI-107: capacity is one byte budget over the assembled Post-TM, and
+    // peg-outs are filled FIRST because they are the class that expires. Peg-ins
+    // then take whatever room is left, by truncating the already-FIFO-ordered
+    // list `CollectPegins` froze.
+    let pegouts = freeze_pegouts(pegouts, batch, budget.max_pegouts(), me, epoch)?;
+
+    let frozen_pegins = fit_pegins_to_budget(frozen_pegins, &budget, pegouts.len(), me, epoch);
+
+    // Each peg-in input is locked under its own per-depositor peg-in script
+    // tree (internal key Y_fed + refund leaf), NOT the treasury tree. Reuse the
+    // `TaprootSpendInfo` `parse_pegin_request` already proved matches the
+    // on-chain deposit scriptPubKey, so the TM sighash commits to the correct
+    // prevout and the signature validates.
+    let pegin_inputs: Vec<PegInInput> = frozen_pegins
+        .into_iter()
+        .map(|p| PegInInput {
+            outpoint: bitcoin::OutPoint {
+                txid: p.btc_txid,
+                vout: p.btc_vout,
+            },
+            value: p.value,
+            spend_info: p.spend_info,
+        })
+        .collect();
 
     let pegout_requests: Vec<PegOutRequest> = pegouts
         .into_iter()
@@ -2187,6 +2262,28 @@ async fn build_tm_phase(
             s.amount.to_sat(),
             s.reason,
         );
+    }
+
+    // WI-107 / spec rev 5.6: "MUST NOT sign a movement whose assembled Post-TM
+    // exceeds max_tx_size". The freeze above already bounds it, and `build_tm`
+    // only ever DROPS peg-outs, so this can fire only if the byte model and the
+    // builder disagree — which is exactly the thing worth catching, and worth
+    // catching HERE. One phase later the movement is signed, the batch
+    // opportunity is spent, and because membership is deterministic the identical
+    // over-size set is rebuilt at the next one.
+    let built_pegins = (unsigned.tx.input.len() as u64).saturating_sub(1);
+    let built_pegouts = (unsigned.tx.output.len() as u64).saturating_sub(2);
+    if !budget.fits(built_pegins, built_pegouts) {
+        return Err(EpochError::TmBuild(format!(
+            "built movement is over the byte budget: {built_pegins} peg-in(s) and \
+             {built_pegouts} peg-out(s) assemble to {} Post-TM bytes against a max_tx_size of {} \
+             (non-batch overhead {}). The batch was frozen inside the budget, so the size model \
+             and the TM builder disagree — refusing to sign rather than burn the opportunity on a \
+             movement that cannot be posted.",
+            budget.post_tm_bytes(built_pegins, built_pegouts),
+            budget.max_tx_size,
+            budget.envelope,
+        )));
     }
 
     let sighashes = compute_sighashes(&unsigned);
@@ -3048,9 +3145,9 @@ mod tests {
     }
 
     /// The same rule with no grid. There is no cutoff to defer past, but ordering
-    /// and the cap still decide membership: every unresolved key collapses to the
-    /// same sort position, so above the cap two nodes with different resolution
-    /// luck take a different hundred.
+    /// still decides membership: every unresolved key collapses to the same sort
+    /// position, so once the byte budget truncates the list, two nodes with
+    /// different resolution luck keep a different set.
     #[test]
     fn an_unresolved_pegin_refuses_the_batch_even_with_no_grid() {
         let me = Identifier::try_from(1u16).unwrap();
@@ -3058,26 +3155,32 @@ mod tests {
             .expect_err("the no-grid path must refuse too");
     }
 
-    /// The capacity bound exists and is applied. `Caps::max_pegins` was defined
-    /// with `Caps` itself and referenced NOWHERE, so an oversubscribed set built a
-    /// transaction past the ~15 KB relay ceiling — which takes that batch's
-    /// peg-outs down with it, since they ride the same movement.
-    ///
-    /// Overflow peg-ins roll over freely, so capping strands nothing.
-    #[test]
-    fn an_oversubscribed_pegin_set_is_capped_and_the_rest_roll_over() {
-        use crate::epoch::batch::{BatchSlot, Caps, SpendVariant};
+    fn test_budget() -> crate::epoch::batch::TmBudget {
+        crate::epoch::batch::TmBudget {
+            max_tx_size: 16_384,
+            envelope: 1_024,
+            variant: crate::epoch::batch::SpendVariant::KeyPath,
+        }
+    }
 
-        let cap = Caps::for_variant(SpendVariant::KeyPath).max_pegins;
+    /// `freeze_pegins` orders and applies the cutoff; it does NOT cap. Capacity is
+    /// a joint budget over the assembled movement (WI-107), so a per-class cap here
+    /// would be a second bound the joint rule could not see — the exact defect the
+    /// item removed.
+    #[test]
+    fn freezing_pegins_orders_them_and_leaves_capacity_alone() {
+        use crate::epoch::batch::BatchSlot;
+
         let batch = BatchSlot {
             index: 1,
             slot: 5_000_000,
             cutoff_slot: 4_900_000,
         };
         let me = Identifier::try_from(1u16).unwrap();
-        // One more than fits, all eligible, in descending slot order so the cap
-        // cannot accidentally agree with the input order.
-        let pegins: Vec<ParsedPegIn> = (0..=cap)
+        // Far more than any budget would take, in descending slot order so a
+        // surviving cap could not accidentally agree with the input order.
+        let n = 400usize;
+        let pegins: Vec<ParsedPegIn> = (0..n)
             .map(|i| {
                 parsed_pegin(
                     Some(batch.cutoff_slot - i as u64),
@@ -3089,11 +3192,65 @@ mod tests {
 
         let frozen = freeze_pegins(pegins, Some(batch), me, 42).expect("all slots resolved");
 
-        assert_eq!(frozen.len(), cap, "the batch takes at most max_pegins");
+        assert_eq!(frozen.len(), n, "every eligible peg-in survives the freeze");
         assert_eq!(
             frozen[0].created_slot,
-            Some(batch.cutoff_slot - cap as u64),
-            "and takes the OLDEST ones: FIFO decides who is dropped, not arrival order"
+            Some(batch.cutoff_slot - (n as u64 - 1)),
+            "and they come out OLDEST first, which is what makes truncation FIFO"
+        );
+    }
+
+    /// The joint rule: peg-outs are served first and peg-ins take what is left, so
+    /// the same peg-in set is cut differently depending on the peg-out load.
+    #[test]
+    fn pegins_take_only_the_room_the_pegouts_leave() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let budget = test_budget();
+        let pegins: Vec<u32> = (0..500).collect();
+
+        let alone = fit_pegins_to_budget(pegins.clone(), &budget, 0, me, 42);
+        let crowded = fit_pegins_to_budget(pegins.clone(), &budget, 50, me, 42);
+        assert!(
+            crowded.len() < alone.len(),
+            "50 peg-outs must cost peg-in room: {} vs {}",
+            crowded.len(),
+            alone.len()
+        );
+        // Whatever is taken, the assembled movement fits — the property that the
+        // two independent caps never had.
+        for (n, q) in [(alone.len(), 0), (crowded.len(), 50)] {
+            assert!(budget.fits(n as u64, q as u64), "{n} peg-ins, {q} peg-outs");
+        }
+        // Truncation keeps the head, so the survivors are the oldest.
+        assert_eq!(crowded[0], 0);
+        assert_eq!(crowded.last(), Some(&(crowded.len() as u32 - 1)));
+    }
+
+    /// A peg-out backlog that fills the movement leaves peg-ins nothing. That is
+    /// the spec's rule, not a bug — but it strands nothing, and the caller says so
+    /// out loud rather than silently sweeping no deposits.
+    #[test]
+    fn a_full_pegout_batch_starves_pegins_without_stranding_them() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let budget = test_budget();
+        let all_pegouts = budget.max_pegouts();
+
+        let kept = fit_pegins_to_budget(vec![1u32, 2, 3], &budget, all_pegouts, me, 42);
+        assert!(kept.is_empty(), "no room left at all");
+        // …and one fewer peg-out is not a cliff: the room returns gradually.
+        let with_slack = fit_pegins_to_budget(vec![1u32, 2, 3], &budget, all_pegouts / 2, me, 42);
+        assert!(!with_slack.is_empty());
+    }
+
+    /// Nothing is dropped when the budget already holds the set — the common case
+    /// must not pay for the rule.
+    #[test]
+    fn an_undersubscribed_batch_is_untouched() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let pegins: Vec<u32> = (0..5).collect();
+        assert_eq!(
+            fit_pegins_to_budget(pegins.clone(), &test_budget(), 3, me, 42),
+            pegins
         );
     }
 

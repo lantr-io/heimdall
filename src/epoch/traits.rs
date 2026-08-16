@@ -174,6 +174,15 @@ pub struct BatchSnapshot {
     /// by `cardano::config_params` and reported by `show-config-params` / the
     /// mover's startup banner, and drives the batch grid when plan N19 lands.)
     pub tm_params: crate::bitcoin::tm_builder::TmParams,
+    /// Cardano's `max_tx_size` for the epoch this snapshot falls in (WI-107,
+    /// spec rev 5.6). A HOST protocol parameter, read from the chain per epoch —
+    /// Conway governance can change it, so a hardcoded 16 384 would eventually
+    /// either refuse batches the chain could carry or sign ones it cannot post.
+    pub max_tx_size: u64,
+    /// `E`: the Post-TM bytes that do not scale with the batch. Derived from the
+    /// deployment (chiefly whether the TM validator rides inline), not
+    /// configured — see [`crate::epoch::batch::TmBudget`].
+    pub post_tm_envelope: u64,
     /// Config UTxO the parameters came from, or the local-override reason.
     pub source: crate::cardano::config_params::ParamSource,
 }
@@ -181,6 +190,14 @@ pub struct BatchSnapshot {
 impl BatchSnapshot {
     /// A snapshot whose parameters came from this node's own config rather than
     /// the chain — mocks, offline CLI paths, and Config-less deployments.
+    ///
+    /// `max_tx_size` falls back to the value every Cardano network has carried
+    /// since Alonzo. That is a guess, and a guessed consensus value is exactly
+    /// what this codebase must not ship silently — which is why it is reachable
+    /// only through this constructor, whose whole purpose is to stamp
+    /// [`ParamSource::LocalOverride`] on the result so the reason travels with it.
+    ///
+    /// [`ParamSource::LocalOverride`]: crate::cardano::config_params::ParamSource::LocalOverride
     #[must_use]
     pub fn local_override(
         now_ms: i64,
@@ -192,10 +209,41 @@ impl BatchSnapshot {
             slot: 0,
             batch: crate::epoch::batch::BatchWindow::NoGrid,
             tm_params,
+            max_tx_size: DEFAULT_MAX_TX_SIZE,
+            post_tm_envelope: POST_TM_ENVELOPE_WITHOUT_SCRIPT,
             source: crate::cardano::config_params::ParamSource::LocalOverride(why),
         }
     }
+
+    /// The batch capacity rule in force at this snapshot.
+    #[must_use]
+    pub fn budget(&self) -> crate::epoch::batch::TmBudget {
+        crate::epoch::batch::TmBudget {
+            max_tx_size: self.max_tx_size,
+            envelope: self.post_tm_envelope,
+            // heimdall builds key-path (51% FROST) movements; the federation
+            // script path is the emergency single-input spend and carries no
+            // batch at all.
+            variant: crate::epoch::batch::SpendVariant::KeyPath,
+        }
+    }
 }
+
+/// `max_tx_size` on every Cardano network since Alonzo. Used ONLY where no chain
+/// answer is available (mocks, offline CLI paths); the daemon reads the live
+/// parameter per epoch.
+pub const DEFAULT_MAX_TX_SIZE: u64 = 16_384;
+
+/// `E` minus the TM validator script: the Post-TM's body, mint, redeemer and
+/// exec units, collateral and collateral return, script-data hash, change,
+/// vkey witness, and the `UnconfirmedTm` datum's non-batch fields.
+///
+/// Summing those from the Conway CBOR shapes `cardano::publish` builds gives
+/// ≈700 bytes; this constant holds ≈45 % of margin over that, in the direction
+/// that shrinks a batch rather than the one that posts a movement the chain
+/// rejects. The script is added on top by the chain adapter, because its size is
+/// a deployment fact — inline or reference script — and it dominates.
+pub const POST_TM_ENVELOPE_WITHOUT_SCRIPT: u64 = 1_024;
 
 /// Everything the epoch machine needs to authorize an on-chain Update-Y — the
 /// key handoff that makes a completed DKG the treasury's actual controller.
