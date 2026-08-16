@@ -535,6 +535,42 @@ pub trait CardanoChain: Send + Sync {
 // PeerNetwork
 // ---------------------------------------------------------------------------
 
+/// What one `/health` probe learned about a peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerHealth {
+    /// Its `/health` answered.
+    pub reachable: bool,
+    /// What it reports running, when it answered. Absent for an unreachable
+    /// peer, and empty for one whose build predates WI-067.
+    pub build: crate::http::compat::PeerBuild,
+}
+
+impl PeerHealth {
+    #[must_use]
+    pub fn unreachable() -> Self {
+        Self {
+            reachable: false,
+            build: crate::http::compat::PeerBuild::default(),
+        }
+    }
+
+    /// Reachable, with nothing said about the software — the answer for a mock
+    /// or any implementation with no liveness signal.
+    #[must_use]
+    pub fn reachable_unknown_build() -> Self {
+        Self {
+            reachable: true,
+            build: crate::http::compat::PeerBuild::default(),
+        }
+    }
+
+    /// The compatibility verdict on this peer's build.
+    #[must_use]
+    pub fn compatibility(&self) -> crate::http::compat::Compatibility {
+        crate::http::compat::Compatibility::of(&self.build)
+    }
+}
+
 /// Pull-only peer protocol surface.
 ///
 /// All `publish_*` calls write to *this* SPO's local state — peers
@@ -552,15 +588,22 @@ pub trait CardanoChain: Send + Sync {
 /// poll loop keeps waiting rather than aborting the epoch.
 #[async_trait]
 pub trait PeerNetwork: Send + Sync {
-    /// Whether `peer` is currently reachable (its `/health` endpoint answers).
+    /// Whether `peer` is reachable, and what software it is running.
+    ///
     /// Used by the pre-ceremony health gate (N21) so a staggered-start roster
-    /// converges on one DKG instead of freezing divergent live subsets. Purely
-    /// advisory — a `true` here guarantees nothing about later rounds, and the
-    /// gate is time-bounded, so implementations should answer quickly (a
-    /// couple of seconds), never retry internally. Defaults to healthy for
-    /// implementations without a liveness signal.
-    async fn check_health(&self, _peer: &SpoInfo) -> bool {
-        true
+    /// converges on one DKG instead of freezing divergent live subsets, and
+    /// since WI-067 to compare the peer's build against ours before entering a
+    /// ceremony with it — `/health` carries both, so this stays one round trip.
+    ///
+    /// Reachability is purely advisory: a reachable answer guarantees nothing
+    /// about later rounds, and the gate is time-bounded, so implementations
+    /// should answer quickly (a couple of seconds) and never retry internally.
+    /// The BUILD is not advisory — see [`crate::http::compat`].
+    ///
+    /// Defaults to reachable-with-an-unknown-build, which is the answer for an
+    /// implementation with no liveness signal at all.
+    async fn check_health(&self, _peer: &SpoInfo) -> PeerHealth {
+        PeerHealth::reachable_unknown_build()
     }
 
     /// Record this node's chain-view for the ceremony it is entering.

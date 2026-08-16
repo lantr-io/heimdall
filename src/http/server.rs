@@ -70,8 +70,17 @@ pub fn router(state: SharedState) -> Router {
         .with_state(state)
 }
 
+/// Liveness AND compatibility (WI-067).
+///
+/// `status` stays exactly where it was so a peer running a build that predates
+/// the extra fields still parses this; the additions are what a peer compares
+/// before entering a ceremony with us. See [`crate::http::compat`].
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "ok"}))
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": crate::http::compat::own_version(),
+        "blueprint_digest": crate::http::compat::own_blueprint_digest(),
+    }))
 }
 
 /// Strip the `.json` suffix and confirm the requested pool_id is ours.

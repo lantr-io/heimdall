@@ -68,7 +68,7 @@ use crate::epoch::state::{
 };
 use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use crate::frost::xonly::group_xonly;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Run the epoch state machine for one full cycle and return the
 /// witnessed `TreasuryMovement` once the cycle reaches `RecordMovement`.
@@ -1065,7 +1065,7 @@ async fn epoch_start_phase(
     // over a reduced candidate set with a bumped attempt inside `dkg_phase`
     // (DkgContext::reduced_to), so the chain is queried once per ceremony
     // entry (which also refreshes the roster after an aborted window).
-    let mut ctx = chain.query_dkg_context(epoch, 0).await?;
+    let ctx = chain.query_dkg_context(epoch, 0).await?;
 
     // Re-derive THIS node's index from the CURRENT context, every epoch. The
     // FROST index is positional — rank in the sorted eligible set — so it
@@ -1116,7 +1116,50 @@ async fn epoch_start_phase(
     // nodes complete a reduced key without the late one, which then loops
     // forever against their stale round-1 packages. Time-bounded: a peer
     // that stays down is excluded by the normal quorum-gated reduction.
-    wait_for_roster_health(peers, &ctx, config, me).await;
+    let incompatible = wait_for_roster_health(peers, &ctx, config, me).await;
+    // WI-067: drop the reachable-but-incompatible peers from the candidate set
+    // before anything is published. Nothing has been generated yet, so this is
+    // simply a smaller candidate set — `t` is re-derived over it and `attempt`
+    // does not move.
+    //
+    // It converges without any agreement protocol because the comparison is
+    // symmetric: every node compares each peer against ITSELF, so a node on a
+    // different minor is dropped by all of its peers and drops all of them, and
+    // the two groups run (or fail to run) separately rather than corrupting one
+    // ceremony. `None` means what is left cannot run at all, which is the
+    // existing abort — loud, and correct: the roster really has gone below what
+    // a DKG needs.
+    let mut ctx = if incompatible.is_empty() {
+        ctx
+    } else {
+        match ctx.without(&incompatible) {
+            Some(narrowed) => {
+                crate::epoch_warn!(
+                    me,
+                    epoch,
+                    "  candidate set reduced to {} of {} by software mismatch; t is now {}",
+                    narrowed.participants.len(),
+                    ctx.participants.len(),
+                    narrowed.threshold,
+                );
+                narrowed
+            }
+            None => {
+                return Err(EpochError::DkgAborted {
+                    epoch,
+                    attempt: ctx.attempt,
+                    eligible: ctx.participants.len(),
+                    qualified: ctx.participants.len().saturating_sub(incompatible.len()),
+                    reason: format!(
+                        "{} of {} candidates run an incompatible build, leaving too few to run \
+                         a ceremony — upgrade the lagging nodes",
+                        incompatible.len(),
+                        ctx.participants.len()
+                    ),
+                });
+            }
+        }
+    };
 
     // N21 ceremony window grid: with a chain-time anchor, join at the next
     // grid line so every node — however late it started, or re-entering
@@ -1191,33 +1234,69 @@ fn next_window(boundary_ms: i64, window: std::time::Duration, now_ms: i64) -> (u
 }
 
 /// Poll every roster peer's `/health` until all answer or `dkg_join_wait`
-/// elapses (N21). Never fails: proceeding without a peer is always legal —
-/// the ceremony's quorum gate decides viability, this gate only makes the
-/// happy path start complete.
+/// elapses (N21), and return the peers whose BUILD is incompatible with ours
+/// (WI-067).
+///
+/// Never fails on reachability: proceeding without a peer is always legal — the
+/// ceremony's quorum gate decides viability, and this gate only makes the happy
+/// path start complete.
+///
+/// The build check is not the same kind of thing. An unreachable peer is absent
+/// and the ceremony copes; a peer on a DIFFERENT minor is present and answering,
+/// and will happily produce payloads that look fine while it computes different
+/// bytes than we do — different batch weights, a different leader, a different
+/// policy id. That is the silent-divergence failure this whole area keeps
+/// meeting, so an incompatible peer is EXCLUDED from the candidate set rather
+/// than left to join.
+///
+/// Excluded rather than refused, deliberately: refusing would let one operator
+/// who has not upgraded halt the bridge, whereas excluding costs that operator
+/// its own participation and nothing else. The quorum gate still decides whether
+/// what remains can run at all.
 async fn wait_for_roster_health(
     peers: &Arc<dyn PeerNetwork>,
     ctx: &crate::cardano::dkg_roster::DkgContext,
     config: &EpochConfig,
     me: frost::Identifier,
-) {
+) -> BTreeSet<frost::Identifier> {
+    use crate::http::compat::Compatibility;
+
     let roster = ctx.to_roster();
     let deadline = tokio::time::Instant::now() + config.dkg_join_wait;
     let poll = config
         .poll_interval
         .max(std::time::Duration::from_millis(200));
+    let mut incompatible: BTreeSet<frost::Identifier> = BTreeSet::new();
     loop {
         let mut down = Vec::new();
         for info in roster.participants.values() {
             if info.identifier == me {
                 continue;
             }
-            if !peers.check_health(info).await {
+            let health = peers.check_health(info).await;
+            if !health.reachable {
                 down.push(crate::epoch::log::id_short(info.identifier));
+                continue;
+            }
+            // Logged ONCE per peer per gate, not per poll: the loop can turn
+            // every 200 ms and this is the line an operator has to find.
+            if let Compatibility::Incompatible { reason } = health.compatibility()
+                && incompatible.insert(info.identifier)
+            {
+                crate::epoch_warn!(
+                    me,
+                    ctx.epoch,
+                    "  ⚠ EXCLUDING spo={} from the ceremony: {reason}. It is running and \
+                     reachable — this is a software mismatch, not an outage. Both sides log \
+                     this, so that operator sees the same line from its own node. Upgrade the \
+                     lagging node to rejoin.",
+                    crate::epoch::log::id_short(info.identifier),
+                );
             }
         }
         if down.is_empty() {
             crate::epoch_log!(me, ctx.epoch, "health gate: full roster reachable");
-            return;
+            return incompatible;
         }
         if tokio::time::Instant::now() >= deadline {
             crate::epoch_warn!(
@@ -1227,7 +1306,7 @@ async fn wait_for_roster_health(
                 down,
                 config.dkg_join_wait
             );
-            return;
+            return incompatible;
         }
         // Per-poll, and `poll` can be 200ms — at info this drowns the join. Both
         // ways out of the loop log (reachable → info, deadline → warn), so the
@@ -3411,6 +3490,81 @@ mod tests {
         let me = Identifier::try_from(1u16).unwrap();
         freeze_pegins(vec![parsed_pegin(None, 0x01, 0)], None, me, 42)
             .expect_err("the no-grid path must refuse too");
+    }
+
+    // ── WI-067: the pre-ceremony build gate ───────────────────────────
+
+    fn build_of(version: &str) -> crate::http::compat::PeerBuild {
+        crate::http::compat::PeerBuild {
+            version: Some(version.into()),
+            blueprint_digest: Some(crate::http::compat::own_blueprint_digest()),
+        }
+    }
+
+    async fn gate_over(builds: &[(u16, crate::http::compat::PeerBuild)]) -> Vec<u16> {
+        let fixture = demo_static_fixture(2, 3, 19_990);
+        let hub = crate::epoch::mocks::MockPeerHub::new();
+        for (i, b) in builds {
+            hub.set_build(Identifier::try_from(*i).unwrap(), b.clone());
+        }
+        let me = Identifier::try_from(1u16).unwrap();
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub));
+        let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture));
+        let ctx = chain.query_dkg_context(0, 0).await.expect("ctx");
+        let mut config = fast_config(me);
+        config.dkg_join_wait = Duration::from_millis(50);
+        let out = wait_for_roster_health(&peers, &ctx, &config, me).await;
+        out.iter()
+            .map(|id| {
+                ctx.participants
+                    .iter()
+                    .position(|p| p.identifier == *id)
+                    .map(|n| n as u16 + 1)
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+
+    /// A peer on a different `major.minor` is reported by the gate, so the
+    /// caller can drop it from the candidate set. It is REACHABLE — this is a
+    /// software mismatch, not an outage, and the two are not the same thing.
+    #[tokio::test]
+    async fn the_gate_reports_a_peer_on_a_different_minor() {
+        assert_eq!(gate_over(&[(3, build_of("9.9.9"))]).await, vec![3]);
+    }
+
+    /// A patch difference is not a mismatch. Punishing one would make every
+    /// rolling upgrade an outage.
+    #[tokio::test]
+    async fn the_gate_ignores_a_patch_difference() {
+        let mine = crate::http::compat::own_version();
+        let series = mine.rsplit_once('.').map(|(s, _)| s).unwrap_or(mine);
+        let patched = build_of(&format!("{series}.99"));
+        assert!(
+            gate_over(&[(2, patched.clone()), (3, patched)])
+                .await
+                .is_empty()
+        );
+    }
+
+    /// A peer whose `/health` predates the check reports no version, and is
+    /// ALLOWED — otherwise the upgrade introducing the check is the outage. This
+    /// is also the default mock build, which is why every other test is
+    /// unaffected by the gate.
+    #[tokio::test]
+    async fn the_gate_allows_a_peer_that_reports_no_version() {
+        assert!(gate_over(&[]).await.is_empty());
+    }
+
+    /// Same version, different contracts: the blueprint digest catches what the
+    /// version convention cannot.
+    #[tokio::test]
+    async fn the_gate_reports_a_peer_carrying_a_different_blueprint() {
+        let odd = crate::http::compat::PeerBuild {
+            version: Some(crate::http::compat::own_version().into()),
+            blueprint_digest: Some("deadbeefdeadbeef".into()),
+        };
+        assert_eq!(gate_over(&[(2, odd)]).await, vec![2]);
     }
 
     fn test_budget() -> crate::epoch::batch::TmBudget {

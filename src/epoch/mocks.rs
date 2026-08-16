@@ -808,6 +808,10 @@ pub struct MockPeerHub {
     /// attempt), a ceremony that NARROWS in place publishes it once (WI-105).
     /// Neither is visible in the store, which only holds the latest package.
     dkg1_publishes: std::sync::atomic::AtomicU32,
+    /// What each peer's `/health` claims to be running (WI-067). Absent = the
+    /// build is unknown, which is what an un-configured mock peer reports and
+    /// what a real peer predating the check reports.
+    builds: Mutex<BTreeMap<Identifier, crate::http::compat::PeerBuild>>,
 }
 
 impl MockPeerHub {
@@ -827,6 +831,21 @@ impl MockPeerHub {
     pub fn dkg1_publish_count(&self) -> u32 {
         self.dkg1_publishes
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Make `peer`'s `/health` report this build (WI-067).
+    pub fn set_build(&self, peer: Identifier, build: crate::http::compat::PeerBuild) {
+        self.builds.lock().unwrap().insert(peer, build);
+    }
+
+    #[must_use]
+    pub fn build_of(&self, peer: Identifier) -> crate::http::compat::PeerBuild {
+        self.builds
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn push_round1_fault_evidence(
@@ -982,8 +1001,17 @@ fn err_502<T>() -> EpochResult<T> {
 
 #[async_trait]
 impl PeerNetwork for MockPeerNetwork {
-    async fn check_health(&self, peer: &SpoInfo) -> bool {
-        self.hub.is_online(peer.identifier)
+    async fn check_health(&self, peer: &SpoInfo) -> crate::epoch::traits::PeerHealth {
+        if !self.hub.is_online(peer.identifier) {
+            return crate::epoch::traits::PeerHealth::unreachable();
+        }
+        // Mock peers report whatever the hub was told to say for them; by
+        // default that is nothing, i.e. an unknown build, which is the allowed
+        // verdict — so every existing test is unaffected by the WI-067 gate.
+        crate::epoch::traits::PeerHealth {
+            reachable: true,
+            build: self.hub.build_of(peer.identifier),
+        }
     }
 
     async fn publish_dkg_round1(

@@ -443,17 +443,30 @@ fn gc_sign_blobs(sign: &mut std::collections::BTreeMap<(u64, u32, RoundKey), Str
 
 #[async_trait]
 impl PeerNetwork for HttpPeerNetwork {
-    async fn check_health(&self, peer: &SpoInfo) -> bool {
+    async fn check_health(&self, peer: &SpoInfo) -> crate::epoch::traits::PeerHealth {
         let url = format!("{}/health", peer.bifrost_url.trim_end_matches('/'));
-        match self
+        let Ok(resp) = self
             .client
             .get(&url)
             .timeout(std::time::Duration::from_secs(2))
             .send()
             .await
-        {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
+        else {
+            return crate::epoch::traits::PeerHealth::unreachable();
+        };
+        if !resp.status().is_success() {
+            return crate::epoch::traits::PeerHealth::unreachable();
+        }
+        // A body we cannot read or parse leaves the BUILD unknown, not the peer
+        // unreachable: it answered. Unknown is the allowed verdict (WI-067), so
+        // a peer whose /health predates the extra fields still joins.
+        let build = resp
+            .json::<crate::http::compat::PeerBuild>()
+            .await
+            .unwrap_or_default();
+        crate::epoch::traits::PeerHealth {
+            reachable: true,
+            build,
         }
     }
 

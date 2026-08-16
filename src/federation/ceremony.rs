@@ -281,7 +281,7 @@ async fn await_presence(
     loop {
         let mut missing = Vec::new();
         for peer in peer_infos {
-            if !peers.check_health(peer).await {
+            if !peers.check_health(peer).await.reachable {
                 missing.push(peer.bifrost_url.clone());
             }
         }
@@ -395,7 +395,7 @@ where
 async fn diagnose_missing(peers: &Arc<dyn PeerNetwork>, missing: &[&SpoInfo]) -> Vec<String> {
     let mut out = Vec::with_capacity(missing.len());
     for peer in missing {
-        let note = if peers.check_health(peer).await {
+        let note = if peers.check_health(peer).await.reachable {
             "reachable, but published nothing for this round"
         } else {
             "unreachable — not started, or its process has already exited"

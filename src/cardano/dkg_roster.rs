@@ -508,6 +508,30 @@ impl DkgContext {
 
     #[must_use]
     pub fn reduced_to(&self, survivors: &BTreeSet<Identifier>) -> Option<DkgContext> {
+        self.rebased_to(survivors, self.attempt + 1)
+    }
+
+    /// Drop candidates BEFORE the ceremony starts, re-deriving the
+    /// stake-weighted threshold and keeping `attempt` (WI-067).
+    ///
+    /// Used for a candidate that is reachable but incompatible — a peer on a
+    /// different `major.minor`, or carrying a different blueprint. Unlike
+    /// [`Self::narrowed_to`] the threshold IS re-derived, because nothing has
+    /// been published yet and this is simply a smaller candidate set; and unlike
+    /// [`Self::reduced_to`] the attempt does not move, because there is no
+    /// earlier attempt to distinguish this from.
+    #[must_use]
+    pub fn without(&self, excluded: &BTreeSet<Identifier>) -> Option<DkgContext> {
+        let kept: BTreeSet<Identifier> = self
+            .participants
+            .iter()
+            .map(|p| p.identifier)
+            .filter(|id| !excluded.contains(id))
+            .collect();
+        self.rebased_to(&kept, self.attempt)
+    }
+
+    fn rebased_to(&self, survivors: &BTreeSet<Identifier>, attempt: u32) -> Option<DkgContext> {
         let kept: Vec<DkgParticipant> = self
             .participants
             .iter()
@@ -526,7 +550,7 @@ impl DkgContext {
         let threshold = stake_weighted_threshold(&stakes, total).min(n);
         Some(DkgContext {
             epoch: self.epoch,
-            attempt: self.attempt + 1,
+            attempt,
             threshold,
             total_stake: total,
             participants: kept,
@@ -773,6 +797,53 @@ pub async fn fetch_dkg_context(
 
 #[cfg(test)]
 mod tests {
+
+    /// WI-067: dropping an incompatible candidate re-derives the threshold over
+    /// what remains and does NOT move `attempt` — nothing has been published, so
+    /// this is simply a smaller candidate set, not a second try.
+    #[test]
+    fn without_rebases_the_threshold_and_keeps_the_attempt() {
+        let ctx = ctx_with(&[10, 10, 10, 10], 3);
+        let dropped: std::collections::BTreeSet<_> =
+            [ctx.participants[3].identifier].into_iter().collect();
+        let out = ctx.without(&dropped).expect("three of four still run");
+        assert_eq!(out.participants.len(), 3);
+        assert_eq!(
+            out.attempt, ctx.attempt,
+            "no attempt bump: nothing was published"
+        );
+        assert_eq!(out.total_stake, 30);
+        assert!(
+            out.threshold <= 3,
+            "t is re-derived over the survivors, got {}",
+            out.threshold
+        );
+    }
+
+    /// Dropping below what FROST can run at all answers `None`, so the caller
+    /// aborts loudly instead of starting a ceremony that cannot finish.
+    #[test]
+    fn without_refuses_when_too_few_remain() {
+        let ctx = ctx_with(&[10, 10], 2);
+        let dropped: std::collections::BTreeSet<_> =
+            [ctx.participants[1].identifier].into_iter().collect();
+        assert!(ctx.without(&dropped).is_none());
+    }
+
+    /// The contrast with `narrowed_to`, which KEEPS the threshold because the
+    /// published commitments already fix it.
+    #[test]
+    fn narrowed_to_keeps_the_threshold_where_without_rebases_it() {
+        let ctx = ctx_with(&[10, 10, 10, 10], 3);
+        let keep: std::collections::BTreeSet<_> =
+            ctx.participants[..3].iter().map(|p| p.identifier).collect();
+        let narrowed = ctx.narrowed_to(&keep).expect("three still run");
+        assert_eq!(
+            narrowed.threshold, ctx.threshold,
+            "t is fixed by the commitments"
+        );
+        assert_eq!(narrowed.attempt, ctx.attempt);
+    }
     use super::*;
     use crate::cardano::roster::RegisteredSpo;
     use crate::cardano::treasury_info::TreasuryInfoDatum;
