@@ -801,6 +801,13 @@ pub struct MockPeerHub {
     /// that second publication is exactly the WI-048 defect. Tests assert on it
     /// because the store itself only shows the latest value.
     sign1_publishes: std::sync::atomic::AtomicU32,
+    /// DKG round-1 packages published across every node and namespace.
+    ///
+    /// The twin of [`Self::sign1_publishes`], and it discriminates the same kind
+    /// of thing: a ceremony that RERUNS publishes round 1 twice (once per
+    /// attempt), a ceremony that NARROWS in place publishes it once (WI-105).
+    /// Neither is visible in the store, which only holds the latest package.
+    dkg1_publishes: std::sync::atomic::AtomicU32,
 }
 
 impl MockPeerHub {
@@ -812,6 +819,13 @@ impl MockPeerHub {
     #[must_use]
     pub fn sign1_publish_count(&self) -> u32 {
         self.sign1_publishes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// See [`MockPeerHub::dkg1_publishes`].
+    #[must_use]
+    pub fn dkg1_publish_count(&self) -> u32 {
+        self.dkg1_publishes
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
@@ -979,6 +993,9 @@ impl PeerNetwork for MockPeerNetwork {
         package: &round1::Package,
     ) -> EpochResult<()> {
         let pkg = package.clone();
+        self.hub
+            .dkg1_publishes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         with_slot(&self.hub, self.me, |s| s.dkg1 = Some((ns, pkg)));
         self.hub.notify.notify_waiters();
         Ok(())

@@ -455,6 +455,57 @@ impl DkgContext {
     /// relative to the survivors' total, not the original epoch stake — the
     /// spec's "restart DKG with the reduced candidate set after slashing"
     /// re-bases the honest-majority requirement on whoever remains eligible.
+    /// Narrow the CURRENT attempt to the participants that published a valid
+    /// Round 1 payload by the deadline (WI-105, spec §Round 0 — "ordinary
+    /// non-participation does not create a new DKG attempt").
+    ///
+    /// Unlike [`Self::reduced_to`] this keeps `attempt` AND `threshold`, and
+    /// both are load-bearing:
+    ///
+    /// * `attempt` is the payload namespace. Bumping it re-namespaces the whole
+    ///   ceremony, so two nodes that observed different absentee sets end up in
+    ///   namespaces that cannot see each other's payloads at all — no error on
+    ///   either side, just a DKG that never converges. Staying put is what lets
+    ///   the already-published Round 1 payloads keep being the ones in use.
+    /// * `threshold` is baked into every published commitment, which carries
+    ///   exactly `t` points. Re-deriving a stake-weighted `t` over the survivors
+    ///   would invalidate the payloads this narrowing exists to reuse, and the
+    ///   spec fixes `t` for the whole `(epoch, threshold-mode)` anyway.
+    ///
+    /// `None` when the survivors cannot run a ceremony at all, exactly as
+    /// [`Self::reduced_to`] — including when the surviving count drops below the
+    /// threshold, which no in-place narrowing can rescue.
+    #[must_use]
+    pub fn narrowed_to(&self, survivors: &BTreeSet<Identifier>) -> Option<DkgContext> {
+        let kept: Vec<DkgParticipant> = self
+            .participants
+            .iter()
+            .filter(|p| survivors.contains(&p.identifier))
+            .cloned()
+            .collect();
+        if kept.len() < usize::from(FROST_MIN_PARTICIPANTS) {
+            return None;
+        }
+        let n = u16::try_from(kept.len()).ok()?;
+        if n < self.threshold {
+            return None;
+        }
+        let total: u64 = kept.iter().map(|p| p.active_stake).sum();
+        if total == 0 {
+            return None;
+        }
+        Some(DkgContext {
+            epoch: self.epoch,
+            attempt: self.attempt,
+            threshold: self.threshold,
+            total_stake: total,
+            participants: kept,
+            excluded: self.excluded.clone(),
+            schedule_anchor_ms: self.schedule_anchor_ms,
+            read_time_ms: self.read_time_ms,
+        })
+    }
+
     #[must_use]
     pub fn reduced_to(&self, survivors: &BTreeSet<Identifier>) -> Option<DkgContext> {
         let kept: Vec<DkgParticipant> = self

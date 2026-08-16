@@ -1,20 +1,31 @@
 //! DKG phase order -- Round1 -> Round2 -> Part3, with a stake-weighted
 //! abort/rerun gate (WI-014 #3).
 //!
-//! Each `(epoch, attempt)` runs the full FROST DKG over the attempt's
-//! candidate set ([`DkgContext`]). frost-core's `dkg_part2`/`part3` require
-//! the *entire* candidate set to contribute (`round1_packages.len() ==
-//! max_signers - 1`), so there is no "complete with a subset" within a single
-//! attempt. When a peer is absent or provably faulty:
+//! Each `(epoch, attempt)` runs the FROST DKG over the attempt's candidate set
+//! ([`DkgContext`]). The two rounds handle absence DIFFERENTLY, and the
+//! difference is the point (WI-105):
 //!
-//!   - the surviving subset — `L1` (valid Round 1 publishers) after Round 1, or
-//!     `Q` (valid Round 2 senders) after Round 2 — is put through the quorum
-//!     gate [`DkgContext::quorum_ok`];
-//!   - if it clears the gate, [`DkgContext::reduced_to`] builds the next
-//!     attempt's candidate set (bumped attempt, re-based stake-weighted
-//!     threshold) and the ceremony reruns from Round 1 over the reduced set;
-//!   - if it fails the gate (or is too small to run FROST DKG), the epoch's DKG
-//!     is dead ([`EpochError::DkgAborted`]) and the caller backs off to the next
+//!   - **Round 1 absence NARROWS this attempt** ([`DkgContext::narrowed_to`]).
+//!     The candidate set closes at the deadline on whoever published, `attempt`
+//!     and `t` both stay put, and nothing is republished — a commitment and its
+//!     proof of knowledge do not depend on how many participants there are.
+//!     `max_signers` never reaches the wire; frost-core uses it only to check
+//!     the package count it is handed, so
+//!     [`participant::dkg_narrow_round1_secret`] tells it the smaller truth.
+//!     This is the spec's rule ("ordinary non-participation does not create a
+//!     new DKG attempt") and it matters because `attempt` is the payload
+//!     NAMESPACE: two nodes that bumped on different absentee sets would land in
+//!     namespaces that cannot see each other, with no error on either side.
+//!   - **Round 2 absence RERUNS** at `attempt + 1` over the reduced set
+//!     ([`DkgContext::reduced_to`], re-based stake-weighted threshold). Not a
+//!     library limitation — a threshold one: a member that published Round 1,
+//!     received everyone's shares and only then went silent already holds a
+//!     usable share of the key the survivors would finalize, since narrowing
+//!     leaves the polynomial unchanged. A fresh polynomial voids it.
+//!   - Either way the survivors first pass the quorum gate
+//!     [`DkgContext::quorum_ok`]; failing it (or being too small to run FROST
+//!     DKG at all) means the epoch's DKG is dead
+//!     ([`EpochError::DkgAborted`]) and the caller backs off to the next
 //!     boundary rather than killing the process.
 //!
 //! The happy path (everyone contributes → `Q == C`, no reduction) needs no
@@ -263,6 +274,79 @@ pub async fn dkg_phase(
                     absent
                 );
                 report_round1_faults(chain, peers, ns, me, &ctx, &l1).await?;
+
+                // WI-105: ordinary absence in Round 1 NARROWS this attempt; it
+                // does not start a new one. The spec is explicit ("ordinary
+                // non-participation does not create a new DKG attempt"), and the
+                // reason it matters is that `attempt` is the payload namespace:
+                // two nodes that observed different absentee sets and bumped
+                // would land in namespaces that cannot see each other's payloads
+                // at all — no error on either side, just a ceremony that never
+                // converges. On separate machines that is the ordinary case.
+                //
+                // Nothing is republished. The already-published Round 1 payloads
+                // stay in use, because a commitment and its proof of knowledge do
+                // not depend on how many participants there are — only on `t`,
+                // which narrowing keeps.
+                //
+                // Round 2 absence is NOT handled this way; see there.
+                //
+                // AND IT IS ONLY SOUND WHEN THE DEADLINE IS SHARED. Narrowing
+                // makes `L1` decide the ceremony's membership, so nodes that
+                // close `L1` at different moments narrow to different sets and
+                // derive different group keys — silently, since nothing
+                // re-namespaces to separate them. A rerun does not have that
+                // problem: it re-namespaces, so a disagreement costs an attempt
+                // and everyone restarts synchronized.
+                //
+                // `schedule_anchor_ms` is exactly the question "is the deadline a
+                // chain fact every node computes identically?" (see
+                // `round_deadline`). Without it — a mock, or a deployment with no
+                // published schedule — the deadline is each node's own timer and
+                // the rerun is the safer answer. Same shape as `signing_window`'s
+                // no-grid fallback (WI-077); this is its DKG twin.
+                let deadline_is_shared = ctx.schedule_anchor_ms.is_some();
+                let narrowed = if deadline_is_shared {
+                    ctx.narrowed_to(&l1).filter(|_| ctx.quorum_ok(&l1))
+                } else {
+                    crate::epoch_warn!(
+                        me,
+                        epoch,
+                        "  no schedule anchor, so the round1 deadline is this node's own timer \
+                         and peers may have closed a different L1 — rerunning rather than \
+                         narrowing, which would derive a different key on each of them"
+                    );
+                    None
+                };
+                if let Some(ctx) = narrowed {
+                    let secret = collected.round1_mine.as_ref().ok_or_else(|| {
+                        EpochError::Frost("round1 narrowing without our own secret".into())
+                    })?;
+                    let n = u16::try_from(l1.len())
+                        .map_err(|_| EpochError::Frost("round1 subset too large".into()))?;
+                    collected.round1_mine = Some(participant::dkg_narrow_round1_secret(
+                        secret,
+                        me,
+                        n,
+                        ctx.threshold,
+                    ));
+                    crate::epoch_log!(
+                        me,
+                        epoch,
+                        "  narrowing attempt {attempt} in place to the {} node(s) that published \
+                         round1 (t={} unchanged, no rerun) — advancing to round2",
+                        l1.len(),
+                        ctx.threshold,
+                    );
+                    return Ok(EpochPhase::Dkg {
+                        round: DkgRound::Round2,
+                        ctx,
+                        collected,
+                    });
+                }
+                // Below the threshold, or carrying no stake: no narrowing can
+                // rescue that, so the old path decides between a reduced rerun
+                // and giving the epoch up.
                 rerun_or_abort(me, &ctx, DkgRound::Round1, &l1, "round1 incomplete")
             }
         }
@@ -394,6 +478,24 @@ pub async fn dkg_phase(
                 );
                 report_round2_faults(chain, peers, ns, me, &ctx, &q, &collected.round1_peers)
                     .await?;
+                // WI-105: Round 2 absence RERUNS, and deliberately, unlike Round 1
+                // above. It is not a library limitation — shares are polynomial
+                // evaluations, so re-deriving them over the smaller set would give
+                // the same values and republish nothing. It is a threshold one.
+                //
+                // A member that published a valid Round 1, RECEIVED everyone's
+                // Round 2 shares, and only then went silent has by that point
+                // assembled a usable share of the key the survivors would go on to
+                // finalize — because narrowing in place leaves the polynomial
+                // unchanged. The roster would name |Q| shareholders while
+                // |Q| + |L1 \ Q| parties held one, so a t-of-roster guarantee
+                // could be met by a coalition including a party the roster
+                // excluded. A rerun's fresh polynomial makes those shares
+                // worthless, which is exactly what is wanted.
+                //
+                // The spec's text covers both rounds with one rule; that this
+                // implementation splits them is raised upstream as an open
+                // question (ft-bifrost-bridge#50), not decided here.
                 rerun_or_abort(me, &ctx, DkgRound::Round2, &q, "round2 incomplete")
             }
         }
@@ -1028,9 +1130,13 @@ mod tests {
         clock: Arc<dyn Clock>,
         config: EpochConfig,
         roster: Roster,
+        anchor_ms: Option<i64>,
     ) -> EpochResult<GroupKeys> {
         let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
-        let ctx = DkgContext::from_roster_equal_stake(&roster, 0, 0);
+        let mut ctx = DkgContext::from_roster_equal_stake(&roster, 0, 0);
+        // The ceremony is driven from a context built here, not from
+        // `query_dkg_context`, so the anchor has to be set here too.
+        ctx.schedule_anchor_ms = anchor_ms;
         let mut phase = EpochPhase::Dkg {
             round: DkgRound::Round1,
             ctx,
@@ -1053,6 +1159,29 @@ mod tests {
 
     /// Spawn `ids` SPOs against a shared hub and drive each through DKG.
     async fn run_ceremony(roster: Roster, ids: &[u16]) -> Vec<EpochResult<GroupKeys>> {
+        run_ceremony_on(roster, ids).await.0
+    }
+
+    /// As [`run_ceremony`], also handing back the hub so a test can count what
+    /// was published rather than only inspect what survived.
+    async fn run_ceremony_on(
+        roster: Roster,
+        ids: &[u16],
+    ) -> (Vec<EpochResult<GroupKeys>>, Arc<MockPeerHub>) {
+        run_ceremony_anchored(roster, ids, None).await
+    }
+
+    /// As [`run_ceremony_on`], with an optional schedule anchor.
+    ///
+    /// The anchor is what makes the round-1 deadline a value every node computes
+    /// identically, and narrowing in place is only offered when it is present
+    /// (WI-105) — so a test of narrowing must supply one, and a test of the
+    /// rerun fallback must not.
+    async fn run_ceremony_anchored(
+        roster: Roster,
+        ids: &[u16],
+        anchor_ms: Option<i64>,
+    ) -> (Vec<EpochResult<GroupKeys>>, Arc<MockPeerHub>) {
         let hub = MockPeerHub::new();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let mut handles = Vec::new();
@@ -1073,16 +1202,23 @@ mod tests {
             // Tight timing so the absent-peer reruns don't make the test slow.
             config.dkg_round_timeout = Duration::from_millis(250);
             config.poll_interval = Duration::from_millis(10);
+            // With an anchor the deadlines are `anchor + offset`, so the offsets
+            // have to be test-sized too — otherwise the round waits out the
+            // production two minutes.
+            if anchor_ms.is_some() {
+                config.dkg_round1_offset = Duration::from_millis(250);
+                config.dkg_round2_offset = Duration::from_millis(500);
+            }
             let roster = roster.clone();
             handles.push(tokio::spawn(async move {
-                drive_dkg(chain, peers, clock, config, roster).await
+                drive_dkg(chain, peers, clock, config, roster, anchor_ms).await
             }));
         }
         let mut out = Vec::new();
         for h in handles {
             out.push(h.await.unwrap());
         }
-        out
+        (out, hub)
     }
 
     fn assert_same_group_key(results: &[EpochResult<GroupKeys>]) {
@@ -1126,12 +1262,51 @@ mod tests {
 
     /// A 3-candidate ceremony where one peer never shows up. The two survivors
     /// both observe L1 = {1,2}, which clears the quorum gate (2/3 stake > 51%),
-    /// so they rerun as a reduced 2-of-2 (attempt 1) and complete with the same
-    /// Y_51 — exercising the poll-to-subset → gate → reduced-rerun path.
+    /// and they NARROW THE ATTEMPT IN PLACE rather than rerunning (WI-105).
+    ///
+    /// The group key alone cannot tell the two apart — a rerun also converges.
+    /// What tells them apart is the round-1 publish COUNT: a rerun publishes
+    /// again under `attempt = 1`, narrowing reuses what is already published.
+    /// That distinction is the whole item, because `attempt` is the payload
+    /// namespace and two nodes that bumped on different absentee sets would land
+    /// in namespaces that cannot see each other at all.
     #[tokio::test]
-    async fn dkg_absent_peer_reduces_and_reruns() {
-        let results = run_ceremony(make_roster(3, 2), &[1, 2]).await; // SPO 3 never spawns
+    async fn an_absent_round1_peer_narrows_the_attempt_instead_of_rerunning() {
+        // A schedule anchor a little in the past: `round_deadline` then closes
+        // round 1 at boundary + dkg_round1_offset, one moment for every node,
+        // which is the precondition narrowing needs.
+        let anchor = wall_now_ms();
+        let (results, hub) = run_ceremony_anchored(make_roster(3, 2), &[1, 2], Some(anchor)).await; // SPO 3 never spawns
         assert_same_group_key(&results);
+        assert_eq!(
+            hub.dkg1_publish_count(),
+            2,
+            "one round-1 publication per surviving node: a rerun would double it"
+        );
+    }
+
+    /// Without a shared deadline the SAME absence must RERUN instead, because
+    /// each node closes `L1` on its own timer and narrowing would have them
+    /// derive different keys with nothing to separate them.
+    #[tokio::test]
+    async fn an_absent_peer_reruns_when_the_deadline_is_not_shared() {
+        let (results, hub) = run_ceremony_on(make_roster(3, 2), &[1, 2]).await;
+        assert_same_group_key(&results);
+        assert_eq!(
+            hub.dkg1_publish_count(),
+            4,
+            "two nodes × two attempts: the rerun is the safe answer here"
+        );
+    }
+
+    /// The control: with nobody absent there is nothing to narrow, and the count
+    /// is the same. Without this, the assertion above could be satisfied by a
+    /// ceremony that simply never published.
+    #[tokio::test]
+    async fn a_complete_round1_publishes_exactly_once_per_node() {
+        let (results, hub) = run_ceremony_on(make_roster(2, 2), &[1, 2]).await;
+        assert_same_group_key(&results);
+        assert_eq!(hub.dkg1_publish_count(), 2);
     }
 
     #[tokio::test]

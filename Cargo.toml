@@ -5,6 +5,13 @@ edition = "2024"
 
 [dependencies]
 frost-secp256k1-tr = { version = "3.0.0-rc.0", features = ["serialization"] }
+# Direct dependency for ONE reason: `internals` makes
+# `keys::dkg::round1::SecretPackage::{coefficients, commitment}` public, which is
+# what lets a DKG narrow to the participants that published Round 1 by the
+# deadline WITHOUT re-running Round 1 (WI-105). Cargo unifies features across the
+# graph, so enabling it here exposes those accessors on the same types
+# `frost-secp256k1-tr` re-exports. Nothing else in heimdall names this crate.
+frost-core = { version = "3.0.0-rc.0", features = ["internals"] }
 ff = "0.13"
 blake2b_simd = "1.0.3"
 halo2-base = { git = "https://github.com/vlasin/halo2-lib.git", rev = "2f753ef0508d5d7500865f2ca803069bcfe4c80d", default-features = false, features = ["halo2-axiom"] }

@@ -21,6 +21,38 @@ pub fn dkg_part1(
     dkg::part1(identifier, max_signers, min_signers, rng)
 }
 
+/// Rebuild a Round 1 secret package for a SMALLER participant set, keeping the
+/// polynomial — and therefore the commitment and proof of knowledge already
+/// published — exactly as they are (WI-105).
+///
+/// This is what lets a DKG narrow to whoever published Round 1 by the deadline
+/// without re-running Round 1. It is sound because `max_signers` never reaches
+/// the wire: `part1`'s published `Package` is `{commitment, proof_of_knowledge}`,
+/// the commitment is over the `t` polynomial coefficients, and `t` is fixed for
+/// the epoch. frost-core uses `max_signers` only to check the package COUNT it is
+/// handed in `part2`/`part3`, so telling it the smaller number is telling it the
+/// truth about the set now being run.
+///
+/// Narrowing must never change `min_signers`: the published commitment carries
+/// exactly `t` points, so a different `t` would invalidate the very payloads this
+/// exists to reuse.
+///
+/// Needs frost-core's `internals` feature for the two accessors — see Cargo.toml.
+pub fn dkg_narrow_round1_secret(
+    secret_package: &dkg::round1::SecretPackage,
+    identifier: Identifier,
+    max_signers: u16,
+    min_signers: u16,
+) -> dkg::round1::SecretPackage {
+    dkg::round1::SecretPackage::new(
+        identifier,
+        secret_package.coefficients(),
+        secret_package.commitment().clone(),
+        min_signers,
+        max_signers,
+    )
+}
+
 /// SPO processes all peers' Round 1 packages, produces Round 2 secret shares.
 pub fn dkg_part2(
     secret_package: dkg::round1::SecretPackage,

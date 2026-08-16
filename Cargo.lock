@@ -1706,6 +1706,7 @@ dependencies = [
  "blockfrost",
  "clap",
  "ff",
+ "frost-core",
  "frost-secp256k1-tr",
  "halo2-base",
  "halo2-ecc",
