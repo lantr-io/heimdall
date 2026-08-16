@@ -12,7 +12,7 @@ use heimdall::cardano::pegin_source::CardanoPegInSource;
 use heimdall::cardano::treasury_datum::TreasuryConfig;
 use heimdall::config::HeimdallConfig;
 use heimdall::epoch::mocks::{MockCardanoChain, OsRngSource, SeededRngSource, SystemClock};
-use heimdall::epoch::state::SpoIdentity;
+use heimdall::epoch::state::{SpoIdentity, SpoInfo};
 use heimdall::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use heimdall::federation::roster::FederationMember;
 use heimdall::federation::{
@@ -2111,29 +2111,72 @@ async fn run_spo(
             match roster.own_participant(&bifrost_id_pk) {
                 Some((id, info)) => (id, info.clone(), kp),
                 None => {
-                    // Not in the roster by bifrost key. Against a real registry
-                    // roster this is fatal (not registered / banned / URL-excluded).
-                    // Fall back to --index ONLY for the legacy fixture demo.
-                    let ix = index.unwrap_or_else(|| {
-                        panic!(
-                            "this node's bifrost_id_pk ({}) is not in the eligible roster for \
-                             epoch {epoch} (not registered / banned / URL-excluded) and no \
-                             --index fallback was given — refusing to run DKG under an unknown \
-                             identity",
-                            hex::encode(bifrost_id_pk)
-                        )
+                    // Phase 1 (WI-098): a genesis bridge has an EMPTY registry by
+                    // definition, and until the first Update-Y the treasury is
+                    // locked under `y_federation` – so the movements are the
+                    // federation's to sign, not a roster's. A configured
+                    // federation member therefore has a seat here even though no
+                    // registry entry names it.
+                    //
+                    // `FederationMember::address()` is a 28-byte member address
+                    // that occupies the `pool_id` slot, which is all the peer
+                    // transport ever asks of it ("the wire never asks it to be a
+                    // Cardano pool id, and a federation member may not have one").
+                    // The same addressing already carried the `federation-dkg`
+                    // ceremony, which runs before any registry exists.
+                    //
+                    // This grants no authority the chain has not already granted:
+                    // the epoch machine still queries the registry and attempts
+                    // the DKG every epoch, and reaches the federation only when
+                    // that aborts (`dkg_unavailable` -> `phase1_fallback`), which
+                    // itself re-checks that the treasury is still locked under
+                    // Config #11 and that this node holds a share of THAT key.
+                    // Once SPOs register and the first Update-Y lands, the branch
+                    // above matches and this one stops being taken.
+                    let fed_seat = federation_roster(&cfg).ok().and_then(|f| {
+                        let m = f.own(&bifrost_id_pk)?.clone();
+                        Some((f.min_signers, f.members.len(), m))
                     });
-                    let id = Identifier::try_from(ix).unwrap();
-                    let info = roster
-                        .participants
-                        .get(&id)
-                        .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
-                        .clone();
-                    warn!(
-                        "[demo] bifrost_id_pk not found in roster; falling back to \
-                         --index {ix} (fixture/legacy demo only)"
-                    );
-                    (id, info, kp)
+                    if let Some((min_signers, n, m)) = fed_seat {
+                        info!(
+                            "no registry entry for this node – taking the Phase-1 FEDERATION \
+                             seat {} ({min_signers}-of-{n}). Treasury movements are the \
+                             federation's to sign until the first Update-Y",
+                            m.label()
+                        );
+                        let info = SpoInfo {
+                            identifier: m.identifier,
+                            pool_id: m.address().to_vec(),
+                            bifrost_url: m.bifrost_url.clone(),
+                            bifrost_id_pk: m.bifrost_id_pk.to_vec(),
+                        };
+                        (m.identifier, info, kp)
+                    } else {
+                        // Not in the roster by bifrost key, and not a federation
+                        // member either. Against a real registry roster this is
+                        // fatal (not registered / banned / URL-excluded). Fall
+                        // back to --index ONLY for the legacy fixture demo.
+                        let ix = index.unwrap_or_else(|| {
+                            panic!(
+                                "this node's bifrost_id_pk ({}) is in neither the eligible \
+                                 roster for epoch {epoch} (not registered / banned / \
+                                 URL-excluded) nor [federation].members, and no --index \
+                                 fallback was given – refusing to run under an unknown identity",
+                                hex::encode(bifrost_id_pk)
+                            )
+                        });
+                        let id = Identifier::try_from(ix).unwrap();
+                        let info = roster
+                            .participants
+                            .get(&id)
+                            .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
+                            .clone();
+                        warn!(
+                            "[demo] bifrost_id_pk not found in roster; falling back to \
+                             --index {ix} (fixture/legacy demo only)"
+                        );
+                        (id, info, kp)
+                    }
                 }
             }
         }

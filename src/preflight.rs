@@ -141,6 +141,30 @@ impl Builder {
     }
 }
 
+/// Is the bridge in Phase 1 – the window where an unregistered federation member
+/// is nonetheless the party that moves the treasury?
+///
+/// Phase 1 is chain state, not a setting: while `treasury_info`'s
+/// `current_spos_frost_key` still equals the Config's published `y_federation`,
+/// the treasury moves on the FEDERATION's signature, and the first Update-Y is
+/// the transition ("there is no phase flag anywhere"). A node holding a share of
+/// that key is doing the protocol's work whether or not a registry names it –
+/// which is the whole of WI-095, whose route was otherwise unreachable because
+/// registration gated the daemon that runs it.
+///
+/// Byte equality, so a datum key that is not 32 bytes is never a seat: a short or
+/// truncated read is not something to act on.
+///
+/// Whether this node HOLDS a share of that key is the caller's half of the test –
+/// see the `phase1_seat` binding in [`preflight`], which requires
+/// `crate::cardano::federation::resolve` to have cross-checked the persisted
+/// share against the published key. A share of some other ceremony's key signs
+/// for an address this bridge does not use.
+#[must_use]
+pub fn phase1_federation_seat(current_spos_frost_key: &[u8], published_y_fed: &[u8; 32]) -> bool {
+    current_spos_frost_key == published_y_fed
+}
+
 /// What to do about step 6 when this node is simply not registered yet.
 ///
 /// Named rather than inline because this is the failure an operator is MOST
@@ -603,6 +627,35 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         _ => None,
     };
 
+    // Resolved once here because TWO steps need it: step 6 to tell a Phase-1
+    // federation seat from an unregistered node, and step 8 to report the
+    // identity. `resolve` cross-checks the share this node holds against the key
+    // the Config publishes, so an `Ok` carrying a share IS "this node holds a
+    // share of the treasury's current key".
+    let federation_share = crate::federation::persist::group_key(
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    );
+    let federation_identity = federation_share.as_ref().ok().map(|share| {
+        crate::cardano::federation::resolve(
+            &cfg.bitcoin,
+            *share,
+            config.as_ref().map(|c| &c.params),
+        )
+    });
+    // WI-098: a genesis bridge has an empty registry BY DEFINITION, and until the
+    // first Update-Y its movements are the federation's to sign. A federation
+    // member is therefore a working node here, not one awaiting an install step.
+    let phase1_seat = match (&snapshot, &federation_identity) {
+        (Some(Ok(snap)), Some(Ok(id))) => {
+            federation_share.as_ref().ok().and_then(|s| *s).is_some()
+                && phase1_federation_seat(
+                    &snap.treasury_state.datum.current_spos_frost_key,
+                    &id.y_fed.serialize(),
+                )
+        }
+        _ => false,
+    };
+
     match (&snapshot, bifrost_pk) {
         (None, _) => b.push(
             6,
@@ -634,6 +687,28 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                         format!(
                             "registered as {} ({} SPOs in the registry)",
                             hex::encode(pk),
+                            snapshot.spos.len()
+                        ),
+                    );
+                } else if phase1_seat {
+                    // WI-098. Registration is still the path to a roster seat,
+                    // and step 6 still fails for a node that is neither
+                    // registered nor a federation member. But this node holds a
+                    // share of the very key the treasury is locked under, so it
+                    // signs the movements – refusing to start it would idle the
+                    // only party that CAN move the treasury, on the grounds that
+                    // it had not yet joined a roster whose whole purpose is to
+                    // take over from it.
+                    b.push(
+                        6,
+                        "registration status",
+                        Status::Pass,
+                        format!(
+                            "not registered, and does not need to be yet – the bridge is in \
+                             PHASE 1 (treasury key == Config y_federation) and this node holds \
+                             a share of it, so treasury movements are signed by the federation. \
+                             Register before the first Update-Y hands the treasury to a roster \
+                             ({} SPOs registered so far)",
                             snapshot.spos.len()
                         ),
                     );
@@ -738,9 +813,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             // that difference decides whether the published key gets cross-checked
             // at all, and a node that silently skips the check is exactly the state
             // this step exists to catch.
-            match crate::federation::persist::group_key(
-                cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
-            ) {
+            match &federation_share {
                 Err(e) => b.push_fix(
                     8,
                     "federation identity",
@@ -751,11 +824,10 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                      federation-key.json under protocol.state_dir — an absent share is a \
                      legitimate state, an unreadable one is not",
                 ),
-                Ok(share) => match crate::cardano::federation::resolve(
-                    &cfg.bitcoin,
-                    share,
-                    config.as_ref().map(|c| &c.params),
-                ) {
+                Ok(_) => match federation_identity
+                    .as_ref()
+                    .expect("federation_identity is Some whenever federation_share is Ok")
+                {
                     Ok(id) => b.push(
                         8,
                         "federation identity",
@@ -980,5 +1052,38 @@ mod tests {
                 "unindented fix line: {line:?}"
             );
         }
+    }
+
+    /// Phase 1 is the window where the treasury is still locked under the key
+    /// the Config publishes, so the federation – not a roster – signs movements.
+    #[test]
+    fn a_phase1_treasury_is_one_still_locked_under_the_published_key() {
+        let y_fed = [7u8; 32];
+        assert!(
+            super::phase1_federation_seat(&y_fed, &y_fed),
+            "treasury key == Config y_federation is Phase 1 by definition"
+        );
+    }
+
+    /// After the first Update-Y the treasury answers to a DKG key, so an
+    /// unregistered node has nothing to contribute and step 6 must go back to
+    /// failing – otherwise the seat outlives the phase that justified it.
+    #[test]
+    fn a_rotated_treasury_is_no_longer_a_federation_seat() {
+        let y_fed = [7u8; 32];
+        let rotated = [9u8; 32];
+        assert!(
+            !super::phase1_federation_seat(&rotated, &y_fed),
+            "a treasury rotated to a DKG key is Phase 2"
+        );
+    }
+
+    /// A datum that is not 32 bytes must not compare equal to anything: a short
+    /// or truncated key is a read this node should not act on.
+    #[test]
+    fn a_malformed_treasury_key_is_not_a_seat() {
+        let y_fed = [7u8; 32];
+        assert!(!super::phase1_federation_seat(&y_fed[..31], &y_fed));
+        assert!(!super::phase1_federation_seat(&[], &y_fed));
     }
 }
