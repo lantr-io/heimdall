@@ -522,7 +522,9 @@ async fn step_phase(
         EpochPhase::EpochStart { epoch } => {
             match epoch_start_phase(chain, peers, config, epoch).await {
                 Ok(next) => next,
-                Err(e) if dkg_unavailable(&e) => phase1_fallback(chain, peers, clock, rng, config, epoch, e).await?,
+                Err(e) if dkg_unavailable(&e) => {
+                    phase1_fallback(chain, peers, clock, rng, config, epoch, e).await?
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -535,7 +537,9 @@ async fn step_phase(
             let epoch = ctx.epoch;
             match dkg_phase(chain, peers, clock, rng, config, round, ctx, collected).await {
                 Ok(next) => next,
-                Err(e) if dkg_unavailable(&e) => phase1_fallback(chain, peers, clock, rng, config, epoch, e).await?,
+                Err(e) if dkg_unavailable(&e) => {
+                    phase1_fallback(chain, peers, clock, rng, config, epoch, e).await?
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1067,7 +1071,19 @@ async fn phase1_fallback(
     // has produced a key worth handing custody to. Opportunistic on purpose —
     // a failure here must not cost the movement this fallback exists to make,
     // so it logs and returns rather than propagating.
-    try_succession_handoff(chain, peers, clock, rng, config, epoch, signer, log_id).await;
+    if try_succession_handoff(chain, peers, clock, rng, config, epoch, signer, log_id).await {
+        // The rotation landed, so `current_spos_frost_key` is the ROSTER's key
+        // now and this node's federation share no longer authorizes anything.
+        // Continuing into CollectPegins would spend the rest of the epoch
+        // building movements signed under a key the datum no longer names —
+        // every one rejected on chain, by the node that just logged that its own
+        // share "stops being the treasury's authority from here".
+        //
+        // Re-entering EpochStart re-reads the phase from the chain instead: the
+        // node then finds `authorized_key != config_y_fed`, i.e. Phase 2, and
+        // the fallback declines for the right reason rather than by accident.
+        return Ok(EpochPhase::EpochStart { epoch });
+    }
 
     Ok(EpochPhase::CollectPegins {
         epoch,
@@ -1099,23 +1115,39 @@ async fn try_succession_handoff(
     epoch: u64,
     signer: &crate::epoch::state::Phase1Signer,
     log_id: frost::Identifier,
-) {
+) -> bool {
     use crate::epoch::succession::{SuccessionEvidence, gather, succession_key};
 
     let ctx = match chain.query_dkg_context(epoch, 0).await {
         Ok(c) => c,
         Err(e) => {
-            crate::epoch_log!(log_id, epoch, "  handoff: no SPO roster to hand to yet ({e})");
-            return;
+            crate::epoch_log!(
+                log_id,
+                epoch,
+                "  handoff: no SPO roster to hand to yet ({e})"
+            );
+            return false;
         }
     };
     let spo_roster = ctx.to_roster();
     if spo_roster.participants.is_empty() {
         crate::epoch_log!(log_id, epoch, "  handoff: the SPO registry is still empty");
-        return;
+        return false;
     }
 
-    let ns = crate::http::wire::DkgNamespace::for_attempt(epoch, 0);
+    // Asked for, never computed: the attempt is window*DKG_ATTEMPTS_PER_WINDOW
+    // counted from whenever each SPO entered its ceremony window, so no outsider
+    // can derive it — assuming 0 fetched URLs no SPO serves and reported the
+    // roster as silent for ever.
+    let Some(ns) = crate::epoch::succession::published_namespace(peers, &spo_roster).await else {
+        crate::epoch_log!(
+            log_id,
+            epoch,
+            "  handoff: the roster is not advertising one agreed DKG namespace yet — either the \
+             ceremony has not run, or its members are in different ones"
+        );
+        return false;
+    };
     let (round1, round2) = gather(peers, &spo_roster, ns).await;
     // The eligible set is ALREADY ban-filtered by `query_dkg_context`, so this
     // is a belt-and-braces pass rather than the enforcement: it catches a ban
@@ -1124,7 +1156,12 @@ async fn try_succession_handoff(
     let faulted: Vec<Vec<u8>> = ctx
         .excluded
         .iter()
-        .filter(|x| matches!(x.reason, crate::cardano::dkg_roster::ExclusionReason::Banned))
+        .filter(|x| {
+            matches!(
+                x.reason,
+                crate::cardano::dkg_roster::ExclusionReason::Banned
+            )
+        })
         .map(|x| x.pool_id.clone())
         .collect();
 
@@ -1141,7 +1178,7 @@ async fn try_succession_handoff(
                 epoch,
                 "  handoff: not yet — {why}. Holding the treasury under the federation key"
             );
-            return;
+            return false;
         }
     };
     crate::epoch_log!(
@@ -1155,42 +1192,61 @@ async fn try_succession_handoff(
     let plan = match chain.plan_update_y(epoch, y_51).await {
         Ok(Some(p)) => p,
         Ok(None) => {
-            crate::epoch_log!(log_id, epoch, "  handoff: already done (the datum names this key)");
-            return;
+            crate::epoch_log!(
+                log_id,
+                epoch,
+                "  handoff: already done (the datum names this key)"
+            );
+            return false;
         }
         Err(e) => {
             crate::epoch_warn!(log_id, epoch, "  handoff: cannot plan the rotation: {e}");
-            return;
+            return false;
         }
     };
     let window = match chain.query_batch_snapshot().await {
         Ok(snap) => rotation_window(clock, &snap),
         Err(e) => {
-            crate::epoch_warn!(log_id, epoch, "  handoff: no schedule to bound the rounds: {e}");
-            return;
+            crate::epoch_warn!(
+                log_id,
+                epoch,
+                "  handoff: no schedule to bound the rounds: {e}"
+            );
+            return false;
         }
     };
     let me = *signer.group_keys.key_package.identifier();
-    let signature =
-        match crate::epoch::rotation::authorize_update_y(peers, clock, rng, config, me, &plan, window)
-            .await
-        {
-            Ok((sig, authority)) => {
-                crate::epoch_log!(log_id, epoch, "  handoff authorized by {authority}");
-                sig
-            }
-            Err(e) => {
-                crate::epoch_warn!(log_id, epoch, "  handoff: the federation could not sign it: {e}");
-                return;
-            }
-        };
+    let signature = match crate::epoch::rotation::authorize_update_y(
+        peers, clock, rng, config, me, &plan, window,
+    )
+    .await
+    {
+        Ok((sig, authority)) => {
+            crate::epoch_log!(log_id, epoch, "  handoff authorized by {authority}");
+            sig
+        }
+        Err(e) => {
+            crate::epoch_warn!(
+                log_id,
+                epoch,
+                "  handoff: the federation could not sign it: {e}"
+            );
+            return false;
+        }
+    };
     match chain.submit_update_y(&plan, &signature).await {
-        Ok(tx) => crate::epoch_log!(
-            log_id,
-            epoch,
-            "  HANDOFF POSTED: tx {tx} — the treasury is now the SPO roster's. This node's              federation share stops being the treasury's authority from here"
-        ),
-        Err(e) => crate::epoch_warn!(log_id, epoch, "  handoff: submission failed: {e}"),
+        Ok(tx) => {
+            crate::epoch_log!(
+                log_id,
+                epoch,
+                "  HANDOFF POSTED: tx {tx} — the treasury is now the SPO roster's. This node's              federation share stops being the treasury's authority from here"
+            );
+            true
+        }
+        Err(e) => {
+            crate::epoch_warn!(log_id, epoch, "  handoff: submission failed: {e}");
+            false
+        }
     }
 }
 
@@ -3222,7 +3278,12 @@ mod tests {
     #[tokio::test]
     async fn the_federation_hands_the_treasury_to_a_roster_that_earned_it() {
         let epoch = 7;
-        let ns = crate::http::wire::DkgNamespace::for_attempt(epoch, 0);
+        // A NON-ZERO attempt, as every chain-anchored ceremony has: the attempt
+        // is `window * DKG_ATTEMPTS_PER_WINDOW`, and our preprod nodes joined
+        // window 522 → 8352. An earlier version of this code probed attempt 0
+        // and so could only ever have worked against a mock; publishing here
+        // under a real-shaped attempt is what keeps that from coming back.
+        let ns = crate::http::wire::DkgNamespace::for_attempt(epoch, 522 * 16);
         let (spo_result, round1_packages) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
         let spo_y51 = group_xonly(spo_result.public_key_package.verifying_key())
             .unwrap()
@@ -3235,12 +3296,33 @@ mod tests {
         // authorship here, never content — the shares are addressed to
         // recipients the federation is not one of and could not decrypt.
         let marker = crate::frost::dkg::run_cheating_dkg(2, 3, 1, 2);
-        let stub = marker.round2_packages.values().next().unwrap()
-            .values().next().unwrap().clone();
-        for (id, info) in &spo_roster.participants {
+        let stub = marker
+            .round2_packages
+            .values()
+            .next()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        for id in spo_roster.participants.keys() {
             let net = MockPeerNetwork::new(*id, hub.clone());
-            net.publish_dkg_round1(ns, *id, &round1_packages[id]).await.unwrap();
-            net.publish_dkg_round2(ns, *id, &[], &[(info.clone(), stub.clone())]).await.unwrap();
+            net.publish_dkg_round1(ns, *id, &round1_packages[id])
+                .await
+                .unwrap();
+            // Addressed to every OTHER member, as a real ceremony's Round 2 is —
+            // the recipient list IS the participant set the sender ran with, and
+            // the succession rule reads it as such.
+            let others: Vec<(
+                crate::epoch::state::SpoInfo,
+                frost::keys::dkg::round2::Package,
+            )> = spo_roster
+                .participants
+                .iter()
+                .filter(|(other, _)| *other != id)
+                .map(|(_, info)| (info.clone(), stub.clone()))
+                .collect();
+            net.publish_dkg_round2(ns, *id, &[], &others).await.unwrap();
         }
 
         // The federation: its own key, its own membership, in no registry.
@@ -3263,8 +3345,7 @@ mod tests {
         for signer in signers {
             let me = *signer.group_keys.key_package.identifier();
             let mut config = fast_config(me);
-            config.identity.bifrost_id_pk =
-                signer.roster.participants[&me].bifrost_id_pk.clone();
+            config.identity.bifrost_id_pk = signer.roster.participants[&me].bifrost_id_pk.clone();
             config.phase1_signer = Some(signer);
             let chain = chain.clone();
             let clock = clock.clone();
@@ -3275,11 +3356,17 @@ mod tests {
             }));
         }
         for h in handles {
-            h.await.unwrap().expect("Phase 1 with a share must continue");
+            h.await
+                .unwrap()
+                .expect("Phase 1 with a share must continue");
         }
 
         let recorded = state.lock().unwrap();
-        assert_eq!(recorded.rotations.len(), 1, "the handoff should have landed");
+        assert_eq!(
+            recorded.rotations.len(),
+            1,
+            "the handoff should have landed"
+        );
         let (rot_epoch, new_key, _sig) = recorded.rotations[0];
         assert_eq!(rot_epoch, epoch);
         assert_eq!(
@@ -3296,14 +3383,16 @@ mod tests {
     #[tokio::test]
     async fn an_unfinished_ceremony_does_not_get_the_treasury() {
         let epoch = 7;
-        let ns = crate::http::wire::DkgNamespace::for_attempt(epoch, 0);
+        let ns = crate::http::wire::DkgNamespace::for_attempt(epoch, 522 * 16);
         let (_spo_result, round1_packages) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
 
         let fixture = demo_static_fixture(2, 3, 19400);
         let hub = MockPeerHub::new();
         for id in fixture.roster.participants.keys() {
             let net = MockPeerNetwork::new(*id, hub.clone());
-            net.publish_dkg_round1(ns, *id, &round1_packages[id]).await.unwrap();
+            net.publish_dkg_round1(ns, *id, &round1_packages[id])
+                .await
+                .unwrap();
             // No Round 2 published.
         }
 
@@ -3336,8 +3425,14 @@ mod tests {
         .expect("declining the handoff must not stop Phase-1 operation");
 
         let recorded = state.lock().unwrap();
-        assert!(recorded.rotations.is_empty(), "no rotation should have landed");
-        assert_eq!(recorded.current_key, y_fed, "the treasury stays the federation's");
+        assert!(
+            recorded.rotations.is_empty(),
+            "no rotation should have landed"
+        );
+        assert_eq!(
+            recorded.current_key, y_fed,
+            "the treasury stays the federation's"
+        );
     }
 
     /// Phase 1 + a federation share → the cycle continues at `CollectPegins`
@@ -3370,8 +3465,8 @@ mod tests {
             7,
             aborted(),
         )
-            .await
-            .expect("Phase 1 with a share must continue, not re-raise");
+        .await
+        .expect("Phase 1 with a share must continue, not re-raise");
         match next {
             EpochPhase::CollectPegins {
                 epoch,
@@ -3412,8 +3507,8 @@ mod tests {
             7,
             aborted(),
         )
-            .await
-            .expect_err("a non-member has nothing to fall back to");
+        .await
+        .expect_err("a non-member has nothing to fall back to");
         assert!(
             matches!(err, EpochError::DkgAborted { .. }),
             "expected the original DKG error, got {err}"
@@ -3442,8 +3537,8 @@ mod tests {
             7,
             aborted(),
         )
-            .await
-            .expect_err("a share of the wrong key must be refused");
+        .await
+        .expect_err("a share of the wrong key must be refused");
         match err {
             EpochError::Transition(m) => assert!(
                 m.contains("cannot move the treasury"),

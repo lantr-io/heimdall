@@ -460,13 +460,17 @@ impl PeerNetwork for HttpPeerNetwork {
         // A body we cannot read or parse leaves the BUILD unknown, not the peer
         // unreachable: it answered. Unknown is the allowed verdict (WI-067), so
         // a peer whose /health predates the extra fields still joins.
-        let build = resp
-            .json::<crate::http::compat::PeerBuild>()
-            .await
+        let body = resp.json::<serde_json::Value>().await.unwrap_or_default();
+        let build = serde_json::from_value::<crate::http::compat::PeerBuild>(body.clone())
             .unwrap_or_default();
+        let published_dkg = match (body.get("dkg_epoch"), body.get("dkg_attempt")) {
+            (Some(e), Some(a)) => e.as_u64().zip(a.as_u64()),
+            _ => None,
+        };
         crate::epoch::traits::PeerHealth {
             reachable: true,
             build,
+            published_dkg,
         }
     }
 
@@ -697,14 +701,18 @@ impl PeerNetwork for HttpPeerNetwork {
         }
     }
 
-    async fn dkg_round2_published(&self, ns: DkgNamespace, peer: &SpoInfo) -> EpochResult<bool> {
+    async fn dkg_round2_recipients(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+    ) -> EpochResult<Option<std::collections::BTreeSet<Vec<u8>>>> {
         let pool_hex = hex::encode(&peer.pool_id);
         let url = format!(
             "{}/dkg/{}/{}/{}/round2/{}.json",
             peer.bifrost_url, ns.epoch, ns.threshold, ns.attempt, pool_hex
         );
         let Some(bytes) = fetch_raw(&self.client, &url).await? else {
-            return Ok(false);
+            return Ok(None);
         };
         let wire: Dkg2Wire = serde_json::from_slice(&bytes).map_err(peer_err)?;
         let peer_pool = pool_id_arr(&peer.pool_id)?;
@@ -717,7 +725,7 @@ impl PeerNetwork for HttpPeerNetwork {
             ns.attempt,
             &wire,
         ) {
-            Ok(()) => Ok(true),
+            Ok(recipients) => Ok(Some(recipients.into_iter().map(|r| r.to_vec()).collect())),
             Err(e) => {
                 // Served but not signed by the member it claims to be from. That
                 // is not evidence of completion, so it reads as absence — the
@@ -726,7 +734,7 @@ impl PeerNetwork for HttpPeerNetwork {
                     "round2 from {} is not authored by it: {e}",
                     hex::encode(&peer.pool_id)
                 );
-                Ok(false)
+                Ok(None)
             }
         }
     }

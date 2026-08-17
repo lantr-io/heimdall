@@ -539,11 +539,18 @@ pub fn verify_round2(
 /// signature covers [`canonical::round2`], which is built entirely from the
 /// wire's public fields, so authorship separates cleanly from confidentiality.
 ///
-/// **This is presence and authorship, and nothing more.** A sender can publish a
-/// well-formed payload whose ciphertexts are wrong; only the recipient can tell,
-/// and when it does the result is a fault proof on chain. So a caller wanting to
-/// know whether a ceremony is sound must consult that too — see
-/// [`crate::epoch::succession`], where the two are conditions of one rule.
+/// **Returns who the payload is addressed to**, which is the load-bearing part.
+/// A Round 2 payload names its recipients in the clear, so the recipient set is
+/// the participant set its sender BELIEVED it was running with. Comparing those
+/// sets across members is what catches a ceremony that narrowed: if A and B
+/// finished without C, their payloads address only each other, however valid C's
+/// own payload looks. Without it a signed empty `shares` list would satisfy
+/// "reached Round 2" while distributing nothing.
+///
+/// **It is still not a correctness check.** A sender can publish a well-formed
+/// payload whose ciphertexts are wrong; only the recipient can tell, and when it
+/// does the result is a fault proof on chain. See [`crate::epoch::succession`],
+/// where these are conditions of one rule.
 pub fn verify_round2_authorship(
     secp: &Secp256k1<All>,
     sender_pool_id: &[u8; POOL_ID_LEN],
@@ -552,12 +559,12 @@ pub fn verify_round2_authorship(
     threshold: u64,
     attempt: u64,
     wire: &Dkg2Wire,
-) -> Result<(), WireError> {
+) -> Result<Vec<[u8; POOL_ID_LEN]>, WireError> {
     let entries = round2_entries(wire)?;
     let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
     let canonical_bytes = canonical::round2(epoch, threshold, attempt, sender_pool_id, &entries);
     auth::verify_payload(secp, sender_bifrost_id_pk, &canonical_bytes, &signature)?;
-    Ok(())
+    Ok(entries.iter().map(|e| e.recipient_pool_id).collect())
 }
 
 fn round2_entries(wire: &Dkg2Wire) -> Result<Vec<ShareEntry>, WireError> {

@@ -88,6 +88,17 @@ pub enum SuccessionError {
     /// A member published round 1 but no signed round 2, so the ceremony that
     /// determined this key is not known to have run to completion.
     Round2Incomplete { missing: Vec<String>, of: usize },
+    /// A member's Round-2 payload is addressed to a different set of
+    /// participants than the roster — the signature that a ceremony ran over a
+    /// NARROWED subset, or over nobody at all.
+    Round2Disagrees {
+        pool_id: String,
+        addressed: Vec<String>,
+    },
+    /// A Round-1 package arrived from somebody who is not in the roster. Its
+    /// commitment would change the sum, so the key would belong to no ceremony
+    /// the chain describes.
+    Surplus { pool_id: String },
     /// Somebody PROVED a member misbehaved in this ceremony. The proof is on
     /// chain, so this is not an opinion about liveness — the roster that
     /// produced this key contains a member the bridge can already demonstrate
@@ -117,6 +128,18 @@ impl std::fmt::Display for SuccessionError {
                  ceremony is not known to have completed: {}",
                 missing.len(),
                 missing.join(", ")
+            ),
+            Self::Round2Disagrees { pool_id, addressed } => write!(
+                f,
+                "member {pool_id} addressed its round 2 to {{{}}}, which is not the rest of the \
+                 roster — this ceremony ran over a different participant set than the registry \
+                 describes, so the key the commitments sum to is not the key its survivors hold",
+                addressed.join(", ")
+            ),
+            Self::Surplus { pool_id } => write!(
+                f,
+                "a round-1 package came from {pool_id}, which is not in the roster — including \
+                 it would change the summed key to one no ceremony produced"
             ),
             Self::FaultProven { pool_ids } => write!(
                 f,
@@ -221,14 +244,16 @@ pub struct SuccessionEvidence<'a> {
     pub roster: &'a crate::epoch::state::Roster,
     /// Round-1 packages already VERIFIED with [`crate::http::wire::verify_round1`].
     pub round1: &'a BTreeMap<Identifier, round1::Package>,
-    /// Members whose signed round-2 payload was fetched and whose signature
-    /// verified under their registered `bifrost_id_pk`.
+    /// For each member whose signed round-2 payload verified, the set of
+    /// `pool_id`s that payload is ADDRESSED to.
     ///
-    /// Presence and authorship only. The shares inside are encrypted per
-    /// recipient, so no third party can check they are CORRECT — that is what
-    /// the fault proofs in [`Self::faulted`] cover, and between them they are
-    /// the strongest statement available without asking the roster for anything.
-    pub round2: &'a BTreeSet<Identifier>,
+    /// Not a presence flag: the recipient list is public, so it is the
+    /// participant set the sender believed it was running with, and comparing
+    /// those sets across members is what detects a ceremony that finished over
+    /// a narrowed subset. The shares themselves are encrypted per recipient, so
+    /// no third party can check they are CORRECT — that is what the fault proofs
+    /// in [`Self::faulted`] cover.
+    pub round2: &'a BTreeMap<Identifier, BTreeSet<Vec<u8>>>,
     /// Pool ids with a fault proof published on chain against this ceremony.
     pub faulted: &'a [Vec<u8>],
 }
@@ -251,6 +276,16 @@ pub struct SuccessionEvidence<'a> {
 ///    and lands on chain, which is exactly the part no outside observer can
 ///    check for itself — the shares are encrypted to their recipients.
 ///
+/// **Condition 3 is weaker than it reads, and the caller decides how much.**
+/// What is checked is the `faulted` set the caller supplies. The natural source
+/// — the eligible roster's ban list — is already applied upstream when the
+/// roster is derived, so passing that makes this a no-op rather than a check;
+/// and a fault proven DURING this epoch's ceremony does not become an active ban
+/// until a later boundary, so it would not appear there anyway. Closing that
+/// needs the fault-proof UTxOs read directly for this epoch, which is a chain
+/// query this module deliberately does not make. Until a caller supplies that,
+/// treat conditions 1 and 2 as the ones doing the work.
+///
 /// **What remains open, deliberately.** All three can hold and the roster still
 /// be dark by the time the rotation lands: this is evidence about a ceremony
 /// that happened, not about liveness now. Only a proof of possession — a
@@ -261,6 +296,19 @@ pub fn succession_key(
     evidence: &SuccessionEvidence<'_>,
 ) -> Result<UntweakedPublicKey, SuccessionError> {
     let of = evidence.roster.participants.len();
+    let pool_of = |id: &Identifier| -> Vec<u8> { evidence.roster.participants[id].pool_id.clone() };
+
+    // Nothing may contribute a commitment that the roster does not name. The
+    // completeness check below walks the ROSTER, so on its own it would let a
+    // surplus package through — and a surplus phi_0 changes the sum, producing a
+    // well-formed key for a ceremony that never happened.
+    for id in evidence.round1.keys() {
+        if !evidence.roster.participants.contains_key(id) {
+            return Err(SuccessionError::Surplus {
+                pool_id: format!("frost identifier {}", crate::frost::identifier_u16(*id)),
+            });
+        }
+    }
 
     let missing: Vec<String> = evidence
         .roster
@@ -304,11 +352,23 @@ pub fn succession_key(
         });
     }
 
+    // Every member must have reached Round 2, AND have addressed it to exactly
+    // the rest of the roster.
+    //
+    // The second half is what makes this more than a liveness check. Round 1
+    // fixes the key before any share moves, so Round-1 evidence alone cannot
+    // distinguish the ceremony that finished from one that narrowed the moment
+    // after — and narrowing happens IN PLACE, inside the same attempt
+    // namespace, so the abandoned member's payloads are still served and still
+    // verify. A member excluded from the ceremony (round-1 absence, WI-105; a
+    // build the others refused, WI-067) simply is not in its peers' recipient
+    // lists, and the survivors' key is the sum over the subset — not the sum
+    // this function would otherwise compute over everyone who published.
     let no_round2: Vec<String> = evidence
         .roster
         .participants
         .iter()
-        .filter(|(id, _)| !evidence.round2.contains(id))
+        .filter(|(id, _)| !evidence.round2.contains_key(id))
         .map(|(_, info)| hex::encode(&info.pool_id))
         .collect();
     if !no_round2.is_empty() {
@@ -317,34 +377,103 @@ pub fn succession_key(
             of,
         });
     }
+    for (id, addressed) in evidence.round2 {
+        let expected: BTreeSet<Vec<u8>> = evidence
+            .roster
+            .participants
+            .keys()
+            .filter(|other| *other != id)
+            .map(pool_of)
+            .collect();
+        if *addressed != expected {
+            return Err(SuccessionError::Round2Disagrees {
+                pool_id: hex::encode(pool_of(id)),
+                addressed: addressed.iter().map(hex::encode).collect(),
+            });
+        }
+    }
 
     group_key_from_round1(evidence.round1)
 }
 
+/// How long one peer may take to answer one probe.
+///
+/// The transport's client has no default timeout, and this is the one code path
+/// that exists so the federation can still move the treasury: a peer that
+/// accepts the connection and never replies would otherwise hold the Phase-1
+/// fallback open until the OS gave up, per peer, and the movements it was about
+/// to make would be lost with it.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The DKG namespace the roster actually published under, if they agree on one.
+///
+/// **It has to be asked for, not computed.** The attempt is
+/// `window * DKG_ATTEMPTS_PER_WINDOW`, where the window counts from the epoch
+/// boundary to whenever that node happened to enter the ceremony — our own
+/// preprod nodes joined window 522 because they were started mid-epoch. An
+/// outsider cannot derive that, and the earlier version of this code assumed
+/// attempt 0, which is only ever right on the mock: against a real bridge it
+/// fetched URLs no SPO serves and reported the roster as silent, for ever.
+///
+/// Unanimity is required because disagreement is itself the answer: members
+/// publishing under different namespaces are not in one ceremony, whatever each
+/// of them has served.
+///
+/// The value is a HINT and is treated as one — every payload fetched from it is
+/// verified against canonical bytes that COMMIT to the namespace, so a peer that
+/// names the wrong one produces packages that fail verification rather than a
+/// handoff to the wrong key.
+pub async fn published_namespace(
+    peers: &std::sync::Arc<dyn crate::epoch::traits::PeerNetwork>,
+    roster: &crate::epoch::state::Roster,
+) -> Option<crate::http::wire::DkgNamespace> {
+    let mut agreed: Option<(u64, u64)> = None;
+    for info in roster.participants.values() {
+        let health = tokio::time::timeout(PROBE_TIMEOUT, peers.check_health(info))
+            .await
+            .ok()?;
+        let published = health.published_dkg?;
+        match agreed {
+            None => agreed = Some(published),
+            Some(seen) if seen != published => return None,
+            Some(_) => {}
+        }
+    }
+    let (epoch, attempt) = agreed?;
+    Some(crate::http::wire::DkgNamespace::for_attempt(epoch, attempt))
+}
+
 /// Fetch what the roster published for `ns`, verifying every payload.
 ///
-/// Returns the verified Round-1 packages and the set of members whose Round-2
-/// payload was served and correctly signed — the two halves
-/// [`succession_key`] consumes.
+/// Returns the verified Round-1 packages and, per member, the set of `pool_id`s
+/// its Round-2 payload is addressed to — the two halves [`succession_key`]
+/// consumes.
 ///
-/// **A transport error and a missing payload are the same answer here**, and
-/// deliberately so: the rule's job is to refuse on absence, so "did not answer"
-/// and "answered with rubbish" both have to read as no evidence. Distinguishing
-/// them would only matter if absence were ever allowed to pass, which is exactly
-/// what must not happen.
+/// **A transport error, a timeout and a missing payload are the same answer
+/// here**, and deliberately so: the rule's job is to refuse on absence, so
+/// "did not answer", "took too long" and "answered with rubbish" all have to
+/// read as no evidence. Distinguishing them would only matter if absence were
+/// ever allowed to pass, which is exactly what must not happen.
 pub async fn gather(
     peers: &std::sync::Arc<dyn crate::epoch::traits::PeerNetwork>,
     roster: &crate::epoch::state::Roster,
     ns: crate::http::wire::DkgNamespace,
-) -> (BTreeMap<Identifier, round1::Package>, BTreeSet<Identifier>) {
+) -> (
+    BTreeMap<Identifier, round1::Package>,
+    BTreeMap<Identifier, BTreeSet<Vec<u8>>>,
+) {
     let mut published = BTreeMap::new();
-    let mut completed = BTreeSet::new();
+    let mut completed = BTreeMap::new();
     for (id, info) in &roster.participants {
-        if let Ok(Some(pkg)) = peers.fetch_dkg_round1(ns, info).await {
+        if let Ok(Ok(Some(pkg))) =
+            tokio::time::timeout(PROBE_TIMEOUT, peers.fetch_dkg_round1(ns, info)).await
+        {
             published.insert(*id, pkg);
         }
-        if let Ok(true) = peers.dkg_round2_published(ns, info).await {
-            completed.insert(*id);
+        if let Ok(Ok(Some(recipients))) =
+            tokio::time::timeout(PROBE_TIMEOUT, peers.dkg_round2_recipients(ns, info)).await
+        {
+            completed.insert(*id, recipients);
         }
     }
     (published, completed)
@@ -452,7 +581,7 @@ mod tests {
 
         // One member never got to round 2.
         let mut r2 = all_of(&roster);
-        let absent = *r2.iter().next_back().unwrap();
+        let absent = *r2.keys().next_back().unwrap();
         r2.remove(&absent);
         let err = succession_key(&ev(&roster, &r1, &r2, &[]))
             .expect_err("an unfinished ceremony must be refused");
@@ -491,22 +620,70 @@ mod tests {
         assert!(succession_key(&ev(&roster, &r1, &all_of(&roster), &[vec![0xEE; 28]])).is_ok());
     }
 
-    fn ev<'a>(
-        roster: &'a crate::epoch::state::Roster,
-        round1: &'a BTreeMap<Identifier, round1::Package>,
-        round2: &'a BTreeSet<Identifier>,
-        faulted: &'a [Vec<u8>],
-    ) -> SuccessionEvidence<'a> {
-        SuccessionEvidence {
-            roster,
-            round1,
-            round2,
-            faulted,
-        }
+    /// WI-113 review finding: a ceremony that NARROWED in place is the case the
+    /// round-2 condition exists for, and presence alone could not see it.
+    ///
+    /// Narrowing (WI-105 round-1 absence, or a peer the others refused on build)
+    /// finishes over a SUBSET inside the SAME attempt namespace, so the
+    /// abandoned member's payloads are still served and still verify. Summing
+    /// every published commitment then yields a key the survivors do not hold,
+    /// and rotating to it strands the treasury until the recovery leaf opens.
+    /// The recipient lists give it away: the survivors addressed only each
+    /// other.
+    #[test]
+    fn a_narrowed_ceremony_is_refused() {
+        let (_r, r1) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
+        let roster = roster_of(3, 2);
+        let ids: Vec<Identifier> = roster.participants.keys().copied().collect();
+        let pool = |i: &Identifier| roster.participants[i].pool_id.clone();
+
+        // A and B finished without C; C ran on regardless and published a
+        // perfectly valid, correctly-signed round 2 of its own.
+        let mut r2: BTreeMap<Identifier, BTreeSet<Vec<u8>>> = BTreeMap::new();
+        r2.insert(ids[0], [pool(&ids[1])].into_iter().collect());
+        r2.insert(ids[1], [pool(&ids[0])].into_iter().collect());
+        r2.insert(ids[2], [pool(&ids[0]), pool(&ids[1])].into_iter().collect());
+
+        let err = succession_key(&ev(&roster, &r1, &r2, &[]))
+            .expect_err("a narrowed ceremony must not take custody");
+        assert!(
+            matches!(err, SuccessionError::Round2Disagrees { .. }),
+            "{err:?}"
+        );
+        assert!(
+            format!("{err}").contains("different participant set"),
+            "{err}"
+        );
     }
 
-    fn all_of(roster: &crate::epoch::state::Roster) -> BTreeSet<Identifier> {
-        roster.participants.keys().copied().collect()
+    /// A correctly signed round 2 addressed to NOBODY is not completion — the
+    /// signature covers whatever `shares` carries, so an empty list verifies.
+    #[test]
+    fn a_signed_but_empty_round2_is_not_completion() {
+        let (_r, r1) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
+        let roster = roster_of(3, 2);
+        let mut r2 = all_of(&roster);
+        let victim = *r2.keys().next().unwrap();
+        r2.insert(victim, BTreeSet::new());
+
+        let err = succession_key(&ev(&roster, &r1, &r2, &[]))
+            .expect_err("distributing nothing is not completing a ceremony");
+        assert!(
+            matches!(err, SuccessionError::Round2Disagrees { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Completeness was one-directional: it walked the roster, then summed every
+    /// entry in the map. A package from outside the roster changes the key.
+    #[test]
+    fn a_surplus_package_is_refused() {
+        let (_r, r1) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
+        let roster = roster_of(2, 2);
+        // r1 has three packages; the roster names two.
+        let err = succession_key(&ev(&roster, &r1, &all_of(&roster), &[]))
+            .expect_err("a package from outside the roster must be refused");
+        assert!(matches!(err, SuccessionError::Surplus { .. }), "{err:?}");
     }
 
     /// Members running different thresholds cannot combine, and the sum of their
@@ -529,6 +706,38 @@ mod tests {
     #[test]
     fn an_empty_set_is_not_a_key() {
         assert!(group_key_from_round1(&BTreeMap::new()).is_err());
+    }
+
+    fn ev<'a>(
+        roster: &'a crate::epoch::state::Roster,
+        round1: &'a BTreeMap<Identifier, round1::Package>,
+        round2: &'a BTreeMap<Identifier, BTreeSet<Vec<u8>>>,
+        faulted: &'a [Vec<u8>],
+    ) -> SuccessionEvidence<'a> {
+        SuccessionEvidence {
+            roster,
+            round1,
+            round2,
+            faulted,
+        }
+    }
+
+    /// The Round-2 evidence a COMPLETE ceremony leaves: every member addressed
+    /// to every other member.
+    fn all_of(roster: &crate::epoch::state::Roster) -> BTreeMap<Identifier, BTreeSet<Vec<u8>>> {
+        roster
+            .participants
+            .keys()
+            .map(|me| {
+                let others = roster
+                    .participants
+                    .iter()
+                    .filter(|(id, _)| *id != me)
+                    .map(|(_, i)| i.pool_id.clone())
+                    .collect();
+                (*me, others)
+            })
+            .collect()
     }
 
     fn roster_of(n: u16, t: u16) -> crate::epoch::state::Roster {

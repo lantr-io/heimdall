@@ -75,13 +75,39 @@ pub fn router(state: SharedState) -> Router {
 /// `status` stays exactly where it was so a peer running a build that predates
 /// the extra fields still parses this; the additions are what a peer compares
 /// before entering a ceremony with us. See [`crate::http::compat`].
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+async fn health(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    // The DKG namespace this node most recently published a Round 1 under
+    // (WI-113). Derived from what is actually SERVED rather than from separate
+    // bookkeeping, so it cannot advertise a ceremony whose payloads are not
+    // here — and a reader treats it as a hint regardless: it fetches that
+    // namespace and verifies the signatures, which a wrong answer cannot pass.
+    //
+    // It exists because the attempt is not derivable by an outsider. It is
+    // `window * DKG_ATTEMPTS_PER_WINDOW` where the window counts from the epoch
+    // boundary to whenever this node happened to enter, so a node started
+    // mid-epoch publishes under an attempt nobody else can compute — our own
+    // preprod nodes joined window 522. Without this a third party auditing the
+    // ceremony (the federation, for the Phase-1 handoff) can only guess, and
+    // guessing wrong is indistinguishable from a roster that published nothing.
+    let published = {
+        let st = state.read().await;
+        st.dkg
+            .keys()
+            .filter(|(_, _, _, round)| *round == RoundKey::Round1)
+            .map(|(epoch, _, attempt, _)| (*epoch, *attempt))
+            .max()
+    };
+    let mut body = serde_json::json!({
         "status": "ok",
         "version": crate::http::compat::own_version(),
         "blueprint_digest": crate::http::compat::own_blueprint_digest(),
         "threshold_percent": crate::http::compat::own_threshold_percent(),
-    }))
+    });
+    if let Some((epoch, attempt)) = published {
+        body["dkg_epoch"] = serde_json::json!(epoch);
+        body["dkg_attempt"] = serde_json::json!(attempt);
+    }
+    Json(body)
 }
 
 /// Strip the `.json` suffix and confirm the requested pool_id is ours.
