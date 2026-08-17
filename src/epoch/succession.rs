@@ -34,23 +34,34 @@
 //! trusts a node's claim about what key it derived, which is the property that
 //! makes it safe for the federation to sign the result.
 //!
-//! ## What this does NOT establish, and why that is a decision not an oversight
+//! ## What is checked, and the one thing that is not
 //!
-//! Round-1 commitments fix the group key BEFORE round 2 distributes the shares.
-//! So a key derived here is certainly the key that ceremony *would* produce — but
-//! it is not evidence that the roster can SIGN with it. A ceremony that collapsed
-//! in round 2 leaves a perfectly derivable `Y_51` that nobody holds a usable
-//! share of, and handing the treasury to it strands the funds until the recovery
-//! leaf's CSV delay expires.
+//! Round-1 commitments fix the group key BEFORE round 2 distributes any share,
+//! so round 1 alone cannot tell a completed ceremony from one that collapsed the
+//! moment after the key was determined — and handing the treasury to a key
+//! nobody holds a share of strands it until the recovery leaf's CSV delay
+//! expires. Two further conditions close most of that, both from facts already
+//! published:
 //!
-//! That gap is accepted deliberately, and it is the same assurance level the
-//! protocol already runs on: in steady state the OUTGOING roster likewise signs
-//! a succession to a key it cannot test. Closing it needs the incoming roster to
-//! prove possession — a signature under `Y_51` over the very `sig_msg` — which is
-//! a protocol addition, not a local one, so it is raised as an open question in
-//! the spec rather than invented here.
+//! - every roster member also served a SIGNED round-2 payload, so the ceremony
+//!   is known to have run past the point where the key was fixed. Presence and
+//!   authorship are all an outsider can check — the shares inside are encrypted
+//!   to their recipients — but that is exactly the ordinary failure: a node that
+//!   crashed, went unreachable, or quietly dropped out;
+//! - no fault proof stands against the ceremony on chain. That covers the half
+//!   an outsider cannot check for itself, because a bad share is provable by its
+//!   VICTIM, who can decrypt it, and the proof lands on chain via the
+//!   identifiable-abort path.
+//!
+//! What remains is liveness, and it is genuinely open: all three conditions can
+//! hold and the roster still be dark by the time the rotation lands. This is
+//! evidence about a ceremony that happened, not a statement about who is up now.
+//! Closing it needs the incoming roster to prove possession — a signature under
+//! `Y_51` over the rotation's own `sig_msg` — which is a protocol addition rather
+//! than a local one, so it is raised as an open question in the spec instead of
+//! invented here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bitcoin::key::UntweakedPublicKey;
 use bitcoin::secp256k1::PublicKey;
@@ -74,6 +85,14 @@ pub enum SuccessionError {
     ThresholdMismatch { expected: usize, found: usize },
     /// A commitment vector was empty or its constant term was not a point.
     Malformed(String),
+    /// A member published round 1 but no signed round 2, so the ceremony that
+    /// determined this key is not known to have run to completion.
+    Round2Incomplete { missing: Vec<String>, of: usize },
+    /// Somebody PROVED a member misbehaved in this ceremony. The proof is on
+    /// chain, so this is not an opinion about liveness — the roster that
+    /// produced this key contains a member the bridge can already demonstrate
+    /// cheated, and custody must not move to it.
+    FaultProven { pool_ids: Vec<String> },
 }
 
 impl std::fmt::Display for SuccessionError {
@@ -92,6 +111,19 @@ impl std::fmt::Display for SuccessionError {
                  combine"
             ),
             Self::Malformed(m) => write!(f, "malformed round-1 commitment: {m}"),
+            Self::Round2Incomplete { missing, of } => write!(
+                f,
+                "{} of {of} roster member(s) published round 1 but no signed round 2, so this \
+                 ceremony is not known to have completed: {}",
+                missing.len(),
+                missing.join(", ")
+            ),
+            Self::FaultProven { pool_ids } => write!(
+                f,
+                "a fault proof is published on chain against this ceremony ({}) — the roster \
+                 that produced this key contains a proven cheat",
+                pool_ids.join(", ")
+            ),
         }
     }
 }
@@ -152,32 +184,98 @@ pub fn group_key_from_round1(
     Ok(tweaked.to_x_only_public_key())
 }
 
-/// The reliability rule: every eligible roster member must have published, and
-/// all must have committed to the same degree, before the sum is a key worth
-/// handing the treasury to.
+/// Everything the reliability rule is decided from, gathered by the caller.
 ///
-/// **All of them, not a threshold.** A threshold subset is enough to SIGN with a
-/// key that already exists, but it is not enough to say which key a ceremony
-/// produced: `Y` is the sum over ALL participants, so a missing member does not
-/// give a weaker answer, it gives a different key. Anything less than complete
-/// attendance computes the group key of a ceremony that did not happen.
+/// A plain struct of already-fetched facts, deliberately: the chain reads and
+/// the HTTP fetches belong to the caller, so the RULE stays pure and can be
+/// tested without either. That split is why the awkward cases below are cheap to
+/// pin.
+pub struct SuccessionEvidence<'a> {
+    /// The eligible roster at this epoch — registry, ban-filtered.
+    pub roster: &'a crate::epoch::state::Roster,
+    /// Round-1 packages already VERIFIED with [`crate::http::wire::verify_round1`].
+    pub round1: &'a BTreeMap<Identifier, round1::Package>,
+    /// Members whose signed round-2 payload was fetched and whose signature
+    /// verified under their registered `bifrost_id_pk`.
+    ///
+    /// Presence and authorship only. The shares inside are encrypted per
+    /// recipient, so no third party can check they are CORRECT — that is what
+    /// the fault proofs in [`Self::faulted`] cover, and between them they are
+    /// the strongest statement available without asking the roster for anything.
+    pub round2: &'a BTreeSet<Identifier>,
+    /// Pool ids with a fault proof published on chain against this ceremony.
+    pub faulted: &'a [Vec<u8>],
+}
+
+/// The reliability rule: what must hold before the federation hands the treasury
+/// to a key it did not help produce.
+///
+/// Three conditions, each answering a different way the handoff goes wrong:
+///
+/// 1. **Every** roster member published round 1 — so the key is determined.
+///    Completeness, not a threshold: `Y` is the sum over ALL participants, so a
+///    missing member does not give a weaker answer, it gives a DIFFERENT key.
+///    A partial set computes the group key of a ceremony that never happened.
+/// 2. Every roster member published a signed round 2 — so the ceremony is known
+///    to have run past the point where the key was fixed. Round-1 commitments
+///    determine `Y` before any share is distributed, so round 1 alone cannot
+///    distinguish a completed ceremony from one that collapsed immediately
+///    after it, and the treasury would move to a key nobody holds a share of.
+/// 3. No fault proof stands against it. A bad share is provable by its victim
+///    and lands on chain, which is exactly the part no outside observer can
+///    check for itself — the shares are encrypted to their recipients.
+///
+/// **What remains open, deliberately.** All three can hold and the roster still
+/// be dark by the time the rotation lands: this is evidence about a ceremony
+/// that happened, not about liveness now. Only a proof of possession — a
+/// signature under `Y_51` over the rotation's own `sig_msg` — closes that, and
+/// it is a protocol addition rather than a local one, so it is raised as an open
+/// question in the spec instead of invented here.
 pub fn succession_key(
-    roster: &crate::epoch::state::Roster,
-    published: &BTreeMap<Identifier, round1::Package>,
+    evidence: &SuccessionEvidence<'_>,
 ) -> Result<UntweakedPublicKey, SuccessionError> {
-    let missing: Vec<String> = roster
+    let of = evidence.roster.participants.len();
+
+    let missing: Vec<String> = evidence
+        .roster
         .participants
         .iter()
-        .filter(|(id, _)| !published.contains_key(id))
+        .filter(|(id, _)| !evidence.round1.contains_key(id))
         .map(|(_, info)| hex::encode(&info.pool_id))
         .collect();
     if !missing.is_empty() {
-        return Err(SuccessionError::Incomplete {
-            missing,
-            of: roster.participants.len(),
+        return Err(SuccessionError::Incomplete { missing, of });
+    }
+
+    // Checked BEFORE the arithmetic. Deriving a key from a ceremony already
+    // known to contain a proven cheat, and only then refusing it, invites a
+    // caller to log the key it must not use.
+    let faulted: Vec<String> = evidence
+        .roster
+        .participants
+        .values()
+        .filter(|info| evidence.faulted.contains(&info.pool_id))
+        .map(|info| hex::encode(&info.pool_id))
+        .collect();
+    if !faulted.is_empty() {
+        return Err(SuccessionError::FaultProven { pool_ids: faulted });
+    }
+
+    let no_round2: Vec<String> = evidence
+        .roster
+        .participants
+        .iter()
+        .filter(|(id, _)| !evidence.round2.contains(id))
+        .map(|(_, info)| hex::encode(&info.pool_id))
+        .collect();
+    if !no_round2.is_empty() {
+        return Err(SuccessionError::Round2Incomplete {
+            missing: no_round2,
+            of,
         });
     }
-    group_key_from_round1(published)
+
+    group_key_from_round1(evidence.round1)
 }
 
 #[cfg(test)]
@@ -223,7 +321,8 @@ mod tests {
         );
 
         let roster = roster_of(3, 2);
-        let err = succession_key(&roster, &partial).expect_err("an incomplete set must be refused");
+        let err = succession_key(&ev(&roster, &partial, &all_of(&roster), &[]))
+            .expect_err("an incomplete set must be refused");
         assert!(
             matches!(err, SuccessionError::Incomplete { of: 3, .. }),
             "{err:?}"
@@ -233,6 +332,69 @@ mod tests {
             format!("{err}").contains("published no round-1 commitment"),
             "{err}"
         );
+    }
+
+    /// Round 1 alone cannot say the ceremony COMPLETED: the commitments fix `Y`
+    /// before any share is distributed. A member that published round 1 and then
+    /// vanished leaves a perfectly derivable key nobody may hold a share of, so
+    /// the handoff must not proceed on round 1 alone.
+    #[test]
+    fn round_1_without_round_2_is_not_a_completed_ceremony() {
+        let (_r, r1) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
+        let roster = roster_of(3, 2);
+
+        // Everything present: the key derives.
+        assert!(succession_key(&ev(&roster, &r1, &all_of(&roster), &[])).is_ok());
+
+        // One member never got to round 2.
+        let mut r2 = all_of(&roster);
+        let absent = *r2.iter().next_back().unwrap();
+        r2.remove(&absent);
+        let err = succession_key(&ev(&roster, &r1, &r2, &[]))
+            .expect_err("an unfinished ceremony must be refused");
+        assert!(
+            matches!(err, SuccessionError::Round2Incomplete { of: 3, .. }),
+            "{err:?}"
+        );
+        assert!(format!("{err}").contains("not known to have completed"), "{err}");
+    }
+
+    /// A proven cheat in the ceremony stops the handoff — and stops it BEFORE the
+    /// key is computed, so no caller can log a key it must not use.
+    #[test]
+    fn a_published_fault_proof_stops_the_handoff() {
+        let (_r, r1) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
+        let roster = roster_of(3, 2);
+        let cheat = roster.participants.values().next().unwrap().pool_id.clone();
+
+        let err = succession_key(&ev(&roster, &r1, &all_of(&roster), std::slice::from_ref(&cheat)))
+            .expect_err("a proven cheat must stop the rotation");
+        let SuccessionError::FaultProven { pool_ids } = &err else {
+            panic!("expected FaultProven, got {err:?}");
+        };
+        assert_eq!(pool_ids, &vec![hex::encode(&cheat)]);
+
+        // A fault proof against somebody who is NOT in this roster is not this
+        // ceremony's problem.
+        assert!(succession_key(&ev(&roster, &r1, &all_of(&roster), &[vec![0xEE; 28]])).is_ok());
+    }
+
+    fn ev<'a>(
+        roster: &'a crate::epoch::state::Roster,
+        round1: &'a BTreeMap<Identifier, round1::Package>,
+        round2: &'a BTreeSet<Identifier>,
+        faulted: &'a [Vec<u8>],
+    ) -> SuccessionEvidence<'a> {
+        SuccessionEvidence {
+            roster,
+            round1,
+            round2,
+            faulted,
+        }
+    }
+
+    fn all_of(roster: &crate::epoch::state::Roster) -> BTreeSet<Identifier> {
+        roster.participants.keys().copied().collect()
     }
 
     /// Members running different thresholds cannot combine, and the sum of their
