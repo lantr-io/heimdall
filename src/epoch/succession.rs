@@ -128,6 +128,32 @@ impl std::fmt::Display for SuccessionError {
     }
 }
 
+/// The threshold a set of round-1 commitments was generated under.
+///
+/// A FROST participant commits to `t` coefficients, so the commitment vector's
+/// length IS the ceremony's threshold. That makes it checkable against the
+/// threshold the reader derives from the chain — see [`succession_key`].
+fn committed_threshold(
+    packages: &BTreeMap<Identifier, round1::Package>,
+) -> Result<usize, SuccessionError> {
+    let mut degree: Option<usize> = None;
+    for pkg in packages.values() {
+        let (commitment, _sigma_i) = frost_bridge::round1_fields(pkg)
+            .map_err(|e| SuccessionError::Malformed(e.to_string()))?;
+        match degree {
+            None => degree = Some(commitment.len()),
+            Some(expected) if expected != commitment.len() => {
+                return Err(SuccessionError::ThresholdMismatch {
+                    expected,
+                    found: commitment.len(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    degree.ok_or_else(|| SuccessionError::Malformed("no round-1 packages at all".into()))
+}
+
 /// `Y = Σᵢ φ_{i,0}` over the given participants' round-1 packages.
 ///
 /// The caller must have VERIFIED each package first
@@ -261,6 +287,23 @@ pub fn succession_key(
         return Err(SuccessionError::FaultProven { pool_ids: faulted });
     }
 
+    // The commitments must have been generated under the threshold THIS reader
+    // derives from the same registry. They agree with each other by the time we
+    // get here, but agreeing with each other is not agreeing with the bridge's
+    // rule: a roster running a lower threshold than the chain-derived one is a
+    // roster that needs fewer signers than the bridge requires, and handing it
+    // custody would install exactly the weakening the rule exists to prevent.
+    // In practice this is what a federation node built with a different
+    // SECURITY_THRESHOLD_PERCENT than the SPOs would hit — and refusing is the
+    // right answer, since it cannot tell which side is wrong.
+    let committed = committed_threshold(evidence.round1)?;
+    if committed != usize::from(evidence.roster.min_signers) {
+        return Err(SuccessionError::ThresholdMismatch {
+            expected: usize::from(evidence.roster.min_signers),
+            found: committed,
+        });
+    }
+
     let no_round2: Vec<String> = evidence
         .roster
         .participants
@@ -331,6 +374,38 @@ mod tests {
                 "{t}-of-{n}: derived key must equal the ceremony's own group key"
             );
         }
+    }
+
+    /// A ceremony run under a DIFFERENT threshold than the reader derives from
+    /// the chain is refused — the case a federation node built with another
+    /// `SECURITY_THRESHOLD_PERCENT` than the SPOs would hit.
+    ///
+    /// The commitments are internally consistent here, so this is not caught by
+    /// members disagreeing with each other: it is caught by them disagreeing
+    /// with the bridge's own rule, which is a weaker roster than the bridge
+    /// requires and must not be handed custody.
+    #[test]
+    fn a_ceremony_run_under_another_threshold_is_refused() {
+        let (_r, r1) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
+        // The reader's chain-derived threshold says 3-of-3; the published
+        // ceremony was 2-of-3.
+        let strict = roster_of(3, 3);
+        let err = succession_key(&ev(&strict, &r1, &all_of(&strict), &[]))
+            .expect_err("a lower-threshold ceremony must not take custody");
+        assert!(
+            matches!(
+                err,
+                SuccessionError::ThresholdMismatch {
+                    expected: 3,
+                    found: 2
+                }
+            ),
+            "{err:?}"
+        );
+        // ...and the matching roster is accepted, so this is a real comparison
+        // rather than a blanket refusal.
+        let matching = roster_of(3, 2);
+        assert!(succession_key(&ev(&matching, &r1, &all_of(&matching), &[])).is_ok());
     }
 
     /// A member that published nothing changes the sum, so it must be refused
