@@ -1092,6 +1092,52 @@ async fn phase1_fallback(
     })
 }
 
+/// Poll the roster until it advertises one agreed DKG namespace, or the budget
+/// runs out.
+///
+/// The budget is deliberately modest: the ceremony starts within a window or two
+/// of the boundary, so a few minutes covers the normal case, and a roster that
+/// has not started by then has not started at all — the next epoch's attempt is
+/// the right place to find out, not a longer wait here.
+async fn wait_for_published_namespace(
+    peers: &Arc<dyn PeerNetwork>,
+    roster: &crate::epoch::state::Roster,
+    config: &EpochConfig,
+    epoch: u64,
+    log_id: frost::Identifier,
+) -> Option<crate::http::wire::DkgNamespace> {
+    // Scaled from the poll interval rather than a wall-clock constant, so the
+    // same code path is exercised under a test config instead of being waited
+    // out by it: ~10 minutes at the production 5s cadence, milliseconds in a
+    // unit test. A chain-anchored ceiling (the schedule's update_y deadline)
+    // would be the more principled source and match WI-077 — noted rather than
+    // done, because it is a second chain read on a path that must not fail.
+    let budget = config.poll_interval.saturating_mul(120);
+    let deadline = std::time::Instant::now() + budget;
+    let mut announced = false;
+    loop {
+        if let Some(ns) = crate::epoch::succession::published_namespace(peers, roster).await {
+            return Some(ns);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        if !announced {
+            crate::epoch_log!(
+                log_id,
+                epoch,
+                "  handoff: waiting up to {budget:.0?} for the roster to start its ceremony"
+            );
+            announced = true;
+        }
+        // Never past the deadline, so the wait cannot overshoot the budget.
+        let nap = config
+            .poll_interval
+            .min(deadline.saturating_duration_since(std::time::Instant::now()));
+        tokio::time::sleep(nap).await;
+    }
+}
+
 /// Hand the treasury to the SPO roster, if the roster has earned it (WI-113).
 ///
 /// This is the Phase-2 transition seen from the only party that can make it. The
@@ -1139,7 +1185,20 @@ async fn try_succession_handoff(
     // counted from whenever each SPO entered its ceremony window, so no outsider
     // can derive it — assuming 0 fetched URLs no SPO serves and reported the
     // roster as silent for ever.
-    let Some(ns) = crate::epoch::succession::published_namespace(peers, &spo_roster).await else {
+    // Wait for the ceremony rather than racing it.
+    //
+    // This runs seconds after the epoch boundary — a federation node fails
+    // `own_participant` immediately and lands here — while the SPOs are still in
+    // their health gate and have not yet joined a ceremony window. The audit is
+    // attempted once per epoch and the loop does not revisit EpochStart within
+    // one, so probing at this instant and giving up means missing by minutes and
+    // then waiting a whole epoch: five days on preprod and mainnet.
+    //
+    // Blocking here is affordable in a way it would not be elsewhere: this is the
+    // Phase-1 path, movements are paced by `tm_batch_interval` (six hours on this
+    // bridge), and a genesis bridge has no movements to delay at all.
+    let Some(ns) = wait_for_published_namespace(peers, &spo_roster, config, epoch, log_id).await
+    else {
         crate::epoch_log!(
             log_id,
             epoch,
@@ -3376,6 +3435,101 @@ mod tests {
             "the federation must hand over to the roster's real Y_51, which nothing told it"
         );
         assert_eq!(recorded.current_key, spo_y51);
+    }
+
+    /// The audit WAITS for the ceremony instead of racing it.
+    ///
+    /// A federation node reaches the Phase-1 fallback seconds after the epoch
+    /// boundary, while the SPOs are still in their health gate — so a single
+    /// probe finds nothing and, since the loop does not revisit EpochStart within
+    /// an epoch, the handoff would then wait a whole epoch: five days here.
+    /// Publishing only after the probe has begun is what pins the waiting.
+    #[tokio::test]
+    async fn the_audit_waits_for_a_ceremony_that_has_not_started_yet() {
+        let epoch = 7;
+        let ns = crate::http::wire::DkgNamespace::for_attempt(epoch, 522 * 16);
+        let (spo_result, round1_packages) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
+        let spo_y51 = group_xonly(spo_result.public_key_package.verifying_key())
+            .unwrap()
+            .xonly;
+
+        let fixture = demo_static_fixture(2, 3, 19500);
+        let hub = MockPeerHub::new();
+        let spo_roster = fixture.roster.clone();
+        let marker = crate::frost::dkg::run_cheating_dkg(2, 3, 1, 2);
+        let stub = marker
+            .round2_packages
+            .values()
+            .next()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+
+        // Nothing is published yet. It appears only after the audit is already
+        // polling, which is the whole point of the case.
+        let publisher = {
+            let hub = hub.clone();
+            let roster = spo_roster.clone();
+            let pkgs = round1_packages.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                for id in roster.participants.keys() {
+                    let net = MockPeerNetwork::new(*id, hub.clone());
+                    net.publish_dkg_round1(ns, *id, &pkgs[id]).await.unwrap();
+                    let others: Vec<(
+                        crate::epoch::state::SpoInfo,
+                        frost::keys::dkg::round2::Package,
+                    )> = roster
+                        .participants
+                        .iter()
+                        .filter(|(other, _)| *other != id)
+                        .map(|(_, info)| (info.clone(), stub.clone()))
+                        .collect();
+                    net.publish_dkg_round2(ns, *id, &[], &others).await.unwrap();
+                }
+            })
+        };
+
+        let (signers, group_keys) = phase1_federation(2, 2);
+        let y_fed = group_xonly(&group_keys.verifying_key).unwrap().xonly;
+        let mut chain_fixture = fixture.clone();
+        chain_fixture.y_fed = y_fed;
+        chain_fixture.y_51 = y_fed;
+        let state = MockCardanoChain::treasury_info_state(y_fed, [0x5au8; 32]);
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(chain_fixture).with_treasury_info(state.clone()));
+
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut handles = Vec::new();
+        for signer in signers {
+            let me = *signer.group_keys.key_package.identifier();
+            let mut config = fast_config(me);
+            config.identity.bifrost_id_pk = signer.roster.participants[&me].bifrost_id_pk.clone();
+            config.phase1_signer = Some(signer);
+            let chain = chain.clone();
+            let clock = clock.clone();
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub.clone()));
+            handles.push(tokio::spawn(async move {
+                let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+                phase1_fallback(&chain, &peers, &clock, &rng, &config, epoch, aborted()).await
+            }));
+        }
+        for h in handles {
+            h.await
+                .unwrap()
+                .expect("Phase 1 with a share must continue");
+        }
+        publisher.await.unwrap();
+
+        let recorded = state.lock().unwrap();
+        assert_eq!(
+            recorded.rotations.len(),
+            1,
+            "the audit should have waited for the ceremony and then handed over"
+        );
+        assert_eq!(recorded.rotations[0].1, spo_y51);
     }
 
     /// ...and it declines when the ceremony is not known to have finished. Same
