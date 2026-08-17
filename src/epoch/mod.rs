@@ -18,6 +18,7 @@ pub mod persist;
 pub mod rotation;
 pub mod signing;
 pub mod state;
+pub mod succession;
 pub mod traits;
 
 pub use machine::{run_epoch_daemon, run_epoch_loop};
