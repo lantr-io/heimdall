@@ -1184,7 +1184,8 @@ async fn try_succession_handoff(
     crate::epoch_log!(
         log_id,
         epoch,
-        "  handoff: the SPO roster's ceremony is complete and unchallenged; its key is {}          (recomputed here from {} published round-1 commitment(s), not taken on trust)",
+        "  handoff: the SPO roster's ceremony is complete and unchallenged; its key is {} \
+         (recomputed here from {} published round-1 commitment(s), not taken on trust)",
         hex::encode(y_51.serialize()),
         round1.len()
     );
@@ -1239,7 +1240,8 @@ async fn try_succession_handoff(
             crate::epoch_log!(
                 log_id,
                 epoch,
-                "  HANDOFF POSTED: tx {tx} — the treasury is now the SPO roster's. This node's              federation share stops being the treasury's authority from here"
+                "  HANDOFF POSTED: tx {tx} — the treasury is now the SPO roster's. This node's \
+                 federation share stops being the treasury's authority from here"
             );
             true
         }
