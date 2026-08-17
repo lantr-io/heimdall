@@ -3980,6 +3980,7 @@ mod tests {
         crate::http::compat::PeerBuild {
             version: Some(version.into()),
             blueprint_digest: Some(crate::http::compat::own_blueprint_digest()),
+            threshold_percent: Some(crate::http::compat::own_threshold_percent()),
         }
     }
 
@@ -4045,6 +4046,7 @@ mod tests {
         let odd = crate::http::compat::PeerBuild {
             version: Some(crate::http::compat::own_version().into()),
             blueprint_digest: Some("deadbeefdeadbeef".into()),
+            threshold_percent: Some(crate::http::compat::own_threshold_percent()),
         };
         assert_eq!(gate_over(&[(2, odd)]).await, vec![2]);
     }

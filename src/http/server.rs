@@ -80,6 +80,7 @@ async fn health() -> Json<serde_json::Value> {
         "status": "ok",
         "version": crate::http::compat::own_version(),
         "blueprint_digest": crate::http::compat::own_blueprint_digest(),
+        "threshold_percent": crate::http::compat::own_threshold_percent(),
     }))
 }
 
