@@ -51,7 +51,28 @@ use tracing::{info, warn};
 
 /// Security threshold as a percentage of total eligible stake: any `t`
 /// signers must control STRICTLY MORE than this (spec: Y_51 → 51%).
-pub const SECURITY_THRESHOLD_PERCENT: u128 = 51;
+///
+/// **THIS BUILD IS LOWERED TO 20 FOR A PREPROD TEST DEPLOYMENT. It is not the
+/// protocol value and must never reach mainnet.** The spec's value is 51 — it is
+/// the "51" in `Y_51` and it is the security model the README states, that a
+/// weighted majority of SPOs must behave honestly. A bridge at 20 is a
+/// deliberately weakened bridge, not the same bridge configured differently.
+///
+/// It is a compile-time constant rather than config or a Config-datum field, and
+/// deliberately: published in the Config it would sit under the Config authority
+/// (datum field 0), a root of trust separate from both the roster and the
+/// federation — which would let that authority reduce the number of SPOs needed
+/// to move the treasury. That fails OPEN. A build mismatch fails CLOSED: nodes
+/// derive different thresholds, commit to polynomials of different degree, and
+/// produce nothing. Between those, closed is the only acceptable direction for
+/// the value that decides custody.
+///
+/// Divergence is nonetheless made loud rather than left silent, in two places:
+/// [`crate::http::compat`] carries this value in the peer handshake so a
+/// mismatched build is excluded and named before a ceremony, and
+/// [`crate::epoch::succession`] refuses to hand custody to a ceremony whose
+/// committed threshold differs from the one derived here.
+pub const SECURITY_THRESHOLD_PERCENT: u128 = 20;
 
 #[derive(Debug)]
 pub enum DkgRosterError {
@@ -957,28 +978,42 @@ mod tests {
         assert!(!ctx.quorum_ok(&qset(&[1, 99]))); // unknown ids ignored → 1 < t
     }
 
+    /// The bound is STRICTLY greater than the security threshold.
+    ///
+    /// Expressed relative to [`SECURITY_THRESHOLD_PERCENT`] rather than to the
+    /// literal it happens to hold: these numbers pin the RULE, and a test that
+    /// hardcodes the value stops testing the boundary the moment the constant
+    /// moves — it just keeps passing somewhere in the interior.
     #[test]
-    fn quorum_gate_requires_strictly_more_than_51_percent_stake() {
-        // 50/30/20, t=2.
-        let ctx = ctx_with(&[50, 30, 20], 2);
-        assert!(!ctx.quorum_ok(&qset(&[2, 3]))); // count ok, 50% <= 51% → abort
-        assert!(ctx.quorum_ok(&qset(&[1, 3]))); // 70% > 51% → ok
-        assert!(ctx.quorum_ok(&qset(&[1, 2]))); // 80% > 51% → ok
+    fn quorum_gate_requires_strictly_more_than_the_threshold_stake() {
+        let p = u64::try_from(SECURITY_THRESHOLD_PERCENT).unwrap();
+        assert!(p < 100, "the threshold must leave room above it");
 
-        // Exactly 51% must ABORT (the bound is strict >).
-        let tie = ctx_with(&[51, 49], 1);
-        assert!(!tie.quorum_ok(&qset(&[1]))); // 51% is not > 51%
+        // Exactly at the threshold must ABORT.
+        let tie = ctx_with(&[p, 100 - p], 1);
+        assert!(!tie.quorum_ok(&qset(&[1])), "exactly {p}% is not > {p}%");
         assert!(tie.quorum_ok(&qset(&[1, 2]))); // 100% → ok
+
+        // One unit over clears it — the other side of the same boundary.
+        let over = ctx_with(&[p + 1, 100 - p - 1], 1);
+        assert!(over.quorum_ok(&qset(&[1])), "{}% must clear {p}%", p + 1);
     }
 
+    /// The count gate and the stake gate are INDEPENDENT: meeting `t` does not
+    /// imply clearing the stake bar, and vice versa.
+    ///
+    /// The whale makes this hold for ANY threshold value: three minnows are a
+    /// vanishing share of the stake however low the bar is set, so the case
+    /// survives a change to the constant instead of quietly becoming vacuous.
     #[test]
     fn quorum_gate_stake_arm_is_independent_of_threshold() {
-        // Equal stake n=4, t=2: the count gate (|Q| >= 2) and the stake gate
-        // (> 51% → >= 3 of 4) are INDEPENDENT. A set of exactly 2 meets t but is
-        // only 50% of stake → abort; honest-majority DKG completion needs 3.
-        let ctx = ctx_with(&[1, 1, 1, 1], 2);
-        assert!(!ctx.quorum_ok(&qset(&[1, 2]))); // count 2 >= t, but 50% <= 51%
-        assert!(ctx.quorum_ok(&qset(&[1, 2, 3]))); // 3, 75% > 51% → ok
+        let ctx = ctx_with(&[1, 1, 1, 1000], 2);
+        // Count 2 >= t, but ~0.2% of stake → abort on the stake arm alone.
+        assert!(!ctx.quorum_ok(&qset(&[1, 2])));
+        // Count 1 < t, despite ~99.7% of stake → abort on the count arm alone.
+        assert!(!ctx.quorum_ok(&qset(&[4])));
+        // Both arms met.
+        assert!(ctx.quorum_ok(&qset(&[1, 4])));
 
         // Degenerate: an empty eligible set never clears the gate.
         let empty = ctx_with(&[], 2);
