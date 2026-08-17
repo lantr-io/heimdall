@@ -278,6 +278,35 @@ pub fn succession_key(
     group_key_from_round1(evidence.round1)
 }
 
+/// Fetch what the roster published for `ns`, verifying every payload.
+///
+/// Returns the verified Round-1 packages and the set of members whose Round-2
+/// payload was served and correctly signed — the two halves
+/// [`succession_key`] consumes.
+///
+/// **A transport error and a missing payload are the same answer here**, and
+/// deliberately so: the rule's job is to refuse on absence, so "did not answer"
+/// and "answered with rubbish" both have to read as no evidence. Distinguishing
+/// them would only matter if absence were ever allowed to pass, which is exactly
+/// what must not happen.
+pub async fn gather(
+    peers: &std::sync::Arc<dyn crate::epoch::traits::PeerNetwork>,
+    roster: &crate::epoch::state::Roster,
+    ns: crate::http::wire::DkgNamespace,
+) -> (BTreeMap<Identifier, round1::Package>, BTreeSet<Identifier>) {
+    let mut published = BTreeMap::new();
+    let mut completed = BTreeSet::new();
+    for (id, info) in &roster.participants {
+        if let Ok(Some(pkg)) = peers.fetch_dkg_round1(ns, info).await {
+            published.insert(*id, pkg);
+        }
+        if let Ok(true) = peers.dkg_round2_published(ns, info).await {
+            completed.insert(*id);
+        }
+    }
+    (published, completed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,7 +385,10 @@ mod tests {
             matches!(err, SuccessionError::Round2Incomplete { of: 3, .. }),
             "{err:?}"
         );
-        assert!(format!("{err}").contains("not known to have completed"), "{err}");
+        assert!(
+            format!("{err}").contains("not known to have completed"),
+            "{err}"
+        );
     }
 
     /// A proven cheat in the ceremony stops the handoff — and stops it BEFORE the
@@ -367,8 +399,13 @@ mod tests {
         let roster = roster_of(3, 2);
         let cheat = roster.participants.values().next().unwrap().pool_id.clone();
 
-        let err = succession_key(&ev(&roster, &r1, &all_of(&roster), std::slice::from_ref(&cheat)))
-            .expect_err("a proven cheat must stop the rotation");
+        let err = succession_key(&ev(
+            &roster,
+            &r1,
+            &all_of(&roster),
+            std::slice::from_ref(&cheat),
+        ))
+        .expect_err("a proven cheat must stop the rotation");
         let SuccessionError::FaultProven { pool_ids } = &err else {
             panic!("expected FaultProven, got {err:?}");
         };
@@ -442,4 +479,3 @@ mod tests {
         }
     }
 }
-

@@ -1096,6 +1096,15 @@ impl PeerNetwork for MockPeerNetwork {
         }))
     }
 
+    /// Presence of a Round-2 payload for `ns`, without decrypting anything —
+    /// the question a third-party auditor asks (WI-113). The mock files Round 2
+    /// per recipient, so "published" is "there is an entry for this namespace".
+    async fn dkg_round2_published(&self, ns: DkgNamespace, peer: &SpoInfo) -> EpochResult<bool> {
+        Ok(with_slot(&self.hub, peer.identifier, |s| {
+            s.dkg2.values().any(|(slot_ns, _)| *slot_ns == ns)
+        }))
+    }
+
     async fn fetch_dkg_round2(
         &self,
         ns: DkgNamespace,

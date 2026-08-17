@@ -697,6 +697,40 @@ impl PeerNetwork for HttpPeerNetwork {
         }
     }
 
+    async fn dkg_round2_published(&self, ns: DkgNamespace, peer: &SpoInfo) -> EpochResult<bool> {
+        let pool_hex = hex::encode(&peer.pool_id);
+        let url = format!(
+            "{}/dkg/{}/{}/{}/round2/{}.json",
+            peer.bifrost_url, ns.epoch, ns.threshold, ns.attempt, pool_hex
+        );
+        let Some(bytes) = fetch_raw(&self.client, &url).await? else {
+            return Ok(false);
+        };
+        let wire: Dkg2Wire = serde_json::from_slice(&bytes).map_err(peer_err)?;
+        let peer_pool = pool_id_arr(&peer.pool_id)?;
+        match wire::verify_round2_authorship(
+            &self.secp,
+            &peer_pool,
+            &peer.bifrost_id_pk,
+            ns.epoch,
+            ns.threshold,
+            ns.attempt,
+            &wire,
+        ) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                // Served but not signed by the member it claims to be from. That
+                // is not evidence of completion, so it reads as absence — the
+                // same answer as no payload, which is the safe direction.
+                warn!(
+                    "round2 from {} is not authored by it: {e}",
+                    hex::encode(&peer.pool_id)
+                );
+                Ok(false)
+            }
+        }
+    }
+
     async fn dkg_round1_fault_evidence(
         &self,
         ns: DkgNamespace,

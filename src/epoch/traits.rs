@@ -675,6 +675,20 @@ pub trait PeerNetwork: Send + Sync {
         recipient_identifier: Identifier,
         sender_commitments: &[[u8; POINT_LEN]],
     ) -> EpochResult<Option<round2::Package>>;
+    /// Did `peer` publish a Round 2 payload for `ns`, signed by it (WI-113)?
+    ///
+    /// Presence and authorship only — no share is decrypted, because the caller
+    /// is a third party auditing a ceremony it took no part in and holds no
+    /// recipient key. [`Self::fetch_dkg_round2`] cannot answer this: it needs
+    /// this node to BE a recipient.
+    ///
+    /// Defaults to `false`, which is the fail-closed direction: a transport that
+    /// has not implemented this reports "no evidence of completion", and the
+    /// succession rule refuses the handoff rather than approving one on an
+    /// unanswered question.
+    async fn dkg_round2_published(&self, _ns: DkgNamespace, _peer: &SpoInfo) -> EpochResult<bool> {
+        Ok(false)
+    }
     /// Return provable Round 1 faults retained while fetching `peer`'s payload.
     async fn dkg_round1_fault_evidence(
         &self,
