@@ -295,6 +295,24 @@ async fn drive_to_movement(
                 );
                 resume = None;
             }
+            // The watch is its own re-entry: a chain read that fails mid-watch
+            // must resume the WATCH, not the handoff. Without this arm `resume`
+            // would still hold the `PublishKeys` that entered it, so a single
+            // 502 would re-run the authorization that already answered "not
+            // mine" — and, because that arm is what increments the counter,
+            // spend a handoff retry doing it. Six of those and the node parks,
+            // which is the whole bug back again.
+            EpochPhase::AwaitRotation {
+                epoch,
+                roster,
+                group_keys,
+            } => {
+                resume = Some(EpochPhase::AwaitRotation {
+                    epoch: *epoch,
+                    roster: roster.clone(),
+                    group_keys: group_keys.clone(),
+                });
+            }
             EpochPhase::CollectPegins {
                 epoch,
                 roster,
@@ -562,6 +580,12 @@ async fn step_phase(
             )
             .await?
         }
+
+        EpochPhase::AwaitRotation {
+            epoch,
+            roster,
+            group_keys,
+        } => await_rotation_phase(chain, config, epoch, roster, group_keys).await?,
 
         EpochPhase::CollectPegins {
             epoch,
@@ -887,6 +911,103 @@ fn advance_spi_trie(
 async fn idle_phase(chain: &Arc<dyn CardanoChain>) -> EpochResult<EpochPhase> {
     let event = chain.await_epoch_boundary().await?;
     Ok(EpochPhase::EpochStart { epoch: event.epoch })
+}
+
+/// Wait for a handoff this node planned but cannot authorize, until it lands or
+/// the epoch ends (WI-114).
+///
+/// Entered from `publish_keys_phase` on `EpochError::NotOursToAuthorize` — the
+/// treasury's `current_spos_frost_key` is a key this node holds no share of, so
+/// the rotation is real and correct but somebody else has to post it. On a
+/// Phase-1 bridge that somebody is the federation: external, on a schedule this
+/// node cannot know, and observed on preprod to take hours. Before this, that
+/// answer was an ordinary error, so it burned the handoff retry budget (~2
+/// minutes) and then parked in `Idle` — leaving the node blind to its own
+/// treasury changing hands for the rest of a five-day epoch.
+///
+/// The exit condition is `plan_update_y` answering `None`, which is the same
+/// question the cascade's stand-down already asks and means "the treasury
+/// already names this key". Polling for the ANSWER rather than for a change of
+/// key is what makes the resume safe: it is true exactly when this node's Y_51
+/// is in charge. A rotation to some THIRD key leaves it false, and this node
+/// rightly keeps waiting — it can do nothing with a key it holds no share of,
+/// and the boundary re-derives everything anyway.
+///
+/// Cadence is `batch_poll_ceiling` (5 min), not `poll_interval` (5 s). Five days
+/// of five-second reads is the API-quota problem the retry budget was introduced
+/// to avoid, and this is the machine's established cadence for waiting on a
+/// chain event that is hours away — the batch loop's own heartbeat.
+async fn await_rotation_phase(
+    chain: &Arc<dyn CardanoChain>,
+    config: &EpochConfig,
+    epoch: u64,
+    roster: Roster,
+    group_keys: GroupKeys,
+) -> EpochResult<EpochPhase> {
+    let me = *group_keys.key_package.identifier();
+    let y_51 = group_xonly(&group_keys.verifying_key)
+        .map_err(EpochError::Frost)?
+        .xonly;
+    loop {
+        // Asked BEFORE the first sleep, for the same reason the cascade asks
+        // before its own: the rotation may well have landed while this node was
+        // discovering it could not post it.
+        if chain.plan_update_y(epoch, y_51).await?.is_none() {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "AwaitRotation: the handoff landed — treasury_info now names {}, so this \
+                 roster's key is in charge and the batch loop can start",
+                hex::encode(y_51.serialize())
+            );
+            config.health.update(|h| {
+                h.epoch = Some(epoch);
+                h.activity = "handoff landed".into();
+            });
+            // Back into the phase this came from, NOT forward into the batch
+            // loop. `plan_update_y` now answers `None`, so `PublishKeys` takes
+            // its "no Update-Y needed" branch and runs its own tail — the
+            // `dkg_qualified` health update and `publish_group_key`, which is
+            // what tells `query_treasury` which Taproot tree the head is locked
+            // under. Returning `CollectPegins` here would skip both and reach
+            // `BuildTm` on a stale view of the treasury.
+            //
+            // Not `EpochStart` either (which is where WI-113's post-handoff fix
+            // goes): that re-derives the ceremony, and on a node with no
+            // `state_dir` it re-RUNS the DKG and lands on a fresh Y_51 that the
+            // treasury does not name. Nothing here needs re-deriving — the key
+            // just installed is the one already in hand.
+            return Ok(EpochPhase::PublishKeys {
+                epoch,
+                roster,
+                group_keys,
+            });
+        }
+        // The only bound the watch needs. A boundary re-derives everything from
+        // chain, and `await_epoch_boundary` returns at once for an epoch it has
+        // not yet run, so `Idle` here costs nothing.
+        let now = chain.current_epoch().await?;
+        if now != epoch {
+            crate::epoch_warn!(
+                me,
+                epoch,
+                "AwaitRotation: epoch {now} began before the handoff landed — the treasury keeps \
+                 the outgoing key and this roster carries over unrotated"
+            );
+            return Ok(EpochPhase::Idle);
+        }
+        config.health.update(|h| {
+            h.epoch = Some(epoch);
+            h.activity = "waiting for another party to post the Update-Y".into();
+        });
+        crate::epoch_log!(
+            me,
+            epoch,
+            "AwaitRotation: treasury_info still names the outgoing key; re-reading in {}s",
+            config.batch_poll_ceiling.as_secs()
+        );
+        tokio::time::sleep(config.batch_poll_ceiling).await;
+    }
 }
 
 /// Did the DKG path fail in a way the federation could cover for?
@@ -1740,7 +1861,7 @@ async fn publish_keys_phase(
             // starts. Read once, before the ceremony, so the deadline is fixed
             // before any nonce is published rather than after.
             let snapshot = chain.query_batch_snapshot().await?;
-            let (signature, authority) = rotation::authorize_update_y(
+            let authorized = rotation::authorize_update_y(
                 peers,
                 clock,
                 rng,
@@ -1749,7 +1870,35 @@ async fn publish_keys_phase(
                 &plan,
                 rotation_window(clock, &snapshot),
             )
-            .await?;
+            .await;
+            // WI-114. "Not mine to authorize" is an ANSWER, and a stable one:
+            // the treasury names a key this node holds no share of, so no
+            // retry can change it and no ceremony here can produce the
+            // signature. Treating it as a failure is what left the node blind
+            // — it spent the handoff retry budget (~2 min) on a question that
+            // was already answered and then parked in `Idle` until the next
+            // boundary, while on a Phase-1 bridge the federation that CAN post
+            // it took hours. Hand it to the watch instead, which is the only
+            // response that fits: what is being waited for is another party's
+            // action.
+            let (signature, authority) = match authorized {
+                Ok(v) => v,
+                Err(e) if matches!(e.cause(), EpochError::NotOursToAuthorize(_)) => {
+                    crate::epoch_warn!(
+                        me,
+                        epoch,
+                        "Update-Y: {e} — so this node WATCHES treasury_info for the party that \
+                         can post it, rather than parking until the next boundary. It signs no \
+                         movement until the handoff lands."
+                    );
+                    return Ok(EpochPhase::AwaitRotation {
+                        epoch,
+                        roster,
+                        group_keys,
+                    });
+                }
+                Err(e) => return Err(e),
+            };
             crate::epoch_log!(me, epoch, "  Update-Y authorized by {authority}");
 
             // WI-099: the cascade runs over the roster that PRODUCED the
@@ -3111,6 +3260,7 @@ fn current_epoch(phase: &EpochPhase) -> u64 {
         EpochPhase::Dkg { ctx, .. } => ctx.epoch,
         EpochPhase::EpochStart { epoch }
         | EpochPhase::PublishKeys { epoch, .. }
+        | EpochPhase::AwaitRotation { epoch, .. }
         | EpochPhase::CollectPegins { epoch, .. }
         | EpochPhase::BuildTm { epoch, .. }
         | EpochPhase::Sign { epoch, .. }
@@ -5259,6 +5409,162 @@ mod tests {
         for h in handles {
             h.abort();
         }
+    }
+
+    /// WI-114 — THE acceptance: a handoff that lands mid-epoch is picked up
+    /// where it lands, not at the next boundary.
+    ///
+    /// The treasury is keyed to a key NOBODY in this test holds, which is the
+    /// live Phase-1 shape: `current_spos_frost_key` is `Y_federation`, the
+    /// federation is external, and the roster can build the Update-Y but cannot
+    /// sign it. So every node plans the rotation, correctly refuses to authorize
+    /// it, and has nothing left to do but watch.
+    ///
+    /// The rotation is landed from OUTSIDE, and deliberately late — after a wait
+    /// many times the handoff retry budget, which is the whole point. Before
+    /// this, "not mine to authorize" was an ordinary `EpochError::Frost`, so it
+    /// was counted against `HANDOFF_RETRIES`, and about two minutes later the
+    /// node parked in `Idle` until the next boundary. On preprod on 2026-08-18
+    /// that left three SPOs holding a treasury they did not know was theirs; the
+    /// federation posted hours after they had stopped looking. Under the old
+    /// behaviour this test hangs at the final await.
+    #[tokio::test]
+    async fn a_handoff_landed_by_someone_else_is_picked_up_mid_epoch() {
+        // Nobody's key: not the federation seed (none is configured), not any
+        // roster share. There is no way for a node here to authorize a rotation
+        // away from it.
+        let secp = Secp256k1::new();
+        let outgoing = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&[0x5cu8; 32]).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        let treasury_info = MockCardanoChain::treasury_info_state(outgoing, [0x1au8; 32]);
+
+        let fixture = demo_static_fixture(2, 2, 19_900);
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        let mut healths = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone()).with_treasury_info(treasury_info.clone()),
+            );
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            healths.push(config.health.clone());
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        // Far past the retry ramp (2 s, then 20 ms a step, six steps): under the
+        // old policy every node has long since given up by now.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            handles.iter().all(|h| !h.is_finished()),
+            "no movement is possible while the treasury is under a key no node holds"
+        );
+        for h in &healths {
+            assert_eq!(
+                h.snapshot().activity,
+                "waiting for another party to post the Update-Y",
+                "a node that cannot authorize the handoff must still be WATCHING for it, not \
+                 parked until the next boundary"
+            );
+        }
+
+        // The federation posts, hours later in wall-clock terms — long after the
+        // node stopped retrying and long before the epoch ends.
+        treasury_info.lock().unwrap().external_post = true;
+
+        for h in handles {
+            let tm = tokio::time::timeout(Duration::from_secs(20), h)
+                .await
+                .expect("the watch must pick the handoff up, not wait for the boundary")
+                .unwrap()
+                .expect("epoch cycle completes once the treasury is under this roster's key");
+            assert!(
+                !tm.sighashes.is_empty(),
+                "a real movement, not an empty one"
+            );
+        }
+        // And it was not this roster that posted it: the point of the watch is
+        // that the node never gains authority it did not have.
+        assert!(
+            treasury_info.lock().unwrap().rotations.is_empty(),
+            "no node here could authorize the rotation, so none may have submitted one"
+        );
+    }
+
+    /// The other half: the watch must not mistake "nothing has happened" for
+    /// success. While the outgoing key stands, it stays in the watch.
+    ///
+    /// Without this, a watch that returned on any poll would look identical to
+    /// the fixed behaviour in the test above and would walk into `BuildTm` under
+    /// a key the treasury does not name.
+    #[tokio::test]
+    async fn the_watch_holds_while_the_outgoing_key_stands() {
+        let secp = Secp256k1::new();
+        let outgoing = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&[0x6du8; 32]).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        let treasury_info = MockCardanoChain::treasury_info_state(outgoing, [0x2bu8; 32]);
+        let fixture = demo_static_fixture(2, 2, 19_901);
+        let epoch = fixture.roster.epoch;
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(fixture).with_treasury_info(treasury_info));
+        let me = Identifier::try_from(1u16).unwrap();
+        let (keys, _) = dealt_group_keys(2, 2);
+        let config = fast_config(me);
+
+        let held = tokio::time::timeout(
+            Duration::from_millis(300),
+            await_rotation_phase(&chain, &config, epoch, roster_of(2, 2), keys[&me].clone()),
+        )
+        .await;
+        assert!(
+            held.is_err(),
+            "the watch must keep waiting while treasury_info still names the outgoing key; got \
+             {:?}",
+            held.map(|r| r.map(|p| p.name().to_string()))
+        );
+    }
+
+    /// The resume is BACK into `PublishKeys`, not forward into the batch loop.
+    ///
+    /// That phase's tail is load-bearing: it calls `publish_group_key`, which is
+    /// what tells `query_treasury` which Taproot tree the head is locked under.
+    /// A watch that returned `CollectPegins` would skip it and reach `BuildTm`
+    /// on a stale view of the treasury.
+    #[tokio::test]
+    async fn the_watch_resumes_into_publish_keys_so_the_phase_can_finish_its_work() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let (keys, y_51) = dealt_group_keys(2, 2);
+        // Already rotated: the handoff landed before the watch even looked.
+        let treasury_info = MockCardanoChain::treasury_info_state(y_51, [0x3cu8; 32]);
+        let fixture = demo_static_fixture(2, 2, 19_902);
+        let epoch = fixture.roster.epoch;
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(fixture).with_treasury_info(treasury_info));
+        let config = fast_config(me);
+
+        let next = await_rotation_phase(&chain, &config, epoch, roster_of(2, 2), keys[&me].clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(next, EpochPhase::PublishKeys { .. }),
+            "expected PublishKeys, got {}",
+            next.name()
+        );
+        assert_eq!(current_epoch(&next), epoch);
     }
 
     /// A dealt `t`-of-`n` key set plus the group's x-only key, for phase tests
