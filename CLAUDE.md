@@ -147,3 +147,8 @@ Coordinator aggregates: `z = sum(zp)`, producing final signature `(R, z)`.
   repos worked on from here (ft-bifrost-bridge, binocular, internal-docs). A commit message
   should read as the change's own rationale, with nothing pointing at how it was produced.
   make commit message 1, max 2 paragraphs.
+
+## anthill-todo rules
+
+  Never span workitem for task, which is possible to do inline
+
