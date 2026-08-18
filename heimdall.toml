@@ -11,13 +11,13 @@
 
 [protocol]
 # Durable directory for this node's completed-peg-outs trie mirror (cpo-trie.json),
-# and for the DKG share that survives a restart. Unset means the EMPTY (genesis)
-# trie on every start — correct only on a bridge that has completed no peg-out.
-# Set it before paying peg-outs, and rebuild after a re-bootstrap with
-# `reconstruct-cpo-trie`. BuildTm cross-checks the loaded root against the cpo_root
-# in the on-chain bridge state singleton (Config #4) and refuses to
-# sign on a mismatch.
-# state_dir = "/var/lib/heimdall"
+# and for the DKG share that survives a restart. REQUIRED — the daemon refuses to
+# start without it, because unset means the EMPTY (genesis) trie on every start and
+# an already-paid peg-out reads as unpaid and is paid again. Rebuild after a
+# re-bootstrap with `reconstruct-cpo-trie`. BuildTm cross-checks the loaded root
+# against the cpo_root in the on-chain bridge state singleton (Config #4) and
+# refuses to sign on a mismatch.
+state_dir = "/var/lib/heimdall"
 
 [bitcoin]
 network = "testnet4"

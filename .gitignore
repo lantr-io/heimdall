@@ -32,3 +32,6 @@ heimdall-spo*.toml
 *.swp
 *.swo
 *~
+
+# Local state for the repo-root dev configs (protocol.state_dir).
+.state/

@@ -34,7 +34,9 @@ pub enum Status {
     Pass,
     /// Something is wrong but the daemon can still run correctly enough to start.
     /// Used where failing would break a deployment that is merely unusual, not
-    /// broken — see `state_dir` in step 1.
+    /// broken — steps 4 and 7 are the two an operator meets most often. NOT
+    /// `state_dir`: that was a warning until it was shown to cost a double
+    /// payout, and it is a `Fail` now (see [`unset_state_dir`]).
     Warn,
     /// Startup must not continue.
     Fail,
@@ -226,6 +228,39 @@ pub fn non_protocol_threshold_on_mainnet(percent: u128, mainnet: bool) -> Option
     })
 }
 
+/// Refuse an unset `protocol.state_dir`.
+///
+/// This was a warning until now, on the reasoning that deployments predating
+/// WI-014 persistence ran without one. But what the omission costs is not a
+/// feature. `cpo-trie.json` lives in this directory, so unset means the
+/// completed-peg-outs trie is rebuilt EMPTY on every start, and a node that has
+/// already paid a peg-out treats it as unpaid and pays again. That is the
+/// treasury's money, decided by one line in a startup banner that nobody is
+/// reading at 3am — and a warning is exactly the wrong instrument for a fault
+/// whose symptom appears an epoch later, on a different machine, as a double
+/// payment.
+///
+/// Refusing costs an operator one config line, which this names. It is a hard
+/// stop rather than a defaulted path because guessing a directory would be
+/// worse: a node silently persisting to somewhere the packaging does not own
+/// and the operator does not back up is the same loss deferred.
+///
+/// Pure and takes the value, so the message is testable without standing up a
+/// whole config.
+#[must_use]
+pub fn unset_state_dir(state_dir: Option<&str>) -> Option<String> {
+    state_dir.is_none().then(|| {
+        "protocol.state_dir is unset. It holds this epoch's DKG signing share, which is \
+         therefore memory-only and lost on restart, and the completed-peg-outs trie \
+         (cpo-trie.json), which without it is rebuilt EMPTY on every start -- on a bridge \
+         that has already paid a peg-out this node would read it as unpaid and pay it \
+         again. Set it, e.g. protocol.state_dir = \"/var/lib/heimdall\" (the value the \
+         Debian package ships); the directory must be 0700 and owned by the user the \
+         daemon runs as"
+            .to_string()
+    })
+}
+
 fn missing_locator_keys(cfg: &HeimdallConfig) -> Vec<&'static str> {
     let c = &cfg.cardano;
     let mut missing = Vec::new();
@@ -344,31 +379,16 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             problems.push(p);
         }
 
-        let state_dir_warning = match &cfg.protocol.state_dir {
-            Some(d) => {
-                notes.push(format!("state_dir {d}"));
-                None
-            }
-            // Not fatal: deployments predating WI-014 persistence run without it.
-            // But unset means the completed-peg-outs trie is rebuilt EMPTY on every
-            // start, which is only correct on a bridge that has completed no
-            // peg-outs — on any other it re-pays them.
-            None => Some(
-                "protocol.state_dir is unset: the DKG share is memory-only and the \
-                 completed-peg-outs trie is rebuilt empty on every start"
-                    .to_string(),
-            ),
-        };
+        // Unset state_dir is a REFUSAL, not a warning: the completed-peg-outs trie
+        // lives there, and rebuilding it empty makes a node pay an already-paid
+        // peg-out a second time. See `unset_state_dir`.
+        match cfg.protocol.state_dir.as_deref() {
+            Some(d) => notes.push(format!("state_dir {d}")),
+            None => problems.extend(unset_state_dir(None)),
+        }
 
         if problems.is_empty() {
-            let (status, warn) = match &state_dir_warning {
-                Some(w) => (Status::Warn, Some(w.clone())),
-                None => (Status::Pass, None),
-            };
-            match warn {
-                Some(w) => b.push_fix(1, "local preflight", status, notes.join("; "), w),
-                None => b.push(1, "local preflight", status, notes.join("; ")),
-            }
+            b.push(1, "local preflight", Status::Pass, notes.join("; "));
         } else {
             // The detail line summarises; the fix lines carry the problems. Putting
             // the benign notes in `detail` here would print a FAIL whose one visible
@@ -1194,8 +1214,9 @@ mod tests {
 }
 
 #[cfg(test)]
-mod threshold_guard_tests {
+mod startup_refusal_tests {
     use super::*;
+    use crate::config::HeimdallConfig;
 
     /// The guard fires on mainnet for any non-protocol value, and only there.
     /// Written over both inputs so it keeps testing something on a branch whose
@@ -1209,6 +1230,55 @@ mod threshold_guard_tests {
         // The protocol value is always allowed.
         assert!(non_protocol_threshold_on_mainnet(51, true).is_none());
         assert!(non_protocol_threshold_on_mainnet(51, false).is_none());
+    }
+
+    /// A missing `state_dir` is refused, and a present one is not. The predicate
+    /// exists so this is provable without standing up a config.
+    #[test]
+    fn an_unset_state_dir_is_refused() {
+        assert!(unset_state_dir(None).is_some());
+        assert!(unset_state_dir(Some("/var/lib/heimdall")).is_none());
+    }
+
+    /// The message has to carry three things, because the operator reading it has
+    /// not necessarily met the trie: the key to set, what it costs to leave unset,
+    /// and a value that works.
+    #[test]
+    fn the_state_dir_refusal_names_the_key_the_cost_and_a_working_value() {
+        let m = unset_state_dir(None).unwrap();
+        assert!(m.contains("protocol.state_dir"), "{m}");
+        assert!(m.contains("cpo-trie.json"), "{m}");
+        assert!(m.contains("pay it again"), "{m}");
+        assert!(m.contains("/var/lib/heimdall"), "{m}");
+    }
+
+    /// Step 1 FAILS on an unset `state_dir` and PASSES once it is set, with
+    /// nothing else changed.
+    ///
+    /// The second half is what makes this test worth having. Asserting only that
+    /// the step fails would keep passing if some unrelated problem were failing
+    /// it instead -- and step 1 has four other ways to fail. Setting the one key
+    /// and watching the same step turn PASS pins the refusal to `state_dir` and
+    /// to nothing else.
+    #[tokio::test]
+    async fn step_1_refuses_an_unset_state_dir_and_passes_once_it_is_set() {
+        let mut cfg = HeimdallConfig::default();
+        // Everything else step 1 inspects, satisfied: a mnemonic source, no
+        // bifrost key (a note, not a problem), no blueprint. Default is preprod,
+        // so the mainnet threshold guard stays silent.
+        cfg.cardano.mnemonic = Some("test test test".into());
+
+        let step1 = |r: Report| r.steps.into_iter().find(|s| s.n == 1).expect("step 1");
+
+        let failed = step1(preflight(&cfg).await);
+        assert_eq!(failed.status, Status::Fail, "{failed:?}");
+        let fix = failed.fix.unwrap_or_default();
+        assert!(fix.contains("protocol.state_dir"), "{fix}");
+
+        cfg.protocol.state_dir = Some("/var/lib/heimdall".into());
+        let passed = step1(preflight(&cfg).await);
+        assert_eq!(passed.status, Status::Pass, "{passed:?}");
+        assert!(passed.detail.contains("state_dir /var/lib/heimdall"));
     }
 
     /// The message names the offending value and what to do, since it appears at

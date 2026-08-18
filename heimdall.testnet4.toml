@@ -2,6 +2,12 @@
 # Only fields that differ from the compiled-in defaults are set here —
 # every field has a serde default (see src/config.rs).
 
+[protocol]
+# Required: the daemon refuses to start without it — it holds the DKG share that
+# survives a restart and the completed-peg-outs trie, and an empty trie re-pays a
+# peg-out that was already paid.
+state_dir = ".state/testnet4"
+
 [bitcoin]
 network = "testnet4"
 

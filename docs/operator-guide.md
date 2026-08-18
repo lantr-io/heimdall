@@ -160,7 +160,9 @@ The values fall into three groups.
 **About you.** `cardano.blockfrost_project_id`, `bifrost.skey_path` (the file from step 2), and
 `protocol.state_dir` — which the package already sets to `/var/lib/heimdall`. Leave `state_dir`
 set: without it the completed-peg-outs trie is rebuilt **empty** on every start, and on a bridge
-that has already paid peg-outs the node would treat them as unpaid.
+that has already paid peg-outs the node would treat them as unpaid and pay them again. **The
+daemon refuses to start without it** — that is a hard failure at step 1, not a warning, because
+the symptom of getting it wrong shows up an epoch later as a double payment.
 
 **About the bridge — three values, and that is all.** `config_address`,
 `config_nft_policy_id` and `config_nft_asset_name`, from the bridge's deployment notes. The Config
@@ -330,7 +332,11 @@ often see one on:
   treasury to the new group key fails, and the handoff does not happen. Set
   `cardano.config_nft_policy_id` to clear it — the one-shot the script compiles from is Config
   #12, and the node reads it from there.
-- `protocol.state_dir is unset` is the one that silently costs money later.
+
+`protocol.state_dir` is **not** in that list any more. It used to warn; it is now a step 1
+**FAIL**, because what it costs is a second payment of an already-paid peg-out rather than a
+degraded feature, and a warning is the wrong instrument for a fault whose symptom arrives an
+epoch later on a different machine.
 
 Do not continue until this passes.
 

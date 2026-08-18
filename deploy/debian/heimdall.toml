@@ -17,11 +17,12 @@
 
 
 [protocol]
-# REQUIRED IN ANY REAL DEPLOYMENT. Holds the per-epoch DKG signing share (0600)
-# so it survives a restart, and the completed-peg-outs trie (cpo-trie.json).
-# Left unset the trie is rebuilt EMPTY on every start, which is correct only on a
-# bridge that has never completed a peg-out — on any other, the daemon would
-# treat already-paid peg-outs as unpaid. The package creates this directory 0700.
+# REQUIRED, and enforced: the daemon REFUSES TO START without it. Holds the
+# per-epoch DKG signing share (0600) so it survives a restart, and the
+# completed-peg-outs trie (cpo-trie.json). Left unset the trie is rebuilt EMPTY
+# on every start, so a bridge that has already paid a peg-out would read it as
+# unpaid and pay it again — which is why this is a refusal and not a warning.
+# The package creates this directory 0700.
 state_dir = "/var/lib/heimdall"
 
 # Poll cadence for the chain-watching loops (ms).
