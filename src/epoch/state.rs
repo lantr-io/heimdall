@@ -398,6 +398,24 @@ pub enum EpochPhase {
         roster: Roster,
         group_keys: GroupKeys,
     },
+    /// The handoff is built and correct but is not this node's to authorize
+    /// (`EpochError::NotOursToAuthorize`): wait for the party that CAN post it.
+    ///
+    /// Reached only from [`Self::PublishKeys`], and only for the one failure
+    /// that no amount of retrying can change. It polls `plan_update_y` until the
+    /// rotation it planned is no longer needed — i.e. the treasury names
+    /// `group_keys`' Y_51 — and then RE-ENTERS [`Self::PublishKeys`] with the
+    /// very roster and keys it was already holding. Back, not forward: the watch
+    /// is a delayed success, so it rejoins the success path at the point where
+    /// the handoff landed and lets that phase run its own tail.
+    ///
+    /// Nothing else bounds it because nothing else needs to: the epoch boundary
+    /// does, and this node signs no movement until the rotation lands anyway.
+    AwaitRotation {
+        epoch: u64,
+        roster: Roster,
+        group_keys: GroupKeys,
+    },
     /// Wait for this epoch's next TM batch opportunity `B_i`, then freeze the
     /// observed peg-in set and advance to `BuildTm`.
     ///
@@ -509,6 +527,7 @@ impl EpochPhase {
                 ..
             } => "Dkg(Part3)",
             EpochPhase::PublishKeys { .. } => "PublishKeys",
+            EpochPhase::AwaitRotation { .. } => "AwaitRotation",
             EpochPhase::CollectPegins { .. } => "CollectPegins",
             EpochPhase::BuildTm { .. } => "BuildTm",
             EpochPhase::Sign {
@@ -769,6 +788,23 @@ pub enum EpochError {
         /// signing cascade would have inherited.
         cause: Box<EpochError>,
     },
+    /// This node built an Update-Y it has no authority to sign: the treasury's
+    /// `current_spos_frost_key` is a key it holds no share of, so the signature
+    /// the rotation needs cannot come from here.
+    ///
+    /// This is an ANSWER, not a failure, and it is a STABLE one — nothing this
+    /// node does can change it. Retrying is therefore pointless, and (the bug
+    /// WI-114 is about) so is giving up after a retry budget: the thing being
+    /// waited for is ANOTHER PARTY'S action, so the one correct response is to
+    /// keep watching for it. On a Phase-1 bridge that party is the federation,
+    /// which is external and on a schedule this node cannot know; ours took
+    /// hours, against a retry budget that spans about two minutes.
+    ///
+    /// Prose only, like [`Self::Frost`]: the routing is on the VARIANT, which is
+    /// the entire point of having one — the outgoing key is already named in the
+    /// message, and the key the watch polls for is the one the caller derived
+    /// the plan from, so nothing needs carrying.
+    NotOursToAuthorize(String),
 }
 
 impl EpochError {
@@ -821,6 +857,7 @@ impl std::fmt::Display for EpochError {
                 f,
                 "round {round} is spent (commitments already published): {cause}"
             ),
+            Self::NotOursToAuthorize(s) => write!(f, "{s}"),
         }
     }
 }

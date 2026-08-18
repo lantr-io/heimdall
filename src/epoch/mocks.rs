@@ -250,6 +250,16 @@ pub struct MockTreasuryInfo {
     pub vout: u32,
     /// Accepted rotations, in order: `(epoch, new_key, signature)`.
     pub rotations: Vec<(u64, bitcoin::key::UntweakedPublicKey, [u8; 64])>,
+    /// Armed by the TEST: the next `plan_update_y` adopts the key it is asked
+    /// for, as if another party had just posted that rotation.
+    ///
+    /// [`MockCardanoChain::external_rotation`] models the same event but fires
+    /// on the second plan read, which is inside any retry budget. This one lets
+    /// the test choose the MOMENT — the WI-114 case is a Phase-1 federation
+    /// posting hours later, long after the node has stopped retrying, and a
+    /// handoff that lands while the node is still retrying proves nothing about
+    /// whether it kept watching.
+    pub external_post: bool,
 }
 
 impl MockCardanoChain {
@@ -286,6 +296,7 @@ impl MockCardanoChain {
             txid,
             vout: 0,
             rotations: Vec::new(),
+            external_post: false,
         }))
     }
 
@@ -593,7 +604,10 @@ impl CardanoChain for MockCardanoChain {
         {
             state.lock().unwrap().current_key = new_y_51;
         }
-        let state = state.lock().unwrap();
+        let mut state = state.lock().unwrap();
+        if std::mem::take(&mut state.external_post) {
+            state.current_key = new_y_51;
+        }
         if state.current_key == new_y_51 {
             return Ok(None);
         }

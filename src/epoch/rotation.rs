@@ -269,6 +269,18 @@ fn federation_threshold_signer(
     Ok(Some((signer.roster.clone(), signer.group_keys.clone())))
 }
 
+/// "This rotation is not mine to post."
+///
+/// One constructor for all three ways `load_outgoing_dkg` reaches that answer,
+/// so the caller can route on the CONDITION rather than parse the prose. It used
+/// to be a bare `EpochError::Frost(String)`, which made the answer
+/// indistinguishable from a failed signing attempt — so the epoch loop counted
+/// it against `HANDOFF_RETRIES` and then parked for the rest of the epoch,
+/// blind to the handoff landing (WI-114).
+fn not_ours(detail: String) -> EpochError {
+    EpochError::NotOursToAuthorize(detail)
+}
+
 /// Find the persisted DKG whose group key is the treasury's current key — the
 /// ceremony that produced the outgoing roster.
 ///
@@ -281,7 +293,7 @@ fn load_outgoing_dkg(
     plan: &UpdateYPlan,
 ) -> EpochResult<(PersistedDkg, GroupKeys)> {
     let Some(dir) = config.state_dir.as_deref() else {
-        return Err(EpochError::Frost(format!(
+        return Err(not_ours(format!(
             "cannot authorize Update-Y: the treasury's current key {} is not the federation key \
              and protocol.state_dir is unset, so no outgoing DKG share was ever persisted",
             hex::encode(plan.current_key.serialize())
@@ -306,7 +318,7 @@ fn load_outgoing_dkg(
     if let Ok(Some(y_fed)) = crate::federation::persist::group_key(Some(dir))
         && y_fed == plan.current_key
     {
-        return Err(EpochError::Frost(format!(
+        return Err(not_ours(format!(
             "cannot authorize Update-Y here: the treasury's current key {} is the FEDERATION \
              key, and this federation is a threshold key — no single node can sign for it \
              alone. `heimdall run-spo` convenes the federation for this rotation by itself; \
@@ -322,7 +334,7 @@ fn load_outgoing_dkg(
     // this may assert. Claiming otherwise misdiagnosed the commonest case, an SPO
     // on a Phase-1 bridge whose outgoing key IS the federation key and simply is
     // not one this node holds any share of.
-    Err(EpochError::Frost(format!(
+    Err(not_ours(format!(
         "cannot authorize Update-Y: nothing in {} holds the treasury's current_spos_frost_key \
          {} — neither a persisted epoch DKG nor a federation share. This node took part in \
          neither the outgoing roster's ceremony nor the federation's, so it cannot authorize \
