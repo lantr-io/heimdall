@@ -47,7 +47,7 @@ let
         ++ lib.optional cfg.requiresBitcoind "bitcoind-watchtower.service";
       wants = [ "network-online.target" ]
         ++ lib.optional cfg.requiresBitcoind "bitcoind-watchtower.service";
-      wantedBy = [ "multi-user.target" ];
+      wantedBy = lib.optional cfg.autoStart "multi-user.target";
 
       serviceConfig = {
         Type = "simple";
@@ -129,8 +129,26 @@ in
       type = lib.types.str;
       default = "heimdall";
       description = ''
-        Service user. Defaults to the one `heimdall-mover.nix` already creates, so the
-        two modules coexist; both declare it identically, which NixOS merges.
+        Service user. Defaults to the one `heimdall-mover.nix` also declares, so the
+        two modules coexist on one host; see the `home` note where the user is
+        defined for how the overlap is resolved.
+      '';
+    };
+
+    autoStart = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Pull the units into `multi-user.target`, so they start on boot and on the
+        `nixos-rebuild switch` that enables them.
+
+        Set false to INSTALL without STARTING. A federation is not a set of
+        independent daemons - the signing rounds poll every peer, so members that
+        come up one rebuild apart simply wait for each other - and the state each
+        one needs (its share, its identity key, a config naming the right bridge) is
+        deployed out of band. Installing first makes the unit files, the ordering and
+        the hardening reviewable with `systemctl cat` before anything holds a key and
+        talks to peers.
       '';
     };
 
@@ -155,7 +173,13 @@ in
     users.users.${cfg.user} = {
       isSystemUser = true;
       group = cfg.user;
-      home = cfg.stateDir;
+      # mkDefault because heimdall-mover.nix declares this same user with its OWN
+      # home (/var/lib/heimdall), and two plain definitions of one option are a
+      # conflict the evaluator refuses rather than merges. The mover's value wins
+      # when both modules are enabled; this one applies when the federation runs
+      # alone. `home` is not load-bearing for either - each unit is given its
+      # working state through StateDirectory - so yielding costs nothing.
+      home = lib.mkDefault cfg.stateDir;
     };
     users.groups.${cfg.user} = { };
 
