@@ -197,6 +197,35 @@ const NOT_REGISTERED_FIX: &str = "Expected on a node that has not been registere
 /// The three `[cardano]` keys that together locate the Config UTxO. Missing any
 /// one of them is what makes `config_locator` return `None`, which is what drops
 /// the mover onto a wall-clock cadence.
+/// The protocol's security threshold. A build carrying anything else is a test
+/// build (WI-113 review).
+pub const PROTOCOL_THRESHOLD_PERCENT: u128 = 51;
+
+/// Refuse a non-protocol security threshold against mainnet.
+///
+/// `SECURITY_THRESHOLD_PERCENT` is a compile-time constant precisely so that no
+/// on-chain authority can lower it at runtime -- publishing it would put the
+/// number of SPOs needed to move the treasury under the Config authority, a
+/// different root of trust from the funds. But a constant is also invisible to
+/// the test suite, which is written against it and so passes identically at 20,
+/// 33 or 51. This is the one place that can tell the difference.
+///
+/// Pure, and takes both inputs, so it is testable on a branch whose constant is
+/// either value -- a guard that only worked on the branch not needing it would
+/// be no guard at all.
+#[must_use]
+pub fn non_protocol_threshold_on_mainnet(percent: u128, mainnet: bool) -> Option<String> {
+    (percent != PROTOCOL_THRESHOLD_PERCENT && mainnet).then(|| {
+        format!(
+            "this build's SECURITY_THRESHOLD_PERCENT is {percent}, not the protocol's \
+             {PROTOCOL_THRESHOLD_PERCENT}, and cardano.network is mainnet. A lowered threshold \
+             lets fewer SPOs than the spec requires move the treasury: this is a test build and \
+             must not run a mainnet bridge. Rebuild with the constant at \
+             {PROTOCOL_THRESHOLD_PERCENT}"
+        )
+    })
+}
+
 fn missing_locator_keys(cfg: &HeimdallConfig) -> Vec<&'static str> {
     let c = &cfg.cardano;
     let mut missing = Vec::new();
@@ -300,6 +329,19 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             } else {
                 notes.push(format!("blueprint {bp}"));
             }
+        }
+
+        // A build carrying a non-protocol security threshold must not run a
+        // mainnet bridge (WI-113 review). The value is a compile-time constant
+        // precisely so no authority can lower it at runtime — but that also means
+        // nothing stops a test build being pointed at mainnet, and the tests
+        // cannot catch it: they are written against the constant, so they pass
+        // identically whatever it holds. This is the one place that can refuse.
+        if let Some(p) = non_protocol_threshold_on_mainnet(
+            crate::cardano::dkg_roster::SECURITY_THRESHOLD_PERCENT,
+            cfg.cardano.is_mainnet().unwrap_or(false),
+        ) {
+            problems.push(p);
         }
 
         let state_dir_warning = match &cfg.protocol.state_dir {
@@ -1148,5 +1190,34 @@ mod tests {
         let y_fed = [7u8; 32];
         assert!(!super::phase1_federation_seat(&y_fed[..31], &y_fed));
         assert!(!super::phase1_federation_seat(&[], &y_fed));
+    }
+}
+
+#[cfg(test)]
+mod threshold_guard_tests {
+    use super::*;
+
+    /// The guard fires on mainnet for any non-protocol value, and only there.
+    /// Written over both inputs so it keeps testing something on a branch whose
+    /// own constant is 51 — the branch where it would otherwise be vacuous.
+    #[test]
+    fn a_test_threshold_is_refused_on_mainnet_only() {
+        assert!(non_protocol_threshold_on_mainnet(20, true).is_some());
+        assert!(non_protocol_threshold_on_mainnet(33, true).is_some());
+        // Not mainnet: a test bridge may run a test threshold.
+        assert!(non_protocol_threshold_on_mainnet(20, false).is_none());
+        // The protocol value is always allowed.
+        assert!(non_protocol_threshold_on_mainnet(51, true).is_none());
+        assert!(non_protocol_threshold_on_mainnet(51, false).is_none());
+    }
+
+    /// The message names the offending value and what to do, since it appears at
+    /// the moment somebody points a test build at real funds.
+    #[test]
+    fn the_refusal_names_the_value_and_the_remedy() {
+        let m = non_protocol_threshold_on_mainnet(20, true).unwrap();
+        assert!(m.contains("20"), "{m}");
+        assert!(m.contains("51"), "{m}");
+        assert!(m.contains("mainnet"), "{m}");
     }
 }

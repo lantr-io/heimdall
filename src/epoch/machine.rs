@@ -522,7 +522,9 @@ async fn step_phase(
         EpochPhase::EpochStart { epoch } => {
             match epoch_start_phase(chain, peers, config, epoch).await {
                 Ok(next) => next,
-                Err(e) if dkg_unavailable(&e) => phase1_fallback(chain, config, epoch, e).await?,
+                Err(e) if dkg_unavailable(&e) => {
+                    phase1_fallback(chain, peers, clock, rng, config, epoch, e).await?
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -535,7 +537,9 @@ async fn step_phase(
             let epoch = ctx.epoch;
             match dkg_phase(chain, peers, clock, rng, config, round, ctx, collected).await {
                 Ok(next) => next,
-                Err(e) if dkg_unavailable(&e) => phase1_fallback(chain, config, epoch, e).await?,
+                Err(e) if dkg_unavailable(&e) => {
+                    phase1_fallback(chain, peers, clock, rng, config, epoch, e).await?
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -932,8 +936,12 @@ fn dkg_unavailable(e: &EpochError) -> bool {
 /// for why it is that field and not `y_51`.
 ///
 /// [`TreasuryUtxo::authorized_key`]: crate::epoch::traits::TreasuryUtxo::authorized_key
+#[allow(clippy::too_many_arguments)]
 async fn phase1_fallback(
     chain: &Arc<dyn CardanoChain>,
+    peers: &Arc<dyn PeerNetwork>,
+    clock: &Arc<dyn Clock>,
+    rng: &Arc<dyn RngSource>,
     config: &EpochConfig,
     epoch: u64,
     dkg_err: EpochError,
@@ -1059,11 +1067,248 @@ async fn phase1_fallback(
         );
     }
 
+    // WI-113: before settling into Phase-1 operation, see whether the SPO roster
+    // has produced a key worth handing custody to. Opportunistic on purpose —
+    // a failure here must not cost the movement this fallback exists to make,
+    // so it logs and returns rather than propagating.
+    if try_succession_handoff(chain, peers, clock, rng, config, epoch, signer, log_id).await {
+        // The rotation landed, so `current_spos_frost_key` is the ROSTER's key
+        // now and this node's federation share no longer authorizes anything.
+        // Continuing into CollectPegins would spend the rest of the epoch
+        // building movements signed under a key the datum no longer names —
+        // every one rejected on chain, by the node that just logged that its own
+        // share "stops being the treasury's authority from here".
+        //
+        // Re-entering EpochStart re-reads the phase from the chain instead: the
+        // node then finds `authorized_key != config_y_fed`, i.e. Phase 2, and
+        // the fallback declines for the right reason rather than by accident.
+        return Ok(EpochPhase::EpochStart { epoch });
+    }
+
     Ok(EpochPhase::CollectPegins {
         epoch,
         roster,
         group_keys: signer.group_keys.clone(),
     })
+}
+
+/// Poll the roster until it advertises one agreed DKG namespace, or the budget
+/// runs out.
+///
+/// The budget is deliberately modest: the ceremony starts within a window or two
+/// of the boundary, so a few minutes covers the normal case, and a roster that
+/// has not started by then has not started at all — the next epoch's attempt is
+/// the right place to find out, not a longer wait here.
+async fn wait_for_published_namespace(
+    peers: &Arc<dyn PeerNetwork>,
+    roster: &crate::epoch::state::Roster,
+    config: &EpochConfig,
+    epoch: u64,
+    log_id: frost::Identifier,
+) -> Option<crate::http::wire::DkgNamespace> {
+    // Scaled from the poll interval rather than a wall-clock constant, so the
+    // same code path is exercised under a test config instead of being waited
+    // out by it: ~10 minutes at the production 5s cadence, milliseconds in a
+    // unit test. A chain-anchored ceiling (the schedule's update_y deadline)
+    // would be the more principled source and match WI-077 — noted rather than
+    // done, because it is a second chain read on a path that must not fail.
+    let budget = config.poll_interval.saturating_mul(120);
+    let deadline = std::time::Instant::now() + budget;
+    let mut announced = false;
+    loop {
+        if let Some(ns) = crate::epoch::succession::published_namespace(peers, roster).await {
+            return Some(ns);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        if !announced {
+            crate::epoch_log!(
+                log_id,
+                epoch,
+                "  handoff: waiting up to {budget:.0?} for the roster to start its ceremony"
+            );
+            announced = true;
+        }
+        // Never past the deadline, so the wait cannot overshoot the budget.
+        let nap = config
+            .poll_interval
+            .min(deadline.saturating_duration_since(std::time::Instant::now()));
+        tokio::time::sleep(nap).await;
+    }
+}
+
+/// Hand the treasury to the SPO roster, if the roster has earned it (WI-113).
+///
+/// This is the Phase-2 transition seen from the only party that can make it. The
+/// federation is not in the registry and did not run the epoch DKG, so it does
+/// not hold `Y_51` — it recomputes it from what the roster published
+/// ([`crate::epoch::succession`]) and hands over only if the ceremony is
+/// complete and unchallenged.
+///
+/// **Nothing here is fatal.** Every exit is a log line and a return: the roster
+/// may not exist yet, may still be mid-ceremony, or may have failed, and all
+/// three are ordinary states of a bridge waiting for its SPOs. Treating any of
+/// them as an error would take down the node that is currently the only one able
+/// to move the treasury at all.
+#[allow(clippy::too_many_arguments)]
+async fn try_succession_handoff(
+    chain: &Arc<dyn CardanoChain>,
+    peers: &Arc<dyn PeerNetwork>,
+    clock: &Arc<dyn Clock>,
+    rng: &Arc<dyn RngSource>,
+    config: &EpochConfig,
+    epoch: u64,
+    signer: &crate::epoch::state::Phase1Signer,
+    log_id: frost::Identifier,
+) -> bool {
+    use crate::epoch::succession::{SuccessionEvidence, gather, succession_key};
+
+    let ctx = match chain.query_dkg_context(epoch, 0).await {
+        Ok(c) => c,
+        Err(e) => {
+            crate::epoch_log!(
+                log_id,
+                epoch,
+                "  handoff: no SPO roster to hand to yet ({e})"
+            );
+            return false;
+        }
+    };
+    let spo_roster = ctx.to_roster();
+    if spo_roster.participants.is_empty() {
+        crate::epoch_log!(log_id, epoch, "  handoff: the SPO registry is still empty");
+        return false;
+    }
+
+    // Asked for, never computed: the attempt is window*DKG_ATTEMPTS_PER_WINDOW
+    // counted from whenever each SPO entered its ceremony window, so no outsider
+    // can derive it — assuming 0 fetched URLs no SPO serves and reported the
+    // roster as silent for ever.
+    // Wait for the ceremony rather than racing it.
+    //
+    // This runs seconds after the epoch boundary — a federation node fails
+    // `own_participant` immediately and lands here — while the SPOs are still in
+    // their health gate and have not yet joined a ceremony window. The audit is
+    // attempted once per epoch and the loop does not revisit EpochStart within
+    // one, so probing at this instant and giving up means missing by minutes and
+    // then waiting a whole epoch: five days on preprod and mainnet.
+    //
+    // Blocking here is affordable in a way it would not be elsewhere: this is the
+    // Phase-1 path, movements are paced by `tm_batch_interval` (six hours on this
+    // bridge), and a genesis bridge has no movements to delay at all.
+    let Some(ns) = wait_for_published_namespace(peers, &spo_roster, config, epoch, log_id).await
+    else {
+        crate::epoch_log!(
+            log_id,
+            epoch,
+            "  handoff: the roster is not advertising one agreed DKG namespace yet — either the \
+             ceremony has not run, or its members are in different ones"
+        );
+        return false;
+    };
+    let (round1, round2) = gather(peers, &spo_roster, ns).await;
+    // The eligible set is ALREADY ban-filtered by `query_dkg_context`, so this
+    // is a belt-and-braces pass rather than the enforcement: it catches a ban
+    // that is visible in `excluded` but whose member somehow survived into the
+    // roster, which would be a bug upstream rather than a protocol event.
+    let faulted: Vec<Vec<u8>> = ctx
+        .excluded
+        .iter()
+        .filter(|x| {
+            matches!(
+                x.reason,
+                crate::cardano::dkg_roster::ExclusionReason::Banned
+            )
+        })
+        .map(|x| x.pool_id.clone())
+        .collect();
+
+    let y_51 = match succession_key(&SuccessionEvidence {
+        roster: &spo_roster,
+        round1: &round1,
+        round2: &round2,
+        faulted: &faulted,
+    }) {
+        Ok(k) => k,
+        Err(why) => {
+            crate::epoch_log!(
+                log_id,
+                epoch,
+                "  handoff: not yet — {why}. Holding the treasury under the federation key"
+            );
+            return false;
+        }
+    };
+    crate::epoch_log!(
+        log_id,
+        epoch,
+        "  handoff: the SPO roster's ceremony is complete and unchallenged; its key is {} \
+         (recomputed here from {} published round-1 commitment(s), not taken on trust)",
+        hex::encode(y_51.serialize()),
+        round1.len()
+    );
+
+    let plan = match chain.plan_update_y(epoch, y_51).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            crate::epoch_log!(
+                log_id,
+                epoch,
+                "  handoff: already done (the datum names this key)"
+            );
+            return false;
+        }
+        Err(e) => {
+            crate::epoch_warn!(log_id, epoch, "  handoff: cannot plan the rotation: {e}");
+            return false;
+        }
+    };
+    let window = match chain.query_batch_snapshot().await {
+        Ok(snap) => rotation_window(clock, &snap),
+        Err(e) => {
+            crate::epoch_warn!(
+                log_id,
+                epoch,
+                "  handoff: no schedule to bound the rounds: {e}"
+            );
+            return false;
+        }
+    };
+    let me = *signer.group_keys.key_package.identifier();
+    let signature = match crate::epoch::rotation::authorize_update_y(
+        peers, clock, rng, config, me, &plan, window,
+    )
+    .await
+    {
+        Ok((sig, authority)) => {
+            crate::epoch_log!(log_id, epoch, "  handoff authorized by {authority}");
+            sig
+        }
+        Err(e) => {
+            crate::epoch_warn!(
+                log_id,
+                epoch,
+                "  handoff: the federation could not sign it: {e}"
+            );
+            return false;
+        }
+    };
+    match chain.submit_update_y(&plan, &signature).await {
+        Ok(tx) => {
+            crate::epoch_log!(
+                log_id,
+                epoch,
+                "  HANDOFF POSTED: tx {tx} — the treasury is now the SPO roster's. This node's \
+                 federation share stops being the treasury's authority from here"
+            );
+            true
+        }
+        Err(e) => {
+            crate::epoch_warn!(log_id, epoch, "  handoff: submission failed: {e}");
+            false
+        }
+    }
 }
 
 async fn epoch_start_phase(
@@ -2892,6 +3137,17 @@ mod tests {
     use frost::Identifier;
     use std::time::Duration;
 
+    /// A peer transport for the Phase-1 tests, which assert the FALLBACK's own
+    /// decisions. Its succession probe finds nothing (no peer serves a round-1
+    /// payload), so the handoff declines and the fallback's behaviour is what is
+    /// left under test — which is the point of these cases.
+    fn fallback_peers() -> Arc<dyn PeerNetwork> {
+        Arc::new(MockPeerNetwork::new(
+            Identifier::try_from(1u16).unwrap(),
+            MockPeerHub::new(),
+        ))
+    }
+
     /// Tight timings so the full cycle runs in well under a second.
     fn fast_config(id: Identifier) -> EpochConfig {
         let mut config = EpochConfig::demo_default(SpoIdentity {
@@ -2982,6 +3238,68 @@ mod tests {
         )
     }
 
+    /// Every member's [`Phase1Signer`] for one federation key, so a test can run
+    /// the whole federation rather than one seat of it. FROST has no 1-of-1, so
+    /// any test that needs the federation to actually SIGN needs all of them.
+    fn phase1_federation(
+        min_signers: u16,
+        max_signers: u16,
+    ) -> (Vec<crate::epoch::state::Phase1Signer>, GroupKeys) {
+        use crate::epoch::state::SpoInfo;
+        let mut rng = rand::thread_rng();
+        let (shares, pkp) = frost::keys::generate_with_dealer(
+            max_signers,
+            min_signers,
+            frost::keys::IdentifierList::Default,
+            &mut rng,
+        )
+        .unwrap();
+        let key_packages: BTreeMap<Identifier, frost::keys::KeyPackage> = shares
+            .into_iter()
+            .map(|(id, s)| (id, frost::keys::KeyPackage::try_from(s).unwrap()))
+            .collect();
+        let participants: BTreeMap<Identifier, SpoInfo> = key_packages
+            .keys()
+            .enumerate()
+            .map(|(i, id)| {
+                (
+                    *id,
+                    SpoInfo {
+                        identifier: *id,
+                        // Distinct from the SPO fixture's pool ids: these two
+                        // rosters must never be mistaken for one another.
+                        pool_id: vec![0xF0 + i as u8; 28],
+                        bifrost_url: format!("http://127.0.0.1:{}", 9500 + i),
+                        bifrost_id_pk: vec![0xF0 + i as u8; 32],
+                    },
+                )
+            })
+            .collect();
+        let roster = Roster {
+            epoch: 0,
+            min_signers,
+            max_signers,
+            participants,
+        };
+        let group = GroupKeys {
+            verifying_key: *pkp.verifying_key(),
+            public_key_package: pkp.clone(),
+            key_package: key_packages.values().next().unwrap().clone(),
+        };
+        let signers = key_packages
+            .into_values()
+            .map(|kp| crate::epoch::state::Phase1Signer {
+                roster: roster.clone(),
+                group_keys: GroupKeys {
+                    verifying_key: *pkp.verifying_key(),
+                    public_key_package: pkp.clone(),
+                    key_package: kp,
+                },
+            })
+            .collect();
+        (signers, group)
+    }
+
     fn aborted() -> EpochError {
         EpochError::DkgAborted {
             epoch: 7,
@@ -3008,6 +3326,271 @@ mod tests {
         assert!(!dkg_unavailable(&EpochError::Frost("bad share".into())));
     }
 
+    /// WI-113 acceptance: the federation hands custody to the SPO roster, having
+    /// worked out that roster's key FOR ITSELF.
+    ///
+    /// The two rosters are disjoint here, as they are in a real deployment: the
+    /// three SPOs run the ceremony and the federation takes no part in it, so it
+    /// is never handed `Y_51`. The assertion is on the rotation the chain
+    /// RECORDED — specifically that its key is the one `part3` computed inside
+    /// the SPOs' own ceremony, which nothing in this test ever told the
+    /// federation. A 1-of-1 federation keeps the focus here; the threshold
+    /// ceremony is covered by `rotation::the_federation_frost_signs_the_phase_1_handoff`.
+    #[tokio::test]
+    async fn the_federation_hands_the_treasury_to_a_roster_that_earned_it() {
+        let epoch = 7;
+        // A NON-ZERO attempt, as every chain-anchored ceremony has: the attempt
+        // is `window * DKG_ATTEMPTS_PER_WINDOW`, and our preprod nodes joined
+        // window 522 → 8352. An earlier version of this code probed attempt 0
+        // and so could only ever have worked against a mock; publishing here
+        // under a real-shaped attempt is what keeps that from coming back.
+        let ns = crate::http::wire::DkgNamespace::for_attempt(epoch, 522 * 16);
+        let (spo_result, round1_packages) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
+        let spo_y51 = group_xonly(spo_result.public_key_package.verifying_key())
+            .unwrap()
+            .xonly;
+
+        let fixture = demo_static_fixture(2, 3, 19300);
+        let hub = MockPeerHub::new();
+        let spo_roster = fixture.roster.clone();
+        // Any well-formed Round 2 package: the rule reads PRESENCE and
+        // authorship here, never content — the shares are addressed to
+        // recipients the federation is not one of and could not decrypt.
+        let marker = crate::frost::dkg::run_cheating_dkg(2, 3, 1, 2);
+        let stub = marker
+            .round2_packages
+            .values()
+            .next()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        for id in spo_roster.participants.keys() {
+            let net = MockPeerNetwork::new(*id, hub.clone());
+            net.publish_dkg_round1(ns, *id, &round1_packages[id])
+                .await
+                .unwrap();
+            // Addressed to every OTHER member, as a real ceremony's Round 2 is —
+            // the recipient list IS the participant set the sender ran with, and
+            // the succession rule reads it as such.
+            let others: Vec<(
+                crate::epoch::state::SpoInfo,
+                frost::keys::dkg::round2::Package,
+            )> = spo_roster
+                .participants
+                .iter()
+                .filter(|(other, _)| *other != id)
+                .map(|(_, info)| (info.clone(), stub.clone()))
+                .collect();
+            net.publish_dkg_round2(ns, *id, &[], &others).await.unwrap();
+        }
+
+        // The federation: its own key, its own membership, in no registry.
+        let (signers, group_keys) = phase1_federation(2, 2);
+        let y_fed = group_xonly(&group_keys.verifying_key).unwrap().xonly;
+
+        let mut chain_fixture = fixture.clone();
+        chain_fixture.y_fed = y_fed;
+        chain_fixture.y_51 = y_fed;
+        let state = MockCardanoChain::treasury_info_state(y_fed, [0x5au8; 32]);
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(chain_fixture).with_treasury_info(state.clone()));
+
+        // One hub serves both populations: the mock keeps DKG payloads (`dkg1`)
+        // and signing payloads (`sign1`) in separate fields of a slot, so the
+        // federation's Update-Y session cannot collide with the SPOs' published
+        // ceremony even where the two rosters happen to reuse an index.
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut handles = Vec::new();
+        for signer in signers {
+            let me = *signer.group_keys.key_package.identifier();
+            let mut config = fast_config(me);
+            config.identity.bifrost_id_pk = signer.roster.participants[&me].bifrost_id_pk.clone();
+            config.phase1_signer = Some(signer);
+            let chain = chain.clone();
+            let clock = clock.clone();
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub.clone()));
+            handles.push(tokio::spawn(async move {
+                let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+                phase1_fallback(&chain, &peers, &clock, &rng, &config, epoch, aborted()).await
+            }));
+        }
+        for h in handles {
+            h.await
+                .unwrap()
+                .expect("Phase 1 with a share must continue");
+        }
+
+        let recorded = state.lock().unwrap();
+        assert_eq!(
+            recorded.rotations.len(),
+            1,
+            "the handoff should have landed"
+        );
+        let (rot_epoch, new_key, _sig) = recorded.rotations[0];
+        assert_eq!(rot_epoch, epoch);
+        assert_eq!(
+            new_key, spo_y51,
+            "the federation must hand over to the roster's real Y_51, which nothing told it"
+        );
+        assert_eq!(recorded.current_key, spo_y51);
+    }
+
+    /// The audit WAITS for the ceremony instead of racing it.
+    ///
+    /// A federation node reaches the Phase-1 fallback seconds after the epoch
+    /// boundary, while the SPOs are still in their health gate — so a single
+    /// probe finds nothing and, since the loop does not revisit EpochStart within
+    /// an epoch, the handoff would then wait a whole epoch: five days here.
+    /// Publishing only after the probe has begun is what pins the waiting.
+    #[tokio::test]
+    async fn the_audit_waits_for_a_ceremony_that_has_not_started_yet() {
+        let epoch = 7;
+        let ns = crate::http::wire::DkgNamespace::for_attempt(epoch, 522 * 16);
+        let (spo_result, round1_packages) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
+        let spo_y51 = group_xonly(spo_result.public_key_package.verifying_key())
+            .unwrap()
+            .xonly;
+
+        let fixture = demo_static_fixture(2, 3, 19500);
+        let hub = MockPeerHub::new();
+        let spo_roster = fixture.roster.clone();
+        let marker = crate::frost::dkg::run_cheating_dkg(2, 3, 1, 2);
+        let stub = marker
+            .round2_packages
+            .values()
+            .next()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+
+        // Nothing is published yet. It appears only after the audit is already
+        // polling, which is the whole point of the case.
+        let publisher = {
+            let hub = hub.clone();
+            let roster = spo_roster.clone();
+            let pkgs = round1_packages.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                for id in roster.participants.keys() {
+                    let net = MockPeerNetwork::new(*id, hub.clone());
+                    net.publish_dkg_round1(ns, *id, &pkgs[id]).await.unwrap();
+                    let others: Vec<(
+                        crate::epoch::state::SpoInfo,
+                        frost::keys::dkg::round2::Package,
+                    )> = roster
+                        .participants
+                        .iter()
+                        .filter(|(other, _)| *other != id)
+                        .map(|(_, info)| (info.clone(), stub.clone()))
+                        .collect();
+                    net.publish_dkg_round2(ns, *id, &[], &others).await.unwrap();
+                }
+            })
+        };
+
+        let (signers, group_keys) = phase1_federation(2, 2);
+        let y_fed = group_xonly(&group_keys.verifying_key).unwrap().xonly;
+        let mut chain_fixture = fixture.clone();
+        chain_fixture.y_fed = y_fed;
+        chain_fixture.y_51 = y_fed;
+        let state = MockCardanoChain::treasury_info_state(y_fed, [0x5au8; 32]);
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(chain_fixture).with_treasury_info(state.clone()));
+
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut handles = Vec::new();
+        for signer in signers {
+            let me = *signer.group_keys.key_package.identifier();
+            let mut config = fast_config(me);
+            config.identity.bifrost_id_pk = signer.roster.participants[&me].bifrost_id_pk.clone();
+            config.phase1_signer = Some(signer);
+            let chain = chain.clone();
+            let clock = clock.clone();
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub.clone()));
+            handles.push(tokio::spawn(async move {
+                let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+                phase1_fallback(&chain, &peers, &clock, &rng, &config, epoch, aborted()).await
+            }));
+        }
+        for h in handles {
+            h.await
+                .unwrap()
+                .expect("Phase 1 with a share must continue");
+        }
+        publisher.await.unwrap();
+
+        let recorded = state.lock().unwrap();
+        assert_eq!(
+            recorded.rotations.len(),
+            1,
+            "the audit should have waited for the ceremony and then handed over"
+        );
+        assert_eq!(recorded.rotations[0].1, spo_y51);
+    }
+
+    /// ...and it declines when the ceremony is not known to have finished. Same
+    /// setup minus the Round 2 payloads: the key is still perfectly derivable
+    /// from Round 1, which is exactly the trap — it would be a key nobody may
+    /// hold a share of.
+    #[tokio::test]
+    async fn an_unfinished_ceremony_does_not_get_the_treasury() {
+        let epoch = 7;
+        let ns = crate::http::wire::DkgNamespace::for_attempt(epoch, 522 * 16);
+        let (_spo_result, round1_packages) = crate::frost::dkg::run_dkg_single_completion(2, 3, 1);
+
+        let fixture = demo_static_fixture(2, 3, 19400);
+        let hub = MockPeerHub::new();
+        for id in fixture.roster.participants.keys() {
+            let net = MockPeerNetwork::new(*id, hub.clone());
+            net.publish_dkg_round1(ns, *id, &round1_packages[id])
+                .await
+                .unwrap();
+            // No Round 2 published.
+        }
+
+        let (signers, group_keys) = phase1_federation(2, 2);
+        let signer = signers.into_iter().next().unwrap();
+        let me = *signer.group_keys.key_package.identifier();
+        let y_fed = group_xonly(&group_keys.verifying_key).unwrap().xonly;
+        let mut chain_fixture = fixture.clone();
+        chain_fixture.y_fed = y_fed;
+        chain_fixture.y_51 = y_fed;
+        let state = MockCardanoChain::treasury_info_state(y_fed, [0x5au8; 32]);
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(chain_fixture).with_treasury_info(state.clone()));
+
+        let mut config = fast_config(me);
+        config.identity.bifrost_id_pk = signer.roster.participants[&me].bifrost_id_pk.clone();
+        config.phase1_signer = Some(signer);
+
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub.clone()));
+        phase1_fallback(
+            &chain,
+            &peers,
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            epoch,
+            aborted(),
+        )
+        .await
+        .expect("declining the handoff must not stop Phase-1 operation");
+
+        let recorded = state.lock().unwrap();
+        assert!(
+            recorded.rotations.is_empty(),
+            "no rotation should have landed"
+        );
+        assert_eq!(
+            recorded.current_key, y_fed,
+            "the treasury stays the federation's"
+        );
+    }
+
     /// Phase 1 + a federation share → the cycle continues at `CollectPegins`
     /// carrying the FEDERATION's roster and group keys, with no DKG in between.
     #[tokio::test]
@@ -3029,9 +3612,17 @@ mod tests {
         config.identity.bifrost_id_pk = signer.roster.participants[&me].bifrost_id_pk.clone();
         config.phase1_signer = Some(signer.clone());
 
-        let next = phase1_fallback(&chain, &config, 7, aborted())
-            .await
-            .expect("Phase 1 with a share must continue, not re-raise");
+        let next = phase1_fallback(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            7,
+            aborted(),
+        )
+        .await
+        .expect("Phase 1 with a share must continue, not re-raise");
         match next {
             EpochPhase::CollectPegins {
                 epoch,
@@ -3063,9 +3654,17 @@ mod tests {
         let config = fast_config(Identifier::try_from(1).unwrap());
         assert!(config.phase1_signer.is_none());
 
-        let err = phase1_fallback(&chain, &config, 7, aborted())
-            .await
-            .expect_err("a non-member has nothing to fall back to");
+        let err = phase1_fallback(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            7,
+            aborted(),
+        )
+        .await
+        .expect_err("a non-member has nothing to fall back to");
         assert!(
             matches!(err, EpochError::DkgAborted { .. }),
             "expected the original DKG error, got {err}"
@@ -3085,9 +3684,17 @@ mod tests {
         let (signer, _) = phase1_signer_for(2, 3);
         config.phase1_signer = Some(signer);
 
-        let err = phase1_fallback(&chain, &config, 7, aborted())
-            .await
-            .expect_err("a share of the wrong key must be refused");
+        let err = phase1_fallback(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            7,
+            aborted(),
+        )
+        .await
+        .expect_err("a share of the wrong key must be refused");
         match err {
             EpochError::Transition(m) => assert!(
                 m.contains("cannot move the treasury"),
@@ -3624,6 +4231,7 @@ mod tests {
         crate::http::compat::PeerBuild {
             version: Some(version.into()),
             blueprint_digest: Some(crate::http::compat::own_blueprint_digest()),
+            threshold_percent: Some(crate::http::compat::own_threshold_percent()),
         }
     }
 
@@ -3689,6 +4297,7 @@ mod tests {
         let odd = crate::http::compat::PeerBuild {
             version: Some(crate::http::compat::own_version().into()),
             blueprint_digest: Some("deadbeefdeadbeef".into()),
+            threshold_percent: Some(crate::http::compat::own_threshold_percent()),
         };
         assert_eq!(gate_over(&[(2, odd)]).await, vec![2]);
     }

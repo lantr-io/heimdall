@@ -12,11 +12,20 @@
 //!
 //! That leaves one question for this module: who holds the outgoing key?
 //!
-//! - **Bootstrap.** The first treasury is keyed to `y_federation`, whose secret
-//!   is a configured seed. If (and only if) that seed's x-only key *is* the
-//!   datum's current key, this node signs the handoff locally. This is the
-//!   Phase-1 path the `update-y` CLI already takes, and it is what turns the
+//! - **Bootstrap, single-key.** The first treasury is keyed to `y_federation`,
+//!   whose secret is a configured seed. If (and only if) that seed's x-only key
+//!   *is* the datum's current key, this node signs the handoff locally. This is
+//!   the Phase-1 path the `update-y` CLI already takes, and it is what turns the
 //!   very first DKG into a real roster.
+//!
+//! - **Bootstrap, threshold federation (WI-113).** Since WI-087 `y_federation`
+//!   is normally a `t`-of-`n` key, so no seed exists and no single node can sign.
+//!   A node holding a SHARE of it convenes the federation — its own roster, over
+//!   the same wire — and the ceremony authorizes the handoff. Without this the
+//!   two bullets either side of it leave a real gap: the seed path does not apply
+//!   and the steady-state path searches the epoch DKGs, which never produced the
+//!   federation key. A genuine Phase-1 bridge could not rotate at all, and its
+//!   SPOs looped on a rotation none of them had the authority to make.
 //!
 //! - **Steady state.** The outgoing key is a previous epoch's FROST group key,
 //!   held as `t`-of-`n` shares. The signature is then produced by a FROST
@@ -27,7 +36,7 @@
 //!   plain `sign`/`aggregate` rather than the `_with_tweak` variants the TM
 //!   inputs need.
 //!
-//! Both paths end at the same place: 64 bytes that verify under the datum's
+//! All three end at the same place: 64 bytes that verify under the datum's
 //! current key. The caller verifies before submitting.
 //!
 //! ## Session namespacing
@@ -85,9 +94,15 @@ pub use crate::http::wire::UPDATE_Y_SESSION;
 /// roster-authorized (steady state).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateYAuthority {
-    /// Signed locally with the configured federation seed, which matched the
-    /// treasury's current key. Only possible while the treasury is still keyed
-    /// to `y_federation`.
+    /// Signed by the FEDERATION, whose key matched the treasury's current one —
+    /// either locally with the configured seed, or by a ceremony among the
+    /// federation's own roster when it is a `t`-of-`n` key (WI-087/WI-113). Only
+    /// possible while the treasury is still keyed to `y_federation`, which is
+    /// exactly the statement that no Update-Y has landed yet.
+    ///
+    /// The two shapes are not distinguished here because the operator already
+    /// sees which one ran: the threshold path logs the roster it convened, and
+    /// the seed path logs nothing because there is nothing to convene.
     Federation,
     /// Signed by a FROST ceremony among the outgoing roster of `epoch`, which is
     /// carried because it is also the ELECTORATE for posting the result.
@@ -106,7 +121,7 @@ pub enum UpdateYAuthority {
 impl std::fmt::Display for UpdateYAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Federation => write!(f, "federation seed (bootstrap handoff)"),
+            Self::Federation => write!(f, "the federation (Phase-1 handoff)"),
             Self::OutgoingRoster {
                 epoch, min_signers, ..
             } => write!(
@@ -133,36 +148,47 @@ pub async fn authorize_update_y(
     // rounds at all.
     window: crate::epoch::state::SigningWindow,
 ) -> EpochResult<([u8; 64], UpdateYAuthority)> {
-    let (signature, authority) = match federation_signature(config, plan)? {
-        Some(sig) => (sig, UpdateYAuthority::Federation),
-        None => {
-            let (outgoing, keys) = load_outgoing_dkg(config, plan)?;
-            let authority = UpdateYAuthority::OutgoingRoster {
-                epoch: outgoing.epoch,
-                min_signers: outgoing.roster.min_signers,
-                roster: Box::new(outgoing.roster.clone()),
-            };
-            crate::epoch_log!(
-                me,
-                plan.epoch,
-                "Update-Y: outgoing key is the epoch-{} FROST group key — running a rotation \
-                 signing ceremony with that roster ({} participant(s))",
-                outgoing.epoch,
-                outgoing.roster.participants.len()
-            );
-            let sig = frost_sign_message(
-                peers,
-                clock,
-                rng,
-                config,
-                plan,
-                &outgoing.roster,
-                &keys,
-                window,
-            )
-            .await?;
-            (sig, authority)
-        }
+    let (signature, authority) = if let Some(sig) = federation_signature(config, plan)? {
+        (sig, UpdateYAuthority::Federation)
+    } else if let Some((roster, keys)) = federation_threshold_signer(config, plan)? {
+        crate::epoch_log!(
+            me,
+            plan.epoch,
+            "Update-Y: outgoing key is the FEDERATION key and this node holds a share of it — \
+             convening the federation ({} member(s), {}-of-n) to authorize the handoff",
+            roster.participants.len(),
+            roster.min_signers
+        );
+        let sig =
+            frost_sign_message(peers, clock, rng, config, plan, &roster, &keys, window).await?;
+        (sig, UpdateYAuthority::Federation)
+    } else {
+        let (outgoing, keys) = load_outgoing_dkg(config, plan)?;
+        let authority = UpdateYAuthority::OutgoingRoster {
+            epoch: outgoing.epoch,
+            min_signers: outgoing.roster.min_signers,
+            roster: Box::new(outgoing.roster.clone()),
+        };
+        crate::epoch_log!(
+            me,
+            plan.epoch,
+            "Update-Y: outgoing key is the epoch-{} FROST group key — running a rotation \
+             signing ceremony with that roster ({} participant(s))",
+            outgoing.epoch,
+            outgoing.roster.participants.len()
+        );
+        let sig = frost_sign_message(
+            peers,
+            clock,
+            rng,
+            config,
+            plan,
+            &outgoing.roster,
+            &keys,
+            window,
+        )
+        .await?;
+        (sig, authority)
     };
 
     // Verify before anyone spends a fee on it.
@@ -208,6 +234,41 @@ fn federation_signature(config: &EpochConfig, plan: &UpdateYPlan) -> EpochResult
     ))
 }
 
+/// The threshold-federation path (WI-113): the outgoing key is `Y_federation`,
+/// this node holds a *share* of it, so the federation can convene and authorize
+/// its own succession.
+///
+/// Before this, a `t`-of-`n` federation (WI-087) could not hand over from the
+/// daemon at all — [`federation_signature`] covers only the single-seed shape,
+/// and [`load_outgoing_dkg`] searched the *epoch* DKGs, which by definition never
+/// produced the federation key. The handoff was left to an out-of-band
+/// `update-y --federation` + `federation-sign` + `--signature` sequence. Nothing
+/// convened it, so on a genuine Phase-1 bridge the first rotation simply never
+/// happened.
+///
+/// **The same equality check as everywhere else carries the safety.** A share is
+/// only authority over the key its own ceremony produced, so this compares the
+/// share's group key against the key the datum actually names, not against any
+/// stored label: a federation that re-ran its ceremony holds shares of a
+/// different `Y`, and those must fall through rather than sign. Returning `None`
+/// on a mismatch (not an error) is deliberate — a node that is both an SPO and a
+/// federation member then still reaches the outgoing-roster path below.
+fn federation_threshold_signer(
+    config: &EpochConfig,
+    plan: &UpdateYPlan,
+) -> EpochResult<Option<(Roster, GroupKeys)>> {
+    let Some(signer) = config.phase1_signer.as_ref() else {
+        return Ok(None);
+    };
+    let share_y = group_xonly(&signer.group_keys.verifying_key)
+        .map_err(EpochError::Frost)?
+        .xonly;
+    if share_y != plan.current_key {
+        return Ok(None);
+    }
+    Ok(Some((signer.roster.clone(), signer.group_keys.clone())))
+}
+
 /// Find the persisted DKG whose group key is the treasury's current key — the
 /// ceremony that produced the outgoing roster.
 ///
@@ -236,28 +297,37 @@ fn load_outgoing_dkg(
             return Ok((state, keys));
         }
     }
-    // The one case that is NOT a misconfiguration: the treasury's current key is
-    // the FEDERATION key and the federation is a t-of-n one (WI-087), so the
-    // authority exists but no single node holds it. That is the bootstrap
-    // handoff, and it is authorized out of band — the daemon has no way to
-    // convene the federation, which is a different signing group with a different
-    // roster and no epoch schedule.
+    // Reached only when this node holds a share of the federation key but the
+    // caller built an `EpochConfig` without a `phase1_signer` — i.e. one of the
+    // one-shot CLI paths, not `run-spo`. The daemon convenes the federation
+    // itself now (see `federation_threshold_signer`); from a CLI invocation
+    // there is no membership loaded to convene, so the out-of-band sequence
+    // remains the answer there.
     if let Ok(Some(y_fed)) = crate::federation::persist::group_key(Some(dir))
         && y_fed == plan.current_key
     {
         return Err(EpochError::Frost(format!(
             "cannot authorize Update-Y here: the treasury's current key {} is the FEDERATION \
-             key, and this federation is a threshold key — no single node can sign for it. \
-             Authorize this rotation out of band: `heimdall update-y --federation` prints the \
-             message, the members sign it together with `heimdall federation-sign`, and it is \
-             submitted with --signature",
+             key, and this federation is a threshold key — no single node can sign for it \
+             alone. `heimdall run-spo` convenes the federation for this rotation by itself; \
+             from a one-shot command, authorize it out of band instead: `heimdall update-y \
+             --federation` prints the message, the members sign it together with `heimdall \
+             federation-sign`, and it is submitted with --signature",
             hex::encode(plan.current_key.serialize())
         )));
     }
+    // Deliberately does NOT claim the key "is not the federation key": nothing
+    // here can know that. `Y_federation` is published at Config #11, which this
+    // module never reads — all that was checked is the state dir, so that is all
+    // this may assert. Claiming otherwise misdiagnosed the commonest case, an SPO
+    // on a Phase-1 bridge whose outgoing key IS the federation key and simply is
+    // not one this node holds any share of.
     Err(EpochError::Frost(format!(
-        "cannot authorize Update-Y: no persisted DKG in {} has group key {} (the treasury's \
-         current_spos_frost_key), and it is not the federation key — this node cannot have taken \
-         part in the outgoing roster's ceremony",
+        "cannot authorize Update-Y: nothing in {} holds the treasury's current_spos_frost_key \
+         {} — neither a persisted epoch DKG nor a federation share. This node took part in \
+         neither the outgoing roster's ceremony nor the federation's, so it cannot authorize \
+         this handoff. If the bridge is still in Phase 1, that key is the federation's \
+         (Config #11) and the handoff is the FEDERATION's to post, not this node's",
         dir.display(),
         hex::encode(plan.current_key.serialize())
     )))
@@ -582,6 +652,92 @@ mod tests {
     }
 
     /// Steady state: the outgoing key is a previous epoch's FROST group key.
+    /// WI-113's acceptance case: a `t`-of-`n` FEDERATION convenes from the daemon
+    /// and authorizes the Phase-1 handoff itself.
+    ///
+    /// This is the rotation that never happened. `federation_signature` covers
+    /// only the single-seed federation, and `load_outgoing_dkg` searches the
+    /// EPOCH ceremonies — which by construction never produced `Y_federation` —
+    /// so a WI-087 federation had no path at all and the first Update-Y waited on
+    /// an out-of-band sequence nobody ran. Observed on the shared preprod bridge:
+    /// three SPOs derived a good `Y_51` and every node looped "cannot authorize
+    /// Update-Y" for ever.
+    ///
+    /// Note what is NOT set up here: no persisted DKG and no `y_fed_seed`. The
+    /// only authority is the federation share, which is the whole point.
+    #[tokio::test]
+    async fn the_federation_frost_signs_the_phase_1_handoff() {
+        let (keys, federation_xonly) = dealt_keys(3, 2);
+        let roster = roster_of(3, 2);
+        let plan = plan_for(federation_xonly, xonly_of([0x55u8; 32]));
+        let hub = MockPeerHub::new();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+        let mut handles = Vec::new();
+        for (id, k) in keys.clone() {
+            let mut config = config_with(None, None);
+            config.identity.identifier = id;
+            config.phase1_signer = Some(crate::epoch::state::Phase1Signer {
+                roster: roster.clone(),
+                group_keys: k,
+            });
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock = clock.clone();
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let plan = plan.clone();
+            handles.push(tokio::spawn(async move {
+                authorize_update_y(&peers, &clock, &rng, &config, id, &plan, test_window(400)).await
+            }));
+        }
+
+        // Reaching Ok IS the signature assertion: `authorize_update_y` verifies
+        // under `plan.current_key` before returning, so every node here produced
+        // a signature the on-chain `UpdateY` branch will accept.
+        for h in handles {
+            let (sig, authority) = h.await.unwrap().unwrap();
+            assert_eq!(authority, UpdateYAuthority::Federation);
+            assert_eq!(sig.len(), 64);
+        }
+    }
+
+    /// A share of a DIFFERENT key must fall through rather than sign: a
+    /// federation that re-ran its ceremony holds shares of another `Y`, and those
+    /// would produce perfectly valid signatures for a key that owns nothing.
+    ///
+    /// Falling through (not erroring inside the federation branch) is what keeps
+    /// a node that is BOTH an SPO and a federation member able to reach the
+    /// outgoing-roster path — here there is no persisted DKG either, so it ends
+    /// in the diagnostic rather than a signature.
+    #[tokio::test]
+    async fn a_federation_share_of_another_key_does_not_authorize() {
+        let (keys, _) = dealt_keys(3, 2);
+        let roster = roster_of(3, 2);
+        // The treasury is locked under something this federation never produced.
+        let plan = plan_for(xonly_of([0x66u8; 32]), xonly_of([0x77u8; 32]));
+        let id = Identifier::try_from(1u16).unwrap();
+        let mut config = config_with(Some(tmp_dir("fed-mismatch")), None);
+        config.identity.identifier = id;
+        config.phase1_signer = Some(crate::epoch::state::Phase1Signer {
+            roster,
+            group_keys: keys[&id].clone(),
+        });
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, MockPeerHub::new()));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+
+        let err = authorize_update_y(&peers, &clock, &rng, &config, id, &plan, test_window(200))
+            .await
+            .expect_err("a share of another key must not authorize");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("neither a persisted epoch DKG nor a federation share"),
+            "{msg}"
+        );
+        // The old wording asserted a fact this module cannot establish — it never
+        // reads Config #11 — and so misreported the commonest Phase-1 case.
+        assert!(!msg.contains("it is not the federation key"), "{msg}");
+    }
+
     /// Every member of the OUTGOING roster runs the rotation ceremony, and the
     /// aggregated signature verifies under the treasury's current key — the
     /// outgoing roster authorizing its own succession.

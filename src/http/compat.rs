@@ -29,6 +29,23 @@
 //! direction of saying two incompatible nodes agree. The blueprint digest is
 //! mechanical (it hashes a file), the version is a human promise, and neither
 //! pretends to be the other.
+//!
+//! ## The one named constant, and why it is not that digest
+//!
+//! `SECURITY_THRESHOLD_PERCENT` travels as its own field. That is not a partial
+//! version of the rejected digest: it claims nothing about completeness, it names
+//! one value and compares it, and a mismatch says exactly which value differs.
+//!
+//! It earns the exception because of where it fails. The percentage decides the
+//! FROST `t` each node derives from the same registry, and `t` is the degree of
+//! the polynomial each node commits to in Round 1 — but the DKG namespace carries
+//! the constant LABEL 51, not the derived `t`. So two nodes on different
+//! percentages address the same namespace, exchange payloads, and produce
+//! commitment vectors of different length that cannot combine: a ceremony that
+//! runs to completion and yields nothing, with no error naming the cause. Every
+//! other build difference either shows up in the blueprint or is caught by the
+//! version. This one is invisible to both, and it is the value most likely to be
+//! deliberately changed for a test deployment.
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +65,13 @@ pub fn own_blueprint_digest() -> String {
     blueprint_digest(crate::cardano::blueprint::EMBEDDED_BLUEPRINT)
 }
 
+/// The stake percentage a threshold subset must exceed — this build's
+/// [`crate::cardano::dkg_roster::SECURITY_THRESHOLD_PERCENT`].
+#[must_use]
+pub fn own_threshold_percent() -> u32 {
+    u32::try_from(crate::cardano::dkg_roster::SECURITY_THRESHOLD_PERCENT).unwrap_or(u32::MAX)
+}
+
 fn blueprint_digest(blueprint: &str) -> String {
     let hash = blake2b_simd::Params::new()
         .hash_length(32)
@@ -65,6 +89,11 @@ pub struct PeerBuild {
     pub version: Option<String>,
     #[serde(default)]
     pub blueprint_digest: Option<String>,
+    /// The stake percentage a threshold subset must exceed. `None` from a build
+    /// that predates this field — see [`Compatibility::of`] for why that is
+    /// allowed rather than refused.
+    #[serde(default)]
+    pub threshold_percent: Option<u32>,
 }
 
 impl PeerBuild {
@@ -74,6 +103,7 @@ impl PeerBuild {
         Self {
             version: Some(own_version().to_string()),
             blueprint_digest: Some(own_blueprint_digest()),
+            threshold_percent: Some(own_threshold_percent()),
         }
     }
 }
@@ -128,6 +158,22 @@ impl Compatibility {
                 ),
             };
         }
+        // Compared only when BOTH report one, for the same reason as the
+        // blueprint: a peer that sends a version but not this is a reporting gap,
+        // not a disagreement. A differing percentage IS a disagreement, and a
+        // total one — the two nodes derive different thresholds from identical
+        // chain state, so nothing they exchange can combine.
+        if let (Some(t), Some(o)) = (peer.threshold_percent, own.threshold_percent)
+            && t != o
+        {
+            return Self::Incompatible {
+                reason: format!(
+                    "same version {theirs}, but the security threshold is {t}% against our {o}% \
+                     — we would derive different FROST thresholds from the same registry, commit \
+                     to polynomials of different degree, and produce no key at all"
+                ),
+            };
+        }
         Self::Compatible
     }
 
@@ -160,6 +206,7 @@ mod tests {
         PeerBuild {
             version: Some(v.into()),
             blueprint_digest: Some(d.into()),
+            threshold_percent: Some(51),
         }
     }
 
@@ -204,6 +251,45 @@ mod tests {
         assert!(reason.contains("different bridge"), "{reason}");
     }
 
+    /// A build whose security threshold differs is excluded, and the reason
+    /// names both percentages — the failure it prevents is a ceremony that
+    /// completes and yields nothing, which no log would otherwise explain.
+    #[test]
+    fn a_different_security_threshold_is_incompatible() {
+        let mut peer = build("0.1.0", "aa");
+        peer.threshold_percent = Some(20);
+        let v = Compatibility::between(&peer, &build("0.1.0", "aa"));
+        assert!(v.is_incompatible(), "{v:?}");
+        let Compatibility::Incompatible { reason } = v else {
+            unreachable!()
+        };
+        assert!(reason.contains("20%"), "{reason}");
+        assert!(reason.contains("51%"), "{reason}");
+    }
+
+    /// A peer that reports no threshold is a reporting gap, not a disagreement —
+    /// same rule as the blueprint, so the upgrade introducing this is not itself
+    /// an outage.
+    #[test]
+    fn a_missing_threshold_is_not_a_disagreement() {
+        let mut peer = build("0.1.0", "aa");
+        peer.threshold_percent = None;
+        assert_eq!(
+            Compatibility::between(&peer, &build("0.1.0", "aa")),
+            Compatibility::Compatible
+        );
+    }
+
+    /// This build reports the constant it actually derives thresholds from —
+    /// the property that makes the comparison mean anything.
+    #[test]
+    fn the_reported_threshold_is_the_one_in_force() {
+        assert_eq!(
+            u128::from(own_threshold_percent()),
+            crate::cardano::dkg_roster::SECURITY_THRESHOLD_PERCENT
+        );
+    }
+
     /// A build predating this check reports nothing and is ALLOWED — otherwise
     /// the upgrade introducing the check is itself the outage.
     #[test]
@@ -221,6 +307,7 @@ mod tests {
         let peer = PeerBuild {
             version: Some("0.1.0".into()),
             blueprint_digest: None,
+            threshold_percent: None,
         };
         assert_eq!(
             Compatibility::between(&peer, &build("0.1.7", "aa")),

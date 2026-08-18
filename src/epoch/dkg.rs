@@ -528,9 +528,14 @@ pub async fn dkg_phase(
             // derives the SAME Y_51 (and hence the same treasury address). That
             // cross-node guarantee is asserted by the multi-instance acceptance
             // test (all SPOs' verifying_key + treasury address match). Note it is
-            // NOT the naive Σ_l φ_{l,0} of the wire commitments: frost-secp256k1-tr
-            // applies BIP-340 even-Y normalization per contribution inside the
-            // ceremony, so the signing key differs from the raw commitment sum.
+            // NOT the naive Σ_l φ_{l,0} of the wire commitments — but the reason
+            // is the BIP-341 key-path tweak that frost-secp256k1-tr applies to
+            // the group key, not a per-contribution normalization. The exact
+            // relation is `Y_51 = taptweak(Σ_l φ_{l,0})`, and it is pinned
+            // against real ceremonies by
+            // `epoch::succession::the_summed_commitments_are_the_key_the_ceremony_produced`,
+            // which a third party relies on to recompute the roster's key from
+            // the published commitments alone.
             //
             // Locally we assert part3's two outputs are coherent: the KeyPackage
             // (this node's share) and the PublicKeyPackage (the published group)

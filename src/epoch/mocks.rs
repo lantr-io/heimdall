@@ -1008,9 +1008,15 @@ impl PeerNetwork for MockPeerNetwork {
         // Mock peers report whatever the hub was told to say for them; by
         // default that is nothing, i.e. an unknown build, which is the allowed
         // verdict — so every existing test is unaffected by the WI-067 gate.
+        // The mock reports the namespace the hub actually holds a Round 1 under,
+        // mirroring the HTTP server deriving it from what it serves.
+        let published_dkg = with_slot(&self.hub, peer.identifier, |s| {
+            s.dkg1.as_ref().map(|(ns, _)| (ns.epoch, ns.attempt))
+        });
         crate::epoch::traits::PeerHealth {
             reachable: true,
             build: self.hub.build_of(peer.identifier),
+            published_dkg,
         }
     }
 
@@ -1093,6 +1099,31 @@ impl PeerNetwork for MockPeerNetwork {
                 .as_ref()
                 .filter(|(slot_ns, _)| *slot_ns == ns)
                 .map(|(_, pkg)| pkg.clone())
+        }))
+    }
+
+    /// Presence of a Round-2 payload for `ns`, without decrypting anything —
+    /// the question a third-party auditor asks (WI-113). The mock files Round 2
+    /// per recipient, so "published" is "there is an entry for this namespace".
+    async fn dkg_round2_recipients(
+        &self,
+        ns: DkgNamespace,
+        peer: &SpoInfo,
+    ) -> EpochResult<Option<std::collections::BTreeSet<Vec<u8>>>> {
+        // The mock files Round 2 per recipient identifier; the wire names them by
+        // pool_id, and the fixture rosters use `pool_id = [index; 28]`, so the
+        // mapping is the same one `roster_of`/`demo_static_fixture` build.
+        Ok(with_slot(&self.hub, peer.identifier, |s| {
+            let addressed: std::collections::BTreeSet<Vec<u8>> = s
+                .dkg2
+                .iter()
+                .filter(|(_, (slot_ns, _))| *slot_ns == ns)
+                .map(|(id, _)| {
+                    let i = crate::frost::identifier_u16(*id);
+                    vec![i as u8; crate::http::canonical::POOL_ID_LEN]
+                })
+                .collect();
+            (!addressed.is_empty()).then_some(addressed)
         }))
     }
 

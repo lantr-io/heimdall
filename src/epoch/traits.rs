@@ -543,6 +543,13 @@ pub struct PeerHealth {
     /// What it reports running, when it answered. Absent for an unreachable
     /// peer, and empty for one whose build predates WI-067.
     pub build: crate::http::compat::PeerBuild,
+    /// `(epoch, attempt)` of the most recent DKG Round 1 this peer has
+    /// published (WI-113). A HINT for a third party auditing the ceremony: the
+    /// attempt is `window * DKG_ATTEMPTS_PER_WINDOW` counted from whenever that
+    /// node entered, so nobody else can compute it. Trusting it is unnecessary —
+    /// the reader fetches that namespace and verifies every signature in it,
+    /// which a wrong answer cannot survive.
+    pub published_dkg: Option<(u64, u64)>,
 }
 
 impl PeerHealth {
@@ -551,6 +558,7 @@ impl PeerHealth {
         Self {
             reachable: false,
             build: crate::http::compat::PeerBuild::default(),
+            published_dkg: None,
         }
     }
 
@@ -561,6 +569,7 @@ impl PeerHealth {
         Self {
             reachable: true,
             build: crate::http::compat::PeerBuild::default(),
+            published_dkg: None,
         }
     }
 
@@ -675,6 +684,26 @@ pub trait PeerNetwork: Send + Sync {
         recipient_identifier: Identifier,
         sender_commitments: &[[u8; POINT_LEN]],
     ) -> EpochResult<Option<round2::Package>>;
+    /// Who `peer`'s Round 2 payload for `ns` is ADDRESSED to, if it published a
+    /// correctly signed one (WI-113).
+    ///
+    /// No share is decrypted: the caller is a third party auditing a ceremony it
+    /// took no part in and holds no recipient key, which is why
+    /// [`Self::fetch_dkg_round2`] cannot answer this — that needs this node to BE
+    /// a recipient. The recipient list is public, and it is the participant set
+    /// the sender believed it was running with, so comparing it across members
+    /// detects a ceremony that finished over a narrowed subset.
+    ///
+    /// Defaults to `None`, the fail-closed direction: a transport that has not
+    /// implemented this reports no evidence of completion, and the succession
+    /// rule refuses rather than approving on an unanswered question.
+    async fn dkg_round2_recipients(
+        &self,
+        _ns: DkgNamespace,
+        _peer: &SpoInfo,
+    ) -> EpochResult<Option<std::collections::BTreeSet<Vec<u8>>>> {
+        Ok(None)
+    }
     /// Return provable Round 1 faults retained while fetching `peer`'s payload.
     async fn dkg_round1_fault_evidence(
         &self,

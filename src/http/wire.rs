@@ -529,6 +529,44 @@ pub fn verify_round2(
     Ok(frost_bridge::round2_from_share(&evidence.share)?)
 }
 
+/// Verify only that `wire` was AUTHORED by `sender_pool_id` for this namespace —
+/// no decryption, no share check (WI-113).
+///
+/// [`verify_round2`] needs the recipient's secret key, because it decrypts the
+/// one share addressed to that recipient. A third party auditing a ceremony it
+/// took no part in has no such key and needs no such share: what it is asking is
+/// "did this member reach Round 2 at all", and the answer is public. The
+/// signature covers [`canonical::round2`], which is built entirely from the
+/// wire's public fields, so authorship separates cleanly from confidentiality.
+///
+/// **Returns who the payload is addressed to**, which is the load-bearing part.
+/// A Round 2 payload names its recipients in the clear, so the recipient set is
+/// the participant set its sender BELIEVED it was running with. Comparing those
+/// sets across members is what catches a ceremony that narrowed: if A and B
+/// finished without C, their payloads address only each other, however valid C's
+/// own payload looks. Without it a signed empty `shares` list would satisfy
+/// "reached Round 2" while distributing nothing.
+///
+/// **It is still not a correctness check.** A sender can publish a well-formed
+/// payload whose ciphertexts are wrong; only the recipient can tell, and when it
+/// does the result is a fault proof on chain. See [`crate::epoch::succession`],
+/// where these are conditions of one rule.
+pub fn verify_round2_authorship(
+    secp: &Secp256k1<All>,
+    sender_pool_id: &[u8; POOL_ID_LEN],
+    sender_bifrost_id_pk: &[u8],
+    epoch: u64,
+    threshold: u64,
+    attempt: u64,
+    wire: &Dkg2Wire,
+) -> Result<Vec<[u8; POOL_ID_LEN]>, WireError> {
+    let entries = round2_entries(wire)?;
+    let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
+    let canonical_bytes = canonical::round2(epoch, threshold, attempt, sender_pool_id, &entries);
+    auth::verify_payload(secp, sender_bifrost_id_pk, &canonical_bytes, &signature)?;
+    Ok(entries.iter().map(|e| e.recipient_pool_id).collect())
+}
+
 fn round2_entries(wire: &Dkg2Wire) -> Result<Vec<ShareEntry>, WireError> {
     let mut entries = Vec::with_capacity(wire.shares.len());
     for s in &wire.shares {
