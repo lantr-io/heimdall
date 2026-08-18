@@ -18,6 +18,9 @@
 dkg_round_timeout_secs = 60
 poll_interval_ms = 1000
 federation_timeout_secs = 60
+# Required: the daemon refuses to start without it. Local and disposable here —
+# this demo runs on the mock chain and pays no real peg-out.
+state_dir = ".state/localdkg"
 
 [bitcoin]
 network = "testnet4"

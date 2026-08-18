@@ -208,11 +208,13 @@ pub struct ProtocolConfig {
     pub dkg_reconcile_backoff_secs: u64,
     pub poll_interval_ms: u64,
     /// Directory for 0600 DKG-state persistence so the signing share survives
-    /// restarts for the epoch (WI-014). Unset → in-memory only.
+    /// restarts for the epoch (WI-014).
     ///
-    /// Also the home of the completed-peg-outs trie (`cpo-trie.json`). Unset means
-    /// the trie is rebuilt as empty on every start, which is correct only on a
-    /// bridge that has completed no peg-outs — set this in any real deployment.
+    /// Also the home of the completed-peg-outs trie (`cpo-trie.json`). Unset, the
+    /// trie is rebuilt EMPTY on every start and an already-paid peg-out reads as
+    /// unpaid — so unset is **refused at startup**, not warned about: see
+    /// [`crate::preflight::unset_state_dir`]. `Option` only because the type
+    /// predates the refusal; every path that runs a daemon requires it.
     pub state_dir: Option<String>,
 }
 
