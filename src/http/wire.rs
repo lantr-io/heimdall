@@ -767,15 +767,32 @@ pub fn round2_equivocation_evidence(
 // Signing rounds (WI-038)
 // ---------------------------------------------------------------------------
 
-/// The domain one FROST signing session lives in: an epoch, a session index
-/// within it, and the message that session signs.
+/// The domain one FROST signing session lives in: an epoch, the movement's
+/// sequence within it, a session index, and the message that session signs.
 ///
 /// The analogue of [`DkgNamespace`], with the message folded in because
 /// `(epoch, session)` is not unique on its own — an epoch runs many treasury
 /// movements and each has an input 0. See [`canonical`] for why that matters.
+///
+/// `sequence` is the analogue of [`DkgNamespace::attempt`], and it exists for
+/// the same reason: two goes at the same thing must not share an address. The
+/// message alone cannot separate them, because a rebuilt movement is
+/// BYTE-IDENTICAL when nothing about the chain has changed — same head, same
+/// Config fee rate, same output — so it hashes to the same sighash. Without
+/// `sequence`, a node that published a commitment at one batch opportunity keeps
+/// serving it at the next, and it verifies: right pool, right signature, right
+/// namespace. Peers then mix it into a signing package built from fresh nonces
+/// and the shares cannot aggregate (WI-W8ZC4, observed on preprod 2026-08-19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SignNamespace {
     pub epoch: u64,
+    /// The movement's 0-indexed sequence within the epoch — the batch grid index
+    /// `i` of `B_i`, the same value `EpochPhase::Sign::tm_sequence` carries, so
+    /// every SPO derives it from the same chain state rather than counting its
+    /// own retries. `0` for the Update-Y ceremony (one per epoch, and its
+    /// `session` already separates it) and for a deployment with no grid (which
+    /// makes exactly one movement per epoch).
+    pub sequence: u64,
     /// TM input index, or [`crate::epoch::rotation::UPDATE_Y_SESSION`].
     pub session: u32,
     /// The exact 32 bytes this session signs: a BIP-341 sighash, or the
@@ -793,9 +810,10 @@ pub const UPDATE_Y_SESSION: u32 = u32::MAX;
 
 impl SignNamespace {
     #[must_use]
-    pub fn new(epoch: u64, session: u32, message: [u8; SIGN_MESSAGE_LEN]) -> Self {
+    pub fn new(epoch: u64, sequence: u64, session: u32, message: [u8; SIGN_MESSAGE_LEN]) -> Self {
         Self {
             epoch,
+            sequence,
             session,
             message,
         }
@@ -871,6 +889,7 @@ pub fn build_sign_round1(
     let (hiding, binding) = frost_bridge::sign_round1_fields(commitments)?;
     let canonical_bytes = canonical::sign_round1(
         ns.epoch,
+        ns.sequence,
         ns.session,
         my_pool_id,
         u64::from(my_identifier),
@@ -904,6 +923,7 @@ pub fn verify_sign_round1(
     let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
     let canonical_bytes = canonical::sign_round1(
         ns.epoch,
+        ns.sequence,
         ns.session,
         peer_pool_id,
         u64::from(peer_identifier),
@@ -928,6 +948,7 @@ pub fn build_sign_round2(
     let share_bytes = frost_bridge::sign_round2_share_bytes(share)?;
     let canonical_bytes = canonical::sign_round2(
         ns.epoch,
+        ns.sequence,
         ns.session,
         my_pool_id,
         u64::from(my_identifier),
@@ -955,6 +976,7 @@ pub fn verify_sign_round2(
     let signature = hex_n::<SIG_LEN>(&wire.signature, "signature")?;
     let canonical_bytes = canonical::sign_round2(
         ns.epoch,
+        ns.sequence,
         ns.session,
         peer_pool_id,
         u64::from(peer_identifier),

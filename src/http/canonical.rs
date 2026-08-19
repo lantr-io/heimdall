@@ -181,24 +181,34 @@ pub fn round2(
 fn push_sign_header(
     out: &mut Vec<u8>,
     epoch: u64,
+    sequence: u64,
     session: u32,
     pool_id: &[u8; POOL_ID_LEN],
     identifier: u64,
     message: &[u8; SIGN_MESSAGE_LEN],
 ) {
     out.extend_from_slice(&epoch.to_be_bytes());
+    out.extend_from_slice(&sequence.to_be_bytes());
     out.extend_from_slice(&u64::from(session).to_be_bytes());
     out.extend_from_slice(pool_id);
     out.extend_from_slice(&identifier.to_be_bytes());
     out.extend_from_slice(message);
 }
 
-const SIGN_HEADER_LEN: usize = 8 + 8 + POOL_ID_LEN + 8 + SIGN_MESSAGE_LEN;
+const SIGN_HEADER_LEN: usize = 8 + 8 + 8 + POOL_ID_LEN + 8 + SIGN_MESSAGE_LEN;
 
 /// Signing Round 1 canonical bytes: this signer's two nonce commitments,
-/// bound to the `(epoch, session, pool_id, identifier, message)` domain.
+/// bound to the `(epoch, sequence, session, pool_id, identifier, message)`
+/// domain.
+///
+/// `sequence` is in the header, not merely in the URL, because it is what makes
+/// two ATTEMPTS at the same message different sessions (WI-W8ZC4). A retried
+/// movement is byte-identical, so `message` repeats; without `sequence` a
+/// commitment published for an earlier attempt verifies against the later one
+/// and mixes into its signing package.
 pub fn sign_round1(
     epoch: u64,
+    sequence: u64,
     session: u32,
     pool_id: &[u8; POOL_ID_LEN],
     identifier: u64,
@@ -208,7 +218,9 @@ pub fn sign_round1(
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(TAG_S1.len() + SIGN_HEADER_LEN + 2 * POINT_LEN);
     out.extend_from_slice(TAG_S1);
-    push_sign_header(&mut out, epoch, session, pool_id, identifier, message);
+    push_sign_header(
+        &mut out, epoch, sequence, session, pool_id, identifier, message,
+    );
     out.extend_from_slice(hiding);
     out.extend_from_slice(binding);
     out
@@ -218,6 +230,7 @@ pub fn sign_round1(
 /// the same domain as its Round 1 commitments.
 pub fn sign_round2(
     epoch: u64,
+    sequence: u64,
     session: u32,
     pool_id: &[u8; POOL_ID_LEN],
     identifier: u64,
@@ -226,7 +239,9 @@ pub fn sign_round2(
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(TAG_S2.len() + SIGN_HEADER_LEN + SHARE_LEN);
     out.extend_from_slice(TAG_S2);
-    push_sign_header(&mut out, epoch, session, pool_id, identifier, message);
+    push_sign_header(
+        &mut out, epoch, sequence, session, pool_id, identifier, message,
+    );
     out.extend_from_slice(share);
     out
 }
@@ -346,8 +361,13 @@ mod tests {
     const SIGN_TAG_LEN: usize = 15; // "bifrost-sign-rN"
 
     fn s1(epoch: u64, session: u32, id: u64, msg: [u8; 32]) -> Vec<u8> {
+        s1_at(epoch, 1, session, id, msg)
+    }
+
+    fn s1_at(epoch: u64, sequence: u64, session: u32, id: u64, msg: [u8; 32]) -> Vec<u8> {
         sign_round1(
             epoch,
+            sequence,
             session,
             &pid(1),
             id,
@@ -369,8 +389,13 @@ mod tests {
         );
         assert_eq!(
             &bytes[SIGN_TAG_LEN + 8..SIGN_TAG_LEN + 16],
+            &1u64.to_be_bytes(),
+            "sequence next — what separates two attempts at one message"
+        );
+        assert_eq!(
+            &bytes[SIGN_TAG_LEN + 16..SIGN_TAG_LEN + 24],
             &2u64.to_be_bytes(),
-            "session next"
+            "then the session"
         );
         assert_eq!(
             &bytes[bytes.len() - 2 * POINT_LEN..bytes.len() - POINT_LEN],
@@ -389,10 +414,15 @@ mod tests {
         assert_ne!(base, s1(9, 3, 5, [0x11; 32]), "session");
         assert_ne!(base, s1(9, 2, 6, [0x11; 32]), "identifier");
         assert_ne!(base, s1(9, 2, 5, [0x12; 32]), "message");
+        // The field the message cannot stand in for: a movement rebuilt at the
+        // next opportunity is byte-identical, so only this separates the two
+        // attempts (WI-W8ZC4).
+        assert_ne!(base, s1_at(9, 2, 2, 5, [0x11; 32]), "sequence");
         assert_ne!(
             base,
             sign_round1(
                 9,
+                1,
                 2,
                 &pid(2),
                 5,
@@ -406,7 +436,7 @@ mod tests {
 
     #[test]
     fn sign_round2_length_and_prefix() {
-        let bytes = sign_round2(9, 2, &pid(1), 5, &[0x11; 32], &[0xcc; SHARE_LEN]);
+        let bytes = sign_round2(9, 1, 2, &pid(1), 5, &[0x11; 32], &[0xcc; SHARE_LEN]);
         assert_eq!(&bytes[..SIGN_TAG_LEN], TAG_S2);
         assert_eq!(bytes.len(), SIGN_TAG_LEN + SIGN_HEADER_LEN + SHARE_LEN);
         assert_eq!(&bytes[bytes.len() - SHARE_LEN..], &[0xcc; SHARE_LEN]);

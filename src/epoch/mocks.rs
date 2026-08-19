@@ -197,6 +197,13 @@ pub struct MockCardanoChain {
     /// be able to ADVANCE mid-test (WI-097) — a batch loop that never leaves `B_i`
     /// can only ever make one movement.
     batch: Arc<Mutex<crate::epoch::batch::BatchWindow>>,
+    /// How far past the open opportunity's slot this chain's tip stands. Zero —
+    /// the tip IS `B_i` — is the ordinary case and what every pre-existing test
+    /// wants. A test that needs a node arriving LATE at an opportunity moves it,
+    /// which is the only way to reach the closed-round-1-window branch, since
+    /// `GridParams::current` keeps reporting `B_i` for a whole interval
+    /// (WI-W8ZC4).
+    slots_past_batch: Arc<std::sync::atomic::AtomicU64>,
     /// When set, a submitted movement advances the mock grid to the next
     /// opportunity — the mock's stand-in for chain time passing while a TM is
     /// signed, posted and confirmed. Shared, so every node sees the same advance.
@@ -296,6 +303,7 @@ impl MockCardanoChain {
             dkg_faults: Arc::new(Mutex::new(Vec::new())),
             schedule_anchor_ms: None,
             batch: Arc::new(Mutex::new(crate::epoch::batch::BatchWindow::NoGrid)),
+            slots_past_batch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             advance_batch_on_submit: false,
             tm_chain: None,
             treasury_busy: Arc::new(AtomicBool::new(false)),
@@ -421,6 +429,12 @@ impl MockCardanoChain {
     /// The grid position this chain reports, for a test that wants to move it.
     pub fn batch_window(&self) -> Arc<Mutex<crate::epoch::batch::BatchWindow>> {
         Arc::clone(&self.batch)
+    }
+
+    /// How far past `B_i` the tip stands — the handle a test moves to place a
+    /// node LATE at an open opportunity. See the field.
+    pub fn slots_past_batch(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.slots_past_batch)
     }
 
     /// A treasury head every node in a test shares, seeded from the fixture — the
@@ -629,7 +643,8 @@ impl CardanoChain for MockCardanoChain {
         );
         let batch = *self.batch.lock().unwrap();
         snapshot.batch = batch;
-        snapshot.slot = batch.open().map_or(0, |b| b.slot);
+        snapshot.slot =
+            batch.open().map_or(0, |b| b.slot) + self.slots_past_batch.load(Ordering::Acquire);
         // One slot per cascade hop. The real value is a Config parameter around a
         // minute; here it only has to be non-zero, because what the tests exercise
         // is the ORDER the cascade imposes, never how long a hop lasts.

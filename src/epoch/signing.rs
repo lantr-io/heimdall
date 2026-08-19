@@ -173,7 +173,11 @@ pub async fn sign_phase(
                 // opportunity (and, on the rotation path, park for the epoch).
                 let mark = |e| if published_any { spent(1)(e) } else { e };
                 peers
-                    .publish_sign_round1(input_namespace(epoch, &tm, i), me, commitments)
+                    .publish_sign_round1(
+                        input_namespace(epoch, tm_sequence, &tm, i),
+                        me,
+                        commitments,
+                    )
                     .await
                     .map_err(mark)?;
                 published_any = true;
@@ -200,7 +204,7 @@ pub async fn sign_phase(
                     "  waiting for round1 commitments on input {i} from {} peer(s)...",
                     peer_infos.len()
                 );
-                let ns = input_namespace(epoch, &tm, i);
+                let ns = input_namespace(epoch, tm_sequence, &tm, i);
                 let map = collected.round1.entry(i).or_default();
                 // S1 for this input: whoever published by the deadline, at least
                 // `min_signers` of them.
@@ -316,7 +320,7 @@ pub async fn sign_phase(
 
                     collected.round2.entry(i).or_default().insert(me, share);
 
-                    let ns = input_namespace(epoch, &tm, i);
+                    let ns = input_namespace(epoch, tm_sequence, &tm, i);
                     peers.publish_sign_round2(ns, me, share).await?;
                     crate::epoch_debug!(me, epoch, "    -> published share for input {i}");
 
@@ -517,8 +521,16 @@ fn verify_spi_root(
 /// input's own BIP-341 sighash. Two TMs in one epoch share `(epoch, i)` but
 /// never the sighash, which is what stops a commitment captured from one from
 /// replaying into the other.
-fn input_namespace(epoch: u64, tm: &TreasuryMovement, i: u32) -> SignNamespace {
-    SignNamespace::new(epoch, i, tm.sighashes[i as usize])
+/// The namespace one input's FROST session publishes under.
+///
+/// `tm_sequence` — the batch grid index this movement was built at — is part of
+/// it, and that is what separates two ATTEMPTS at the same movement. A rebuild
+/// at the next opportunity is byte-identical when the chain has not moved, so
+/// `(epoch, session, sighash)` repeats exactly; the sequence does not, and every
+/// SPO derives it from the same grid rather than from its own retry count
+/// (WI-W8ZC4).
+fn input_namespace(epoch: u64, tm_sequence: u64, tm: &TreasuryMovement, i: u32) -> SignNamespace {
+    SignNamespace::new(epoch, tm_sequence, i, tm.sighashes[i as usize])
 }
 
 /// The payload one signing round collects from each peer, and how to fetch it.
@@ -880,7 +892,7 @@ mod tests {
         });
         config.poll_interval = std::time::Duration::from_millis(5);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let ns = SignNamespace::new(7, 0, [0xa1u8; 32]);
+        let ns = SignNamespace::new(7, 1, 0, [0xa1u8; 32]);
 
         // SPO 3 publishes; the leader (SPO 1) never does. That is a threshold
         // subset {2,3} of a 2-of-3 roster — enough signers, wrong ones.
@@ -1052,7 +1064,7 @@ mod tests {
             &peers,
             &clock,
             &config,
-            SignNamespace::new(7, 0, [0xd4u8; 32]),
+            SignNamespace::new(7, 1, 0, [0xd4u8; 32]),
             me,
             Quorum::of(&peer_infos, roster.min_signers),
             std::time::Instant::now() + std::time::Duration::from_millis(100),
@@ -1127,6 +1139,201 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "the round must close on the window it was given, not run its own timer"
         );
+    }
+
+    /// WI-W8ZC4(b). A burned attempt leaves this node's round-1 commitments
+    /// published, and the movement rebuilt at the next opportunity is
+    /// BYTE-IDENTICAL when nothing on chain has changed — same head, same Config
+    /// fee rate, same output — so `(epoch, session, sighash)` repeats exactly.
+    /// The sequence is what keeps the two attempts apart.
+    ///
+    /// The second node is started late on purpose. That is not a timing hack, it
+    /// is the shape of the live failure (preprod 2026-08-19): a node publishes,
+    /// then polls peers that have not republished yet, and takes their PREVIOUS
+    /// attempt's commitments — which verify, being correctly signed for a
+    /// namespace that, without the sequence, is this one. Its package then
+    /// differs from theirs and the shares cannot aggregate. With the sequence in
+    /// the namespace the stale blobs are unreachable, so the poll simply waits
+    /// for the real ones.
+    #[tokio::test]
+    async fn a_burned_attempt_does_not_poison_the_next_one() {
+        let (roster, group_keys_all, tm, hub) = dkg_and_movement(2, 2).await;
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+        let cfg_for = |id| {
+            EpochConfig::demo_default(SpoIdentity {
+                identifier: id,
+                bifrost_id_pk: Vec::new(),
+                port: 0,
+            })
+        };
+
+        // Attempt at B_1: the window is already shut, so each node publishes its
+        // round-1 commitments and then fails alone — the session is spent, and
+        // the commitments outlive it.
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let expired = crate::epoch::state::SigningWindow {
+            round1_close: past,
+            round2_close: past,
+        };
+        for gk in &group_keys_all {
+            let id = *gk.key_package.identifier();
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let outcome = sign_phase(
+                &peers,
+                &clock,
+                &rng,
+                &cfg_for(id),
+                0,
+                roster.clone(),
+                CascadeLevel::Quorum51,
+                gk.clone(),
+                EpochKeys {
+                    roster: roster.clone(),
+                    group_keys: gk.clone(),
+                },
+                tm.clone(),
+                SigningRound::Round1,
+                SignCollected::default(),
+                1,
+                expired,
+            )
+            .await;
+            assert!(
+                !matches!(outcome, Ok(EpochPhase::Submit { .. })),
+                "a shut window cannot carry a movement to Submit"
+            );
+        }
+
+        // The precondition, asserted rather than assumed: both nodes' round-1
+        // commitments from that attempt are still SERVED under B_1's namespace.
+        // They go out before the poll, so a round that fails still leaves them —
+        // and the nonces behind them are gone with the attempt.
+        let observer: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(
+            roster.participants.keys().copied().next().unwrap(),
+            hub.clone(),
+        ));
+        for peer in roster.participants.values() {
+            assert!(
+                observer
+                    .fetch_sign_round1(SignNamespace::new(0, 1, 0, tm.sighashes[0]), peer)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the burned attempt must leave commitments behind — otherwise this test proves \
+                 nothing about reading them"
+            );
+        }
+
+        // ...and that the next attempt cannot reach them. This is the mechanism
+        // under test, stated where it can be read: same epoch, same session,
+        // same message — only the sequence differs, and it is enough.
+        for peer in roster.participants.values() {
+            assert!(
+                observer
+                    .fetch_sign_round1(SignNamespace::new(0, 2, 0, tm.sighashes[0]), peer)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a commitment published for B_1 must not be readable as B_2's"
+            );
+        }
+
+        // Attempt at B_2: the same movement, byte for byte.
+        let mut handles = Vec::new();
+        for (n, gk) in group_keys_all.into_iter().enumerate() {
+            let id = *gk.key_package.identifier();
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock = clock.clone();
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = cfg_for(id);
+            let roster = roster.clone();
+            let tm = tm.clone();
+            handles.push(tokio::spawn(async move {
+                // Stagger, so the first node polls a peer that is still serving
+                // only the burned attempt's payloads.
+                tokio::time::sleep(std::time::Duration::from_millis(50 * n as u64)).await;
+                let mut phase = EpochPhase::Sign {
+                    epoch: 0,
+                    tm_sequence: 2,
+                    window: test_window(60_000),
+                    roster: roster.clone(),
+                    cascade: CascadeLevel::Quorum51,
+                    group_keys: gk.clone(),
+                    epoch_keys: EpochKeys {
+                        roster,
+                        group_keys: gk,
+                    },
+                    tm,
+                    round: SigningRound::Round1,
+                    collected: SignCollected::default(),
+                };
+                loop {
+                    phase = match phase {
+                        EpochPhase::Sign {
+                            epoch,
+                            roster,
+                            cascade,
+                            tm_sequence,
+                            window,
+                            group_keys,
+                            epoch_keys,
+                            tm,
+                            round,
+                            collected,
+                        } => sign_phase(
+                            &peers,
+                            &clock,
+                            &rng,
+                            &config,
+                            epoch,
+                            roster,
+                            cascade,
+                            group_keys,
+                            epoch_keys,
+                            tm,
+                            round,
+                            collected,
+                            tm_sequence,
+                            window,
+                        )
+                        .await
+                        .expect("the second attempt must not read the first's commitments"),
+                        EpochPhase::Submit { tm, .. } => return tm,
+                        other => panic!("unexpected: {}", other.name()),
+                    };
+                }
+            }));
+        }
+
+        let mut signed = Vec::new();
+        for h in handles {
+            signed.push(h.await.expect("no panic"));
+        }
+        let secp = Secp256k1::new();
+        for (i, sig) in signed[0].signatures.iter().enumerate() {
+            let sig = sig.as_ref().expect("every input is signed");
+            assert_eq!(
+                sig.serialize().unwrap(),
+                signed[1].signatures[i]
+                    .as_ref()
+                    .expect("every input is signed")
+                    .serialize()
+                    .unwrap(),
+                "both nodes must aggregate the same signature for input {i}"
+            );
+            let xonly = signed[0].input_spend_info[i]
+                .output_key()
+                .to_x_only_public_key();
+            secp.verify_schnorr(
+                &bitcoin::secp256k1::schnorr::Signature::from_slice(&sig.serialize().unwrap())
+                    .unwrap(),
+                &bitcoin::secp256k1::Message::from_digest(signed[0].sighashes[i]),
+                &xonly,
+            )
+            .expect("the retry's signature verifies under the input's output key");
+        }
     }
 
     /// A finished DKG plus a two-input movement built against its group key —
@@ -1280,7 +1487,7 @@ mod tests {
             &peers,
             &clock,
             &config,
-            SignNamespace::new(7, 0, [0xc3u8; 32]),
+            SignNamespace::new(7, 1, 0, [0xc3u8; 32]),
             me,
             Quorum::of(&peer_infos, roster.min_signers),
             expired,

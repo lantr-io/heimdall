@@ -97,7 +97,7 @@ pub async fn frost_sign(
             me: crate::frost::identifier_u16(me),
         });
     }
-    let ns = SignNamespace::new(0, FEDERATION_SESSION, message);
+    let ns = SignNamespace::new(0, 0, FEDERATION_SESSION, message);
     let spo_roster = roster.to_roster();
     let co_signers: Vec<SpoInfo> = signers
         .iter()

@@ -489,7 +489,10 @@ async fn frost_sign_message(
     // The rotation's signing domain: the incoming epoch, the reserved session,
     // and the Update-Y message itself — so a share from one rotation can never
     // be replayed into another.
-    let ns = SignNamespace::new(epoch, UPDATE_Y_SESSION, *msg);
+    // Sequence 0: the rotation happens at most once per epoch and its
+    // reserved `session` already separates it from every movement, so it
+    // needs no grid index to tell two of them apart (WI-W8ZC4).
+    let ns = SignNamespace::new(epoch, 0, UPDATE_Y_SESSION, *msg);
 
     // Never `rng.rng(..)`: the context would be `update-y:epoch={epoch}`, constant
     // across the re-entries WI-047 introduced, so under `--deterministic` a retry

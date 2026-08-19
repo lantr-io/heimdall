@@ -2208,8 +2208,11 @@ async fn await_batch_opportunity(
     loop {
         let snapshot = chain.query_batch_snapshot().await?;
         let wait = match snapshot.batch {
-            // An opportunity is open and this process has not built for it.
-            BatchWindow::Open { batch: b, .. } if !built.is(epoch, b.index) => {
+            // An opportunity is open, this process has not built for it, and its
+            // round-1 window has not closed.
+            BatchWindow::Open { batch: b, .. }
+                if !built.is(epoch, b.index) && round1_still_open(&snapshot, b) =>
+            {
                 built.mark(epoch, b.index);
                 config.health.update(|h| {
                     h.epoch = Some(epoch);
@@ -2256,6 +2259,33 @@ async fn await_batch_opportunity(
             // closed window would post a movement outside the schedule every SPO
             // agreed on, which no co-signer would reproduce.
             ref window => {
+                // An opportunity this node has NOT served, whose round-1 window
+                // has already shut — the state a node restarted mid-epoch wakes
+                // into, since `GridParams::current` reports the same `B_i` for a
+                // whole interval. Let it pass, and say so once (WI-W8ZC4).
+                //
+                // Building here cannot produce a movement: `SigningWindow` gives
+                // a deadline of NOW for a close slot in the past, so round 1
+                // closes on whoever has already answered — nobody — and the
+                // attempt fails. It is not free, either. The round-1 commitments
+                // go out before the poll, so the session is spent, and this node
+                // spends it alone at a moment its peers are not signing.
+                if let Some(b) = window.open() {
+                    if !built.is(epoch, b.index) {
+                        built.mark(epoch, b.index);
+                        crate::epoch_log!(
+                            me,
+                            epoch,
+                            "batch B_{} @ slot {} passes unused: its round-1 window closed at \
+                             slot {} and the chain is at slot {}. A round opened now would close \
+                             on entry with nobody to sign alongside.",
+                            b.index,
+                            b.slot,
+                            b.slot.saturating_add(snapshot.sign_r1_window),
+                            snapshot.slot,
+                        );
+                    }
+                }
                 let Some(b) = window.next() else {
                     return Ok(BatchTurn::EpochOver);
                 };
@@ -2290,6 +2320,28 @@ async fn await_batch_opportunity(
         };
         tokio::time::sleep(wait).await;
     }
+}
+
+/// Whether `b`'s FROST round 1 can still be entered at the snapshot's slot.
+///
+/// Round 1 closes at `B_i + sign_r1_window` — an absolute slot every SPO derives
+/// from the same Config, which is what makes `S1` the same set for all of them
+/// (see `signing_window`). A node arriving after it holds no window at all:
+/// `SigningWindow::from_slots` yields a deadline of NOW for a close slot already
+/// past, so the round shuts the instant it opens.
+///
+/// `GridParams::current` reports one opportunity for the whole interval, so this
+/// is the ordinary state of a node that restarted, or was down, mid-interval —
+/// and before WI-W8ZC4 such a node built anyway, published its round-1
+/// commitments into a session nobody else was in, and failed. Those commitments
+/// then outlived the attempt: with the movement deterministic, the next
+/// opportunity rebuilt the same sighash, and peers still serving the burnt
+/// attempt's payloads mixed them into the new signing package.
+fn round1_still_open(
+    snapshot: &crate::epoch::traits::BatchSnapshot,
+    b: crate::epoch::batch::BatchSlot,
+) -> bool {
+    snapshot.slot < b.slot.saturating_add(snapshot.sign_r1_window)
 }
 
 /// How long to sleep before re-reading the grid: the exact hop to `next_slot`,
@@ -7355,6 +7407,72 @@ mod tests {
         assert!(
             matches!(turn, BatchTurn::EpochOver),
             "an open-but-last opportunity, once served, is the end of the epoch"
+        );
+    }
+
+    /// WI-W8ZC4(a). `GridParams::current` reports one opportunity for its whole
+    /// interval, so a node that restarts hours into it wakes to an OPEN window it
+    /// has not served — and before this, it built. It could not succeed: round 1
+    /// closes at `B_i + sign_r1_window`, an absolute slot, so `SigningWindow`
+    /// hands it a deadline of NOW and the round shuts on entry. The cost was not
+    /// the wasted attempt but what it left behind — round-1 commitments published
+    /// into a session no peer was in, which the next opportunity then read back,
+    /// the rebuilt movement being byte-identical.
+    #[tokio::test]
+    async fn a_batch_whose_round1_window_has_closed_is_not_offered() {
+        use crate::epoch::batch::BatchWindow;
+        use std::sync::atomic::Ordering;
+
+        let chain = MockCardanoChain::new(demo_static_fixture(2, 2, 19_600));
+        let window = chain.batch_window();
+        let lateness = chain.slots_past_batch();
+        let chain: Arc<dyn CardanoChain> = Arc::new(chain);
+        let config = fast_config(Identifier::try_from(1u16).unwrap());
+        let me = config.identity.identifier;
+
+        *window.lock().unwrap() = BatchWindow::Open {
+            batch: slot(3),
+            next: Some(slot(4)),
+        };
+
+        // The mock publishes `sign_r1_window = 1`, so a tip two slots past B_3 is
+        // past the close.
+        lateness.store(2, Ordering::Release);
+        let mut built = BuiltBatch::default();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                await_batch_opportunity(&chain, &config, me, 7, &mut built),
+            )
+            .await
+            .is_err(),
+            "an opportunity whose round-1 window has shut must be waited out, not built"
+        );
+
+        // And it stays passed. The marker is what makes this a decision rather
+        // than a poll: without it the loop would re-ask every few minutes and
+        // re-decide the same thing, and the log would say so every time.
+        lateness.store(0, Ordering::Release);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                await_batch_opportunity(&chain, &config, me, 7, &mut built),
+            )
+            .await
+            .is_err(),
+            "an opportunity already let go must not be reopened"
+        );
+
+        // Control, and the reason the guard is a comparison rather than a ban on
+        // late entry: the SAME opportunity, entered while its round-1 window is
+        // still open, is built.
+        let mut fresh = BuiltBatch::default();
+        let turn = await_batch_opportunity(&chain, &config, me, 7, &mut fresh)
+            .await
+            .unwrap();
+        assert!(
+            matches!(turn, BatchTurn::Build(Some(b)) if b.index == 3),
+            "an opportunity entered inside its round-1 window is still built"
         );
     }
 

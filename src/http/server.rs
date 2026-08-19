@@ -36,13 +36,18 @@ pub struct AppState {
     pub own_pool_id_hex: String,
     /// Published DKG payload JSON, keyed by `(epoch, threshold, attempt, round)`.
     pub dkg: BTreeMap<(u64, u64, u64, RoundKey), String>,
-    /// Published signing payload JSON, keyed by `(epoch, session, round)` — one
-    /// FROST session per TM input, plus the reserved rotation session. Folds the
-    /// round into the key exactly as `dkg` above does, so serving needs no
-    /// branch. Stored as the pre-signed JSON string for the same reason DKG
-    /// payloads are: the publisher signs canonical bytes, and the server must
-    /// hand back exactly what was signed, not a re-serialization of it.
-    pub sign: BTreeMap<(u64, u32, RoundKey), String>,
+    /// Published signing payload JSON, keyed by `(epoch, sequence, session,
+    /// round)` — one FROST session per TM input, plus the reserved rotation
+    /// session. Folds the round into the key exactly as `dkg` above does, so
+    /// serving needs no branch. Stored as the pre-signed JSON string for the
+    /// same reason DKG payloads are: the publisher signs canonical bytes, and
+    /// the server must hand back exactly what was signed, not a
+    /// re-serialization of it.
+    ///
+    /// `sequence` is in the key for the same reason `attempt` is in `dkg`'s: a
+    /// retried movement is byte-identical, so without it the second attempt
+    /// reads the first's commitments (WI-W8ZC4).
+    pub sign: BTreeMap<(u64, u64, u32, RoundKey), String>,
     /// `protocol.state_dir` – where the epoch machine persists this node's
     /// swept peg-ins trie (`spi-trie.json`). The [SPI-4] proof route loads the
     /// trie from here at the point of use (the CpoTrie idiom), so it always
@@ -65,8 +70,14 @@ pub fn router(state: SharedState) -> Router {
             "/dkg/{epoch}/{threshold}/{attempt}/round2/{file}",
             get(get_dkg2),
         )
-        .route("/sign/{epoch}/round1/{session}/{file}", get(get_sign1))
-        .route("/sign/{epoch}/round2/{session}/{file}", get(get_sign2))
+        .route(
+            "/sign/{epoch}/{sequence}/round1/{session}/{file}",
+            get(get_sign1),
+        )
+        .route(
+            "/sign/{epoch}/{sequence}/round2/{session}/{file}",
+            get(get_sign2),
+        )
         .with_state(state)
 }
 
@@ -159,6 +170,7 @@ async fn serve_sign(
     state: SharedState,
     round: RoundKey,
     epoch: u64,
+    sequence: u64,
     session: u32,
     file: String,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -166,7 +178,7 @@ async fn serve_sign(
     check_pool_id(&file, &s.own_pool_id_hex)?;
     let body = s
         .sign
-        .get(&(epoch, session, round))
+        .get(&(epoch, sequence, session, round))
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(([(header::CONTENT_TYPE, "application/json")], body))
@@ -174,14 +186,14 @@ async fn serve_sign(
 
 async fn get_sign1(
     State(state): State<SharedState>,
-    Path((epoch, session, file)): Path<(u64, u32, String)>,
+    Path((epoch, sequence, session, file)): Path<(u64, u64, u32, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    serve_sign(state, RoundKey::Round1, epoch, session, file).await
+    serve_sign(state, RoundKey::Round1, epoch, sequence, session, file).await
 }
 
 async fn get_sign2(
     State(state): State<SharedState>,
-    Path((epoch, session, file)): Path<(u64, u32, String)>,
+    Path((epoch, sequence, session, file)): Path<(u64, u64, u32, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    serve_sign(state, RoundKey::Round2, epoch, session, file).await
+    serve_sign(state, RoundKey::Round2, epoch, sequence, session, file).await
 }

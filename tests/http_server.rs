@@ -78,14 +78,14 @@ async fn test_sign_routes_serve_stored_json_and_gate_on_pool_id() {
         let mut s = state.write().await;
         s.own_pool_id_hex = pool_hex.clone();
         s.sign
-            .insert((4, 0, RoundKey::Round1), r#"{"round":1}"#.to_string());
+            .insert((4, 1, 0, RoundKey::Round1), r#"{"round":1}"#.to_string());
         s.sign
-            .insert((4, 0, RoundKey::Round2), r#"{"round":2}"#.to_string());
+            .insert((4, 1, 0, RoundKey::Round2), r#"{"round":2}"#.to_string());
     }
     let base = spawn_server(state).await;
 
     for (round, body) in [("round1", r#"{"round":1}"#), ("round2", r#"{"round":2}"#)] {
-        let resp = reqwest::get(format!("{base}/sign/4/{round}/0/{pool_hex}.json"))
+        let resp = reqwest::get(format!("{base}/sign/4/1/{round}/0/{pool_hex}.json"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
@@ -94,13 +94,21 @@ async fn test_sign_routes_serve_stored_json_and_gate_on_pool_id() {
 
     // Another pool's id -> 404: a server only ever holds its own payloads.
     let other = hex::encode([9u8; 28]);
-    let resp = reqwest::get(format!("{base}/sign/4/round1/0/{other}.json"))
+    let resp = reqwest::get(format!("{base}/sign/4/1/round1/0/{other}.json"))
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
 
     // A session that was never published -> 404.
-    let resp = reqwest::get(format!("{base}/sign/4/round1/1/{pool_hex}.json"))
+    let resp = reqwest::get(format!("{base}/sign/4/1/round1/1/{pool_hex}.json"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // The next ATTEMPT at the same session -> 404. The sequence is a path
+    // segment, so a retried movement cannot be served the previous attempt's
+    // blob even though everything else about it is identical (WI-W8ZC4).
+    let resp = reqwest::get(format!("{base}/sign/4/2/round1/0/{pool_hex}.json"))
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
@@ -116,7 +124,7 @@ async fn test_sign_endpoints_404_when_empty() {
     let base = spawn_server(state).await;
 
     for round in ["round1", "round2"] {
-        let resp = reqwest::get(format!("{base}/sign/0/{round}/0/{pool_hex}.json"))
+        let resp = reqwest::get(format!("{base}/sign/0/1/{round}/0/{pool_hex}.json"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);

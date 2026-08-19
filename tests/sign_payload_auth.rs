@@ -48,8 +48,15 @@ fn identity(secp: &Secp256k1<All>, tag: u8) -> Identity {
     }
 }
 
+/// A namespace at the first batch opportunity — what almost every case here
+/// needs, since the sequence only matters where two ATTEMPTS are compared.
 fn ns(epoch: u64, session: u32, msg: u8) -> SignNamespace {
-    SignNamespace::new(epoch, session, [msg; 32])
+    ns_at(epoch, 1, session, msg)
+}
+
+/// A namespace at a named batch sequence.
+fn ns_at(epoch: u64, sequence: u64, session: u32, msg: u8) -> SignNamespace {
+    SignNamespace::new(epoch, sequence, session, [msg; 32])
 }
 
 /// One signer's commitments for a session.
@@ -187,6 +194,14 @@ fn round1_does_not_replay_into_another_session() {
         ("different epoch", ns(43, 0, 0x11)),
         ("different session", ns(42, 1, 0x11)),
         ("different message, same epoch+session", ns(42, 0, 0x12)),
+        // The one the message cannot catch: a movement rebuilt at the next
+        // opportunity when nothing on chain has changed is byte-identical, so
+        // its sighash — and therefore `message` — is the SAME. Only the
+        // sequence separates the two attempts (WI-W8ZC4).
+        (
+            "the next attempt at the same movement",
+            ns_at(42, 2, 0, 0x11),
+        ),
     ] {
         assert!(
             verify_sign_round1(&secp, &me.pool_id, &me.xonly, other, 1, &wire).is_err(),
@@ -290,7 +305,12 @@ fn round2_does_not_replay_into_another_session() {
         &signature_share(&kps, id, b"m"),
     )
     .unwrap();
-    for other in [ns(8, 3, 0x22), ns(7, 4, 0x22), ns(7, 3, 0x23)] {
+    for other in [
+        ns(8, 3, 0x22),
+        ns(7, 4, 0x22),
+        ns(7, 3, 0x23),
+        ns_at(7, 2, 3, 0x22),
+    ] {
         assert!(
             verify_sign_round2(&secp, &me.pool_id, &me.xonly, other, 1, &wire).is_err(),
             "a round2 payload must not replay into another session"
