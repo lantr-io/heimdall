@@ -171,12 +171,6 @@ pub struct MockCardanoChain {
     /// `query_treasury` returns this as Y_51 so the FROST group can
     /// sign the treasury input.
     treasury_y_51: Mutex<Option<bitcoin::key::UntweakedPublicKey>>,
-    /// Overrides `TreasuryUtxo::authorized_key` independently of `y_51`, which
-    /// the mock otherwise keeps equal. The two diverge on a real bridge for the
-    /// whole window between an Update-Y landing and the movement that acts on
-    /// it, and that window is a state worth testing: the datum names the
-    /// incoming roster while the coins are still locked under the outgoing key.
-    authorized_key_override: Mutex<Option<bitcoin::key::UntweakedPublicKey>>,
     /// Optional Bitcoin RPC config. When set, `submit_signed_tm` also
     /// broadcasts the signed BTC tx to the node via `sendrawtransaction`.
     btc_rpc: Option<BtcRpcConfig>,
@@ -269,21 +263,12 @@ pub struct MockTreasuryInfo {
 }
 
 impl MockCardanoChain {
-    /// Put the bridge in the post-Update-Y window: the datum authorizes
-    /// `key` while the treasury head stays locked under its own `y_51`.
-    #[must_use]
-    pub fn with_authorized_key(self, key: bitcoin::key::UntweakedPublicKey) -> Self {
-        *self.authorized_key_override.lock().unwrap() = Some(key);
-        self
-    }
-
     pub fn new(fixture: crate::epoch::fixture::StaticFixture) -> Self {
         Self {
             fixture,
             boundary_fired: Mutex::new(false),
             submitted_txs: Arc::new(Mutex::new(Vec::new())),
             treasury_y_51: Mutex::new(None),
-            authorized_key_override: Mutex::new(None),
             btc_rpc: None,
             dkg_faults: Arc::new(Mutex::new(Vec::new())),
             schedule_anchor_ms: None,
@@ -543,14 +528,8 @@ impl CardanoChain for MockCardanoChain {
             config_y_fed: y_fed,
             // The mock has no treasury_info datum: whatever key the head is
             // under is also the authorized one, which is the bootstrap
-            // (Phase-1) reading its fixture already models — unless a test asks
-            // for the post-Update-Y window, where the datum has rotated and the
-            // coins have not.
-            authorized_key: self
-                .authorized_key_override
-                .lock()
-                .unwrap()
-                .unwrap_or(y_51),
+            // (Phase-1) reading its fixture already models.
+            authorized_key: y_51,
             federation_csv_blocks: self.fixture.federation_csv_blocks,
             // The mock's tree is self-consistent; 720 > the fixture's 144 federation delay.
             pegin_refund_timeout_blocks: 720,
