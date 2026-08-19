@@ -370,6 +370,24 @@ pub struct SignCollected {
     pub nonces: BTreeMap<u32, frost::round1::SigningNonces>,
 }
 
+/// The epoch's own ceremony output, carried through the movement phases without
+/// being used by them.
+///
+/// It exists because `Sign`/`Submit`'s `roster` and `group_keys` are **not** the
+/// epoch's: a movement is a key-path spend of the treasury head, so the roster
+/// that signs it is whichever one holds `TreasuryUtxo::y_51`. After an Update-Y
+/// those differ for exactly one movement — the handoff — and the phases that
+/// sign, verify and post must all use the key the coins are locked under.
+///
+/// `RecordMovement` hands this back to `CollectPegins`, so the next batch
+/// re-selects a signer with this epoch's own keys still in the candidate set
+/// rather than depending on the state dir to hold them.
+#[derive(Debug, Clone)]
+pub struct EpochKeys {
+    pub roster: Roster,
+    pub group_keys: GroupKeys,
+}
+
 // ---------------------------------------------------------------------------
 // Phase enum
 // ---------------------------------------------------------------------------
@@ -451,9 +469,17 @@ pub enum EpochPhase {
     },
     Sign {
         epoch: u64,
+        /// The roster that holds `TreasuryUtxo::y_51` — the peers polled for
+        /// this movement's FROST rounds. See [`EpochKeys`] for why this is not
+        /// necessarily the epoch's own roster.
         roster: Roster,
         cascade: CascadeLevel,
+        /// The share of `TreasuryUtxo::y_51`, chosen by `build_tm_phase`. A
+        /// share only signs for the key its own ceremony produced, so this is
+        /// the outgoing roster's (or the federation's) for a handoff movement.
         group_keys: GroupKeys,
+        /// This epoch's ceremony output, ferried through untouched.
+        epoch_keys: EpochKeys,
         tm: TreasuryMovement,
         round: SigningRound,
         collected: SignCollected,
@@ -468,14 +494,15 @@ pub enum EpochPhase {
     },
     Submit {
         epoch: u64,
+        /// The roster that SIGNED — the cascade is elected over it, not over the
+        /// epoch's, because a node that holds no share of `y_51` declines at
+        /// `BuildTm` and never assembles a transaction to post. Electing over the
+        /// epoch's roster would hand hop 0 to a node with nothing to submit.
         roster: Roster,
-        /// Carried, not used: `Submit` and `RecordMovement` are the last two hops
-        /// before the machine returns to `CollectPegins` for the epoch's next
-        /// batch, and it must arrive there holding the same ceremony output. The
-        /// two phases used to drop it (`Submit` the keys, `RecordMovement` the
-        /// roster as well), which is why a completed movement could only be
-        /// followed by a fresh `EpochStart`.
+        /// Carried, not used here.
         group_keys: GroupKeys,
+        /// This epoch's ceremony output, ferried through untouched.
+        epoch_keys: EpochKeys,
         tm: TreasuryMovement,
         /// Which cascade hop this is. `Roster::leader` maps it to the SPO
         /// This movement's 0-indexed sequence within the epoch — the third
@@ -500,10 +527,15 @@ pub enum EpochPhase {
     /// unused. The fold happens where the head is OBSERVED, in `CollectPegins`.
     RecordMovement {
         epoch: u64,
-        /// See [`EpochPhase::Submit::group_keys`] — both ride through to the next
-        /// batch's `CollectPegins`.
+        /// Carried, not used: what actually rides through to the next batch's
+        /// `CollectPegins` is [`Self::RecordMovement::epoch_keys`]. These two
+        /// describe the movement just posted.
         roster: Roster,
         group_keys: GroupKeys,
+        /// This epoch's ceremony output — what `CollectPegins` is re-entered
+        /// with, so the next batch selects its signer with these keys in the
+        /// candidate set.
+        epoch_keys: EpochKeys,
         tm: TreasuryMovement,
     },
 }

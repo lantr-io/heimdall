@@ -281,6 +281,93 @@ fn not_ours(detail: String) -> EpochError {
     EpochError::NotOursToAuthorize(detail)
 }
 
+/// Where a share of some group key was found on this node.
+///
+/// Reported so the operator can see, in one log line, *why* this node considered
+/// itself able to sign — "the epoch's own ceremony", "the federation", or "the
+/// epoch-N ceremony still on disk" are three very different situations to be in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyHolder {
+    /// The caller's own in-hand ceremony output.
+    InHand,
+    /// The configured `[federation]` share.
+    Federation,
+    /// A persisted epoch DKG, named by the epoch whose ceremony produced it.
+    OutgoingEpoch(u64),
+}
+
+impl std::fmt::Display for KeyHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InHand => write!(f, "this epoch's own ceremony"),
+            Self::Federation => write!(f, "the federation share"),
+            Self::OutgoingEpoch(e) => write!(f, "the persisted epoch-{e} ceremony"),
+        }
+    }
+}
+
+/// Which roster and share on this node can sign under `key`, if any.
+///
+/// **The equality check is the whole safety argument, and it is the only one.**
+/// A FROST share is authority over exactly the key its own ceremony produced, so
+/// every candidate is compared against the group package it carries rather than
+/// against any label, epoch number or configured name. That makes the answer
+/// derived entirely from the key asked about: two nodes asked about the same key
+/// select the same ceremony, which is what lets them meet in a signing round.
+///
+/// Candidates, in order: the pair the caller already holds, the configured
+/// federation share, then the persisted epoch ceremonies newest-first. The order
+/// only decides which of several equal answers is reported — a node cannot hold
+/// two different shares of one key — so it is chosen to avoid touching the disk
+/// in the common case.
+///
+/// `Ok(None)` is a legitimate state, not an error: a node that holds no share of
+/// `key` simply is not one of the parties that can move it.
+pub fn holder_of(
+    config: &EpochConfig,
+    in_hand: Option<(&Roster, &GroupKeys)>,
+    key: &bitcoin::key::UntweakedPublicKey,
+) -> EpochResult<Option<(Roster, GroupKeys, KeyHolder)>> {
+    let matches = |keys: &GroupKeys| -> EpochResult<bool> {
+        Ok(group_xonly(&keys.verifying_key)
+            .map_err(EpochError::Frost)?
+            .xonly
+            == *key)
+    };
+
+    if let Some((roster, keys)) = in_hand
+        && matches(keys)?
+    {
+        return Ok(Some((
+            (*roster).clone(),
+            (*keys).clone(),
+            KeyHolder::InHand,
+        )));
+    }
+    if let Some(signer) = config.phase1_signer.as_ref()
+        && matches(&signer.group_keys)?
+    {
+        return Ok(Some((
+            signer.roster.clone(),
+            signer.group_keys.clone(),
+            KeyHolder::Federation,
+        )));
+    }
+    let Some(dir) = config.state_dir.as_deref() else {
+        return Ok(None);
+    };
+    for epoch in persisted_dkg_epochs(dir)? {
+        let Some(state) = read_dkg_state(dir, epoch)? else {
+            continue;
+        };
+        let keys = state.to_group_keys()?;
+        if matches(&keys)? {
+            return Ok(Some((state.roster, keys, KeyHolder::OutgoingEpoch(epoch))));
+        }
+    }
+    Ok(None)
+}
+
 /// Find the persisted DKG whose group key is the treasury's current key — the
 /// ceremony that produced the outgoing roster.
 ///

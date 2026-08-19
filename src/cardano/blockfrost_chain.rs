@@ -617,6 +617,18 @@ pub struct BlockfrostCardanoChain {
     /// `query_treasury` returns this as Y_51 so the FROST group can
     /// sign the treasury input (same pattern as MockCardanoChain).
     treasury_y_51: Mutex<Option<bitcoin::key::UntweakedPublicKey>>,
+    /// `protocol.state_dir`, read for the group keys of ceremonies this node took
+    /// part in — extra candidates for the head's internal key.
+    ///
+    /// The head is locked under the key that held the treasury when it was
+    /// created, and after an Update-Y that is a key the datum no longer names and
+    /// the current ceremony did not produce: the OUTGOING epoch's. Without it the
+    /// candidate list is `{this epoch's key, the datum's key, y_federation}` and a
+    /// node in the handoff window cannot reconstruct the head's scriptPubKey at
+    /// all — `query_treasury` fails outright, so the movement that would close the
+    /// window is never even attempted. `None` keeps the pre-existing candidates,
+    /// which is right for the one-shot CLI paths that persist no ceremony.
+    state_dir: Option<std::path::PathBuf>,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     submit_oracle: bool,
     /// Resolved Blockfrost base URL + project id, for raw-HTTP UTxO queries (lenient parsing).
@@ -866,6 +878,7 @@ impl BlockfrostCardanoChain {
             payment_key: None,
             wallet_base_address: None,
             treasury_y_51: Mutex::new(None),
+            state_dir: None,
             submit_oracle: true,
             tm_script_cbor: None,
             validity_window_secs: 1800,
@@ -1014,6 +1027,39 @@ impl BlockfrostCardanoChain {
         self.config_address = Some(address.to_string());
         self.config_nft_unit = Some(nft_unit.to_string());
         self
+    }
+
+    /// Where this node's persisted ceremonies live — see [`Self::state_dir`].
+    #[must_use]
+    pub fn with_state_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.state_dir = dir;
+        self
+    }
+
+    /// The group keys of every ceremony persisted under `state_dir`, newest
+    /// epoch first.
+    ///
+    /// Best-effort by design: these are only CANDIDATES, and the head's actual
+    /// scriptPubKey decides. A state dir that cannot be read must not turn a
+    /// treasury query into a failure — it just leaves the caller with the
+    /// candidates it had before.
+    fn persisted_internal_candidates(&self) -> Vec<bitcoin::key::UntweakedPublicKey> {
+        let Some(dir) = self.state_dir.as_deref() else {
+            return Vec::new();
+        };
+        let Ok(epochs) = crate::epoch::persist::persisted_dkg_epochs(dir) else {
+            return Vec::new();
+        };
+        epochs
+            .into_iter()
+            .filter_map(|e| crate::epoch::persist::read_dkg_state(dir, e).ok().flatten())
+            .filter_map(|state| state.to_group_keys().ok())
+            .filter_map(|keys| {
+                crate::frost::xonly::group_xonly(&keys.verifying_key)
+                    .ok()
+                    .map(|g| g.xonly)
+            })
+            .collect()
     }
 
     /// The `bitcoin.fee_rate_sat_per_vb` dev override, for the paths that have no
@@ -1836,12 +1882,20 @@ impl CardanoChain for BlockfrostCardanoChain {
         // to the configured value, which meant a node restarted after an Update-Y
         // had exactly one guess and it was the wrong one — the match failed and
         // the node could not read the treasury at all. The head can legitimately
-        // be under either the authorized key (steady state) or the key it
-        // superseded (the handoff window, where Cardano has rotated but the BTC
-        // has not moved yet), so both are offered and the chain decides.
+        // be under the authorized key (steady state), the key it superseded (the
+        // handoff window, where Cardano has rotated but the BTC has not moved
+        // yet), or `y_federation` (a bridge that has never rotated), so all are
+        // offered and the chain decides.
+        //
+        // The superseded key is neither configured nor in the datum — the datum
+        // holds only the CURRENT one — so it comes from the ceremonies this node
+        // persisted. That is also why it is a list rather than one previous key:
+        // an epoch whose DKG failed posts no Update-Y and the old key carries
+        // over, so the head can be several ceremonies behind.
         let mut internal_candidates = vec![maybe_key.unwrap_or(self.treasury_config.y_51)];
         for cand in authorized_key
             .into_iter()
+            .chain(self.persisted_internal_candidates())
             .chain([self.treasury_config.y_fed])
         {
             if !internal_candidates.contains(&cand) {
@@ -2731,9 +2785,91 @@ fn viable_in_flight_spends(
 mod tests {
     use super::{BlockfrostCardanoChain, DkgFaultBanFlow, viable_in_flight_spends};
     use crate::cardano::treasury_datum::UnconfirmedTm;
+    use crate::epoch::state::Roster;
     use bitcoin::hashes::Hash as _;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
     use std::collections::HashSet;
+
+    /// One dealer-generated FROST group, standing in for a ceremony output. What
+    /// is under test is which group KEYS a persisted ceremony contributes, so how
+    /// the shares were produced does not matter.
+    fn dealt_group_keys() -> crate::epoch::state::GroupKeys {
+        use frost_secp256k1_tr as frost;
+        let (shares, pkp) = frost::keys::generate_with_dealer(
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            &mut rand::thread_rng(),
+        )
+        .unwrap();
+        let share = shares.into_values().next().unwrap();
+        crate::epoch::state::GroupKeys {
+            verifying_key: *pkp.verifying_key(),
+            public_key_package: pkp,
+            key_package: frost::keys::KeyPackage::try_from(share).unwrap(),
+        }
+    }
+
+    /// The head's internal key after an Update-Y is the OUTGOING ceremony's, and
+    /// nothing on chain names it: the datum holds only the key that supersedes
+    /// it. So it has to come from the ceremonies this node persisted, or the
+    /// candidate list cannot reproduce the head's scriptPubKey and
+    /// `query_treasury` fails outright — taking with it the very movement that
+    /// would close the window.
+    ///
+    /// Newest first, and several deep: an epoch whose DKG fails posts no Update-Y
+    /// and the old key carries over, so the head can be more than one ceremony
+    /// behind.
+    #[test]
+    fn persisted_ceremonies_are_offered_as_internal_key_candidates() {
+        use crate::epoch::persist::{PersistedDkg, write_dkg_state};
+
+        let dir = std::env::temp_dir().join(format!(
+            "wi75wte-candidates-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // No state dir → the candidates this node had before, and no failure.
+        assert!(bare_chain().persisted_internal_candidates().is_empty());
+        let chain = bare_chain().with_state_dir(Some(dir.clone()));
+        assert!(
+            chain.persisted_internal_candidates().is_empty(),
+            "an unreadable or absent state dir is not an error — the head's own \
+             scriptPubKey is still what decides"
+        );
+
+        let mut expected = Vec::new();
+        for epoch in [6u64, 7] {
+            let keys = dealt_group_keys();
+            expected.push(
+                crate::frost::xonly::group_xonly(&keys.verifying_key)
+                    .unwrap()
+                    .xonly,
+            );
+            write_dkg_state(
+                &dir,
+                &PersistedDkg::from_output(
+                    epoch,
+                    0,
+                    &Roster {
+                        epoch,
+                        min_signers: 2,
+                        max_signers: 3,
+                        participants: Default::default(),
+                    },
+                    &keys,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        expected.reverse(); // newest epoch first
+
+        assert_eq!(chain.persisted_internal_candidates(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A chain with no Bitcoin/Cardano state worth speaking of — enough to reach
     /// the pure branches of `current_federation`, which is the only thing these

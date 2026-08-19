@@ -2017,7 +2017,16 @@ async fn run_spo(
         )
         // Only reached when no Config UTxO is configured — with one, the batch's
         // fee rate is the Config's (WI-040).
-        .with_local_fee_rate(cfg.bitcoin.fee_rate_sat_per_vb);
+        .with_local_fee_rate(cfg.bitcoin.fee_rate_sat_per_vb)
+        // The ceremonies this node has persisted, so the treasury reader can
+        // recognise a head still locked under the OUTGOING epoch's key — the state
+        // every bridge is in between an Update-Y and the movement that acts on it.
+        .with_state_dir(
+            cfg.protocol
+                .state_dir
+                .as_deref()
+                .map(std::path::PathBuf::from),
+        );
 
         // The on-chain bridge-state singleton, so BuildTm can cross-check the
         // persisted trie against it before signing anything. Config #4, so there is

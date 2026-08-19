@@ -81,6 +81,14 @@ pub struct TreasuryUtxo {
     /// The Taproot internal key of the *current* treasury (the Y_51 it
     /// was locked under). At bootstrap this equals `y_fed`; after the
     /// first DKG it is the previous epoch's FROST group x-only key.
+    ///
+    /// **This is the field that decides who can SIGN a movement, and only this
+    /// one.** A movement is a key-path spend of the head, so it is authorized by
+    /// a signature under this key and by nothing else — the datum's
+    /// [`Self::authorized_key`] is a Cardano statement of intent that Bitcoin
+    /// never reads. The two agree except for the one movement after an Update-Y,
+    /// and that movement is precisely the one a node must not decline on the
+    /// strength of the datum.
     pub y_51: bitcoin::key::UntweakedPublicKey,
     /// The federation leaf key of the TREASURY tree — chosen by matching the head's
     /// scriptPubKey against the candidates, so on a bridge still using the collapsed
@@ -102,12 +110,19 @@ pub struct TreasuryUtxo {
     /// BTC stays under the old key until a movement spends it there and pays the
     /// change to the new address.
     ///
-    /// This is the field that decides the ROLLOUT PHASE, and only this one.
-    /// §Rollout Phases: "there is no phase flag anywhere — the transition *is*
-    /// the first Update-Y", so `authorized_key == config_y_fed` is precisely the
-    /// statement that no Update-Y has ever landed and the federation is still the
-    /// key-path signer. Comparing `y_51` instead would answer a different
-    /// question and get it wrong for a whole movement's worth of the handoff.
+    /// This is the field that decides the ROLLOUT PHASE, and where a movement's
+    /// change output PAYS — and only those. §Rollout Phases: "there is no phase
+    /// flag anywhere — the transition *is* the first Update-Y", so
+    /// `authorized_key == config_y_fed` is precisely the statement that no
+    /// Update-Y has ever landed. Comparing `y_51` instead would answer a
+    /// different question and get it wrong for a whole movement's worth of the
+    /// handoff.
+    ///
+    /// It does NOT decide who signs. That is [`Self::y_51`], because a share is
+    /// authority over the key its own ceremony produced and the head is locked
+    /// under that key whatever the datum says. Reading this field as "who may
+    /// move the treasury" deadlocks the handoff: the roster the datum names
+    /// cannot spend the head, and the party that can believes it is retired.
     pub authorized_key: bitcoin::key::UntweakedPublicKey,
     pub federation_csv_blocks: u16,
     /// The peg-in refund leaf's CSV delay, Config `params[8]` ([CFG-9]) — carried

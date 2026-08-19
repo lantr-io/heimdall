@@ -20,7 +20,7 @@ use frost_secp256k1_tr as frost;
 
 use crate::epoch::log::id_short;
 use crate::epoch::state::{
-    CascadeLevel, EpochConfig, EpochError, EpochPhase, EpochResult, GroupKeys, Roster,
+    CascadeLevel, EpochConfig, EpochError, EpochKeys, EpochPhase, EpochResult, GroupKeys, Roster,
     SignCollected, SigningRound, TreasuryMovement,
 };
 use crate::epoch::traits::{Clock, PeerNetwork, RngSource};
@@ -77,9 +77,14 @@ pub async fn sign_phase(
     rng: &Arc<dyn RngSource>,
     config: &EpochConfig,
     epoch: u64,
+    // The roster that holds the key the treasury head is locked under, chosen by
+    // `build_tm_phase` — see `EpochKeys`. Not necessarily this epoch's own.
     roster: Roster,
     cascade: CascadeLevel,
     group_keys: GroupKeys,
+    // Ferried, not used: this epoch's ceremony output, on its way back to
+    // `CollectPegins` for the next batch.
+    epoch_keys: EpochKeys,
     mut tm: TreasuryMovement,
     round: SigningRound,
     mut collected: SignCollected,
@@ -248,6 +253,7 @@ pub async fn sign_phase(
                 window,
                 cascade,
                 group_keys,
+                epoch_keys,
                 tm,
                 round: SigningRound::Round2,
                 collected,
@@ -378,6 +384,7 @@ pub async fn sign_phase(
                 epoch,
                 roster,
                 group_keys,
+                epoch_keys,
                 tm,
                 tm_sequence,
             })
@@ -1097,9 +1104,13 @@ mod tests {
             &rng,
             &config,
             0,
-            roster,
+            roster.clone(),
             CascadeLevel::Quorum51,
-            me_keys,
+            me_keys.clone(),
+            EpochKeys {
+                roster,
+                group_keys: me_keys,
+            },
             tm,
             SigningRound::Round1,
             SignCollected::default(),
@@ -1315,9 +1326,13 @@ mod tests {
                     epoch: 0,
                     tm_sequence: 0,
                     window: test_window(60_000),
-                    roster,
+                    roster: roster.clone(),
                     cascade: CascadeLevel::Quorum51,
-                    group_keys: gk,
+                    group_keys: gk.clone(),
+                    epoch_keys: EpochKeys {
+                        roster,
+                        group_keys: gk,
+                    },
                     tm,
                     round: SigningRound::Round1,
                     collected: SignCollected::default(),
@@ -1331,6 +1346,7 @@ mod tests {
                             tm_sequence,
                             window,
                             group_keys,
+                            epoch_keys,
                             tm,
                             round,
                             collected,
@@ -1343,6 +1359,7 @@ mod tests {
                             roster,
                             cascade,
                             group_keys,
+                            epoch_keys,
                             tm,
                             round,
                             collected,

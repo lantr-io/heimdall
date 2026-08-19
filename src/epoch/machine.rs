@@ -64,7 +64,8 @@ use crate::epoch::rotation;
 use crate::epoch::signing::sign_phase;
 use crate::epoch::state::{
     CascadeLevel, DKG_ATTEMPTS_PER_WINDOW, DkgCollected, DkgRound, EpochConfig, EpochError,
-    EpochPhase, EpochResult, GroupKeys, Roster, SignCollected, SigningRound, TreasuryMovement,
+    EpochKeys, EpochPhase, EpochResult, GroupKeys, Roster, SignCollected, SigningRound,
+    TreasuryMovement,
 };
 use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use crate::frost::xonly::group_xonly;
@@ -631,6 +632,7 @@ async fn step_phase(
             tm_sequence,
             window,
             group_keys,
+            epoch_keys,
             tm,
             round,
             collected,
@@ -644,6 +646,7 @@ async fn step_phase(
                 roster,
                 cascade,
                 group_keys,
+                epoch_keys,
                 tm,
                 round,
                 collected,
@@ -657,27 +660,44 @@ async fn step_phase(
             epoch,
             roster,
             group_keys,
+            epoch_keys,
             tm,
             tm_sequence,
-        } => submit_phase(chain, me, epoch, roster, group_keys, tm, tm_sequence).await?,
+        } => {
+            submit_phase(
+                chain,
+                me,
+                epoch,
+                roster,
+                group_keys,
+                epoch_keys,
+                tm,
+                tm_sequence,
+            )
+            .await?
+        }
 
         EpochPhase::RecordMovement {
             epoch,
-            roster,
-            group_keys,
+            epoch_keys,
             tm,
+            ..
         } => {
             record_movement_phase(config, epoch, &tm)?;
             // Back to the epoch's batch loop, not out of it. This movement is
-            // posted; the EPOCH is not over, and the roster + keys that signed
-            // this one sign every remaining batch — `CollectPegins` decides
-            // whether any opportunity is left and returns `Idle` when none is.
+            // posted; the EPOCH is not over — `CollectPegins` decides whether any
+            // opportunity is left and returns `Idle` when none is.
+            //
+            // The EPOCH's keys are what goes back, not the ones that just signed:
+            // those two differ for a handoff movement, and the next batch must
+            // select its signer with this node's own ceremony output in the
+            // candidate set.
             return Ok(Step::Done(
                 tm,
                 EpochPhase::CollectPegins {
                     epoch,
-                    roster,
-                    group_keys,
+                    roster: epoch_keys.roster,
+                    group_keys: epoch_keys.group_keys,
                 },
             ));
         }
@@ -1044,19 +1064,35 @@ fn dkg_unavailable(e: &EpochError) -> bool {
 /// Declining returns the ORIGINAL DKG error, so a node that is not a federation
 /// member keeps the diagnostic that actually applies to it.
 ///
-/// **The phase test is a comparison, not a flag.** §Rollout Phases is explicit
-/// that "there is no phase flag anywhere — the transition *is* the first
-/// Update-Y", and the TreasuryDatum table says `current_spos_frost_key` holds
-/// "$Y_{51}$ after the first successful DKG; **$Y_{federation}$ from K1 until
-/// then**". So `authorized_key == config_y_fed` is exactly the statement that no
-/// Update-Y has ever landed, and the two diverge for ever the moment one does.
-/// Nothing is configured and nothing is remembered across restarts: a node that
-/// joins a bridge mid-life reaches the same answer as one that watched it deploy.
+/// **The test is a comparison, not a flag.** §Rollout Phases is explicit that
+/// "there is no phase flag anywhere — the transition *is* the first Update-Y",
+/// and the TreasuryDatum table says `current_spos_frost_key` holds "$Y_{51}$
+/// after the first successful DKG; **$Y_{federation}$ from K1 until then**". So
+/// `authorized_key == config_y_fed` is exactly the statement that no Update-Y has
+/// ever landed. Nothing is configured and nothing is remembered across restarts:
+/// a node that joins a bridge mid-life reaches the same answer as one that
+/// watched it deploy.
 ///
-/// Both halves come from ONE chain read — see [`TreasuryUtxo::authorized_key`]
-/// for why it is that field and not `y_51`.
+/// **But the phase is not the question this function asks.** What decides whether
+/// the federation should sign a movement is who holds the COINS, and an Update-Y
+/// does not move any: it rotates a Cardano datum, while the treasury stays locked
+/// under the old Bitcoin key until a movement spends it there. Neither chain
+/// takes the datum's word for who may spend — Bitcoin checks the signature
+/// against the spent output's key, and the Post-TM carries no authorization at
+/// all — so for exactly one movement after a rotation the federation is the only
+/// party that can move the treasury, and the datum says it is retired.
+///
+/// So this declines only when the datum has rotated AND the head has followed it
+/// ([`TreasuryUtxo::y_51`]), and the share check below is against `y_51` rather
+/// than against the datum. Getting this wrong is not a lost batch: the handoff
+/// movement is the only thing that makes the two fields agree again, so a
+/// federation that stands down early strands the rotation half-done for ever.
+///
+/// Every half comes from ONE chain read — see [`TreasuryUtxo::authorized_key`]
+/// for what that field does and does not decide.
 ///
 /// [`TreasuryUtxo::authorized_key`]: crate::epoch::traits::TreasuryUtxo::authorized_key
+/// [`TreasuryUtxo::y_51`]: crate::epoch::traits::TreasuryUtxo::y_51
 #[allow(clippy::too_many_arguments)]
 async fn phase1_fallback(
     chain: &Arc<dyn CardanoChain>,
@@ -1083,10 +1119,19 @@ async fn phase1_fallback(
             return Err(dkg_err);
         }
     };
-    if treasury.authorized_key != treasury.config_y_fed {
-        // Phase 2: a DKG key owns the treasury, so a failed ceremony is just a
-        // failed ceremony. The old roster carries over and the next boundary
-        // retries — the spec's "no halt, no special state".
+    if treasury.authorized_key != treasury.config_y_fed && treasury.y_51 != treasury.config_y_fed {
+        // Phase 2, and the coins have followed the datum: a DKG key both owns
+        // and authorizes the treasury, so a failed ceremony is just a failed
+        // ceremony. The old roster carries over and the next boundary retries —
+        // the spec's "no halt, no special state".
+        //
+        // The second half of the condition is what makes this the PHASE test and
+        // not a custody test. Between an Update-Y and the handoff movement that
+        // acts on it the datum names a roster key while the head is still locked
+        // under `y_federation`; declining there would leave the one movement only
+        // the federation can make to a roster that cannot make it. What actually
+        // decides whether this node signs is the share check below, against
+        // `y_51`.
         return Err(dkg_err);
     }
 
@@ -1097,10 +1142,9 @@ async fn phase1_fallback(
         crate::epoch_log!(
             log_id,
             epoch,
-            "  the bridge is still in Phase 1 (treasury key == Config y_federation {}), so \
-             treasury movements are the FEDERATION's to sign. This node holds no federation \
-             share, so it has nothing to contribute until the first Update-Y hands the \
-             treasury to an SPO roster",
+            "  the treasury head is still locked under Config y_federation {}, so this movement \
+             is the FEDERATION's to sign. This node holds no federation share, so it has \
+             nothing to contribute until the treasury is handed to an SPO roster",
             hex::encode(treasury.config_y_fed.serialize())
         );
         return Err(dkg_err);
@@ -1161,9 +1205,9 @@ async fn phase1_fallback(
     crate::epoch_log!(
         log_id,
         epoch,
-        "Phase 1: no Update-Y has landed (treasury key == Config y_federation {}), so the \
-         FEDERATION signs this movement's key path — {}-of-{}, this node at index {}. Skipping \
-         DKG: there is no roster to run one over and no key to rotate to",
+        "the treasury head is locked under Config y_federation {}, so the FEDERATION signs this \
+         movement's key path — {}-of-{}, this node at index {}. Skipping DKG: this node is not \
+         in the SPO roster",
         hex::encode(treasury.config_y_fed.serialize()),
         roster.min_signers,
         roster.max_signers,
@@ -1193,17 +1237,41 @@ async fn phase1_fallback(
     // a failure here must not cost the movement this fallback exists to make,
     // so it logs and returns rather than propagating.
     if try_succession_handoff(chain, peers, clock, rng, config, epoch, signer, log_id).await {
-        // The rotation landed, so `current_spos_frost_key` is the ROSTER's key
-        // now and this node's federation share no longer authorizes anything.
-        // Continuing into CollectPegins would spend the rest of the epoch
-        // building movements signed under a key the datum no longer names —
-        // every one rejected on chain, by the node that just logged that its own
-        // share "stops being the treasury's authority from here".
+        // The rotation landed — and the treasury has NOT moved. An Update-Y
+        // rotates the datum; it does not spend a Bitcoin output. The head is
+        // still locked under the federation key checked above, and neither chain
+        // takes the datum's word for who may spend it: Bitcoin checks the
+        // signature against the spent output's key, and the Post-TM is
+        // permissionless on Cardano. So this node's share is not merely still
+        // valid, it is the ONLY thing that can make the handoff movement.
         //
-        // Re-entering EpochStart re-reads the phase from the chain instead: the
-        // node then finds `authorized_key != config_y_fed`, i.e. Phase 2, and
-        // the fallback declines for the right reason rather than by accident.
-        return Ok(EpochPhase::EpochStart { epoch });
+        // Which is why this continues into CollectPegins rather than returning
+        // to EpochStart. Standing down here left the rotation half-done for ever:
+        // the datum named the roster, the coins stayed with the federation, and
+        // the movement that would have reconciled them was the one movement
+        // nobody would sign. `build_tm_phase` pays the change to
+        // `treasury.authorized_key` — the roster this node has just handed the
+        // datum to — so making this movement is what retires the share, and the
+        // next epoch's gate above then declines for the right reason.
+        crate::epoch_log!(
+            log_id,
+            epoch,
+            "  the Update-Y is posted, but the treasury head is still locked under the \
+             federation key — making the handoff movement that pays it to the new roster \
+             before standing down"
+        );
+        // ...once the chain SHOWS the rotation. `submit_update_y` returns when the
+        // transaction is accepted, not when it is in a block, so the datum read
+        // that `BuildTm` makes moments later can still answer with the key this
+        // node has just replaced. The movement would then pay its change to the
+        // federation — a self-send that burns a fee and leaves the window exactly
+        // as wide as it was.
+        if !await_datum_rotation(chain, config, epoch, treasury.config_y_fed, log_id).await {
+            // Not seen in time. Re-entering EpochStart re-reads everything next
+            // turn, which is the same answer this wait was after — no movement is
+            // lost, because none can be made until the rotation is visible.
+            return Ok(EpochPhase::EpochStart { epoch });
+        }
     }
 
     Ok(EpochPhase::CollectPegins {
@@ -1211,6 +1279,49 @@ async fn phase1_fallback(
         roster,
         group_keys: signer.group_keys.clone(),
     })
+}
+
+/// Wait until `treasury_info` no longer names `y_federation`, i.e. until the
+/// Update-Y this node just posted is visible on chain.
+///
+/// Returns whether it was seen. The budget matches
+/// [`wait_for_published_namespace`]'s and for the same reason: scaled from the
+/// poll interval so a unit test exercises the path in milliseconds rather than
+/// waiting it out, ~10 minutes at the production cadence.
+///
+/// A read error is not a "no" — it is retried, because a provider hiccup says
+/// nothing about whether the rotation landed.
+async fn await_datum_rotation(
+    chain: &Arc<dyn CardanoChain>,
+    config: &EpochConfig,
+    epoch: u64,
+    y_fed: bitcoin::key::UntweakedPublicKey,
+    log_id: frost::Identifier,
+) -> bool {
+    let deadline = std::time::Instant::now() + config.poll_interval.saturating_mul(120);
+    loop {
+        match chain.query_treasury().await {
+            Ok(t) if t.authorized_key != y_fed => return true,
+            Ok(_) => {}
+            Err(e) => crate::epoch_warn!(
+                log_id,
+                epoch,
+                "  handoff: could not re-read the treasury while waiting for the rotation to \
+                 appear: {e}"
+            ),
+        }
+        if std::time::Instant::now() >= deadline {
+            crate::epoch_warn!(
+                log_id,
+                epoch,
+                "  handoff: the Update-Y was posted but treasury_info still names y_federation \
+                 {} — not building a movement against a datum that has not caught up",
+                hex::encode(y_fed.serialize())
+            );
+            return false;
+        }
+        tokio::time::sleep(config.poll_interval).await;
+    }
 }
 
 /// Poll the roster until it advertises one agreed DKG namespace, or the budget
@@ -2741,6 +2852,68 @@ async fn build_tm_phase(
         budget.max_pegins_with(0),
     );
 
+    // --- Who signs this movement, and where the coins go ---
+    //
+    // Two different keys, and conflating them is what stalled the bridge. A
+    // movement SPENDS the head, so it must be signed under `treasury.y_51` —
+    // what the head is locked under. It PAYS the change to
+    // `treasury.authorized_key` — what the datum says should hold the treasury
+    // from here. Those agree in steady state and differ for exactly one
+    // movement: the handoff after an Update-Y, which is the movement that makes
+    // them agree again. Taking either from this phase's own `group_keys` gets
+    // that one movement wrong in both directions at once — the node signs with a
+    // key that owns nothing, and pays the change back to itself, so the window
+    // never closes.
+    let Some((signing_roster, signing_keys, holder)) =
+        crate::epoch::rotation::holder_of(config, Some((&roster, &group_keys)), &treasury.y_51)?
+    else {
+        // Declining is the whole point: without this the node would run both
+        // FROST rounds, fail `submit_phase`'s verification as
+        // `SignatureVerify`, and re-enter on a spent signing round — burning a
+        // batch opportunity per `B_i` and reporting what reads as a crypto
+        // fault. Back to `CollectPegins`: the opportunity is already marked, so
+        // this waits for the next `B_i` rather than spinning, and by then the
+        // party that DOES hold the key may have moved the treasury.
+        crate::epoch_log!(
+            me,
+            epoch,
+            "BuildTm: not this node's movement to sign — the treasury head {} is locked under \
+             {}, and this node holds no share of it (the datum authorizes {}). Waiting for the \
+             holder of that key to move the treasury",
+            treasury.outpoint,
+            hex::encode(treasury.y_51.serialize()),
+            hex::encode(treasury.authorized_key.serialize()),
+        );
+        return Ok(EpochPhase::CollectPegins {
+            epoch,
+            roster,
+            group_keys,
+        });
+    };
+    if holder != crate::epoch::rotation::KeyHolder::InHand {
+        // Two ways to get here, and they are worth telling apart in a log. The
+        // datum has rotated and the coins have not (the handoff), or the datum
+        // never rotated because this epoch's Update-Y did not land and the old
+        // roster carries over — the spec's "no halt, no special state". Either
+        // way this node signs with the share that matches the head.
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  the treasury head is locked under {}, which is not this epoch's ceremony key — \
+             signing with {} ({}-of-{}) and paying the change to the datum's authorized key {}{}",
+            hex::encode(treasury.y_51.serialize()),
+            holder,
+            signing_roster.min_signers,
+            signing_roster.max_signers,
+            hex::encode(treasury.authorized_key.serialize()),
+            if treasury.authorized_key == treasury.y_51 {
+                ", which the head already sits at (the rotation this epoch did not land)"
+            } else {
+                ", which is what hands custody over"
+            },
+        );
+    }
+
     let secp = Secp256k1::new();
 
     // Treasury *input* spend info: the current treasury is locked under
@@ -2753,14 +2926,14 @@ async fn build_tm_phase(
         treasury.federation_csv_blocks,
     );
 
-    // Treasury *change output*: send to the new roster's Taproot address,
-    // using the just-derived FROST group key as the internal key.
-    let new_y_51 = group_xonly(&group_keys.verifying_key)
-        .map_err(EpochError::Frost)?
-        .xonly;
+    // Treasury *change output*: the address of the key the bridge AUTHORIZES,
+    // read from the datum rather than from this node's own ceremony output. The
+    // spec's output-0 rule is state-derived, and this is the field that holds
+    // that state — so every node building this movement derives the same address
+    // whether it is an SPO, an outgoing SPO or a federation member.
     let change_spend = treasury_spend_info(
         &secp,
-        new_y_51,
+        treasury.authorized_key,
         treasury.y_fed,
         treasury.federation_csv_blocks,
     );
@@ -2944,9 +3117,10 @@ async fn build_tm_phase(
 
     Ok(EpochPhase::Sign {
         epoch,
-        roster,
+        roster: signing_roster,
         cascade: CascadeLevel::Quorum51,
-        group_keys,
+        group_keys: signing_keys,
+        epoch_keys: EpochKeys { roster, group_keys },
         tm,
         round: SigningRound::Round1,
         collected: SignCollected::default(),
@@ -3082,8 +3256,14 @@ async fn submit_phase(
     chain: &Arc<dyn CardanoChain>,
     me: frost_secp256k1_tr::Identifier,
     epoch: u64,
+    // The roster that SIGNED this movement — the cascade is elected over it. A
+    // node that holds no share of `treasury.y_51` declines at `BuildTm`, so
+    // electing over the epoch's roster could hand hop 0 to a node with nothing
+    // to post.
     roster: Roster,
     group_keys: GroupKeys,
+    // Ferried through to `RecordMovement`, which hands it back to the batch loop.
+    epoch_keys: EpochKeys,
     mut tm: TreasuryMovement,
     tm_sequence: u64,
 ) -> EpochResult<EpochPhase> {
@@ -3201,6 +3381,7 @@ async fn submit_phase(
                     epoch,
                     roster,
                     group_keys,
+                    epoch_keys,
                     tm,
                 });
             }
@@ -3225,6 +3406,7 @@ async fn submit_phase(
                     epoch,
                     roster,
                     group_keys,
+                    epoch_keys,
                     tm,
                 });
             }
@@ -3248,6 +3430,7 @@ async fn submit_phase(
         epoch,
         roster,
         group_keys,
+        epoch_keys,
         tm,
     })
 }
@@ -3567,9 +3750,22 @@ mod tests {
             }));
         }
         for h in handles {
-            h.await
+            let next = h
+                .await
                 .unwrap()
                 .expect("Phase 1 with a share must continue");
+            // ...and continues into the BATCH loop, not back to `EpochStart`.
+            // Posting the Update-Y rotates a Cardano datum; it does not spend a
+            // Bitcoin output, so the treasury is still locked under `y_fed` and
+            // this node's share is the only thing that can hand it over. Standing
+            // down here left the rotation half-done for ever — the datum named the
+            // roster, the coins stayed with the federation, and the movement that
+            // would have reconciled them was the one movement nobody would sign.
+            assert!(
+                matches!(next, EpochPhase::CollectPegins { .. }),
+                "expected CollectPegins after the rotation, got {}",
+                next.name()
+            );
         }
 
         let recorded = state.lock().unwrap();
@@ -3791,6 +3987,418 @@ mod tests {
                 );
             }
             other => panic!("expected CollectPegins, got {}", other.name()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The handoff window: the datum names one key, the coins are under another
+    // -----------------------------------------------------------------------
+
+    /// One dealer-generated FROST group, as a roster + this node's share.
+    ///
+    /// Enough for the movement-BUILDING tests, which never run a round: what is
+    /// under test is which share a node picks up and where it sends the change,
+    /// and both are decided before the first nonce.
+    fn group_for(min_signers: u16, max_signers: u16) -> (Roster, GroupKeys) {
+        let (signer, keys) = phase1_signer_for(min_signers, max_signers);
+        (signer.roster, keys)
+    }
+
+    fn xonly_of(keys: &GroupKeys) -> bitcoin::key::UntweakedPublicKey {
+        group_xonly(&keys.verifying_key).unwrap().xonly
+    }
+
+    /// The Taproot scriptPubKey a treasury output under `internal` has, using the
+    /// treasury's own federation leaf and delay. Recomputed here rather than
+    /// asserted against a constant, so the test states the RULE (output 0 pays
+    /// the key the datum names) rather than a derivation.
+    fn treasury_spk(
+        treasury: &crate::epoch::traits::TreasuryUtxo,
+        internal: bitcoin::key::UntweakedPublicKey,
+    ) -> bitcoin::ScriptBuf {
+        bitcoin::ScriptBuf::new_p2tr_tweaked(
+            treasury_spend_info(
+                &Secp256k1::new(),
+                internal,
+                treasury.y_fed,
+                treasury.federation_csv_blocks,
+            )
+            .output_key(),
+        )
+    }
+
+    /// A chain standing in the window: the head locked under `head`, the datum
+    /// naming `authorized`.
+    fn chain_mid_handoff(
+        port: u16,
+        head: bitcoin::key::UntweakedPublicKey,
+        authorized: bitcoin::key::UntweakedPublicKey,
+    ) -> Arc<dyn CardanoChain> {
+        let mut fixture = demo_static_fixture(2, 2, port);
+        fixture.y_51 = head;
+        fixture.y_fed = head;
+        Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(head)
+                .with_treasury_info(MockCardanoChain::treasury_info_state(
+                    authorized, [0x5a; 32],
+                )),
+        )
+    }
+
+    /// SPO side. Epoch 8's Update-Y has landed, so the datum names epoch 8's key
+    /// — but the treasury head is still locked under epoch 7's, because an
+    /// Update-Y spends no Bitcoin output. The node must sign with the epoch-7
+    /// share it still has on disk, and pay the change to epoch 8's address.
+    ///
+    /// Before this, `build_tm_phase` took BOTH from the phase's own `group_keys`:
+    /// it signed with a key that owns nothing (failing at `Submit` as
+    /// `SignatureVerify`, then again on a spent round) and paid the change to the
+    /// key that already held the datum. Every batch of every epoch, for ever —
+    /// the handoff is the only movement that makes the two fields agree, so a
+    /// bridge that cannot make it never leaves the window.
+    #[tokio::test]
+    async fn the_handoff_is_signed_by_the_outgoing_roster_and_paid_to_the_incoming_one() {
+        let (outgoing_roster, outgoing_keys) = group_for(2, 3);
+        let (incoming_roster, incoming_keys) = group_for(2, 3);
+        let y_out = xonly_of(&outgoing_keys);
+        let y_in = xonly_of(&incoming_keys);
+        assert_ne!(y_out, y_in);
+
+        let config = fast_config(Identifier::try_from(1u16).unwrap());
+        // The outgoing ceremony, as `PublishKeys` left it on disk at epoch 7.
+        crate::epoch::persist::write_dkg_state(
+            config.state_dir.as_deref().unwrap(),
+            &crate::epoch::persist::PersistedDkg::from_output(
+                7,
+                0,
+                &outgoing_roster,
+                &outgoing_keys,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let chain = chain_mid_handoff(19310, y_out, y_in);
+        let treasury = chain.query_treasury().await.unwrap();
+        assert_eq!(treasury.y_51, y_out, "the head has not moved");
+        assert_eq!(treasury.authorized_key, y_in, "the datum has");
+
+        let next = build_tm_phase(
+            &chain,
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &config,
+            8,
+            incoming_roster,
+            incoming_keys.clone(),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("the handoff movement is buildable");
+
+        let EpochPhase::Sign {
+            roster,
+            group_keys,
+            epoch_keys,
+            tm,
+            ..
+        } = next
+        else {
+            panic!("expected Sign, got {}", next.name());
+        };
+        // Signed by the share of the key the coins are under...
+        assert_eq!(
+            xonly_of(&group_keys),
+            y_out,
+            "the movement must be signed under the key the head is locked under"
+        );
+        assert_eq!(
+            roster.participants.keys().collect::<Vec<_>>(),
+            outgoing_roster.participants.keys().collect::<Vec<_>>(),
+            "and polled among the roster that holds it"
+        );
+        // ...while THIS epoch's ceremony rides through untouched, so the next
+        // batch — by which time the head has moved — selects it again.
+        assert_eq!(xonly_of(&epoch_keys.group_keys), y_in);
+
+        // ...and paid to the key the datum authorizes. This is the half that
+        // closes the window: after it confirms, `y_51 == authorized_key`.
+        assert_eq!(
+            tm.unsigned_tx.output[0].script_pubkey,
+            treasury_spk(&treasury, y_in),
+            "output 0 must pay the incoming key's treasury address"
+        );
+        assert_ne!(
+            tm.unsigned_tx.output[0].script_pubkey,
+            treasury_spk(&treasury, y_out),
+            "paying the outgoing key back is the self-send that never closes the window"
+        );
+        // The input is spent under the outgoing key, which is what the signature
+        // above will be checked against.
+        assert_eq!(
+            tm.input_spend_info[0].internal_key(),
+            y_out,
+            "input 0 spends the head as it is actually locked"
+        );
+    }
+
+    /// Federation side, and the live preprod deadlock. The federation posted the
+    /// Update-Y itself, so the datum names the SPO roster — but the treasury is
+    /// still under `Y_federation`, and a federation share is the only thing that
+    /// can spend it. Bitcoin checks the signature against the spent output's key
+    /// and never reads the Cardano datum; the Post-TM carries no authorization at
+    /// all. So "the datum no longer names us" is not a reason to stand down.
+    #[tokio::test]
+    async fn the_federation_makes_the_handoff_the_datum_says_it_cannot() {
+        let (signer, fed_keys) = phase1_signer_for(2, 3);
+        let (_, roster_keys) = group_for(2, 3);
+        let me = *fed_keys.key_package.identifier();
+        let y_fed = xonly_of(&fed_keys);
+        let y_roster = xonly_of(&roster_keys);
+
+        let mut config = fast_config(Identifier::try_from(1u16).unwrap());
+        config.identity.bifrost_id_pk = signer.roster.participants[&me].bifrost_id_pk.clone();
+        config.phase1_signer = Some(signer.clone());
+
+        // Phase 2 by the datum, Phase 1 by the coins.
+        let chain = chain_mid_handoff(19320, y_fed, y_roster);
+        let treasury = chain.query_treasury().await.unwrap();
+        assert_ne!(
+            treasury.authorized_key, treasury.config_y_fed,
+            "the datum has rotated away from the federation"
+        );
+
+        // (b) The fallback must not read the rotated datum as "retired".
+        let next = phase1_fallback(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            9,
+            aborted(),
+        )
+        .await
+        .expect("the federation still holds the coins, so it still has a movement to make");
+        let EpochPhase::CollectPegins {
+            roster, group_keys, ..
+        } = next
+        else {
+            panic!("expected CollectPegins, got {}", next.name());
+        };
+
+        // ...and the movement it then builds hands custody OVER rather than back
+        // to itself. A widened gate without this is worse than standing down: the
+        // federation re-pays itself at every batch, burning a fee each time, and
+        // the window becomes self-sustaining.
+        let next = build_tm_phase(
+            &chain,
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &config,
+            9,
+            roster,
+            group_keys,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("the federation can build the handoff");
+        let EpochPhase::Sign { group_keys, tm, .. } = next else {
+            panic!("expected Sign, got {}", next.name());
+        };
+        assert_eq!(xonly_of(&group_keys), y_fed, "signed by the federation");
+        assert_eq!(
+            tm.unsigned_tx.output[0].script_pubkey,
+            treasury_spk(&treasury, y_roster),
+            "output 0 must pay the SPO roster the datum names"
+        );
+        assert_ne!(
+            tm.unsigned_tx.output[0].script_pubkey,
+            treasury_spk(&treasury, y_fed),
+            "the federation must not pay itself"
+        );
+    }
+
+    /// A node holding no share of the head's key declines BEFORE the signing
+    /// rounds, rather than signing with a key that owns nothing and finding out
+    /// at `Submit`.
+    ///
+    /// The cost of getting this wrong is not one failure: the immediate re-entry
+    /// re-walks a spent round and dies as `aggregate_with_tweak: Invalid
+    /// signature share` (WI-110), which reads as a crypto fault and hides the
+    /// real cause. Returning to `CollectPegins` costs the opportunity — already
+    /// marked, so this waits for the next `B_i` rather than spinning — and by
+    /// then the party that DOES hold the key may have moved the treasury.
+    #[tokio::test]
+    async fn a_node_with_no_share_of_the_head_key_declines_before_signing() {
+        let (_, stranger_keys) = group_for(2, 3);
+        let (roster, keys) = group_for(2, 3);
+        let y_head = xonly_of(&stranger_keys);
+        let y_me = xonly_of(&keys);
+
+        let config = fast_config(Identifier::try_from(1u16).unwrap());
+        assert!(config.phase1_signer.is_none());
+        let chain = chain_mid_handoff(19330, y_head, y_me);
+
+        let next = build_tm_phase(
+            &chain,
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &config,
+            9,
+            roster,
+            keys.clone(),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("declining is not a failure");
+        match next {
+            EpochPhase::CollectPegins { group_keys, .. } => {
+                assert_eq!(
+                    xonly_of(&group_keys),
+                    y_me,
+                    "the epoch's own keys ride on, so a later batch can use them"
+                );
+            }
+            other => panic!("expected CollectPegins, got {}", other.name()),
+        }
+    }
+
+    /// The wait that stands between a posted Update-Y and the movement that acts
+    /// on it. `submit_update_y` returns when the transaction is ACCEPTED, not
+    /// when it is in a block, so for a minute or two afterwards the datum still
+    /// names the key the poster has just replaced.
+    ///
+    /// Building against that stale read pays the treasury back to the federation
+    /// — a self-send that costs a fee, closes the batch gate for the ~17 h the
+    /// movement takes to confirm, and leaves the window exactly as wide as it
+    /// was. So a rotation that has not appeared yet is a reason to wait, and one
+    /// that never appears is a reason to re-read from the top rather than build
+    /// anything.
+    #[tokio::test]
+    async fn the_movement_waits_for_the_posted_rotation_to_appear() {
+        let (_, fed_keys) = group_for(2, 3);
+        let (_, roster_keys) = group_for(2, 3);
+        let y_fed = xonly_of(&fed_keys);
+        let y_roster = xonly_of(&roster_keys);
+        let config = fast_config(Identifier::try_from(1u16).unwrap());
+        let log_id = Identifier::try_from(1u16).unwrap();
+
+        // Visible already: proceed at once.
+        let chain = chain_mid_handoff(19350, y_fed, y_roster);
+        assert!(await_datum_rotation(&chain, &config, 9, y_fed, log_id).await);
+
+        // Two stale reads, then the rotation appears — the ordinary case.
+        let mut fixture = demo_static_fixture(2, 2, 19360);
+        fixture.y_51 = y_fed;
+        fixture.y_fed = y_fed;
+        let lagging: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture.clone())
+                .with_head_key(y_fed)
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y_roster, [0x5a; 32]))
+                .with_datum_lag(2),
+        );
+        assert!(await_datum_rotation(&lagging, &config, 9, y_fed, log_id).await);
+
+        // Never appears: decline rather than build against a datum that has not
+        // caught up. The budget is 120 poll intervals, milliseconds under a test
+        // config.
+        let never: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(y_fed)
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y_roster, [0x5a; 32]))
+                .with_datum_lag(u32::MAX),
+        );
+        assert!(!await_datum_rotation(&never, &config, 9, y_fed, log_id).await);
+    }
+
+    /// (c) Disjointness. Over all four `(authorized_key, y_51)` combinations of
+    /// the federation key and a roster key, EXACTLY ONE of {the SPO roster, the
+    /// federation} builds a movement — and it is always the one holding `y_51`,
+    /// never the one the datum names.
+    ///
+    /// The two off-diagonal cells are the ones that stalled the bridge. Cell
+    /// (roster, fed) is the live deadlock: the datum names the roster, the coins
+    /// are the federation's. Cell (fed, roster) is its mirror, which a
+    /// datum-gated rule also gets wrong.
+    #[tokio::test]
+    async fn exactly_one_party_is_the_mover_for_every_datum_and_head_pair() {
+        let (fed_signer, fed_keys) = phase1_signer_for(2, 3);
+        let (spo_roster, spo_keys) = group_for(2, 3);
+        let y_fed = xonly_of(&fed_keys);
+        let y_spo = xonly_of(&spo_keys);
+        let fed_me = *fed_keys.key_package.identifier();
+
+        let mut port = 19340u16;
+        for (authorized, head, expected_mover) in [
+            (y_fed, y_fed, "federation"), // Phase 1, steady
+            (y_spo, y_fed, "federation"), // the handoff window
+            (y_spo, y_spo, "roster"),     // Phase 2, steady
+            (y_fed, y_spo, "roster"),     // its mirror: a datum handed back
+        ] {
+            let chain = chain_mid_handoff(port, head, authorized);
+            port += 10;
+            let treasury = chain.query_treasury().await.unwrap();
+
+            // The SPO: this epoch's ceremony in hand, no federation share.
+            let spo_config = fast_config(Identifier::try_from(1u16).unwrap());
+            let spo_next = build_tm_phase(
+                &chain,
+                &(Arc::new(SystemClock) as Arc<dyn Clock>),
+                &spo_config,
+                9,
+                spo_roster.clone(),
+                spo_keys.clone(),
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect("neither party may error");
+
+            // The federation member: its share, and no epoch ceremony at all.
+            let mut fed_config = fast_config(Identifier::try_from(1u16).unwrap());
+            fed_config.identity.bifrost_id_pk = fed_signer.roster.participants[&fed_me]
+                .bifrost_id_pk
+                .clone();
+            fed_config.phase1_signer = Some(fed_signer.clone());
+            let fed_next = build_tm_phase(
+                &chain,
+                &(Arc::new(SystemClock) as Arc<dyn Clock>),
+                &fed_config,
+                9,
+                fed_signer.roster.clone(),
+                fed_keys.clone(),
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect("neither party may error");
+
+            let spo_moves = matches!(spo_next, EpochPhase::Sign { .. });
+            let fed_moves = matches!(fed_next, EpochPhase::Sign { .. });
+            assert!(
+                spo_moves ^ fed_moves,
+                "authorized={} head={}: exactly one mover, got spo={spo_moves} fed={fed_moves}",
+                hex::encode(authorized.serialize()),
+                hex::encode(head.serialize()),
+            );
+            assert_eq!(
+                if spo_moves { "roster" } else { "federation" },
+                expected_mover,
+                "the mover is whoever holds the head's key, not whoever the datum names"
+            );
+
+            // Whichever one moves, the change goes where the datum points.
+            let mover = if spo_moves { spo_next } else { fed_next };
+            let EpochPhase::Sign { tm, .. } = mover else {
+                unreachable!("checked above")
+            };
+            assert_eq!(
+                tm.unsigned_tx.output[0].script_pubkey,
+                treasury_spk(&treasury, authorized),
+                "output 0 always pays the authorized key"
+            );
         }
     }
 

@@ -228,6 +228,19 @@ pub struct MockCardanoChain {
     /// Update-Y while this node was failing its own round" (WI-048). Shared, so
     /// every node observes the one external rotation.
     external_rotation: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// How many further treasury reads answer with the datum as it stood BEFORE
+    /// the last rotation — a posted Update-Y that is accepted but not yet in a
+    /// block, which is what every node sees for a minute or two after posting one.
+    datum_lag: Arc<std::sync::atomic::AtomicU32>,
+    /// Pin the head's internal key, so `publish_group_key` no longer moves it.
+    ///
+    /// The default mock collapses the handoff: `PublishKeys` publishes the new
+    /// group key and `query_treasury` immediately reports the head as being
+    /// locked under it, which no chain does — an Update-Y rotates a Cardano
+    /// datum and spends no Bitcoin output. This pins the head where a real one
+    /// stays, so a test can stand inside the window between the rotation and the
+    /// movement that acts on it.
+    head_key: Option<bitcoin::key::UntweakedPublicKey>,
     /// In-memory stand-in for the `treasury_info` state UTxO. `None` (the
     /// default) is a chain with nothing to rotate, so `plan_update_y` reports
     /// no handoff.
@@ -280,8 +293,28 @@ impl MockCardanoChain {
             update_y_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             external_rotation: None,
             bridge_roots: None,
+            datum_lag: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            head_key: None,
             treasury_info: None,
         }
+    }
+
+    /// The next `n` treasury reads report the pre-rotation datum — see
+    /// [`Self::datum_lag`].
+    #[must_use]
+    pub fn with_datum_lag(self, n: u32) -> Self {
+        self.datum_lag.store(n, Ordering::Release);
+        self
+    }
+
+    /// Lock the treasury head under `key` and keep it there — see
+    /// [`Self::head_key`]. Pair with [`Self::with_treasury_info`] to model the
+    /// window an Update-Y opens: the datum names one key, the coins are under
+    /// another.
+    #[must_use]
+    pub fn with_head_key(mut self, key: bitcoin::key::UntweakedPublicKey) -> Self {
+        self.head_key = Some(key);
+        self
     }
 
     /// A fresh `treasury_info` state keyed to `current_key`, on the UTxO `txid`
@@ -512,7 +545,7 @@ impl CardanoChain for MockCardanoChain {
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {
-        let maybe_key = *self.treasury_y_51.lock().unwrap();
+        let maybe_key = self.head_key.or(*self.treasury_y_51.lock().unwrap());
         let y_51 = maybe_key.unwrap_or(self.fixture.y_51);
         // After DKG: Y_fed = Y_51 = FROST group key (same key everywhere).
         let y_fed = maybe_key.unwrap_or(self.fixture.y_fed);
@@ -526,10 +559,24 @@ impl CardanoChain for MockCardanoChain {
             y_51,
             y_fed,
             config_y_fed: y_fed,
-            // The mock has no treasury_info datum: whatever key the head is
-            // under is also the authorized one, which is the bootstrap
-            // (Phase-1) reading its fixture already models.
-            authorized_key: y_51,
+            // The datum, when the mock has one — the same field `plan_update_y`
+            // rotates, so a test that posts an Update-Y sees `authorized_key`
+            // move while the head stays put, exactly as both chains behave.
+            // Without one, whatever key the head is under is also the authorized
+            // one, which is the bootstrap (Phase-1) reading its fixture models.
+            authorized_key: self.treasury_info.as_ref().map_or(y_51, |t| {
+                if self
+                    .datum_lag
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    // Still reading the datum as it was: whatever key the head is
+                    // under was the authorized one before the rotation.
+                    y_51
+                } else {
+                    t.lock().unwrap().current_key
+                }
+            }),
             federation_csv_blocks: self.fixture.federation_csv_blocks,
             // The mock's tree is self-consistent; 720 > the fixture's 144 federation delay.
             pegin_refund_timeout_blocks: 720,
