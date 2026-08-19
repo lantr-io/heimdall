@@ -55,7 +55,21 @@ let
         Group = cfg.user;
         # Creates/owns /var/lib/heimdall-fed<N> and makes it writable under
         # ProtectSystem=strict. Holds the share, the identity key and the tries.
-        StateDirectory = "heimdall-fed${toString n}";
+        # Derived from `stateDir`, not hardcoded: systemd resolves StateDirectory
+        # relative to /var/lib, so a literal name here silently creates
+        # /var/lib/heimdall-fed<N> while ExecStart and ReadWritePaths point at
+        # ${cfg.stateDir}<N>. Under ProtectSystem=strict that mismatch fails the
+        # mount namespace with "No such file or directory" and nothing names the
+        # option that caused it. The assertion below keeps stateDir under
+        # /var/lib so the two can never diverge.
+        StateDirectory = "${baseNameOf cfg.stateDir}${toString n}";
+        # 0700, not systemd's 0755 default: this directory holds the ceremony
+        # share (federation-key.json), the identity key (bifrost.skey) and the
+        # tries. `preflight` tells operators it "must be 0700 and owned by the
+        # user the daemon runs as", and the daemon cannot repair it —
+        # `create_dir_0700` returns early when the directory already exists,
+        # which it always does once systemd has made it.
+        StateDirectoryMode = "0700";
         # The mnemonic only. Everything else a member needs is in its own config,
         # which is why this file can be shared by all of them.
         EnvironmentFile = cfg.secretsFile;
@@ -116,7 +130,8 @@ in
 
     secretsFile = lib.mkOption {
       type = lib.types.str;
-      default = "/var/lib/heimdall-fed/secrets.env";
+      default = "${cfg.stateDir}/secrets.env";
+      defaultText = lib.literalExpression ''"''${config.services.heimdall-federation.stateDir}/secrets.env"'';
       description = ''
         EnvironmentFile holding `HEIMDALL_MNEMONIC` (mode 600). Shared by every member
         on this host, which means they share a Cardano wallet and will contend for its
@@ -182,6 +197,19 @@ in
       home = lib.mkDefault cfg.stateDir;
     };
     users.groups.${cfg.user} = { };
+
+    assertions = [
+      {
+        assertion = lib.hasPrefix "/var/lib/" cfg.stateDir;
+        message =
+          "services.heimdall-federation.stateDir must be under /var/lib "
+          + "(got ${cfg.stateDir}): each member's directory is created by "
+          + "systemd's StateDirectory=, which resolves relative to /var/lib. "
+          + "A path elsewhere would be created in the wrong place and the unit "
+          + "would fail its mount namespace with no hint that this option "
+          + "caused it.";
+      }
+    ];
 
     systemd.services = lib.listToAttrs (map mkMember cfg.members);
   };
