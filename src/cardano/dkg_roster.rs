@@ -52,13 +52,13 @@ use tracing::{info, warn};
 /// Security threshold as a percentage of total eligible stake: any `t`
 /// signers must control STRICTLY MORE than this (spec: Y_51 → 51%).
 ///
-/// This is the protocol value. It is the "51" in `Y_51` and it is the security
-/// model the README states, that a weighted majority of SPOs must behave
-/// honestly; a build carrying anything else is a test build, and a bridge run at
-/// a lower number is a deliberately weakened bridge rather than the same bridge
-/// configured differently. `deploy/preprod-test` lowers it to 20 so a three-pool
-/// roster can exercise the protocol, and [`crate::preflight`] refuses to let any
-/// such build start against mainnet.
+/// **THIS BUILD IS LOWERED TO 20 FOR THE PREPROD TEST DEPLOYMENT. It is not the
+/// protocol value and must never reach mainnet.** The spec's value is 51 — it is
+/// the "51" in `Y_51` and it is the security model the README states, that a
+/// weighted majority of SPOs must behave honestly. A bridge at 20 is a
+/// deliberately weakened bridge, not the same bridge configured differently.
+/// [`crate::preflight`] refuses to let a build carrying anything but 51 start
+/// against mainnet, which is what keeps this value off a real bridge.
 ///
 /// It is a compile-time constant rather than config or a Config-datum field, and
 /// deliberately: published in the Config it would sit under the Config authority
@@ -74,7 +74,7 @@ use tracing::{info, warn};
 /// mismatched build is excluded and named before a ceremony, and
 /// [`crate::epoch::succession`] refuses to hand custody to a ceremony whose
 /// committed threshold differs from the one derived here.
-pub const SECURITY_THRESHOLD_PERCENT: u128 = 51;
+pub const SECURITY_THRESHOLD_PERCENT: u128 = 20;
 
 #[derive(Debug)]
 pub enum DkgRosterError {
