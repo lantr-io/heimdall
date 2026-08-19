@@ -35,3 +35,8 @@ heimdall-spo*.toml
 
 # Local state for the repo-root dev configs (protocol.state_dir).
 .state/
+
+# Symlink to the work-item store, which lives in the internal-docs repo
+# (bitfrost/heimdall/anthill-todo) so the items are versioned with the design
+# notes rather than the code. Local because it assumes the sibling checkout.
+anthill-todo
