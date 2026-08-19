@@ -1185,7 +1185,6 @@ mod tests {
             );
         }
     }
-
 }
 
 #[cfg(test)]
@@ -1274,7 +1273,8 @@ mod startup_refusal_tests {
         let failed = step1(preflight(&cfg).await);
         assert_eq!(failed.status, Status::Fail, "{failed:?}");
         assert!(
-            failed.detail.contains("Mainnet") || failed.fix.clone().unwrap_or_default().contains("Mainnet"),
+            failed.detail.contains("Mainnet")
+                || failed.fix.clone().unwrap_or_default().contains("Mainnet"),
             "the refusal must name the value it could not resolve: {failed:?}"
         );
 
