@@ -144,30 +144,6 @@ impl Builder {
     }
 }
 
-/// Does step 6's registration requirement apply to this node at all?
-///
-/// It does not apply to a federation member. Registration is how a Cardano POOL
-/// joins the roster: it locks a security deposit and is signed with the pool's
-/// cold key. A federation member is not a pool — it has no cold key, no stake
-/// and no deposit — so "not registered" is not an unfinished install step for
-/// it, it is a permanent and correct state, and the remedy step 6 prints
-/// (`register-spo`) is one such a node must never run.
-///
-/// This deliberately takes NO view of the treasury datum, and the missing
-/// parameter is the guard. Whether the bridge is in Phase 1 or Phase 2 decides
-/// whether the federation has WORK this epoch, which
-/// `epoch::machine::phase1_fallback` re-reads from chain on every epoch. Asking
-/// it here instead turned a per-epoch condition into a permanent admission gate:
-/// on 2026-08-18 our federation posted the Update-Y that handed the treasury to
-/// the roster and, from that moment, could not start again — while still holding
-/// the only key its Bitcoin treasury was locked under. A node must be allowed to
-/// run and then decline; being refused the process is not the same as having
-/// nothing to do.
-#[must_use]
-pub fn registration_applies(is_federation_member: bool) -> bool {
-    !is_federation_member
-}
-
 /// What to do about step 6 when this node is simply not registered yet.
 ///
 /// Named rather than inline because this is the failure an operator is MOST
@@ -196,9 +172,6 @@ const NOT_REGISTERED_FIX: &str = "Expected on a node that has not been registere
      than the one you registered with — fix the path rather than registering again, which would \
      be refused and would cost a second deposit attempt.";
 
-/// The three `[cardano]` keys that together locate the Config UTxO. Missing any
-/// one of them is what makes `config_locator` return `None`, which is what drops
-/// the mover onto a wall-clock cadence.
 /// The protocol's security threshold. A build carrying anything else is a test
 /// build (WI-113 review).
 pub const PROTOCOL_THRESHOLD_PERCENT: u128 = 51;
@@ -261,6 +234,9 @@ pub fn unset_state_dir(state_dir: Option<&str>) -> Option<String> {
     })
 }
 
+/// The three `[cardano]` keys that together locate the Config UTxO. Missing any
+/// one of them is what makes `config_locator` return `None`, which is what drops
+/// the mover onto a wall-clock cadence.
 fn missing_locator_keys(cfg: &HeimdallConfig) -> Vec<&'static str> {
     let c = &cfg.cardano;
     let mut missing = Vec::new();
@@ -372,9 +348,27 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         // nothing stops a test build being pointed at mainnet, and the tests
         // cannot catch it: they are written against the constant, so they pass
         // identically whatever it holds. This is the one place that can refuse.
+        //
+        // `unwrap_or(false)` here read "we could not tell" as "not mainnet",
+        // which made this guard bypassable by a capital letter: `network =
+        // "Mainnet"` is an unknown string, so `is_mainnet` errs, so a build at 20
+        // ran a mainnet bridge unrefused. Unresolvable is not "no".
+        //
+        // The Err also carries the only network/config_address cross-check this
+        // node performs — "a well-formed address on the other network that holds
+        // nothing" — and this is its ONLY production caller, so swallowing it
+        // meant that check never fired at all. Report it, and hold the threshold
+        // to the answer that cannot be ruled out.
+        let mainnet = match cfg.cardano.is_mainnet() {
+            Ok(m) => m,
+            Err(e) => {
+                problems.push(e);
+                true
+            }
+        };
         if let Some(p) = non_protocol_threshold_on_mainnet(
             crate::cardano::dkg_roster::SECURITY_THRESHOLD_PERCENT,
-            cfg.cardano.is_mainnet().unwrap_or(false),
+            mainnet,
         ) {
             problems.push(p);
         }
@@ -707,7 +701,21 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     });
     // WI-098: a federation member is a working node here, not one awaiting an
     // install step — it is not a Cardano pool and registration does not apply to
-    // it. `resolve` has cross-checked the persisted share against the key the
+    // it. It has no cold key, no stake and no deposit, so `register-spo` (the
+    // remedy step 6 prints below) is a command such a node must never run.
+    //
+    // Deliberately NO view of the treasury datum, because a startup gate must be
+    // IDEMPOTENT: restarting a node whose local state has not changed must give
+    // the same verdict, so the gate may only read facts the node cannot move
+    // under its own feet. This once also required
+    // `treasury_info.current_spos_frost_key == y_federation`, a per-epoch fact
+    // used as a permanent admission gate — on 2026-08-18 our federation posted
+    // the Update-Y that rotated exactly that field and was refused every start
+    // afterwards, same binary, same config, same share, opposite verdict
+    // fourteen seconds apart. Whether the federation has WORK this epoch is
+    // `epoch::machine::phase1_fallback`'s question and it still asks it every
+    // epoch; being refused the process was never the same as having nothing to
+    // do. `resolve` has cross-checked the persisted share against the key the
     // Config publishes, so a `Some` here IS "this node holds a share of the
     // bridge's y_federation"; a share of some other ceremony's key signs for an
     // address this bridge does not use. Carries the key so step 6 can name it.
@@ -752,10 +760,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             snapshot.spos.len()
                         ),
                     );
-                } else if !registration_applies(federation_y_fed.is_some()) {
-                    let y_fed = federation_y_fed.as_deref().expect(
-                        "registration_applies is false only when federation_y_fed is Some",
-                    );
+                } else if let Some(y_fed) = federation_y_fed.as_deref() {
                     // WI-098. Registration is still the path to a roster seat,
                     // and step 6 still fails for a node that is neither
                     // registered nor a federation member. But this node is not a
@@ -1181,43 +1186,6 @@ mod tests {
         }
     }
 
-    /// Registration is how a Cardano POOL joins the roster. A federation member
-    /// is not a pool, so the requirement does not apply to it — and this is a
-    /// fact about what the node IS, so no chain state can change the answer.
-    #[test]
-    fn registration_does_not_apply_to_a_federation_member() {
-        assert!(!super::registration_applies(true));
-    }
-
-    /// Every other node must register: the exemption is for federation members
-    /// alone, not for "unregistered" in general.
-    #[test]
-    fn registration_applies_to_everyone_else() {
-        assert!(super::registration_applies(false));
-    }
-
-    /// The regression this predicate exists to prevent, stated as an invariant:
-    /// a startup gate must be IDEMPOTENT. Restarting a node whose local state has
-    /// not changed must give the same verdict, so the gate may only read facts
-    /// the node cannot move under its own feet.
-    ///
-    /// It used to also require `treasury_info.current_spos_frost_key ==
-    /// y_federation`. On 2026-08-18 our federation posted the Update-Y that
-    /// rotated exactly that field and was refused every start afterwards — same
-    /// binary, same config, same share, opposite verdict, fourteen seconds apart.
-    /// Phase is a per-epoch question and `epoch::machine::phase1_fallback` still
-    /// asks it every epoch; it is not an admission gate.
-    ///
-    /// The guard is structural: `registration_applies` takes only what the node
-    /// is, so there is nothing chain-derived to consult. Adding such a parameter
-    /// is what this test is here to make someone justify.
-    #[test]
-    fn the_verdict_does_not_depend_on_chain_state() {
-        for _ in 0..3 {
-            assert!(!super::registration_applies(true));
-            assert!(super::registration_applies(false));
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1286,6 +1254,33 @@ mod startup_refusal_tests {
         let passed = step1(preflight(&cfg).await);
         assert_eq!(passed.status, Status::Pass, "{passed:?}");
         assert!(passed.detail.contains("state_dir /var/lib/heimdall"));
+    }
+
+    /// A network this node cannot resolve must not read as "not mainnet".
+    ///
+    /// `is_mainnet` errs on an unrecognised `cardano.network`, and the guard used
+    /// to take that as false — so `"Mainnet"` with a capital M was enough to run
+    /// a 20%-threshold build against real funds. The second half pins the
+    /// refusal to the network value and not to step 1's other ways to fail.
+    #[tokio::test]
+    async fn step_1_refuses_a_network_it_cannot_resolve() {
+        let mut cfg = HeimdallConfig::default();
+        cfg.cardano.mnemonic = Some("test test test".into());
+        cfg.protocol.state_dir = Some("/var/lib/heimdall".into());
+
+        let step1 = |r: Report| r.steps.into_iter().find(|s| s.n == 1).expect("step 1");
+
+        cfg.cardano.network = Some("Mainnet".into());
+        let failed = step1(preflight(&cfg).await);
+        assert_eq!(failed.status, Status::Fail, "{failed:?}");
+        assert!(
+            failed.detail.contains("Mainnet") || failed.fix.clone().unwrap_or_default().contains("Mainnet"),
+            "the refusal must name the value it could not resolve: {failed:?}"
+        );
+
+        cfg.cardano.network = Some("preprod".into());
+        let passed = step1(preflight(&cfg).await);
+        assert_eq!(passed.status, Status::Pass, "{passed:?}");
     }
 
     /// The message names the offending value and what to do, since it appears at
