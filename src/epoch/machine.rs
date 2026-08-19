@@ -1054,7 +1054,14 @@ fn dkg_unavailable(e: &EpochError) -> bool {
 /// joins a bridge mid-life reaches the same answer as one that watched it deploy.
 ///
 /// Both halves come from ONE chain read — see [`TreasuryUtxo::authorized_key`]
-/// for why it is that field and not `y_51`.
+/// for why the PHASE is that field and not `y_51`.
+///
+/// Phase is not the whole test, though, because phase is about AUTHORITY and
+/// this function is about CAPABILITY. An Update-Y rotates the datum the instant
+/// it confirms; the coins move only when a movement spends them there. In the
+/// window between, the federation is the only party that can spend a head still
+/// locked under `y_federation`, and the movement that does IS the handoff the
+/// Update-Y is waiting for — so Phase 2 alone does not disqualify it.
 ///
 /// [`TreasuryUtxo::authorized_key`]: crate::epoch::traits::TreasuryUtxo::authorized_key
 #[allow(clippy::too_many_arguments)]
@@ -1083,10 +1090,23 @@ async fn phase1_fallback(
             return Err(dkg_err);
         }
     };
-    if treasury.authorized_key != treasury.config_y_fed {
-        // Phase 2: a DKG key owns the treasury, so a failed ceremony is just a
-        // failed ceremony. The old roster carries over and the next boundary
-        // retries — the spec's "no halt, no special state".
+    // Decline only when the coins have moved on TOO. Phase 2 with a head still
+    // locked under `y_federation` is the handoff window, not a bridge that has
+    // finished handing over: on preprod on 2026-08-18 the federation posted the
+    // Update-Y, the datum rotated, and from that instant the roster could not
+    // spend the treasury (wrong key) while the federation would not try (right
+    // key, and it read the rotated datum as "not mine") — 299807 sat with no
+    // party willing and able. `y_51` is the head's actual lock, chosen by
+    // matching its scriptPubKey against the candidates.
+    //
+    // This widens nothing on its own: the share-versus-`y_51` check below still
+    // decides whether this node can sign, and is strictly more precise than
+    // either comparison here.
+    if treasury.authorized_key != treasury.config_y_fed && treasury.y_51 != treasury.config_y_fed
+    {
+        // A roster key both authorizes AND holds the treasury, so a failed
+        // ceremony is just a failed ceremony. The old roster carries over and
+        // the next boundary retries — the spec's "no halt, no special state".
         return Err(dkg_err);
     }
 
@@ -3792,6 +3812,95 @@ mod tests {
             }
             other => panic!("expected CollectPegins, got {}", other.name()),
         }
+    }
+
+    /// The handoff window: the Update-Y has landed, so the datum names the
+    /// incoming roster, but the treasury head is STILL locked under
+    /// y_federation. The federation is the only party that can spend it and the
+    /// movement that does is the handoff itself, so it must not decline.
+    ///
+    /// This is preprod 2026-08-18 as a test. The federation posted the Update-Y,
+    /// the datum rotated, and the phase test then read Phase 2 and stood the
+    /// federation down — while the roster could not spend the head at all,
+    /// having a different key. 299807 sat sat still with no party both willing
+    /// and able, and every batch failed `signature verification failed`.
+    #[tokio::test]
+    async fn a_rotated_datum_over_a_federation_locked_head_still_signs() {
+        let (signer, group_keys) = phase1_signer_for(2, 3);
+        let me = *group_keys.key_package.identifier();
+        let y_fed = group_xonly(&group_keys.verifying_key).unwrap().xonly;
+        let mut fixture = demo_static_fixture(2, 2, 19140);
+        // Head locked under the federation key, as at the moment of handoff.
+        fixture.y_fed = y_fed;
+        fixture.y_51 = y_fed;
+        // ...but the datum already authorizes the incoming roster's key.
+        let incoming = {
+            let (_, gk) = phase1_signer_for(2, 4);
+            group_xonly(&gk.verifying_key).unwrap().xonly
+        };
+        assert_ne!(incoming, y_fed, "the rotated key must differ, or the test is vacuous");
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(fixture).with_authorized_key(incoming));
+        let mut config = fast_config(Identifier::try_from(1).unwrap());
+        config.identity.bifrost_id_pk = signer.roster.participants[&me].bifrost_id_pk.clone();
+        config.phase1_signer = Some(signer.clone());
+
+        let next = phase1_fallback(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            7,
+            aborted(),
+        )
+        .await
+        .expect("a head still locked under y_federation is the federation's to move");
+        assert!(
+            matches!(next, EpochPhase::CollectPegins { .. }),
+            "expected CollectPegins, got {}",
+            next.name()
+        );
+    }
+
+    /// ...and the widening stops there. Once a movement has actually paid the
+    /// treasury to the roster's address, the head is locked under a key this
+    /// node holds no share of, and the federation is done: a failed ceremony is
+    /// just a failed ceremony, and the original DKG error stands.
+    #[tokio::test]
+    async fn a_head_locked_under_a_roster_key_is_not_the_federations_to_move() {
+        let (signer, group_keys) = phase1_signer_for(2, 3);
+        let me = *group_keys.key_package.identifier();
+        let y_fed = group_xonly(&group_keys.verifying_key).unwrap().xonly;
+        let roster_key = {
+            let (_, gk) = phase1_signer_for(2, 4);
+            group_xonly(&gk.verifying_key).unwrap().xonly
+        };
+        assert_ne!(roster_key, y_fed);
+        let mut fixture = demo_static_fixture(2, 2, 19160);
+        // The published federation key, and a head that has moved past it.
+        fixture.y_fed = y_fed;
+        fixture.y_51 = roster_key;
+        let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture));
+        let mut config = fast_config(Identifier::try_from(1).unwrap());
+        config.identity.bifrost_id_pk = signer.roster.participants[&me].bifrost_id_pk.clone();
+        config.phase1_signer = Some(signer);
+
+        let err = phase1_fallback(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            7,
+            aborted(),
+        )
+        .await
+        .expect_err("a roster-held treasury is not the federation's to move");
+        assert!(
+            matches!(err, EpochError::DkgAborted { .. }),
+            "the ORIGINAL dkg error must stand, got {err}"
+        );
     }
 
     /// No share → the ORIGINAL DKG error is re-raised. A node that is not a
