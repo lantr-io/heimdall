@@ -144,28 +144,28 @@ impl Builder {
     }
 }
 
-/// Is the bridge in Phase 1 – the window where an unregistered federation member
-/// is nonetheless the party that moves the treasury?
+/// Does step 6's registration requirement apply to this node at all?
 ///
-/// Phase 1 is chain state, not a setting: while `treasury_info`'s
-/// `current_spos_frost_key` still equals the Config's published `y_federation`,
-/// the treasury moves on the FEDERATION's signature, and the first Update-Y is
-/// the transition ("there is no phase flag anywhere"). A node holding a share of
-/// that key is doing the protocol's work whether or not a registry names it –
-/// which is the whole of WI-095, whose route was otherwise unreachable because
-/// registration gated the daemon that runs it.
+/// It does not apply to a federation member. Registration is how a Cardano POOL
+/// joins the roster: it locks a security deposit and is signed with the pool's
+/// cold key. A federation member is not a pool — it has no cold key, no stake
+/// and no deposit — so "not registered" is not an unfinished install step for
+/// it, it is a permanent and correct state, and the remedy step 6 prints
+/// (`register-spo`) is one such a node must never run.
 ///
-/// Byte equality, so a datum key that is not 32 bytes is never a seat: a short or
-/// truncated read is not something to act on.
-///
-/// Whether this node HOLDS a share of that key is the caller's half of the test –
-/// see the `phase1_seat` binding in [`preflight`], which requires
-/// `crate::cardano::federation::resolve` to have cross-checked the persisted
-/// share against the published key. A share of some other ceremony's key signs
-/// for an address this bridge does not use.
+/// This deliberately takes NO view of the treasury datum, and the missing
+/// parameter is the guard. Whether the bridge is in Phase 1 or Phase 2 decides
+/// whether the federation has WORK this epoch, which
+/// `epoch::machine::phase1_fallback` re-reads from chain on every epoch. Asking
+/// it here instead turned a per-epoch condition into a permanent admission gate:
+/// on 2026-08-18 our federation posted the Update-Y that handed the treasury to
+/// the roster and, from that moment, could not start again — while still holding
+/// the only key its Bitcoin treasury was locked under. A node must be allowed to
+/// run and then decline; being refused the process is not the same as having
+/// nothing to do.
 #[must_use]
-pub fn phase1_federation_seat(current_spos_frost_key: &[u8], published_y_fed: &[u8; 32]) -> bool {
-    current_spos_frost_key == published_y_fed
+pub fn registration_applies(is_federation_member: bool) -> bool {
+    !is_federation_member
 }
 
 /// What to do about step 6 when this node is simply not registered yet.
@@ -705,18 +705,17 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             config.as_ref().map(|c| &c.params),
         )
     });
-    // WI-098: a genesis bridge has an empty registry BY DEFINITION, and until the
-    // first Update-Y its movements are the federation's to sign. A federation
-    // member is therefore a working node here, not one awaiting an install step.
-    let phase1_seat = match (&snapshot, &federation_identity) {
-        (Some(Ok(snap)), Some(Ok(id))) => {
-            federation_share.as_ref().ok().and_then(|s| *s).is_some()
-                && phase1_federation_seat(
-                    &snap.treasury_state.datum.current_spos_frost_key,
-                    &id.y_fed.serialize(),
-                )
+    // WI-098: a federation member is a working node here, not one awaiting an
+    // install step — it is not a Cardano pool and registration does not apply to
+    // it. `resolve` has cross-checked the persisted share against the key the
+    // Config publishes, so a `Some` here IS "this node holds a share of the
+    // bridge's y_federation"; a share of some other ceremony's key signs for an
+    // address this bridge does not use. Carries the key so step 6 can name it.
+    let federation_y_fed: Option<String> = match &federation_identity {
+        Some(Ok(id)) if federation_share.as_ref().ok().and_then(|s| *s).is_some() => {
+            Some(hex::encode(id.y_fed.serialize()))
         }
-        _ => false,
+        _ => None,
     };
 
     match (&snapshot, bifrost_pk) {
@@ -753,25 +752,28 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             snapshot.spos.len()
                         ),
                     );
-                } else if phase1_seat {
+                } else if !registration_applies(federation_y_fed.is_some()) {
+                    let y_fed = federation_y_fed.as_deref().expect(
+                        "registration_applies is false only when federation_y_fed is Some",
+                    );
                     // WI-098. Registration is still the path to a roster seat,
                     // and step 6 still fails for a node that is neither
-                    // registered nor a federation member. But this node holds a
-                    // share of the very key the treasury is locked under, so it
-                    // signs the movements – refusing to start it would idle the
-                    // only party that CAN move the treasury, on the grounds that
-                    // it had not yet joined a roster whose whole purpose is to
-                    // take over from it.
+                    // registered nor a federation member. But this node is not a
+                    // pool at all: it holds a share of the bridge's y_federation,
+                    // and refusing to start it would idle the only party that can
+                    // move a treasury still locked under that key, on the grounds
+                    // that it had not joined a roster it was never eligible for.
                     b.push(
                         6,
                         "registration status",
                         Status::Pass,
                         format!(
-                            "not registered, and does not need to be yet – the bridge is in \
-                             PHASE 1 (treasury key == Config y_federation) and this node holds \
-                             a share of it, so treasury movements are signed by the federation. \
-                             Register before the first Update-Y hands the treasury to a roster \
-                             ({} SPOs registered so far)",
+                            "not registered, and does not need to be – this node is a \
+                             FEDERATION member, not a Cardano pool: it holds a share of the \
+                             bridge's y_federation {y_fed}. Registration is how a pool joins \
+                             the roster and does not apply here; whether the federation has \
+                             work THIS epoch is re-read from chain every epoch, not decided at \
+                             startup ({} SPOs registered so far)",
                             snapshot.spos.len()
                         ),
                     );
@@ -1179,37 +1181,42 @@ mod tests {
         }
     }
 
-    /// Phase 1 is the window where the treasury is still locked under the key
-    /// the Config publishes, so the federation – not a roster – signs movements.
+    /// Registration is how a Cardano POOL joins the roster. A federation member
+    /// is not a pool, so the requirement does not apply to it — and this is a
+    /// fact about what the node IS, so no chain state can change the answer.
     #[test]
-    fn a_phase1_treasury_is_one_still_locked_under_the_published_key() {
-        let y_fed = [7u8; 32];
-        assert!(
-            super::phase1_federation_seat(&y_fed, &y_fed),
-            "treasury key == Config y_federation is Phase 1 by definition"
-        );
+    fn registration_does_not_apply_to_a_federation_member() {
+        assert!(!super::registration_applies(true));
     }
 
-    /// After the first Update-Y the treasury answers to a DKG key, so an
-    /// unregistered node has nothing to contribute and step 6 must go back to
-    /// failing – otherwise the seat outlives the phase that justified it.
+    /// Every other node must register: the exemption is for federation members
+    /// alone, not for "unregistered" in general.
     #[test]
-    fn a_rotated_treasury_is_no_longer_a_federation_seat() {
-        let y_fed = [7u8; 32];
-        let rotated = [9u8; 32];
-        assert!(
-            !super::phase1_federation_seat(&rotated, &y_fed),
-            "a treasury rotated to a DKG key is Phase 2"
-        );
+    fn registration_applies_to_everyone_else() {
+        assert!(super::registration_applies(false));
     }
 
-    /// A datum that is not 32 bytes must not compare equal to anything: a short
-    /// or truncated key is a read this node should not act on.
+    /// The regression this predicate exists to prevent, stated as an invariant:
+    /// a startup gate must be IDEMPOTENT. Restarting a node whose local state has
+    /// not changed must give the same verdict, so the gate may only read facts
+    /// the node cannot move under its own feet.
+    ///
+    /// It used to also require `treasury_info.current_spos_frost_key ==
+    /// y_federation`. On 2026-08-18 our federation posted the Update-Y that
+    /// rotated exactly that field and was refused every start afterwards — same
+    /// binary, same config, same share, opposite verdict, fourteen seconds apart.
+    /// Phase is a per-epoch question and `epoch::machine::phase1_fallback` still
+    /// asks it every epoch; it is not an admission gate.
+    ///
+    /// The guard is structural: `registration_applies` takes only what the node
+    /// is, so there is nothing chain-derived to consult. Adding such a parameter
+    /// is what this test is here to make someone justify.
     #[test]
-    fn a_malformed_treasury_key_is_not_a_seat() {
-        let y_fed = [7u8; 32];
-        assert!(!super::phase1_federation_seat(&y_fed[..31], &y_fed));
-        assert!(!super::phase1_federation_seat(&[], &y_fed));
+    fn the_verdict_does_not_depend_on_chain_state() {
+        for _ in 0..3 {
+            assert!(!super::registration_applies(true));
+            assert!(super::registration_applies(false));
+        }
     }
 }
 
