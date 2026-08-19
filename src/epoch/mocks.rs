@@ -232,6 +232,16 @@ pub struct MockCardanoChain {
     /// the last rotation — a posted Update-Y that is accepted but not yet in a
     /// block, which is what every node sees for a minute or two after posting one.
     datum_lag: Arc<std::sync::atomic::AtomicU32>,
+    /// The PUBLISHED federation key (Config #11), pinned independently of the
+    /// head.
+    ///
+    /// The default collapses it onto whatever key the head is under, which is
+    /// right for a genesis bridge and wrong for every bridge that has rotated —
+    /// and it made `y_51 != config_y_fed` unsatisfiable, so the branch where a
+    /// federation node declines on a fully rotated Phase-2 bridge could not be
+    /// reached by any test. On a live chain this field is
+    /// `treasury_config.y_fed`, read from the Config and never from the head.
+    config_y_fed: Option<bitcoin::key::UntweakedPublicKey>,
     /// Pin the head's internal key, so `publish_group_key` no longer moves it.
     ///
     /// The default mock collapses the handoff: `PublishKeys` publishes the new
@@ -294,9 +304,18 @@ impl MockCardanoChain {
             external_rotation: None,
             bridge_roots: None,
             datum_lag: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            config_y_fed: None,
             head_key: None,
             treasury_info: None,
         }
+    }
+
+    /// Publish `key` as Config `y_federation`, independently of the head — see
+    /// [`Self::config_y_fed`].
+    #[must_use]
+    pub fn with_config_y_fed(mut self, key: bitcoin::key::UntweakedPublicKey) -> Self {
+        self.config_y_fed = Some(key);
+        self
     }
 
     /// The next `n` treasury reads report the pre-rotation datum — see
@@ -558,7 +577,7 @@ impl CardanoChain for MockCardanoChain {
             value,
             y_51,
             y_fed,
-            config_y_fed: y_fed,
+            config_y_fed: self.config_y_fed.unwrap_or(y_fed),
             // The datum, when the mock has one — the same field `plan_update_y`
             // rotates, so a test that posts an Update-Y sees `authorized_key`
             // move while the head stays put, exactly as both chains behave.

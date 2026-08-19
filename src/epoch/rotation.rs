@@ -356,11 +356,37 @@ pub fn holder_of(
     let Some(dir) = config.state_dir.as_deref() else {
         return Ok(None);
     };
-    for epoch in persisted_dkg_epochs(dir)? {
-        let Some(state) = read_dkg_state(dir, epoch)? else {
-            continue;
+    // One unreadable ceremony must not hide the readable one behind it. The walk
+    // is newest-first, so a `dkg-<epoch>.json` that is torn, written by an older
+    // binary, or carries an `epoch` field disagreeing with its filename comes
+    // BEFORE the file that actually holds the key asked about — and propagating
+    // its error would turn every movement into a permanent hard failure while
+    // `query_treasury`, reading the same directory leniently, kept reporting a
+    // healthy treasury. The head's own key decides what this node can sign for;
+    // a file that cannot answer that question is skipped, not fatal.
+    let epochs = match persisted_dkg_epochs(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("state dir {} could not be listed: {e}", dir.display());
+            return Ok(None);
+        }
+    };
+    for epoch in epochs {
+        let state = match read_dkg_state(dir, epoch) {
+            Ok(Some(state)) => state,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!("persisted epoch-{epoch} ceremony could not be read: {e}");
+                continue;
+            }
         };
-        let keys = state.to_group_keys()?;
+        let keys = match state.to_group_keys() {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::warn!("persisted epoch-{epoch} ceremony has unusable key material: {e}");
+                continue;
+            }
+        };
         if matches(&keys)? {
             return Ok(Some((state.roster, keys, KeyHolder::OutgoingEpoch(epoch))));
         }
