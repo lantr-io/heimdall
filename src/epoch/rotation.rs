@@ -388,6 +388,12 @@ pub fn holder_of(
             }
         };
         if matches(&keys)? {
+            // Checked HERE rather than during the walk (WI-100): this is the
+            // ceremony whose roster is about to be used as a pair with its share,
+            // and refusing it earlier would let one contradicted file hide the
+            // readable one behind it — the very thing the comment above says the
+            // walk must not do.
+            state.roster.check_threshold(&keys.key_package)?;
             return Ok(Some((state.roster, keys, KeyHolder::OutgoingEpoch(epoch))));
         }
     }
@@ -419,6 +425,9 @@ fn load_outgoing_dkg(
         let keys = state.to_group_keys()?;
         let g = group_xonly(&keys.verifying_key).map_err(EpochError::Frost)?;
         if g.xonly == plan.current_key {
+            // Same rule as `holder_of`: the pair is checked when it is the pair
+            // being used, so an unrelated epoch's file cannot fail this search.
+            state.roster.check_threshold(&keys.key_package)?;
             return Ok((state, keys));
         }
     }

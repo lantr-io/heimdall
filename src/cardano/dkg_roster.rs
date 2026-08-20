@@ -210,6 +210,25 @@ pub struct ChainView {
     pub read_time_ms: i64,
 }
 
+/// What [`DkgContext::rebased_to`] does with `t` when it builds a smaller
+/// context.
+///
+/// The spec fixes this per DKG instance (§Threshold Calculation): "For a fixed
+/// `(epoch, threshold-mode)` DKG instance, the resulting threshold `t` is
+/// **frozen for all attempts**. Retries may exclude or ban participants, but
+/// they do not recompute `t`; the instance simply fails once fewer than `t`
+/// eligible participants remain."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThresholdRule {
+    /// Keep the instance's `t` — the survivors are a RETRY of a ceremony that
+    /// already fixed it.
+    Frozen,
+    /// Re-derive `t` over the kept participants' stake. Only for a set narrowed
+    /// before the instance starts, where no attempt has run and there is no `t`
+    /// to be frozen yet.
+    Rederived,
+}
+
 impl DkgContext {
     /// This node's chain-view for the current context.
     #[must_use]
@@ -458,32 +477,12 @@ impl DkgContext {
             && stake * 100 > u128::from(self.total_stake) * SECURITY_THRESHOLD_PERCENT
     }
 
-    /// Build the candidate context for the NEXT attempt after a failed
-    /// ceremony, keeping only the `survivors` (the participants who completed
-    /// the round that aborted — `L1` after Round 1, `Q` after Round 2). The
-    /// threshold and total stake are re-derived over the survivors alone (a
-    /// fresh stake-weighted `t`), and `attempt` is bumped by one so every rerun
-    /// payload is re-namespaced. Returns `None` when the survivors are below
-    /// [`FROST_MIN_PARTICIPANTS`] or carry no stake — there is nothing left to
-    /// rerun and the epoch's DKG is dead.
-    ///
-    /// Each survivor KEEPS its original FROST [`Identifier`] (a field element —
-    /// frost-core does not require contiguous `1..=n`, only `max_signers`
-    /// distinct ones), so all honest nodes that observed the same survivor set
-    /// derive the identical reduced context. The positional [`DkgParticipant::index`]
-    /// is left as-is and so may become non-contiguous; `identifier` is the
-    /// source of truth for the ceremony, `index` is a display hint only.
-    ///
-    /// NOTE: the `> 51%` arm of [`Self::quorum_ok`] on the reduced context is
-    /// relative to the survivors' total, not the original epoch stake — the
-    /// spec's "restart DKG with the reduced candidate set after slashing"
-    /// re-bases the honest-majority requirement on whoever remains eligible.
     /// Narrow the CURRENT attempt to the participants that published a valid
     /// Round 1 payload by the deadline (WI-105, spec §Round 0 — "ordinary
     /// non-participation does not create a new DKG attempt").
     ///
-    /// Unlike [`Self::reduced_to`] this keeps `attempt` AND `threshold`, and
-    /// both are load-bearing:
+    /// Unlike [`Self::reduced_to`] this keeps `attempt`; `threshold` both of
+    /// them keep (WI-100). Both values are load-bearing here:
     ///
     /// * `attempt` is the payload namespace. Bumping it re-namespaces the whole
     ///   ceremony, so two nodes that observed different absentee sets end up in
@@ -500,38 +499,46 @@ impl DkgContext {
     /// threshold, which no in-place narrowing can rescue.
     #[must_use]
     pub fn narrowed_to(&self, survivors: &BTreeSet<Identifier>) -> Option<DkgContext> {
-        let kept: Vec<DkgParticipant> = self
-            .participants
-            .iter()
-            .filter(|p| survivors.contains(&p.identifier))
-            .cloned()
-            .collect();
-        if kept.len() < usize::from(FROST_MIN_PARTICIPANTS) {
-            return None;
-        }
-        let n = u16::try_from(kept.len()).ok()?;
-        if n < self.threshold {
-            return None;
-        }
-        let total: u64 = kept.iter().map(|p| p.active_stake).sum();
-        if total == 0 {
-            return None;
-        }
-        Some(DkgContext {
-            epoch: self.epoch,
-            attempt: self.attempt,
-            threshold: self.threshold,
-            total_stake: total,
-            participants: kept,
-            excluded: self.excluded.clone(),
-            schedule_anchor_ms: self.schedule_anchor_ms,
-            read_time_ms: self.read_time_ms,
-        })
+        self.rebased_to(survivors, self.attempt, ThresholdRule::Frozen)
     }
 
+    /// Build the candidate context for the NEXT attempt after a failed
+    /// ceremony, keeping only the `survivors` (the participants who completed
+    /// the round that aborted — `L1` after Round 1, `Q` after Round 2).
+    /// `attempt` is bumped by one so every rerun payload is re-namespaced.
+    /// Returns `None` when the survivors are below [`FROST_MIN_PARTICIPANTS`],
+    /// carry no stake, or number fewer than `t` — there is nothing left to rerun
+    /// and the epoch's DKG is dead.
+    ///
+    /// `t` is CARRIED, not re-derived (`ThresholdRule::Frozen`, WI-100): a
+    /// rerun is another attempt at the same `(epoch, threshold-mode)` instance,
+    /// and the spec freezes `t` for all of an instance's attempts. Re-deriving it
+    /// over the survivors' stake — as this did until WI-100 — lowers `t` for a
+    /// key that still guards the same treasury. Worked at this build's
+    /// [`SECURITY_THRESHOLD_PERCENT`]: stakes `10/10/10/70` give `t = 3`; the
+    /// whale goes silent in Round 2, the three survivors clear
+    /// [`Self::quorum_ok`] (30% of the epoch's stake, over the 20% gate), and
+    /// re-deriving over their `10/10/10` gives `t = 2` — so two SPOs holding a
+    /// fifth of the epoch's stake could move the treasury. The stake-weighted
+    /// rule is what makes any `t` signers a stake majority, and it is stated over
+    /// the INSTANCE's candidate set, not over whoever is left mid-ceremony.
+    ///
+    /// Each survivor KEEPS its original FROST [`Identifier`] (a field element —
+    /// frost-core does not require contiguous `1..=n`, only `max_signers`
+    /// distinct ones), so all honest nodes that observed the same survivor set
+    /// derive the identical reduced context. The positional [`DkgParticipant::index`]
+    /// is left as-is and so may become non-contiguous; `identifier` is the
+    /// source of truth for the ceremony, `index` is a display hint only.
+    ///
+    /// NOTE: total stake IS re-based, and with it the stake arm of
+    /// [`Self::quorum_ok`] on the reduced context — it is relative to the
+    /// survivors' total, not the original epoch stake. That arm is a separate
+    /// honest-majority-COMPLETION requirement, and the spec's "restart DKG with
+    /// the reduced candidate set after slashing" re-bases it on whoever remains
+    /// eligible. Only `t`, the threshold the resulting key signs at, is frozen.
     #[must_use]
     pub fn reduced_to(&self, survivors: &BTreeSet<Identifier>) -> Option<DkgContext> {
-        self.rebased_to(survivors, self.attempt + 1)
+        self.rebased_to(survivors, self.attempt + 1, ThresholdRule::Frozen)
     }
 
     /// Drop candidates BEFORE the ceremony starts, re-deriving the
@@ -551,10 +558,15 @@ impl DkgContext {
             .map(|p| p.identifier)
             .filter(|id| !excluded.contains(id))
             .collect();
-        self.rebased_to(&kept, self.attempt)
+        self.rebased_to(&kept, self.attempt, ThresholdRule::Rederived)
     }
 
-    fn rebased_to(&self, survivors: &BTreeSet<Identifier>, attempt: u32) -> Option<DkgContext> {
+    fn rebased_to(
+        &self,
+        survivors: &BTreeSet<Identifier>,
+        attempt: u32,
+        rule: ThresholdRule,
+    ) -> Option<DkgContext> {
         let kept: Vec<DkgParticipant> = self
             .participants
             .iter()
@@ -569,8 +581,23 @@ impl DkgContext {
             return None;
         }
         let n = u16::try_from(kept.len()).ok()?;
-        let stakes: Vec<u64> = kept.iter().map(|p| p.active_stake).collect();
-        let threshold = stake_weighted_threshold(&stakes, total).min(n);
+        let threshold = match rule {
+            ThresholdRule::Frozen => {
+                // "the instance simply fails once fewer than `t` eligible
+                // participants remain" — a set that cannot field `t` is dead, not
+                // a smaller ceremony. Reachable: `narrowed_to`'s caller applies
+                // `quorum_ok` AFTER narrowing, so this guard is what stops a
+                // Round-1 set below `t` from being built at all.
+                if n < self.threshold {
+                    return None;
+                }
+                self.threshold
+            }
+            ThresholdRule::Rederived => {
+                let stakes: Vec<u64> = kept.iter().map(|p| p.active_stake).collect();
+                stake_weighted_threshold(&stakes, total).min(n)
+            }
+        };
         Some(DkgContext {
             epoch: self.epoch,
             attempt,
@@ -1083,8 +1110,9 @@ mod tests {
         );
         let idxs: Vec<u16> = reduced.participants.iter().map(|p| p.index).collect();
         assert_eq!(idxs, vec![1, 3]);
-        // Threshold re-derived over survivors' stake (40,20 of 60: weakest-1=20
-        // = 33% <= 51% → need both → t=2).
+        // t is the instance's, carried (WI-100) — here it happens to equal what a
+        // re-derivation over 40/20 would have given, which is why this case reads
+        // the same before and after the freeze.
         assert_eq!(reduced.threshold, 2);
         // The reduced full set clears its own (re-based) gate.
         assert!(reduced.quorum_ok(&qset(&[1, 3])));
@@ -1100,14 +1128,51 @@ mod tests {
         assert!(ctx.reduced_to(&qset(&[1, 99])).is_none());
     }
 
+    /// The spec freezes `t` for every attempt of one `(epoch, threshold-mode)`
+    /// DKG instance, and WI-100 is why that matters here: re-deriving it over
+    /// the survivors LOWERS the threshold guarding the same treasury. Four
+    /// equal-stake SPOs need `t = 3`; a rerun over any three of them used to
+    /// deal a `2`, so a pair holding half the epoch's stake could move funds.
     #[test]
-    fn reduced_to_recomputes_threshold_on_survivor_stake() {
-        // 10/10/80, t=3. Survivors {1,2} (the whale dropped): 10/10 of 20, the
-        // weakest-1 = 50% <= 51% → both needed → t=2 (was 3).
+    fn reduced_to_freezes_the_instance_threshold() {
+        // The vector is derived, not asserted from memory: `ctx_with` INJECTS the
+        // threshold, so a worked example written against some other
+        // SECURITY_THRESHOLD_PERCENT would sit here passing and describing
+        // nothing. 10/10/10/70 is the shape that dilutes at this build's value.
+        let stakes = [10u64, 10, 10, 70];
+        let t = stake_weighted_threshold(&stakes, stakes.iter().sum());
+        let ctx = ctx_with(&stakes, t);
+
+        // The whale goes silent; the three survivors clear the quorum gate...
+        let survivors = qset(&[1, 2, 3]);
+        assert!(
+            ctx.quorum_ok(&survivors),
+            "the rerun must be reachable for the example to describe anything — if this fails, \
+             SECURITY_THRESHOLD_PERCENT moved and both this vector and the worked example in \
+             `reduced_to`'s doc need re-picking for the new value"
+        );
+        // ...and their own stake alone would have dealt a SMALLER key.
+        let rederived = stake_weighted_threshold(&[10, 10, 10], 30);
+        assert!(
+            rederived < t,
+            "the example must actually dilute at this build's threshold: {rederived} < {t}"
+        );
+
+        let reduced = ctx.reduced_to(&survivors).expect("three survivors");
+        assert_eq!(reduced.threshold, t, "t is frozen for the instance");
+        assert_eq!(reduced.attempt, 1);
+        // Total stake IS re-based: the stake gate is a separate completion
+        // requirement the spec re-bases on whoever remains eligible.
+        assert_eq!(reduced.total_stake, 30);
+    }
+
+    /// "the instance simply fails once fewer than `t` eligible participants
+    /// remain" — the survivors are not a smaller ceremony, they are a dead one.
+    #[test]
+    fn reduced_to_is_dead_when_the_survivors_cannot_field_the_frozen_threshold() {
+        // 10/10/80, t=3. The whale drops: two survivors cannot run a 3-of-n.
         let ctx = ctx_with(&[10, 10, 80], 3);
-        let reduced = ctx.reduced_to(&qset(&[1, 2])).unwrap();
-        assert_eq!(reduced.threshold, 2);
-        assert_eq!(reduced.total_stake, 20);
+        assert!(ctx.reduced_to(&qset(&[1, 2])).is_none());
     }
 
     // ---- eligibility + context ------------------------------------------

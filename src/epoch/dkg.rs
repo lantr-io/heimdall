@@ -17,7 +17,8 @@
 //!     NAMESPACE: two nodes that bumped on different absentee sets would land in
 //!     namespaces that cannot see each other, with no error on either side.
 //!   - **Round 2 absence RERUNS** at `attempt + 1` over the reduced set
-//!     ([`DkgContext::reduced_to`], re-based stake-weighted threshold). Not a
+//!     ([`DkgContext::reduced_to`]) — carrying the instance's `t`, which the
+//!     spec freezes for every attempt (WI-100). Not a
 //!     library limitation — a threshold one: a member that published Round 1,
 //!     received everyone's shares and only then went silent already holds a
 //!     usable share of the key the survivors would finalize, since narrowing
@@ -543,6 +544,13 @@ pub async fn dkg_phase(
             // node's verification share. A mismatch means a corrupt part3 output —
             // abort before locking funds under an incoherent key.
             check_dkg_output_coherent(me, &key_package, &public_key_package)?;
+            // ...and that the key the ceremony produced carries the threshold the
+            // candidate set was derived for (WI-100). `dkg_part1` was handed
+            // `ctx.threshold`, so this holds unless frost-core's part3 disagrees
+            // with what part1 was asked for — but the value decides where the
+            // round-1 poll closes for the whole epoch, and a movement is the
+            // wrong place to discover it did not.
+            roster.check_threshold(&key_package)?;
 
             let vk_bytes = public_key_package
                 .verifying_key()
@@ -702,6 +710,31 @@ fn rerun_or_abort(
         ));
     }
     match ctx.reduced_to(survivors) {
+        Some(reduced) if reduced.participants.len() == usize::from(reduced.threshold) => {
+            // A frozen `t` over exactly `t` survivors deals a t-of-t key: correct,
+            // and the spec's answer, but it has no fault tolerance for the rest of
+            // the epoch. Every later signing round needs ALL of them at the
+            // deadline, so one reboot costs a batch opportunity — and the DKG
+            // SUCCEEDED, so nothing re-enters this path to widen it before the
+            // next boundary. Worth saying once, loudly, rather than leaving an
+            // operator to infer it from a run of `PollTimeout`s.
+            crate::epoch_warn!(
+                me,
+                ctx.epoch,
+                "  the rerun has exactly {} survivor(s) for a threshold of {} — the key it deals \
+                 is {}-of-{}, so every signing round this epoch needs all of them present at the \
+                 deadline",
+                reduced.participants.len(),
+                reduced.threshold,
+                reduced.threshold,
+                reduced.participants.len(),
+            );
+            Ok(EpochPhase::Dkg {
+                round: DkgRound::Round1,
+                ctx: reduced,
+                collected: DkgCollected::default(),
+            })
+        }
         Some(reduced) => Ok(EpochPhase::Dkg {
             round: DkgRound::Round1,
             ctx: reduced,

@@ -117,9 +117,43 @@ impl FederationKeyState {
     }
 
     /// Rebuild the in-memory [`GroupKeys`].
+    ///
+    /// Says nothing about the `min_signers` beside them — see
+    /// [`Self::check_threshold`], which is deliberately NOT called here: this is
+    /// also how an address-only reader gets the key
+    /// ([`Self::federation_setup_y`] → [`group_key`] → `preflight`), and a node
+    /// that only needs to derive a scriptPubKey must not be refused over a
+    /// threshold it never uses.
     pub fn to_group_keys(&self) -> Result<GroupKeys, StateError> {
         group_keys_from_hex(&self.key_package_hex, &self.public_key_package_hex)
             .map_err(|e| StateError::Keys(e.to_string()))
+    }
+
+    /// Refuse a file whose stored `min_signers` is not the threshold its share
+    /// was dealt (WI-100) — call it wherever this state is about to SIGN.
+    ///
+    /// The stored value is a convenience copy of something only the key package
+    /// answers for, the same relationship [`Self::federation_setup_y`] handles by
+    /// re-deriving rather than trusting the field beside it. It is what a signing
+    /// round's floor is tested against, so a file whose halves came from
+    /// different ceremonies tests the wrong one.
+    ///
+    /// [`Self::check_roster`] is a different direction — the CONFIGURED roster
+    /// against the one the ceremony ran with — and neither implies this one. (A
+    /// member running a different threshold is caught earlier still, at Round 1,
+    /// off the commitment count: [`crate::federation::ceremony`].)
+    pub fn check_threshold(&self) -> Result<(), StateError> {
+        let dealt = *self.to_group_keys()?.key_package.min_signers();
+        if self.min_signers == dealt {
+            return Ok(());
+        }
+        Err(StateError::Keys(format!(
+            "federation share says {}-of-{} but the stored key package was dealt a {dealt}-of-n \
+             share — the file's two halves come from different ceremonies. The share is the one \
+             that decides: with {} as the floor, a signing round is tested against a threshold \
+             this key does not have",
+            self.min_signers, self.max_signers, self.min_signers
+        )))
     }
 
     /// The federation setup key, re-derived from the group package rather than
@@ -370,6 +404,26 @@ mod tests {
         state.federation_setup_y = member_key(0x77);
         let e = state.federation_setup_y().expect_err("must refuse");
         assert!(e.to_string().contains("does not derive"), "{e}");
+    }
+
+    /// WI-100: the stored `min_signers` is a claim about the share, and since
+    /// WI-047 it is the value a signing round closes at. A file whose halves come
+    /// from different ceremonies is refused where the share is rebuilt, so no
+    /// caller can reach a `GroupKeys` the number beside it does not describe.
+    #[test]
+    fn a_stored_threshold_the_share_was_not_dealt_is_refused() {
+        let mut state = FederationKeyState::from_output(&roster(2, &[0x11, 0x22]), &group_keys())
+            .expect("capture");
+        state.check_threshold().expect("consistent as written");
+        // The share is a dealt 2-of-2; claim it needs three.
+        state.min_signers = 3;
+        state
+            .to_group_keys()
+            .expect("the share still reads — an address-only reader is unaffected");
+        let e = state.check_threshold().expect_err("must refuse");
+        let msg = e.to_string();
+        assert!(msg.contains("3-of-2"), "{msg}");
+        assert!(msg.contains("2-of-n"), "{msg}");
     }
 
     /// "No ceremony has run" and "we could not read the file" have different

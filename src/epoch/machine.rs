@@ -1869,7 +1869,7 @@ fn try_resume_dkg(
     let Some(saved) = crate::epoch::persist::read_dkg_state(dir, epoch)? else {
         return Ok(None);
     };
-    match saved.to_group_keys() {
+    match saved.checked_group_keys() {
         Ok(group_keys) if *group_keys.key_package.identifier() == me => {
             crate::epoch_log!(
                 me,
@@ -1891,6 +1891,14 @@ fn try_resume_dkg(
                  running a fresh ceremony"
             );
             Ok(None)
+        }
+        Err(e) if e.is_threshold_mismatch() => {
+            // NOT the arm below (WI-100). An unreadable share leaves this node with
+            // nothing, so a fresh ceremony is the only move; a share that reads
+            // fine but is paired with a roster contradicting it is a state the
+            // operator has to resolve, and re-running would quietly replace a key
+            // this node's peers may already hold with a different one.
+            Err(e)
         }
         Err(e) => {
             crate::epoch_warn!(

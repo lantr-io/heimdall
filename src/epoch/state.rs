@@ -97,6 +97,51 @@ impl Roster {
             sequence,
         )
     }
+
+    /// Refuse a roster whose `min_signers` is not the threshold the key package
+    /// it is paired with was dealt (WI-100).
+    ///
+    /// `min_signers` is the floor `S1` is tested against when the round-1
+    /// deadline closes it ([`crate::epoch::signing::poll_sign_round`] — the
+    /// subset is fixed by the DEADLINE, never by whoever answered first), and it
+    /// is heimdall's stand-in for a spec test it does not run directly. Both
+    /// roles need it to be the ceremony's own `t`:
+    ///
+    /// * Against the KEY. Too LOW and a sub-threshold `S1` clears the floor, so
+    ///   the round proceeds to an aggregation that cannot succeed — and only
+    ///   sometimes, since a round where everyone answers builds a full package
+    ///   and works, which is what makes it so hard to attribute when it does
+    ///   bite. Too HIGH and rounds that had signers enough end in `PollTimeout`,
+    ///   one batch opportunity at a time.
+    /// * Against the SPEC. `technical_documentation.md` §Signing cascade tests
+    ///   `S1` by delegated STAKE; this floor is a COUNT. The two are equivalent
+    ///   only because `t = min { k : combined_stake(bottom k) >
+    ///   security_threshold }` (§Threshold Calculation) makes ANY `t` signers
+    ///   exceed the threshold — so a `t` that did not come from that rule
+    ///   silently turns a stake test into an arbitrary one.
+    ///
+    /// WHAT THIS DOES NOT DO. It is not tamper detection.
+    /// `KeyPackage::deserialize` derives `min_signers` from nothing — frost-core
+    /// stores it as a plain field and says so itself ("people lie about
+    /// min_signers", `keys.rs::reconstruct`) — so on a persisted pair this
+    /// compares two integers that an editor of the file controls together. What
+    /// it catches is halves that came from DIFFERENT ceremonies: a typed config
+    /// against a real share, or a state file assembled from two of them. The
+    /// check that reads `t` off cryptographic content is the commitment-vector
+    /// length at Round 1, which [`crate::federation::ceremony`] does and the
+    /// epoch DKG does not.
+    pub fn check_threshold(&self, key_package: &frost::keys::KeyPackage) -> EpochResult<()> {
+        let dealt = *key_package.min_signers();
+        if self.min_signers == dealt {
+            return Ok(());
+        }
+        Err(EpochError::ThresholdMismatch {
+            epoch: self.epoch,
+            roster: self.min_signers,
+            dealt,
+            participants: u16::try_from(self.participants.len()).unwrap_or(u16::MAX),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -788,6 +833,19 @@ pub enum EpochError {
     Peer(String),
     Chain(String),
     Transition(String),
+    /// A roster's `min_signers` is not the threshold the key package it is paired
+    /// with was dealt (WI-100). Typed rather than a `Frost(String)` because the
+    /// two sides want different policies: a resume must refuse loudly, while a
+    /// directory walk looking for some OTHER epoch's ceremony steps over it.
+    ThresholdMismatch {
+        epoch: u64,
+        /// What the roster claims.
+        roster: u16,
+        /// What the key package was dealt.
+        dealt: u16,
+        /// Participants the roster names.
+        participants: u16,
+    },
     SignatureVerify(usize, String),
     /// A signing round failed AFTER this node published its round-1 commitment,
     /// so the round is SPENT: this node must not walk it again on its own.
@@ -848,6 +906,14 @@ impl EpochError {
         matches!(self, Self::RoundSpent { .. })
     }
 
+    /// Whether this failure is a roster contradicting the share it is paired with
+    /// ([`EpochError::ThresholdMismatch`]) — a state an operator has to resolve,
+    /// never one to recover from by running another ceremony.
+    #[must_use]
+    pub fn is_threshold_mismatch(&self) -> bool {
+        matches!(self.cause(), Self::ThresholdMismatch { .. })
+    }
+
     /// This error with any `RoundSpent` wrapper removed — what actually went
     /// wrong. Match on THIS, never on the outer error, when the question is the
     /// failure and not whether this node has already published.
@@ -885,6 +951,23 @@ impl std::fmt::Display for EpochError {
             Self::SignatureVerify(i, s) => {
                 write!(f, "signature verification failed for input {i}: {s}")
             }
+            Self::ThresholdMismatch {
+                epoch,
+                roster,
+                dealt,
+                participants,
+            } => write!(
+                f,
+                "threshold mismatch: the roster for epoch {epoch} says t = {roster} over \
+                 {participants} participant(s), but the key package this node holds was dealt \
+                 t = {dealt}. The share is what the ceremony produced and every co-signer \
+                 derived against, so the roster is the wrong half: with t = {roster} a signing \
+                 round is tested against the wrong floor — too low lets a sub-threshold S1 \
+                 through to an aggregation that cannot succeed, too high times out rounds that \
+                 had signers enough. Fix where the roster's threshold came from (a typed \
+                 [federation].min_signers, or persisted state from another ceremony), not the \
+                 share"
+            ),
             Self::RoundSpent { round, cause } => write!(
                 f,
                 "round {round} is spent (commitments already published): {cause}"
@@ -1031,6 +1114,39 @@ mod tests {
         assert!(r.own_participant(&vec![0xFF; 32]).is_none());
         // An empty key (legacy fixture) never matches a real entry.
         assert!(r.own_participant(&[]).is_none());
+    }
+
+    /// WI-100: the roster is a claim about the key, and since WI-047 it is the
+    /// claim that decides where a signing round closes. Where the two meet, the
+    /// key wins — and the refusal names both numbers, because the operator has to
+    /// know which end to fix (the typed threshold, not the share).
+    #[test]
+    fn a_roster_threshold_the_key_was_not_dealt_is_refused() {
+        let mut rng = rand::thread_rng();
+        let (shares, _pkp) =
+            frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, &mut rng)
+                .expect("dealt 2-of-3");
+        let key_package =
+            frost::keys::KeyPackage::try_from(shares.into_values().next().expect("a share"))
+                .expect("key package");
+
+        let mut roster = Roster {
+            epoch: 7,
+            min_signers: 2,
+            max_signers: 3,
+            participants: BTreeMap::new(),
+        };
+        roster
+            .check_threshold(&key_package)
+            .expect("2 matches the dealt 2-of-3");
+
+        roster.min_signers = 3;
+        let e = roster
+            .check_threshold(&key_package)
+            .expect_err("3 is not what the ceremony dealt");
+        let msg = e.to_string();
+        assert!(msg.contains("t = 3"), "{msg}");
+        assert!(msg.contains("t = 2"), "{msg}");
     }
 
     #[test]

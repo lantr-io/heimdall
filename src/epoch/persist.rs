@@ -46,6 +46,10 @@ impl PersistedDkg {
         roster: &Roster,
         keys: &GroupKeys,
     ) -> EpochResult<Self> {
+        // A file this node would refuse to read is not worth writing: the refusal
+        // would surface one restart later, after the ceremony is over and cannot
+        // be re-run without producing a different key (WI-100).
+        roster.check_threshold(&keys.key_package)?;
         let (key_package_hex, public_key_package_hex) = group_keys_to_hex(keys)?;
         Ok(Self {
             epoch,
@@ -57,8 +61,31 @@ impl PersistedDkg {
     }
 
     /// Rebuild the in-memory [`GroupKeys`] from the persisted bytes.
+    ///
+    /// Says nothing about the `roster` beside them — a caller that wants the PAIR
+    /// (to sign with, or to decide who its co-signers are) wants
+    /// [`Self::checked_group_keys`] instead.
     pub fn to_group_keys(&self) -> EpochResult<GroupKeys> {
         group_keys_from_hex(&self.key_package_hex, &self.public_key_package_hex)
+    }
+
+    /// The share, refusing a file whose `roster` contradicts it (WI-100).
+    ///
+    /// `roster` is a plain `Deserialize` that rides along for convenience, and
+    /// `min_signers` is the value a signing round's floor is tested against — so
+    /// the two halves have to describe one ceremony. This catches a file whose
+    /// halves came from different ones, or a writer that produced a pair it
+    /// should not have; it is NOT tamper detection, because
+    /// `KeyPackage::deserialize` does not derive `min_signers` from anything (see
+    /// [`crate::epoch::state::Roster::check_threshold`]).
+    ///
+    /// Deliberately separate from [`Self::to_group_keys`]: callers that want only
+    /// the KEY — deriving a treasury scriptPubKey, listing candidate internal keys
+    /// — have no use for the roster's claim, and must not be refused over it.
+    pub fn checked_group_keys(&self) -> EpochResult<GroupKeys> {
+        let keys = self.to_group_keys()?;
+        self.roster.check_threshold(&keys.key_package)?;
+        Ok(keys)
     }
 }
 
@@ -310,6 +337,40 @@ mod tests {
 
         // A different epoch has no state.
         assert!(read_dkg_state(&dir, 99).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WI-100: the roster rides along as a convenience, the share is what this
+    /// node signs with. A file whose roster claims a threshold the share was not
+    /// dealt is refused on the way in — resuming on it would close every round of
+    /// the epoch at the wrong count and fail aggregation with an opaque error.
+    #[test]
+    fn a_persisted_roster_that_contradicts_its_own_share_is_refused() {
+        let (keys, roster) = sample_output();
+        let mut saved = PersistedDkg::from_output(11, 3, &roster, &keys).unwrap();
+        // The share was dealt 2-of-2; claim 3.
+        saved.roster.min_signers = 3;
+
+        let dir = std::env::temp_dir().join(format!(
+            "heimdall-persist-threshold-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_dkg_state(&dir, &saved).unwrap();
+
+        let loaded = read_dkg_state(&dir, 11)
+            .unwrap()
+            .expect("the file still reads");
+        loaded
+            .to_group_keys()
+            .expect("the share itself is fine — only the roster beside it is wrong");
+        let err = loaded
+            .checked_group_keys()
+            .expect_err("a contradicted roster is refused");
+        let msg = err.to_string();
+        // Both numbers, so the operator can tell which end is wrong.
+        assert!(msg.contains("t = 3"), "{msg}");
+        assert!(msg.contains("t = 2"), "{msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

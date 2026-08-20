@@ -3406,6 +3406,15 @@ fn phase1_signer(
     }
     let roster = federation_roster(cfg)?.to_roster();
     let group_keys = state.to_group_keys().map_err(|e| e.to_string())?;
+    // The typed `[federation].min_signers` is the floor a signing round's `S1` is
+    // tested against, so it has to be the threshold the ceremony dealt — not
+    // merely a number the members agree on (WI-100). `check_roster` above compares
+    // this config against the roster the share was made for; these compare both
+    // against the share itself.
+    state.check_threshold().map_err(|e| e.to_string())?;
+    roster
+        .check_threshold(&group_keys.key_package)
+        .map_err(|e| e.to_string())?;
     Ok(Some(heimdall::epoch::state::Phase1Signer {
         roster,
         group_keys,
@@ -4139,6 +4148,8 @@ fn frost_federation_signature(
 ) -> Result<([u8; 64], HeldSession), String> {
     let roster = federation_roster(cfg)?;
     let (me, keypair) = federation_identity(cfg, &roster)?;
+    // About to sign, so the stored threshold has to be the dealt one (WI-100).
+    state.check_threshold().map_err(|e| e.to_string())?;
     let keys = state.to_group_keys().map_err(|e| e.to_string())?;
     // The share must be THIS member's. A share file copied from another member
     // carries their index, so the node would publish material under an identity
