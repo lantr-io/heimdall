@@ -3043,6 +3043,9 @@ async fn build_tm_phase(
         treasury.federation_csv_blocks,
     );
     let change_script = bitcoin::ScriptBuf::new_p2tr_tweaked(change_spend.output_key());
+    // Kept past the move into the builder: the "does this movement do anything"
+    // check below asks whether the change lands back on the very output spent.
+    let head_script = bitcoin::ScriptBuf::new_p2tr_tweaked(treasury_input_spend.output_key());
 
     // The completed-peg-outs trie: this node's own copy, which decides both which
     // requests are still owed a payment and the root this TM will commit.
@@ -3191,6 +3194,61 @@ async fn build_tm_phase(
             budget.max_tx_size,
             budget.envelope,
         )));
+    }
+
+    // The third condition on the batch gate: a movement has to MOVE something.
+    //
+    // With no peg-ins to sweep, no peg-outs to pay, and the treasury already at
+    // the address the datum authorizes, the assembled transaction spends the head
+    // to recreate it unchanged. It pays a Bitcoin fee to alter nothing, and the
+    // fee is the smaller half: `TreasuryUtxo::btc_confirmed` goes false the moment
+    // a movement is in flight, and both the gate in `collect_pegins_phase` and the
+    // wait above refuse to build on top of one — so a pointless movement closes
+    // the treasury for the ~100 confirmations plus the oracle's challenge-aging
+    // window it takes to confirm, and the first real peg-in to arrive queues
+    // behind it. On a six-hour grid an idle bridge would spend its whole life
+    // doing this.
+    //
+    // The spec's gate at each `B_i` is "if the TM-chain tip is Binocular-confirmed
+    // and no TM is currently in flight, the batch is frozen and built; otherwise
+    // the opportunity passes unused" (§TM batches). It does not contemplate a
+    // batch with nothing in it, and it already makes an unused opportunity a
+    // first-class outcome — so this reads as a third clause on that gate rather
+    // than a new behaviour: nothing downstream requires a movement per
+    // opportunity.
+    //
+    // THE HANDOFF IS NOT THIS. After an Update-Y the change pays the key the datum
+    // has rotated to, so the scripts differ and the guard does not fire — which
+    // matters, because the handoff is exactly the movement that carries no peg-ins
+    // and no peg-outs and must still be made.
+    //
+    // Judged on the ASSEMBLED transaction, not on the inputs to it: `build_tm`
+    // skips peg-outs the trie records as already completed, so a batch that
+    // arrived with requests can still pay none. What is signed is what is checked.
+    //
+    // Fee-bumping and consolidation are the two reasons a real bridge might want
+    // an otherwise-empty movement. Neither is modelled anywhere in heimdall today;
+    // if either arrives, this is the condition that has to learn about it.
+    if built_pegins == 0 && built_pegouts == 0 && unsigned.tx.output[0].script_pubkey == head_script
+    {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  nothing to move: no peg-ins, no peg-outs, and the treasury already sits at the \
+             address the datum authorizes ({}). {} passes unused rather than paying a fee to \
+             recreate the same output — and holding the treasury for the whole confirmation \
+             window while it does",
+            hex::encode(treasury.authorized_key.serialize()),
+            batch.map_or_else(
+                || "this epoch's movement".to_string(),
+                |b| format!("batch B_{}", b.index)
+            ),
+        );
+        return Ok(EpochPhase::CollectPegins {
+            epoch,
+            roster,
+            group_keys,
+        });
     }
 
     let sighashes = compute_sighashes(&unsigned);
@@ -4168,23 +4226,36 @@ mod tests {
     /// The mock used to derive `config_y_fed` from the head, which makes
     /// `y_51 != config_y_fed` unsatisfiable and the Phase-2 decline in
     /// `phase1_fallback` unreachable by any test in the suite.
+    ///
+    /// `pegouts` is the batch's WORK, and choosing it is part of what each caller
+    /// is saying. Zero means the movement's only reason to exist is the handoff
+    /// itself — the case that must still be built, and the one the WI-JVS2N guard
+    /// has to leave alone. One means the movement is warranted whatever the keys
+    /// are doing, which is what a test about the mover's IDENTITY needs so that
+    /// the cells where the datum and the head already agree are not skipped for
+    /// having nothing to do.
     fn chain_at(
         port: u16,
         head: bitcoin::key::UntweakedPublicKey,
         authorized: bitcoin::key::UntweakedPublicKey,
         y_fed: bitcoin::key::UntweakedPublicKey,
+        pegouts: u8,
     ) -> Arc<dyn CardanoChain> {
-        let mut fixture = demo_static_fixture(2, 2, port);
+        let mut fixture = movable_fixture(2, 2, port, pegouts);
         fixture.y_51 = head;
         fixture.y_fed = head;
-        Arc::new(
-            MockCardanoChain::new(fixture)
-                .with_head_key(head)
-                .with_config_y_fed(y_fed)
-                .with_treasury_info(MockCardanoChain::treasury_info_state(
-                    authorized, [0x5a; 32],
-                )),
-        )
+        let mock = MockCardanoChain::new(fixture)
+            .with_head_key(head)
+            .with_config_y_fed(y_fed)
+            .with_treasury_info(MockCardanoChain::treasury_info_state(
+                authorized, [0x5a; 32],
+            ));
+        // A withdrawal is only payable against a trie the node can vouch for.
+        Arc::new(if pegouts > 0 {
+            mock.with_cpo_root(empty_cpo_root())
+        } else {
+            mock
+        })
     }
 
     /// SPO side. Epoch 8's Update-Y has landed, so the datum names epoch 8's key
@@ -4222,7 +4293,7 @@ mod tests {
 
         // A distinct published federation key: this handoff is roster-to-roster and
         // has nothing to do with the federation.
-        let chain = chain_at(19310, y_out, y_in, xonly_of(&group_for(0xc0, 2, 3).1));
+        let chain = chain_at(19310, y_out, y_in, xonly_of(&group_for(0xc0, 2, 3).1), 0);
         let treasury = chain.query_treasury().await.unwrap();
         assert_eq!(treasury.y_51, y_out, "the head has not moved");
         assert_eq!(treasury.authorized_key, y_in, "the datum has");
@@ -4313,7 +4384,7 @@ mod tests {
         config.phase1_signer = Some(signer.clone());
 
         // Phase 2 by the datum, Phase 1 by the coins.
-        let chain = chain_at(19320, y_fed, y_roster, y_fed);
+        let chain = chain_at(19320, y_fed, y_roster, y_fed, 0);
         let treasury = chain.query_treasury().await.unwrap();
         assert_ne!(
             treasury.authorized_key, treasury.config_y_fed,
@@ -4390,7 +4461,7 @@ mod tests {
 
         let config = fast_config(Identifier::try_from(1u16).unwrap());
         assert!(config.phase1_signer.is_none());
-        let chain = chain_at(19330, y_head, y_me, y_head);
+        let chain = chain_at(19330, y_head, y_me, y_head, 0);
 
         let next = build_tm_phase(
             &chain,
@@ -4589,7 +4660,7 @@ mod tests {
         config.phase1_signer = Some(signer);
 
         // The handoff movement has confirmed: datum AND head are the roster's.
-        let chain = chain_at(19390, y_roster, y_roster, y_fed);
+        let chain = chain_at(19390, y_roster, y_roster, y_fed, 0);
         let treasury = chain.query_treasury().await.unwrap();
         assert_ne!(treasury.y_51, treasury.config_y_fed, "the coins have moved");
         assert_ne!(treasury.authorized_key, treasury.config_y_fed);
@@ -4608,6 +4679,122 @@ mod tests {
         assert!(
             matches!(err, EpochError::DkgAborted { .. }),
             "the ORIGINAL DKG error, not something about a federation that is done: {err}"
+        );
+    }
+
+    /// WI-JVS2N. A movement has to MOVE something: no peg-ins, no peg-outs, and
+    /// the treasury already at the address the datum authorizes means the batch
+    /// opportunity passes unused instead of paying a fee to recreate the same
+    /// output.
+    ///
+    /// The fee is the smaller half of what that costs. `btc_confirmed` goes false
+    /// the moment a movement is in flight and the batch gate refuses to build on
+    /// top of one, so a pointless movement holds the treasury for the ~100
+    /// confirmations plus the oracle's challenge window it takes to confirm, and
+    /// the first real request to arrive queues behind it. On preprod's six-hour
+    /// grid an idle bridge would spend its whole life doing this — and it became
+    /// reachable the moment the signer was chosen correctly, because before that
+    /// such a movement died at Submit on the signature.
+    ///
+    /// Third case is the one that makes the guard safe rather than merely frugal:
+    /// the HANDOFF carries no peg-ins and no peg-outs either, and must still be
+    /// built. What separates them is where output 0 pays.
+    #[tokio::test]
+    async fn a_movement_that_would_move_nothing_is_not_made_and_the_handoff_still_is() {
+        let (roster, keys) = group_for(0xf0, 2, 3);
+        let (_, next_keys) = group_for(0xf1, 2, 3);
+        let (_, fed) = group_for(0xf2, 2, 3);
+        let y = xonly_of(&keys);
+        let y_next = xonly_of(&next_keys);
+        let y_fed = xonly_of(&fed);
+        let clock = Arc::new(SystemClock) as Arc<dyn Clock>;
+        let config = fast_config(*keys.key_package.identifier());
+
+        let build = |chain: Arc<dyn CardanoChain>,
+                     batch: Option<crate::epoch::batch::BatchSlot>| {
+            let (roster, keys, config, clock) =
+                (roster.clone(), keys.clone(), config.clone(), clock.clone());
+            async move {
+                build_tm_phase(&chain, &clock, &config, 9, roster, keys, batch, Vec::new())
+                    .await
+                    .expect("declining is not a failure")
+            }
+        };
+
+        // 1. Steady state, empty batch: nothing to do, so nothing is done.
+        let idle = build(chain_at(19_500, y, y, y_fed, 0), None).await;
+        assert!(
+            matches!(idle, EpochPhase::CollectPegins { .. }),
+            "an empty batch in steady state must pass unused, got {}",
+            idle.name()
+        );
+
+        // 2. The same chain with one withdrawal waiting: the movement is made.
+        let working = build(chain_at(19_510, y, y, y_fed, 1), None).await;
+        assert!(
+            matches!(working, EpochPhase::Sign { .. }),
+            "a batch with work in it must still be built, got {}",
+            working.name()
+        );
+
+        // 3. The handoff: no peg-ins, no peg-outs, and it must be built anyway —
+        //    output 0 pays the key the datum has rotated to, so it is not a
+        //    self-send and the guard must not touch it. This is the movement the
+        //    whole handoff fix exists to make; a guard that swallowed it would
+        //    reintroduce the deadlock in a new place.
+        let handoff = build(chain_at(19_520, y, y_next, y_fed, 0), None).await;
+        let EpochPhase::Sign { tm, .. } = handoff else {
+            panic!("the handoff must be built even with an empty batch");
+        };
+        let treasury = chain_at(19_520, y, y_next, y_fed, 0)
+            .query_treasury()
+            .await
+            .unwrap();
+        assert_eq!(
+            tm.unsigned_tx.output[0].script_pubkey,
+            treasury_spk(&treasury, y_next),
+            "and it pays the incoming key, which is what makes it not a self-send"
+        );
+    }
+
+    /// The declined opportunity is SPENT, not retried in a loop.
+    ///
+    /// `await_batch_opportunity` marks `B_i` before the build, so returning to
+    /// `CollectPegins` waits for the next one rather than re-deciding the same
+    /// one — which is what keeps the guard from becoming a spin. By the next `B_i`
+    /// the answer can legitimately differ: a peg-in may have arrived, or the party
+    /// that holds the key may have moved the treasury.
+    #[tokio::test]
+    async fn a_declined_batch_waits_for_the_next_one_rather_than_re_deciding() {
+        let (roster, keys) = group_for(0xf3, 2, 3);
+        let (_, fed) = group_for(0xf4, 2, 3);
+        let y = xonly_of(&keys);
+        let chain = chain_at(19_530, y, y, xonly_of(&fed), 0);
+        let config = fast_config(*keys.key_package.identifier());
+        let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+        let clock = Arc::new(SystemClock) as Arc<dyn Clock>;
+
+        let mut built = BuiltBatch::default();
+        let next = collect_pegins_phase(&chain, &pegin, &config, 9, roster, keys, &mut built)
+            .await
+            .expect("the opportunity is served");
+        assert!(matches!(next, EpochPhase::BuildTm { .. }));
+        // Served once. A second pass over the same grid position finds it spent
+        // and reports the epoch over rather than offering it again.
+        let EpochPhase::BuildTm {
+            roster, group_keys, ..
+        } = next
+        else {
+            unreachable!()
+        };
+        let again =
+            collect_pegins_phase(&chain, &pegin, &config, 9, roster, group_keys, &mut built)
+                .await
+                .expect("a spent opportunity is not an error");
+        assert!(
+            matches!(again, EpochPhase::Idle),
+            "the declined opportunity must not be re-offered, got {}",
+            again.name()
         );
     }
 
@@ -4635,7 +4822,11 @@ mod tests {
             (y_spo, y_spo, "roster"),     // Phase 2, steady
             (y_fed, y_spo, "roster"),     // its mirror: a datum handed back
         ] {
-            let chain = chain_at(port, head, authorized, y_fed);
+            // One withdrawal, so every cell has a movement worth making: the two cells
+            // where the datum and the head already agree would otherwise carry nothing
+            // and pass unused, and this test is about WHO moves, not whether there is
+            // anything to move.
+            let chain = chain_at(port, head, authorized, y_fed, 1);
             port += 10;
             let treasury = chain.query_treasury().await.unwrap();
 
@@ -4767,13 +4958,14 @@ mod tests {
     /// the new treasury address as its change output. Identical txids across all
     /// instances ⇒ identical Y_51 ⇒ identical treasury address.
     async fn multi_instance_same_treasury(n: u16, t: u16) {
-        let fixture = demo_static_fixture(t, n, 18_600);
+        let fixture = movable_fixture(t, n, 18_600, 1);
         let hub = MockPeerHub::new();
 
         let mut handles = Vec::new();
         for i in 1..=n {
             let id = Identifier::try_from(i).unwrap();
-            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(empty_cpo_root()));
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -4847,13 +5039,15 @@ mod tests {
         let state_txid = [0xc3u8; 32];
         let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, state_txid);
 
-        let fixture = demo_static_fixture(2, 2, 18_900);
+        let fixture = movable_fixture(2, 2, 18_900, 1);
         let hub = MockPeerHub::new();
         let mut handles = Vec::new();
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
             let chain: Arc<dyn CardanoChain> = Arc::new(
-                MockCardanoChain::new(fixture.clone()).with_treasury_info(treasury_info.clone()),
+                MockCardanoChain::new(fixture.clone())
+                    .with_cpo_root(empty_cpo_root())
+                    .with_treasury_info(treasury_info.clone()),
             );
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
@@ -4934,6 +5128,56 @@ mod tests {
 
     /// A standard, payable destination — `build_tm` drops anything else as
     /// `NonStandardScript`, which would mask the rule under test.
+    /// The attested completed-peg-outs root of an empty trie — what a chain with
+    /// no peg-out history reports, and what `build_tm` must be able to verify the
+    /// local trie against before it will pay anything at all (WI-031).
+    fn empty_cpo_root() -> [u8; 32] {
+        crate::cardano::cpo_trie::CpoTrie::empty().root()
+    }
+
+    /// A fixture with a REASON TO MOVE: `n` payable peg-outs.
+    ///
+    /// Most tests below are about the CYCLE — does it reach Submit, does the
+    /// cascade stagger, does a second batch run without a second ceremony — not
+    /// about withdrawals. They used to get their movement for free, because a
+    /// movement carrying nothing was still built and signed. Since WI-JVS2N it is
+    /// not: spending the head to recreate it unchanged pays a Bitcoin fee to alter
+    /// nothing and holds the treasury for the whole confirmation window, so the
+    /// batch opportunity passes unused instead. The thing under test therefore
+    /// needs an actual reason to spend the treasury, and one withdrawal per
+    /// expected movement is the cheapest honest one — it also makes these tests
+    /// exercise a movement a real bridge would make, rather than a degenerate one.
+    ///
+    /// Pair with [`empty_cpo_root`] on the chain, or `build_tm` treats the local
+    /// trie as unvouched-for and pays nothing (which would leave the movement
+    /// empty again).
+    fn movable_fixture(
+        min_signers: u16,
+        max_signers: u16,
+        base_port: u16,
+        n: u8,
+    ) -> crate::epoch::fixture::StaticFixture {
+        use crate::epoch::fixture::StaticPegOut;
+        let mut fixture = demo_static_fixture(min_signers, max_signers, base_port);
+        let now = now_ms();
+        for i in 0..n {
+            fixture.pegouts.push(StaticPegOut {
+                script_pubkey: p2wpkh(0xd0 + i),
+                amount: bitcoin::Amount::from_sat(50_000),
+                // One per BATCH, not all in the first. `slot(i)`'s membership
+                // cutoff is `4_900_000 + i`, so request `i` (0-based) lands in
+                // batch `i + 1` and nowhere earlier — which is what gives a
+                // multi-movement test a reason for its SECOND movement to exist.
+                // All of them together in batch 1 would leave batch 2 empty, and
+                // an empty batch now passes unused. Zero for the first, so a test
+                // on a grid-less chain (where no cutoff applies) is unaffected.
+                created_slot: if i == 0 { 0 } else { 4_900_001 + u64::from(i) },
+                created: now,
+            });
+        }
+        fixture
+    }
+
     fn p2wpkh(tag: u8) -> bitcoin::ScriptBuf {
         let mut spk = vec![0x00, 0x14];
         spk.extend_from_slice(&[tag; 20]);
@@ -5236,14 +5480,17 @@ mod tests {
             "nothing has run yet"
         );
 
-        let fixture = demo_static_fixture(2, 2, 19_980);
+        let fixture = movable_fixture(2, 2, 19_980, 1);
         let hub = MockPeerHub::new();
         let head = MockCardanoChain::tm_chain_head(&fixture);
         let mut handles = Vec::new();
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
-            let chain: Arc<dyn CardanoChain> =
-                Arc::new(MockCardanoChain::new(fixture.clone()).with_tm_chain(Arc::clone(&head)));
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone())
+                    .with_cpo_root(empty_cpo_root())
+                    .with_tm_chain(Arc::clone(&head)),
+            );
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -5292,7 +5539,7 @@ mod tests {
     }
 
     async fn gate_over(builds: &[(u16, crate::http::compat::PeerBuild)]) -> Vec<u16> {
-        let fixture = demo_static_fixture(2, 3, 19_990);
+        let fixture = movable_fixture(2, 3, 19_990, 1);
         let hub = crate::epoch::mocks::MockPeerHub::new();
         for (i, b) in builds {
             hub.set_build(Identifier::try_from(*i).unwrap(), b.clone());
@@ -5619,48 +5866,80 @@ mod tests {
     /// The safety gate that makes deleting the multiset guard sound: with no
     /// `cardano.cpo_policy_id` the local trie was never cross-checked, so it cannot be trusted
     /// to say what was already paid — and paying without any dedup re-pays every open request
-    /// on every movement. The daemon must skip peg-outs entirely, while still sweeping
-    /// peg-ins.
+    /// on every movement. The daemon must skip peg-outs entirely.
+    ///
+    /// Stated at `build_tm_phase`, which is where the decision is made, and in two
+    /// halves so the skip is attributable: the SAME chain, fixture and node, once
+    /// with the bridge-state roots published and once without. With them, the
+    /// withdrawal is paid. Without them it is skipped — and since it was the only
+    /// work in the batch, what is left is a movement that would return the
+    /// treasury to the address it already sits at, so the opportunity passes
+    /// unused rather than spending a fee to pay nobody (WI-JVS2N).
+    ///
+    /// It used to drive `run_epoch_loop` and assert that the movement carried no
+    /// payment. That shape is gone with the empty movement it depended on; the
+    /// safety claim is unchanged and now holds a fortiori — an unvouched node does
+    /// not even pay the fee. Peg-ins are unaffected either way and would still be
+    /// swept, which is the degradation WI-030 documents.
     #[tokio::test]
     async fn daemon_pays_no_pegout_when_the_trie_was_not_cross_checked() {
-        use crate::epoch::fixture::StaticPegOut;
-        use bitcoin::Amount;
+        let (roster, keys) = group_for(0xe0, 2, 3);
+        let y = xonly_of(&keys);
+        let (_, fed) = group_for(0xe1, 2, 3);
+        let y_fed = xonly_of(&fed);
 
-        let mut fixture = demo_static_fixture(2, 2, 18_800);
-        let dest = p2wpkh(0x05);
-        fixture.pegouts.push(StaticPegOut {
-            script_pubkey: dest.clone(),
-            amount: Amount::from_sat(50_000),
-            created_slot: 0,
-            created: now_ms(),
-        });
+        // Steady state: the datum names the key the head is locked under, and one
+        // withdrawal is waiting.
+        let chain_of = |port: u16, vouched: bool| -> Arc<dyn CardanoChain> {
+            let mut fixture = movable_fixture(2, 2, port, 1);
+            fixture.y_51 = y;
+            fixture.y_fed = y;
+            let mock = MockCardanoChain::new(fixture)
+                .with_head_key(y)
+                .with_config_y_fed(y_fed)
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y, [0x5a; 32]));
+            Arc::new(if vouched {
+                mock.with_cpo_root(empty_cpo_root())
+            } else {
+                mock
+            })
+        };
+        let build = |chain: Arc<dyn CardanoChain>, roster: Roster, keys: GroupKeys| async move {
+            build_tm_phase(
+                &chain,
+                &(Arc::new(SystemClock) as Arc<dyn Clock>),
+                &fast_config(*keys.key_package.identifier()),
+                9,
+                roster,
+                keys,
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect("neither case is an error")
+        };
 
-        let hub = MockPeerHub::new();
-        let mut handles = Vec::new();
-        for i in 1..=2u16 {
-            let id = Identifier::try_from(i).unwrap();
-            // No `with_cpo_root`: query_cpo_root returns None = "not configured".
-            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
-            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
-            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
-            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
-            let config = fast_config(id);
-            handles.push(tokio::spawn(async move {
-                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
-            }));
-        }
-        let mut tms = Vec::new();
-        for h in handles {
-            tms.push(h.await.unwrap().expect("epoch cycle completes"));
-        }
+        // Vouched for: the withdrawal is paid, so there is a movement to make.
+        let paid = build(chain_of(19_810, true), roster.clone(), keys.clone()).await;
+        let EpochPhase::Sign { tm, .. } = paid else {
+            panic!("expected Sign with the payment, got {}", paid.name());
+        };
+        let payments: Vec<_> = tm
+            .unsigned_tx
+            .output
+            .iter()
+            .filter(|o| !o.script_pubkey.is_op_return() && !o.script_pubkey.is_p2tr())
+            .collect();
+        assert_eq!(payments.len(), 1, "the control case must pay: {tm:?}");
+        assert_eq!(payments[0].script_pubkey, p2wpkh(0xd0));
 
-        let outputs = &tms[0].unsigned_tx.output;
+        // Not vouched for: skipped, and nothing else is left to move.
+        let skipped = build(chain_of(19_820, false), roster, keys).await;
         assert!(
-            outputs
-                .iter()
-                .all(|o| o.script_pubkey.is_op_return() || o.script_pubkey.is_p2tr()),
-            "an uncross-checked trie must yield NO peg-out payment, got {outputs:?}"
+            matches!(skipped, EpochPhase::CollectPegins { .. }),
+            "an uncross-checked trie must yield NO peg-out payment, and with nothing else in \
+             the batch no movement at all — got {}",
+            skipped.name()
         );
     }
 
@@ -5682,13 +5961,14 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("wi032-record-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let fixture = demo_static_fixture(2, 2, 18_650);
+        let fixture = movable_fixture(2, 2, 18_650, 1);
         let hub = MockPeerHub::new();
         let mut handles = Vec::new();
 
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
-            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(empty_cpo_root()));
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -5919,15 +6199,18 @@ mod tests {
     /// on their stale attempt-0 packages forever).
     #[tokio::test]
     async fn full_cycle_3_of_3_staggered_start_converges() {
-        let fixture = demo_static_fixture(3, 3, 18_800);
+        let fixture = movable_fixture(3, 3, 18_800, 1);
         let hub = MockPeerHub::new();
         let anchor_ms = crate::epoch::dkg::wall_now_ms();
 
         let mut handles = Vec::new();
         for i in 1..=3u16 {
             let id = Identifier::try_from(i).unwrap();
-            let chain: Arc<dyn CardanoChain> =
-                Arc::new(MockCardanoChain::new(fixture.clone()).with_schedule_anchor_ms(anchor_ms));
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone())
+                    .with_cpo_root(empty_cpo_root())
+                    .with_schedule_anchor_ms(anchor_ms),
+            );
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -6204,13 +6487,14 @@ mod tests {
         // outage would leave them, so they retry the handoff together.
         let outage = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-        let fixture = demo_static_fixture(2, 2, 19_700);
+        let fixture = movable_fixture(2, 2, 19_700, 1);
         let hub = MockPeerHub::new();
         let mut handles = Vec::new();
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
             let chain: Arc<dyn CardanoChain> = Arc::new(
                 MockCardanoChain::new(fixture.clone())
+                    .with_cpo_root(empty_cpo_root())
                     .with_treasury_info(treasury_info.clone())
                     .fail_next_update_y_plans(Arc::clone(&outage), 2),
             );
@@ -6348,14 +6632,16 @@ mod tests {
         .0;
         let treasury_info = MockCardanoChain::treasury_info_state(outgoing, [0x1au8; 32]);
 
-        let fixture = demo_static_fixture(2, 2, 19_900);
+        let fixture = movable_fixture(2, 2, 19_900, 1);
         let hub = MockPeerHub::new();
         let mut handles = Vec::new();
         let mut healths = Vec::new();
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
             let chain: Arc<dyn CardanoChain> = Arc::new(
-                MockCardanoChain::new(fixture.clone()).with_treasury_info(treasury_info.clone()),
+                MockCardanoChain::new(fixture.clone())
+                    .with_cpo_root(empty_cpo_root())
+                    .with_treasury_info(treasury_info.clone()),
             );
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
@@ -6635,7 +6921,7 @@ mod tests {
     /// derive different group keys, which is WI-105's territory, not this one's.
     #[tokio::test]
     async fn a_peer_that_errors_during_the_dkg_is_excluded_not_fatal() {
-        let fixture = demo_static_fixture(2, 3, 19_960);
+        let fixture = movable_fixture(2, 3, 19_960, 1);
         let hub = MockPeerHub::new();
         let spo3 = Identifier::try_from(3u16).unwrap();
         let mut handles = Vec::new();
@@ -6643,7 +6929,8 @@ mod tests {
         // endpoint answering 502 rather than going quietly unanswered.
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
-            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(empty_cpo_root()));
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             let peers: Arc<dyn PeerNetwork> =
                 Arc::new(MockPeerNetwork::new(id, hub.clone()).seeing_unreachable(spo3));
@@ -6692,13 +6979,14 @@ mod tests {
     /// aggregate even though nothing was wrong with either of them.
     #[tokio::test]
     async fn a_peer_that_errors_is_signed_around_like_one_that_is_silent() {
-        let fixture = demo_static_fixture(2, 3, 19_950);
+        let fixture = movable_fixture(2, 3, 19_950, 1);
         let hub = MockPeerHub::new();
         let spo3 = Identifier::try_from(3u16).unwrap();
         let mut handles = Vec::new();
         for i in 1..=3u16 {
             let id = Identifier::try_from(i).unwrap();
-            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(empty_cpo_root()));
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             let net = MockPeerNetwork::new(id, hub.clone());
             // spo 3 goes dark for signing: silent to everyone. spo 2 additionally
@@ -6847,9 +7135,10 @@ mod tests {
     /// roster, not assumed — the point is that whoever it names can be missing.
     #[tokio::test]
     async fn a_dark_leader_costs_a_cascade_hop_not_the_movement() {
-        let fixture = demo_static_fixture(2, 3, 19_970);
+        let fixture = movable_fixture(2, 3, 19_970, 1);
         let head = MockCardanoChain::tm_chain_head(&fixture);
-        let probe: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+        let probe: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(empty_cpo_root()));
         let roster = probe.query_roster(0).await.expect("fixture roster");
         // The movement spends the fixture's treasury outpoint, so that is the
         // election's `prev_tm_txid` — the same value every node reads.
@@ -6872,7 +7161,7 @@ mod tests {
         // the rest of the roster, and it is the case the cascade exists for.
         for (_, info) in roster.participants.iter() {
             let id = info.identifier;
-            let mock = MockCardanoChain::new(fixture.clone());
+            let mock = MockCardanoChain::new(fixture.clone()).with_cpo_root(empty_cpo_root());
             let mock = if id == elected {
                 mock
             } else {
@@ -6922,7 +7211,7 @@ mod tests {
     /// stands down instead of burning a fee posting the same bytes again.
     #[tokio::test]
     async fn a_later_hop_stands_down_once_a_predecessor_has_posted() {
-        let fixture = demo_static_fixture(2, 2, 19_971);
+        let fixture = movable_fixture(2, 2, 19_971, 1);
         let head = MockCardanoChain::tm_chain_head(&fixture);
         let hub = MockPeerHub::new();
         // Separate chain objects so each node's submissions are counted on its
@@ -6930,7 +7219,11 @@ mod tests {
         // predecessor already posted.
         let chains: Vec<Arc<MockCardanoChain>> = (1..=2u16)
             .map(|_| {
-                Arc::new(MockCardanoChain::new(fixture.clone()).with_tm_chain(Arc::clone(&head)))
+                Arc::new(
+                    MockCardanoChain::new(fixture.clone())
+                        .with_cpo_root(empty_cpo_root())
+                        .with_tm_chain(Arc::clone(&head)),
+                )
             })
             .collect();
         let mut handles = Vec::new();
@@ -6997,13 +7290,15 @@ mod tests {
         .0;
         let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, [0xe4u8; 32]);
 
-        let fixture = demo_static_fixture(2, 2, 19_900);
+        let fixture = movable_fixture(2, 2, 19_900, 1);
         let hub = MockPeerHub::new();
         let mut handles = Vec::new();
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
             let chain: Arc<dyn CardanoChain> = Arc::new(
-                MockCardanoChain::new(fixture.clone()).with_treasury_info(treasury_info.clone()),
+                MockCardanoChain::new(fixture.clone())
+                    .with_cpo_root(empty_cpo_root())
+                    .with_treasury_info(treasury_info.clone()),
             );
             let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
             // Node 2 completes the DKG and then goes dark for the signing rounds,
@@ -7066,7 +7361,7 @@ mod tests {
         .0;
         let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, [0xd4u8; 32]);
 
-        let fixture = demo_static_fixture(2, 2, 19_200);
+        let fixture = movable_fixture(2, 2, 19_200, 2);
         let hub = MockPeerHub::new();
         // ONE grid and ONE treasury, shared: every node stands at the same
         // opportunity, and a submitted movement moves the head and the grid on
@@ -7074,12 +7369,23 @@ mod tests {
         // transaction rather than a replay of the first.
         let grid = Arc::new(std::sync::Mutex::new(crate::epoch::mocks::open_at(slot(1))));
         let head = MockCardanoChain::tm_chain_head(&fixture);
+        // SHARED roots, not a frozen one: the singleton advances with each
+        // movement, so the second movement's cross-check sees the root the first
+        // one committed. A static `with_cpo_root` would go stale the moment the
+        // first payment landed in the trie, `build_tm` would refuse to pay
+        // anything against an unvouched-for trie, and the second batch would have
+        // nothing to move.
+        let roots = MockCardanoChain::bridge_roots_state(
+            crate::cardano::spi_trie::SpiTrie::empty().root(),
+            crate::cardano::cpo_trie::CpoTrie::empty().root(),
+        );
 
         let mut handles = Vec::new();
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
             let chain: Arc<dyn CardanoChain> = Arc::new(
                 MockCardanoChain::new(fixture.clone())
+                    .with_shared_bridge_roots(Arc::clone(&roots))
                     .with_treasury_info(treasury_info.clone())
                     .with_batch_window(Arc::clone(&grid))
                     .with_tm_chain(Arc::clone(&head))
@@ -7188,6 +7494,24 @@ mod tests {
             created_slot: 0,
             created: now_ms(),
         });
+        // A SECOND withdrawal, requested between the two batches: `slot(1)`'s
+        // membership cutoff is 4_900_001 and the next batch's is 4_900_002, so this
+        // one is outside the first batch and inside the second.
+        //
+        // It is what gives the second movement a reason to exist at all. Since
+        // WI-JVS2N a movement that sweeps nothing, pays nothing and returns the
+        // treasury to the address it already sits at is not built — so without a
+        // new request the second batch would correctly pass unused, and the
+        // re-payment this test is about could not be observed either way. With it,
+        // the second movement is a real one, and the assertion below is the sharp
+        // form of the claim: it pays THIS request and not the one already settled.
+        let dest2 = p2wpkh(0x0a);
+        fixture.pegouts.push(StaticPegOut {
+            script_pubkey: dest2.clone(),
+            amount: Amount::from_sat(40_000),
+            created_slot: 4_900_002,
+            created: now_ms(),
+        });
 
         let hub = MockPeerHub::new();
         // One grid, one treasury, one bridge-state singleton — all shared, as on
@@ -7274,11 +7598,22 @@ mod tests {
             "the first movement pays the request"
         );
         assert_eq!(payments(first)[0].script_pubkey, dest);
+        // The sharp form of the claim: the second movement is a REAL one — it pays
+        // the withdrawal that arrived between the batches — and the request the
+        // first movement settled is absent from it. The completed-peg-outs trie is
+        // the only record that can tell the two apart (the request UTxO is still
+        // open at both), and it only holds the payment if the fold happened.
+        assert_eq!(
+            payments(second).len(),
+            1,
+            "the second movement pays the request that arrived after the first batch's cutoff: \
+             got {:?}",
+            payments(second)
+        );
+        assert_eq!(payments(second)[0].script_pubkey, dest2);
         assert!(
-            payments(second).is_empty(),
-            "the second movement must not re-pay a request the first already paid — the \
-             completed-peg-outs trie is the only record that can tell them apart, and it only \
-             holds the payment if the fold happened: got {:?}",
+            payments(second).iter().all(|o| o.script_pubkey != dest),
+            "the second movement must not re-pay a request the first already paid: got {:?}",
             payments(second)
         );
 
@@ -7613,12 +7948,13 @@ mod tests {
     /// first call, so that failure mode hangs the test.
     #[tokio::test]
     async fn a_transient_failure_costs_one_batch_not_the_epoch() {
-        let fixture = demo_static_fixture(2, 2, 19_600);
+        let fixture = movable_fixture(2, 2, 19_600, 1);
         let hub = MockPeerHub::new();
         let mut handles = Vec::new();
         for i in 1..=2u16 {
             let id = Identifier::try_from(i).unwrap();
-            let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(empty_cpo_root()));
             let source = MockCardanoPegInSource::new();
             // Both nodes fail the same query, so they stay in step; one node
             // failing alone would merely time the other out of its signing round.

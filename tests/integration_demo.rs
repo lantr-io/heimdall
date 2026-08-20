@@ -27,7 +27,32 @@ async fn full_cycle_3_spos_over_http() {
     let max_signers = 3u16;
     let base_port = 18460u16; // distinct from other test files
 
-    let fixture = demo_static_fixture(min_signers, max_signers, base_port);
+    let mut fixture = demo_static_fixture(min_signers, max_signers, base_port);
+    // A withdrawal to pay, so the movement this test converges on is one a real
+    // bridge would make. Since WI-JVS2N a movement that sweeps nothing, pays
+    // nothing and returns the treasury to the address it already sits at is not
+    // built at all — the batch opportunity passes unused rather than paying a fee
+    // to recreate the same output — so without a request there would be no
+    // movement here to converge ON.
+    fixture
+        .pegouts
+        .push(heimdall::epoch::fixture::StaticPegOut {
+            script_pubkey: bitcoin::ScriptBuf::from_bytes({
+                let mut spk = vec![0x00, 0x14];
+                spk.extend_from_slice(&[0xd0u8; 20]);
+                spk
+            }),
+            amount: bitcoin::Amount::from_sat(50_000),
+            created_slot: 0,
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        });
+    let fixture = fixture;
+    // ...and the attested root that lets `build_tm` actually pay it: an unvouched
+    // trie means "pay no peg-out" (WI-031), which would leave the batch empty again.
+    let cpo_root = heimdall::cardano::cpo_trie::CpoTrie::empty().root();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
     // Build per-SPO HTTP layer + spawn the axum server. Each SPO gets the
@@ -71,7 +96,8 @@ async fn full_cycle_3_spos_over_http() {
     for (i, net) in nets.into_iter().enumerate() {
         let id = Identifier::try_from((i as u16) + 1).unwrap();
         let port = base_port + i as u16;
-        let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(cpo_root));
         let pegin_source: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
         let clock = clock.clone();
         let peers: Arc<dyn PeerNetwork> = net;
