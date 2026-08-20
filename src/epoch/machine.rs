@@ -4516,11 +4516,17 @@ mod tests {
             let mut fixture = demo_static_fixture(2, 2, port);
             fixture.y_51 = y_fed;
             fixture.y_fed = y_fed;
+            let state = MockCardanoChain::treasury_info_state(datum, [0x5a; 32]);
+            // Recorded as an accepted rotation, not just a datum that happens to
+            // hold this key: the lag models a posted Update-Y that is not in a
+            // block yet, and only a read taken after one was posted can lag behind
+            // it.
+            state.lock().unwrap().rotations.push((9, datum, [0u8; 64]));
             Arc::new(
                 MockCardanoChain::new(fixture)
                     .with_head_key(y_fed)
                     .with_config_y_fed(y_fed)
-                    .with_treasury_info(MockCardanoChain::treasury_info_state(datum, [0x5a; 32]))
+                    .with_treasury_info(state)
                     .with_datum_lag(lag),
             ) as Arc<dyn CardanoChain>
         };
@@ -4757,44 +4763,74 @@ mod tests {
         );
     }
 
-    /// The declined opportunity is SPENT, not retried in a loop.
+    /// The declined opportunity is SPENT, not handed back — which is what keeps
+    /// the guard from becoming a spin.
     ///
-    /// `await_batch_opportunity` marks `B_i` before the build, so returning to
-    /// `CollectPegins` waits for the next one rather than re-deciding the same
-    /// one — which is what keeps the guard from becoming a spin. By the next `B_i`
-    /// the answer can legitimately differ: a peg-in may have arrived, or the party
-    /// that holds the key may have moved the treasury.
+    /// `await_batch_opportunity` marks `B_i` BEFORE the build, and the decline
+    /// returns `CollectPegins` without clearing that mark, so the loop waits for
+    /// the next opportunity rather than re-deciding this one. By then the answer
+    /// can legitimately differ: a request may have arrived, or the party holding
+    /// the key may have moved the treasury.
+    ///
+    /// This drives the real sequence on a real GRID — `collect_pegins_phase`
+    /// serves `B_1`, `build_tm_phase` declines it — and checks the marker either
+    /// side. An earlier version of this test called `collect_pegins_phase` twice
+    /// on a grid-less chain and never reached `build_tm_phase` at all, so it
+    /// passed with both of the new exits reverted: it was measuring the
+    /// pre-existing one-movement-per-epoch rule, not this contract.
     #[tokio::test]
-    async fn a_declined_batch_waits_for_the_next_one_rather_than_re_deciding() {
+    async fn a_declined_batch_is_spent_not_handed_back() {
         let (roster, keys) = group_for(0xf3, 2, 3);
         let (_, fed) = group_for(0xf4, 2, 3);
         let y = xonly_of(&keys);
-        let chain = chain_at(19_530, y, y, xonly_of(&fed), 0);
+        let mut fixture = demo_static_fixture(2, 2, 19_530);
+        fixture.y_51 = y;
+        fixture.y_fed = y;
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(y)
+                .with_config_y_fed(xonly_of(&fed))
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y, [0x5a; 32]))
+                .with_batch(slot(1)),
+        );
         let config = fast_config(*keys.key_package.identifier());
         let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
         let clock = Arc::new(SystemClock) as Arc<dyn Clock>;
 
         let mut built = BuiltBatch::default();
-        let next = collect_pegins_phase(&chain, &pegin, &config, 9, roster, keys, &mut built)
-            .await
-            .expect("the opportunity is served");
-        assert!(matches!(next, EpochPhase::BuildTm { .. }));
-        // Served once. A second pass over the same grid position finds it spent
-        // and reports the epoch over rather than offering it again.
-        let EpochPhase::BuildTm {
-            roster, group_keys, ..
-        } = next
-        else {
-            unreachable!()
+        let next = collect_pegins_phase(
+            &chain,
+            &pegin,
+            &config,
+            9,
+            roster.clone(),
+            keys.clone(),
+            &mut built,
+        )
+        .await
+        .expect("the opportunity is served");
+        let EpochPhase::BuildTm { batch, .. } = next else {
+            panic!("expected BuildTm, got {}", next.name());
         };
-        let again =
-            collect_pegins_phase(&chain, &pegin, &config, 9, roster, group_keys, &mut built)
-                .await
-                .expect("a spent opportunity is not an error");
+        let b = batch.expect("this chain has a grid");
         assert!(
-            matches!(again, EpochPhase::Idle),
-            "the declined opportunity must not be re-offered, got {}",
-            again.name()
+            built.is(9, b.index),
+            "the opportunity is marked before the build, not after it"
+        );
+
+        let declined = build_tm_phase(&chain, &clock, &config, 9, roster, keys, batch, Vec::new())
+            .await
+            .expect("declining is not a failure");
+        assert!(
+            matches!(declined, EpochPhase::CollectPegins { .. }),
+            "an empty batch declines back into the batch loop, got {}",
+            declined.name()
+        );
+        assert!(
+            built.is(9, b.index),
+            "and it stays SPENT — handing B_{} back would re-decide the same empty batch \
+             immediately instead of waiting for the next one",
+            b.index
         );
     }
 

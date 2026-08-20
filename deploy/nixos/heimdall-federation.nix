@@ -179,7 +179,11 @@ in
     extraArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
-      example = [ "--timeout-secs" "300" ];
+      # `run-spo` REJECTS unknown arguments, and the unit restarts for ever on a
+      # clap exit without reaching the startup gate that would explain why — so an
+      # example naming a flag `run-spo` does not have bricks every member of the
+      # federation. `--timeout-secs` is `federation-dkg` / `federation-sign`.
+      example = [ "--deterministic" ];
       description = "Extra CLI arguments appended to every member's `run-spo`.";
     };
   };

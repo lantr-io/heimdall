@@ -598,10 +598,18 @@ impl CardanoChain for MockCardanoChain {
             // Without one, whatever key the head is under is also the authorized
             // one, which is the bootstrap (Phase-1) reading its fixture models.
             authorized_key: self.treasury_info.as_ref().map_or(y_51, |t| {
-                if self
-                    .datum_lag
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-                    .is_ok()
+                // Only a read taken AFTER a rotation was posted can lag behind it,
+                // so the budget is spent only then. Decrementing on every treasury
+                // read let the incidental ones — `phase1_fallback`'s gate, the
+                // batch loop's head read, `build_tm_phase`'s btc_confirmed wait —
+                // exhaust it before the rotation even existed, which quietly turns
+                // a test of the wait into a tautology.
+                let rotated = !t.lock().unwrap().rotations.is_empty();
+                if rotated
+                    && self
+                        .datum_lag
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                        .is_ok()
                 {
                     // Still reading the datum as it was: whatever key the head is
                     // under was the authorized one before the rotation.

@@ -212,7 +212,32 @@ pub fn demo_static_fixture_from_config(
         },
         treasury_value: Amount::from_sat(10_000_000),
         pegins: vec![],
-        pegouts: vec![],
+        // One demo withdrawal, so the offline demo has a movement to make.
+        //
+        // Without it there is nothing to sweep, nothing to pay, and the change
+        // returns to the address the treasury already sits at — which since
+        // WI-JVS2N is a batch that passes unused rather than a transaction. The
+        // WI-023 workflow (three `run-spo` processes with no chain configured)
+        // would then complete its DKG and go quiet for ever, printing no error,
+        // because the whole point of that setup is to exercise the HTTP signing
+        // path on a movement.
+        //
+        // As synthetic as the treasury outpoint above, and on the same path: a
+        // live chain answers `query_pegout_requests` from `peg_out.ak`, never from
+        // this fixture, so this is reachable only on the mock.
+        pegouts: vec![StaticPegOut {
+            script_pubkey: ScriptBuf::from_bytes({
+                let mut spk = vec![0x00, 0x14];
+                spk.extend_from_slice(&[0xDE; 20]);
+                spk
+            }),
+            amount: Amount::from_sat(50_000),
+            created_slot: 0,
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        }],
         fee_rate_sat_per_vb: cfg.bitcoin.fee_rate_sat_per_vb,
         per_pegout_fee: Amount::from_sat(cfg.bitcoin.per_pegout_fee_sat),
         per_pegout_fee_floor: Amount::ZERO,

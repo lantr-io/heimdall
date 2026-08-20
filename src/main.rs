@@ -2577,7 +2577,14 @@ fn mock_chain_with_rpc(
     cfg: &HeimdallConfig,
     fixture: heimdall::epoch::fixture::StaticFixture,
 ) -> MockCardanoChain {
-    let mut chain = MockCardanoChain::new(fixture);
+    // Publish the bridge-state roots the demo starts from. A peg-out is only
+    // payable against a completed-peg-outs trie the node can cross-check (WI-031),
+    // and with nothing published the demo would skip its own fixture withdrawal —
+    // leaving a batch with nothing in it, which since WI-JVS2N is not a movement at
+    // all. The mock advances these as movements are submitted, so a second one
+    // cross-checks against the root the first committed.
+    let mut chain = MockCardanoChain::new(fixture)
+        .with_cpo_root(heimdall::cardano::cpo_trie::CpoTrie::empty().root());
     if let Some(rpc_url) = &cfg.bitcoin.rpc_url {
         chain = chain.with_btc_rpc(
             rpc_url,
