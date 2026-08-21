@@ -520,12 +520,27 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                         None
                     }
                     Ok(view) => {
+                        // The peg-in scan address, derived from this very datum
+                        // (#6). Reported because "0 eligible peg-ins" is the same
+                        // line whether there are no deposits or the node is
+                        // watching an address no depositor uses — and without the
+                        // address in any output, telling those apart meant
+                        // decoding the Config datum by hand.
+                        let scanning = cfg
+                            .cardano
+                            .is_mainnet()
+                            .ok()
+                            .and_then(|m| view.params.bridge_contracts(m).ok())
+                            .map_or_else(
+                                || String::from("; peg-in address underivable from this datum"),
+                                |c| format!("; peg-in requests at {}", c.pegin_script_address),
+                            );
                         b.push(
                             3,
                             "resolve the Config",
                             Status::Pass,
                             format!(
-                                "{} ({} fields, fee_rate {} sat/vB)",
+                                "{} ({} fields, fee_rate {} sat/vB){scanning}",
                                 view.utxo,
                                 view.params.field_count,
                                 view.params.tunables.fee_rate_sat_per_vb

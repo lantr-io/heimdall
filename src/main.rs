@@ -2041,6 +2041,16 @@ async fn run_spo(
         // authenticated source, so the half-configured daemon this used to guard
         // against (peg-out-capable in its own report, blind in practice) can no
         // longer be expressed.
+        // The peg-in side of the line below. Both addresses come from the same
+        // Config record, and only one of them used to be reported — so a node
+        // scanning an unexpected peg-in address looked identical to one with
+        // nothing to sweep, and "0 eligible peg-ins" was the only symptom either
+        // way. That is the state to be able to tell apart at a glance: this is
+        // where deposits are found, and the policy is what a request NFT carries.
+        info!(
+            "peg-in requests:      {} (policy {})",
+            bridge.pegin_script_address, bridge.pegin_policy_id
+        );
         info!("peg-out requests:     {}", bridge.pegout_script_address);
         bf_chain =
             bf_chain.with_pegout_source(&bridge.pegout_script_address, &bridge.bridged_token_unit);
