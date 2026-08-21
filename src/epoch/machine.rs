@@ -2365,7 +2365,9 @@ fn hop_to_opportunity(
 /// Wait for this epoch's next batch opportunity, then read the Cardano peg-in
 /// source ONCE and freeze what it holds, parsing each request against the
 /// spec-derived peg-in Taproot for the current Y_51 internal key, the Y_fed
-/// emergency leaf and Q_auth. Parse failures are logged and dropped. The deduped,
+/// emergency leaf and Q_auth. Parse failures are logged and dropped, as is any
+/// request naming a deposit this node's SPI trie already records as swept — its
+/// PegInRequest outlives the sweep, so the source keeps offering it. The deduped,
 /// parsed set is frozen into the next `BuildTm` phase.
 ///
 /// The read used to be a poll over a local `pegin_collection_window` — a second,
@@ -2436,7 +2438,26 @@ async fn collect_pegins_phase(
     // `config_y_fed`, not the head-derived `y_fed` — so no call site re-decides it.
     let pegin_tree = treasury.pegin_tree().map_err(EpochError::Chain)?;
 
+    // What confirmed TMs have already taken ([SPI-1]). A swept deposit's
+    // PegInRequest survives on Cardano until the DEPOSITOR mints against it — the
+    // sweep happens on Bitcoin, the completion is a separate user action, and
+    // nothing consumes the request in between — so the source keeps offering it as
+    // a candidate batch after batch.
+    //
+    // Re-including one is caught, but far too late and as a hard failure: the
+    // deposit outpoint is already spent on Bitcoin, and `build_tm`'s
+    // `root_after_inputs` re-inserts its key with a DIFFERENT value (this TM's own
+    // input-0, [SPI-3]) and raises `Conflict`, failing the WHOLE batch. One stale
+    // request would take every other peg-in and peg-out down with it, at every
+    // opportunity, until the depositor happened to mint. Skipping here leaves
+    // `Conflict` as the backstop it was written to be rather than the first line of
+    // defence. Loaded AFTER `settle_pending_tm` above, so a movement this node
+    // posted earlier is already folded in.
+    let swept = crate::cardano::spi_trie::SpiTrie::load_or_empty(config.state_dir.as_deref())
+        .map_err(|e| EpochError::Chain(format!("swept peg-ins trie: {e}")))?;
+
     let mut accepted: BTreeMap<CardanoOutRef, ParsedPegIn> = BTreeMap::new();
+    let mut skipped_swept = 0usize;
     for req in pegin_source
         .query_pegin_requests(&config.pegin_policy_id)
         .await?
@@ -2448,12 +2469,37 @@ async fn collect_pegins_phase(
         // see parse_pegin_request / commit 6af7c67.
         match parse_pegin_request(&req, &pegin_tree) {
             Ok(parsed) => {
+                let deposit = crate::cardano::tm_chain::outpoint_bytes(&bitcoin::OutPoint {
+                    txid: parsed.btc_txid,
+                    vout: parsed.btc_vout,
+                });
+                if swept.contains(&deposit) {
+                    skipped_swept += 1;
+                    crate::epoch_debug!(
+                        me,
+                        epoch,
+                        "  skipped peg-in {:?}: deposit {}:{} was already swept",
+                        req.cardano_utxo,
+                        parsed.btc_txid,
+                        parsed.btc_vout
+                    );
+                    continue;
+                }
                 accepted.insert(req.cardano_utxo.clone(), parsed);
             }
             Err(e) => {
                 crate::epoch_warn!(me, epoch, "  dropped peg-in {:?}: {}", req.cardano_utxo, e);
             }
         }
+    }
+    if skipped_swept > 0 {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  {} peg-in request(s) name a deposit a confirmed TM already swept — skipped, \
+             awaiting their depositors' mint",
+            skipped_swept
+        );
     }
 
     let frozen_pegins = freeze_pegins(accepted.into_values().collect(), batch, me, epoch)?;
@@ -4832,6 +4878,99 @@ mod tests {
              immediately instead of waiting for the next one",
             b.index
         );
+    }
+
+    /// A deposit a confirmed TM already swept must be skipped where it is
+    /// COLLECTED, not where the movement is built.
+    ///
+    /// Its PegInRequest survives the sweep — the sweep is on Bitcoin, the mint is
+    /// a separate user action, and nothing consumes the request in between — so
+    /// the source keeps offering it. Re-including one used to reach `build_tm`,
+    /// where `root_after_inputs` re-inserts the key with this TM's own input-0
+    /// ([SPI-3]) instead of the original sweeper's and raises `Conflict`. Correct,
+    /// but it failed the WHOLE batch: one stale request took every other peg-in
+    /// and peg-out down with it, at every opportunity, until its depositor
+    /// happened to mint.
+    ///
+    /// The fresh request in the same source is the half that makes this a
+    /// regression test rather than a tautology: it proves the batch still gets
+    /// built, and gets built with exactly the deposits that are still there.
+    #[tokio::test]
+    async fn an_already_swept_deposit_is_skipped_at_collection() {
+        use crate::cardano::pegin_datum::testkit;
+        use crate::cardano::spi_trie::SpiTrie;
+
+        let (roster, keys) = group_for(0xf5, 2, 3);
+        let (_, fed) = group_for(0xf6, 2, 3);
+        let y = xonly_of(&keys);
+        let mut fixture = demo_static_fixture(2, 2, 19_560);
+        fixture.y_51 = y;
+        fixture.y_fed = y;
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(y)
+                .with_config_y_fed(xonly_of(&fed))
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y, [0x5a; 32]))
+                .with_batch(slot(1)),
+        );
+        let config = fast_config(*keys.key_package.identifier());
+        let dir = config
+            .state_dir
+            .clone()
+            .expect("fast_config gives a state dir");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Both deposits pay the bridge's own peg-in address, so the only thing
+        // separating them is the trie.
+        let tree = chain
+            .query_treasury()
+            .await
+            .expect("the mock treasury reads")
+            .pegin_tree()
+            .expect("the fixture's timeouts are ordered");
+        let depositor = testkit::xonly_from_seed([0xd1; 32]).serialize();
+        let swept =
+            testkit::pegin_request(&tree, depositor, bitcoin::Amount::from_sat(400_000), 0x11);
+        let fresh =
+            testkit::pegin_request(&tree, depositor, bitcoin::Amount::from_sat(400_000), 0x22);
+
+        // Record the first as a confirmed TM would have: input 0 is the head that
+        // TM spent, the deposit is the swept input [SPI-1].
+        let parsed = parse_pegin_request(&swept, &tree).expect("the fixture parses");
+        let mut trie = SpiTrie::empty();
+        trie.insert_for_confirmed_tm(&[
+            spi_op(0xaa, 0),
+            crate::cardano::tm_chain::outpoint_bytes(&bitcoin::OutPoint {
+                txid: parsed.btc_txid,
+                vout: parsed.btc_vout,
+            }),
+        ])
+        .expect("a fresh trie takes the sweep");
+        trie.save(&dir).expect("the trie persists");
+
+        let source = MockCardanoPegInSource::new();
+        source.push(std::time::Instant::now(), swept.clone());
+        source.push(std::time::Instant::now(), fresh.clone());
+        let pegin: Arc<dyn CardanoPegInSource> = Arc::new(source);
+
+        let mut built = BuiltBatch::default();
+        let next = collect_pegins_phase(&chain, &pegin, &config, 9, roster, keys, &mut built)
+            .await
+            .expect("a stale request must not fail the collection");
+        let EpochPhase::BuildTm { frozen_pegins, .. } = next else {
+            panic!("expected BuildTm, got {}", next.name());
+        };
+
+        assert_eq!(
+            frozen_pegins.len(),
+            1,
+            "the swept deposit must be dropped and the fresh one kept"
+        );
+        assert_eq!(
+            frozen_pegins[0].cardano_utxo, fresh.cardano_utxo,
+            "the survivor is the request whose deposit no TM has taken"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (c) Disjointness. Over all four `(authorized_key, y_51)` combinations of
