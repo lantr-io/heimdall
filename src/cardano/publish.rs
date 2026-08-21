@@ -19,7 +19,9 @@
 //! UTxO rides along as a second reference input (the validator reads
 //! `bridge_state_policy` from it, [PAR-1]), and the validator checks
 //! the embedded BTC tx spends the singleton's `treasury_utxo_id`.
-//! There is no scaffold fallback: `tm_script_cbor` is required.
+//! There is no scaffold fallback: the real validator is required, and
+//! [`resolve_tm_script`] sources it from the chain by the hash the Config
+//! publishes.
 //!
 //! The current treasury is the singleton's head — no Confirmed chain
 //! walk exists any more.
@@ -35,6 +37,48 @@ use whisky_pallas::WhiskyPallas;
 use crate::cardano::tx_common::whisky_network;
 use crate::cardano::wallet::pub_key_hash_hex;
 use crate::epoch::state::{EpochError, EpochResult};
+
+/// The TreasuryMovementValidator bytes for this bridge, sourced from the chain
+/// by the hash the Config publishes (#5, `tm_script_hash`).
+///
+/// Minting the TM NFT needs the minting script itself, and heimdall cannot
+/// compile it: it is Scalus, it lives in binocular, and it is parameterized per
+/// bridge instance. It used to be an operator-typed `cardano.tm_script_cbor`,
+/// which is the worst shape a must-match value can take — unset it and the
+/// node passes every check, runs a whole signing ceremony,
+/// and only then discovers it cannot post; mistype it and the mint fails on
+/// chain after the ceremony is already spent. Both cost a batch opportunity, and
+/// on the shared preprod bridge the first cost five (WI-HJ1N5).
+///
+/// So the node reads it the way it reads everything else about the bridge: from
+/// the chain, by an identifier the Config publishes, verified against that
+/// identifier. `fetch_script_cbor` does the verifying, which is why nothing here
+/// has to trust the provider.
+///
+/// The bytes are on chain because `binocular deploy-script-refs` publishes the
+/// TM validator as a reference script at deployment — before any TM exists, so
+/// there is no first-movement chicken-and-egg. (Heimdall still rides them INLINE
+/// in the Post-TM witness set; using the reference UTxO instead would save ~4 KB
+/// per movement, but which of the two a node does changes the batch byte budget,
+/// and a budget that depends on what each node happened to find is a consensus
+/// value decided per node. That is a bridge-wide switch, not this change.)
+pub async fn resolve_tm_script(
+    base_url: &str,
+    project_id: &str,
+    tm_script_hash: &str,
+) -> Result<String, String> {
+    crate::cardano::bf_http::fetch_script_cbor(base_url, project_id, tm_script_hash)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "the TM validator {tm_script_hash} (Config #5) is not on chain as far as this \
+                 provider can see, so this node cannot mint the TM NFT and cannot post a \
+                 movement it signs. `binocular deploy-script-refs` publishes it at deployment \
+                 and skips whatever is already deployed, so re-running it against this bridge \
+                 is the repair"
+            )
+        })
+}
 
 /// A wallet UTxO fetched from Blockfrost, suitable for coin selection.
 #[derive(Debug, Clone)]

@@ -420,6 +420,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             (6, "registration status"),
             (7, "key handoff (Update-Y)"),
             (8, "federation identity"),
+            (9, "post a movement"),
         ] {
             b.push(n, title, Status::Skipped, "needs a Cardano provider");
         }
@@ -936,6 +937,56 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         }
     }
 
+    // ── 9. Post a movement — the capability the node exists for ──────────
+    // Signing a movement is only worth doing if it can be POSTED, and nothing
+    // here used to check that. The TM validator was an operator-typed CBOR
+    // string, so a node without it passed all eight steps above, took part in a
+    // whole signing ceremony, and met the gap only when it tried to mint. On the
+    // shared preprod bridge that cost five batch opportunities: the leader
+    // cascade walked every node onto the same missing value, and the Bitcoin
+    // transaction they had already broadcast then sat unconfirmed, which reads as
+    // "a movement is still in flight" and skips every batch behind it.
+    //
+    // A Fail, and fatal — unlike the reference script of step 4, which only
+    // `register-spo` needs. Every SPO takes a turn on the leader cascade, so a
+    // node that cannot post is a node whose turn is a wasted hop, and it is
+    // invisible from that node's own log.
+    match &config {
+        None => b.push(
+            9,
+            "post a movement",
+            Status::Skipped,
+            "the Config did not resolve, so the TM validator has no published hash (step 3)",
+        ),
+        Some(view) => {
+            let hash = hex::encode(view.params.tm_script_hash);
+            match crate::cardano::publish::resolve_tm_script(&base_url, &project_id, &hash).await {
+                Ok(cbor) => b.push(
+                    9,
+                    "post a movement",
+                    Status::Pass,
+                    format!(
+                        "TM validator {hash} on chain, {} bytes, verified against Config #5",
+                        cbor.len() / 2
+                    ),
+                ),
+                Err(e) => b.push_fix(
+                    9,
+                    "post a movement",
+                    Status::Fail,
+                    e,
+                    "the TM NFT can only be minted by supplying the validator, and this node \
+                     sources it from the chain rather than from a config file — there is \
+                     nothing to type here and nothing to paste. Either the provider cannot \
+                     answer (check step 2 and network access) or this bridge never published \
+                     the script, which re-running `binocular deploy-script-refs` repairs — it \
+                     skips what is already deployed. Until then this node can sign movements it \
+                     can never post",
+                ),
+            }
+        }
+    }
+
     Report { steps: b.steps }
 }
 
@@ -1118,8 +1169,9 @@ mod tests {
     /// "[9/7]" — and its entry for 6 carried step 7's title, so the ban-list check
     /// was reported as "registration status". WI-070 removed the contract-set
     /// check (there are no operator copies left to verify), taking the count from
-    /// nine to eight — which this test pins, since the early return lists the
-    /// steps by hand and would otherwise drift again.
+    /// nine to eight, and WI-HJ1N5 added "post a movement" to take it back to
+    /// nine — which this test pins, since the early return lists the steps by
+    /// hand and would otherwise drift again.
     #[tokio::test]
     async fn the_no_provider_report_accounts_for_every_step() {
         let cfg = HeimdallConfig::default();
@@ -1129,10 +1181,10 @@ mod tests {
         );
         let report = preflight(&cfg).await;
         let numbers: Vec<u8> = report.steps.iter().map(|s| s.n).collect();
-        assert_eq!(numbers, (1..=8).collect::<Vec<u8>>(), "{numbers:?}");
+        assert_eq!(numbers, (1..=9).collect::<Vec<u8>>(), "{numbers:?}");
         // Every rendered line's step number is within the total it prints.
         let total = report.steps.len();
-        assert_eq!(total, 8);
+        assert_eq!(total, 9);
         for s in &report.steps {
             assert!(usize::from(s.n) <= total, "step {} of {total}", s.n);
         }
@@ -1142,6 +1194,7 @@ mod tests {
         assert_eq!(titled[4], "ban list");
         assert_eq!(titled[5], "registration status");
         assert_eq!(titled[7], "federation identity");
+        assert_eq!(titled[8], "post a movement");
     }
 
     #[test]

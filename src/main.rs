@@ -1851,13 +1851,21 @@ fn main() {
     }
 }
 
-/// Apply the TM-NFT minting policy and the Config-UTxO locator to the chain. Requires
-/// `cardano.tm_script_cbor`, `cardano.config_address` and `cardano.config_nft_policy_id` to be
-/// configured together — posting has no scaffold fallback, and the Config UTxO locates the
-/// bridge-state singleton the mint redeemer links against. Errors on a half-configured set.
-fn apply_tm_policy(
+/// Apply the TM-NFT minting policy and the Config-UTxO locator to the chain.
+///
+/// The minting script is the TreasuryMovementValidator, fetched from the chain by
+/// `tm_script_hash` (Config #5) and verified against it — see
+/// [`heimdall::cardano::publish::resolve_tm_script`]. It was an operator-typed
+/// `cardano.tm_script_cbor` until WI-HJ1N5; nothing is typed now, and a node that
+/// cannot resolve it refuses to start rather than discovering it after a ceremony.
+///
+/// `cardano.config_address` and `cardano.config_nft_policy_id` must still be
+/// configured together — the Config UTxO locates the bridge-state singleton the
+/// mint redeemer links against. Errors on a half-configured set.
+async fn apply_tm_policy(
     chain: BlockfrostCardanoChain,
     cfg: &HeimdallConfig,
+    tm_script_hash: &str,
 ) -> Result<BlockfrostCardanoChain, String> {
     // The Config-UTxO locator is needed by query_treasury (the singleton read)
     // independently of posting, so apply it whenever configured.
@@ -1880,20 +1888,25 @@ fn apply_tm_policy(
             );
         }
     };
-    match &cfg.cardano.tm_script_cbor {
-        Some(cbor) => {
-            if cfg.cardano.config_address.is_none() {
-                return Err(
-                    "cardano.tm_script_cbor requires cardano.config_address and \
-                     cardano.config_nft_policy_id (the mint redeemer links against the config \
-                     anchor)"
-                        .into(),
-                );
-            }
-            Ok(chain.with_tm_policy(cbor))
-        }
-        None => Ok(chain),
+    // No Config locator means no bridge to post to — the fixture/demo shape.
+    // Fetching a validator there would be a network call in service of a
+    // transaction that has nowhere to go.
+    let Some(project_id) = cfg.cardano.blockfrost_project_id.as_deref() else {
+        return Ok(chain);
+    };
+    if cfg.cardano.config_address.is_none() {
+        return Ok(chain);
     }
+    let base_url =
+        heimdall::cardano::bf_http::base_url(project_id, cfg.cardano.blockfrost_url.as_deref());
+    let cbor = heimdall::cardano::publish::resolve_tm_script(&base_url, project_id, tm_script_hash)
+        .await?;
+    info!(
+        "[config] TM validator {tm_script_hash} ({} bytes) sourced from the chain and verified \
+         against Config #5",
+        cbor.len() / 2
+    );
+    Ok(chain.with_tm_policy(&cbor))
 }
 
 async fn run_spo(
@@ -2181,7 +2194,17 @@ async fn run_spo(
             }
         }
 
-        let bf_chain = apply_tm_policy(bf_chain, &cfg).expect("invalid TM policy config");
+        let bf_chain = match apply_tm_policy(bf_chain, &cfg, &bridge.tm_policy_id).await {
+            Ok(c) => c,
+            // Fatal, and deliberately so: this node would run every check green,
+            // take part in a whole signing ceremony, and only then fail to post
+            // the movement it just helped sign — spending a batch opportunity to
+            // learn something knowable at boot (WI-HJ1N5).
+            Err(e) => {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        };
 
         // Everything resolved above is what THIS PROCESS SAW AT BOOT. The
         // federation identity is chain state a governance Update can move, so
@@ -2750,26 +2773,41 @@ struct SweepBatch {
 /// The batch byte budget for the CLI drivers, mirroring
 /// `BlockfrostChain::post_tm_envelope` / `query_batch_snapshot`.
 ///
-/// `loc` is `None` when there is no Config UTxO to read, in which case
+/// `bridge` is `None` when there is no Config UTxO to read, in which case
 /// `max_tx_size` falls back to the post-Alonzo value and says so — the same
-/// local-override shape the fee parameters already take on that path.
+/// local-override shape the fee parameters already take on that path — and no TM
+/// validator rides inline because there is no bridge to post to.
 fn sweep_budget(
     rt: &tokio::runtime::Runtime,
-    cfg: &HeimdallConfig,
-    loc: Option<&ConfigLocator>,
-) -> heimdall::epoch::batch::TmBudget {
+    bridge: Option<(&ConfigLocator, &str)>,
+) -> Result<heimdall::epoch::batch::TmBudget, String> {
     use heimdall::epoch::traits::{DEFAULT_MAX_TX_SIZE, POST_TM_ENVELOPE_WITHOUT_SCRIPT};
 
     // The TM validator rides inline in every Post-TM, so its bytes are the
     // dominant non-batch term and are charged honestly rather than assumed away.
-    let envelope = POST_TM_ENVELOPE_WITHOUT_SCRIPT
-        + cfg
-            .cardano
-            .tm_script_cbor
-            .as_deref()
-            .map_or(0, |hex| (hex.len() as u64) / 2 + 8);
-    let max_tx_size = loc
-        .and_then(|l| {
+    // Its SIZE is asked of the chain directly (`/scripts/{hash}` carries
+    // `serialised_size`), which is cheaper than fetching the bytes and is the
+    // same number every SPO reads — the property a batch budget needs.
+    //
+    // An error here refuses the batch for the same reason `max_tx_size` does: an
+    // assumed envelope is an assumed CONSENSUS value, and assuming the script
+    // away OVERSTATES capacity by ~4 KB, which is the direction that builds a
+    // movement no co-signer will reproduce.
+    let script_bytes = match bridge {
+        Some((l, hash)) => {
+            rt.block_on(heimdall::cardano::bf_http::fetch_script_size(
+                &l.base_url,
+                &l.project_id,
+                hash,
+            ))
+            .map_err(|e| format!("TM validator {hash} (Config #5): {e}"))?
+                + 8
+        }
+        None => 0,
+    };
+    let envelope = POST_TM_ENVELOPE_WITHOUT_SCRIPT + script_bytes;
+    let max_tx_size = bridge
+        .and_then(|(l, _)| {
             let epoch = rt
                 .block_on(heimdall::cardano::bf_http::fetch_current_epoch(
                     &l.base_url,
@@ -2792,11 +2830,11 @@ fn sweep_budget(
             );
             DEFAULT_MAX_TX_SIZE
         });
-    heimdall::epoch::batch::TmBudget {
+    Ok(heimdall::epoch::batch::TmBudget {
         max_tx_size,
         envelope,
         variant: heimdall::epoch::batch::SpendVariant::KeyPath,
-    }
+    })
 }
 
 fn batch_params(
@@ -2814,7 +2852,7 @@ fn batch_params(
             now_ms: None,
             tip: None,
             batch: heimdall::epoch::batch::BatchWindow::NoGrid,
-            budget: sweep_budget(rt, cfg, None),
+            budget: sweep_budget(rt, None)?,
         });
     };
     let snapshot = rt.block_on(fetch_param_snapshot(
@@ -2859,7 +2897,10 @@ fn batch_params(
         now_ms: Some(time_ms),
         tip: Some((snapshot.slot, time_ms)),
         batch,
-        budget: sweep_budget(rt, cfg, Some(&loc)),
+        budget: sweep_budget(
+            rt,
+            Some((&loc, &hex::encode(snapshot.config.params.tm_script_hash))),
+        )?,
     })
 }
 
@@ -8051,7 +8092,7 @@ fn run_sweep_pegins(
         // transaction; with nothing able to broadcast, the guard has no subject.
         chain = chain.with_submit_config(cfg.cardano.submit_oracle);
         chain = chain.with_validity_window(cfg.cardano.tm_validity_window_secs.unwrap_or(1800));
-        let chain = apply_tm_policy(chain, cfg)?;
+        let chain = rt.block_on(apply_tm_policy(chain, cfg, &bridge.tm_policy_id))?;
         // The data-availability hint describes the peg-outs of the tx being posted.
         // Under --existing-tm-hex the posted bytes are somebody ELSE'S transaction:
         // the locally built TM's `fulfilled` list says nothing about which requests

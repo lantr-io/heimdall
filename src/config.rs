@@ -445,11 +445,6 @@ pub struct CardanoConfig {
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
     pub submit_oracle: bool,
-    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). REQUIRED for posting a
-    /// TM (with the `config_*` fields below): the TM NFT is only ever minted under the real
-    /// validator policy — `treasury_policy_id` must be the validator's script hash and
-    /// `treasury_asset_name` empty. The always-ok scaffold fallback is gone.
-    pub tm_script_cbor: Option<String>,
     /// Validity window (seconds) for posted TM txs (`invalid_hereafter`/`created` = latest +
     /// window). `None` → 1800 (preprod/mainnet). MUST be small (e.g. 90) on a short-epoch
     /// devnet, whose era-forecast horizon is only ~tens-to-hundreds of slots ahead — a large
@@ -465,8 +460,8 @@ pub struct CardanoConfig {
     /// is what moves a node off its local `bitcoin.fee_rate_sat_per_vb` and onto the value its
     /// co-signers use — see `cardano::config_params` and `show-config-params`.
     pub config_address: Option<String>,
-    /// Config NFT policy id (56 hex chars) locating the Config UTxO. Required alongside
-    /// `tm_script_cbor` and `config_address`.
+    /// Config NFT policy id (56 hex chars) locating the Config UTxO. Required
+    /// alongside `config_address`.
     pub config_nft_policy_id: Option<String>,
     /// Config NFT asset name (hex). Required alongside `config_nft_policy_id`.
     pub config_nft_asset_name: Option<String>,
@@ -529,7 +524,6 @@ impl Default for CardanoConfig {
             stake_source: None,
             demo_exclude_unstaked: false,
             submit_oracle: true,
-            tm_script_cbor: None,
             tm_validity_window_secs: None,
             config_address: None,
             config_nft_policy_id: None,
@@ -798,6 +792,17 @@ const RETIRED_KEYS: &[RetiredKey] = &[
         "cardano",
         "ban_bootstrap",
         "Config #12 (federation_one_shot) — the same outpoint again",
+    ),
+    // WI-HJ1N5: the TM validator's own bytes. The one artifact left on the
+    // posting path that an operator pasted in, and the one whose absence was
+    // silent — a node without it passed all 8 preflight steps, ran a full signing
+    // ceremony, and only then could not post the movement it had just signed.
+    // Config #5 names the script and the chain holds it, so nothing is typed.
+    (
+        "cardano",
+        "tm_script_cbor",
+        "Config #5 (tm_script_hash) — the validator is fetched from the chain by that hash and \
+         refused unless blake2b224(0x03 || cbor) equals it",
     ),
     // WI-070: the bridge's own identifiers. Every one was an operator-typed copy
     // of a Config field, and a copy that can disagree is the whole defect — a
@@ -1151,6 +1156,25 @@ mod tests {
                 "the diagnostic must name the key and what replaced it: {rendered}"
             );
         }
+    }
+
+    /// The TM validator's bytes were the last artifact on the posting path that
+    /// an operator pasted in, and the only one whose absence was SILENT: a node
+    /// without it passed every startup check, ran a whole signing ceremony, and
+    /// failed at the mint — after the batch opportunity was spent and the Bitcoin
+    /// transaction was already broadcast. Refusing the key is how an operator who
+    /// upgrades into this learns their pasted copy is no longer what the node
+    /// uses; the node fetches the script by Config #5 and verifies it.
+    #[test]
+    fn the_retired_tm_script_cbor_is_refused_and_points_at_the_chain() {
+        let err = HeimdallConfig::from_toml_str("[cardano]\ntm_script_cbor = \"59ab\"\n")
+            .expect_err("a retired key must be refused, not ignored");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("tm_script_cbor"), "{rendered}");
+        // Naming the field is what makes the diagnostic actionable: the operator
+        // has to know the value still exists, just not here.
+        assert!(rendered.contains("#5"), "{rendered}");
+        assert!(rendered.contains("tm_script_hash"), "{rendered}");
     }
 
     /// WI-071's key is in `[protocol]`, and what replaced it is a compiled-in
