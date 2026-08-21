@@ -2994,6 +2994,29 @@ fn assert_mover_key_owns_treasury(
     cfg: &HeimdallConfig,
     y_51: bitcoin::key::UntweakedPublicKey,
 ) -> Result<(), String> {
+    let Some(authorized) = treasury_authorized_key(rt, cfg, "mover")? else {
+        return Ok(());
+    };
+    if authorized == y_51 {
+        return Ok(());
+    }
+    Err(mover_key_mismatch_error(y_51, authorized))
+}
+
+/// The x-only key the `treasury_info` datum currently authorizes — the key the
+/// treasury is actually locked under, and the one a mover's signer is chosen by.
+///
+/// `None` means there is no readable datum: a fixture/mock deployment has no
+/// `treasury_info` at all, and that is the one configuration where a demo key IS
+/// the treasury's. Every read failure is reported through `who` and answers
+/// `None` rather than an error, because both callers degrade rather than abort.
+/// `Err` is reserved for a datum that IS readable but holds something that is not
+/// a key — that is corruption, not absence.
+fn treasury_authorized_key(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+    who: &str,
+) -> Result<Option<bitcoin::key::UntweakedPublicKey>, String> {
     use heimdall::cardano::roster::RegistryRosterSource;
 
     let config = rt.block_on(config_view_async(cfg)).ok().flatten();
@@ -3001,10 +3024,10 @@ fn assert_mover_key_owns_treasury(
         RegistryRosterSource::resolve(&cfg.cardano, config.as_ref().map(|v| &v.params))
     else {
         info!(
-            "  [mover] no on-chain treasury_info to check the signing key against — assuming the \
+            "  [{who}] no on-chain treasury_info to read the treasury's key from — assuming the \
              fixture deployment, where the demo key IS the treasury's"
         );
-        return Ok(());
+        return Ok(None);
     };
     let utxos = match rt.block_on(heimdall::cardano::bf_http::fetch_address_utxos(
         &heimdall::cardano::bf_http::base_url(
@@ -3016,8 +3039,8 @@ fn assert_mover_key_owns_treasury(
     )) {
         Ok(u) => u,
         Err(e) => {
-            warn!("  [mover] could not read treasury_info to check the signing key: {e}");
-            return Ok(());
+            warn!("  [{who}] could not read treasury_info: {e}");
+            return Ok(None);
         }
     };
     let state = match heimdall::cardano::treasury_spend::find_treasury_state(
@@ -3027,23 +3050,18 @@ fn assert_mover_key_owns_treasury(
     ) {
         Ok(s) => s,
         Err(e) => {
-            warn!("  [mover] could not locate the treasury_info state: {e}");
-            return Ok(());
+            warn!("  [{who}] could not locate the treasury_info state: {e}");
+            return Ok(None);
         }
     };
-    let authorized = bitcoin::key::UntweakedPublicKey::from_slice(
-        &state.datum.current_spos_frost_key,
-    )
-    .map_err(|e| {
-        format!(
-            "treasury_info current_spos_frost_key ({}) is not an x-only key: {e}",
-            hex::encode(&state.datum.current_spos_frost_key)
-        )
-    })?;
-    if authorized == y_51 {
-        return Ok(());
-    }
-    Err(mover_key_mismatch_error(y_51, authorized))
+    bitcoin::key::UntweakedPublicKey::from_slice(&state.datum.current_spos_frost_key)
+        .map(Some)
+        .map_err(|e| {
+            format!(
+                "treasury_info current_spos_frost_key ({}) is not an x-only key: {e}",
+                hex::encode(&state.datum.current_spos_frost_key)
+            )
+        })
 }
 
 /// The refusal message, separated so a test can pin it against
@@ -7222,23 +7240,41 @@ fn run_show_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
         );
     }
 
-    // Our expected treasury keys: demo Y_51 (deterministic DKG) + the federation
+    // The treasury's keys: Y_51 from the treasury_info datum + the federation
     // identity. Read-only: this reports what the treasury SHOULD look like, so it
     // must use the same source the mover signs against — the treasury_info datum,
     // not this node's local seed (WI-069).
+    //
+    // It used to print the DEMO Y_51 here (a deterministic DKG over a hardcoded
+    // seed) against that very comment, which on a real bridge names a key no node
+    // holds and derives an "expected" scriptPubKey the treasury does not have —
+    // stated with the same confidence as the chain-read line beside it. The demo
+    // key is still the answer where it IS the treasury's: a fixture deployment
+    // with no treasury_info datum. It just has to say which one it is.
     let secp = Secp256k1::new();
     let federation = rt.block_on(resolve_federation(cfg))?;
     let y_fed = federation.y_fed;
-    let dkg = run_demo_dkg(
-        b"heimdall-demo-seed-v1-0123456789",
-        cfg.demo.min_signers,
-        cfg.demo.max_signers,
-    );
-    let y_51 = group_xonly(dkg.public_key_package.verifying_key())?.xonly;
+    let (y_51, y_51_origin) = match treasury_authorized_key(&rt, cfg, "show-treasury")? {
+        Some(k) => (k, "from the treasury_info datum"),
+        None => {
+            let dkg = run_demo_dkg(
+                b"heimdall-demo-seed-v1-0123456789",
+                cfg.demo.min_signers,
+                cfg.demo.max_signers,
+            );
+            (
+                group_xonly(dkg.public_key_package.verifying_key())?.xonly,
+                "DEMO seed — no treasury_info datum to read",
+            )
+        }
+    };
     let csv = federation.csv_blocks;
     let expected_spk =
         ScriptBuf::new_p2tr_tweaked(treasury_spend_info(&secp, y_51, y_fed, csv).output_key());
-    println!("our Y_51:             {}", hex::encode(y_51.serialize()));
+    println!(
+        "treasury Y_51:        {} ({y_51_origin})",
+        hex::encode(y_51.serialize())
+    );
     println!(
         "expected treasury spk: {}",
         hex::encode(expected_spk.as_bytes())
