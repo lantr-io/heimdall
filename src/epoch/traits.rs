@@ -136,8 +136,13 @@ pub struct TreasuryUtxo {
     /// longer sweeping. A movement is signed with a single key package, so it can
     /// only spend inputs under the head's internal key; once the head has moved on,
     /// nothing signs under these again, and the deposit's own tree — the
-    /// federation's sweep leaf first, the depositor's refund after it — is the only
-    /// way back. Recognising the address turns that from silence into a warning.
+    /// federation's sweep leaf first, the depositor's refund after it — is the way
+    /// back. Recognising the address turns that from silence into a warning.
+    ///
+    /// "Nothing signs under these again" describes this implementation, not the
+    /// protocol: the retired ceremony's key package is still on disk, and one
+    /// Bitcoin transaction may spend inputs under several keys. WI-GC1FV weighs
+    /// signing them in a second FROST session.
     ///
     /// Unlike its neighbours this is NOT a bridge-wide value: it comes from what
     /// this node persisted plus the published federation key, so two nodes can
@@ -178,9 +183,16 @@ pub enum PeginKeyOrigin {
     Published,
     /// [`TreasuryUtxo::y_51`] alone: the address depositors were given BEFORE the
     /// Update-Y. The movement that spends the current head is the last one that
-    /// can ever take these, because no later movement signs under this key.
+    /// takes these, because no later movement signs under this key — a limit of
+    /// how movements are signed here (one key package for every input), not of
+    /// Bitcoin, which is content with a transaction whose inputs sit under
+    /// different keys. See WI-GC1FV.
     Head,
-    /// A ceremony the bridge has moved past. Nothing will sweep it, ever.
+    /// A ceremony the bridge has moved past. No movement signs under it any more,
+    /// so nothing sweeps it as things stand — recoverable in principle by signing
+    /// with the retired key package, which is still on disk (WI-GC1FV), and in
+    /// practice by the deposit's own tree: the federation's sweep leaf first, the
+    /// depositor's refund after it.
     Retired,
 }
 
