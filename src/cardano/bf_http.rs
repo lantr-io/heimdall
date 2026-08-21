@@ -79,6 +79,74 @@ pub async fn fetch_address_utxos(
     Ok(all)
 }
 
+/// The Plutus V3 script bytes for `script_hash`, from `/scripts/{hash}/cbor`,
+/// **verified against the hash that asked for them**.
+///
+/// This is what lets a script the node cannot compile be sourced from the chain
+/// instead of pasted into a config file (WI-HJ1N5). The verification is not a
+/// nicety, it is the entire safety argument: `script_hash_v3` digests
+/// `0x03 || bytes`, so a matching digest proves both that these are the bytes
+/// the bridge named AND that they are Plutus V3 — there is nothing left for a
+/// provider to get wrong, and nothing an operator has to be trusted to type.
+///
+/// `Ok(None)` means the provider does not know the script — on a bridge whose
+/// deployment published it as a reference script that means the wrong hash or
+/// the wrong network, and it is distinguished from a transport failure because
+/// only one of the two is repaired by editing a config file.
+pub async fn fetch_script_cbor(
+    base_url: &str,
+    project_id: &str,
+    script_hash: &str,
+) -> Result<Option<String>, String> {
+    let url = format!("{base_url}/scripts/{script_hash}/cbor");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("script cbor request: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!(
+            "script cbor http {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("script cbor json: {e}"))?;
+    // Blockfrost answers `{"cbor": null}` for a native script, which has no
+    // Plutus bytes at all — the same shape as a missing field, and neither is an
+    // answer we can use.
+    let cbor = v
+        .get("cbor")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("script {script_hash}: no cbor in the provider's answer"))?
+        .to_string();
+    verified_script_cbor(script_hash, cbor).map(Some)
+}
+
+/// The safety property of [`fetch_script_cbor`], separated from the transport so
+/// it can be tested without one: bytes are only ever returned when they hash
+/// back to the identifier that asked for them.
+fn verified_script_cbor(script_hash: &str, cbor: String) -> Result<String, String> {
+    let bytes =
+        hex::decode(&cbor).map_err(|e| format!("script {script_hash}: cbor is not hex: {e}"))?;
+    let got = hex::encode(crate::cardano::blueprint::script_hash_v3(&bytes));
+    if !got.eq_ignore_ascii_case(script_hash) {
+        return Err(format!(
+            "script {script_hash}: the provider returned {} bytes hashing to {got} — refusing \
+             them. blake2b224(0x03 || cbor) must equal the hash they were fetched by",
+            bytes.len()
+        ));
+    }
+    Ok(cbor)
+}
+
 /// `serialised_size` (bytes) of an on-chain script, from `/scripts/{hash}` —
 /// the input to the Conway ref-script fee when a ref-script UTxO must be spent.
 pub async fn fetch_script_size(
@@ -862,4 +930,48 @@ pub async fn fetch_cost_models(base_url: &str, project_id: &str) -> Result<Vec<V
         out.push(nums);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Plutus script the node cannot compile is only usable if the bytes can be
+    /// checked, and the check is the whole reason `cardano.tm_script_cbor` could
+    /// be deleted rather than merely validated (WI-HJ1N5). `script_hash_v3`
+    /// digests `0x03 || bytes`, so a matching digest proves the bytes AND the
+    /// language version at once — there is nothing left for a provider to get
+    /// wrong and nothing an operator has to be trusted to paste.
+    #[test]
+    fn script_bytes_are_only_accepted_under_the_hash_that_asked_for_them() {
+        let bytes = [0x59u8, 0x01, 0x02, 0xde, 0xad, 0xbe, 0xef];
+        let hash = hex::encode(crate::cardano::blueprint::script_hash_v3(&bytes));
+        let cbor = hex::encode(bytes);
+
+        assert_eq!(
+            verified_script_cbor(&hash, cbor.clone()).unwrap(),
+            cbor,
+            "the bytes that hash to the identifier are the ones to use"
+        );
+
+        // One flipped byte is a different script — and it is the case that
+        // matters, because a wrong-but-well-formed validator mints under a policy
+        // nothing on this bridge scans, discovered only after a ceremony is spent.
+        let mut tampered = bytes;
+        tampered[4] ^= 0x01;
+        let err = verified_script_cbor(&hash, hex::encode(tampered))
+            .expect_err("bytes that hash elsewhere must be refused");
+        assert!(err.contains(&hash), "{err}");
+
+        // The hash cannot vouch for something that is not bytes at all.
+        assert!(
+            verified_script_cbor(&hash, "not hex".into()).is_err(),
+            "unparseable cbor must be refused, not hashed"
+        );
+
+        // Upper-case is the same identifier: Blockfrost and the Config datum
+        // render hex differently, and refusing on case alone would read to an
+        // operator exactly like a wrong bridge.
+        assert!(verified_script_cbor(&hash.to_uppercase(), cbor).is_ok());
+    }
 }

@@ -292,7 +292,7 @@ sudo -u heimdall heimdall doctor --config /etc/heimdall/heimdall.toml
 Run it as the `heimdall` user: the config is `0640 root:heimdall` so you cannot read it as
 yourself, and running as root would leave root-owned files in the state directory.
 
-This runs eight startup checks and prints all of them with the exact command that fixes each one,
+This runs nine startup checks and prints all of them with the exact command that fixes each one,
 then exits non-zero if any failed. It reads the chain and **posts nothing** — a missing reference
 script and an unregistered SPO are both reported, never deployed or registered for you.
 
@@ -302,14 +302,15 @@ other direction, if you would rather not type a second command name. When someth
 later, `heimdall doctor` is the first output to capture.
 
 ```
-[1/8] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
-[2/8] cardano connectivity         PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
-[3/8] resolve the Config           PASS  2dce4027…#0 (12 fields, fee_rate 1 sat/vB)
-[4/8] reference script             …
-[5/8] ban list                     PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (detection only)
-[6/8] registration status          …
-[7/8] key handoff (Update-Y)       …
-[8/8] federation identity          PASS  Y_fed 37b381ac…, csv 144 blocks — published in the Config datum
+[1/9] local preflight              PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
+[2/9] cardano connectivity         PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
+[3/9] resolve the Config           PASS  2dce4027…#0 (12 fields, fee_rate 1 sat/vB); peg-in requests at addr_test1…
+[4/9] reference script             …
+[5/9] ban list                     PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (detection only)
+[6/9] registration status          …
+[7/9] key handoff (Update-Y)       …
+[8/9] federation identity          PASS  Y_fed 37b381ac…, csv 144 blocks — published in the Config datum
+[9/9] post a movement              PASS  TM validator f691433e… on chain, 4032 bytes, verified against Config #5
 ```
 
 Step 3's field count is the datum's, and **more than twelve is normal** — the Config grows by
@@ -321,6 +322,14 @@ about the bridge follows from it. Step 5 confirms your roster is ban-filtered �
 registry is configured without a ban list, since that node could not agree with its peers on who is
 in the DKG.
 Step 6 tells you whether this node is registered; it never spends — it names the command and stops.
+
+Step 9 asks the question the rest of the report does not: **can this node actually post the
+movement it would sign?** Minting the TM NFT needs the treasury-movement validator itself, not
+just its hash, and the node fetches it from the chain by the hash the Config publishes (#5),
+refusing any bytes that do not hash back to it. Nothing here is yours to configure — that is the
+point. It used to be a CBOR string pasted into the config file, and a node missing it passed every
+other check, took a full turn in a signing ceremony, and failed at the mint, having already
+broadcast the Bitcoin transaction. That is why this one is a **FAIL** and not a warning.
 
 Only `FAIL` blocks startup. A `WARN` is worth reading, and steps 4 and 7 are the two you will most
 often see one on:
@@ -544,7 +553,7 @@ sudo -u heimdall heimdall show-roster --config /etc/heimdall/heimdall.toml
 ```
 
 Read-only. Your pool id and `bifrost_url` should appear. Re-running the step-4 check now should
-show `[6/8] registration status` satisfied.
+show `[6/9] registration status` satisfied.
 
 Before you register, that step FAILS and the daemon refuses to start. That is expected, not a
 misconfiguration: an unregistered node is in no roster and would contribute nothing, so it says so
@@ -714,8 +723,9 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 | the service will not start | `journalctl -u heimdall -p err`, then re-run the step-4 check — it names the failing check and what to fix |
 | starts, then nothing happens for days | expected; see *Quiet is normal* |
 | peers seem not to see you | step 5 — is the registered port open and reachable *from outside*? |
-| `[3/8] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
-| `[6/8] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
+| `[3/9] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
+| `[6/9] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
+| `[9/9] post a movement FAIL` | this bridge has never published its treasury-movement validator on chain, so no SPO can post — `binocular deploy-script-refs`, re-run, publishes it and skips what already exists. Not something one operator's config can fix |
 | a key you set is `refused` at load | it names a value the Config publishes; delete it, and `show-config-params` prints what the chain says |
 | `trie diverged` or `trie is out of sync with the chain` | this node's cumulative state is behind the bridge's — run the `reconstruct-…` command the message names; it rebuilds from chain history and refuses anything it cannot explain |
 | a transaction is refused | read the whole message: the min-stake gate and the preflight both refuse loudly rather than submitting something wrong |

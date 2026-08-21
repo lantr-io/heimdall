@@ -1078,3 +1078,42 @@ they now do.
 Test note: `fast_config` gives every node a temp state_dir, unique per CALL.
 Keying it on the identifier alone made `full_cycle_2_of_2` and
 `full_cycle_3_of_3` share node 1's trie under the parallel runner.
+
+**DEC-040: the TM validator comes from the chain, not from the config file;
+`tm_script_cbor` is refused.** DEC-036 made the real TreasuryMovementValidator
+mandatory for posting, and left it as an operator-typed CBOR string - the last
+hand-copied artifact on the posting path, and the only one whose absence was
+silent. A node without it passed all eight startup checks, took a full turn in
+a signing ceremony, and discovered the gap at the mint. On the shared preprod
+bridge on 2026-08-20 that cost five batch opportunities: the leader cascade
+walked all three SPOs onto the same missing value, and the Bitcoin transaction
+they had already broadcast then sat unconfirmed, which reads as "a movement is
+still in flight" and skips every batch behind it. A mistyped value fails later
+and worse - after the ceremony, on chain, under a policy nothing scans.
+
+heimdall cannot compile the script (it is Scalus, it lives in binocular, it is
+parameterized per bridge instance), but it does not have to: Config #5 names it
+and the chain holds it. `publish::resolve_tm_script` fetches
+`/scripts/{hash}/cbor` and `bf_http::fetch_script_cbor` refuses any bytes whose
+`blake2b224(0x03 || cbor)` is not the hash they were fetched by - which proves
+the bytes AND the Plutus version in one digest, so there is nothing left for a
+provider to get wrong. Startup does this before the daemon runs, preflight step
+9 ("post a movement") reports it, and a Fail there stops the node instead of
+letting it sign what it cannot post. The batch byte budget reads the script's
+`serialised_size` the same way rather than measuring an operator's string, and
+refuses the batch if it cannot - an assumed envelope understates by ~4 KB, in
+the direction that builds a movement no co-signer reproduces.
+
+A script exists on chain only once something uses it, so the first movement
+would need the script to make the transaction that would publish it. binocular
+`deploy-script-refs` therefore publishes `treasury_movement` as a CIP-33
+reference output at deployment - the only entry in that list published for its
+existence rather than to shrink a transaction. Re-running it against an older
+bridge is the migration, since it skips what is already deployed.
+
+heimdall still passes the script INLINE (`ProvidedScriptSource`) and charges
+its bytes to the envelope. Spending the reference output instead would save
+~4 KB per movement and roughly ten more peg-in/peg-out pairs per batch, but
+whether a node inlines or references changes the byte budget, and a budget that
+depends on what each node happened to find on chain is a consensus value
+decided per node. That is a bridge-wide switch, and not this change.

@@ -634,9 +634,11 @@ pub struct BlockfrostCardanoChain {
     /// Resolved Blockfrost base URL + project id, for raw-HTTP UTxO queries (lenient parsing).
     bf_base_url: String,
     bf_project_id: String,
-    /// TreasuryMovementValidator CBOR (`binocular tm-script`). When set, the TM NFT is minted under
-    /// this policy (and `treasury_policy_id` must be its hash, `treasury_asset_name_hex` empty); else
-    /// the always-ok scaffold is used.
+    /// TreasuryMovementValidator CBOR, chain-sourced by the hash the Config
+    /// publishes (#5) and verified against it — see `publish::resolve_tm_script`.
+    /// `treasury_policy_id` is that same hash and `treasury_asset_name_hex` is
+    /// empty. `None` means this chain cannot post a TM, which the startup gate
+    /// refuses on a configured bridge (WI-HJ1N5).
     tm_script_cbor: Option<String>,
     /// Validity window (seconds) for posted TM txs (`invalid_hereafter`/`created` =
     /// latest + window). 1800 for preprod/mainnet; small on a short-epoch devnet whose
@@ -919,8 +921,9 @@ impl BlockfrostCardanoChain {
         self
     }
 
-    /// Mint the TM NFT under the real TreasuryMovementValidator policy (CBOR from
-    /// `binocular tm-script`). Without this the always-ok scaffold policy is used.
+    /// Mint the TM NFT under the real TreasuryMovementValidator policy. The CBOR
+    /// comes from `publish::resolve_tm_script` — the chain, by Config #5 — so
+    /// nothing here has to trust a value an operator typed.
     pub fn with_tm_policy(mut self, script_cbor: &str) -> Self {
         self.tm_script_cbor = Some(script_cbor.to_string());
         self
@@ -2469,8 +2472,11 @@ impl CardanoChain for BlockfrostCardanoChain {
         // under anything else lands at an address nothing scans).
         let tm_script_cbor = self.tm_script_cbor.as_deref().ok_or_else(|| {
             EpochError::Chain(
-                "cardano.tm_script_cbor not set (from `binocular tm-script`) — required to \
-                 mint the TM NFT under the real TreasuryMovementValidator policy"
+                "no TM validator on this chain adapter — required to mint the TM NFT under the \
+                 real TreasuryMovementValidator policy. It is sourced from the chain by Config \
+                 #5 at startup, and preflight step 9 refuses to start a bridge node without \
+                 it, so reaching here means this adapter was built off a path that skipped \
+                 both"
                     .into(),
             )
         })?;

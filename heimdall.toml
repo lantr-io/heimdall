@@ -73,11 +73,11 @@ submit_oracle = true   # publish oracle-update UTxO to Cardano after signing
 # config_address = "addr_test1..."                    # the config script address
 # config_nft_policy_id = "<config NFT policy, 56 hex>"
 # config_nft_asset_name = "424946434647"              # "BIFCFG" hex
-# REQUIRED for posting a TM: the TreasuryMovementValidator CBOR (from `binocular tm-script`),
-# alongside the config_* fields above. Its hash must equal the published Config #5.
-# Minting is permissionless: the redeemer names the bridge-state singleton reference
-# input, and the validator checks the posted TM spends the singleton's head.
-# tm_script_cbor = "<cbor from `binocular tm-script`>"
+# Posting a TM needs the TreasuryMovementValidator itself, not just its hash. It is
+# NOT a key: the node fetches the script from the chain by Config #5 and refuses any
+# bytes that do not hash back to it (WI-HJ1N5). Minting is permissionless — the
+# redeemer names the bridge-state singleton reference input, and the validator checks
+# the posted TM spends the singleton's head.
 
 [http]
 # bind_address is the local interface; 0.0.0.0 by default, because peers must

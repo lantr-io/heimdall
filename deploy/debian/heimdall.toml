@@ -194,9 +194,11 @@ stake_source = "blockfrost"
 #config_nft_policy_id = ""
 #config_nft_asset_name = ""
 
-# The treasury movement validator (PlutusV3 CBOR hex). Not an identifier: posting
-# a TM needs the compiled script, which the Config publishes only the hash of.
-#tm_script_cbor = ""
+# The treasury movement validator is NOT a key. Posting a TM needs the compiled
+# script and the Config publishes only its hash — so the node fetches the script
+# from the chain by that hash (#5) and refuses bytes that do not hash back to it.
+# A `tm_script_cbor` key is refused at load: an unset one used to let a node pass
+# every check, sign a whole movement, and only then fail to post it.
 
 # On-chain SPO registry. LEAVE ALL THREE UNSET on any bridge whose Config
 # publishes the registry identity (#9-#10) — the node reads the registry
