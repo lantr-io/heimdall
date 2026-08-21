@@ -249,6 +249,10 @@ pub struct MockCardanoChain {
     /// reached by any test. On a live chain this field is
     /// `treasury_config.y_fed`, read from the Config and never from the head.
     config_y_fed: Option<bitcoin::key::UntweakedPublicKey>,
+    /// Group keys the bridge has moved past — what a real node recovers from the
+    /// ceremonies it persisted. Only peg-in RECOGNITION reads them, so the default
+    /// of "none" changes nothing but a log line.
+    retired_internal_keys: Vec<bitcoin::key::UntweakedPublicKey>,
     /// Pin the head's internal key, so `publish_group_key` no longer moves it.
     ///
     /// The default mock collapses the handoff: `PublishKeys` publishes the new
@@ -313,6 +317,7 @@ impl MockCardanoChain {
             bridge_roots: None,
             datum_lag: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             config_y_fed: None,
+            retired_internal_keys: Vec::new(),
             head_key: None,
             treasury_info: None,
         }
@@ -323,6 +328,17 @@ impl MockCardanoChain {
     #[must_use]
     pub fn with_config_y_fed(mut self, key: bitcoin::key::UntweakedPublicKey) -> Self {
         self.config_y_fed = Some(key);
+        self
+    }
+
+    /// Report `keys` as superseded ceremony keys — see
+    /// [`Self::retired_internal_keys`].
+    #[must_use]
+    pub fn with_retired_internal_keys(
+        mut self,
+        keys: Vec<bitcoin::key::UntweakedPublicKey>,
+    ) -> Self {
+        self.retired_internal_keys = keys;
         self
     }
 
@@ -621,6 +637,7 @@ impl CardanoChain for MockCardanoChain {
             federation_csv_blocks: self.fixture.federation_csv_blocks,
             // The mock's tree is self-consistent; 720 > the fixture's 144 federation delay.
             pegin_refund_timeout_blocks: 720,
+            retired_internal_keys: self.retired_internal_keys.clone(),
             btc_confirmed: !self.treasury_busy.load(Ordering::Acquire),
         })
     }

@@ -67,6 +67,7 @@ use crate::epoch::state::{
     EpochKeys, EpochPhase, EpochResult, GroupKeys, Roster, SignCollected, SigningRound,
     TreasuryMovement,
 };
+use crate::epoch::traits::PeginKeyOrigin;
 use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use crate::frost::xonly::group_xonly;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2433,10 +2434,12 @@ async fn collect_pegins_phase(
         );
     };
 
-    // The bridge's peg-in tree, straight from the oracle. `TreasuryUtxo::pegin_tree` owns
-    // the field mapping — notably that the federation LEAF key is the PUBLISHED
-    // `config_y_fed`, not the head-derived `y_fed` — so no call site re-decides it.
-    let pegin_tree = treasury.pegin_tree().map_err(EpochError::Chain)?;
+    // Every tree a deposit may legitimately sit under, straight from the oracle.
+    // `TreasuryUtxo::pegin_trees` owns the field mapping — notably that the address
+    // the bridge PUBLISHES is keyed to the datum's `authorized_key` and its
+    // federation LEAF to `config_y_fed`, neither of them head-derived — so no call
+    // site re-decides any of it.
+    let pegin_trees = treasury.pegin_trees().map_err(EpochError::Chain)?;
 
     // What confirmed TMs have already taken ([SPI-1]). A swept deposit's
     // PegInRequest survives on Cardano until the DEPOSITOR mints against it — the
@@ -2458,6 +2461,8 @@ async fn collect_pegins_phase(
 
     let mut accepted: BTreeMap<CardanoOutRef, ParsedPegIn> = BTreeMap::new();
     let mut skipped_swept = 0usize;
+    let mut deferred = 0usize;
+    let mut stranded = 0usize;
     for req in pegin_source
         .query_pegin_requests(&config.pegin_policy_id)
         .await?
@@ -2467,8 +2472,8 @@ async fn collect_pegins_phase(
         }
         // Peg-in internal key is Y_51 (the FROST group key); Y_fed is a LEAF key —
         // see parse_pegin_request / commit 6af7c67.
-        match parse_pegin_request(&req, &pegin_tree) {
-            Ok(parsed) => {
+        match recognise_pegin(&req, &pegin_trees) {
+            Ok((origin, parsed)) => {
                 let deposit = crate::cardano::tm_chain::outpoint_bytes(&bitcoin::OutPoint {
                     txid: parsed.btc_txid,
                     vout: parsed.btc_vout,
@@ -2485,6 +2490,40 @@ async fn collect_pegins_phase(
                     );
                     continue;
                 }
+                // A movement is signed with ONE key package, so it can only spend
+                // inputs under the key that spends the head. Recognising a deposit
+                // and being able to take it are separate questions, and this is the
+                // second one.
+                if !origin.sweepable() {
+                    match origin {
+                        PeginKeyOrigin::Retired => {
+                            stranded += 1;
+                            crate::epoch_warn!(
+                                me,
+                                epoch,
+                                "  peg-in {:?} deposits {} sat at a RETIRED address (internal \
+                                 key {}) — no movement will ever sign under it, so this can \
+                                 only be recovered by its depositor's refund leaf, {} blocks \
+                                 after the deposit confirmed",
+                                req.cardano_utxo,
+                                parsed.value.to_sat(),
+                                hex::encode(parsed.spend_info.internal_key().serialize()),
+                                treasury.pegin_refund_timeout_blocks
+                            );
+                        }
+                        _ => {
+                            deferred += 1;
+                            crate::epoch_debug!(
+                                me,
+                                epoch,
+                                "  deferring peg-in {:?}: it pays the address the bridge now \
+                                 publishes, which the current head cannot spend",
+                                req.cardano_utxo
+                            );
+                        }
+                    }
+                    continue;
+                }
                 accepted.insert(req.cardano_utxo.clone(), parsed);
             }
             Err(e) => {
@@ -2499,6 +2538,39 @@ async fn collect_pegins_phase(
             "  {} peg-in request(s) name a deposit a confirmed TM already swept — skipped, \
              awaiting their depositors' mint",
             skipped_swept
+        );
+    }
+    if deferred > 0 {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  {} peg-in(s) wait for the handoff: they pay the address the treasury_info datum \
+             publishes, and the head is still locked under the key it supersedes",
+            deferred
+        );
+    }
+    if stranded > 0 {
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  {} peg-in(s) sit at a retired address and CANNOT be swept — see the warnings \
+             above",
+            stranded
+        );
+    }
+    // A movement built while the datum and the head disagree IS the handoff: it
+    // spends the head and pays its change to `authorized_key`, so the head is under
+    // the incoming key from then on and nothing signs under the outgoing one again.
+    // Everything accepted above is under the outgoing key, which makes this the last
+    // opportunity any of it has.
+    if treasury.authorized_key != treasury.y_51 && !accepted.is_empty() {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  {} peg-in(s) pay the OUTGOING address and this movement is the handoff — the \
+             last one that can sweep them, since its change moves the treasury to {}",
+            accepted.len(),
+            hex::encode(treasury.authorized_key.serialize())
         );
     }
 
@@ -2518,6 +2590,36 @@ async fn collect_pegins_phase(
         batch,
         frozen_pegins,
     })
+}
+
+/// Recognise a peg-in request against every tree the bridge may hold deposits
+/// under, and report WHICH tree matched.
+///
+/// At most one can match: the deposit output's scriptPubKey is a single Taproot
+/// output key, and two trees differing in their internal key derive two different
+/// ones. So the order below decides nothing about the result — only which error is
+/// reported when a request matches nothing.
+///
+/// That error is the PUBLISHED tree's, because that is the address this bridge
+/// tells depositors to use; an operator reading "no output pays the peg-in
+/// address" wants it measured against the address they would have quoted, not
+/// against whichever superseded key happened to be tried last.
+fn recognise_pegin(
+    req: &crate::cardano::pegin_source::CardanoPegInRequest,
+    trees: &[(PeginKeyOrigin, crate::bitcoin::taproot::PeginTreeParams)],
+) -> Result<(PeginKeyOrigin, ParsedPegIn), crate::cardano::pegin_datum::ParseError> {
+    let mut published_err = None;
+    for (origin, tree) in trees {
+        match parse_pegin_request(req, tree) {
+            Ok(parsed) => return Ok((*origin, parsed)),
+            Err(e) => {
+                if published_err.is_none() {
+                    published_err = Some(e);
+                }
+            }
+        }
+    }
+    Err(published_err.expect("pegin_trees always yields at least the published tree"))
 }
 
 /// Freeze the discovered peg-in set against this batch (spec §TM batches; WI-049).
@@ -4973,6 +5075,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Inside the handoff window a node must recognise the address the bridge
+    /// PUBLISHES, batch only the deposits the head can actually spend, and say so
+    /// about the rest.
+    ///
+    /// Three deposits, one per tree, all real and all this bridge's:
+    ///
+    /// - the PUBLISHED address (`authorized_key`) — where every spec-compliant
+    ///   depositor sends from the Update-Y onward (spec §Rollout Phases step 5).
+    ///   The head is still under the superseded key, and a movement signs every
+    ///   input with one key package, so nothing can take this until the handoff
+    ///   confirms. Deferred, not dropped: peg-ins roll over freely.
+    /// - the HEAD's address — where deposits built before the Update-Y land. The
+    ///   movement about to be built is the last one that can ever take these.
+    /// - a RETIRED ceremony's address — nothing will sign under that key again, so
+    ///   this is reportable and nothing more.
+    ///
+    /// Before this, `pegin_tree()` was keyed to the head and returned one tree, so
+    /// the published deposit — the spec-correct one — failed to parse and was
+    /// dropped with a `warn!` for the whole window, once per epoch.
+    #[tokio::test]
+    async fn the_handoff_window_batches_what_the_head_can_spend_and_defers_the_rest() {
+        use crate::cardano::pegin_datum::testkit;
+
+        let (roster, keys) = group_for(0xa8, 2, 3);
+        let (_, incoming) = group_for(0xa9, 2, 3);
+        let (_, retired) = group_for(0xab, 2, 3);
+        let (_, fed) = group_for(0xac, 2, 3);
+        let y_out = xonly_of(&keys);
+        let y_in = xonly_of(&incoming);
+        let y_old = xonly_of(&retired);
+        assert_ne!(y_out, y_in);
+
+        let mut fixture = demo_static_fixture(2, 2, 19_580);
+        fixture.y_51 = y_out;
+        fixture.y_fed = y_out;
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(y_out)
+                .with_config_y_fed(xonly_of(&fed))
+                // The datum has rotated; the BTC has not moved.
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y_in, [0x5a; 32]))
+                .with_retired_internal_keys(vec![y_old])
+                .with_batch(slot(1)),
+        );
+        let config = fast_config(*keys.key_package.identifier());
+        let dir = config
+            .state_dir
+            .clone()
+            .expect("fast_config gives a state dir");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let treasury = chain
+            .query_treasury()
+            .await
+            .expect("the mock treasury reads");
+        assert_eq!(
+            treasury.y_51, y_out,
+            "the head is still under the outgoing key"
+        );
+        assert_eq!(
+            treasury.authorized_key, y_in,
+            "the datum already names the incoming one"
+        );
+
+        // (i) The address this bridge publishes is the one a depositor builds.
+        assert_eq!(
+            treasury.pegin_tree().expect("valid").y_51,
+            y_in,
+            "the published peg-in address follows the datum, which is the only peg-in key a \
+             Cardano-only reader can see"
+        );
+
+        let trees = treasury.pegin_trees().expect("valid");
+        assert_eq!(trees.len(), 3, "published, head, retired");
+        let depositor = testkit::xonly_from_seed([0xd2; 32]).serialize();
+        let amount = bitcoin::Amount::from_sat(400_000);
+        let published = testkit::pegin_request(&trees[0].1, depositor, amount, 0x31);
+        let head = testkit::pegin_request(&trees[1].1, depositor, amount, 0x32);
+        let stranded = testkit::pegin_request(&trees[2].1, depositor, amount, 0x33);
+
+        let source = MockCardanoPegInSource::new();
+        for req in [&published, &head, &stranded] {
+            source.push(std::time::Instant::now(), req.clone());
+        }
+        let pegin: Arc<dyn CardanoPegInSource> = Arc::new(source);
+
+        let mut built = BuiltBatch::default();
+        let next = collect_pegins_phase(&chain, &pegin, &config, 9, roster, keys, &mut built)
+            .await
+            .expect("collection must not fail on any of the three");
+        let EpochPhase::BuildTm { frozen_pegins, .. } = next else {
+            panic!("expected BuildTm, got {}", next.name());
+        };
+
+        // (ii) and (iii).
+        assert_eq!(
+            frozen_pegins.len(),
+            1,
+            "only the deposit under the head's key can be spent by the movement this batch \
+             builds"
+        );
+        assert_eq!(
+            frozen_pegins[0].cardano_utxo, head.cardano_utxo,
+            "and it is the one paying the head's address, not the published one"
+        );
+        assert_eq!(
+            frozen_pegins[0].spend_info.internal_key(),
+            y_out,
+            "every input of a movement is signed with one key package, so a batched peg-in's \
+             internal key must be the head's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (c) Disjointness. Over all four `(authorized_key, y_51)` combinations of
     /// the federation key and a roster key, EXACTLY ONE of {the SPO roster, the
     /// federation} builds a movement — and it is always the one holding `y_51`,
@@ -6619,6 +6835,7 @@ mod tests {
             authorized_key: f.y_51,
             federation_csv_blocks: f.federation_csv_blocks,
             pegin_refund_timeout_blocks: 720,
+            retired_internal_keys: Vec::new(),
             btc_confirmed: true,
         }
     }

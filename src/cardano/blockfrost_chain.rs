@@ -1895,10 +1895,14 @@ impl CardanoChain for BlockfrostCardanoChain {
         // persisted. That is also why it is a list rather than one previous key:
         // an epoch whose DKG failed posts no Update-Y and the old key carries
         // over, so the head can be several ceremonies behind.
+        // Read once and used twice: to reconstruct the head below, and to name the
+        // ceremonies this bridge has moved past, which is what lets peg-in
+        // collection report a deposit that has stranded at a retired address.
+        let persisted = self.persisted_internal_candidates();
         let mut internal_candidates = vec![maybe_key.unwrap_or(self.treasury_config.y_51)];
         for cand in authorized_key
             .into_iter()
-            .chain(self.persisted_internal_candidates())
+            .chain(persisted.iter().copied())
             .chain([self.treasury_config.y_fed])
         {
             if !internal_candidates.contains(&cand) {
@@ -2012,6 +2016,15 @@ impl CardanoChain for BlockfrostCardanoChain {
             authorized_key: authorized_key.unwrap_or(y_51),
             federation_csv_blocks: csv,
             pegin_refund_timeout_blocks: self.treasury_config.pegin_refund_timeout_blocks,
+            // The ceremonies this node persisted, minus the two keys that are still
+            // live. Whatever is left is a key no movement will ever sign under
+            // again, so a deposit found under one can only be reported, never swept.
+            retired_internal_keys: persisted
+                .into_iter()
+                .filter(|k| {
+                    *k != y_51 && Some(*k) != authorized_key && *k != self.treasury_config.y_fed
+                })
+                .collect(),
             btc_confirmed,
         })
     }
