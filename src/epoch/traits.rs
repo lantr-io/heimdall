@@ -129,16 +129,23 @@ pub struct TreasuryUtxo {
     /// beside the federation delay because the peg-in tree needs both, and both
     /// must come from the bridge rather than from each node's own file.
     pub pegin_refund_timeout_blocks: u16,
-    /// Group keys from ceremonies this bridge has moved PAST — neither the head's
+    /// Internal keys this bridge has published and moved PAST — neither the head's
     /// nor the datum's — newest first.
     ///
-    /// They buy exactly one thing: the ability to name a deposit that has stranded.
-    /// A movement is signed with a single key package, so it can only spend inputs
-    /// under the head's internal key; once the head has moved on, a deposit under
-    /// one of these keys can never be swept by anybody, and its depositor's refund
-    /// leaf is the only way back. Recognising the address turns that from silence
-    /// into a warning. Empty is always a safe answer — it costs a warning, not a
-    /// coin.
+    /// They buy exactly one thing: the ability to NAME a deposit the bridge is no
+    /// longer sweeping. A movement is signed with a single key package, so it can
+    /// only spend inputs under the head's internal key; once the head has moved on,
+    /// nothing signs under these again, and the deposit's own tree — the
+    /// federation's sweep leaf first, the depositor's refund after it — is the only
+    /// way back. Recognising the address turns that from silence into a warning.
+    ///
+    /// Unlike its neighbours this is NOT a bridge-wide value: it comes from what
+    /// this node persisted plus the published federation key, so two nodes can
+    /// legitimately disagree about it. That is only sound because it cannot change
+    /// batch membership in either direction — a `Retired` match and a match against
+    /// nothing at all are both refused, so the set a movement is built from is
+    /// identical whatever this field holds. Do not give it a consensus job. Empty
+    /// is always a safe answer: it costs a warning, not a coin.
     pub retired_internal_keys: Vec<bitcoin::key::UntweakedPublicKey>,
     /// Whether it is safe to begin the NEXT treasury movement off this UTxO.
     /// A new movement can only begin once the previous one is confirmed, so the
@@ -253,10 +260,21 @@ impl TreasuryUtxo {
     /// tree drops the other half with a `warn!` — deposits the bridge is holding
     /// and can see.
     ///
-    /// Recognising both costs one extra `pegin_spend_info` per request, and in the
-    /// steady state — where the datum and the head agree — there is only one tree
-    /// and no cost at all. What a node may DO with each match is
+    /// Recognising them all costs one extra Taproot derivation per tree per request
+    /// — and only that, because the tree-independent half of the parse is done once
+    /// (`pegin_datum::decode_pegin_request`). In the steady state, where the datum
+    /// and the head agree and nothing has been superseded, there is one tree and no
+    /// cost at all. What a node may DO with each match is
     /// [`PeginKeyOrigin::sweepable`]'s answer, not this one's.
+    ///
+    /// KNOWN LIMIT: only the internal key varies. The other three tap-tweak inputs
+    /// — the published federation key, its CSV delay and the refund timeout — are
+    /// taken at their CURRENT values for every tree, including retired ones. All
+    /// three are chain-published and can be changed by governance or a federation
+    /// rotation, and when one is, deposits made before the change reconstruct under
+    /// none of these trees and fall back to being dropped. Covering that needs the
+    /// whole `(internal, leaf, csv, timeout)` tuple that was live at deposit time,
+    /// which this field cannot express.
     pub fn pegin_trees(
         &self,
     ) -> Result<Vec<(PeginKeyOrigin, crate::bitcoin::taproot::PeginTreeParams)>, String> {

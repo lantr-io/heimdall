@@ -2016,15 +2016,30 @@ impl CardanoChain for BlockfrostCardanoChain {
             authorized_key: authorized_key.unwrap_or(y_51),
             federation_csv_blocks: csv,
             pegin_refund_timeout_blocks: self.treasury_config.pegin_refund_timeout_blocks,
-            // The ceremonies this node persisted, minus the two keys that are still
-            // live. Whatever is left is a key no movement will ever sign under
-            // again, so a deposit found under one can only be reported, never swept.
-            retired_internal_keys: persisted
-                .into_iter()
-                .filter(|k| {
-                    *k != y_51 && Some(*k) != authorized_key && *k != self.treasury_config.y_fed
-                })
-                .collect(),
+            // Every internal key this bridge is known to have published, minus the
+            // two that are still live. Whatever is left is a key no movement signs
+            // under any more, so a deposit found under one can only be reported.
+            //
+            // `y_federation` belongs in the list and is not among the persisted
+            // ceremonies: a Phase-1 bridge's peg-in address IS keyed to it (the datum
+            // names the federation key until the first Update-Y lands), and the
+            // federation share lives outside `state_dir` entirely. Leaving it out
+            // meant deposits at the address the bridge published for the whole of
+            // Phase 1 matched no tree after the handoff, and fell back to the "no
+            // output pays the peg-in address" drop this exists to replace.
+            retired_internal_keys: {
+                let mut out: Vec<bitcoin::key::UntweakedPublicKey> = Vec::new();
+                for k in persisted
+                    .into_iter()
+                    .chain([self.treasury_config.y_fed])
+                    .filter(|k| *k != y_51 && Some(*k) != authorized_key)
+                {
+                    if !out.contains(&k) {
+                        out.push(k);
+                    }
+                }
+                out
+            },
             btc_confirmed,
         })
     }

@@ -211,6 +211,52 @@ pub fn parse_pegin_request(
     req: &CardanoPegInRequest,
     tree: &PeginTreeParams,
 ) -> Result<ParsedPegIn, ParseError> {
+    decode_pegin_request(req)?.locate(tree, &Secp256k1::new())
+}
+
+/// A peg-in request decoded as far as it can be WITHOUT knowing the bridge's tree —
+/// the datum, the referenced Bitcoin transaction, and the beacon's `Q_auth`.
+///
+/// Split out because a node with more than one candidate tree (during a treasury
+/// handoff it has at least two, plus one per superseded ceremony) would otherwise
+/// redo all of it per tree: a CBOR decode, a transaction deserialize, an output
+/// scan for the beacon, and a fresh libsecp256k1 context. None of that depends on
+/// the tree. What does is [`Self::locate`], which is the only part worth repeating.
+#[derive(Debug, Clone)]
+pub struct PegInDeposit {
+    btc_tx: Transaction,
+    btc_txid: Txid,
+    depositor_outputkey: UntweakedPublicKey,
+    cardano_utxo: CardanoOutRef,
+    created_slot: Option<u64>,
+}
+
+impl ParsedPegIn {
+    /// The deposit's Bitcoin outpoint in the `tm_chain::outpoint_bytes` encoding —
+    /// which is both the movement input this peg-in becomes and its
+    /// `peg_in_utxo_id`, the SPI trie's key ([SPI-1]).
+    ///
+    /// One function because it is the deposit's IDENTITY: two PegInRequests naming
+    /// the same Bitcoin deposit are the same coin however differently they were
+    /// posted on Cardano, and every caller that compares, dedupes or records one
+    /// has to agree byte for byte on what that identity is.
+    #[must_use]
+    pub fn outpoint(&self) -> [u8; 36] {
+        crate::cardano::tm_chain::outpoint_bytes(&bitcoin::OutPoint {
+            txid: self.btc_txid,
+            vout: self.btc_vout,
+        })
+    }
+}
+
+/// Decode steps 1-3 of the peg-in validation: the datum's field[1] raw tx, that
+/// transaction, and the `Q_auth` its beacon carries.
+///
+/// Every error here is a statement about the REQUEST — malformed datum, undecodable
+/// transaction, missing or duplicated beacon — so it is the same answer whatever
+/// tree a caller had in mind, and a caller holding several need not try them all to
+/// learn it.
+pub fn decode_pegin_request(req: &CardanoPegInRequest) -> Result<PegInDeposit, ParseError> {
     // 1. Decode the Cardano datum: we only trust field[1] (raw tx).
     let plutus: PlutusData = pallas_codec::minicbor::decode(&req.datum_cbor)
         .map_err(|e| ParseError::BadDatumShape(format!("cbor: {e}")))?;
@@ -224,39 +270,60 @@ pub fn parse_pegin_request(
     // 3. Read the depositor's Taproot output key Q_auth from the OP_RETURN beacon.
     let depositor_outputkey = parse_beacon(&btc_tx)?;
 
-    // 4. Locate the deposit output. Q_auth is known and the rest of the tree comes from
-    //    the oracle, so the peg-in address is computed once rather than searched for. Two
-    //    outputs paying that same address remain ambiguous — this function resolves the
-    //    peg-in from the tx alone, with no datum outpoint to disambiguate them — so that
-    //    case is still refused.
-    let secp = Secp256k1::new();
-    let spend_info = pegin_spend_info(&secp, tree, depositor_outputkey);
-    let expected_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
-    let mut hits = btc_tx
-        .output
-        .iter()
-        .enumerate()
-        .filter(|(_, txout)| txout.script_pubkey == expected_spk);
-    let (vout, txout) = hits.next().ok_or(ParseError::NoPegInOutput)?;
-    if hits.next().is_some() {
-        return Err(ParseError::AmbiguousPegInOutput);
-    }
-    let value = txout.value;
-
-    if value < DUST_THRESHOLD {
-        return Err(ParseError::DustOutput);
-    }
-
-    Ok(ParsedPegIn {
-        btc_tx: btc_tx.clone(),
+    Ok(PegInDeposit {
+        btc_tx,
         btc_txid,
-        btc_vout: vout as u32,
-        value,
-        cardano_utxo: req.cardano_utxo.clone(),
         depositor_outputkey,
-        spend_info,
+        cardano_utxo: req.cardano_utxo.clone(),
         created_slot: req.created_slot,
     })
+}
+
+impl PegInDeposit {
+    /// Step 4: locate the output paying `tree`'s peg-in address.
+    ///
+    /// `Q_auth` is known and the rest of the tree comes from the oracle, so the
+    /// address is computed once rather than searched for. Two outputs paying that
+    /// same address remain ambiguous — a peg-in is resolved from the transaction
+    /// alone, with no datum outpoint to disambiguate them — so that case is
+    /// refused.
+    ///
+    /// `secp` is the caller's so that trying several trees costs one context, not
+    /// one per attempt.
+    pub fn locate(
+        &self,
+        tree: &PeginTreeParams,
+        secp: &Secp256k1<bitcoin::secp256k1::All>,
+    ) -> Result<ParsedPegIn, ParseError> {
+        let spend_info = pegin_spend_info(secp, tree, self.depositor_outputkey);
+        let expected_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
+        let mut hits = self
+            .btc_tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, txout)| txout.script_pubkey == expected_spk);
+        let (vout, txout) = hits.next().ok_or(ParseError::NoPegInOutput)?;
+        if hits.next().is_some() {
+            return Err(ParseError::AmbiguousPegInOutput);
+        }
+        let value = txout.value;
+
+        if value < DUST_THRESHOLD {
+            return Err(ParseError::DustOutput);
+        }
+
+        Ok(ParsedPegIn {
+            btc_tx: self.btc_tx.clone(),
+            btc_txid: self.btc_txid,
+            btc_vout: vout as u32,
+            value,
+            cardano_utxo: self.cardano_utxo.clone(),
+            depositor_outputkey: self.depositor_outputkey,
+            spend_info,
+            created_slot: self.created_slot,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
