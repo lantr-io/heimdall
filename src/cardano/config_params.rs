@@ -33,20 +33,37 @@
 //! Positions are a frozen contract — the datum evolves by APPENDING only — so a
 //! reader may safely decode the twelve fields it knows and ignore trailing ones:
 //!
-//! | # | field | read here |
-//! |---|-------|-----------|
-//! | 0 | `update_auth` | no |
-//! | 1 | `params` (nested [`Tunables`]) | TM fee rate, skip floors, schedule, ban schedule, federation CSV |
-//! | 2 | `bridged_token_policy` | no (heimdall.toml carries it) |
-//! | 3 | `completed_peg_ins_policy` | no |
-//! | 4 | `bridge_state_policy` | locate the bridge-state singleton ([PAR-1]) |
-//! | 5 | `tm_script_hash` | the TM validator hash = TM address ([CFG-2]) |
-//! | 6 | `peg_in_script_hash` | no |
-//! | 7 | `peg_out_script_hash` | no |
-//! | 8 | `spo_bans_policy_id` | the ban script address the roster is filtered against |
-//! | 9 | `spos_registry_policy_id` | the registry address |
-//! | 10 | `treasury_info_policy_id` | the `treasury_info` state UTxO's address |
-//! | 11 | `y_federation` | the federation leaf key of both Taproot trees (WI-069) |
+//! The `freshness` column is the answer to "may this move under a running node,
+//! and does this node notice". The spec's parameter registry (§G31) marks EVERY
+//! Config field `governance Update only` — i.e. all of them may move on a live
+//! bridge — but it states an effect time for `params` alone (§Operational
+//! parameters: read "as of the relevant TM batch's snapshot slot", so "an update
+//! takes effect from the next batch, never retroactively"). The wiring fields have
+//! no stated effect time, which is why `per scan` below is a bound rather than an
+//! answer: see `BlockfrostCardanoChain::current_contracts` and WI-2AHGZ.
+//!
+//! | # | field | read here | freshness |
+//! |---|-------|-----------|-----------|
+//! | 0 | `update_auth` | no | — |
+//! | 1 | `params` (nested [`Tunables`]) | TM fee rate, skip floors, schedule, ban schedule, federation CSV + refund timeout | **per batch snapshot** ([`fetch_param_snapshot`]) |
+//! | 2 | `bridged_token_policy` | the fBTC unit a peg-out's locked amount is measured in (WI-070 deleted the `heimdall.toml` copy) | per scan |
+//! | 3 | `completed_peg_ins_policy` | no | — |
+//! | 4 | `bridge_state_policy` | locate the bridge-state singleton ([PAR-1]) | per scan |
+//! | 5 | `tm_script_hash` | the TM validator hash = TM address ([CFG-2]) | **boot** — see below |
+//! | 6 | `peg_in_script_hash` | the address peg-in requests are scanned at, and the policy their NFT carries | per scan, both from ONE read |
+//! | 7 | `peg_out_script_hash` | the address peg-out requests are scanned at | per scan |
+//! | 8 | `spo_bans_policy_id` | the ban script address the roster is filtered against | per roster read |
+//! | 9 | `spos_registry_policy_id` | the registry address | per roster read |
+//! | 10 | `treasury_info_policy_id` | the `treasury_info` state UTxO's address | per roster read |
+//! | 11 | `y_federation` | the federation leaf key of both Taproot trees (WI-069) | boot |
+//! | 12 | `federation_one_shot` | the compile input every federation script is parameterized by (WI-090) | boot |
+//!
+//! #5 is deliberately left at boot: it names a SCRIPT, and re-reading it means
+//! fetching validator bytes, not comparing a hash. More to the point a TM policy
+//! change orphans the whole TM chain minted under the old one, so it describes a
+//! new bridge instance rather than a parameter move. #12 is the compile input to
+//! #9/#10 for the same reason. Neither judgement is written down anywhere a
+//! reader could check it — that is acceptance clause (a) of WI-2AHGZ, still open.
 //!
 //! `params` is at index 1 on purpose ([CFG-5]). Rev 5.4 put it last and told the
 //! reader to append after it, which invites the one edit that shifts every index:
