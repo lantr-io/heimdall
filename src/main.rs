@@ -2217,11 +2217,22 @@ async fn run_spo(
         let bf_chain = bf_chain.with_federation_refresh(cfg.cardano.clone());
 
         chain = Arc::new(bf_chain);
-        pegin_source = Arc::new(BlockfrostPegInSource::new(
+        // Config #6 gets the same treatment as #8/#9-#10 above: located once, read
+        // every scan. Without it a governance Update to peg_in_script_hash leaves
+        // this node watching a retired address and calling it "0 eligible peg-ins".
+        let mut src = BlockfrostPegInSource::new(
             project_id,
             &bridge.pegin_script_address,
             cfg.cardano.blockfrost_url.as_deref(),
-        ));
+        );
+        if let Some(loc) = config_locator(&cfg) {
+            src = src.with_config_refresh(
+                loc.address,
+                loc.nft_unit,
+                cfg.cardano.is_mainnet().unwrap_or(false),
+            );
+        }
+        pegin_source = Arc::new(src);
     } else if let Some(socket) = cfg.cardano.socket_path.clone() {
         let magic = cfg
             .cardano

@@ -16,6 +16,18 @@ pub struct BlockfrostPegInSource {
     base_url: String,
     project_id: String,
     address: String,
+    /// Where to re-read Config #6 from. `None` → the pinned `address` stands, which
+    /// is what every non-Config deployment (fixtures, devnets) wants.
+    refresh: Option<PegInRefresh>,
+}
+
+/// Enough to locate the bridge Config and derive an address from it.
+struct PegInRefresh {
+    config_address: String,
+    config_nft_unit: String,
+    /// Decides only the bech32 network tag of the derived address; the hash is the
+    /// datum's. Same single local input `ConfigParams::bridge_contracts` documents.
+    mainnet: bool,
 }
 
 impl BlockfrostPegInSource {
@@ -27,7 +39,81 @@ impl BlockfrostPegInSource {
             base_url: bf_http::base_url(project_id, blockfrost_url),
             project_id: project_id.to_string(),
             address: address.into(),
+            refresh: None,
         }
+    }
+
+    /// Re-read Config #6 on every scan instead of running forever on the boot read.
+    ///
+    /// This is the case that motivated the whole refresh: a governance Update moves
+    /// `peg_in_script_hash`, and a node still scanning the retired address reports
+    /// `0 eligible peg-ins` — indistinguishable from a bridge nobody is depositing
+    /// to. Restarting does not fix it, it just moves the node to the other side of
+    /// the disagreement. See `BlockfrostCardanoChain::current_contracts` for what
+    /// this bounds and what it does not (the adoption point remains WI-2AHGZ).
+    #[must_use]
+    pub fn with_config_refresh(
+        mut self,
+        config_address: impl Into<String>,
+        config_nft_unit: impl Into<String>,
+        mainnet: bool,
+    ) -> Self {
+        self.refresh = Some(PegInRefresh {
+            config_address: config_address.into(),
+            config_nft_unit: config_nft_unit.into(),
+            mainnet,
+        });
+        self
+    }
+
+    /// The peg-in address AND the request-NFT policy AS OF NOW, from ONE Config read.
+    ///
+    /// Both are Config #6. Taking them from a single read is the point: an Update
+    /// landing between two reads would otherwise pair the new address with the old
+    /// policy, and the scan would filter everything out and call it empty — the
+    /// same silence, arrived at by a different route.
+    ///
+    /// `Ok(None)` → nothing to refresh from; the pinned pair stands.
+    async fn current_pegin_contract(&self) -> EpochResult<Option<(String, String)>> {
+        let Some(r) = &self.refresh else {
+            return Ok(None);
+        };
+        // Retried rather than allowed to fall back: silently keeping the pinned copy
+        // on a 502 is the same divergence with a network blip as its trigger.
+        let view = crate::cardano::retry::retry_transient(
+            &crate::cardano::retry::DEFAULT_DELAYS,
+            "pegin-config",
+            |_: &String| true,
+            || {
+                crate::cardano::config_params::fetch_config(
+                    &self.base_url,
+                    &self.project_id,
+                    &r.config_address,
+                    &r.config_nft_unit,
+                )
+            },
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("bridge Config (peg-in identity #6): {e}")))?;
+
+        let contracts = view
+            .params
+            .bridge_contracts(r.mainnet)
+            .map_err(|e| EpochError::Chain(format!("peg-in identity: {e}")))?;
+
+        if contracts.pegin_script_address != self.address {
+            tracing::warn!(
+                "[pegin] the bridge Config now publishes a different peg-in address: {} -> {} \
+                 (Config UTxO {}). This node follows the chain, not its startup snapshot",
+                self.address,
+                contracts.pegin_script_address,
+                view.utxo
+            );
+        }
+        Ok(Some((
+            contracts.pegin_script_address,
+            contracts.pegin_policy_id,
+        )))
     }
 }
 
@@ -37,12 +123,19 @@ impl CardanoPegInSource for BlockfrostPegInSource {
         &self,
         policy_id: &[u8; 28],
     ) -> EpochResult<Vec<CardanoPegInRequest>> {
-        let policy_hex = hex::encode(policy_id);
+        // Config #6, re-read when there is a Config to read it from. `policy_id` is
+        // the caller's boot-time copy (EpochConfig::pegin_policy_id, pinned since
+        // WI-070) and stands only when nothing can be refreshed.
+        let refreshed = self.current_pegin_contract().await?;
+        let (address, policy_hex) = refreshed.map_or_else(
+            || (self.address.clone(), hex::encode(policy_id)),
+            |(addr, pol)| (addr, pol),
+        );
 
         // Fetch all UTxOs at the address (raw HTTP, lenient parse — tolerates backends like
         // yaci-devkit that omit `tx_index`) and filter by policy locally. (The asset-filtered
         // endpoint wants the FULL `<policy><name>` unit on some backends, so we don't rely on it.)
-        let utxos = bf_http::fetch_address_utxos(&self.base_url, &self.project_id, &self.address)
+        let utxos = bf_http::fetch_address_utxos(&self.base_url, &self.project_id, &address)
             .await
             .map_err(EpochError::Chain)?;
 
@@ -119,5 +212,35 @@ impl CardanoPegInSource for BlockfrostPegInSource {
 
         out.sort_by(|a, b| a.cardano_utxo.cmp(&b.cardano_utxo));
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WI-2AHGZ: peg-in identity follows the chain when there is a chain to follow,
+    /// and otherwise stays exactly where it was. The fallback arm is what every
+    /// fixture and devnet runs on, so it must not become a fetch against nothing.
+    #[tokio::test]
+    async fn without_a_config_the_pinned_pegin_address_stands() {
+        let src = BlockfrostPegInSource::new("preprodXXX", "addr_test1_pegin", None);
+        assert!(src.current_pegin_contract().await.unwrap().is_none());
+        assert_eq!(src.address, "addr_test1_pegin");
+    }
+
+    /// The locator is recorded, not resolved eagerly: construction must stay free
+    /// of I/O so a misconfigured backend fails at the first scan with a named
+    /// error, not inside a constructor nobody is awaiting.
+    #[test]
+    fn the_refresh_locator_is_recorded_without_touching_the_network() {
+        let src = BlockfrostPegInSource::new("preprodXXX", "addr_test1_pegin", None)
+            .with_config_refresh("addr_test1_config", "beef424946434647", false);
+        let r = src.refresh.as_ref().expect("locator recorded");
+        assert_eq!(r.config_address, "addr_test1_config");
+        assert_eq!(r.config_nft_unit, "beef424946434647");
+        assert!(!r.mainnet);
+        // Still pinned until something actually scans.
+        assert_eq!(src.address, "addr_test1_pegin");
     }
 }

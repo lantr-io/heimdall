@@ -1224,6 +1224,92 @@ impl BlockfrostCardanoChain {
         Ok((registry, bans))
     }
 
+    /// The scanned contract identities AS OF NOW, re-read from the bridge Config.
+    ///
+    /// The other half of [`Self::current_federation`], on the same argument.
+    /// `with_pegout_source` and `with_cpo_source` are set once from the boot read,
+    /// so a governance Update to Config #2/#4/#7 leaves a long-running node
+    /// scanning addresses nobody uses any more and reporting nothing pending —
+    /// which reads exactly like a quiet bridge. Restarting does not fix it either:
+    /// the restarted node then disagrees with every peer that has not restarted.
+    ///
+    /// This BOUNDS that divergence rather than removing it. Two nodes reading
+    /// seconds apart across an Update still disagree for the width of one read —
+    /// but that replaces "however long since each last restarted", which is
+    /// unbounded, invisible, and does not heal on its own. Making it exactly zero
+    /// needs an adoption point every node derives from chain rather than from
+    /// observation time; the batch snapshot slot is the candidate, since every
+    /// co-signer takes it for the same batch. That is a protocol decision
+    /// (WI-2AHGZ), not one this can settle locally.
+    ///
+    /// `Ok(None)` → no Config locator to refresh from, and the pinned values stand.
+    async fn current_contracts(
+        &self,
+    ) -> EpochResult<Option<crate::cardano::config_params::BridgeContracts>> {
+        let (Some(addr), Some(unit)) = (
+            self.config_address.as_deref(),
+            self.config_nft_unit.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        // Retried on `current_federation`'s reasoning: a Config read that fails must
+        // not quietly leave the node on its pinned copy, or the divergence is back
+        // with a 502 as the trigger instead of a restart.
+        let view = crate::cardano::retry::retry_transient(
+            &crate::cardano::retry::DEFAULT_DELAYS,
+            "contracts-config",
+            |_: &String| true,
+            || {
+                crate::cardano::config_params::fetch_config(
+                    &self.bf_base_url,
+                    &self.bf_project_id,
+                    addr,
+                    unit,
+                )
+            },
+        )
+        .await
+        .map_err(|e| {
+            EpochError::Chain(format!("bridge Config (contract identities #2/#4/#7): {e}"))
+        })?;
+
+        let contracts = view
+            .params
+            .bridge_contracts(self.is_mainnet())
+            .map_err(|e| EpochError::Chain(format!("contract identities: {e}")))?;
+
+        // Say so when the chain moved under us, for the reason the federation
+        // refresh says so: a contract move is a governance event, and an operator
+        // must not have to diff two nodes' logs to discover it.
+        for (what, was, now) in [
+            (
+                "peg-out address",
+                self.pegout_source.as_ref().map(|s| &s.address),
+                &contracts.pegout_script_address,
+            ),
+            (
+                "fBTC unit",
+                self.pegout_source.as_ref().map(|s| &s.fbtc_unit),
+                &contracts.bridged_token_unit,
+            ),
+            (
+                "bridge-state policy",
+                self.cpo_policy_id.as_ref(),
+                &contracts.bridge_state_policy_id,
+            ),
+        ] {
+            if was.is_some_and(|w| w != now) {
+                warn!(
+                    "[contracts] the bridge Config now publishes a different {what}: {} -> {now} \
+                     (Config UTxO {}). This node follows the chain, not its startup snapshot",
+                    was.map_or("<none>", String::as_str),
+                    view.utxo
+                );
+            }
+        }
+        Ok(Some(contracts))
+    }
+
     /// Select where per-pool active stake is read (Blockfrost vs a local
     /// yaci-devkit devnet). Only meaningful alongside [`Self::with_registry_roster`].
     pub fn with_stake_source(mut self, source: crate::cardano::stake::StakeSource) -> Self {
@@ -2242,7 +2328,7 @@ impl CardanoChain for BlockfrostCardanoChain {
     /// building peg-in-only TMs, and paying nothing is under-payment (the request stays open
     /// until its own cancel deadline), never over-payment.
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>> {
-        let Some(src) = &self.pegout_source else {
+        let Some(pinned) = &self.pegout_source else {
             warn!(
                 "[pegout] no cardano.pegout_script_address / cardano.bridged_token_unit \
                  — this TM pays NO peg-out; every pending withdrawal waits for a later batch"
@@ -2250,14 +2336,29 @@ impl CardanoChain for BlockfrostCardanoChain {
             return Ok(vec![]);
         };
 
+        // Config #7 and #2, re-read rather than trusted from boot: a governance
+        // Update moves where withdrawals sit, and a node still scanning the old
+        // address reports "nothing pending", which is what a quiet bridge looks
+        // like too. See `current_contracts` for what this does and does not fix.
+        let refreshed = self.current_contracts().await?;
+        let (address, fbtc_unit) =
+            refreshed
+                .as_ref()
+                .map_or((pinned.address.as_str(), pinned.fbtc_unit.as_str()), |c| {
+                    (
+                        c.pegout_script_address.as_str(),
+                        c.bridged_token_unit.as_str(),
+                    )
+                });
+
         // Malformed UTxOs at the (permissionlessly payable) peg-out address are skipped with a
         // per-UTxO line on stderr inside `fetch_pegout_requests`, matching the CLI sweep path:
         // one poison datum must not block every Treasury Movement bridge-wide.
         let scan = crate::cardano::pegout_datum::fetch_pegout_requests(
             &self.bf_base_url,
             &self.bf_project_id,
-            &src.address,
-            &src.fbtc_unit,
+            address,
+            fbtc_unit,
         )
         .await
         .map_err(|e| EpochError::Chain(format!("fetch_pegout_requests: {e}")))?;
@@ -2290,7 +2391,7 @@ impl CardanoChain for BlockfrostCardanoChain {
                 "[pegout] {} UTxO(s) at {} carry the bridged token but no decodable \
                  PegOutDatum — they are NOT payable by any TM and are absent from the open count \
                  below; their owners can still Cancel",
-                scan.malformed, src.address,
+                scan.malformed, address,
             );
         }
 
@@ -2382,9 +2483,16 @@ impl CardanoChain for BlockfrostCardanoChain {
     }
 
     async fn query_bridge_roots(&self) -> EpochResult<Option<crate::epoch::traits::BridgeRoots>> {
-        let Some(policy) = self.cpo_policy_id.as_deref() else {
+        let Some(pinned) = self.cpo_policy_id.as_deref() else {
             return Ok(None);
         };
+        // Config #4, re-read for the same reason (`current_contracts`): a node
+        // checking its trie against a singleton the bridge has retired attests a
+        // root no peer reproduces.
+        let refreshed = self.current_contracts().await?;
+        let policy = refreshed
+            .as_ref()
+            .map_or(pinned, |c| c.bridge_state_policy_id.as_str());
         // Same backend selection as `reconstruct-cpo-trie` (see run_reconstruct_cpo_trie):
         // Kupo when configured, else the Blockfrost-compatible API. Reading the singleton
         // is a plain unspent-with-asset query, which both backends serve.
@@ -2975,6 +3083,33 @@ mod tests {
         // fallback fixture roster, not an error.
         let chain = bare_chain().with_federation_refresh(crate::config::CardanoConfig::default());
         assert!(chain.current_federation().await.unwrap().0.is_none());
+    }
+
+    /// WI-2AHGZ: the contract identities follow the chain, but a node with no
+    /// Config to follow keeps what it was given rather than erroring or scanning
+    /// nothing. This pins the fallback arm — the one that has to hold for every
+    /// fixture, devnet and pre-Config deployment — and pins that the refresh does
+    /// NOT fire against an unset Config address.
+    #[tokio::test]
+    async fn without_a_config_the_pinned_contract_set_stands() {
+        let chain = bare_chain()
+            .with_pegout_source("addr_test1_pegout", "aabbcc.fBTC")
+            .with_cpo_source(Some("DD".repeat(28).as_str()), None);
+
+        // No config_address / config_nft_unit → nothing to refresh from, and the
+        // caller falls back to what boot handed it.
+        assert!(chain.current_contracts().await.unwrap().is_none());
+
+        // The pinned values are still there to fall back TO, and the policy kept its
+        // normalisation (`with_cpo_source` lowercases, so a Config-derived hex and a
+        // typed one compare equal instead of differing by case).
+        assert_eq!(
+            chain.cpo_policy_id.as_deref(),
+            Some("dd".repeat(28).as_str())
+        );
+        let pinned = chain.pegout_source.as_ref().unwrap();
+        assert_eq!(pinned.address, "addr_test1_pegout");
+        assert_eq!(pinned.fbtc_unit, "aabbcc.fBTC");
     }
 
     /// WI-060: reading the ban list and enforcing faults are separate. A node
