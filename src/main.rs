@@ -7562,6 +7562,17 @@ fn run_sweep_pegins(
     // the demo DKG above rather than reading it off the oracle. The other three values are
     // the bridge's, and the mapping lives in one place.
     let pegin_tree = federation.pegin_tree(y_51)?;
+    // The one other internal key this path can name without reading the oracle: the
+    // federation's own. A Phase-1 bridge's peg-in address IS keyed to it, and during a
+    // handoff deposits keep arriving there, so without it every such deposit fell out
+    // of the loop below as "no output pays the peg-in address" — which reads as another
+    // bridge's deposit, and is the one thing this tool must not say about coins it is
+    // holding. Recognising it does NOT make it sweepable here: this mover signs with one
+    // key package, so an input under y_federation needs the federation's signature and
+    // this command cannot produce it. The value is that the operator is told the truth.
+    let federation_pegin_tree = (federation.y_fed != y_51)
+        .then(|| federation.pegin_tree(federation.y_fed))
+        .transpose()?;
 
     let policy_id: [u8; 28] = hex::decode(pegin_policy_id)
         .map_err(|e| format!("pegin_policy_id: {e}"))?
@@ -7664,7 +7675,26 @@ fn run_sweep_pegins(
         let parsed = match parse_pegin_request(req, &pegin_tree) {
             Ok(p) => p,
             Err(e) => {
-                warn!("  dropped peg-in {:?}: {e}", req.cardano_utxo);
+                // Before calling it someone else's: does it pay the FEDERATION
+                // address? If so it is this bridge's deposit and this tool simply
+                // cannot move it — a different sentence entirely, and the one an
+                // operator needs in order to reach for the federation instead of
+                // concluding there is nothing to sweep.
+                match federation_pegin_tree
+                    .as_ref()
+                    .and_then(|t| parse_pegin_request(req, t).ok())
+                {
+                    Some(fed) => warn!(
+                        "  peg-in {:?} pays the FEDERATION address ({}:{}, {} sat) — this \
+                         bridge's deposit, but this mover signs under Y_51 only and one \
+                         movement signs every input with one key. The federation must move it",
+                        req.cardano_utxo,
+                        fed.btc_txid,
+                        fed.btc_vout,
+                        fed.value.to_sat(),
+                    ),
+                    None => warn!("  dropped peg-in {:?}: {e}", req.cardano_utxo),
+                }
                 continue;
             }
         };

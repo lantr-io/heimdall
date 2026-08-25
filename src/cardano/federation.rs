@@ -124,10 +124,17 @@ impl FederationIdentity {
     /// The INTERNAL key is where the two now differ, and deliberately: the oracle path
     /// takes it from the treasury_info datum (`authorized_key`), which is what the spec
     /// tells depositors to derive from, while this one takes the caller's because the
-    /// mover derives it from the demo DKG rather than reading it off the chain. This path
-    /// therefore has exactly ONE tree and no view of a rotation, so it still misses
-    /// deposits at the published address for the length of a handoff — see WI-MA9BA. It is
-    /// a demo/offline path; a mover that must not miss them should read the oracle.
+    /// mover derives it from the demo DKG rather than reading it off the chain.
+    ///
+    /// The caller is expected to build TWO trees from this — one under its own `y_51` and
+    /// one under `y_fed` — because a Phase-1 bridge's peg-in address is keyed to the
+    /// federation and deposits keep arriving there through a handoff. Recognising the
+    /// second does not make it SWEEPABLE from a roster mover (one movement signs every
+    /// input with one key package), but it is the difference between telling an operator
+    /// the bridge is holding a deposit it cannot move and telling them it belongs to
+    /// someone else. What neither tree covers is a rotation this path cannot see, since
+    /// it never reads `authorized_key` — see WI-MA9BA. It is a demo/offline path; a mover
+    /// that must not miss those should read the oracle.
     pub fn pegin_tree(
         &self,
         y_51: UntweakedPublicKey,
