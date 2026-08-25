@@ -217,12 +217,28 @@ pub struct ChainView {
     /// lives. Chain-derived (a block time), never a local clock, so it is
     /// comparable across nodes.
     pub read_time_ms: i64,
-    /// Whether the publisher weighted by `live_stake` (test runs) or by the epoch
-    /// snapshot (everything else).
+    /// The FROST threshold this publisher derived — the size its Round-1
+    /// commitment vector is built to.
     ///
-    /// Unlike a digest disagreement this is NOT a freshness problem and re-reading
-    /// the chain will never settle it: it is two nodes configured differently, and
-    /// it must be said so rather than folded into the stale/fresher reconcile.
+    /// This is the DETECTOR for weight disagreements. The digest covers the
+    /// candidate SET, and every way two nodes can disagree about WEIGHTS leaves
+    /// that set identical: a `demo_live_stake` mismatch, a `stake_source` or
+    /// `demo_exclude_unstaked` difference, and — with `demo_live_stake` correctly
+    /// set on BOTH — plain `live_stake` drift between two reads seconds apart. All
+    /// of them give matching digests and different `t`: a ceremony that cannot
+    /// aggregate while the reconcile reports agreement. Publishing `t` catches the
+    /// lot without a flag per cause.
+    ///
+    /// Unlike a digest disagreement none of these is a freshness problem, and no
+    /// amount of re-reading settles them, so they must not enter the
+    /// stale/fresher machinery.
+    ///
+    /// `0` means a publisher that does not report it (an older build) and is never
+    /// compared.
+    pub threshold: u16,
+    /// Whether the publisher weighted by `live_stake` (test runs) or by the epoch
+    /// snapshot. NOT the detector — `threshold` is — but it turns "our thresholds
+    /// differ" into a named cause when it is the cause.
     pub live_stake: bool,
 }
 
@@ -238,6 +254,7 @@ impl DkgContext {
             digest: crate::cardano::hash::blake2b_256(&buf),
             n: u16::try_from(self.participants.len()).unwrap_or(u16::MAX),
             read_time_ms: self.read_time_ms,
+            threshold: self.threshold,
             live_stake: self.live_stake,
         }
     }
@@ -731,6 +748,17 @@ pub async fn fetch_eligible_stakes(
     // node of the roster sets it the same way.
     live_stake: bool,
 ) -> Result<BTreeMap<Vec<u8>, u64>, String> {
+    // yaci-store publishes no `live_stake` — `fetch_pool_stake_yaci` mirrors
+    // `active_stake` into it — so the flag cannot do anything there. Say so rather
+    // than let an operator follow the guide's "your delegation counts from the
+    // moment it lands" onto a devnet where it silently does not.
+    if live_stake && matches!(source, StakeSource::YaciStore) {
+        warn!(
+            "[stake] cardano.demo_live_stake has NO EFFECT with stake_source = \"yaci_store\": \
+             that backend reports no live_stake and mirrors active_stake, so an unactivated \
+             pool still weighs zero. Nothing here can shorten the wait on a yaci devnet"
+        );
+    }
     let mut stakes = BTreeMap::new();
     for pool_id in pool_ids {
         let arr: [u8; 28] = pool_id

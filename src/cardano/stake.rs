@@ -40,9 +40,31 @@ pub struct MinStakeCheck {
 /// lovelace). At-threshold passes (`>=`).
 #[must_use]
 pub fn check_min_stake(stake: &PoolStake, min_stake_lovelace: u64) -> MinStakeCheck {
+    check_min_stake_with(stake, min_stake_lovelace, false)
+}
+
+/// [`check_min_stake`], against `live_stake` when the caller is a test run.
+///
+/// The gate must key on whatever the DKG roster will key on. On a test bridge
+/// where `cardano.demo_live_stake` weights by `live_stake`, keeping this on
+/// `active_stake` refuses to submit a registration for a pool the roster is about
+/// to weight normally — so the tester cannot reach the registry that the flag
+/// exists to re-weight. `min_stake_lovelace = 0` is the only other way out and is
+/// documented nowhere.
+#[must_use]
+pub fn check_min_stake_with(
+    stake: &PoolStake,
+    min_stake_lovelace: u64,
+    live_stake: bool,
+) -> MinStakeCheck {
+    let measured = if live_stake {
+        stake.live_stake
+    } else {
+        stake.active_stake
+    };
     MinStakeCheck {
-        meets: stake.active_stake >= min_stake_lovelace,
-        active_stake: stake.active_stake,
+        meets: measured >= min_stake_lovelace,
+        active_stake: measured,
         threshold: min_stake_lovelace,
     }
 }

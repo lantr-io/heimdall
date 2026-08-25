@@ -57,6 +57,12 @@ struct ViewState {
     /// view matches ours again; NOT reset by `set_chain_view`, since one
     /// disagreement can span several attempts.
     divergence_since: BTreeMap<Vec<u8>, Instant>,
+    /// Per-peer `pool_id` → the last threshold we reported a disagreement about.
+    ///
+    /// The fetch path polls every few seconds, and this is an `error!`: without
+    /// throttling one misconfigured peer buries `journalctl -p err`. Keyed on the
+    /// VALUE, not a bool, so a peer whose threshold moves again is reported again.
+    threshold_reported: BTreeMap<Vec<u8>, u16>,
 }
 
 /// Key under which a fetched peer payload's raw bytes are retained for
@@ -140,28 +146,59 @@ impl HttpPeerNetwork {
                 return;
             }
         };
-        // A configuration disagreement, not a freshness one. The candidate SET is
-        // the same on both sides — so the digest matches and the reconcile below
-        // would call it agreement — while the weights, and therefore the FROST
-        // threshold, differ. That ceremony cannot aggregate, and no amount of
-        // re-reading the chain will settle it, so it must not enter the
-        // stale/fresher machinery: say what is wrong and which side to change.
-        if peer.live_stake != own.live_stake {
-            let (mine, theirs) = if own.live_stake {
-                ("live_stake (TEST RUN)", "the epoch snapshot")
+        // A WEIGHT disagreement, which is not a freshness one. The candidate SET
+        // can be identical on both sides — same digest, same n — while the derived
+        // `t` differs, and that ceremony cannot aggregate: `dkg.rs` drops every
+        // peer whose commitment vector is not `ctx.threshold` long and blames a
+        // "different candidate set", which is false. Causes: a `demo_live_stake`
+        // mismatch, a `stake_source` or `demo_exclude_unstaked` difference, or —
+        // with `demo_live_stake` correctly set on BOTH — plain `live_stake` drift
+        // between two reads seconds apart, which is the hazard the flag's own
+        // documentation names.
+        //
+        // Reported, never folded into the stale/fresher reconcile: no re-read
+        // settles any of them. But it does NOT return either — a node can be both
+        // misconfigured and genuinely behind, and swallowing the digest comparison
+        // below would suppress its stale flag and its divergence alarm.
+        if own.threshold != 0 && peer.threshold != 0 && peer.threshold != own.threshold {
+            let cause = if peer.live_stake != own.live_stake {
+                let (mine, theirs) = if own.live_stake {
+                    ("live_stake (TEST RUN)", "the epoch snapshot")
+                } else {
+                    ("the epoch snapshot", "live_stake (TEST RUN)")
+                };
+                format!(
+                    "cardano.demo_live_stake does not match: we weight by {mine}, the peer by \
+                     {theirs}"
+                )
+            } else if own.live_stake {
+                "both nodes weight by live_stake, which DRIFTS — these were read at different \
+                 moments. Wait for the next attempt, or move the roster back to the epoch \
+                 snapshot"
+                    .to_string()
             } else {
-                ("the epoch snapshot", "live_stake (TEST RUN)")
+                "same candidate set, different weights — check cardano.stake_source and \
+                 cardano.demo_exclude_unstaked on both nodes"
+                    .to_string()
             };
-            error!(
-                "[chain-view] peer {} weights the DKG roster by {theirs} and this node by \
-                 {mine} — cardano.demo_live_stake does not match across the roster. The \
-                 candidate set agrees, so this will NOT show up as a view disagreement; it \
-                 shows up as a ceremony that never aggregates. Re-reading the chain cannot \
-                 fix it: set the flag the same way on every node",
-                hex::encode(peer_pool_id),
-            );
-            v.divergence_since.remove(peer_pool_id);
-            return;
+            if v.threshold_reported
+                .insert(peer_pool_id.to_vec(), peer.threshold)
+                != Some(peer.threshold)
+            {
+                error!(
+                    "[chain-view] peer {} derived threshold {} and this node {} — their DKG \
+                     round 1 cannot aggregate with ours. {cause}. Note the candidate sets {}, \
+                     so this will not appear as a view disagreement",
+                    hex::encode(peer_pool_id),
+                    peer.threshold,
+                    own.threshold,
+                    if peer.digest == own.digest {
+                        "AGREE"
+                    } else {
+                        "also differ"
+                    },
+                );
+            }
         }
         if peer.digest == own.digest {
             if v.divergence_since.remove(peer_pool_id).is_some() {
@@ -1028,6 +1065,7 @@ mod tests {
             digest: [0xA1; 32],
             n: 4,
             read_time_ms: 100,
+            threshold: 2,
             live_stake: false,
         })
         .await;
@@ -1035,6 +1073,7 @@ mod tests {
             digest: [0xB2; 32],
             n: 3,
             read_time_ms: 200,
+            threshold: 2,
             live_stake: false,
         })
         .await;
@@ -1065,6 +1104,7 @@ mod tests {
             digest: [0xB2; 32],
             n: 3,
             read_time_ms: 300,
+            threshold: 2,
             live_stake: false,
         })
         .await;
@@ -1074,16 +1114,18 @@ mod tests {
         );
     }
 
-    /// A `demo_live_stake` mismatch must NOT be mistaken for agreement.
+    /// A weight disagreement must be caught even when the candidate sets AGREE,
+    /// and must not disturb the freshness machinery.
     ///
-    /// It changes the roster's WEIGHTS, never its membership, so both nodes compute
-    /// the same candidate-set digest — the reconcile below would call that
-    /// "reconciled" — while their FROST thresholds differ and the ceremony cannot
-    /// aggregate. Nor is it a freshness problem: neither node is stale, and no
-    /// amount of re-reading the chain settles a configuration difference. So it
-    /// must not arm the stale flag or the divergence timer.
+    /// Two nodes can derive different thresholds from an identical member set —
+    /// a `demo_live_stake` mismatch, a `stake_source` difference, or `live_stake`
+    /// drift with the flag correctly set on both. The ceremony then cannot
+    /// aggregate while `compare_view` reports "reconciled", so the derived
+    /// threshold is published and compared. It is NOT a freshness problem, so it
+    /// must not set the stale flag on its own — and it must not SUPPRESS a real
+    /// one either, which is what an early return would do.
     #[tokio::test]
-    async fn a_live_stake_mismatch_is_not_a_stale_view() {
+    async fn differing_thresholds_are_caught_even_when_the_candidate_sets_agree() {
         let secp = Secp256k1::new();
         let (kp1, pool1, pk1) = identity(&secp, 1);
         let (kp2, pool2, pk2) = identity(&secp, 2);
@@ -1093,17 +1135,24 @@ mod tests {
         let url2 = serve(&net2).await;
         let ns = DkgNamespace::new(11);
 
-        // SAME digest and n — the candidate set agrees, which is exactly what makes
-        // this dangerous. Only the weighting differs.
-        for (net, live) in [(&net1, true), (&net2, false)] {
-            net.set_chain_view(ChainView {
-                digest: [0xC3; 32],
-                n: 3,
-                read_time_ms: 500,
-                live_stake: live,
-            })
-            .await;
-        }
+        // IDENTICAL digest, n and read_time — the candidate set agrees and neither
+        // node is behind. Only the derived threshold differs.
+        net1.set_chain_view(ChainView {
+            digest: [0xC3; 32],
+            n: 3,
+            read_time_ms: 500,
+            threshold: 3,
+            live_stake: true,
+        })
+        .await;
+        net2.set_chain_view(ChainView {
+            digest: [0xC3; 32],
+            n: 3,
+            read_time_ms: 500,
+            threshold: 2,
+            live_stake: false,
+        })
+        .await;
 
         let (_s1, pkg1) = dkg::part1(id(1), 3, 2, OsRng).unwrap();
         let (_s2, pkg2) = dkg::part1(id(2), 3, 2, OsRng).unwrap();
@@ -1115,13 +1164,65 @@ mod tests {
         let _ = fetch_r1_retrying(&net1, ns, &peer2).await;
         let _ = fetch_r1_retrying(&net2, ns, &peer1).await;
 
-        // Neither side is behind, so neither must be told to settle and re-read —
-        // that would loop forever against a difference the chain cannot resolve.
+        // The report fired (it is throttled per peer per value, so the record of
+        // having reported is what the branch leaves behind) ...
+        for net in [&net1, &net2] {
+            let v = net.views.lock().unwrap();
+            assert!(
+                !v.threshold_reported.is_empty(),
+                "a threshold disagreement must be reported; with the branch removed \
+                 compare_view returns at the digest match and this map stays empty"
+            );
+            // ... and neither node was told it is behind: no re-read settles a
+            // weight disagreement, so the settling backoff must not be armed.
+            assert!(!v.stale);
+            assert!(v.divergence_since.is_empty());
+        }
+    }
+
+    /// The weight check must not SWALLOW a genuine stale view. A node can be both
+    /// misconfigured and behind, and an early return would leave it retrying
+    /// against an unsettled tip forever.
+    #[tokio::test]
+    async fn a_threshold_disagreement_does_not_mask_a_stale_view() {
+        let secp = Secp256k1::new();
+        let (kp1, pool1, pk1) = identity(&secp, 1);
+        let (kp2, pool2, pk2) = identity(&secp, 2);
+        let net1 = HttpPeerNetwork::new(Secp256k1::new(), kp1, pool1);
+        let net2 = HttpPeerNetwork::new(Secp256k1::new(), kp2, pool2);
+        let url1 = serve(&net1).await;
+        let _url2 = serve(&net2).await;
+        let ns = DkgNamespace::new(13);
+
+        // net1 is BOTH behind (older read, different digest) AND on a different
+        // threshold. The stale verdict must survive the weight report.
+        net1.set_chain_view(ChainView {
+            digest: [0xD1; 32],
+            n: 4,
+            read_time_ms: 100,
+            threshold: 3,
+            live_stake: true,
+        })
+        .await;
+        net2.set_chain_view(ChainView {
+            digest: [0xD2; 32],
+            n: 3,
+            read_time_ms: 900,
+            threshold: 2,
+            live_stake: false,
+        })
+        .await;
+
+        let (_s2, pkg2) = dkg::part1(id(2), 3, 2, OsRng).unwrap();
+        net2.publish_dkg_round1(ns, id(2), &pkg2).await.unwrap();
+        let peer2 = peer_info(2, &pool2, &_url2, &pk2);
+        let _ = fetch_r1_retrying(&net1, ns, &peer2).await;
+
         assert!(
-            !net1.is_view_stale().await,
-            "a configuration mismatch must not be reported as a stale chain read"
+            net1.is_view_stale().await,
+            "the older-read node is still the stale side, threshold row or not"
         );
-        assert!(!net2.is_view_stale().await);
+        let _ = (pool1, pk1, url1);
     }
 
     #[tokio::test]

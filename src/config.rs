@@ -962,12 +962,23 @@ impl HeimdallConfig {
     /// is refused at load rather than warned about — a warning in a unit's journal
     /// is not something an operator reads before the first ceremony fails.
     fn refuse_test_flags_on_mainnet(&self) -> Result<(), ConfigError> {
-        if self.cardano.demo_live_stake && self.cardano.is_mainnet().unwrap_or(false) {
+        // Unresolvable is not "no". `is_mainnet` errs on an unrecognised network
+        // string, on a network/config_address disagreement, and on `network` unset
+        // beside a `blockfrost_url` — and `unwrap_or(false)` would read every one of
+        // those as "not mainnet", so `network = "Mainnet"` would carry a
+        // consensus-breaking test flag onto a real-funds bridge. preflight.rs
+        // documents this exact bug being fixed on the sibling guard; do not
+        // reintroduce it here. Hold to the answer that cannot be ruled out.
+        let mainnet = self.cardano.is_mainnet().unwrap_or(true);
+        if self.cardano.demo_live_stake && mainnet {
             return Err(ConfigError::TestFlagOnMainnet(
                 "cardano.demo_live_stake weights the DKG roster by live_stake, which drifts \
                  intra-epoch — two SPOs reading moments apart derive different thresholds and \
                  the ceremony cannot aggregate. It exists so a test SPO need not wait two epoch \
-                 boundaries for its stake to activate, and has no place on mainnet",
+                 boundaries for its stake to activate, and has no place on mainnet. If this \
+                 is NOT a mainnet node, cardano.network could not be resolved — an unknown \
+                 spelling, or a network that disagrees with cardano.config_address — and an \
+                 unresolvable network is treated as mainnet here rather than waved through",
             ));
         }
         Ok(())
@@ -1271,6 +1282,14 @@ demo_live_stake = true
             HeimdallConfig::from_toml_str(&toml(n))
                 .unwrap_or_else(|e| panic!("{n} must allow it: {e}"));
         }
+
+        // AND an unresolvable network is refused, not waved through. A capital
+        // letter is an unknown string, so `is_mainnet` errs — reading that as
+        // "not mainnet" is how the sibling guard in preflight.rs was once
+        // bypassable, and the failure is silent on a real-funds bridge.
+        let err = HeimdallConfig::from_toml_str(&toml("Mainnet"))
+            .expect_err("an unresolvable network must not open the gate");
+        assert!(err.to_string().contains("demo_live_stake"), "{err}");
     }
 
     /// ...and a config that sets none of them still loads.

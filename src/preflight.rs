@@ -201,6 +201,26 @@ pub fn non_protocol_threshold_on_mainnet(percent: u128, mainnet: bool) -> Option
     })
 }
 
+/// Report a test-run flag that changes a consensus derivation.
+///
+/// Not a refusal — the flag is legitimate on a test bridge, and mainnet already
+/// refuses it at config load. But `doctor` / `run-spo --check` / `status` are what
+/// an operator runs to ask "is this node set up correctly", and answering "all
+/// checks passed" while a flag that decides the FROST threshold is in force is the
+/// wrong answer. `--check` returns before the daemon's startup warning ever runs,
+/// so without this there is no surface that mentions it at all.
+#[must_use]
+pub fn test_stake_weighting(live_stake: bool) -> Option<String> {
+    live_stake.then(|| {
+        "cardano.demo_live_stake is set: this node weights the DKG roster by live_stake, not \
+         the epoch snapshot. It decides the FROST threshold, so EVERY node of the roster must \
+         set it identically — and live_stake drifts, so two nodes reading moments apart can \
+         still derive different thresholds. Clear it once stake has activated, on all nodes \
+         together at an epoch boundary"
+            .to_string()
+    })
+}
+
 /// Refuse an unset `protocol.state_dir`.
 ///
 /// This was a warning until now, on the reasoning that deployments predating
@@ -370,6 +390,9 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             crate::cardano::dkg_roster::SECURITY_THRESHOLD_PERCENT,
             mainnet,
         ) {
+            problems.push(p);
+        }
+        if let Some(p) = test_stake_weighting(cfg.cardano.demo_live_stake) {
             problems.push(p);
         }
 
