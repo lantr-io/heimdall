@@ -281,6 +281,11 @@ mod tests {
 
         *shared.lock().unwrap() = Some(BatchContracts {
             batch_key: Some(1_000),
+            pegin_tree_inputs: crate::cardano::config_params::PeginTreeInputs {
+                y_federation: [0x9f; 32],
+                federation_csv_blocks: 144,
+                pegin_refund_timeout_blocks: 720,
+            },
             contracts: BridgeContracts {
                 pegin_policy_id: "aa".repeat(28),
                 pegin_script_address: "addr_test1_batch_pegin".into(),

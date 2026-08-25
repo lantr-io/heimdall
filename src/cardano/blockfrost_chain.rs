@@ -1299,6 +1299,7 @@ impl BlockfrostCardanoChain {
         };
         let entry = crate::cardano::config_params::BatchContracts {
             batch_key: Some(batch.slot),
+            pegin_tree_inputs: snapshot.config.params.pegin_tree_inputs(),
             contracts,
             config_utxo: snapshot.config.utxo.to_string(),
         };
@@ -2207,6 +2208,17 @@ impl CardanoChain for BlockfrostCardanoChain {
             btc_confirmed,
         );
 
+        // #11, params[7] and params[8] as this batch pinned them. Boot copies are
+        // the fallback and nothing more: they are chain-published, must-match
+        // values hashed into an ADDRESS, so a node running on its startup copies
+        // after a governance move reconstructs a deposit address none of its peers
+        // reconstructs — and reports `0 eligible peg-ins`, not an error.
+        let pinned_tree_inputs = self
+            .contracts_cache
+            .lock()
+            .ok()
+            .and_then(|s| s.as_ref().map(|e| e.pegin_tree_inputs));
+
         Ok(TreasuryUtxo {
             outpoint,
             value,
@@ -2215,12 +2227,20 @@ impl CardanoChain for BlockfrostCardanoChain {
             // The PUBLISHED federation key, not the one the head happens to be locked
             // under: a depositor builds against what the Config names, so the peg-in tree
             // must too (`leaf_candidates[0]` above is this same value).
-            config_y_fed: self.treasury_config.y_fed,
+            config_y_fed: pinned_tree_inputs
+                .and_then(|i| bitcoin::key::UntweakedPublicKey::from_slice(&i.y_federation).ok())
+                .unwrap_or(self.treasury_config.y_fed),
             // With no treasury_info configured there is nothing that could have
             // rotated, so the head's own key stands in.
             authorized_key: authorized_key.unwrap_or(y_51),
-            federation_csv_blocks: csv,
-            pegin_refund_timeout_blocks: self.treasury_config.pegin_refund_timeout_blocks,
+            // The peg-in tree's copy, from the pin. The `csv` above stays as read:
+            // it derives the TREASURY tree, whose head was created under whatever
+            // was live then, and the candidate loop already handles that.
+            federation_csv_blocks: pinned_tree_inputs.map_or(csv, |i| i.federation_csv_blocks),
+            pegin_refund_timeout_blocks: pinned_tree_inputs
+                .map_or(self.treasury_config.pegin_refund_timeout_blocks, |i| {
+                    i.pegin_refund_timeout_blocks
+                }),
             // Every internal key this bridge is known to have published, minus the
             // two that are still live. Whatever is left is a key no movement signs
             // under any more, so a deposit found under one can only be reported.

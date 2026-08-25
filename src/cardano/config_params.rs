@@ -276,9 +276,27 @@ impl Contracts {
 #[derive(Debug, Clone)]
 pub struct BatchContracts {
     pub batch_key: Option<u64>,
+    /// The three tap-tweak inputs the peg-in address is built from besides the
+    /// internal key: #11 `y_federation`, `params[7]` and `params[8]`.
+    ///
+    /// They belong in the same pin as the contract identities because they are
+    /// the same kind of value — chain-published, must-match, and hashed into an
+    /// ADDRESS. A node that keeps its boot copies reconstructs a different
+    /// deposit address from every one of its peers the moment governance moves
+    /// one of them, and the symptom is `0 eligible peg-ins` rather than an error
+    /// ([CFG-9] publishes them for exactly this reason).
+    pub pegin_tree_inputs: PeginTreeInputs,
     pub contracts: BridgeContracts,
     /// Which Config UTxO it came from, for the log line when it moves.
     pub config_utxo: String,
+}
+
+/// The published inputs to the peg-in Taproot tree other than the internal key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeginTreeInputs {
+    pub y_federation: [u8; 32],
+    pub federation_csv_blocks: u16,
+    pub pegin_refund_timeout_blocks: u16,
 }
 
 /// A [`BatchContracts`] shared between the chain (which writes it, from the batch
@@ -401,6 +419,16 @@ pub struct ConfigParams {
 }
 
 impl ConfigParams {
+    /// The peg-in tree's published inputs, as of this Config read.
+    #[must_use]
+    pub fn pegin_tree_inputs(&self) -> PeginTreeInputs {
+        PeginTreeInputs {
+            y_federation: self.y_federation,
+            federation_csv_blocks: self.tunables.federation_csv_blocks,
+            pegin_refund_timeout_blocks: self.tunables.pegin_refund_timeout_blocks,
+        }
+    }
+
     /// Derive every bridge identifier from this Config datum (WI-070).
     ///
     /// `mainnet` decides only the bech32 network tag of the three derived

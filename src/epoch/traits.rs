@@ -274,19 +274,22 @@ impl TreasuryUtxo {
     ///
     /// Recognising them all costs one extra Taproot derivation per tree per request
     /// — and only that, because the tree-independent half of the parse is done once
-    /// (`pegin_datum::decode_pegin_request`). In the steady state, where the datum
-    /// and the head agree and nothing has been superseded, there is one tree and no
-    /// cost at all. What a node may DO with each match is
+    /// (`pegin_datum::decode_pegin_request`). Where the datum and the head agree and
+    /// nothing has been superseded there is exactly one tree; on a bridge that has
+    /// rotated even once there is one more per retired key it still recognises. What a node may DO with each match is
     /// [`PeginKeyOrigin::sweepable`]'s answer, not this one's.
     ///
-    /// KNOWN LIMIT: only the internal key varies. The other three tap-tweak inputs
-    /// — the published federation key, its CSV delay and the refund timeout — are
-    /// taken at their CURRENT values for every tree, including retired ones. All
-    /// three are chain-published and can be changed by governance or a federation
-    /// rotation, and when one is, deposits made before the change reconstruct under
-    /// none of these trees and fall back to being dropped. Covering that needs the
-    /// whole `(internal, leaf, csv, timeout)` tuple that was live at deposit time,
-    /// which this field cannot express.
+    /// KNOWN LIMIT: only the internal key varies across these trees. The other
+    /// three tap-tweak inputs — the published federation key, its CSV delay and the
+    /// refund timeout — are one value each, applied to every tree including the
+    /// retired ones. They are now the values the CURRENT BATCH pinned rather than
+    /// the ones this process booted with, so a governance move of `y_federation`,
+    /// `params[7]` or `params[8]` is followed from the next batch and every
+    /// co-signer follows it together. What is still not covered is HISTORY: a
+    /// deposit made before such a move reconstructs under none of these trees and
+    /// falls back to being dropped, because covering it needs the whole
+    /// `(internal, leaf, csv, timeout)` tuple that was live at deposit time and a
+    /// list of internal keys cannot express one.
     pub fn pegin_trees(
         &self,
     ) -> Result<Vec<(PeginKeyOrigin, crate::bitcoin::taproot::PeginTreeParams)>, String> {
