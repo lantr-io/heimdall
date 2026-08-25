@@ -119,6 +119,13 @@ pub enum ExclusionReason {
     BadUrl(String),
     /// `bifrost_url` (canonicalized) is shared with another registration.
     DuplicateUrl(String),
+    /// Registered, but holding no stake at this epoch's snapshot.
+    ///
+    /// Not a fault and not permanent — it is what every pool looks like for the
+    /// two epoch boundaries Cardano takes to activate a new registration. It is an
+    /// exclusion because a zero-weight member is not free: see
+    /// [`derive_dkg_context`].
+    NoStake,
 }
 
 impl std::fmt::Display for ExclusionReason {
@@ -127,6 +134,11 @@ impl std::fmt::Display for ExclusionReason {
             Self::Banned => write!(f, "banned"),
             Self::BadUrl(why) => write!(f, "bad bifrost_url: {why}"),
             Self::DuplicateUrl(url) => write!(f, "duplicate bifrost_url {url:?}"),
+            Self::NoStake => write!(
+                f,
+                "no stake at this epoch's snapshot (a registration activates two epoch \
+                 boundaries later)"
+            ),
         }
     }
 }
@@ -371,7 +383,53 @@ pub fn derive_dkg_context(
     epoch: u64,
     attempt: u32,
 ) -> Result<DkgContext, DkgRosterError> {
-    let (mut eligible, excluded) = filter_eligible(snapshot, active_bans);
+    let (mut eligible, mut excluded) = filter_eligible(snapshot, active_bans);
+
+    // Stake for every eligible pool. Read BEFORE the count check, because a pool
+    // holding none does not join the roster and so does not count toward it.
+    let mut stake_of: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    for e in &eligible {
+        let s = *stakes
+            .get(&e.pool_id)
+            .ok_or_else(|| DkgRosterError::MissingStake {
+                pool_id: e.pool_id.clone(),
+            })?;
+        stake_of.insert(e.pool_id.clone(), s);
+    }
+
+    // A REGISTERED POOL WITH NO STAKE DOES NOT JOIN THE ROSTER.
+    //
+    // Weighting it at zero is not the neutral choice it looks like. The threshold
+    // is the smallest `t` whose weakest `t` members exceed the security
+    // percentage, and a zero-stake member is the weakest there is — so each one
+    // raises `t` by one while holding a signing share and contributing no stake.
+    // Three honest pools sit at 2-of-3; add two zero-stake registrations and it is
+    // 4-of-5, where the honest three hold every lovelace of stake and still cannot
+    // reach the threshold. That is a VETO over treasury movements bought with no
+    // stake at all, and nothing detects it: the holder takes part in the ceremony,
+    // so it is never narrowed out, and then simply does not sign — which looks
+    // exactly like an offline node.
+    //
+    // The bar is "greater than zero" rather than a configurable floor on purpose.
+    // A floor is a must-match consensus value, and an operator-set one is the same
+    // class of divergence this codebase keeps closing; nobody can disagree about
+    // whether a number is zero. A floor above zero, if one is ever wanted, needs a
+    // chain-published home.
+    //
+    // This is not a fault and not permanent: it is what EVERY pool looks like for
+    // the two epoch boundaries Cardano takes to activate a registration, so it is
+    // an exclusion with a reason rather than an error.
+    eligible.retain(|e| {
+        let has_stake = stake_of.get(&e.pool_id).is_some_and(|s| *s > 0);
+        if !has_stake {
+            excluded.push(ExcludedSpo {
+                pool_id: e.pool_id.clone(),
+                reason: ExclusionReason::NoStake,
+            });
+        }
+        has_stake
+    });
+
     if eligible.len() < usize::from(FROST_MIN_PARTICIPANTS) {
         return Err(DkgRosterError::TooFew {
             got: eligible.len(),
@@ -379,22 +437,18 @@ pub fn derive_dkg_context(
     }
     let n = u16::try_from(eligible.len()).map_err(|_| DkgRosterError::TooMany(eligible.len()))?;
 
-    // Stake for every eligible pool, then the threshold over those stakes.
-    let mut stake_of: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-    let mut total: u64 = 0;
-    for e in &eligible {
-        let s = *stakes
-            .get(&e.pool_id)
-            .ok_or_else(|| DkgRosterError::MissingStake {
-                pool_id: e.pool_id.clone(),
-            })?;
-        total = total.saturating_add(s);
-        stake_of.insert(e.pool_id.clone(), s);
-    }
+    let total: u64 = eligible
+        .iter()
+        .map(|e| stake_of[&e.pool_id])
+        .fold(0u64, u64::saturating_add);
+    // Unreachable by construction now that every survivor carries stake, and kept
+    // as the guard that catches a future change to the retain above rather than
+    // letting a zero total reach `stake_weighted_threshold`, where it would make
+    // every member's share of the total infinite.
     if total == 0 {
         return Err(DkgRosterError::ZeroStake);
     }
-    let stake_vals: Vec<u64> = stake_of.values().copied().collect();
+    let stake_vals: Vec<u64> = eligible.iter().map(|e| stake_of[&e.pool_id]).collect();
     let threshold = stake_weighted_threshold(&stake_vals, total);
 
     // Order by bifrost_id_pk and assign identifiers 1..=n.
@@ -1302,27 +1356,81 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_zero_stake_is_fatal() {
+    fn a_stake_read_that_is_missing_is_fatal_and_one_that_is_zero_is_an_exclusion() {
         let snap = snapshot(vec![
             spo(0xAA, 0x11, "http://a.example:18500"),
             spo(0xBB, 0x22, "http://b.example:18500"),
         ]);
-        // BB's stake absent → MissingStake.
+        // BB's stake ABSENT → MissingStake. "I could not read it" is not "it is
+        // zero", and guessing either way changes who is in the roster.
         assert!(matches!(
             derive_dkg_context(&snap, &BTreeSet::new(), &stakes(&[(0xAA, 5)]), 0, 0),
             Err(DkgRosterError::MissingStake { .. })
         ));
-        // both zero → ZeroStake.
-        assert!(matches!(
-            derive_dkg_context(
-                &snap,
-                &BTreeSet::new(),
-                &stakes(&[(0xAA, 0), (0xBB, 0)]),
-                0,
-                0
-            ),
-            Err(DkgRosterError::ZeroStake)
-        ));
+        // Both read as ZERO → both excluded, and what is left is not a roster.
+        // TooFew rather than ZeroStake, which matters: TooFew is the error the
+        // chain layer maps to DkgAborted, so the node falls back to the Phase-1
+        // federation instead of failing hard — and "every pool registered this
+        // epoch" is exactly how a bridge is stood up.
+        let all_zero = derive_dkg_context(
+            &snap,
+            &BTreeSet::new(),
+            &stakes(&[(0xAA, 0), (0xBB, 0)]),
+            0,
+            0,
+        );
+        assert!(
+            matches!(all_zero, Err(DkgRosterError::TooFew { got: 0 })),
+            "{all_zero:?}"
+        );
+    }
+
+    /// A registered pool holding no stake must not join the roster, because a
+    /// zero-weight member is not free: it raises the threshold by one while
+    /// holding a share, which buys a veto over treasury movements with no stake.
+    #[test]
+    fn a_zero_stake_pool_neither_joins_the_roster_nor_raises_the_threshold() {
+        let snap = snapshot(vec![
+            spo(0xAA, 0x11, "http://a.example:18500"),
+            spo(0xBB, 0x22, "http://b.example:18500"),
+            spo(0xCC, 0x33, "http://c.example:18500"),
+            // Two registrations carrying nothing — the cheap half of the attack.
+            spo(0xDD, 0x44, "http://d.example:18500"),
+            spo(0xEE, 0x55, "http://e.example:18500"),
+        ]);
+        let ctx = derive_dkg_context(
+            &snap,
+            &BTreeSet::new(),
+            &stakes(&[(0xAA, 100), (0xBB, 100), (0xCC, 100), (0xDD, 0), (0xEE, 0)]),
+            0,
+            0,
+        )
+        .expect("three staked pools are a roster");
+
+        assert_eq!(ctx.participants.len(), 3, "only the staked pools take part");
+        assert!(
+            ctx.participants.iter().all(|p| p.active_stake > 0),
+            "no participant may carry zero stake"
+        );
+        // The threshold is the one the three staked pools alone produce. Without
+        // the exclusion it would be 4-of-5 here — unreachable by the honest three,
+        // who hold every lovelace.
+        assert_eq!(ctx.threshold, 2, "2-of-3, not 4-of-5");
+        assert_eq!(ctx.total_stake, 300);
+
+        // And they are reported, not silently dropped: an operator whose pool is
+        // waiting for activation must be able to see why it is not in the roster.
+        let no_stake: Vec<_> = ctx
+            .excluded
+            .iter()
+            .filter(|e| e.reason == ExclusionReason::NoStake)
+            .map(|e| e.pool_id.clone())
+            .collect();
+        assert_eq!(no_stake.len(), 2, "both are named");
+        assert!(
+            ExclusionReason::NoStake.to_string().contains("two epoch"),
+            "the reason says why, so it is not read as a fault"
+        );
     }
 
     #[test]

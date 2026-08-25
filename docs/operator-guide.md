@@ -568,39 +568,28 @@ Before you register, that step FAILS and the daemon refuses to start. That is ex
 misconfiguration: an unregistered node is in no roster and would contribute nothing, so it says so
 rather than running as an idle process that looks healthy. The check names the command.
 
-### Registering does not make your stake count — and it raises the threshold
+### Registering is not the same as joining the roster
 
 Cardano snapshots stake at an epoch boundary and **activates it two boundaries later**, so a pool
-registered today has `active_stake = 0` for about ten days. Epochs are five days on both preprod
-and mainnet, so the wait is the same on either.
+registered today holds no active stake for about ten days. Until it does, it is registered but
+**not in the DKG roster**, and `show-roster` lists it as excluded with the reason.
 
-Heimdall weights the DKG roster by `active_stake`, so during that window you are *in* the roster
-and weigh nothing. **That is not neutral.** The FROST threshold is the smallest `t` whose weakest
-`t` members still exceed the security percentage — and a zero-stake member is the weakest there
-is, so it raises `t` by one while contributing no signing weight:
+That is deliberate. A member holding no stake is not a neutral extra: the threshold is the
+smallest `t` whose weakest `t` members exceed the security percentage, so a zero-stake member
+would raise `t` by one while holding a signing share and carrying no stake. Three staked pools sit
+at 2-of-3; two zero-stake members would make it 4-of-5, where the three holding *every* lovelace
+of stake can no longer reach the threshold on their own. Influence has to cost stake, so a pool
+joins the roster when its stake activates and not before.
 
-| roster | threshold |
-|---|---|
-| 3 activated pools | 2 of 3 |
-| 3 activated + 1 registered today | 3 of 4 |
-| 3 activated + 2 registered today | 4 of 5 |
-| 3 activated + 3 registered today | 5 of 6 |
-
-That is the correct security answer — any `t` members really must hold a majority of stake — but
-its cost is liveness, and it lands on everyone. At 5-of-6 a single node being offline halts every
-treasury movement on the bridge, for two epoch boundaries, because other operators registered.
-
-So on a bridge with live operators, **do not register a batch of new pools at once** unless the
-roster can carry the higher threshold until their stake activates.
-
-Check where you stand — it prints the threshold and each pool's weight:
+Nothing is wrong during the wait. Check where you stand — excluded pools are listed with their
+reason:
 
 ```bash
 sudo -u heimdall heimdall show-roster --config /etc/heimdall/heimdall.toml
 ```
 
-If every pool in the roster is unactivated, there is no stake at all to weight and the node
-refuses to derive a roster rather than inventing one.
+If **every** pool is still unactivated there is no roster to form at all, and the node says so and
+falls back to the Phase-1 federation rather than inventing one.
 
 ### Not waiting, on a test bridge
 
@@ -624,7 +613,7 @@ each pool's weight, and therefore the FROST threshold. `live_stake` also drifts 
 delegation moves, which is exactly why the normal path uses the epoch snapshot — two SPOs reading
 it seconds apart can derive different thresholds and produce signatures that never aggregate.
 
-Three things make a mistake here visible rather than mysterious:
+Four things make a mistake here visible rather than mysterious:
 
 - Each node logs a `TEST RUN` warning at startup naming the flag.
 - Each node publishes **the threshold it derived** alongside its DKG payloads, and reports by pool
