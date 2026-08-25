@@ -2085,7 +2085,21 @@ async fn run_spo(
             heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
                 .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
         bf_chain = bf_chain.with_stake_source(stake_source);
-        bf_chain = bf_chain.with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked);
+        if cfg.cardano.demo_live_stake {
+            // Loud because it is a consensus setting, and because the failure it
+            // causes when only some of the roster has it does not name itself: the
+            // candidate set still agrees, so nothing looks wrong until a ceremony
+            // quietly fails to aggregate.
+            warn!(
+                "[stake] TEST RUN: the DKG roster is weighted by live_stake, not the epoch \
+                 snapshot (cardano.demo_live_stake). A pool registered this epoch counts \
+                 immediately instead of waiting two epoch boundaries — and live_stake drifts, \
+                 so EVERY node of this roster must set it too. It is refused on mainnet"
+            );
+        }
+        bf_chain = bf_chain
+            .with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked)
+            .with_demo_live_stake(cfg.cardano.demo_live_stake);
 
         // The bridge Config, read once at startup. It publishes the ban policy
         // (#8 and params[4..=6]), so a node needs no ban keys of its own — and an unreadable

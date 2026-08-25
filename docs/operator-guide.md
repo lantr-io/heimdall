@@ -568,6 +568,53 @@ Before you register, that step FAILS and the daemon refuses to start. That is ex
 misconfiguration: an unregistered node is in no roster and would contribute nothing, so it says so
 rather than running as an idle process that looks healthy. The check names the command.
 
+### You will not carry weight for two epoch boundaries
+
+Registering does not make your stake count. Cardano snapshots stake at an epoch boundary and
+**activates it two boundaries later** — so a pool registered today has `active_stake = 0` for
+roughly ten days on preprod, and five on mainnet-length epochs.
+
+Heimdall weights the DKG roster by `active_stake`, so during that window you are *in* the roster
+and weigh nothing. You take part in ceremonies, but your share carries no stake toward the
+threshold. Nothing is wrong; there is nothing to fix, and no command that shortens it.
+
+Check where you stand:
+
+```bash
+sudo -u heimdall heimdall show-roster --config /etc/heimdall/heimdall.toml
+```
+
+### Not waiting, on a test bridge
+
+If you are standing up a test bridge and cannot spend ten days waiting for the first real
+ceremony, weight the roster by `live_stake` — the delegation as it is right now — instead of the
+snapshot:
+
+```toml
+[cardano]
+demo_live_stake = true      # TEST BRIDGES ONLY
+```
+
+Your delegation then counts from the moment it lands.
+
+**Every node of the roster must set this identically.** It is not a display setting: it decides
+each pool's weight, and therefore the FROST threshold. `live_stake` also drifts continuously as
+delegation moves, which is exactly why the normal path uses the epoch snapshot — two SPOs reading
+it seconds apart can derive different thresholds and produce signatures that never aggregate.
+
+Three things make a mistake here visible rather than mysterious:
+
+- Each node logs a `TEST RUN` warning at startup naming the flag.
+- Each node publishes the setting alongside its DKG payloads. A peer configured differently is
+  reported by pool id at round 1, with the reason — because this mismatch does **not** show up as
+  a candidate-set disagreement. Both nodes see the same members; only the weights differ, so
+  without that line it would look like agreement right up until the ceremony failed to aggregate.
+- `network = "mainnet"` **refuses to start** with the flag set. It is not warned about, because a
+  warning in a journal is not something anyone reads before the first ceremony fails.
+
+Turn it off once your stake has activated. Leaving it on keeps a drifting value in a consensus
+decision for no benefit — after activation, `active_stake` is what you wanted all along.
+
 ---
 
 ## 7. Start it

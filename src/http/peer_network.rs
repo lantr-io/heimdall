@@ -140,6 +140,29 @@ impl HttpPeerNetwork {
                 return;
             }
         };
+        // A configuration disagreement, not a freshness one. The candidate SET is
+        // the same on both sides — so the digest matches and the reconcile below
+        // would call it agreement — while the weights, and therefore the FROST
+        // threshold, differ. That ceremony cannot aggregate, and no amount of
+        // re-reading the chain will settle it, so it must not enter the
+        // stale/fresher machinery: say what is wrong and which side to change.
+        if peer.live_stake != own.live_stake {
+            let (mine, theirs) = if own.live_stake {
+                ("live_stake (TEST RUN)", "the epoch snapshot")
+            } else {
+                ("the epoch snapshot", "live_stake (TEST RUN)")
+            };
+            error!(
+                "[chain-view] peer {} weights the DKG roster by {theirs} and this node by \
+                 {mine} — cardano.demo_live_stake does not match across the roster. The \
+                 candidate set agrees, so this will NOT show up as a view disagreement; it \
+                 shows up as a ceremony that never aggregates. Re-reading the chain cannot \
+                 fix it: set the flag the same way on every node",
+                hex::encode(peer_pool_id),
+            );
+            v.divergence_since.remove(peer_pool_id);
+            return;
+        }
         if peer.digest == own.digest {
             if v.divergence_since.remove(peer_pool_id).is_some() {
                 info!(
@@ -1005,12 +1028,14 @@ mod tests {
             digest: [0xA1; 32],
             n: 4,
             read_time_ms: 100,
+            live_stake: false,
         })
         .await;
         net2.set_chain_view(ChainView {
             digest: [0xB2; 32],
             n: 3,
             read_time_ms: 200,
+            live_stake: false,
         })
         .await;
 
@@ -1040,12 +1065,63 @@ mod tests {
             digest: [0xB2; 32],
             n: 3,
             read_time_ms: 300,
+            live_stake: false,
         })
         .await;
         assert!(
             !net1.is_view_stale().await,
             "set_chain_view resets the stale flag for the new attempt"
         );
+    }
+
+    /// A `demo_live_stake` mismatch must NOT be mistaken for agreement.
+    ///
+    /// It changes the roster's WEIGHTS, never its membership, so both nodes compute
+    /// the same candidate-set digest — the reconcile below would call that
+    /// "reconciled" — while their FROST thresholds differ and the ceremony cannot
+    /// aggregate. Nor is it a freshness problem: neither node is stale, and no
+    /// amount of re-reading the chain settles a configuration difference. So it
+    /// must not arm the stale flag or the divergence timer.
+    #[tokio::test]
+    async fn a_live_stake_mismatch_is_not_a_stale_view() {
+        let secp = Secp256k1::new();
+        let (kp1, pool1, pk1) = identity(&secp, 1);
+        let (kp2, pool2, pk2) = identity(&secp, 2);
+        let net1 = HttpPeerNetwork::new(Secp256k1::new(), kp1, pool1);
+        let net2 = HttpPeerNetwork::new(Secp256k1::new(), kp2, pool2);
+        let url1 = serve(&net1).await;
+        let url2 = serve(&net2).await;
+        let ns = DkgNamespace::new(11);
+
+        // SAME digest and n — the candidate set agrees, which is exactly what makes
+        // this dangerous. Only the weighting differs.
+        for (net, live) in [(&net1, true), (&net2, false)] {
+            net.set_chain_view(ChainView {
+                digest: [0xC3; 32],
+                n: 3,
+                read_time_ms: 500,
+                live_stake: live,
+            })
+            .await;
+        }
+
+        let (_s1, pkg1) = dkg::part1(id(1), 3, 2, OsRng).unwrap();
+        let (_s2, pkg2) = dkg::part1(id(2), 3, 2, OsRng).unwrap();
+        net1.publish_dkg_round1(ns, id(1), &pkg1).await.unwrap();
+        net2.publish_dkg_round1(ns, id(2), &pkg2).await.unwrap();
+
+        let peer1 = peer_info(1, &pool1, &url1, &pk1);
+        let peer2 = peer_info(2, &pool2, &url2, &pk2);
+        let _ = fetch_r1_retrying(&net1, ns, &peer2).await;
+        let _ = fetch_r1_retrying(&net2, ns, &peer1).await;
+
+        // Neither side is behind, so neither must be told to settle and re-read —
+        // that would loop forever against a difference the chain cannot resolve.
+        assert!(
+            !net1.is_view_stale().await,
+            "a configuration mismatch must not be reported as a stale chain read"
+        );
+        assert!(!net2.is_view_stale().await);
     }
 
     #[tokio::test]

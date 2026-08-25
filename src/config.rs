@@ -442,6 +442,24 @@ pub struct CardanoConfig {
     /// the real-stake pools while a legacy synthetic SPO sits in the registry.
     /// Default false — production must never silently drop a registered member.
     pub demo_exclude_unstaked: bool,
+    /// TEST-RUN ONLY. Weight the DKG roster by `live_stake` instead of the
+    /// epoch-snapshot `active_stake`.
+    ///
+    /// Cardano activates a newly registered pool's stake only two epoch
+    /// boundaries later, so on preprod a tester who registers an SPO weighs ZERO
+    /// for about ten days and cannot meaningfully take part in a ceremony. This
+    /// makes the delegation count from the moment it lands.
+    ///
+    /// It is a CONSENSUS input, and `cardano::stake`'s module doc explains why the
+    /// production path does not do this: `live_stake` drifts continuously, so two
+    /// SPOs reading seconds apart derive different weights, a different threshold
+    /// and a ceremony that never aggregates. Every node of the roster must
+    /// therefore set it identically. A mismatch is published in the DKG chain-view
+    /// and reported by name rather than left to look like a stalled ceremony, and
+    /// the flag is refused outright on mainnet.
+    ///
+    /// Default false. Never set it on a bridge holding real funds.
+    pub demo_live_stake: bool,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
     pub submit_oracle: bool,
@@ -523,6 +541,7 @@ impl Default for CardanoConfig {
             min_stake_lovelace: None,
             stake_source: None,
             demo_exclude_unstaked: false,
+            demo_live_stake: false,
             submit_oracle: true,
             tm_validity_window_secs: None,
             config_address: None,
@@ -928,8 +947,30 @@ impl HeimdallConfig {
         if !retired.is_empty() {
             return Err(ConfigError::RetiredKeys(retired));
         }
-        doc.try_into()
-            .map_err(|e| ConfigError::Parse(String::new(), e))
+        let cfg: Self = doc
+            .try_into()
+            .map_err(|e| ConfigError::Parse(String::new(), e))?;
+        cfg.refuse_test_flags_on_mainnet()?;
+        Ok(cfg)
+    }
+
+    /// Refuse a test-run flag on a network holding real funds.
+    ///
+    /// `cardano.demo_live_stake` weights the DKG roster by a value that drifts
+    /// intra-epoch. On a test bridge that is a deliberate trade for not waiting two
+    /// epoch boundaries; on mainnet it is a threshold no two SPOs agree on, so it
+    /// is refused at load rather than warned about — a warning in a unit's journal
+    /// is not something an operator reads before the first ceremony fails.
+    fn refuse_test_flags_on_mainnet(&self) -> Result<(), ConfigError> {
+        if self.cardano.demo_live_stake && self.cardano.is_mainnet().unwrap_or(false) {
+            return Err(ConfigError::TestFlagOnMainnet(
+                "cardano.demo_live_stake weights the DKG roster by live_stake, which drifts \
+                 intra-epoch — two SPOs reading moments apart derive different thresholds and \
+                 the ceremony cannot aggregate. It exists so a test SPO need not wait two epoch \
+                 boundaries for its stake to activate, and has no place on mainnet",
+            ));
+        }
+        Ok(())
     }
 
     /// Load this SPO's bifrost identity keypair from `[bifrost].skey_path`.
@@ -1043,6 +1084,8 @@ pub enum ConfigError {
     },
     /// The key file's contents are not a valid 32-byte secp256k1 secret.
     KeyParse(String),
+    /// A test-run flag is set on a network holding real funds.
+    TestFlagOnMainnet(&'static str),
     /// The document sets keys the bridge Config now publishes.
     RetiredKeys(Vec<RetiredKey>),
 }
@@ -1070,6 +1113,10 @@ impl std::fmt::Display for ConfigError {
                 "bifrost key file {path} has mode {mode:o}; must be 0600 (not group/other readable)"
             ),
             Self::KeyParse(s) => write!(f, "bifrost key: {s}"),
+            Self::TestFlagOnMainnet(why) => write!(
+                f,
+                "a test-run flag is set on mainnet, and is refused rather than warned about: {why}"
+            ),
             Self::RetiredKeys(keys) => {
                 writeln!(
                     f,
@@ -1196,6 +1243,34 @@ mod tests {
         // The same key name under another section is NOT this key.
         HeimdallConfig::from_toml_str("[cardano]\npegout_freshness_margin_ms = 1\n")
             .expect("a stray key in another section is not the retired one");
+    }
+
+    /// A test-run flag must not be expressible on a bridge holding real funds, and
+    /// must be refused at LOAD rather than warned about: a warning in a unit's
+    /// journal is not something anyone reads before the first ceremony fails.
+    #[test]
+    fn the_live_stake_test_flag_is_refused_on_mainnet_and_allowed_elsewhere() {
+        let toml = |network: &str| {
+            format!(
+                r#"
+[cardano]
+network = "{network}"
+blockfrost_url = "http://localhost:3000/api/v0"
+demo_live_stake = true
+"#
+            )
+        };
+        let err =
+            HeimdallConfig::from_toml_str(&toml("mainnet")).expect_err("mainnet must refuse it");
+        let msg = err.to_string();
+        assert!(msg.contains("demo_live_stake"), "{msg}");
+        assert!(msg.contains("drifts intra-epoch"), "names WHY: {msg}");
+
+        // Every other network is a test bridge as far as this flag is concerned.
+        for n in ["preprod", "preview", "testnet"] {
+            HeimdallConfig::from_toml_str(&toml(n))
+                .unwrap_or_else(|e| panic!("{n} must allow it: {e}"));
+        }
     }
 
     /// ...and a config that sets none of them still loads.
