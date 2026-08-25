@@ -3441,6 +3441,18 @@ async fn build_tm_phase(
     // what keeps the TM bytes identical — so a divergence here is the first place
     // an operator sees a chain-state disagreement. Without this the daemon drops
     // them silently, unlike the CLI sweep path.
+    // Should be zero here — `collect_pegins_phase` resolves this earlier, and with
+    // more to say. A non-zero count means the two disagree, which is worth a line
+    // of its own rather than a silently smaller input set.
+    if unsigned.duplicate_deposits_dropped > 0 {
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  {} peg-in input(s) dropped by the builder as duplicate deposits — collection \
+             should have caught these; the batch is still correct",
+            unsigned.duplicate_deposits_dropped
+        );
+    }
     for s in &unsigned.skipped_pegouts {
         crate::epoch_log!(
             me,

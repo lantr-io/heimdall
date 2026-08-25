@@ -7935,6 +7935,20 @@ fn run_sweep_pegins(
         unsigned.tx.input.len().saturating_sub(1),
     );
 
+    // This path parses against ONE tree and has no dedup of its own, so the
+    // builder's is the only thing standing between two requests naming one deposit
+    // and a transaction that spends an outpoint twice. Say so rather than let the
+    // count vanish: the extra PegInRequest is still on chain and will be offered
+    // again at every attempt until it is closed.
+    if unsigned.duplicate_deposits_dropped > 0 {
+        warn!(
+            "[sweep] {} peg-in request(s) named a deposit another input already spends — \
+             dropped. The movement is correct; the surplus request(s) need closing, or every \
+             later attempt hits this again",
+            unsigned.duplicate_deposits_dropped
+        );
+    }
+
     // Surface any peg-outs the TM dropped as unpayable (non-standard destination
     // or sub-dust after fee) so the operator sees them — the TM still pays the
     // rest rather than aborting.

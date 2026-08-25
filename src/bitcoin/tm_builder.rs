@@ -439,6 +439,15 @@ pub struct UnsignedTm {
     /// readable back out of the tx with [`committed_spi_root`] — the two agree
     /// by construction.
     pub spi_root: [u8; 32],
+    /// How many peg-in inputs were dropped because another input already spent the
+    /// same Bitcoin outpoint.
+    ///
+    /// Never silently: a caller that hands in two requests naming one deposit has
+    /// an extra PegInRequest on chain that will keep being offered, and the TM it
+    /// nearly built would have been `bad-txns-inputs-duplicate` — unrelayable and
+    /// rebuilt identically forever. Non-zero here means "that request needs
+    /// closing", not "this TM is wrong".
+    pub duplicate_deposits_dropped: usize,
 }
 
 /// A peg-out request excluded from a TM (see [`UnsignedTm::skipped_pegouts`]).
@@ -776,6 +785,28 @@ pub fn build_tm(
     // --- Sort peg-in inputs lexicographically by (txid || vout_le) ---
     pegins.sort_by(|a, b| outpoint_sort_key(&a.outpoint).cmp(&outpoint_sort_key(&b.outpoint)));
 
+    // --- One deposit is one input ---
+    // The peg-in counterpart of the `por_id` rule above, and it belongs here for
+    // the same reason: every caller must apply it or none does. A Bitcoin
+    // transaction that spends one outpoint twice is `bad-txns-inputs-duplicate` —
+    // never relayed, and rebuilt identically at every opportunity, so the bridge
+    // stops moving until the extra request is closed. Two PegInRequests can name
+    // one deposit whenever a second peg-in NFT is minted over the same raw
+    // transaction, which anyone can do at the permissionlessly payable address.
+    //
+    // Deduped AFTER the sort, never before: "keep the first" over caller order
+    // would make the TM bytes depend on whatever order a chain query returned,
+    // which is not a consensus input. After the sort the survivor is decided by the
+    // outpoint alone, so every co-signer keeps the same one.
+    //
+    // `collect_pegins_phase` also resolves this, earlier and with more to say about
+    // it (it can name the losing Cardano request and pick by FIFO order). This is
+    // the floor under every caller — the CLI mover included, which is what an
+    // operator reaches for precisely when the daemon is stuck.
+    let before = pegins.len();
+    pegins.dedup_by(|a, b| outpoint_sort_key(&a.outpoint) == outpoint_sort_key(&b.outpoint));
+    let dropped_duplicate_deposits = before - pegins.len();
+
     // --- Sort peg-out outputs by (script_pubkey, net amount, por_id) ---
     // Spec orders outputs by raw scriptPubKey; the net amount breaks ties. That
     // tiebreaker is load-bearing: with a spk-only comparator two requests sharing
@@ -959,6 +990,7 @@ pub fn build_tm(
         fulfilled,
         cpo_root,
         spi_root,
+        duplicate_deposits_dropped: dropped_duplicate_deposits,
     })
 }
 
@@ -1391,6 +1423,55 @@ mod tests {
             &empty_cpo(),
             &empty_spi(),
         )
+    }
+
+    /// One Bitcoin deposit is one input, whatever the caller hands in.
+    ///
+    /// Two PegInRequests can name one deposit — anyone can mint a second peg-in
+    /// NFT over the same raw transaction at the permissionlessly payable address —
+    /// and a transaction that spends one outpoint twice is
+    /// `bad-txns-inputs-duplicate`: never relayed, and rebuilt identically at every
+    /// opportunity, so the bridge stops moving until the surplus request is closed.
+    /// The guard lives here rather than in one caller because every caller has to
+    /// apply it: the daemon does its own, earlier and with more to say, but the CLI
+    /// mover is what an operator reaches for when the daemon is stuck.
+    #[test]
+    fn one_deposit_is_one_input_however_many_times_it_is_offered() {
+        let params = default_params();
+        let dup_outpoint = make_pegin_input(0xBB, 0, 500_000).outpoint;
+        let tm = build_tm_t(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![
+                make_pegin_input(0xBB, 0, 500_000),
+                make_pegin_input(0xCC, 0, 700_000),
+                make_pegin_input(0xBB, 0, 500_000),
+                // Same txid, DIFFERENT vout: a distinct UTxO, and it must survive.
+                make_pegin_input(0xBB, 1, 600_000),
+            ],
+            vec![],
+            change_address(),
+            &params,
+        )
+        .unwrap();
+
+        assert_eq!(tm.duplicate_deposits_dropped, 1, "and it is reported");
+        // input 0 is the treasury; three distinct deposits follow.
+        assert_eq!(tm.tx.input.len(), 4);
+        let mut seen = std::collections::BTreeSet::new();
+        for txin in &tm.tx.input {
+            assert!(
+                seen.insert(outpoint_sort_key(&txin.previous_output)),
+                "no outpoint may appear twice: {} would be bad-txns-inputs-duplicate",
+                txin.previous_output
+            );
+        }
+        assert!(
+            tm.tx
+                .input
+                .iter()
+                .any(|i| i.previous_output == dup_outpoint),
+            "the deposit is still swept, just once"
+        );
     }
 
     /// A payable peg-out with a valid P2TR-length destination (34 bytes:
