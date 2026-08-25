@@ -859,6 +859,15 @@ struct PegOutSource {
     fbtc_unit: String,
 }
 
+/// How many retired peg-in internal keys a node keeps recognising.
+///
+/// Every entry costs one full Taproot derivation per peg-in request scanned, and
+/// the peg-in address is permissionlessly payable, so the cost is paid on foreign
+/// deposits too. Eight epochs is ~40 days on Cardano — well past the published
+/// refund timeout of any deposit made under such a key, so what falls off the end
+/// is a deposit whose depositor can already take it back.
+const MAX_RECOGNISED_RETIRED_KEYS: usize = 8;
+
 impl BlockfrostCardanoChain {
     pub fn new(
         project_id: &str,
@@ -1061,7 +1070,7 @@ impl BlockfrostCardanoChain {
     /// scriptPubKey decides. A state dir that cannot be read must not turn a
     /// treasury query into a failure — it just leaves the caller with the
     /// candidates it had before.
-    fn persisted_internal_candidates(&self) -> Vec<bitcoin::key::UntweakedPublicKey> {
+    fn persisted_internal_candidates(&self) -> Vec<(u64, bitcoin::key::UntweakedPublicKey)> {
         let Some(dir) = self.state_dir.as_deref() else {
             return Vec::new();
         };
@@ -1070,12 +1079,13 @@ impl BlockfrostCardanoChain {
         };
         epochs
             .into_iter()
-            .filter_map(|e| crate::epoch::persist::read_dkg_state(dir, e).ok().flatten())
-            .filter_map(|state| state.to_group_keys().ok())
-            .filter_map(|keys| {
-                crate::frost::xonly::group_xonly(&keys.verifying_key)
+            .filter_map(|e| {
+                let state = crate::epoch::persist::read_dkg_state(dir, e)
                     .ok()
-                    .map(|g| g.xonly)
+                    .flatten()?;
+                let keys = state.to_group_keys().ok()?;
+                let g = crate::frost::xonly::group_xonly(&keys.verifying_key).ok()?;
+                Some((e, g.xonly))
             })
             .collect()
     }
@@ -2105,10 +2115,14 @@ impl CardanoChain for BlockfrostCardanoChain {
         // ceremonies this bridge has moved past, which is what lets peg-in
         // collection report a deposit that has stranded at a retired address.
         let persisted = self.persisted_internal_candidates();
+        // Which ceremonies can already have been superseded. A read failure means
+        // "cannot tell", and the safe answer there is to report nothing as retired
+        // rather than to guess a key unsweepable.
+        let now_epoch = self.current_epoch().await.unwrap_or(0);
         let mut internal_candidates = vec![maybe_key.unwrap_or(self.treasury_config.y_51)];
         for cand in authorized_key
             .into_iter()
-            .chain(persisted.iter().copied())
+            .chain(persisted.iter().map(|(_, k)| *k))
             .chain([self.treasury_config.y_fed])
         {
             if !internal_candidates.contains(&cand) {
@@ -2253,15 +2267,54 @@ impl CardanoChain for BlockfrostCardanoChain {
             // Phase 1 matched no tree after the handoff, and fell back to the "no
             // output pays the peg-in address" drop this exists to replace.
             retired_internal_keys: {
+                // A ceremony for THIS epoch or a later one is not retired, it is
+                // PENDING: write_dkg_state runs when the DKG completes locally,
+                // which is before PublishKeys posts the Update-Y, so between those
+                // two moments the incoming key is neither `y_51` nor the datum's.
+                // Calling it retired made the collection log say a deposit under it
+                // is unsweepable and recoverable only through the federation leaf —
+                // about a key that goes live minutes later, and an operator acting
+                // on that would emergency-sweep coins the bridge will happily take.
+                // Excluding it costs one transient generic drop that heals itself
+                // the moment the Update-Y lands.
                 let mut out: Vec<bitcoin::key::UntweakedPublicKey> = Vec::new();
-                for k in persisted
+                let mut pending = 0usize;
+                for (e, k) in persisted
                     .into_iter()
-                    .chain([self.treasury_config.y_fed])
-                    .filter(|k| *k != y_51 && Some(*k) != authorized_key)
+                    .map(|(e, k)| (Some(e), k))
+                    .chain([(None, self.treasury_config.y_fed)])
+                    .filter(|(_, k)| *k != y_51 && Some(*k) != authorized_key)
                 {
+                    if e.is_some_and(|e| e >= now_epoch) {
+                        pending += 1;
+                        continue;
+                    }
                     if !out.contains(&k) {
                         out.push(k);
                     }
+                }
+                if pending > 0 {
+                    debug!(
+                        "[treasury] {pending} persisted ceremony key(s) for epoch >= {now_epoch} \
+                         are not yet superseded — not reported as retired"
+                    );
+                }
+                // Newest first, then bounded. Unbounded, this grows one entry per
+                // epoch forever and every peg-in request pays a full Taproot
+                // derivation per entry — including the foreign deposits anyone can
+                // send to a permissionlessly payable address. A key older than the
+                // cap is long past its own refund timeout, so recognising it buys
+                // an operator nothing it can act on.
+                out.reverse();
+                if out.len() > MAX_RECOGNISED_RETIRED_KEYS {
+                    warn!(
+                        "[treasury] {} retired peg-in key(s) beyond the most recent {} are no \
+                         longer recognised; a deposit under one is past its own refund timeout \
+                         and reads as another bridge's",
+                        out.len() - MAX_RECOGNISED_RETIRED_KEYS,
+                        MAX_RECOGNISED_RETIRED_KEYS
+                    );
+                    out.truncate(MAX_RECOGNISED_RETIRED_KEYS);
                 }
                 out
             },
@@ -3156,7 +3209,14 @@ mod tests {
         }
         expected.reverse(); // newest epoch first
 
-        assert_eq!(chain.persisted_internal_candidates(), expected);
+        assert_eq!(
+            chain
+                .persisted_internal_candidates()
+                .into_iter()
+                .map(|(_, k)| k)
+                .collect::<Vec<_>>(),
+            expected
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
