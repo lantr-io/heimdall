@@ -2363,6 +2363,23 @@ fn hop_to_opportunity(
     std::time::Duration::from_secs(next_slot.saturating_sub(now_slot).max(1)).min(ceiling)
 }
 
+/// A peg-in request's place in the batch's total order.
+///
+/// The CARDANO outpoint, not the Bitcoin one: this orders REQUESTS, and the
+/// request is the Cardano UTxO. (The TM's input order is a separate, Bitcoin-side
+/// rule — lexicographic by `txid ‖ vout` — and is unaffected by this.)
+///
+/// An unresolved `created_slot` sorts LAST, which is the same `u64::MAX` the
+/// freeze uses: a request whose creation slot could not be read cannot be shown
+/// to be eligible, so it must never displace one that can.
+fn pegin_fifo_key(p: &ParsedPegIn) -> crate::epoch::batch::FifoKey {
+    crate::epoch::batch::FifoKey {
+        created_slot: p.created_slot.unwrap_or(u64::MAX),
+        tx_hash: p.cardano_utxo.tx_hash,
+        output_index: p.cardano_utxo.output_index,
+    }
+}
+
 /// Wait for this epoch's next batch opportunity, then read the Cardano peg-in
 /// source ONCE and freeze what it holds, parsing each request against the
 /// spec-derived peg-in Taproot for the current Y_51 internal key, the Y_fed
@@ -2470,7 +2487,10 @@ async fn collect_pegins_phase(
     // two copies carry the SAME value (this movement's input 0, [SPI-3]), which
     // `insert_entry` accepts as a replay. `build_tm` guards the peg-OUT side of
     // this on `por_id`; this is the peg-in side of the same rule.
-    let mut accepted_deposits: BTreeSet<[u8; 36]> = BTreeSet::new();
+    // deposit outpoint -> (that request's FIFO key, its Cardano outpoint). The key
+    // is what decides a collision; the outpoint is how the loser is un-accepted.
+    let mut accepted_deposits: BTreeMap<[u8; 36], (crate::epoch::batch::FifoKey, CardanoOutRef)> =
+        BTreeMap::new();
     let mut skipped_swept = 0usize;
     let mut deferred = 0usize;
     let mut stranded = 0usize;
@@ -2562,18 +2582,44 @@ async fn collect_pegins_phase(
                     }
                     continue;
                 }
-                if !accepted_deposits.insert(deposit) {
+                // Two requests naming one deposit: keep the FIFO-lowest, not the
+                // one that happened to arrive first. Both sources return requests
+                // ascending by Cardano outpoint, so "first wins" handed the deposit
+                // to whichever request had the smaller txid — which is grindable
+                // offline. Anyone could mint a peg-in NFT at a low txid carrying
+                // someone else's deposit tx, evict the real request here, and then
+                // be dropped by `freeze_pegins` as created after the cutoff: the
+                // deposit lands in NO batch, and repeating it once per
+                // `tm_batch_interval` censors that depositor indefinitely.
+                //
+                // The FIFO key is already the batch's own total order, and its
+                // leading term is `created_slot`, so the earliest-created request
+                // wins — which is also the one most likely to be eligible, since
+                // eligibility IS `created_slot <= C_i`. An unresolved slot sorts
+                // last for the same reason `freeze_pegins` maps it to `u64::MAX`.
+                let key = pegin_fifo_key(&parsed);
+                let (deposit_txid, deposit_vout) = (parsed.btc_txid, parsed.btc_vout);
+                if let Some((prev_key, prev_utxo)) = accepted_deposits.get(&deposit).cloned() {
+                    let (loser, winner) = if key < prev_key {
+                        accepted.remove(&prev_utxo);
+                        accepted_deposits.insert(deposit, (key, req.cardano_utxo.clone()));
+                        accepted.insert(req.cardano_utxo.clone(), parsed);
+                        (prev_utxo, req.cardano_utxo.clone())
+                    } else {
+                        (req.cardano_utxo.clone(), prev_utxo)
+                    };
                     crate::epoch_warn!(
                         me,
                         epoch,
-                        "  dropped peg-in {:?}: deposit {}:{} is already claimed by another \
-                         request in this batch — a movement cannot spend one outpoint twice",
-                        req.cardano_utxo,
-                        parsed.btc_txid,
-                        parsed.btc_vout
+                        "  dropped peg-in {loser:?}: deposit {}:{} is also claimed by {winner:?}, \
+                         which is earlier in the batch's FIFO order — a movement cannot spend one \
+                         outpoint twice, and the earlier request is the one that can be eligible",
+                        deposit_txid,
+                        deposit_vout
                     );
                     continue;
                 }
+                accepted_deposits.insert(deposit, (key, req.cardano_utxo.clone()));
                 accepted.insert(req.cardano_utxo.clone(), parsed);
             }
             Err(e) => {
@@ -2739,16 +2785,11 @@ fn freeze_pegins(
         )));
     }
 
-    // The CARDANO outpoint, not the Bitcoin one: this orders REQUESTS, and the
-    // request is the Cardano UTxO. (The TM's input order is a separate, Bitcoin-
-    // side rule — lexicographic by (txid ‖ vout) — and is unaffected by this.)
-    let key = |p: &ParsedPegIn| FifoKey {
-        // Every entry is resolved by the refusal above, so the fallback is
-        // unreachable rather than a policy.
-        created_slot: p.created_slot.unwrap_or(u64::MAX),
-        tx_hash: p.cardano_utxo.tx_hash,
-        output_index: p.cardano_utxo.output_index,
-    };
+    // Every entry is resolved by the refusal above, so `pegin_fifo_key`'s
+    // unresolved fallback is unreachable here rather than a policy. Shared with
+    // the collection-time dedup so a request cannot rank one way there and another
+    // way here.
+    let key: fn(&ParsedPegIn) -> FifoKey = pegin_fifo_key;
 
     let Some(batch) = batch else {
         // No grid: order only. A mock chain, or a deployment whose Config carries
@@ -5379,6 +5420,90 @@ mod tests {
             frozen_pegins.len(),
             1,
             "one deposit is one input however many requests name it"
+        );
+        // AND it is the ORIGINAL that survives, not whichever Cardano outpoint
+        // sorts first. Both sources return requests ascending by outpoint, so
+        // "first wins" would hand the deposit to the lower txid — which anyone can
+        // grind offline. The survivor must be decided by the batch's own FIFO
+        // order, whose leading term is `created_slot`.
+        assert_eq!(
+            frozen_pegins[0].cardano_utxo.tx_hash, original.cardano_utxo.tx_hash,
+            "the earlier-created request keeps the deposit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A duplicate request cannot CENSOR a deposit by sorting ahead of the real
+    /// one and then being dropped by the cutoff.
+    ///
+    /// The attack the FIFO rule closes: mint a peg-in NFT whose Cardano txid is
+    /// below the honest request's (grindable offline), point it at someone else's
+    /// deposit, and post it after the batch cutoff. Under "first insert wins" the
+    /// impostor took the deposit at collection and `freeze_pegins` then discarded
+    /// it as too new — so the deposit joined NO batch, and repeating it once per
+    /// `tm_batch_interval` withholds that depositor's funds indefinitely.
+    #[tokio::test]
+    async fn a_later_duplicate_cannot_evict_the_request_that_is_in_the_batch() {
+        use crate::cardano::pegin_datum::testkit;
+
+        let (roster, keys) = group_for(0xf9, 2, 3);
+        let (_, fed) = group_for(0xfa, 2, 3);
+        let y = xonly_of(&keys);
+        let mut fixture = demo_static_fixture(2, 2, 19_610);
+        fixture.y_51 = y;
+        fixture.y_fed = y;
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(y)
+                .with_config_y_fed(xonly_of(&fed))
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y, [0x5a; 32]))
+                .with_batch(slot(1)),
+        );
+        let config = fast_config(*keys.key_package.identifier());
+        let dir = config
+            .state_dir
+            .clone()
+            .expect("fast_config gives a state dir");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let tree = chain
+            .query_treasury()
+            .await
+            .expect("the mock treasury reads")
+            .pegin_tree()
+            .expect("valid");
+        let depositor = testkit::xonly_from_seed([0xd5; 32]).serialize();
+        let mut honest =
+            testkit::pegin_request(&tree, depositor, bitcoin::Amount::from_sat(400_000), 0x61);
+        // The honest request is old enough for the batch...
+        honest.cardano_utxo.tx_hash = [0xee; 32];
+        honest.created_slot = Some(1);
+        // ...and the impostor grinds a LOWER txid, but is created far too late.
+        let mut impostor = honest.clone();
+        impostor.cardano_utxo.tx_hash = [0x00; 32];
+        impostor.created_slot = Some(u64::MAX / 2);
+        assert!(impostor.cardano_utxo.tx_hash < honest.cardano_utxo.tx_hash);
+
+        let source = MockCardanoPegInSource::new();
+        source.push(std::time::Instant::now(), impostor);
+        source.push(std::time::Instant::now(), honest.clone());
+        let pegin: Arc<dyn CardanoPegInSource> = Arc::new(source);
+
+        let mut built = BuiltBatch::default();
+        let next = collect_pegins_phase(&chain, &pegin, &config, 9, roster, keys, &mut built)
+            .await
+            .expect("collection survives the duplicate");
+        let EpochPhase::BuildTm { frozen_pegins, .. } = next else {
+            panic!("expected BuildTm, got {}", next.name());
+        };
+        assert_eq!(
+            frozen_pegins.len(),
+            1,
+            "the deposit is still in the batch — the late duplicate did not take it out"
+        );
+        assert_eq!(
+            frozen_pegins[0].cardano_utxo.tx_hash, honest.cardano_utxo.tx_hash,
+            "and it is the honest request that carries it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
