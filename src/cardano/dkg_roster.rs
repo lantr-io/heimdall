@@ -178,6 +178,15 @@ pub struct DkgContext {
     /// unchanged by `reduced_to` (a rerun uses the same read). `0` on the
     /// mock/fixture path, which has no chain.
     pub read_time_ms: i64,
+    /// TEST-RUN ONLY: this context weighted the roster by `live_stake` rather than
+    /// the epoch snapshot ([`crate::config::CardanoConfig::demo_live_stake`]).
+    ///
+    /// Carried here so it reaches the published [`ChainView`]. It does NOT change
+    /// the candidate set, only the weights — so the view digest matches between a
+    /// node running it and one not, while their thresholds differ. Without a field
+    /// of its own the mismatch would read as "reconciled" on a ceremony that cannot
+    /// converge.
+    pub live_stake: bool,
 }
 
 /// A node's view of the on-chain candidate set. Published UNSIGNED alongside
@@ -208,6 +217,29 @@ pub struct ChainView {
     /// lives. Chain-derived (a block time), never a local clock, so it is
     /// comparable across nodes.
     pub read_time_ms: i64,
+    /// The FROST threshold this publisher derived — the size its Round-1
+    /// commitment vector is built to.
+    ///
+    /// This is the DETECTOR for weight disagreements. The digest covers the
+    /// candidate SET, and every way two nodes can disagree about WEIGHTS leaves
+    /// that set identical: a `demo_live_stake` mismatch, a `stake_source` or
+    /// `demo_exclude_unstaked` difference, and — with `demo_live_stake` correctly
+    /// set on BOTH — plain `live_stake` drift between two reads seconds apart. All
+    /// of them give matching digests and different `t`: a ceremony that cannot
+    /// aggregate while the reconcile reports agreement. Publishing `t` catches the
+    /// lot without a flag per cause.
+    ///
+    /// Unlike a digest disagreement none of these is a freshness problem, and no
+    /// amount of re-reading settles them, so they must not enter the
+    /// stale/fresher machinery.
+    ///
+    /// `0` means a publisher that does not report it (an older build) and is never
+    /// compared.
+    pub threshold: u16,
+    /// Whether the publisher weighted by `live_stake` (test runs) or by the epoch
+    /// snapshot. NOT the detector — `threshold` is — but it turns "our thresholds
+    /// differ" into a named cause when it is the cause.
+    pub live_stake: bool,
 }
 
 impl DkgContext {
@@ -222,6 +254,8 @@ impl DkgContext {
             digest: crate::cardano::hash::blake2b_256(&buf),
             n: u16::try_from(self.participants.len()).unwrap_or(u16::MAX),
             read_time_ms: self.read_time_ms,
+            threshold: self.threshold,
+            live_stake: self.live_stake,
         }
     }
 }
@@ -392,6 +426,9 @@ pub fn derive_dkg_context(
         // fetches the boundary time); the pure derivation leaves it unset.
         schedule_anchor_ms: None,
         read_time_ms: 0,
+        // Both of these belong to the fetch, not to the derivation: this function
+        // is handed stakes and does not know where they came from.
+        live_stake: false,
     })
 }
 
@@ -522,6 +559,8 @@ impl DkgContext {
             attempt: self.attempt,
             threshold: self.threshold,
             total_stake: total,
+            // A narrowing keeps the node's own weighting: it is the same read.
+            live_stake: self.live_stake,
             participants: kept,
             excluded: self.excluded.clone(),
             schedule_anchor_ms: self.schedule_anchor_ms,
@@ -576,6 +615,7 @@ impl DkgContext {
             attempt,
             threshold,
             total_stake: total,
+            live_stake: self.live_stake,
             participants: kept,
             // Carry the prior exclusions forward for diagnostics; the dropped
             // survivors (this attempt's absent/faulty peers) are tracked as
@@ -620,6 +660,9 @@ impl DkgContext {
             attempt,
             threshold: roster.min_signers,
             total_stake,
+            // No chain stake is read on this path, so there is no snapshot to be
+            // ahead of and nothing for the flag to change.
+            live_stake: false,
             participants,
             excluded: vec![],
             // Mock / no-registry fallback has no chain schedule → relative
@@ -698,7 +741,24 @@ pub async fn fetch_eligible_stakes(
     // (omitted from the map) instead of failing the whole fetch. The caller
     // then excludes those pools from the roster. Default false in production.
     exclude_unstaked: bool,
+    // TEST-RUN ONLY: weight by `live_stake` rather than the epoch snapshot, so a
+    // pool registered this epoch counts immediately instead of weighing zero for
+    // two epoch boundaries. See `cardano::stake`'s module doc for why production
+    // does not: live_stake drifts intra-epoch, so this is only safe when every
+    // node of the roster sets it the same way.
+    live_stake: bool,
 ) -> Result<BTreeMap<Vec<u8>, u64>, String> {
+    // yaci-store publishes no `live_stake` — `fetch_pool_stake_yaci` mirrors
+    // `active_stake` into it — so the flag cannot do anything there. Say so rather
+    // than let an operator follow the guide's "your delegation counts from the
+    // moment it lands" onto a devnet where it silently does not.
+    if live_stake && matches!(source, StakeSource::YaciStore) {
+        warn!(
+            "[stake] cardano.demo_live_stake has NO EFFECT with stake_source = \"yaci_store\": \
+             that backend reports no live_stake and mirrors active_stake, so an unactivated \
+             pool still weighs zero. Nothing here can shorten the wait on a yaci devnet"
+        );
+    }
     let mut stakes = BTreeMap::new();
     for pool_id in pool_ids {
         let arr: [u8; 28] = pool_id
@@ -708,7 +768,12 @@ pub async fn fetch_eligible_stakes(
         match fetch_pool_stake_src(source, base_url, project_id, epoch, &pool_id_bech32(&arr)).await
         {
             Ok(stake) => {
-                stakes.insert(pool_id.clone(), stake.active_stake);
+                let weight = if live_stake {
+                    stake.live_stake
+                } else {
+                    stake.active_stake
+                };
+                stakes.insert(pool_id.clone(), weight);
             }
             Err(e) if exclude_unstaked => {
                 warn!(
@@ -737,6 +802,9 @@ pub async fn fetch_dkg_context(
     // DEMO-ONLY: exclude eligible pools whose stake can't be resolved instead of
     // failing the whole roster (`MissingStake`). Default false in production.
     exclude_unstaked: bool,
+    // TEST-RUN ONLY: see `fetch_pool_stakes`. Carried into the DkgContext so it
+    // reaches the published chain-view, where a roster-wide mismatch is named.
+    live_stake: bool,
 ) -> Result<DkgContext, DkgFetchError> {
     // The registry snapshot and the epoch-boundary time are independent — fetch
     // them concurrently. Ban activity is checked at that boundary time
@@ -783,6 +851,7 @@ pub async fn fetch_dkg_context(
         stake_source,
         epoch,
         exclude_unstaked,
+        live_stake,
     )
     .await
     .map_err(DkgFetchError::Stake)?;
@@ -802,6 +871,7 @@ pub async fn fetch_dkg_context(
     // Anchor the ceremony's round deadlines to the chain epoch boundary (WI-014
     // #6), so every node freezes L1/Q at the same chain-time instant.
     ctx.schedule_anchor_ms = Some(epoch_start_ms);
+    ctx.live_stake = live_stake;
     // Freshness stamp for the published ChainView: the chain time this view was
     // read at. A node that read the chain later saw more of it, so on a
     // candidate-set disagreement the OLDER read_time_ms marks the stale node.
@@ -956,6 +1026,7 @@ mod tests {
             attempt: 0,
             threshold,
             total_stake: total,
+            live_stake: false,
             participants,
             excluded: vec![],
             schedule_anchor_ms: None,

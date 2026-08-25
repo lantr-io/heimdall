@@ -606,6 +606,11 @@ pub struct BlockfrostCardanoChain {
     /// resolved are excluded from the roster instead of failing the whole
     /// stake-weighted derivation. Default false.
     demo_exclude_unstaked: bool,
+    /// TEST-RUN ONLY: weight the DKG roster by `live_stake`. See
+    /// [`crate::config::CardanoConfig::demo_live_stake`] — it is a consensus
+    /// input, so every node of the roster must agree, and a mismatch is published
+    /// in the chain-view rather than left to look like a stalled ceremony.
+    demo_live_stake: bool,
     /// Mnemonic-derived payment key for the Cardano wallet that pays
     /// fees. `None` means publishing is disabled (dry run).
     payment_key: Option<PrivateKey>,
@@ -900,6 +905,7 @@ impl BlockfrostCardanoChain {
             federation_refresh: None,
             stake_source: crate::cardano::stake::StakeSource::Blockfrost,
             demo_exclude_unstaked: false,
+            demo_live_stake: false,
             payment_key: None,
             wallet_base_address: None,
             treasury_y_51: Mutex::new(None),
@@ -1468,6 +1474,14 @@ impl BlockfrostCardanoChain {
         self
     }
 
+    /// TEST-RUN ONLY: weight the DKG roster by `live_stake` rather than the epoch
+    /// snapshot (see [`crate::config::CardanoConfig::demo_live_stake`]).
+    #[must_use]
+    pub fn with_demo_live_stake(mut self, v: bool) -> Self {
+        self.demo_live_stake = v;
+        self
+    }
+
     /// DEMO-ONLY: exclude eligible pools whose Cardano stake can't be resolved
     /// from the roster (instead of failing the stake-weighted derivation).
     pub fn with_demo_exclude_unstaked(mut self, v: bool) -> Self {
@@ -1889,6 +1903,14 @@ fn eligible_roster_error(
         let too_few = match &e {
             DkgFetchError::Registry(RosterError::TooFew { got })
             | DkgFetchError::Derive(DkgRosterError::TooFew { got }) => Some(*got),
+            // The whole roster is registered but none of its stake has activated
+            // yet — the state a bridge is in for two epoch boundaries after every
+            // SPO registers in one epoch, which is exactly how a test bridge is
+            // stood up. There is no threshold to derive, but that is a bridge with
+            // no usable roster, not a fault: it belongs with "not enough", so the
+            // caller falls back to the Phase-1 federation instead of panicking on
+            // a node whose own preflight passed (preflight reads no pool stake).
+            DkgFetchError::Derive(DkgRosterError::ZeroStake) => Some(0),
             _ => None,
         };
         match too_few {
@@ -1963,6 +1985,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             epoch,
             0,
             self.demo_exclude_unstaked,
+            self.demo_live_stake,
         )
         .await
         .map_err(eligible_roster_error(epoch, 0))?;
@@ -1991,6 +2014,7 @@ impl CardanoChain for BlockfrostCardanoChain {
                 epoch,
                 attempt,
                 self.demo_exclude_unstaked,
+                self.demo_live_stake,
             )
             .await
             .map_err(eligible_roster_error(epoch, attempt)),

@@ -2085,7 +2085,21 @@ async fn run_spo(
             heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
                 .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
         bf_chain = bf_chain.with_stake_source(stake_source);
-        bf_chain = bf_chain.with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked);
+        if cfg.cardano.demo_live_stake {
+            // Loud because it is a consensus setting, and because the failure it
+            // causes when only some of the roster has it does not name itself: the
+            // candidate set still agrees, so nothing looks wrong until a ceremony
+            // quietly fails to aggregate.
+            warn!(
+                "[stake] TEST RUN: the DKG roster is weighted by live_stake, not the epoch \
+                 snapshot (cardano.demo_live_stake). A pool registered this epoch counts \
+                 immediately instead of waiting two epoch boundaries — and live_stake drifts, \
+                 so EVERY node of this roster must set it too. It is refused on mainnet"
+            );
+        }
+        bf_chain = bf_chain
+            .with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked)
+            .with_demo_live_stake(cfg.cardano.demo_live_stake);
 
         // The bridge Config, read once at startup. It publishes the ban policy
         // (#8 and params[4..=6]), so a node needs no ban keys of its own — and an unreadable
@@ -5661,7 +5675,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         registration_message, verify_registration,
     };
     use heimdall::cardano::registry::REGISTRATION_ROOT_KEY;
-    use heimdall::cardano::stake::{StakeSource, check_min_stake, fetch_pool_stake_src};
+    use heimdall::cardano::stake::{StakeSource, check_min_stake_with, fetch_pool_stake_src};
     use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
     use pallas_crypto::key::ed25519;
 
@@ -5852,9 +5866,14 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
                     &pool_id_bech32(&pool_id),
                 ))
                 .map_err(|e| format!("min-stake gate: {e}"))?;
-            let chk = check_min_stake(&stake, threshold);
+            // Keyed on whatever the roster will key on: refusing to submit a
+            // registration the DKG is about to weight normally is the one failure
+            // this gate must not produce.
+            let live = cfg.cardano.demo_live_stake;
+            let chk = check_min_stake_with(&stake, threshold, live);
             println!(
-                "min-stake gate:    active_stake={} threshold={} → {}",
+                "min-stake gate:    {}={} threshold={} → {}",
+                if live { "live_stake" } else { "active_stake" },
                 chk.active_stake,
                 chk.threshold,
                 if chk.meets { "PASS" } else { "FAIL" }
@@ -6753,6 +6772,13 @@ fn run_show_roster(
         heimdall::cardano::stake::StakeSource::from_config(cfg.cardano.stake_source.as_deref())
             .unwrap_or_else(|e| panic!("cardano.stake_source: {e}"));
     let exclude_unstaked = cfg.cardano.demo_exclude_unstaked;
+    // The same weighting the daemon uses. `show-roster` is the command the guide
+    // sends an operator to when they want to know where they stand, so it must not
+    // answer from a different rule than the node they are asking about.
+    let live_stake = cfg.cardano.demo_live_stake;
+    if live_stake {
+        println!("(TEST RUN: weighted by live_stake, not the epoch snapshot)");
+    }
     match rt.block_on(fetch_eligible_stakes(
         &base_url,
         pid,
@@ -6760,6 +6786,7 @@ fn run_show_roster(
         stake_source,
         epoch,
         exclude_unstaked,
+        live_stake,
     )) {
         Ok(stakes) => {
             // DEMO-ONLY: drop pools whose stake was skipped (mirrors the demo

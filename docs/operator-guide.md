@@ -568,6 +568,96 @@ Before you register, that step FAILS and the daemon refuses to start. That is ex
 misconfiguration: an unregistered node is in no roster and would contribute nothing, so it says so
 rather than running as an idle process that looks healthy. The check names the command.
 
+### Registering does not make your stake count — and it raises the threshold
+
+Cardano snapshots stake at an epoch boundary and **activates it two boundaries later**, so a pool
+registered today has `active_stake = 0` for about ten days. Epochs are five days on both preprod
+and mainnet, so the wait is the same on either.
+
+Heimdall weights the DKG roster by `active_stake`, so during that window you are *in* the roster
+and weigh nothing. **That is not neutral.** The FROST threshold is the smallest `t` whose weakest
+`t` members still exceed the security percentage — and a zero-stake member is the weakest there
+is, so it raises `t` by one while contributing no signing weight:
+
+| roster | threshold |
+|---|---|
+| 3 activated pools | 2 of 3 |
+| 3 activated + 1 registered today | 3 of 4 |
+| 3 activated + 2 registered today | 4 of 5 |
+| 3 activated + 3 registered today | 5 of 6 |
+
+That is the correct security answer — any `t` members really must hold a majority of stake — but
+its cost is liveness, and it lands on everyone. At 5-of-6 a single node being offline halts every
+treasury movement on the bridge, for two epoch boundaries, because other operators registered.
+
+So on a bridge with live operators, **do not register a batch of new pools at once** unless the
+roster can carry the higher threshold until their stake activates.
+
+Check where you stand — it prints the threshold and each pool's weight:
+
+```bash
+sudo -u heimdall heimdall show-roster --config /etc/heimdall/heimdall.toml
+```
+
+If every pool in the roster is unactivated, there is no stake at all to weight and the node
+refuses to derive a roster rather than inventing one.
+
+### Not waiting, on a test bridge
+
+If you are standing up a test bridge, this is not a delay to sit through: with every pool
+registered in the same epoch there is no usable roster at all until stake activates. Weight the
+roster by `live_stake` — the delegation as it is right now — instead of the snapshot:
+
+```toml
+[cardano]
+demo_live_stake = true      # TEST BRIDGES ONLY
+```
+
+Your delegation then counts from the moment it lands.
+
+This needs a backend that reports it. A **yaci-devkit devnet** (`stake_source = "yaci_store"`)
+publishes no `live_stake`, so the flag does nothing there and the node says so at startup — on a
+devnet there is no shortening the wait.
+
+**Every node of the roster must set this identically.** It is not a display setting: it decides
+each pool's weight, and therefore the FROST threshold. `live_stake` also drifts continuously as
+delegation moves, which is exactly why the normal path uses the epoch snapshot — two SPOs reading
+it seconds apart can derive different thresholds and produce signatures that never aggregate.
+
+Three things make a mistake here visible rather than mysterious:
+
+- Each node logs a `TEST RUN` warning at startup naming the flag.
+- Each node publishes **the threshold it derived** alongside its DKG payloads, and reports by pool
+  id any peer whose threshold differs — naming the flag when that is the cause. This matters
+  because a weight disagreement does **not** show up as a candidate-set disagreement: both nodes
+  see the same members, so without that line it looks like agreement right up until the ceremony
+  fails to aggregate. The same check catches a `stake_source` or `demo_exclude_unstaked`
+  difference, and drift between two correctly-configured nodes.
+- `network = "mainnet"` **refuses to start** with the flag set. It is not warned about, because a
+  warning in a journal is not something anyone reads before the first ceremony fails. A network
+  heimdall cannot resolve — an unknown spelling, or one that disagrees with your
+  `config_address` — is treated as mainnet, so the guard cannot be slipped by a capital letter.
+- `heimdall doctor` and `run-spo --check` report it, so it cannot hide behind "all checks passed".
+
+There is one thing none of that catches: two nodes that both set the flag **correctly** can still
+derive different thresholds, because `live_stake` moves between their two reads. They will see
+each other's thresholds disagree and say so — the ceremony is retried at the next attempt — but
+it is the reason this is a test-bridge setting and not a way to run a bridge.
+
+### Turning it off again
+
+Once stake has activated, `active_stake` is what you wanted all along, and leaving the flag on
+keeps a drifting value in a consensus decision for no benefit.
+
+**Do not turn it off one node at a time.** It is the same roster-wide value going the other way:
+a node that switches mid-epoch re-derives a different threshold from its peers, publishes a
+Round-1 commitment vector of the wrong length, and is dropped from the ceremony by every other
+node — which will report *the honest majority* as the side that disagrees.
+
+Stake also activates per-pool at different epochs, so "once your stake has activated" is not a
+moment the roster shares. Agree an epoch boundary with the other operators, change the flag on
+every node before it, and restart them together.
+
 ---
 
 ## 7. Start it
