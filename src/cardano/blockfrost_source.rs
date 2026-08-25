@@ -296,6 +296,7 @@ mod tests {
                 tm_address: "addr_test1_tm".into(),
             },
             config_utxo: format!("{}#0", "ee".repeat(32)),
+            reported_unadopted: None,
         });
 
         let (address, policy) = src

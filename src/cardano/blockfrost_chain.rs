@@ -1292,6 +1292,26 @@ impl BlockfrostCardanoChain {
             return;
         };
         if slot.as_ref().and_then(|e| e.batch_key) == Some(batch.slot) {
+            // Still inside the batch this was pinned for, so the pin stands — that
+            // IS the rule. But say so when the chain has moved under it: "held
+            // deliberately" and "never noticed" look identical in a log that says
+            // nothing, and an operator who has just run update-config needs to be
+            // able to tell that their change was seen and is queued rather than
+            // lost. Reported once per newer Config, not once per poll.
+            let seen = snapshot.config.utxo.to_string();
+            if let Some(entry) = slot
+                .as_mut()
+                .filter(|e| e.config_utxo != seen && e.reported_unadopted.as_deref() != Some(&seen))
+            {
+                warn!(
+                    "[contracts] a bridge Config Update has landed ({} -> {}) and this node \
+                         is NOT on it yet: B_{} is already pinned to the earlier one, and an \
+                         update takes effect from the next batch, never retroactively. Nothing \
+                         is wrong; the next opportunity adopts it",
+                    entry.config_utxo, seen, batch.index,
+                );
+                entry.reported_unadopted = Some(seen);
+            }
             return;
         }
         let contracts = match snapshot.config.params.bridge_contracts(self.is_mainnet()) {
@@ -1310,6 +1330,7 @@ impl BlockfrostCardanoChain {
         let entry = crate::cardano::config_params::BatchContracts {
             batch_key: Some(batch.slot),
             pegin_tree_inputs: snapshot.config.params.pegin_tree_inputs(),
+            reported_unadopted: None,
             contracts,
             config_utxo: snapshot.config.utxo.to_string(),
         };
@@ -3336,6 +3357,28 @@ mod tests {
         // different bytes for one movement.
         chain.remember_contracts(&snap(0x22, "bb"), Some(b_i));
         assert_eq!(chain.contracts_for_batch().unwrap(), first);
+
+        // WI-2AHGZ clause 4: not adopting it is correct, but staying SILENT about it
+        // is not — an operator who just ran update-config must be able to tell their
+        // change was seen and queued rather than lost. Reported once per newer
+        // Config, not once per poll of a loop that runs every few seconds.
+        let reported = |c: &BlockfrostCardanoChain| {
+            c.contracts_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|e| e.reported_unadopted.clone())
+        };
+        assert_eq!(
+            reported(&chain).as_deref(),
+            Some(format!("{}#0", "bb".repeat(32)).as_str())
+        );
+        chain.remember_contracts(&snap(0x22, "bb"), Some(b_i));
+        assert_eq!(
+            reported(&chain).as_deref(),
+            Some(format!("{}#0", "bb".repeat(32)).as_str()),
+            "the same newer Config is not re-reported on the next poll"
+        );
 
         // No open opportunity must not clobber it either — `batch.next()` is a
         // FUTURE slot and NoGrid is a transient read failure, not a Config change.

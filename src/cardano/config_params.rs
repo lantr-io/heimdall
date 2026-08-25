@@ -289,6 +289,12 @@ pub struct BatchContracts {
     pub contracts: BridgeContracts,
     /// Which Config UTxO it came from, for the log line when it moves.
     pub config_utxo: String,
+    /// A NEWER Config UTxO seen while this pin was held, once it has been reported.
+    ///
+    /// Only so the report happens once per (pin, newer Config) pair: the batch
+    /// opportunity is polled every few seconds, and an operator who reads a warning
+    /// forty times learns nothing the first one did not tell them.
+    pub reported_unadopted: Option<String>,
 }
 
 /// The published inputs to the peg-in Taproot tree other than the internal key.
