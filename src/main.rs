@@ -2216,6 +2216,7 @@ async fn run_spo(
         // moment a misconfiguration can still be refused before the node runs.
         let bf_chain = bf_chain.with_federation_refresh(cfg.cardano.clone());
 
+        let shared_contracts = bf_chain.contracts_cache();
         chain = Arc::new(bf_chain);
         // Config #6 gets the same treatment as #8/#9-#10 above: located once, read
         // every scan. Without it a governance Update to peg_in_script_hash leaves
@@ -2232,6 +2233,9 @@ async fn run_spo(
                 cfg.cardano.is_mainnet().unwrap_or(false),
             );
         }
+        // One Config read per batch, shared: the chain pins the identities when it
+        // takes the batch snapshot and this source scans what that pin names.
+        src = src.with_shared_contracts(shared_contracts);
         pegin_source = Arc::new(src);
     } else if let Some(socket) = cfg.cardano.socket_path.clone() {
         let magic = cfg

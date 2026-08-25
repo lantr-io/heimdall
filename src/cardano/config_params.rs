@@ -268,6 +268,28 @@ impl Contracts {
     }
 }
 
+/// The contract identities of one batch, plus the `B_i` they belong to.
+///
+/// `batch_key` is `None` on a deployment with no grid (a mock, or a Config with no
+/// `schedule`): there is no batch to be "as of", so a reader treats the entry as
+/// always stale and falls back to reading for itself.
+#[derive(Debug, Clone)]
+pub struct BatchContracts {
+    pub batch_key: Option<u64>,
+    /// `tm_batch_interval` as this snapshot published it, so a reader can tell
+    /// whether `batch_key` is still the open opportunity without another Config
+    /// read. `None` where the schedule did not publish a usable pitch.
+    pub interval: Option<u64>,
+    pub contracts: BridgeContracts,
+    /// Which Config UTxO it came from, for the log line when it moves.
+    pub config_utxo: String,
+}
+
+/// A [`BatchContracts`] shared between the chain (which writes it, from the batch
+/// snapshot) and the peg-in source (which reads it). One cell, so the two objects
+/// cannot resolve the same Config to different answers within one batch.
+pub type SharedContracts = std::sync::Arc<std::sync::Mutex<Option<BatchContracts>>>;
+
 /// The TM state token's asset name — empty, a protocol constant like
 /// [`BRIDGED_TOKEN_ASSET_NAME`]. The TreasuryMovementValidator counts the
 /// empty-name token under its own script hash, so there is nothing per-bridge

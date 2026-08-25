@@ -693,6 +693,20 @@ pub struct BlockfrostCardanoChain {
     /// address plus the bridged-token unit that identifies one. `None` → the daemon pays
     /// no peg-out, and says so loudly on every build.
     pegout_source: Option<PegOutSource>,
+    /// The contract identities of the batch currently being built, keyed on `B_i`.
+    ///
+    /// Written by [`Self::batch_snapshot`], which is the one read that already
+    /// carries the spec's guarantees: it takes tip-then-Config, refuses a Config
+    /// created after the tip, and retries — so everything derived from it belongs
+    /// to one batch. Reading the identities from here instead of re-reading per
+    /// scan is what turns "roughly current" into "as of this batch", which is the
+    /// effect time the spec gives `params` (§Operational parameters) and which
+    /// every co-signer of `B_i` reproduces.
+    ///
+    /// Shared with [`crate::cardano::blockfrost_source::BlockfrostPegInSource`],
+    /// which scans a different address off the same Config and must not resolve it
+    /// from a separate read — see [`Self::contracts_cache`].
+    contracts_cache: crate::cardano::config_params::SharedContracts,
 }
 
 /// The bridge-state singleton as the post/build paths need it: the decoded
@@ -894,6 +908,7 @@ impl BlockfrostCardanoChain {
             cpo_policy_id: None,
             kupo_url: None,
             pegout_source: None,
+            contracts_cache: crate::cardano::config_params::SharedContracts::default(),
         }
     }
 
@@ -1224,6 +1239,81 @@ impl BlockfrostCardanoChain {
         Ok((registry, bans))
     }
 
+    /// The shared cell this chain pins each batch's contract identities into.
+    ///
+    /// Hand it to the peg-in source so both scan the addresses of the SAME Config
+    /// read. Two independent reads would be two chances to straddle a governance
+    /// Update, and the peg-in scan is precisely where that is invisible: a policy
+    /// from one read and an address from another filter every UTxO out, which
+    /// looks like an empty bridge.
+    #[must_use]
+    pub fn contracts_cache(&self) -> crate::cardano::config_params::SharedContracts {
+        std::sync::Arc::clone(&self.contracts_cache)
+    }
+
+    /// Pin the identities this batch is built against, and say so when they moved.
+    fn remember_contracts(
+        &self,
+        snapshot: &crate::cardano::config_params::ParamSnapshot,
+        batch: Option<crate::epoch::batch::BatchSlot>,
+    ) {
+        let Ok(contracts) = snapshot.config.params.bridge_contracts(self.is_mainnet()) else {
+            // A datum this build cannot turn into addresses is already fatal further
+            // down `batch_snapshot`; do not also poison the cache with a stale entry.
+            return;
+        };
+        let entry = crate::cardano::config_params::BatchContracts {
+            batch_key: batch.map(|b| b.slot),
+            interval: u64::try_from(snapshot.config.params.tunables.schedule.tm_batch_interval)
+                .ok()
+                .filter(|i| *i > 0),
+            contracts,
+            config_utxo: snapshot.config.utxo.to_string(),
+        };
+        let Ok(mut slot) = self.contracts_cache.lock() else {
+            return;
+        };
+        let moved = slot
+            .as_ref()
+            .filter(|p| p.contracts != entry.contracts)
+            .map(|p| p.config_utxo.clone());
+        if let Some(was) = moved {
+            warn!(
+                "[contracts] the bridge Config moved between batches: Config UTxO {was} -> {}. \
+                 This batch is built against the new one; peg-in {} peg-out {}",
+                entry.config_utxo,
+                entry.contracts.pegin_script_address,
+                entry.contracts.pegout_script_address,
+            );
+        }
+        *slot = Some(entry);
+    }
+
+    /// The pinned identities, but only while the batch they were pinned for is the
+    /// one still open. A `None` key (no grid) never matches, so those deployments
+    /// keep reading per scan rather than freezing on a batch that does not exist.
+    async fn contracts_for_open_batch(
+        &self,
+    ) -> Option<crate::cardano::config_params::BridgeContracts> {
+        let (key, interval, contracts) = {
+            let slot = self.contracts_cache.lock().ok()?;
+            let entry = slot.as_ref()?;
+            (entry.batch_key?, entry.interval, entry.contracts.clone())
+        };
+        // Cheap tip read rather than a Config read: what has to be checked is
+        // whether we are still inside the batch this was pinned for, not whether
+        // the Config moved. If it moved, the NEXT batch snapshot adopts it, which
+        // is exactly "an update takes effect from the next batch".
+        let now = crate::cardano::bf_http::fetch_latest_block_slot_time(
+            &self.bf_base_url,
+            &self.bf_project_id,
+        )
+        .await
+        .ok()?;
+        (now.0 >= key && interval.is_none_or(|i| now.0 < key.saturating_add(i)))
+            .then_some(contracts)
+    }
+
     /// The scanned contract identities AS OF NOW, re-read from the bridge Config.
     ///
     /// The other half of [`Self::current_federation`], on the same argument.
@@ -1246,6 +1336,16 @@ impl BlockfrostCardanoChain {
     async fn current_contracts(
         &self,
     ) -> EpochResult<Option<crate::cardano::config_params::BridgeContracts>> {
+        // The batch snapshot's answer, when there is one for the batch now open.
+        // This is the path that matters: it is the same ConfigView every co-signer
+        // of this B_i derived from, so no two of them can scan different addresses
+        // for one movement.
+        if let Some(c) = self.contracts_for_open_batch().await {
+            return Ok(Some(c));
+        }
+        // No batch taken yet (startup, or a deployment with no grid), so read for
+        // ourselves rather than run on the boot copy. Bounded-and-self-healing, not
+        // "as of the batch" — see the type doc on `contracts_cache`.
         let (Some(addr), Some(unit)) = (
             self.config_address.as_deref(),
             self.config_nft_unit.as_deref(),
@@ -2447,6 +2547,14 @@ impl CardanoChain for BlockfrostCardanoChain {
         let batch =
             config_params::batch_at(&self.bf_base_url, &self.bf_project_id, &snapshot).await;
         let max_tx_size = self.max_tx_size().await?;
+
+        // Pin this batch's contract identities from the snapshot that just passed
+        // the ordering guard. Everything scanned until the next opportunity now
+        // resolves to the same answer, and to the answer every other co-signer of
+        // this B_i resolves — which is the whole point: the identities become "as
+        // of the batch", not "as of whenever this node happened to look".
+        self.remember_contracts(&snapshot, batch.open().or_else(|| batch.next()));
+
         let schedule = &snapshot.config.params.tunables.schedule;
         // `B_i = epoch_start + i × interval`, so the anchor comes back out of any
         // opportunity the grid resolved — cheaper and exactly as accurate as

@@ -19,6 +19,11 @@ pub struct BlockfrostPegInSource {
     /// Where to re-read Config #6 from. `None` → the pinned `address` stands, which
     /// is what every non-Config deployment (fixtures, devnets) wants.
     refresh: Option<PegInRefresh>,
+    /// The chain's per-batch pin, when this source was given it. Preferred over
+    /// `refresh`: it is the ConfigView the batch was snapshotted from, so the
+    /// address scanned here and the addresses the movement is built against cannot
+    /// come from two reads that straddle a governance Update.
+    shared: Option<crate::cardano::config_params::SharedContracts>,
 }
 
 /// Enough to locate the bridge Config and derive an address from it.
@@ -40,7 +45,24 @@ impl BlockfrostPegInSource {
             project_id: project_id.to_string(),
             address: address.into(),
             refresh: None,
+            shared: None,
         }
+    }
+
+    /// Scan the address the current batch was snapshotted against.
+    ///
+    /// Pass [`crate::cardano::blockfrost_chain::BlockfrostCardanoChain::contracts_cache`]
+    /// so both objects answer from one Config read. Without it this source would
+    /// take its own, and two reads are two chances to pair a new peg-in address
+    /// with an old request policy — which filters every deposit out and reports an
+    /// empty bridge.
+    #[must_use]
+    pub fn with_shared_contracts(
+        mut self,
+        shared: crate::cardano::config_params::SharedContracts,
+    ) -> Self {
+        self.shared = Some(shared);
+        self
     }
 
     /// Re-read Config #6 on every scan instead of running forever on the boot read.
@@ -75,6 +97,19 @@ impl BlockfrostPegInSource {
     ///
     /// `Ok(None)` → nothing to refresh from; the pinned pair stands.
     async fn current_pegin_contract(&self) -> EpochResult<Option<(String, String)>> {
+        // The batch's own answer first — same Config read the movement is built
+        // from, so the scan cannot disagree with it.
+        let pinned_by_batch = self.shared.as_ref().and_then(|shared| {
+            let slot = shared.lock().ok()?;
+            let entry = slot.as_ref()?;
+            Some((
+                entry.contracts.pegin_script_address.clone(),
+                entry.contracts.pegin_policy_id.clone(),
+            ))
+        });
+        if pinned_by_batch.is_some() {
+            return Ok(pinned_by_batch);
+        }
         let Some(r) = &self.refresh else {
             return Ok(None);
         };
@@ -227,6 +262,46 @@ mod tests {
         let src = BlockfrostPegInSource::new("preprodXXX", "addr_test1_pegin", None);
         assert!(src.current_pegin_contract().await.unwrap().is_none());
         assert_eq!(src.address, "addr_test1_pegin");
+    }
+
+    /// WI-2AHGZ: the batch's pin wins over this source's own read, and it is the
+    /// SAME cell the chain writes — that is what stops the scan from pairing a
+    /// peg-in address out of one Config read with a request policy out of another.
+    #[tokio::test]
+    async fn the_batch_pin_beats_this_source_s_own_read() {
+        use crate::cardano::config_params::{BatchContracts, BridgeContracts};
+
+        let shared: crate::cardano::config_params::SharedContracts = Default::default();
+        let src = BlockfrostPegInSource::new("preprodXXX", "addr_test1_boot", None)
+            // A locator IS present, so without the shared pin this would go to the
+            // network. The pin has to take precedence over it, not merely over the
+            // boot value.
+            .with_config_refresh("addr_test1_config", "beef424946434647", false)
+            .with_shared_contracts(std::sync::Arc::clone(&shared));
+
+        *shared.lock().unwrap() = Some(BatchContracts {
+            batch_key: Some(1_000),
+            interval: Some(7_200),
+            contracts: BridgeContracts {
+                pegin_policy_id: "aa".repeat(28),
+                pegin_script_address: "addr_test1_batch_pegin".into(),
+                pegout_script_address: "addr_test1_batch_pegout".into(),
+                bridged_token_unit: "bb".repeat(28),
+                bridge_state_policy_id: "cc".repeat(28),
+                tm_policy_id: "dd".repeat(28),
+                tm_address: "addr_test1_tm".into(),
+            },
+            config_utxo: format!("{}#0", "ee".repeat(32)),
+        });
+
+        let (address, policy) = src
+            .current_pegin_contract()
+            .await
+            .unwrap()
+            .expect("the pin");
+        assert_eq!(address, "addr_test1_batch_pegin");
+        // And the POLICY comes from the same entry, not from the caller's boot copy.
+        assert_eq!(policy, "aa".repeat(28));
     }
 
     /// The locator is recorded, not resolved eagerly: construction must stay free
