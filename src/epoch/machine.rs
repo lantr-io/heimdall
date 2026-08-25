@@ -2701,16 +2701,27 @@ async fn collect_pegins_phase(
 /// Recognise a peg-in request against every tree the bridge may hold deposits
 /// under, and report WHICH tree matched.
 ///
-/// At most one can match: the deposit output's scriptPubKey is a single Taproot
-/// output key, and two trees differing in their internal key derive two different
-/// ones. So the order below decides nothing about the result — only which error is
-/// reported when a request matches nothing.
+/// A SWEEPABLE match wins over tree order. Only one tree can match a given OUTPUT
+/// — the scriptPubKey is one Taproot output key and two trees differing in their
+/// internal key derive two different ones — but a transaction has many outputs,
+/// and `locate` searches all of them. So one transaction paying two of this
+/// bridge's addresses matches two trees, on different outputs. Returning the first
+/// match would resolve it by tree order, and `pegin_trees` puts the non-sweepable
+/// Published tree first: the request would be deferred on account of the output
+/// the movement cannot spend while the output it CAN spend goes unswept, and after
+/// the handoff the same tx keeps matching the same output, so the sweepable one is
+/// never even reported as stranded.
 ///
-/// That error is the PUBLISHED tree's, because that is the address this bridge
-/// tells depositors to use; an operator reading "no output pays the peg-in
-/// address" wants it measured against the address they would have quoted, not
-/// against whichever superseded key happened to be tried last. An error from the
-/// decode is not a tree's at all and short-circuits before any is tried.
+/// Preferring sweepable makes the choice about what the bridge can act on rather
+/// than about the order a list happened to be built in. Where no match is
+/// sweepable the first is returned, which is the published tree's — the address
+/// this bridge tells depositors to use.
+///
+/// The error, when nothing matches, is likewise the first tree's: an operator
+/// reading "no output pays the peg-in address" wants it measured against the
+/// address they would have quoted, not against whichever superseded key happened
+/// to be tried last. An error from the decode is not a tree's at all and
+/// short-circuits before any is tried.
 fn recognise_pegin(
     req: &crate::cardano::pegin_source::CardanoPegInRequest,
     trees: &[(PeginKeyOrigin, crate::bitcoin::taproot::PeginTreeParams)],
@@ -2721,9 +2732,15 @@ fn recognise_pegin(
     // says so without any of them being tried.
     let deposit = crate::cardano::pegin_datum::decode_pegin_request(req)?;
     let mut published_err = None;
+    let mut unsweepable: Option<(PeginKeyOrigin, ParsedPegIn)> = None;
     for (origin, tree) in trees {
         match deposit.locate(tree, secp) {
-            Ok(parsed) => return Ok((*origin, parsed)),
+            Ok(parsed) if origin.sweepable() => return Ok((*origin, parsed)),
+            Ok(parsed) => {
+                if unsweepable.is_none() {
+                    unsweepable = Some((*origin, parsed));
+                }
+            }
             Err(e) => {
                 if published_err.is_none() {
                     published_err = Some(e);
@@ -2731,7 +2748,13 @@ fn recognise_pegin(
             }
         }
     }
-    Err(published_err.expect("pegin_trees always yields at least the published tree"))
+    if let Some(found) = unsweepable {
+        return Ok(found);
+    }
+    // `pegin_trees` never yields an empty list, but the invariant lives in another
+    // function: report the request as matching nothing rather than panicking here
+    // if it ever does.
+    Err(published_err.unwrap_or(crate::cardano::pegin_datum::ParseError::NoPegInOutput))
 }
 
 /// Freeze the discovered peg-in set against this batch (spec §TM batches; WI-049).
@@ -5352,6 +5375,71 @@ mod tests {
             matches!(err, crate::cardano::pegin_datum::ParseError::NoPegInOutput),
             "{err}"
         );
+    }
+
+    /// One transaction paying TWO of this bridge's addresses must resolve to the
+    /// output the movement can actually spend, not to whichever tree is listed
+    /// first.
+    ///
+    /// `locate` searches every output, so during a handoff a tx with one output at
+    /// the Published address and another at the Head address matches BOTH trees —
+    /// "at most one tree matches" holds per output, not per transaction. With
+    /// `pegin_trees` putting the non-sweepable Published tree first, returning the
+    /// first match deferred the request on account of the output this movement
+    /// cannot spend, while the output it CAN spend went unswept; and after the
+    /// handoff the same tx kept matching the same output, so the sweepable one was
+    /// never even reported as stranded.
+    #[test]
+    fn a_deposit_paying_two_of_our_addresses_resolves_to_the_sweepable_one() {
+        use crate::cardano::pegin_datum::testkit;
+
+        let mut u = treasury_at(bitcoin::OutPoint::null());
+        u.y_51 = xonly_seed(0x11); // the head — sweepable
+        u.authorized_key = xonly_seed(0x22); // what the datum publishes
+        u.config_y_fed = xonly_seed(0x33);
+        let trees = u.pegin_trees().expect("valid");
+        assert_eq!(trees[0].0, PeginKeyOrigin::Published);
+        assert_eq!(trees[1].0, PeginKeyOrigin::Head);
+
+        let depositor = testkit::xonly_from_seed([0xd6; 32]).serialize();
+        // Published output FIRST, so output order cannot be what saves this.
+        let tx = testkit::tx_with_outputs(vec![
+            bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(400_000),
+                script_pubkey: testkit::pegin_spk(&trees[0].1, depositor),
+            },
+            bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(900_000),
+                script_pubkey: testkit::pegin_spk(&trees[1].1, depositor),
+            },
+            bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: testkit::beacon_spk(depositor),
+            },
+        ]);
+        let req = crate::cardano::pegin_source::CardanoPegInRequest {
+            cardano_utxo: crate::cardano::pegin_source::CardanoOutRef {
+                tx_hash: [0x7c; 32],
+                output_index: 0,
+            },
+            datum_cbor: testkit::datum_bytes(bitcoin::consensus::encode::serialize(&tx)),
+            created_slot: Some(1),
+        };
+
+        let secp = bitcoin::key::Secp256k1::new();
+        let (origin, parsed) = recognise_pegin(&req, &trees, &secp).expect("ours either way");
+        assert_eq!(
+            origin,
+            PeginKeyOrigin::Head,
+            "the sweepable match must win over tree order"
+        );
+        assert!(origin.sweepable());
+        assert_eq!(
+            parsed.spend_info.internal_key(),
+            trees[1].1.y_51,
+            "and it must carry the tree it matched, so the input signs under the head key"
+        );
+        assert_eq!(parsed.btc_vout, 1, "the output this movement can spend");
     }
 
     /// Two PegInRequests naming the SAME Bitcoin deposit must yield one movement
