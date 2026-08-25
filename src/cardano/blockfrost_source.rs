@@ -281,7 +281,6 @@ mod tests {
 
         *shared.lock().unwrap() = Some(BatchContracts {
             batch_key: Some(1_000),
-            interval: Some(7_200),
             contracts: BridgeContracts {
                 pegin_policy_id: "aa".repeat(28),
                 pegin_script_address: "addr_test1_batch_pegin".into(),

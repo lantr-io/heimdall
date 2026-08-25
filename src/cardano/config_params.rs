@@ -276,10 +276,6 @@ impl Contracts {
 #[derive(Debug, Clone)]
 pub struct BatchContracts {
     pub batch_key: Option<u64>,
-    /// `tm_batch_interval` as this snapshot published it, so a reader can tell
-    /// whether `batch_key` is still the open opportunity without another Config
-    /// read. `None` where the schedule did not publish a usable pitch.
-    pub interval: Option<u64>,
     pub contracts: BridgeContracts,
     /// Which Config UTxO it came from, for the log line when it moves.
     pub config_utxo: String,
@@ -422,7 +418,7 @@ impl ConfigParams {
         let peg_in = hash28(&self.contracts.peg_in_script_hash, "#6 peg_in_script_hash")?;
         let peg_out = hash28(
             &self.contracts.peg_out_script_hash,
-            "#6 peg_out_script_hash",
+            "#7 peg_out_script_hash",
         )?;
         Ok(BridgeContracts {
             pegin_policy_id: hex::encode(peg_in),
@@ -559,8 +555,12 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
         bridged_token_policy_id: field_hash28(fields, 2, "bridged_token_policy")?.to_vec(),
         completed_peg_ins_policy_id: contract_field(3, "completed_peg_ins_policy")?,
         bridge_state_policy_id: contract_field(4, "bridge_state_policy")?,
-        peg_in_script_hash: contract_field(6, "peg_in_script_hash")?,
-        peg_out_script_hash: contract_field(7, "peg_out_script_hash")?,
+        // Length-checked here rather than left to `bridge_contracts`, which every
+        // scan calls: a #6/#7 that is not 28 bytes must be refused ONCE, at the
+        // read, naming the field — not turned into a per-tick failure of both
+        // CollectPegins and BuildTm with the Config still parsing cleanly.
+        peg_in_script_hash: field_hash28(fields, 6, "peg_in_script_hash")?.to_vec(),
+        peg_out_script_hash: field_hash28(fields, 7, "peg_out_script_hash")?.to_vec(),
     };
 
     let bridge_state_policy = field_hash28(fields, 4, "bridge_state_policy")?;
