@@ -33,20 +33,37 @@
 //! Positions are a frozen contract — the datum evolves by APPENDING only — so a
 //! reader may safely decode the twelve fields it knows and ignore trailing ones:
 //!
-//! | # | field | read here |
-//! |---|-------|-----------|
-//! | 0 | `update_auth` | no |
-//! | 1 | `params` (nested [`Tunables`]) | TM fee rate, skip floors, schedule, ban schedule, federation CSV |
-//! | 2 | `bridged_token_policy` | no (heimdall.toml carries it) |
-//! | 3 | `completed_peg_ins_policy` | no |
-//! | 4 | `bridge_state_policy` | locate the bridge-state singleton ([PAR-1]) |
-//! | 5 | `tm_script_hash` | the TM validator hash = TM address ([CFG-2]) |
-//! | 6 | `peg_in_script_hash` | no |
-//! | 7 | `peg_out_script_hash` | no |
-//! | 8 | `spo_bans_policy_id` | the ban script address the roster is filtered against |
-//! | 9 | `spos_registry_policy_id` | the registry address |
-//! | 10 | `treasury_info_policy_id` | the `treasury_info` state UTxO's address |
-//! | 11 | `y_federation` | the federation leaf key of both Taproot trees (WI-069) |
+//! The `freshness` column is the answer to "may this move under a running node,
+//! and does this node notice". The spec's parameter registry (§G31) marks EVERY
+//! Config field `governance Update only` — i.e. all of them may move on a live
+//! bridge — but it states an effect time for `params` alone (§Operational
+//! parameters: read "as of the relevant TM batch's snapshot slot", so "an update
+//! takes effect from the next batch, never retroactively"). The wiring fields have
+//! no stated effect time, which is why `per scan` below is a bound rather than an
+//! answer: see `BlockfrostCardanoChain::current_contracts` and WI-2AHGZ.
+//!
+//! | # | field | read here | freshness |
+//! |---|-------|-----------|-----------|
+//! | 0 | `update_auth` | no | — |
+//! | 1 | `params` (nested [`Tunables`]) | TM fee rate, skip floors, schedule, ban schedule, federation CSV + refund timeout | **per batch snapshot** ([`fetch_param_snapshot`]) |
+//! | 2 | `bridged_token_policy` | the fBTC unit a peg-out's locked amount is measured in (WI-070 deleted the `heimdall.toml` copy) | per scan |
+//! | 3 | `completed_peg_ins_policy` | no | — |
+//! | 4 | `bridge_state_policy` | locate the bridge-state singleton ([PAR-1]) | per scan |
+//! | 5 | `tm_script_hash` | the TM validator hash = TM address ([CFG-2]) | **boot** — see below |
+//! | 6 | `peg_in_script_hash` | the address peg-in requests are scanned at, and the policy their NFT carries | per scan, both from ONE read |
+//! | 7 | `peg_out_script_hash` | the address peg-out requests are scanned at | per scan |
+//! | 8 | `spo_bans_policy_id` | the ban script address the roster is filtered against | per roster read |
+//! | 9 | `spos_registry_policy_id` | the registry address | per roster read |
+//! | 10 | `treasury_info_policy_id` | the `treasury_info` state UTxO's address | per roster read |
+//! | 11 | `y_federation` | the federation leaf key of both Taproot trees (WI-069) | boot |
+//! | 12 | `federation_one_shot` | the compile input every federation script is parameterized by (WI-090) | boot |
+//!
+//! #5 is deliberately left at boot: it names a SCRIPT, and re-reading it means
+//! fetching validator bytes, not comparing a hash. More to the point a TM policy
+//! change orphans the whole TM chain minted under the old one, so it describes a
+//! new bridge instance rather than a parameter move. #12 is the compile input to
+//! #9/#10 for the same reason. Neither judgement is written down anywhere a
+//! reader could check it — that is acceptance clause (a) of WI-2AHGZ, still open.
 //!
 //! `params` is at index 1 on purpose ([CFG-5]). Rev 5.4 put it last and told the
 //! reader to append after it, which invites the one edit that shifts every index:
@@ -251,6 +268,42 @@ impl Contracts {
     }
 }
 
+/// The contract identities of one batch, plus the `B_i` they belong to.
+///
+/// `batch_key` is `None` on a deployment with no grid (a mock, or a Config with no
+/// `schedule`): there is no batch to be "as of", so a reader treats the entry as
+/// always stale and falls back to reading for itself.
+#[derive(Debug, Clone)]
+pub struct BatchContracts {
+    pub batch_key: Option<u64>,
+    /// The three tap-tweak inputs the peg-in address is built from besides the
+    /// internal key: #11 `y_federation`, `params[7]` and `params[8]`.
+    ///
+    /// They belong in the same pin as the contract identities because they are
+    /// the same kind of value — chain-published, must-match, and hashed into an
+    /// ADDRESS. A node that keeps its boot copies reconstructs a different
+    /// deposit address from every one of its peers the moment governance moves
+    /// one of them, and the symptom is `0 eligible peg-ins` rather than an error
+    /// ([CFG-9] publishes them for exactly this reason).
+    pub pegin_tree_inputs: PeginTreeInputs,
+    pub contracts: BridgeContracts,
+    /// Which Config UTxO it came from, for the log line when it moves.
+    pub config_utxo: String,
+}
+
+/// The published inputs to the peg-in Taproot tree other than the internal key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeginTreeInputs {
+    pub y_federation: [u8; 32],
+    pub federation_csv_blocks: u16,
+    pub pegin_refund_timeout_blocks: u16,
+}
+
+/// A [`BatchContracts`] shared between the chain (which writes it, from the batch
+/// snapshot) and the peg-in source (which reads it). One cell, so the two objects
+/// cannot resolve the same Config to different answers within one batch.
+pub type SharedContracts = std::sync::Arc<std::sync::Mutex<Option<BatchContracts>>>;
+
 /// The TM state token's asset name — empty, a protocol constant like
 /// [`BRIDGED_TOKEN_ASSET_NAME`]. The TreasuryMovementValidator counts the
 /// empty-name token under its own script hash, so there is nothing per-bridge
@@ -366,6 +419,16 @@ pub struct ConfigParams {
 }
 
 impl ConfigParams {
+    /// The peg-in tree's published inputs, as of this Config read.
+    #[must_use]
+    pub fn pegin_tree_inputs(&self) -> PeginTreeInputs {
+        PeginTreeInputs {
+            y_federation: self.y_federation,
+            federation_csv_blocks: self.tunables.federation_csv_blocks,
+            pegin_refund_timeout_blocks: self.tunables.pegin_refund_timeout_blocks,
+        }
+    }
+
     /// Derive every bridge identifier from this Config datum (WI-070).
     ///
     /// `mainnet` decides only the bech32 network tag of the three derived
@@ -383,7 +446,7 @@ impl ConfigParams {
         let peg_in = hash28(&self.contracts.peg_in_script_hash, "#6 peg_in_script_hash")?;
         let peg_out = hash28(
             &self.contracts.peg_out_script_hash,
-            "#6 peg_out_script_hash",
+            "#7 peg_out_script_hash",
         )?;
         Ok(BridgeContracts {
             pegin_policy_id: hex::encode(peg_in),
@@ -520,8 +583,12 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
         bridged_token_policy_id: field_hash28(fields, 2, "bridged_token_policy")?.to_vec(),
         completed_peg_ins_policy_id: contract_field(3, "completed_peg_ins_policy")?,
         bridge_state_policy_id: contract_field(4, "bridge_state_policy")?,
-        peg_in_script_hash: contract_field(6, "peg_in_script_hash")?,
-        peg_out_script_hash: contract_field(7, "peg_out_script_hash")?,
+        // Length-checked here rather than left to `bridge_contracts`, which every
+        // scan calls: a #6/#7 that is not 28 bytes must be refused ONCE, at the
+        // read, naming the field — not turned into a per-tick failure of both
+        // CollectPegins and BuildTm with the Config still parsing cleanly.
+        peg_in_script_hash: field_hash28(fields, 6, "peg_in_script_hash")?.to_vec(),
+        peg_out_script_hash: field_hash28(fields, 7, "peg_out_script_hash")?.to_vec(),
     };
 
     let bridge_state_policy = field_hash28(fields, 4, "bridge_state_policy")?;

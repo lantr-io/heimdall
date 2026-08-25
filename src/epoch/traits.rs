@@ -129,6 +129,29 @@ pub struct TreasuryUtxo {
     /// beside the federation delay because the peg-in tree needs both, and both
     /// must come from the bridge rather than from each node's own file.
     pub pegin_refund_timeout_blocks: u16,
+    /// Internal keys this bridge has published and moved PAST — neither the head's
+    /// nor the datum's — newest first.
+    ///
+    /// They buy exactly one thing: the ability to NAME a deposit the bridge is no
+    /// longer sweeping. A movement is signed with a single key package, so it can
+    /// only spend inputs under the head's internal key; once the head has moved on,
+    /// nothing signs under these again, and the deposit's own tree — the
+    /// federation's sweep leaf first, the depositor's refund after it — is the way
+    /// back. Recognising the address turns that from silence into a warning.
+    ///
+    /// "Nothing signs under these again" describes this implementation, not the
+    /// protocol: the retired ceremony's key package is still on disk, and one
+    /// Bitcoin transaction may spend inputs under several keys. WI-GC1FV weighs
+    /// signing them in a second FROST session.
+    ///
+    /// Unlike its neighbours this is NOT a bridge-wide value: it comes from what
+    /// this node persisted plus the published federation key, so two nodes can
+    /// legitimately disagree about it. That is only sound because it cannot change
+    /// batch membership in either direction — a `Retired` match and a match against
+    /// nothing at all are both refused, so the set a movement is built from is
+    /// identical whatever this field holds. Do not give it a consensus job. Empty
+    /// is always a safe answer: it costs a warning, not a coin.
+    pub retired_internal_keys: Vec<bitcoin::key::UntweakedPublicKey>,
     /// Whether it is safe to begin the NEXT treasury movement off this UTxO.
     /// A new movement can only begin once the previous one is confirmed, so the
     /// Blockfrost impl (WI-028) sets this false when an Unconfirmed TM (or an
@@ -137,28 +160,155 @@ pub struct TreasuryUtxo {
     pub btc_confirmed: bool,
 }
 
+/// Where a peg-in tree's INTERNAL key comes from — which decides what a node may
+/// do with a deposit sitting under it.
+///
+/// The distinction exists because a movement is a set of key-path spends signed
+/// with ONE key package (`signing::sign_phase` passes the same one for every
+/// input, varying only the Taproot merkle root). So a movement can only take
+/// inputs whose internal key is the key that spends the head, and "which address
+/// does a deposit sit at" and "can this bridge ever sweep it" are two questions,
+/// not one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeginKeyOrigin {
+    /// The datum's key and the head's key at once — the steady state, in which the
+    /// address the bridge publishes is also the one it can sweep.
+    Current,
+    /// [`TreasuryUtxo::authorized_key`] alone: the address the bridge publishes,
+    /// while the head is still locked under the key it supersedes. A depositor
+    /// building from the chain lands here for the whole handoff window (spec
+    /// §Rollout Phases step 5: from the Update-Y on, depositors derive peg-in
+    /// addresses from the new key). Nothing can sweep it until the handoff
+    /// confirms — a deferral, not a loss.
+    Published,
+    /// [`TreasuryUtxo::y_51`] alone: the address depositors were given BEFORE the
+    /// Update-Y. The movement that spends the current head is the last one that
+    /// takes these, because no later movement signs under this key — a limit of
+    /// how movements are signed here (one key package for every input), not of
+    /// Bitcoin, which is content with a transaction whose inputs sit under
+    /// different keys. See WI-GC1FV.
+    Head,
+    /// A ceremony the bridge has moved past. No movement signs under it any more,
+    /// so nothing sweeps it as things stand — recoverable in principle by signing
+    /// with the retired key package, which is still on disk (WI-GC1FV), and in
+    /// practice by the deposit's own tree: the federation's sweep leaf first, the
+    /// depositor's refund after it.
+    Retired,
+}
+
+impl PeginKeyOrigin {
+    /// Whether a movement built against the CURRENT head can spend a deposit under
+    /// this key — i.e. whether this is the head's key.
+    #[must_use]
+    pub fn sweepable(self) -> bool {
+        matches!(self, Self::Current | Self::Head)
+    }
+
+    /// Short label for logs.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Published => "published",
+            Self::Head => "head",
+            Self::Retired => "retired",
+        }
+    }
+}
+
 impl TreasuryUtxo {
-    /// The peg-in Taproot tree this bridge publishes — the canonical answer to "what
+    /// The peg-in Taproot tree this bridge PUBLISHES — the canonical answer to "what
     /// address does a deposit land at", for every reader that can see the oracle.
     ///
-    /// It exists because the mapping is not obvious and getting it wrong is silent. The
-    /// federation LEAF key is [`Self::config_y_fed`], the value the Config publishes and a
-    /// depositor builds against — NOT [`Self::y_fed`], which is whichever candidate
-    /// reproduces the treasury HEAD's scriptPubKey and is `y_51` on a bridge still using the
-    /// collapsed convention. Both are `UntweakedPublicKey`, so nothing but this function
+    /// It exists because the mapping is not obvious and getting it wrong is silent. Both
+    /// keys are the ones the bridge publishes rather than the ones its head happens to be
+    /// locked under:
+    ///
+    /// - the INTERNAL key is [`Self::authorized_key`], the `current_spos_frost_key` the
+    ///   treasury_info datum names. Spec §Rollout Phases step 5 is explicit that from the
+    ///   Update-Y onward "depositors derive peg-in addresses from `Y_51'`", and §Peg-in
+    ///   Taproot tree sources both keys from `treasury.ak` — the state UTxO, not the head's
+    ///   scriptPubKey, which no Cardano-only reader can compute at all;
+    /// - the federation LEAF key is [`Self::config_y_fed`], NOT [`Self::y_fed`], which is
+    ///   whichever candidate reproduces the HEAD's scriptPubKey and equals `y_51` on a
+    ///   bridge still using the collapsed convention.
+    ///
+    /// Everything here is an `UntweakedPublicKey` or a `u16`, so nothing but this function
     /// stands between a caller and a well-formed address holding nothing.
+    ///
+    /// This is the address to PUBLISH. It is not necessarily one this bridge can sweep
+    /// today — see [`Self::pegin_trees`], which is what a node parses against.
     ///
     /// Fails when the published pair breaks the spec's ordering rule; that is a
     /// misconfiguration of the bridge, not an invariant a node may assume.
     pub fn pegin_tree(&self) -> Result<crate::bitcoin::taproot::PeginTreeParams, String> {
+        self.pegin_tree_for(self.authorized_key)
+    }
+
+    /// The peg-in tree for one internal key. Everything else in the tree is
+    /// bridge-wide, so this is the only axis a caller may vary.
+    fn pegin_tree_for(
+        &self,
+        internal: bitcoin::key::UntweakedPublicKey,
+    ) -> Result<crate::bitcoin::taproot::PeginTreeParams, String> {
         let tree = crate::bitcoin::taproot::PeginTreeParams {
-            y_51: self.y_51,
+            y_51: internal,
             y_federation: self.config_y_fed,
             federation_csv_blocks: self.federation_csv_blocks,
             refund_timeout: self.pegin_refund_timeout_blocks,
         };
         tree.validate()?;
         Ok(tree)
+    }
+
+    /// Every peg-in tree a node must RECOGNISE, most current first, each tagged with
+    /// what it is.
+    ///
+    /// A single tree is not enough, and which single tree it should be is not a
+    /// question with a stable answer. During a handoff the bridge publishes one
+    /// address and can sweep a different one: deposits keep arriving at the old
+    /// address for as long as depositors hold a stale view, and spec-compliant
+    /// deposits arrive at the new one from the Update-Y onward. Parsing against one
+    /// tree drops the other half with a `warn!` — deposits the bridge is holding
+    /// and can see.
+    ///
+    /// Recognising them all costs one extra Taproot derivation per tree per request
+    /// — and only that, because the tree-independent half of the parse is done once
+    /// (`pegin_datum::decode_pegin_request`). Where the datum and the head agree and
+    /// nothing has been superseded there is exactly one tree; on a bridge that has
+    /// rotated even once there is one more per retired key it still recognises. What a node may DO with each match is
+    /// [`PeginKeyOrigin::sweepable`]'s answer, not this one's.
+    ///
+    /// KNOWN LIMIT: only the internal key varies across these trees. The other
+    /// three tap-tweak inputs — the published federation key, its CSV delay and the
+    /// refund timeout — are one value each, applied to every tree including the
+    /// retired ones. They are now the values the CURRENT BATCH pinned rather than
+    /// the ones this process booted with, so a governance move of `y_federation`,
+    /// `params[7]` or `params[8]` is followed from the next batch and every
+    /// co-signer follows it together. What is still not covered is HISTORY: a
+    /// deposit made before such a move reconstructs under none of these trees and
+    /// falls back to being dropped, because covering it needs the whole
+    /// `(internal, leaf, csv, timeout)` tuple that was live at deposit time and a
+    /// list of internal keys cannot express one.
+    pub fn pegin_trees(
+        &self,
+    ) -> Result<Vec<(PeginKeyOrigin, crate::bitcoin::taproot::PeginTreeParams)>, String> {
+        let mut out = Vec::with_capacity(2 + self.retired_internal_keys.len());
+        if self.authorized_key == self.y_51 {
+            out.push((PeginKeyOrigin::Current, self.pegin_tree()?));
+        } else {
+            // Published first: it is the address the bridge tells depositors to use,
+            // so it is the one a growing share of requests will match.
+            out.push((PeginKeyOrigin::Published, self.pegin_tree()?));
+            out.push((PeginKeyOrigin::Head, self.pegin_tree_for(self.y_51)?));
+        }
+        for k in &self.retired_internal_keys {
+            if *k == self.authorized_key || *k == self.y_51 {
+                continue;
+            }
+            out.push((PeginKeyOrigin::Retired, self.pegin_tree_for(*k)?));
+        }
+        Ok(out)
     }
 }
 
@@ -851,16 +1001,20 @@ mod pegin_tree_tests {
         Keypair::from_secret_key(&secp, &sk).x_only_public_key().0
     }
 
-    fn utxo(y_51: u8, head_y_fed: u8, published_y_fed: u8) -> TreasuryUtxo {
+    /// A treasury standing wherever the caller puts it: `y_51` is the key the HEAD
+    /// is locked under, `authorized` the one the datum names. Passing the same
+    /// value for both is the steady state.
+    fn utxo(y_51: u8, head_y_fed: u8, published_y_fed: u8, authorized: u8) -> TreasuryUtxo {
         TreasuryUtxo {
             outpoint: bitcoin::OutPoint::null(),
             value: bitcoin::Amount::ZERO,
             y_51: xonly(y_51),
             y_fed: xonly(head_y_fed),
             config_y_fed: xonly(published_y_fed),
-            authorized_key: xonly(y_51),
+            authorized_key: xonly(authorized),
             federation_csv_blocks: 144,
             pegin_refund_timeout_blocks: 720,
+            retired_internal_keys: Vec::new(),
             btc_confirmed: true,
         }
     }
@@ -871,20 +1025,114 @@ mod pegin_tree_tests {
     /// depositor misses — silently, because both are valid keys.
     #[test]
     fn the_leaf_key_is_the_published_one_not_the_head_derived_one() {
-        let u = utxo(0x11, 0x22, 0x33);
+        let u = utxo(0x11, 0x22, 0x33, 0x11);
         let tree = u.pegin_tree().expect("valid");
         assert_eq!(tree.y_federation, u.config_y_fed);
         assert_ne!(tree.y_federation, u.y_fed);
         assert_eq!(tree.y_51, u.y_51);
     }
 
+    /// The INTERNAL key follows the same rule as the leaf: publish, do not infer.
+    ///
+    /// Spec §Rollout Phases step 5 — "from this point depositors derive peg-in
+    /// addresses from `Y_51'`" — puts the switch at the Update-Y, so for the whole
+    /// handoff window the address a depositor builds is the datum's, not the one
+    /// the head is still locked under. Deriving from the head here would quote an
+    /// address no depositor uses, and no Cardano-only reader can even compute it.
+    #[test]
+    fn the_published_address_follows_the_datum_not_the_head() {
+        let u = utxo(0x11, 0x22, 0x33, 0x44);
+        let tree = u.pegin_tree().expect("valid");
+        assert_eq!(tree.y_51, u.authorized_key);
+        assert_ne!(tree.y_51, u.y_51);
+    }
+
+    /// In the steady state there is nothing to disambiguate, so there is one tree
+    /// and one extra parse attempt is not paid.
+    #[test]
+    fn a_settled_bridge_has_exactly_one_pegin_tree() {
+        let u = utxo(0x11, 0x22, 0x33, 0x11);
+        let trees = u.pegin_trees().expect("valid");
+        assert_eq!(trees.len(), 1);
+        assert_eq!(trees[0].0, PeginKeyOrigin::Current);
+        assert!(trees[0].0.sweepable());
+        assert_eq!(trees[0].1.y_51, u.y_51);
+    }
+
+    /// Inside the window a node must recognise BOTH addresses — and they mean
+    /// different things. The published one is where spec-compliant deposits land
+    /// from the Update-Y onward and no movement can take it until the handoff
+    /// confirms; the head's is where deposits built before the Update-Y land, and
+    /// the handoff movement is the LAST one that can ever take those.
+    #[test]
+    fn the_handoff_window_has_a_published_tree_and_a_sweepable_one() {
+        let u = utxo(0x11, 0x22, 0x33, 0x44);
+        let trees = u.pegin_trees().expect("valid");
+        assert_eq!(trees.len(), 2);
+
+        assert_eq!(trees[0].0, PeginKeyOrigin::Published);
+        assert_eq!(trees[0].1.y_51, u.authorized_key);
+        assert!(
+            !trees[0].0.sweepable(),
+            "the address the bridge publishes is NOT the one the head can spend during a \
+             handoff — a movement signs with one key package and the head is under the other \
+             key"
+        );
+
+        assert_eq!(trees[1].0, PeginKeyOrigin::Head);
+        assert_eq!(trees[1].1.y_51, u.y_51);
+        assert!(trees[1].0.sweepable());
+    }
+
+    /// A superseded ceremony key is recognised but never sweepable: no movement
+    /// will sign under it again, so the only thing a node can do with a deposit
+    /// there is name it.
+    #[test]
+    fn a_retired_key_is_recognised_and_never_sweepable() {
+        let mut u = utxo(0x11, 0x22, 0x33, 0x11);
+        u.retired_internal_keys = vec![xonly(0x55), xonly(0x66)];
+        let trees = u.pegin_trees().expect("valid");
+        assert_eq!(trees.len(), 3);
+        for (origin, tree) in &trees[1..] {
+            assert_eq!(*origin, PeginKeyOrigin::Retired);
+            assert!(!origin.sweepable());
+            assert_eq!(
+                tree.y_federation, u.config_y_fed,
+                "only the internal key varies"
+            );
+        }
+        assert_eq!(
+            trees[1].1.y_51,
+            xonly(0x55),
+            "newest retired ceremony first"
+        );
+    }
+
+    /// A key that is still live must not also be offered as retired: it would
+    /// derive the same address twice, and the second copy would carry the wrong
+    /// verdict about whether it can be swept.
+    #[test]
+    fn a_live_key_is_never_repeated_as_retired() {
+        let mut u = utxo(0x11, 0x22, 0x33, 0x44);
+        u.retired_internal_keys = vec![xonly(0x11), xonly(0x44), xonly(0x55)];
+        let trees = u.pegin_trees().expect("valid");
+        assert_eq!(
+            trees.len(),
+            3,
+            "published, head, and the one genuinely retired key"
+        );
+        assert_eq!(trees[2].1.y_51, xonly(0x55));
+    }
+
     /// A bridge publishing a refund window that opens before its own sweep window is
     /// refused, rather than each deriver rediscovering it one deposit at a time.
     #[test]
     fn a_bridge_whose_refund_opens_first_is_refused() {
-        let mut u = utxo(0x11, 0x22, 0x33);
+        let mut u = utxo(0x11, 0x22, 0x33, 0x11);
         u.pegin_refund_timeout_blocks = 100;
         let err = u.pegin_tree().unwrap_err();
+        assert!(err.contains("must exceed federation_csv_blocks"), "{err}");
+        let err = u.pegin_trees().unwrap_err();
         assert!(err.contains("must exceed federation_csv_blocks"), "{err}");
     }
 }

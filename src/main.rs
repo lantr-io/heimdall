@@ -2216,12 +2216,27 @@ async fn run_spo(
         // moment a misconfiguration can still be refused before the node runs.
         let bf_chain = bf_chain.with_federation_refresh(cfg.cardano.clone());
 
+        let shared_contracts = bf_chain.contracts_cache();
         chain = Arc::new(bf_chain);
-        pegin_source = Arc::new(BlockfrostPegInSource::new(
+        // Config #6 gets the same treatment as #8/#9-#10 above: located once, read
+        // every scan. Without it a governance Update to peg_in_script_hash leaves
+        // this node watching a retired address and calling it "0 eligible peg-ins".
+        let mut src = BlockfrostPegInSource::new(
             project_id,
             &bridge.pegin_script_address,
             cfg.cardano.blockfrost_url.as_deref(),
-        ));
+        );
+        if let Some(loc) = config_locator(&cfg) {
+            src = src.with_config_refresh(
+                loc.address,
+                loc.nft_unit,
+                cfg.cardano.is_mainnet().unwrap_or(false),
+            );
+        }
+        // One Config read per batch, shared: the chain pins the identities when it
+        // takes the batch snapshot and this source scans what that pin names.
+        src = src.with_shared_contracts(shared_contracts);
+        pegin_source = Arc::new(src);
     } else if let Some(socket) = cfg.cardano.socket_path.clone() {
         let magic = cfg
             .cardano
@@ -7547,6 +7562,17 @@ fn run_sweep_pegins(
     // the demo DKG above rather than reading it off the oracle. The other three values are
     // the bridge's, and the mapping lives in one place.
     let pegin_tree = federation.pegin_tree(y_51)?;
+    // The one other internal key this path can name without reading the oracle: the
+    // federation's own. A Phase-1 bridge's peg-in address IS keyed to it, and during a
+    // handoff deposits keep arriving there, so without it every such deposit fell out
+    // of the loop below as "no output pays the peg-in address" — which reads as another
+    // bridge's deposit, and is the one thing this tool must not say about coins it is
+    // holding. Recognising it does NOT make it sweepable here: this mover signs with one
+    // key package, so an input under y_federation needs the federation's signature and
+    // this command cannot produce it. The value is that the operator is told the truth.
+    let federation_pegin_tree = (federation.y_fed != y_51)
+        .then(|| federation.pegin_tree(federation.y_fed))
+        .transpose()?;
 
     let policy_id: [u8; 28] = hex::decode(pegin_policy_id)
         .map_err(|e| format!("pegin_policy_id: {e}"))?
@@ -7649,7 +7675,26 @@ fn run_sweep_pegins(
         let parsed = match parse_pegin_request(req, &pegin_tree) {
             Ok(p) => p,
             Err(e) => {
-                warn!("  dropped peg-in {:?}: {e}", req.cardano_utxo);
+                // Before calling it someone else's: does it pay the FEDERATION
+                // address? If so it is this bridge's deposit and this tool simply
+                // cannot move it — a different sentence entirely, and the one an
+                // operator needs in order to reach for the federation instead of
+                // concluding there is nothing to sweep.
+                match federation_pegin_tree
+                    .as_ref()
+                    .and_then(|t| parse_pegin_request(req, t).ok())
+                {
+                    Some(fed) => warn!(
+                        "  peg-in {:?} pays the FEDERATION address ({}:{}, {} sat) — this \
+                         bridge's deposit, but this mover signs under Y_51 only and one \
+                         movement signs every input with one key. The federation must move it",
+                        req.cardano_utxo,
+                        fed.btc_txid,
+                        fed.btc_vout,
+                        fed.value.to_sat(),
+                    ),
+                    None => warn!("  dropped peg-in {:?}: {e}", req.cardano_utxo),
+                }
                 continue;
             }
         };
@@ -7919,6 +7964,20 @@ fn run_sweep_pegins(
         hex::encode(unsigned.spi_root),
         unsigned.tx.input.len().saturating_sub(1),
     );
+
+    // This path parses against ONE tree and has no dedup of its own, so the
+    // builder's is the only thing standing between two requests naming one deposit
+    // and a transaction that spends an outpoint twice. Say so rather than let the
+    // count vanish: the extra PegInRequest is still on chain and will be offered
+    // again at every attempt until it is closed.
+    if unsigned.duplicate_deposits_dropped > 0 {
+        warn!(
+            "[sweep] {} peg-in request(s) named a deposit another input already spends — \
+             dropped. The movement is correct; the surplus request(s) need closing, or every \
+             later attempt hits this again",
+            unsigned.duplicate_deposits_dropped
+        );
+    }
 
     // Surface any peg-outs the TM dropped as unpayable (non-standard destination
     // or sub-dust after fee) so the operator sees them — the TM still pays the

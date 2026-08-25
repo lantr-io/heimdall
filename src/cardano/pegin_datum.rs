@@ -211,6 +211,52 @@ pub fn parse_pegin_request(
     req: &CardanoPegInRequest,
     tree: &PeginTreeParams,
 ) -> Result<ParsedPegIn, ParseError> {
+    decode_pegin_request(req)?.locate(tree, &Secp256k1::new())
+}
+
+/// A peg-in request decoded as far as it can be WITHOUT knowing the bridge's tree —
+/// the datum, the referenced Bitcoin transaction, and the beacon's `Q_auth`.
+///
+/// Split out because a node with more than one candidate tree (during a treasury
+/// handoff it has at least two, plus one per superseded ceremony) would otherwise
+/// redo all of it per tree: a CBOR decode, a transaction deserialize, an output
+/// scan for the beacon, and a fresh libsecp256k1 context. None of that depends on
+/// the tree. What does is [`Self::locate`], which is the only part worth repeating.
+#[derive(Debug, Clone)]
+pub struct PegInDeposit {
+    btc_tx: Transaction,
+    btc_txid: Txid,
+    depositor_outputkey: UntweakedPublicKey,
+    cardano_utxo: CardanoOutRef,
+    created_slot: Option<u64>,
+}
+
+impl ParsedPegIn {
+    /// The deposit's Bitcoin outpoint in the `tm_chain::outpoint_bytes` encoding —
+    /// which is both the movement input this peg-in becomes and its
+    /// `peg_in_utxo_id`, the SPI trie's key ([SPI-1]).
+    ///
+    /// One function because it is the deposit's IDENTITY: two PegInRequests naming
+    /// the same Bitcoin deposit are the same coin however differently they were
+    /// posted on Cardano, and every caller that compares, dedupes or records one
+    /// has to agree byte for byte on what that identity is.
+    #[must_use]
+    pub fn outpoint(&self) -> [u8; 36] {
+        crate::cardano::tm_chain::outpoint_bytes(&bitcoin::OutPoint {
+            txid: self.btc_txid,
+            vout: self.btc_vout,
+        })
+    }
+}
+
+/// Decode steps 1-3 of the peg-in validation: the datum's field[1] raw tx, that
+/// transaction, and the `Q_auth` its beacon carries.
+///
+/// Every error here is a statement about the REQUEST — malformed datum, undecodable
+/// transaction, missing or duplicated beacon — so it is the same answer whatever
+/// tree a caller had in mind, and a caller holding several need not try them all to
+/// learn it.
+pub fn decode_pegin_request(req: &CardanoPegInRequest) -> Result<PegInDeposit, ParseError> {
     // 1. Decode the Cardano datum: we only trust field[1] (raw tx).
     let plutus: PlutusData = pallas_codec::minicbor::decode(&req.datum_cbor)
         .map_err(|e| ParseError::BadDatumShape(format!("cbor: {e}")))?;
@@ -224,100 +270,94 @@ pub fn parse_pegin_request(
     // 3. Read the depositor's Taproot output key Q_auth from the OP_RETURN beacon.
     let depositor_outputkey = parse_beacon(&btc_tx)?;
 
-    // 4. Locate the deposit output. Q_auth is known and the rest of the tree comes from
-    //    the oracle, so the peg-in address is computed once rather than searched for. Two
-    //    outputs paying that same address remain ambiguous — this function resolves the
-    //    peg-in from the tx alone, with no datum outpoint to disambiguate them — so that
-    //    case is still refused.
-    let secp = Secp256k1::new();
-    let spend_info = pegin_spend_info(&secp, tree, depositor_outputkey);
-    let expected_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
-    let mut hits = btc_tx
-        .output
-        .iter()
-        .enumerate()
-        .filter(|(_, txout)| txout.script_pubkey == expected_spk);
-    let (vout, txout) = hits.next().ok_or(ParseError::NoPegInOutput)?;
-    if hits.next().is_some() {
-        return Err(ParseError::AmbiguousPegInOutput);
-    }
-    let value = txout.value;
-
-    if value < DUST_THRESHOLD {
-        return Err(ParseError::DustOutput);
-    }
-
-    Ok(ParsedPegIn {
-        btc_tx: btc_tx.clone(),
+    Ok(PegInDeposit {
+        btc_tx,
         btc_txid,
-        btc_vout: vout as u32,
-        value,
-        cardano_utxo: req.cardano_utxo.clone(),
         depositor_outputkey,
-        spend_info,
+        cardano_utxo: req.cardano_utxo.clone(),
         created_slot: req.created_slot,
     })
 }
 
+impl PegInDeposit {
+    /// Step 4: locate the output paying `tree`'s peg-in address.
+    ///
+    /// `Q_auth` is known and the rest of the tree comes from the oracle, so the
+    /// address is computed once rather than searched for. Two outputs paying that
+    /// same address remain ambiguous — a peg-in is resolved from the transaction
+    /// alone, with no datum outpoint to disambiguate them — so that case is
+    /// refused.
+    ///
+    /// `secp` is the caller's so that trying several trees costs one context, not
+    /// one per attempt.
+    pub fn locate(
+        &self,
+        tree: &PeginTreeParams,
+        secp: &Secp256k1<bitcoin::secp256k1::All>,
+    ) -> Result<ParsedPegIn, ParseError> {
+        let spend_info = pegin_spend_info(secp, tree, self.depositor_outputkey);
+        let expected_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
+        let mut hits = self
+            .btc_tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, txout)| txout.script_pubkey == expected_spk);
+        let (vout, txout) = hits.next().ok_or(ParseError::NoPegInOutput)?;
+        if hits.next().is_some() {
+            return Err(ParseError::AmbiguousPegInOutput);
+        }
+        let value = txout.value;
+
+        if value < DUST_THRESHOLD {
+            return Err(ParseError::DustOutput);
+        }
+
+        Ok(ParsedPegIn {
+            btc_tx: self.btc_tx.clone(),
+            btc_txid: self.btc_txid,
+            btc_vout: vout as u32,
+            value,
+            cardano_utxo: self.cardano_utxo.clone(),
+            depositor_outputkey: self.depositor_outputkey,
+            spend_info,
+            created_slot: self.created_slot,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Tests
+// Test fixtures
 // ---------------------------------------------------------------------------
 
+/// Builders for a well-formed peg-in request, shared with the epoch machine's
+/// tests.
+///
+/// They live here rather than in each test module because a peg-in request is
+/// only meaningful if it round-trips through [`parse_pegin_request`] — a fixture
+/// built to a second, hand-written idea of the format proves nothing about the
+/// parser. Everything a caller can get wrong is a parameter: the tree the deposit
+/// pays, the depositor key the beacon names, and the amount.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testkit {
     use super::*;
-    use bitcoin::consensus::encode::serialize;
     use bitcoin::hashes::Hash as _;
     use bitcoin::opcodes::all::OP_RETURN;
     use bitcoin::secp256k1::{Keypair, SecretKey};
-    use bitcoin::{
-        Amount, OutPoint, Sequence, TxIn, TxOut, Witness, absolute, script, transaction,
-    };
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness, absolute, script, transaction};
     use pallas_primitives::conway::Constr;
     use pallas_primitives::{BigInt, BoundedBytes, MaybeIndefArray};
 
-    // ------ Helpers ------------------------------------------------------
-
-    const REFUND_TIMEOUT: u16 = 720;
-
-    fn xonly_from_seed(seed: [u8; 32]) -> UntweakedPublicKey {
+    /// A deterministic x-only key. Same seed, same key, on every run.
+    pub(crate) fn xonly_from_seed(seed: [u8; 32]) -> UntweakedPublicKey {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&seed).unwrap();
         let kp = Keypair::from_secret_key(&secp, &sk);
         kp.x_only_public_key().0
     }
 
-    /// Return a deterministic depositor Taproot output key as 32 raw bytes.
-    fn depositor_xonly() -> [u8; 32] {
-        xonly_from_seed([0xABu8; 32]).serialize()
-    }
-
-    fn test_y_fed() -> UntweakedPublicKey {
-        xonly_from_seed([0xFEu8; 32])
-    }
-
-    /// The bridge-wide tree the fixtures are built and parsed under. `test_y_fed()` is the
-    /// INTERNAL key here for historical reasons (the fixtures were written when it was);
-    /// what matters is that build and parse use the same params.
-    fn test_tree() -> PeginTreeParams {
-        PeginTreeParams {
-            y_51: test_y_fed(),
-            y_federation: xonly_from_seed([0xEDu8; 32]),
-            federation_csv_blocks: 144,
-            refund_timeout: REFUND_TIMEOUT,
-        }
-    }
-
-    fn pegin_spk(depositor_xonly_bytes: [u8; 32]) -> ScriptBuf {
-        let secp = Secp256k1::new();
-        let depositor =
-            UntweakedPublicKey::from_slice(&depositor_xonly_bytes).expect("valid xonly");
-        let si = pegin_spend_info(&secp, &test_tree(), depositor);
-        ScriptBuf::new_p2tr_tweaked(si.output_key())
-    }
-
-    /// Build the 35-byte one-key beacon: `"BFR" || Q_auth`.
-    fn beacon_spk(depositor_key: [u8; 32]) -> ScriptBuf {
+    /// The 35-byte one-key beacon: `OP_RETURN "BFR" || Q_auth`.
+    pub(crate) fn beacon_spk(depositor_key: [u8; 32]) -> ScriptBuf {
         let mut payload = Vec::with_capacity(35);
         payload.extend_from_slice(BEACON_MARKER);
         payload.extend_from_slice(&depositor_key);
@@ -327,41 +367,8 @@ mod tests {
             .into_script()
     }
 
-    /// Build the retired 67-byte dual-key beacon `"BFR" || D || Q_auth`, kept
-    /// only to prove it is refused rather than dual-read.
-    fn beacon_spk_dual(refund: [u8; 32], auth: [u8; 32]) -> ScriptBuf {
-        let mut payload = Vec::with_capacity(67);
-        payload.extend_from_slice(BEACON_MARKER);
-        payload.extend_from_slice(&refund);
-        payload.extend_from_slice(&auth);
-        script::Builder::new()
-            .push_opcode(OP_RETURN)
-            .push_slice(<&bitcoin::script::PushBytes>::try_from(payload.as_slice()).unwrap())
-            .into_script()
-    }
-
-    /// Build a peg-in BTC tx with: 1 input (dummy P2WPKH), 1 P2TR peg-in
-    /// output at `amount`, 1 OP_RETURN beacon, 1 change output.
-    fn build_pegin_tx(depositor_xonly_bytes: [u8; 32], amount: Amount) -> Transaction {
-        let change_script =
-            ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x33; 20]));
-        build_tx_with_outputs(vec![
-            TxOut {
-                value: amount,
-                script_pubkey: pegin_spk(depositor_xonly_bytes),
-            },
-            TxOut {
-                value: Amount::ZERO,
-                script_pubkey: beacon_spk(depositor_xonly_bytes),
-            },
-            TxOut {
-                value: Amount::from_sat(500_000),
-                script_pubkey: change_script,
-            },
-        ])
-    }
-
-    fn build_tx_with_outputs(outputs: Vec<TxOut>) -> Transaction {
+    /// A one-input transaction paying exactly `outputs`.
+    pub(crate) fn tx_with_outputs(outputs: Vec<TxOut>) -> Transaction {
         Transaction {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
@@ -378,9 +385,44 @@ mod tests {
         }
     }
 
-    /// Build a full Aiken `PegInDatum` Constr with the raw tx in field[1].
-    /// Other fields are filler — production SPOs must ignore them.
-    fn build_datum_bytes(raw_tx: Vec<u8>) -> Vec<u8> {
+    /// The deposit scriptPubKey `tree` and `depositor` derive.
+    pub(crate) fn pegin_spk(tree: &PeginTreeParams, depositor: [u8; 32]) -> ScriptBuf {
+        let secp = Secp256k1::new();
+        let depositor = UntweakedPublicKey::from_slice(&depositor).expect("valid xonly");
+        ScriptBuf::new_p2tr_tweaked(pegin_spend_info(&secp, tree, depositor).output_key())
+    }
+
+    /// A peg-in BTC tx: the deposit output, the beacon, and a change output.
+    ///
+    /// `salt` only varies the change amount, which changes the txid — the way a
+    /// test gets two DISTINCT deposits out of one tree and one depositor.
+    pub(crate) fn pegin_tx(
+        tree: &PeginTreeParams,
+        depositor: [u8; 32],
+        amount: Amount,
+        salt: u64,
+    ) -> Transaction {
+        tx_with_outputs(vec![
+            TxOut {
+                value: amount,
+                script_pubkey: pegin_spk(tree, depositor),
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: beacon_spk(depositor),
+            },
+            TxOut {
+                value: Amount::from_sat(500_000 + salt),
+                script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                    [0x33; 20],
+                )),
+            },
+        ])
+    }
+
+    /// An Aiken `PegInDatum` Constr carrying `raw_tx` in field 1. Every other
+    /// field is filler: a production SPO must ignore all of them.
+    pub(crate) fn datum_bytes(raw_tx: Vec<u8>) -> Vec<u8> {
         // Filler `AuthorizationMethod::CardanoSignature { hash: .. }`:
         // Constr(0, [BoundedBytes(28-byte hash)]) = tag 121.
         let owner_auth = PlutusData::Constr(Constr {
@@ -407,6 +449,97 @@ mod tests {
             ]),
         });
         pallas_codec::minicbor::to_vec(&datum).unwrap()
+    }
+
+    /// A complete request: a deposit of `amount` paying `tree`, wrapped in a
+    /// datum and posted at the Cardano outpoint `(tag, 0)`.
+    pub(crate) fn pegin_request(
+        tree: &PeginTreeParams,
+        depositor: [u8; 32],
+        amount: Amount,
+        tag: u8,
+    ) -> CardanoPegInRequest {
+        let tx = pegin_tx(tree, depositor, amount, u64::from(tag));
+        CardanoPegInRequest {
+            cardano_utxo: CardanoOutRef {
+                tx_hash: [tag; 32],
+                output_index: 0,
+            },
+            datum_cbor: datum_bytes(bitcoin::consensus::encode::serialize(&tx)),
+            created_slot: Some(1),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::testkit::{beacon_spk, xonly_from_seed};
+    use super::*;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::opcodes::all::OP_RETURN;
+    use bitcoin::{Amount, TxOut, script};
+    use pallas_primitives::conway::Constr;
+    use pallas_primitives::{BigInt, BoundedBytes, MaybeIndefArray};
+
+    // ------ Helpers ------------------------------------------------------
+
+    const REFUND_TIMEOUT: u16 = 720;
+
+    /// Return a deterministic depositor Taproot output key as 32 raw bytes.
+    fn depositor_xonly() -> [u8; 32] {
+        xonly_from_seed([0xABu8; 32]).serialize()
+    }
+
+    fn test_y_fed() -> UntweakedPublicKey {
+        xonly_from_seed([0xFEu8; 32])
+    }
+
+    /// The bridge-wide tree the fixtures are built and parsed under. `test_y_fed()` is the
+    /// INTERNAL key here for historical reasons (the fixtures were written when it was);
+    /// what matters is that build and parse use the same params.
+    fn test_tree() -> PeginTreeParams {
+        PeginTreeParams {
+            y_51: test_y_fed(),
+            y_federation: xonly_from_seed([0xEDu8; 32]),
+            federation_csv_blocks: 144,
+            refund_timeout: REFUND_TIMEOUT,
+        }
+    }
+
+    fn pegin_spk(depositor_xonly_bytes: [u8; 32]) -> ScriptBuf {
+        testkit::pegin_spk(&test_tree(), depositor_xonly_bytes)
+    }
+
+    /// Build the retired 67-byte dual-key beacon `"BFR" || D || Q_auth`, kept
+    /// only to prove it is refused rather than dual-read.
+    fn beacon_spk_dual(refund: [u8; 32], auth: [u8; 32]) -> ScriptBuf {
+        let mut payload = Vec::with_capacity(67);
+        payload.extend_from_slice(BEACON_MARKER);
+        payload.extend_from_slice(&refund);
+        payload.extend_from_slice(&auth);
+        script::Builder::new()
+            .push_opcode(OP_RETURN)
+            .push_slice(<&bitcoin::script::PushBytes>::try_from(payload.as_slice()).unwrap())
+            .into_script()
+    }
+
+    /// Build a peg-in BTC tx with: 1 input (dummy P2WPKH), 1 P2TR peg-in
+    /// output at `amount`, 1 OP_RETURN beacon, 1 change output.
+    fn build_pegin_tx(depositor_xonly_bytes: [u8; 32], amount: Amount) -> Transaction {
+        testkit::pegin_tx(&test_tree(), depositor_xonly_bytes, amount, 0)
+    }
+
+    fn build_tx_with_outputs(outputs: Vec<TxOut>) -> Transaction {
+        testkit::tx_with_outputs(outputs)
+    }
+
+    fn build_datum_bytes(raw_tx: Vec<u8>) -> Vec<u8> {
+        testkit::datum_bytes(raw_tx)
     }
 
     fn make_request(datum_bytes: Vec<u8>) -> CardanoPegInRequest {

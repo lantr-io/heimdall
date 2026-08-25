@@ -173,6 +173,9 @@ pub fn treasury_from_btc_tx_bytes(
         authorized_key: config.y_51,
         federation_csv_blocks: config.federation_csv_blocks,
         pegin_refund_timeout_blocks: config.pegin_refund_timeout_blocks,
+        // A config-sourced reader knows of exactly one ceremony, so there is no
+        // superseded key it could name.
+        retired_internal_keys: Vec::new(),
         btc_confirmed,
     })
 }
@@ -241,6 +244,9 @@ pub fn parse_treasury_datum(
         authorized_key: config.y_51,
         federation_csv_blocks: config.federation_csv_blocks,
         pegin_refund_timeout_blocks: config.pegin_refund_timeout_blocks,
+        // A config-sourced reader knows of exactly one ceremony, so there is no
+        // superseded key it could name.
+        retired_internal_keys: Vec::new(),
         btc_confirmed,
     })
 }

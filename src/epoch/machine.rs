@@ -57,7 +57,7 @@ use crate::bitcoin::taproot::treasury_spend_info;
 use crate::bitcoin::tm_builder::{
     Freshness, PegInInput, PegOutRequest, TreasuryInput, build_tm, compute_sighashes,
 };
-use crate::cardano::pegin_datum::{ParsedPegIn, parse_pegin_request};
+use crate::cardano::pegin_datum::ParsedPegIn;
 use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInSource};
 use crate::epoch::dkg::dkg_phase;
 use crate::epoch::rotation;
@@ -67,6 +67,7 @@ use crate::epoch::state::{
     EpochKeys, EpochPhase, EpochResult, GroupKeys, Roster, SignCollected, SigningRound,
     TreasuryMovement,
 };
+use crate::epoch::traits::PeginKeyOrigin;
 use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use crate::frost::xonly::group_xonly;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2362,10 +2363,29 @@ fn hop_to_opportunity(
     std::time::Duration::from_secs(next_slot.saturating_sub(now_slot).max(1)).min(ceiling)
 }
 
+/// A peg-in request's place in the batch's total order.
+///
+/// The CARDANO outpoint, not the Bitcoin one: this orders REQUESTS, and the
+/// request is the Cardano UTxO. (The TM's input order is a separate, Bitcoin-side
+/// rule — lexicographic by `txid ‖ vout` — and is unaffected by this.)
+///
+/// An unresolved `created_slot` sorts LAST, which is the same `u64::MAX` the
+/// freeze uses: a request whose creation slot could not be read cannot be shown
+/// to be eligible, so it must never displace one that can.
+fn pegin_fifo_key(p: &ParsedPegIn) -> crate::epoch::batch::FifoKey {
+    crate::epoch::batch::FifoKey {
+        created_slot: p.created_slot.unwrap_or(u64::MAX),
+        tx_hash: p.cardano_utxo.tx_hash,
+        output_index: p.cardano_utxo.output_index,
+    }
+}
+
 /// Wait for this epoch's next batch opportunity, then read the Cardano peg-in
 /// source ONCE and freeze what it holds, parsing each request against the
 /// spec-derived peg-in Taproot for the current Y_51 internal key, the Y_fed
-/// emergency leaf and Q_auth. Parse failures are logged and dropped. The deduped,
+/// emergency leaf and Q_auth. Parse failures are logged and dropped, as is any
+/// request naming a deposit this node's SPI trie already records as swept — its
+/// PegInRequest outlives the sweep, so the source keeps offering it. The deduped,
 /// parsed set is frozen into the next `BuildTm` phase.
 ///
 /// The read used to be a poll over a local `pegin_collection_window` — a second,
@@ -2431,12 +2451,52 @@ async fn collect_pegins_phase(
         );
     };
 
-    // The bridge's peg-in tree, straight from the oracle. `TreasuryUtxo::pegin_tree` owns
-    // the field mapping — notably that the federation LEAF key is the PUBLISHED
-    // `config_y_fed`, not the head-derived `y_fed` — so no call site re-decides it.
-    let pegin_tree = treasury.pegin_tree().map_err(EpochError::Chain)?;
+    // Every tree a deposit may legitimately sit under, straight from the oracle.
+    // `TreasuryUtxo::pegin_trees` owns the field mapping — notably that the address
+    // the bridge PUBLISHES is keyed to the datum's `authorized_key` and its
+    // federation LEAF to `config_y_fed`, neither of them head-derived — so no call
+    // site re-decides any of it.
+    let pegin_trees = treasury.pegin_trees().map_err(EpochError::Chain)?;
+
+    // What confirmed TMs have already taken ([SPI-1]). A swept deposit's
+    // PegInRequest survives on Cardano until the DEPOSITOR mints against it — the
+    // sweep happens on Bitcoin, the completion is a separate user action, and
+    // nothing consumes the request in between — so the source keeps offering it as
+    // a candidate batch after batch.
+    //
+    // Re-including one is caught, but far too late and as a hard failure: the
+    // deposit outpoint is already spent on Bitcoin, and `build_tm`'s
+    // `root_after_inputs` re-inserts its key with a DIFFERENT value (this TM's own
+    // input-0, [SPI-3]) and raises `Conflict`, failing the WHOLE batch. One stale
+    // request would take every other peg-in and peg-out down with it, at every
+    // opportunity, until the depositor happened to mint. Skipping here leaves
+    // `Conflict` as the backstop it was written to be rather than the first line of
+    // defence. Loaded AFTER `settle_pending_tm` above, so a movement this node
+    // posted earlier is already folded in.
+    let swept = crate::cardano::spi_trie::SpiTrie::load_or_empty(config.state_dir.as_deref())
+        .map_err(|e| EpochError::Chain(format!("swept peg-ins trie: {e}")))?;
 
     let mut accepted: BTreeMap<CardanoOutRef, ParsedPegIn> = BTreeMap::new();
+    // The deposits `accepted` already holds, by their BITCOIN identity. Peg-in NFTs
+    // are permissionless, so nothing stops two PegInRequests — at two different
+    // Cardano outpoints, which is what `accepted` keys on — from naming the same
+    // raw deposit transaction. Both would become movement inputs, and a Bitcoin
+    // transaction that spends one outpoint twice is `bad-txns-inputs-duplicate`:
+    // never relayed, rebuilt identically at every opportunity, and the bridge stops
+    // moving until the extra request is closed. The SPI trie cannot catch it — the
+    // two copies carry the SAME value (this movement's input 0, [SPI-3]), which
+    // `insert_entry` accepts as a replay. `build_tm` guards the peg-OUT side of
+    // this on `por_id`; this is the peg-in side of the same rule.
+    // deposit outpoint -> (that request's FIFO key, its Cardano outpoint). The key
+    // is what decides a collision; the outpoint is how the loser is un-accepted.
+    let mut accepted_deposits: BTreeMap<[u8; 36], (crate::epoch::batch::FifoKey, CardanoOutRef)> =
+        BTreeMap::new();
+    let mut skipped_swept = 0usize;
+    let mut deferred = 0usize;
+    let mut stranded = 0usize;
+    // One libsecp256k1 context for the whole scan: `recognise_pegin` may try
+    // several trees per request, and building one per attempt dominated the cost.
+    let secp = bitcoin::key::Secp256k1::new();
     for req in pegin_source
         .query_pegin_requests(&config.pegin_policy_id)
         .await?
@@ -2446,14 +2506,178 @@ async fn collect_pegins_phase(
         }
         // Peg-in internal key is Y_51 (the FROST group key); Y_fed is a LEAF key —
         // see parse_pegin_request / commit 6af7c67.
-        match parse_pegin_request(&req, &pegin_tree) {
-            Ok(parsed) => {
+        match recognise_pegin(&req, &pegin_trees, &secp) {
+            Ok((origin, parsed)) => {
+                let deposit = parsed.outpoint();
+                if swept.contains(&deposit) {
+                    skipped_swept += 1;
+                    crate::epoch_debug!(
+                        me,
+                        epoch,
+                        "  skipped peg-in {:?}: deposit {}:{} was already swept",
+                        req.cardano_utxo,
+                        parsed.btc_txid,
+                        parsed.btc_vout
+                    );
+                    continue;
+                }
+                // A movement is signed with ONE key package, so it can only spend
+                // inputs under the key that spends the head. Recognising a deposit
+                // and being able to take it are separate questions, and this is the
+                // second one.
+                if !origin.sweepable() {
+                    match origin {
+                        PeginKeyOrigin::Retired => {
+                            stranded += 1;
+                            // Deliberately not "lost": every peg-in tree carries the
+                            // federation's emergency-sweep leaf as well as the
+                            // depositor's refund, and `PeginTreeParams::validate`
+                            // forces the federation's window to open FIRST. So the
+                            // earlier recovery is the federation's, and an operator
+                            // told only about the refund would either wait out the
+                            // longer window or write off coins the bridge can still
+                            // reach.
+                            //
+                            // Hedged on "no longer" rather than "never" because this
+                            // node classifies from what IT has: a key can land here
+                            // while this node's view of the datum lags a rotation it
+                            // has already run locally.
+                            crate::epoch_warn!(
+                                me,
+                                epoch,
+                                "  peg-in {:?} deposits {} sat ({}:{}) at an address this \
+                                 bridge no longer sweeps — internal key {}, Q_auth {}. No \
+                                 movement signs under that key, so recovery is the federation \
+                                 leaf after {} blocks or the depositor's refund after {}",
+                                req.cardano_utxo,
+                                parsed.value.to_sat(),
+                                parsed.btc_txid,
+                                parsed.btc_vout,
+                                hex::encode(parsed.spend_info.internal_key().serialize()),
+                                hex::encode(parsed.depositor_outputkey.serialize()),
+                                treasury.federation_csv_blocks,
+                                treasury.pegin_refund_timeout_blocks
+                            );
+                        }
+                        // Exhaustive on purpose. `sweepable()` admits only
+                        // `Published` here today, but the guard above is the only
+                        // thing keeping the others out — a new origin, or a change
+                        // to what counts as sweepable, must be a compile error and
+                        // not a request silently counted with someone else's
+                        // explanation.
+                        PeginKeyOrigin::Published => {
+                            deferred += 1;
+                            crate::epoch_debug!(
+                                me,
+                                epoch,
+                                "  deferring peg-in {:?}: it pays the address the bridge now \
+                                 publishes, which the current head cannot spend",
+                                req.cardano_utxo
+                            );
+                        }
+                        PeginKeyOrigin::Current | PeginKeyOrigin::Head => unreachable!(
+                            "{} is sweepable and cannot reach the deferral arm",
+                            origin.label()
+                        ),
+                    }
+                    continue;
+                }
+                // Two requests naming one deposit: keep the FIFO-lowest, not the
+                // one that happened to arrive first. Both sources return requests
+                // ascending by Cardano outpoint, so "first wins" handed the deposit
+                // to whichever request had the smaller txid — which is grindable
+                // offline. Anyone could mint a peg-in NFT at a low txid carrying
+                // someone else's deposit tx, evict the real request here, and then
+                // be dropped by `freeze_pegins` as created after the cutoff: the
+                // deposit lands in NO batch, and repeating it once per
+                // `tm_batch_interval` censors that depositor indefinitely.
+                //
+                // The FIFO key is already the batch's own total order, and its
+                // leading term is `created_slot`, so the earliest-created request
+                // wins — which is also the one most likely to be eligible, since
+                // eligibility IS `created_slot <= C_i`. An unresolved slot sorts
+                // last for the same reason `freeze_pegins` maps it to `u64::MAX`.
+                let key = pegin_fifo_key(&parsed);
+                let (deposit_txid, deposit_vout) = (parsed.btc_txid, parsed.btc_vout);
+                if let Some((prev_key, prev_utxo)) = accepted_deposits.get(&deposit).cloned() {
+                    let (loser, winner) = if key < prev_key {
+                        accepted.remove(&prev_utxo);
+                        accepted_deposits.insert(deposit, (key, req.cardano_utxo.clone()));
+                        accepted.insert(req.cardano_utxo.clone(), parsed);
+                        (prev_utxo, req.cardano_utxo.clone())
+                    } else {
+                        (req.cardano_utxo.clone(), prev_utxo)
+                    };
+                    crate::epoch_warn!(
+                        me,
+                        epoch,
+                        "  dropped peg-in {loser:?}: deposit {}:{} is also claimed by {winner:?}, \
+                         which is earlier in the batch's FIFO order — a movement cannot spend one \
+                         outpoint twice, and the earlier request is the one that can be eligible",
+                        deposit_txid,
+                        deposit_vout
+                    );
+                    continue;
+                }
+                accepted_deposits.insert(deposit, (key, req.cardano_utxo.clone()));
                 accepted.insert(req.cardano_utxo.clone(), parsed);
             }
             Err(e) => {
                 crate::epoch_warn!(me, epoch, "  dropped peg-in {:?}: {}", req.cardano_utxo, e);
             }
         }
+    }
+    if skipped_swept > 0 {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  {} peg-in request(s) name a deposit a confirmed TM already swept — skipped, \
+             awaiting their depositors' mint. If a LIVE deposit is missing from a batch, this \
+             trie is what excluded it: check it with reconstruct-spi-trie",
+            skipped_swept
+        );
+    }
+    if deferred > 0 {
+        // WARN, not INFO, even though a short wait here is by design. These are
+        // deposits the bridge is holding and cannot yet move, and the only thing
+        // separating "a normal 17-hour handoff" from a handoff that never completes
+        // — the outgoing roster gone, nobody left holding the key the head is under
+        // — is how long it goes on. A node cannot tell those apart at one
+        // opportunity, so it must not report the second as if it were the first:
+        // an operator whose alerting reads `journalctl -p warning` would otherwise
+        // watch an unsweepable balance accumulate in silence.
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  {} peg-in(s) wait for the handoff: they pay the address the treasury_info datum \
+             publishes, and the head is still locked under the key it supersedes. Expected \
+             briefly after an Update-Y; persisting means the handoff movement is not happening",
+            deferred
+        );
+    }
+    if stranded > 0 {
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  {} peg-in(s) sit at a retired address and CANNOT be swept — see the warnings \
+             above",
+            stranded
+        );
+    }
+    // A movement built while the datum and the head disagree IS the handoff: it
+    // spends the head and pays its change to `authorized_key`, so the head is under
+    // the incoming key from then on and nothing signs under the outgoing one again.
+    // Everything accepted above is under the outgoing key, which makes this the last
+    // opportunity any of it has.
+    if treasury.authorized_key != treasury.y_51 && !accepted.is_empty() {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  {} peg-in(s) pay the OUTGOING address and this movement is the handoff — the \
+             last one that can sweep them, since its change moves the treasury to {}",
+            accepted.len(),
+            hex::encode(treasury.authorized_key.serialize())
+        );
     }
 
     let frozen_pegins = freeze_pegins(accepted.into_values().collect(), batch, me, epoch)?;
@@ -2472,6 +2696,65 @@ async fn collect_pegins_phase(
         batch,
         frozen_pegins,
     })
+}
+
+/// Recognise a peg-in request against every tree the bridge may hold deposits
+/// under, and report WHICH tree matched.
+///
+/// A SWEEPABLE match wins over tree order. Only one tree can match a given OUTPUT
+/// — the scriptPubKey is one Taproot output key and two trees differing in their
+/// internal key derive two different ones — but a transaction has many outputs,
+/// and `locate` searches all of them. So one transaction paying two of this
+/// bridge's addresses matches two trees, on different outputs. Returning the first
+/// match would resolve it by tree order, and `pegin_trees` puts the non-sweepable
+/// Published tree first: the request would be deferred on account of the output
+/// the movement cannot spend while the output it CAN spend goes unswept, and after
+/// the handoff the same tx keeps matching the same output, so the sweepable one is
+/// never even reported as stranded.
+///
+/// Preferring sweepable makes the choice about what the bridge can act on rather
+/// than about the order a list happened to be built in. Where no match is
+/// sweepable the first is returned, which is the published tree's — the address
+/// this bridge tells depositors to use.
+///
+/// The error, when nothing matches, is likewise the first tree's: an operator
+/// reading "no output pays the peg-in address" wants it measured against the
+/// address they would have quoted, not against whichever superseded key happened
+/// to be tried last. An error from the decode is not a tree's at all and
+/// short-circuits before any is tried.
+fn recognise_pegin(
+    req: &crate::cardano::pegin_source::CardanoPegInRequest,
+    trees: &[(PeginKeyOrigin, crate::bitcoin::taproot::PeginTreeParams)],
+    secp: &bitcoin::key::Secp256k1<bitcoin::secp256k1::All>,
+) -> Result<(PeginKeyOrigin, ParsedPegIn), crate::cardano::pegin_datum::ParseError> {
+    // Decoded ONCE: the datum, the transaction and the beacon say nothing about the
+    // bridge's tree, so a request that is malformed is malformed for every tree and
+    // says so without any of them being tried.
+    let deposit = crate::cardano::pegin_datum::decode_pegin_request(req)?;
+    let mut published_err = None;
+    let mut unsweepable: Option<(PeginKeyOrigin, ParsedPegIn)> = None;
+    for (origin, tree) in trees {
+        match deposit.locate(tree, secp) {
+            Ok(parsed) if origin.sweepable() => return Ok((*origin, parsed)),
+            Ok(parsed) => {
+                if unsweepable.is_none() {
+                    unsweepable = Some((*origin, parsed));
+                }
+            }
+            Err(e) => {
+                if published_err.is_none() {
+                    published_err = Some(e);
+                }
+            }
+        }
+    }
+    if let Some(found) = unsweepable {
+        return Ok(found);
+    }
+    // `pegin_trees` never yields an empty list, but the invariant lives in another
+    // function: report the request as matching nothing rather than panicking here
+    // if it ever does.
+    Err(published_err.unwrap_or(crate::cardano::pegin_datum::ParseError::NoPegInOutput))
 }
 
 /// Freeze the discovered peg-in set against this batch (spec §TM batches; WI-049).
@@ -2525,16 +2808,11 @@ fn freeze_pegins(
         )));
     }
 
-    // The CARDANO outpoint, not the Bitcoin one: this orders REQUESTS, and the
-    // request is the Cardano UTxO. (The TM's input order is a separate, Bitcoin-
-    // side rule — lexicographic by (txid ‖ vout) — and is unaffected by this.)
-    let key = |p: &ParsedPegIn| FifoKey {
-        // Every entry is resolved by the refusal above, so the fallback is
-        // unreachable rather than a policy.
-        created_slot: p.created_slot.unwrap_or(u64::MAX),
-        tx_hash: p.cardano_utxo.tx_hash,
-        output_index: p.cardano_utxo.output_index,
-    };
+    // Every entry is resolved by the refusal above, so `pegin_fifo_key`'s
+    // unresolved fallback is unreachable here rather than a policy. Shared with
+    // the collection-time dedup so a request cannot rank one way there and another
+    // way here.
+    let key: fn(&ParsedPegIn) -> FifoKey = pegin_fifo_key;
 
     let Some(batch) = batch else {
         // No grid: order only. A mock chain, or a deployment whose Config carries
@@ -3163,6 +3441,18 @@ async fn build_tm_phase(
     // what keeps the TM bytes identical — so a divergence here is the first place
     // an operator sees a chain-state disagreement. Without this the daemon drops
     // them silently, unlike the CLI sweep path.
+    // Should be zero here — `collect_pegins_phase` resolves this earlier, and with
+    // more to say. A non-zero count means the two disagree, which is worth a line
+    // of its own rather than a silently smaller input set.
+    if unsigned.duplicate_deposits_dropped > 0 {
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  {} peg-in input(s) dropped by the builder as duplicate deposits — collection \
+             should have caught these; the batch is still correct",
+            unsigned.duplicate_deposits_dropped
+        );
+    }
     for s in &unsigned.skipped_pegouts {
         crate::epoch_log!(
             me,
@@ -4834,6 +5124,490 @@ mod tests {
         );
     }
 
+    /// A deposit a confirmed TM already swept must be skipped where it is
+    /// COLLECTED, not where the movement is built.
+    ///
+    /// Its PegInRequest survives the sweep — the sweep is on Bitcoin, the mint is
+    /// a separate user action, and nothing consumes the request in between — so
+    /// the source keeps offering it. Re-including one used to reach `build_tm`,
+    /// where `root_after_inputs` re-inserts the key with this TM's own input-0
+    /// ([SPI-3]) instead of the original sweeper's and raises `Conflict`. Correct,
+    /// but it failed the WHOLE batch: one stale request took every other peg-in
+    /// and peg-out down with it, at every opportunity, until its depositor
+    /// happened to mint.
+    ///
+    /// The fresh request in the same source is the half that makes this a
+    /// regression test rather than a tautology: it proves the batch still gets
+    /// built, and gets built with exactly the deposits that are still there.
+    #[tokio::test]
+    async fn an_already_swept_deposit_is_skipped_at_collection() {
+        use crate::cardano::pegin_datum::testkit;
+        use crate::cardano::spi_trie::SpiTrie;
+
+        let (roster, keys) = group_for(0xf5, 2, 3);
+        let (_, fed) = group_for(0xf6, 2, 3);
+        let y = xonly_of(&keys);
+        let mut fixture = demo_static_fixture(2, 2, 19_560);
+        fixture.y_51 = y;
+        fixture.y_fed = y;
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(y)
+                .with_config_y_fed(xonly_of(&fed))
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y, [0x5a; 32]))
+                .with_batch(slot(1)),
+        );
+        let config = fast_config(*keys.key_package.identifier());
+        let dir = config
+            .state_dir
+            .clone()
+            .expect("fast_config gives a state dir");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Both deposits pay the bridge's own peg-in address, so the only thing
+        // separating them is the trie.
+        let tree = chain
+            .query_treasury()
+            .await
+            .expect("the mock treasury reads")
+            .pegin_tree()
+            .expect("the fixture's timeouts are ordered");
+        let depositor = testkit::xonly_from_seed([0xd1; 32]).serialize();
+        let swept =
+            testkit::pegin_request(&tree, depositor, bitcoin::Amount::from_sat(400_000), 0x11);
+        let fresh =
+            testkit::pegin_request(&tree, depositor, bitcoin::Amount::from_sat(400_000), 0x22);
+
+        // Record the first as a confirmed TM would have: input 0 is the head that
+        // TM spent, the deposit is the swept input [SPI-1].
+        let parsed = crate::cardano::pegin_datum::parse_pegin_request(&swept, &tree)
+            .expect("the fixture parses");
+        let mut trie = SpiTrie::empty();
+        trie.insert_for_confirmed_tm(&[
+            spi_op(0xaa, 0),
+            crate::cardano::tm_chain::outpoint_bytes(&bitcoin::OutPoint {
+                txid: parsed.btc_txid,
+                vout: parsed.btc_vout,
+            }),
+        ])
+        .expect("a fresh trie takes the sweep");
+        trie.save(&dir).expect("the trie persists");
+
+        let source = MockCardanoPegInSource::new();
+        source.push(std::time::Instant::now(), swept.clone());
+        source.push(std::time::Instant::now(), fresh.clone());
+        let pegin: Arc<dyn CardanoPegInSource> = Arc::new(source);
+
+        let mut built = BuiltBatch::default();
+        let next = collect_pegins_phase(&chain, &pegin, &config, 9, roster, keys, &mut built)
+            .await
+            .expect("a stale request must not fail the collection");
+        let EpochPhase::BuildTm { frozen_pegins, .. } = next else {
+            panic!("expected BuildTm, got {}", next.name());
+        };
+
+        assert_eq!(
+            frozen_pegins.len(),
+            1,
+            "the swept deposit must be dropped and the fresh one kept"
+        );
+        assert_eq!(
+            frozen_pegins[0].cardano_utxo, fresh.cardano_utxo,
+            "the survivor is the request whose deposit no TM has taken"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Inside the handoff window a node must recognise the address the bridge
+    /// PUBLISHES, batch only the deposits the head can actually spend, and say so
+    /// about the rest.
+    ///
+    /// Three deposits, one per tree, all real and all this bridge's:
+    ///
+    /// - the PUBLISHED address (`authorized_key`) — where every spec-compliant
+    ///   depositor sends from the Update-Y onward (spec §Rollout Phases step 5).
+    ///   The head is still under the superseded key, and a movement signs every
+    ///   input with one key package, so nothing can take this until the handoff
+    ///   confirms. Deferred, not dropped: peg-ins roll over freely.
+    /// - the HEAD's address — where deposits built before the Update-Y land. The
+    ///   movement about to be built is the last one that can ever take these.
+    /// - a RETIRED ceremony's address — nothing will sign under that key again, so
+    ///   this is reportable and nothing more.
+    ///
+    /// Before this, `pegin_tree()` was keyed to the head and returned one tree, so
+    /// the published deposit — the spec-correct one — failed to parse and was
+    /// dropped with a `warn!` for the whole window, once per epoch.
+    #[tokio::test]
+    async fn the_handoff_window_batches_what_the_head_can_spend_and_defers_the_rest() {
+        use crate::cardano::pegin_datum::testkit;
+
+        let (roster, keys) = group_for(0xa8, 2, 3);
+        let (_, incoming) = group_for(0xa9, 2, 3);
+        let (_, retired) = group_for(0xab, 2, 3);
+        let (_, fed) = group_for(0xac, 2, 3);
+        let y_out = xonly_of(&keys);
+        let y_in = xonly_of(&incoming);
+        let y_old = xonly_of(&retired);
+        assert_ne!(y_out, y_in);
+
+        let mut fixture = demo_static_fixture(2, 2, 19_580);
+        fixture.y_51 = y_out;
+        fixture.y_fed = y_out;
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(y_out)
+                .with_config_y_fed(xonly_of(&fed))
+                // The datum has rotated; the BTC has not moved.
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y_in, [0x5a; 32]))
+                .with_retired_internal_keys(vec![y_old])
+                .with_batch(slot(1)),
+        );
+        let config = fast_config(*keys.key_package.identifier());
+        let dir = config
+            .state_dir
+            .clone()
+            .expect("fast_config gives a state dir");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let treasury = chain
+            .query_treasury()
+            .await
+            .expect("the mock treasury reads");
+        assert_eq!(
+            treasury.y_51, y_out,
+            "the head is still under the outgoing key"
+        );
+        assert_eq!(
+            treasury.authorized_key, y_in,
+            "the datum already names the incoming one"
+        );
+
+        // (i) The address this bridge publishes is the one a depositor builds.
+        assert_eq!(
+            treasury.pegin_tree().expect("valid").y_51,
+            y_in,
+            "the published peg-in address follows the datum, which is the only peg-in key a \
+             Cardano-only reader can see"
+        );
+
+        let trees = treasury.pegin_trees().expect("valid");
+        assert_eq!(trees.len(), 3, "published, head, retired");
+        let depositor = testkit::xonly_from_seed([0xd2; 32]).serialize();
+        let amount = bitcoin::Amount::from_sat(400_000);
+        let published = testkit::pegin_request(&trees[0].1, depositor, amount, 0x31);
+        let head = testkit::pegin_request(&trees[1].1, depositor, amount, 0x32);
+        let stranded = testkit::pegin_request(&trees[2].1, depositor, amount, 0x33);
+
+        let source = MockCardanoPegInSource::new();
+        for req in [&published, &head, &stranded] {
+            source.push(std::time::Instant::now(), req.clone());
+        }
+        let pegin: Arc<dyn CardanoPegInSource> = Arc::new(source);
+
+        let mut built = BuiltBatch::default();
+        let next = collect_pegins_phase(&chain, &pegin, &config, 9, roster, keys, &mut built)
+            .await
+            .expect("collection must not fail on any of the three");
+        let EpochPhase::BuildTm { frozen_pegins, .. } = next else {
+            panic!("expected BuildTm, got {}", next.name());
+        };
+
+        // (ii) and (iii).
+        assert_eq!(
+            frozen_pegins.len(),
+            1,
+            "only the deposit under the head's key can be spent by the movement this batch \
+             builds"
+        );
+        assert_eq!(
+            frozen_pegins[0].cardano_utxo, head.cardano_utxo,
+            "and it is the one paying the head's address, not the published one"
+        );
+        assert_eq!(
+            frozen_pegins[0].spend_info.internal_key(),
+            y_out,
+            "every input of a movement is signed with one key package, so a batched peg-in's \
+             internal key must be the head's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `recognise_pegin` is where the recognition half of WI-MA9BA actually lives,
+    /// and it is testable directly — which the phase-level test is not, because a
+    /// deposit that is recognised-but-deferred and one that failed to parse both
+    /// leave the frozen set the same size.
+    ///
+    /// Each of the three trees, plus a deposit built under a key this bridge has
+    /// never published, which must still be refused.
+    #[test]
+    fn recognise_pegin_reports_which_tree_matched() {
+        use crate::cardano::pegin_datum::testkit;
+
+        let mut u = treasury_at(bitcoin::OutPoint::null());
+        u.y_51 = xonly_seed(0x11);
+        u.authorized_key = xonly_seed(0x22);
+        u.config_y_fed = xonly_seed(0x33);
+        u.retired_internal_keys = vec![xonly_seed(0x44)];
+        let trees = u.pegin_trees().expect("valid");
+        assert_eq!(trees.len(), 3);
+
+        let secp = bitcoin::key::Secp256k1::new();
+        let depositor = testkit::xonly_from_seed([0xd3; 32]).serialize();
+        let amount = bitcoin::Amount::from_sat(300_000);
+
+        for (i, expected) in [
+            PeginKeyOrigin::Published,
+            PeginKeyOrigin::Head,
+            PeginKeyOrigin::Retired,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let req = testkit::pegin_request(&trees[i].1, depositor, amount, 0x40 + i as u8);
+            let (origin, parsed) =
+                recognise_pegin(&req, &trees, &secp).expect("this bridge published this address");
+            assert_eq!(origin, expected, "tree {i}");
+            assert_eq!(
+                parsed.spend_info.internal_key(),
+                trees[i].1.y_51,
+                "the match must report the tree it actually matched, not the first one tried"
+            );
+            assert_eq!(origin.sweepable(), expected == PeginKeyOrigin::Head);
+        }
+
+        // A key this bridge never published: refused, and the error is measured
+        // against the PUBLISHED address rather than whichever tree was tried last.
+        let foreign = crate::bitcoin::taproot::PeginTreeParams {
+            y_51: xonly_seed(0x99),
+            ..trees[0].1
+        };
+        let req = testkit::pegin_request(&foreign, depositor, amount, 0x4f);
+        let err = recognise_pegin(&req, &trees, &secp).expect_err("not this bridge's deposit");
+        assert!(
+            matches!(err, crate::cardano::pegin_datum::ParseError::NoPegInOutput),
+            "{err}"
+        );
+    }
+
+    /// One transaction paying TWO of this bridge's addresses must resolve to the
+    /// output the movement can actually spend, not to whichever tree is listed
+    /// first.
+    ///
+    /// `locate` searches every output, so during a handoff a tx with one output at
+    /// the Published address and another at the Head address matches BOTH trees —
+    /// "at most one tree matches" holds per output, not per transaction. With
+    /// `pegin_trees` putting the non-sweepable Published tree first, returning the
+    /// first match deferred the request on account of the output this movement
+    /// cannot spend, while the output it CAN spend went unswept; and after the
+    /// handoff the same tx kept matching the same output, so the sweepable one was
+    /// never even reported as stranded.
+    #[test]
+    fn a_deposit_paying_two_of_our_addresses_resolves_to_the_sweepable_one() {
+        use crate::cardano::pegin_datum::testkit;
+
+        let mut u = treasury_at(bitcoin::OutPoint::null());
+        u.y_51 = xonly_seed(0x11); // the head — sweepable
+        u.authorized_key = xonly_seed(0x22); // what the datum publishes
+        u.config_y_fed = xonly_seed(0x33);
+        let trees = u.pegin_trees().expect("valid");
+        assert_eq!(trees[0].0, PeginKeyOrigin::Published);
+        assert_eq!(trees[1].0, PeginKeyOrigin::Head);
+
+        let depositor = testkit::xonly_from_seed([0xd6; 32]).serialize();
+        // Published output FIRST, so output order cannot be what saves this.
+        let tx = testkit::tx_with_outputs(vec![
+            bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(400_000),
+                script_pubkey: testkit::pegin_spk(&trees[0].1, depositor),
+            },
+            bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(900_000),
+                script_pubkey: testkit::pegin_spk(&trees[1].1, depositor),
+            },
+            bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: testkit::beacon_spk(depositor),
+            },
+        ]);
+        let req = crate::cardano::pegin_source::CardanoPegInRequest {
+            cardano_utxo: crate::cardano::pegin_source::CardanoOutRef {
+                tx_hash: [0x7c; 32],
+                output_index: 0,
+            },
+            datum_cbor: testkit::datum_bytes(bitcoin::consensus::encode::serialize(&tx)),
+            created_slot: Some(1),
+        };
+
+        let secp = bitcoin::key::Secp256k1::new();
+        let (origin, parsed) = recognise_pegin(&req, &trees, &secp).expect("ours either way");
+        assert_eq!(
+            origin,
+            PeginKeyOrigin::Head,
+            "the sweepable match must win over tree order"
+        );
+        assert!(origin.sweepable());
+        assert_eq!(
+            parsed.spend_info.internal_key(),
+            trees[1].1.y_51,
+            "and it must carry the tree it matched, so the input signs under the head key"
+        );
+        assert_eq!(parsed.btc_vout, 1, "the output this movement can spend");
+    }
+
+    /// Two PegInRequests naming the SAME Bitcoin deposit must yield one movement
+    /// input, not two.
+    ///
+    /// Peg-in NFTs are permissionless, so posting a second request that carries the
+    /// same raw deposit transaction costs an attacker one NFT. The dedup that was
+    /// here keyed on the Cardano outpoint, which differs, so both survived and both
+    /// became inputs — and a transaction spending one outpoint twice is
+    /// `bad-txns-inputs-duplicate`: never relayed, rebuilt identically at the next
+    /// opportunity, and the bridge stops moving. The SPI trie is no backstop, since
+    /// both copies carry the same value and `insert_entry` treats that as a replay.
+    #[tokio::test]
+    async fn two_requests_naming_one_deposit_yield_one_input() {
+        use crate::cardano::pegin_datum::testkit;
+
+        let (roster, keys) = group_for(0xf7, 2, 3);
+        let (_, fed) = group_for(0xf8, 2, 3);
+        let y = xonly_of(&keys);
+        let mut fixture = demo_static_fixture(2, 2, 19_600);
+        fixture.y_51 = y;
+        fixture.y_fed = y;
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(y)
+                .with_config_y_fed(xonly_of(&fed))
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y, [0x5a; 32]))
+                .with_batch(slot(1)),
+        );
+        let config = fast_config(*keys.key_package.identifier());
+        let dir = config
+            .state_dir
+            .clone()
+            .expect("fast_config gives a state dir");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let tree = chain
+            .query_treasury()
+            .await
+            .expect("the mock treasury reads")
+            .pegin_tree()
+            .expect("valid");
+        let depositor = testkit::xonly_from_seed([0xd4; 32]).serialize();
+        let original =
+            testkit::pegin_request(&tree, depositor, bitcoin::Amount::from_sat(400_000), 0x51);
+        // Same deposit transaction, a different Cardano outpoint — which is exactly
+        // what a second peg-in NFT buys.
+        let mut clone = original.clone();
+        clone.cardano_utxo.tx_hash = [0x52; 32];
+        assert_ne!(original.cardano_utxo, clone.cardano_utxo);
+        assert_eq!(original.datum_cbor, clone.datum_cbor);
+
+        let source = MockCardanoPegInSource::new();
+        source.push(std::time::Instant::now(), original.clone());
+        source.push(std::time::Instant::now(), clone);
+        let pegin: Arc<dyn CardanoPegInSource> = Arc::new(source);
+
+        let mut built = BuiltBatch::default();
+        let next = collect_pegins_phase(&chain, &pegin, &config, 9, roster, keys, &mut built)
+            .await
+            .expect("a duplicate request must not fail the collection");
+        let EpochPhase::BuildTm { frozen_pegins, .. } = next else {
+            panic!("expected BuildTm, got {}", next.name());
+        };
+        assert_eq!(
+            frozen_pegins.len(),
+            1,
+            "one deposit is one input however many requests name it"
+        );
+        // AND it is the ORIGINAL that survives, not whichever Cardano outpoint
+        // sorts first. Both sources return requests ascending by outpoint, so
+        // "first wins" would hand the deposit to the lower txid — which anyone can
+        // grind offline. The survivor must be decided by the batch's own FIFO
+        // order, whose leading term is `created_slot`.
+        assert_eq!(
+            frozen_pegins[0].cardano_utxo.tx_hash, original.cardano_utxo.tx_hash,
+            "the earlier-created request keeps the deposit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A duplicate request cannot CENSOR a deposit by sorting ahead of the real
+    /// one and then being dropped by the cutoff.
+    ///
+    /// The attack the FIFO rule closes: mint a peg-in NFT whose Cardano txid is
+    /// below the honest request's (grindable offline), point it at someone else's
+    /// deposit, and post it after the batch cutoff. Under "first insert wins" the
+    /// impostor took the deposit at collection and `freeze_pegins` then discarded
+    /// it as too new — so the deposit joined NO batch, and repeating it once per
+    /// `tm_batch_interval` withholds that depositor's funds indefinitely.
+    #[tokio::test]
+    async fn a_later_duplicate_cannot_evict_the_request_that_is_in_the_batch() {
+        use crate::cardano::pegin_datum::testkit;
+
+        let (roster, keys) = group_for(0xf9, 2, 3);
+        let (_, fed) = group_for(0xfa, 2, 3);
+        let y = xonly_of(&keys);
+        let mut fixture = demo_static_fixture(2, 2, 19_610);
+        fixture.y_51 = y;
+        fixture.y_fed = y;
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(y)
+                .with_config_y_fed(xonly_of(&fed))
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y, [0x5a; 32]))
+                .with_batch(slot(1)),
+        );
+        let config = fast_config(*keys.key_package.identifier());
+        let dir = config
+            .state_dir
+            .clone()
+            .expect("fast_config gives a state dir");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let tree = chain
+            .query_treasury()
+            .await
+            .expect("the mock treasury reads")
+            .pegin_tree()
+            .expect("valid");
+        let depositor = testkit::xonly_from_seed([0xd5; 32]).serialize();
+        let mut honest =
+            testkit::pegin_request(&tree, depositor, bitcoin::Amount::from_sat(400_000), 0x61);
+        // The honest request is old enough for the batch...
+        honest.cardano_utxo.tx_hash = [0xee; 32];
+        honest.created_slot = Some(1);
+        // ...and the impostor grinds a LOWER txid, but is created far too late.
+        let mut impostor = honest.clone();
+        impostor.cardano_utxo.tx_hash = [0x00; 32];
+        impostor.created_slot = Some(u64::MAX / 2);
+        assert!(impostor.cardano_utxo.tx_hash < honest.cardano_utxo.tx_hash);
+
+        let source = MockCardanoPegInSource::new();
+        source.push(std::time::Instant::now(), impostor);
+        source.push(std::time::Instant::now(), honest.clone());
+        let pegin: Arc<dyn CardanoPegInSource> = Arc::new(source);
+
+        let mut built = BuiltBatch::default();
+        let next = collect_pegins_phase(&chain, &pegin, &config, 9, roster, keys, &mut built)
+            .await
+            .expect("collection survives the duplicate");
+        let EpochPhase::BuildTm { frozen_pegins, .. } = next else {
+            panic!("expected BuildTm, got {}", next.name());
+        };
+        assert_eq!(
+            frozen_pegins.len(),
+            1,
+            "the deposit is still in the batch — the late duplicate did not take it out"
+        );
+        assert_eq!(
+            frozen_pegins[0].cardano_utxo.tx_hash, honest.cardano_utxo.tx_hash,
+            "and it is the honest request that carries it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (c) Disjointness. Over all four `(authorized_key, y_51)` combinations of
     /// the federation key and a roster key, EXACTLY ONE of {the SPO roster, the
     /// federation} builds a movement — and it is always the one holding `y_51`,
@@ -6418,6 +7192,11 @@ mod tests {
     // --- swept peg-ins trie wiring [SPI-1] [SPI-3] -------------------------
 
     /// A 36-byte outpoint: txid internal order (32 bytes of `b`) ++ vout LE.
+    /// A deterministic x-only key, for tests that only need distinct ones.
+    fn xonly_seed(b: u8) -> bitcoin::key::UntweakedPublicKey {
+        crate::cardano::pegin_datum::testkit::xonly_from_seed([b; 32])
+    }
+
     fn spi_op(b: u8, vout: u32) -> [u8; 36] {
         let mut o = [b; 36];
         o[32..].copy_from_slice(&vout.to_le_bytes());
@@ -6480,6 +7259,7 @@ mod tests {
             authorized_key: f.y_51,
             federation_csv_blocks: f.federation_csv_blocks,
             pegin_refund_timeout_blocks: 720,
+            retired_internal_keys: Vec::new(),
             btc_confirmed: true,
         }
     }

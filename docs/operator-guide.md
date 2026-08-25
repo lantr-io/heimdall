@@ -278,8 +278,17 @@ with a testnet bech32 prefix, and the fault-proof safety gate described in
 [the fault-proof trusted setup](fault-proof-srs.md) would fail open. Refusing to guess is the only
 safe behaviour.
 
-Verify your backend serves what heimdall needs before switching over: the check below exercises the
-read paths against whatever you configured, so run it after the change and read every line.
+**Verified:** Dolos **v1.6.0** answers every read heimdall makes, checked against preprod with real
+data — address UTxOs, `/blocks/latest`, `/epochs/latest` and its parameters, `/pools/{id}`,
+`/accounts/{stake_address}`, script and datum resolution, and `/txs/{hash}` with its UTxOs.
+Pagination follows Blockfrost's convention — pages start at 1 — which is what heimdall expects.
+Transaction submission goes to the same `blockfrost_url`, but was not exercised in that run; the
+first movement your node posts is what proves it.
+
+Older builds are not equivalent. `/epochs/latest` is a recent addition to Dolos, and it is the first
+call heimdall makes of any provider, so a build without it fails at startup rather than partway
+through. Whatever backend you run, the check below exercises the read paths against it — run it
+after the change and read every line.
 
 ---
 
