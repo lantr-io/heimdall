@@ -2097,9 +2097,27 @@ async fn run_spo(
                  so EVERY node of this roster must set it too. It is refused on mainnet"
             );
         }
+        // TEST-RUN ONLY: the virtual epoch. Validated at config load, so this
+        // cannot fail on a config that got this far — but it is mapped rather
+        // than unwrapped so a future caller that skips the load-time check gets
+        // an error instead of a panic.
+        let scheme = heimdall::epoch::virtual_epoch::EpochScheme::from_slots(
+            cfg.cardano.demo_virtual_epoch_slots,
+        )
+        .unwrap_or_else(|e| panic!("cardano.demo_virtual_epoch_slots: {e}"));
+        if let Some(slots) = scheme.virtual_slots() {
+            // Loud for the same reason demo_live_stake is, only more so: this one
+            // decides the DKG NAMESPACE, so a node that has it and a node that
+            // does not never fetch each other's payloads at all. Neither side
+            // errors; each waits for a ceremony the other cannot see.
+            warn!(
+                "[epoch] TEST RUN: the bridge cycle is a {slots}-slot VIRTUAL epoch                  (cardano.demo_virtual_epoch_slots), not Cardano's five-day one, and the                  Config schedule is rescaled to fit it. EVERY node of this roster must set                  the same value — a mismatch splits the DKG namespace. It is refused on                  mainnet"
+            );
+        }
         bf_chain = bf_chain
             .with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked)
-            .with_demo_live_stake(cfg.cardano.demo_live_stake);
+            .with_demo_live_stake(cfg.cardano.demo_live_stake)
+            .with_epoch_scheme(scheme);
 
         // The bridge Config, read once at startup. It publishes the ban policy
         // (#8 and params[4..=6]), so a node needs no ban keys of its own — and an unreadable
@@ -2910,10 +2928,18 @@ fn batch_params(
              sat/vB) — {why}. Co-signers reading a different value build different TM bytes."
         );
     }
+    // The same cycle the daemon runs on, for the same reason the pitch and the
+    // anchor come from the chain: a CLI sweep that resolved a different grid than
+    // its co-signers would freeze a batch none of them reproduce.
+    let scheme = heimdall::epoch::virtual_epoch::EpochScheme::from_slots(
+        cfg.cardano.demo_virtual_epoch_slots,
+    )
+    .map_err(|e| format!("cardano.demo_virtual_epoch_slots: {e}"))?;
     let batch = rt.block_on(heimdall::cardano::config_params::batch_at(
         &loc.base_url,
         &loc.project_id,
         &snapshot,
+        scheme,
     ));
     if let (true, Some(b)) = (verbose, batch.open()) {
         info!(

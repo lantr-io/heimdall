@@ -221,6 +221,28 @@ pub fn test_stake_weighting(live_stake: bool) -> Option<String> {
     })
 }
 
+/// Report a virtual epoch in force, for the same reason as
+/// [`test_stake_weighting`]: `heimdall doctor` answering "all checks passed"
+/// while the node is on a cycle Cardano has never heard of is the wrong answer.
+///
+/// This one is the more total of the two settings. A `live_stake` mismatch gives
+/// two nodes different weights over payloads they can still fetch from each
+/// other; a cycle mismatch means they address DKG namespaces that never meet, so
+/// nothing is ever fetched and nothing anywhere errors.
+#[must_use]
+pub fn test_virtual_epoch(slots: Option<u64>) -> Option<String> {
+    slots.map(|s| {
+        format!(
+            "cardano.demo_virtual_epoch_slots is set: this node runs the bridge on a \
+             {s}-slot virtual epoch, not Cardano's, and rescales the Config schedule to fit \
+             it. It decides the DKG namespace, so EVERY node of the roster must set the same \
+             value — a node without it publishes into namespaces this one never reads, with \
+             no error on either side. Clear it, on all nodes together, to return to real \
+             epochs"
+        )
+    })
+}
+
 /// Refuse an unset `protocol.state_dir`.
 ///
 /// This was a warning until now, on the reasoning that deployments predating
@@ -393,6 +415,9 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             problems.push(p);
         }
         if let Some(p) = test_stake_weighting(cfg.cardano.demo_live_stake) {
+            problems.push(p);
+        }
+        if let Some(p) = test_virtual_epoch(cfg.cardano.demo_virtual_epoch_slots) {
             problems.push(p);
         }
 

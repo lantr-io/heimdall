@@ -48,6 +48,11 @@ pub struct AppState {
     /// retried movement is byte-identical, so without it the second attempt
     /// reads the first's commitments (WI-W8ZC4).
     pub sign: BTreeMap<(u64, u64, u32, RoundKey), String>,
+    /// What this deployment runs with, for peers to compare before entering a
+    /// ceremony with it (WI-VMP6J). Written at each ceremony entry by
+    /// `PeerNetwork::set_node_facts`; empty until the first one, which readers
+    /// treat as "has not entered a ceremony yet" rather than as a disagreement.
+    pub facts: crate::http::compat::NodeFacts,
     /// `protocol.state_dir` – where the epoch machine persists this node's
     /// swept peg-ins trie (`spi-trie.json`). The [SPI-4] proof route loads the
     /// trie from here at the point of use (the CpoTrie idiom), so it always
@@ -100,20 +105,23 @@ async fn health(State(state): State<SharedState>) -> Json<serde_json::Value> {
     // preprod nodes joined window 522. Without this a third party auditing the
     // ceremony (the federation, for the Phase-1 handoff) can only guess, and
     // guessing wrong is indistinguishable from a roster that published nothing.
-    let published = {
+    let (published, facts) = {
         let st = state.read().await;
-        st.dkg
+        let published = st
+            .dkg
             .keys()
             .filter(|(_, _, _, round)| *round == RoundKey::Round1)
             .map(|(epoch, _, attempt, _)| (*epoch, *attempt))
-            .max()
+            .max();
+        (published, st.facts)
     };
-    let mut body = serde_json::json!({
-        "status": "ok",
-        "version": crate::http::compat::own_version(),
-        "blueprint_digest": crate::http::compat::own_blueprint_digest(),
-        "threshold_percent": crate::http::compat::own_threshold_percent(),
-    });
+    // Serialized from `PeerBuild` itself rather than hand-written, so the
+    // published field names cannot drift from the ones the reader parses. The
+    // deployment values skip when absent, which keeps a production node's
+    // `/health` reading exactly as it did before they existed.
+    let mut body = serde_json::to_value(crate::http::compat::PeerBuild::own(facts))
+        .unwrap_or_else(|_| serde_json::json!({}));
+    body["status"] = serde_json::json!("ok");
     if let Some((epoch, attempt)) = published {
         body["dkg_epoch"] = serde_json::json!(epoch);
         body["dkg_attempt"] = serde_json::json!(attempt);

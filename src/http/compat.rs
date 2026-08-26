@@ -46,6 +46,37 @@
 //! other build difference either shows up in the blueprint or is caught by the
 //! version. This one is invisible to both, and it is the value most likely to be
 //! deliberately changed for a test deployment.
+//!
+//! ## The deployment's own values, and why they are here rather than in the payload
+//!
+//! [`NodeFacts`] carries three values that are not build identity at all: the
+//! two TEST-RUN settings (`cardano.demo_virtual_epoch_slots`,
+//! `cardano.demo_live_stake`) and the FROST `t` this node actually derived. They
+//! live in this gate for three reasons the DKG payload cannot match.
+//!
+//! **It is the only channel that survives a namespace split.** The DKG namespace
+//! is `(epoch, threshold, attempt)`, so two nodes on different epoch schemes
+//! publish into namespaces that cannot see each other: neither ever fetches
+//! anything of the other's, and every detector built into a payload is dead
+//! before it runs. `/health` is un-namespaced, which is precisely what makes it
+//! able to name that failure.
+//!
+//! **It runs before anything is published, and it converges.** The gate is
+//! `wait_for_roster_health`, and a peer it excludes is simply not in the
+//! candidate set: `t` is re-derived over the survivors and `attempt` does not
+//! move. A majority that agrees therefore completes the ceremony while the odd
+//! node out is left alone — where a chain-view check fires only once payloads
+//! are already exchanged and the attempt is spent.
+//!
+//! **It works for a peer that publishes no view at all**, which the chain-view
+//! comparison counts as agreeing.
+//!
+//! One distinction is kept in the wording rather than in the verdict. A version
+//! or blueprint mismatch is PERMANENT for the epoch and the operator must
+//! upgrade; a derived-`t` difference may be transient drift between two
+//! `live_stake` reads that resolves at the next entry. Same verdict — excluded,
+//! re-checked on the next ceremony entry — but an operator must never be told to
+//! upgrade when the answer is "your stake read drifted".
 
 use serde::{Deserialize, Serialize};
 
@@ -79,10 +110,35 @@ fn blueprint_digest(blueprint: &str) -> String {
     hex::encode(&hash.as_bytes()[..8])
 }
 
-/// What `/health` reports about the software behind it.
+/// What this DEPLOYMENT reports, as opposed to what its build is.
 ///
-/// Both fields are `Option` on the reading side because a peer running a build
-/// that predates this reports neither — see [`Compatibility::of`].
+/// Everything here comes from the operator's configuration or from this node's
+/// own roster read, so — unlike the version and the blueprint digest — two nodes
+/// of the same build can differ on it. See the module doc for why these are
+/// compared in the handshake rather than in the DKG payload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodeFacts {
+    /// `cardano.demo_virtual_epoch_slots` — the length of this node's ceremony
+    /// cycle, or `None` for real Cardano epochs.
+    pub virtual_epoch_slots: Option<u64>,
+    /// `cardano.demo_live_stake` — whether the roster is weighted by `live_stake`
+    /// (test runs) or by the epoch snapshot.
+    pub live_stake: Option<bool>,
+    /// The FROST `t` this node derived for the ceremony it is about to enter —
+    /// the length its Round-1 commitment vector will have.
+    ///
+    /// Live state, not configuration: `None` until this node has read a roster,
+    /// exactly as `dkg_epoch`/`dkg_attempt` are absent until it has published a
+    /// Round 1. A peer that has not yet entered a ceremony is therefore a
+    /// reporting gap, not a disagreement.
+    pub threshold: Option<u16>,
+}
+
+/// What `/health` reports about the software behind it, plus the deployment
+/// values of [`NodeFacts`].
+///
+/// Every field is `Option` on the reading side because a peer running a build
+/// that predates one reports it as absent — see [`Compatibility::of`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerBuild {
     #[serde(default)]
@@ -94,16 +150,31 @@ pub struct PeerBuild {
     /// allowed rather than refused.
     #[serde(default)]
     pub threshold_percent: Option<u32>,
+    /// [`NodeFacts::virtual_epoch_slots`]. Absent means real Cardano epochs, so
+    /// a production node and a build predating the field report the same thing —
+    /// which is correct: a build without virtual epochs runs on real ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_epoch_slots: Option<u64>,
+    /// [`NodeFacts::live_stake`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_stake: Option<bool>,
+    /// [`NodeFacts::threshold`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u16>,
 }
 
 impl PeerBuild {
-    /// This node's own answer.
+    /// This node's own answer: its build identity plus the deployment values it
+    /// currently holds.
     #[must_use]
-    pub fn own() -> Self {
+    pub fn own(facts: NodeFacts) -> Self {
         Self {
             version: Some(own_version().to_string()),
             blueprint_digest: Some(own_blueprint_digest()),
             threshold_percent: Some(own_threshold_percent()),
+            virtual_epoch_slots: facts.virtual_epoch_slots,
+            live_stake: facts.live_stake,
+            threshold: facts.threshold,
         }
     }
 }
@@ -127,8 +198,8 @@ pub enum Compatibility {
 impl Compatibility {
     /// Compare a peer's reported build against this node's.
     #[must_use]
-    pub fn of(peer: &PeerBuild) -> Self {
-        Self::between(peer, &PeerBuild::own())
+    pub fn of(peer: &PeerBuild, own: NodeFacts) -> Self {
+        Self::between(peer, &PeerBuild::own(own))
     }
 
     /// Pure form, for tests: compare `peer` against `own`.
@@ -174,6 +245,75 @@ impl Compatibility {
                 ),
             };
         }
+        // THE EPOCH SCHEME. Compared even when only one side reports it, unlike
+        // every check above: absent means "real Cardano epochs", which is a
+        // definite answer rather than a reporting gap, and it is the one value
+        // whose mismatch no other detector can ever reach. Two nodes on
+        // different cycles derive different epoch NUMBERS, and the DKG namespace
+        // is `(epoch, threshold, attempt)` — so they publish into namespaces
+        // that never fetch each other. Nothing errors on either side; the
+        // ceremony simply never has a second participant.
+        if peer.virtual_epoch_slots != own.virtual_epoch_slots {
+            let describe = |v: Option<u64>| match v {
+                Some(s) => format!("a {s}-slot virtual epoch (TEST RUN)"),
+                None => "real Cardano epochs".to_string(),
+            };
+            return Self::Incompatible {
+                reason: format!(
+                    "same version {theirs}, but the peer runs on {} and we run on {} — we \
+                     would number epochs differently, publish into DKG namespaces that never \
+                     fetch each other, and each wait for a ceremony the other cannot see. Set \
+                     cardano.demo_virtual_epoch_slots identically on every node of the roster",
+                    describe(peer.virtual_epoch_slots),
+                    describe(own.virtual_epoch_slots),
+                ),
+            };
+        }
+        // THE STAKE WEIGHTING, for the same reason: absent means the epoch
+        // snapshot, which is a definite answer. A mismatch gives two nodes
+        // different weights over an IDENTICAL candidate set, so the digest they
+        // publish agrees while their thresholds do not.
+        if peer.live_stake.unwrap_or(false) != own.live_stake.unwrap_or(false) {
+            let describe = |v: bool| {
+                if v {
+                    "live_stake (TEST RUN)"
+                } else {
+                    "the epoch snapshot"
+                }
+            };
+            return Self::Incompatible {
+                reason: format!(
+                    "same version {theirs}, but the peer weights the roster by {} and we by {} \
+                     — the candidate set would AGREE while the derived thresholds differ, so \
+                     nothing we exchange can aggregate. Set cardano.demo_live_stake identically \
+                     on every node of the roster",
+                    describe(peer.live_stake.unwrap_or(false)),
+                    describe(own.live_stake.unwrap_or(false)),
+                ),
+            };
+        }
+        // THE DERIVED `t` itself — the value all of the above exist to protect,
+        // compared directly so a cause nobody anticipated is still caught.
+        //
+        // Compared only when BOTH report one, because absent here means "has not
+        // read a roster yet", not a disagreement — a node whose peer is still
+        // starting up must not exclude it. And the wording is deliberately not
+        // the upgrade advice the version mismatch gives: with both flags
+        // matching, the remaining cause is `live_stake` drift between two reads
+        // seconds apart, which resolves on its own.
+        if let (Some(t), Some(o)) = (peer.threshold, own.threshold)
+            && t != o
+        {
+            return Self::Incompatible {
+                reason: format!(
+                    "same version {theirs} and the same settings, but the peer derived FROST \
+                     threshold t={t} and we t={o} — commitment vectors of different length, \
+                     which cannot combine. This is NOT a build problem and needs no upgrade: \
+                     with live_stake weighting it is two reads moments apart, and it resolves \
+                     at the next ceremony entry"
+                ),
+            };
+        }
         Self::Compatible
     }
 
@@ -202,11 +342,23 @@ fn minor_series(v: &str) -> &str {
 mod tests {
     use super::*;
 
+    /// The same build as [`build`], carrying this node's deployment values — so
+    /// a comparison isolates the facts instead of tripping over the version.
+    fn build_with(facts: NodeFacts) -> PeerBuild {
+        PeerBuild {
+            virtual_epoch_slots: facts.virtual_epoch_slots,
+            live_stake: facts.live_stake,
+            threshold: facts.threshold,
+            ..build("0.1.0", "aa")
+        }
+    }
+
     fn build(v: &str, d: &str) -> PeerBuild {
         PeerBuild {
             version: Some(v.into()),
             blueprint_digest: Some(d.into()),
             threshold_percent: Some(51),
+            ..PeerBuild::default()
         }
     }
 
@@ -267,6 +419,87 @@ mod tests {
         assert!(reason.contains("51%"), "{reason}");
     }
 
+    /// The epoch scheme is compared even when only ONE side reports it: absent
+    /// means real Cardano epochs, which is a definite answer rather than a
+    /// reporting gap. Getting this wrong in the permissive direction would make
+    /// the mismatch invisible in exactly the deployment it matters for — an old
+    /// node beside a virtual-epoch one.
+    #[test]
+    fn a_virtual_epoch_difference_is_incompatible_in_both_directions() {
+        let mut peer = build("0.1.0", "aa");
+        peer.virtual_epoch_slots = Some(86_400);
+        let Compatibility::Incompatible { reason } =
+            Compatibility::between(&peer, &build_with(NodeFacts::default()))
+        else {
+            panic!("a virtual epoch against real epochs must be incompatible");
+        };
+        assert!(reason.contains("86400"), "{reason}");
+        assert!(reason.contains("real Cardano epochs"), "{reason}");
+
+        // …and the other way round, which is the same misconfiguration seen from
+        // the other node.
+        let mine = NodeFacts {
+            virtual_epoch_slots: Some(86_400),
+            ..NodeFacts::default()
+        };
+        let plain = build("0.1.0", "aa");
+        assert!(Compatibility::between(&plain, &build_with(mine)).is_incompatible());
+
+        // Two nodes on the SAME cycle agree.
+        assert_eq!(
+            Compatibility::between(&peer, &build_with(mine)),
+            Compatibility::Compatible
+        );
+    }
+
+    /// The stake weighting reads the same way: absent is "the epoch snapshot",
+    /// which is what a build predating the field actually does.
+    #[test]
+    fn a_live_stake_difference_is_incompatible_even_against_an_older_build() {
+        let mut peer = build("0.1.0", "aa");
+        peer.live_stake = None;
+        let mine = NodeFacts {
+            live_stake: Some(true),
+            ..NodeFacts::default()
+        };
+        let Compatibility::Incompatible { reason } =
+            Compatibility::between(&peer, &build_with(mine))
+        else {
+            panic!("live_stake against the epoch snapshot must be incompatible");
+        };
+        assert!(reason.contains("demo_live_stake"), "{reason}");
+        assert!(reason.contains("candidate set would AGREE"), "{reason}");
+    }
+
+    /// The derived `t` is the opposite case: absent means "has not read a roster
+    /// yet", so a peer still starting up must NOT be excluded for it.
+    #[test]
+    fn a_derived_threshold_is_compared_only_when_both_report_one() {
+        let mut peer = build("0.1.0", "aa");
+        peer.threshold = None;
+        let mine = NodeFacts {
+            threshold: Some(3),
+            ..NodeFacts::default()
+        };
+        assert_eq!(
+            Compatibility::between(&peer, &build_with(mine)),
+            Compatibility::Compatible
+        );
+
+        peer.threshold = Some(2);
+        let Compatibility::Incompatible { reason } =
+            Compatibility::between(&peer, &build_with(mine))
+        else {
+            panic!("two derived thresholds that differ cannot combine");
+        };
+        assert!(reason.contains("t=2"), "{reason}");
+        assert!(reason.contains("t=3"), "{reason}");
+        // The wording must NOT send an operator to upgrade a node that is fine:
+        // with both settings matching, the cause is drift and it resolves itself.
+        assert!(reason.contains("needs no upgrade"), "{reason}");
+        assert!(!reason.contains("Upgrade"), "{reason}");
+    }
+
     /// A peer that reports no threshold is a reporting gap, not a disagreement —
     /// same rule as the blueprint, so the upgrade introducing this is not itself
     /// an outage.
@@ -295,10 +528,10 @@ mod tests {
     #[test]
     fn a_peer_reporting_no_version_is_unknown_not_incompatible() {
         assert_eq!(
-            Compatibility::of(&PeerBuild::default()),
+            Compatibility::of(&PeerBuild::default(), NodeFacts::default()),
             Compatibility::Unknown
         );
-        assert!(!Compatibility::of(&PeerBuild::default()).is_incompatible());
+        assert!(!Compatibility::of(&PeerBuild::default(), NodeFacts::default()).is_incompatible());
     }
 
     /// A version but no digest is a reporting gap, not a bridge mismatch.
@@ -306,8 +539,7 @@ mod tests {
     fn a_version_without_a_digest_is_compatible_on_the_version_alone() {
         let peer = PeerBuild {
             version: Some("0.1.0".into()),
-            blueprint_digest: None,
-            threshold_percent: None,
+            ..PeerBuild::default()
         };
         assert_eq!(
             Compatibility::between(&peer, &build("0.1.7", "aa")),
@@ -332,10 +564,17 @@ mod tests {
     /// healthy roster depends on.
     #[test]
     fn own_build_is_compatible_with_itself() {
-        assert_eq!(
-            Compatibility::of(&PeerBuild::own()),
-            Compatibility::Compatible
-        );
+        let facts = NodeFacts {
+            virtual_epoch_slots: Some(86_400),
+            live_stake: Some(true),
+            threshold: Some(3),
+        };
+        for f in [NodeFacts::default(), facts] {
+            assert_eq!(
+                Compatibility::of(&PeerBuild::own(f), f),
+                Compatibility::Compatible
+            );
+        }
         assert_eq!(own_blueprint_digest().len(), 16);
     }
 

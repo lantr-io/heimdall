@@ -102,7 +102,7 @@ use crate::bitcoin::tm_builder::TmParams;
 use crate::cardano::bf_http::{self, BfUtxo};
 use crate::cardano::plutus;
 use crate::epoch::batch::{BatchWindow, GridParams};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Field count of the rev-5.5 Config datum (spec §Config datum). Appends are the
 /// legal evolution, so a reader accepts MORE fields and refuses fewer.
@@ -971,18 +971,36 @@ pub async fn batch_at(
     bf_base_url: &str,
     bf_project_id: &str,
     snapshot: &ParamSnapshot,
+    scheme: crate::epoch::virtual_epoch::EpochScheme,
 ) -> BatchWindow {
-    let schedule = &snapshot.config.params.tunables.schedule;
-    let epoch_start_slot = match epoch_start_slot(bf_base_url, bf_project_id, snapshot).await {
-        Ok(slot) => slot,
+    // TEST-RUN ONLY: on a virtual epoch the grid is anchored at the cycle's own
+    // start and the schedule is rescaled to fit it. A schedule the cycle cannot
+    // hold is REFUSED rather than degraded to `NoGrid`: no-grid means "this
+    // deployment has no schedule to respect" and falls back to a local cadence,
+    // which is the opposite of what a bad one should do. `Closed { next: None }`
+    // says what is true — no opportunity, and none coming.
+    let schedule = match scheme.schedule(&snapshot.config.params.tunables.schedule) {
+        Ok(s) => s,
         Err(e) => {
-            warn!(
-                "[batch] no epoch anchor ({e}) — building without the batch membership cutoff; \
-                 peg-out selection falls back to whatever is open at this instant"
+            error!(
+                "[batch] the virtual epoch cannot hold this bridge's schedule: {e}. No batch \
+                 will be built. Lengthen cardano.demo_virtual_epoch_slots, on every node"
             );
-            return BatchWindow::NoGrid;
+            return BatchWindow::Closed { next: None };
         }
     };
+    let schedule = &schedule;
+    let epoch_start_slot =
+        match epoch_anchor_slot(bf_base_url, bf_project_id, snapshot, scheme).await {
+            Ok(slot) => slot,
+            Err(e) => {
+                warn!(
+                    "[batch] no epoch anchor ({e}) — building without the batch membership cutoff; \
+                 peg-out selection falls back to whatever is open at this instant"
+                );
+                return BatchWindow::NoGrid;
+            }
+        };
     let Ok(interval) = u64::try_from(schedule.tm_batch_interval) else {
         return BatchWindow::NoGrid;
     };
@@ -1019,6 +1037,23 @@ pub async fn batch_at(
             BatchWindow::Closed { next }
         }
     }
+}
+
+/// Absolute slot the current cycle is anchored at: the Cardano epoch boundary,
+/// or — on a test bridge running a virtual epoch — that cycle's own start.
+///
+/// The virtual case needs no read at all: the anchor is a function of the
+/// snapshot's slot, which every SPO holding this snapshot already agrees on.
+async fn epoch_anchor_slot(
+    bf_base_url: &str,
+    bf_project_id: &str,
+    snapshot: &ParamSnapshot,
+    scheme: crate::epoch::virtual_epoch::EpochScheme,
+) -> Result<u64, String> {
+    if let Some(start) = scheme.start_slot(snapshot.slot) {
+        return Ok(start);
+    }
+    epoch_start_slot(bf_base_url, bf_project_id, snapshot).await
 }
 
 /// Absolute slot of the current epoch's boundary.
@@ -1098,6 +1133,73 @@ mod tests {
                 constr(0, vec![bytes(&[0xc3; 32]), int(0)]),
             ],
         )
+    }
+
+    /// On a virtual epoch the grid is anchored at the CYCLE's start and pitched
+    /// on the rescaled interval — and it needs no chain read to do it, which is
+    /// why a bogus Blockfrost URL is enough here.
+    #[tokio::test]
+    async fn a_virtual_epoch_anchors_the_grid_on_its_own_cycle() {
+        use crate::epoch::virtual_epoch::EpochScheme;
+
+        let mut snap = snapshot_of(&config_datum(7, 1_000, 100_000));
+        // Two full cycles in, plus one rescaled interval so B_1 is behind us.
+        // The published interval is 21600, which a 86400-slot cycle scales to 4320.
+        snap.slot = 86_400 * 2 + 4_500;
+        let w = batch_at(
+            "http://127.0.0.1:1",
+            "x",
+            &snap,
+            EpochScheme::Virtual { slots: 86_400 },
+        )
+        .await;
+        let b = w.open().expect("an opportunity is open inside the cycle");
+        assert_eq!(b.index, 1, "B_1 of THIS cycle, not of the Cardano epoch");
+        assert_eq!(b.slot, 86_400 * 2 + 4_320);
+    }
+
+    /// A schedule the cycle cannot hold is refused, and refused as CLOSED rather
+    /// than as no-grid: no-grid means "this deployment has no schedule to
+    /// respect" and falls back to a local cadence, which is the opposite of the
+    /// right answer for a schedule that is wrong.
+    ///
+    /// The published preprod schedule survives any cycle this build accepts —
+    /// its cutoff is 345600, four fifths of an epoch, so rescaling keeps it
+    /// inside. What does not survive is a GOVERNANCE-set cutoff longer than an
+    /// epoch, which is why the refusal is checked rather than assumed away.
+    #[tokio::test]
+    async fn a_virtual_epoch_that_cannot_hold_the_schedule_builds_nothing() {
+        use crate::epoch::virtual_epoch::EpochScheme;
+
+        let mut sched = schedule_data();
+        let PlutusData::Constr(ref mut c) = sched else {
+            unreachable!("schedule_data builds a Constr")
+        };
+        let mut fields = c.fields.clone().to_vec();
+        fields[8] = int(900_000); // final_tm_cutoff: longer than a Cardano epoch
+        c.fields = pallas_codec::utils::MaybeIndefArray::Indef(fields);
+
+        let PlutusData::Constr(mut outer) = config_datum(7, 1_000, 100_000) else {
+            unreachable!()
+        };
+        let mut top = outer.fields.clone().to_vec();
+        let PlutusData::Constr(ref mut params) = top[1] else {
+            unreachable!("params is a Constr")
+        };
+        let mut pf = params.fields.clone().to_vec();
+        pf[0] = sched;
+        params.fields = pallas_codec::utils::MaybeIndefArray::Indef(pf);
+        outer.fields = pallas_codec::utils::MaybeIndefArray::Indef(top);
+
+        let snap = snapshot_of(&PlutusData::Constr(outer));
+        let w = batch_at(
+            "http://127.0.0.1:1",
+            "x",
+            &snap,
+            EpochScheme::Virtual { slots: 86_400 },
+        )
+        .await;
+        assert_eq!(w, BatchWindow::Closed { next: None }, "{w:?}");
     }
 
     fn snapshot_of(datum: &PlutusData) -> ParamSnapshot {

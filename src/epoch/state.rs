@@ -655,6 +655,15 @@ pub struct EpochConfig {
     pub identity: SpoIdentity,
     /// Cardano policy ID (script hash) identifying peg-in request UTxOs.
     pub pegin_policy_id: [u8; 28],
+    /// TEST-RUN ONLY: `cardano.demo_virtual_epoch_slots`, the length of this
+    /// node's ceremony cycle in slots, or `None` for real Cardano epochs.
+    ///
+    /// The machine does not derive anything from it — the chain adapter owns the
+    /// scheme (see [`crate::epoch::virtual_epoch`]). It is here so the value can
+    /// be PUBLISHED in the pre-ceremony handshake, where a peer on a different
+    /// cycle is excluded before either node addresses a DKG namespace the other
+    /// cannot see.
+    pub virtual_epoch_slots: Option<u64>,
     /// Upper bound on how long the batch loop sleeps between grid checks.
     ///
     /// NOT a protocol value and deliberately not an operator key: it decides read
@@ -748,6 +757,7 @@ impl EpochConfig {
             retry_backoff_max: Duration::from_secs(60),
             identity,
             pegin_policy_id: [0u8; 28],
+            virtual_epoch_slots: None,
             batch_poll_ceiling: Duration::from_secs(300),
             pegin_refund_timeout_blocks: 4320,
             state_dir: None,

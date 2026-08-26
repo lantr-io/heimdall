@@ -20,6 +20,7 @@ pub mod signing;
 pub mod state;
 pub mod succession;
 pub mod traits;
+pub mod virtual_epoch;
 
 pub use machine::{run_epoch_daemon, run_epoch_loop};
 

@@ -68,8 +68,15 @@ pub struct NodeState {
     /// which is the thing it hurts most to learn late, because the node keeps
     /// running and looks fine.
     pub dkg_qualified: Option<bool>,
-    /// Peers excluded from the ceremony for running incompatible software
-    /// (WI-067), as `"spo=<short id>: <reason>"`.
+    /// Peers excluded from the ceremony by the pre-ceremony handshake (WI-067),
+    /// as `"spo=<short id>: <reason>"`.
+    ///
+    /// The reason distinguishes the three causes, because the fix is different
+    /// for each: a version or blueprint difference wants an upgrade, a settings
+    /// difference (`demo_live_stake`, `demo_virtual_epoch_slots`) wants the
+    /// setting matched across the roster, and a bare derived-threshold
+    /// difference wants nothing done — it is `live_stake` drift and clears at
+    /// the next ceremony entry.
     ///
     /// Here because it is the one problem that is INVISIBLE from the excluded
     /// node's chain state: it is registered, unbanned, reachable, and simply not
@@ -181,7 +188,7 @@ pub fn render(state: &NodeState) -> String {
     if state.excluded_peers.is_empty() {
         out.push_str("peers excluded  none\n");
     } else {
-        out.push_str("peers excluded  (incompatible software — WI-067)\n");
+        out.push_str("peers excluded  (the reason says whether to act — WI-067)\n");
         for p in &state.excluded_peers {
             out.push_str(&format!("         -> {p}\n"));
         }

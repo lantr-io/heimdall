@@ -1638,6 +1638,13 @@ async fn epoch_start_phase(
         return Ok(resumed);
     }
 
+    // Publish what this node is about to run with BEFORE the gate below opens, so
+    // a peer entering alongside us compares against the real values rather than
+    // against a gap. `/health` is un-namespaced, which is what lets this reach a
+    // peer whose epoch scheme differs — the one mismatch no DKG payload can ever
+    // carry, because the two nodes address namespaces that never meet.
+    peers.set_node_facts(own_node_facts(config, &ctx)).await;
+
     // N21 health gate: bring the roster up before the ceremony. A staggered
     // process start otherwise freezes divergent live subsets — the early
     // nodes complete a reduced key without the late one, which then loops
@@ -1760,6 +1767,25 @@ fn next_window(boundary_ms: i64, window: std::time::Duration, now_ms: i64) -> (u
     )
 }
 
+/// What this node publishes on `/health` for peers to compare against, and
+/// compares their answers to.
+///
+/// Assembled from the two places the values actually live — the operator's
+/// configuration for the test settings, and the context just read from the chain
+/// for the derived `t`. Built at ceremony entry rather than at start-up because
+/// `t` is not known until the roster is read, and it is the value a drift shows
+/// up in.
+fn own_node_facts(
+    config: &EpochConfig,
+    ctx: &crate::cardano::dkg_roster::DkgContext,
+) -> crate::http::compat::NodeFacts {
+    crate::http::compat::NodeFacts {
+        virtual_epoch_slots: config.virtual_epoch_slots,
+        live_stake: Some(ctx.live_stake),
+        threshold: Some(ctx.threshold),
+    }
+}
+
 /// Poll every roster peer's `/health` until all answer or `dkg_join_wait`
 /// elapses (N21), and return the peers whose BUILD is incompatible with ours
 /// (WI-067).
@@ -1788,6 +1814,7 @@ async fn wait_for_roster_health(
 ) -> BTreeSet<frost::Identifier> {
     use crate::http::compat::Compatibility;
 
+    let own = own_node_facts(config, ctx);
     let roster = ctx.to_roster();
     let deadline = tokio::time::Instant::now() + config.dkg_join_wait;
     let poll = config
@@ -1807,16 +1834,18 @@ async fn wait_for_roster_health(
             }
             // Logged ONCE per peer per gate, not per poll: the loop can turn
             // every 200 ms and this is the line an operator has to find.
-            if let Compatibility::Incompatible { reason } = health.compatibility()
+            if let Compatibility::Incompatible { reason } = health.compatibility(own)
                 && incompatible.insert(info.identifier)
             {
                 crate::epoch_warn!(
                     me,
                     ctx.epoch,
                     "  ⚠ EXCLUDING spo={} from the ceremony: {reason}. It is running and \
-                     reachable — this is a software mismatch, not an outage. Both sides log \
-                     this, so that operator sees the same line from its own node. Upgrade the \
-                     lagging node to rejoin.",
+                     reachable — this is a disagreement, not an outage. Both sides log this, \
+                     so that operator sees the same line from its own node. The reason says \
+                     what to change: a version or blueprint difference needs an upgrade, a \
+                     settings difference needs the setting matched, and a bare threshold \
+                     difference resolves at the next ceremony entry.",
                     crate::epoch::log::id_short(info.identifier),
                 );
                 // Also on the operator surface: this is the one failure invisible
@@ -6345,6 +6374,7 @@ mod tests {
             version: Some(version.into()),
             blueprint_digest: Some(crate::http::compat::own_blueprint_digest()),
             threshold_percent: Some(crate::http::compat::own_threshold_percent()),
+            ..crate::http::compat::PeerBuild::default()
         }
     }
 
@@ -6411,8 +6441,55 @@ mod tests {
             version: Some(crate::http::compat::own_version().into()),
             blueprint_digest: Some("deadbeefdeadbeef".into()),
             threshold_percent: Some(crate::http::compat::own_threshold_percent()),
+            ..crate::http::compat::PeerBuild::default()
         };
         assert_eq!(gate_over(&[(2, odd)]).await, vec![2]);
+    }
+
+    /// A node whose DERIVED `t` differs is excluded before round 1, and the
+    /// majority carries on over a re-derived threshold without spending an
+    /// attempt (WI-VMP6J).
+    ///
+    /// This is the property that makes the handshake the right home for the
+    /// check rather than the chain-view: the chain-view fires only once payloads
+    /// are already out, by which point the attempt is gone. Here nothing has been
+    /// published, so a reduced candidate set is simply a smaller ceremony.
+    #[tokio::test]
+    async fn the_gate_excludes_a_drifted_threshold_and_leaves_the_attempt_alone() {
+        let fixture = movable_fixture(2, 3, 19_990, 1);
+        let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture));
+        let ctx = chain.query_dkg_context(0, 0).await.expect("ctx");
+
+        // A peer reporting a `t` one away from ours — the shape a `live_stake`
+        // drift takes, with every setting on both nodes identical.
+        let drifted = crate::http::compat::PeerBuild {
+            threshold: Some(ctx.threshold + 1),
+            ..build_of(crate::http::compat::own_version())
+        };
+        let excluded = gate_over(&[(3, drifted)]).await;
+        assert_eq!(excluded, vec![3], "the drifted peer must be dropped");
+
+        // What the caller then does with it: a smaller candidate set, `t`
+        // re-derived over the survivors, and the SAME attempt.
+        let out = ctx
+            .participants
+            .iter()
+            .filter(|p| {
+                ctx.participants
+                    .iter()
+                    .position(|q| q.identifier == p.identifier)
+                    == Some(2)
+            })
+            .map(|p| p.identifier)
+            .collect::<BTreeSet<_>>();
+        let narrowed = ctx
+            .without(&out)
+            .expect("two of three still run a ceremony");
+        assert_eq!(narrowed.participants.len(), ctx.participants.len() - 1);
+        assert_eq!(
+            narrowed.attempt, ctx.attempt,
+            "an exclusion before publishing must not spend an attempt"
+        );
     }
 
     fn test_budget() -> crate::epoch::batch::TmBudget {
