@@ -299,7 +299,7 @@ mod tests {
     use super::*;
 
     /// The published preprod schedule, as the fixtures carry it.
-    fn schedule() -> ScheduleParams {
+    pub(super) fn schedule() -> ScheduleParams {
         ScheduleParams {
             dkg_r1_deadline: 3_600,
             dkg_r2_deadline: 7_200,
@@ -487,5 +487,79 @@ mod tests {
         assert!(u64::try_from(out.tm_batch_interval).unwrap() < MIN_VIRTUAL_EPOCH_SLOTS);
         assert!(u64::try_from(out.final_tm_cutoff).unwrap() < MIN_VIRTUAL_EPOCH_SLOTS);
         assert!(u64::try_from(out.update_y_deadline).unwrap() > FLOOR);
+    }
+}
+
+#[cfg(test)]
+mod operator_guide {
+    use super::*;
+
+    /// The worked table in `docs/operator-guide.md` §"Choosing the number".
+    ///
+    /// The guide tells an operator to pick a cycle length by how many batch
+    /// opportunities it leaves, and prints the arithmetic for three candidates. It
+    /// is arithmetic nobody would recompute by hand after a change to the rescale
+    /// rule, and a guide that quietly goes wrong about `update_y_deadline` costs a
+    /// roster a ceremony window. So the numbers are pinned here rather than
+    /// trusted.
+    ///
+    /// Against the schedule the shared preprod bridge publishes: pitch 21600,
+    /// cutoff 345600, `update_y_deadline` 10800.
+    #[test]
+    fn the_guides_worked_table_still_holds() {
+        let raw = super::tests::schedule();
+        // (slots, cycle, final_tm_cutoff, batch opportunities, update_y_deadline)
+        for (slots, cutoff, opportunities, update_y) in [
+            (43_200u64, 34_560i64, 1i64, 1_080i64),
+            (86_400, 69_120, 3, 2_160),
+            (172_800, 138_240, 6, 4_320),
+        ] {
+            let s = EpochScheme::Virtual { slots }
+                .schedule(&raw, 900)
+                .unwrap_or_else(|e| panic!("{slots}-slot cycle must be usable: {e}"));
+            assert_eq!(s.final_tm_cutoff, cutoff, "cutoff for {slots} slots");
+            assert_eq!(s.update_y_deadline, update_y, "update_y for {slots} slots");
+            // `B_i <= final_tm_cutoff`, and the pitch does NOT rescale — which is
+            // the whole point the table is making.
+            assert_eq!(
+                s.final_tm_cutoff / s.tm_batch_interval,
+                opportunities,
+                "batch opportunities in a {slots}-slot cycle"
+            );
+            assert_eq!(
+                s.tm_batch_interval, raw.tm_batch_interval,
+                "the pitch must not rescale, or the table's premise is gone"
+            );
+        }
+    }
+
+    /// The guide's rule of thumb: the usable minimum is 40x the ceremony floor,
+    /// because the published `update_y_deadline` rescales to `slots / 40` while the
+    /// floor does not move.
+    #[test]
+    fn the_guides_forty_times_the_ceremony_floor_rule_holds() {
+        let raw = super::tests::schedule();
+        for slots in [43_200u64, 86_400, 172_800] {
+            let s = EpochScheme::Virtual { slots }.schedule(&raw, 900).unwrap();
+            assert_eq!(
+                s.update_y_deadline,
+                i64::try_from(slots / 40).unwrap(),
+                "the guide states the scaled deadline is slots/40"
+            );
+        }
+        // Default floor 900 -> 36000, comfortably under the 43200 hard minimum.
+        assert!(
+            EpochScheme::Virtual { slots: 43_200 }
+                .schedule(&raw, 900)
+                .is_ok()
+        );
+        // A 20-minute ceremony window moves the requirement to 48000, so the
+        // 12-hour cycle the guide warns about is refused.
+        assert!(
+            EpochScheme::Virtual { slots: 43_200 }
+                .schedule(&raw, 1_200)
+                .is_err(),
+            "a widened ceremony window must refuse a 12-hour cycle, as the guide says"
+        );
     }
 }

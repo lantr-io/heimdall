@@ -707,6 +707,65 @@ The same guards as `demo_live_stake` apply: a `TEST RUN` warning at startup nami
 `heimdall doctor` reporting it, and a **refusal to start** on `network = "mainnet"` (or on any
 network heimdall cannot resolve).
 
+#### Choosing the number
+
+The floor and ceiling are checked for you (43200 slots to just under a real epoch), but they leave a
+wide range, and the value that matters is not the cycle length — it is **how many batch
+opportunities the cycle contains**, because that is how many chances a deposit gets.
+
+Only `final_tm_cutoff` shrinks; `tm_batch_interval` does not. So the count is
+`final_tm_cutoff ÷ tm_batch_interval` after the rescale, and it falls away faster than the cycle
+does. Against the schedule the shared preprod bridge publishes today — pitch 21600, cutoff 345600 —
+that gives:
+
+| `demo_virtual_epoch_slots` | cycle | `final_tm_cutoff` | batch opportunities | `update_y_deadline` |
+|---|---|---|---|---|
+| 43200 | 12 h | 34560 (9.6 h) | **1** | 1080 (18 min) |
+| 86400 | 24 h | 69120 (19.2 h) | **3** | 2160 (36 min) |
+| 172800 | 48 h | 138240 (38.4 h) | **6** | 4320 (72 min) |
+
+Read your own bridge's numbers with `heimdall show-config-params` rather than copying these — the
+schedule is governance-set and the rescale is `published × slots ÷ 432000`.
+
+**A 12-hour cycle gives you one opportunity, and that is usually the wrong trade.** One movement per
+cycle means a deposit that misses it waits a whole cycle, and a cycle whose single opportunity passes
+unused — a movement still in flight, a peer late to round 1 — moves nothing at all. 86400 is the
+value to reach for first: it rotates the key daily, which is the thing you are usually trying to
+watch, and still leaves three chances to move coins.
+
+One trap worth knowing before you hit it. The rotation deadline must clear the window a node cannot
+enter a ceremony before (`dkg_window_secs + dkg_join_wait_secs`, 900 slots by default), and it
+rescales while that floor does not. With the published schedule the scaled deadline is
+`slots ÷ 40`, so the usable minimum is **40 × your ceremony floor** — 36000 slots at the default,
+comfortably under the 43200 floor. Widen `dkg_window_secs` to 20 minutes and the requirement moves to
+48000, at which point a 12-hour cycle is refused and 86400 is your smallest option. The refusal names
+`update_y_deadline` and the ceremony window, so you will not have to work this out from symptoms.
+
+#### Confirming it took
+
+Three places say so, and it is worth checking all three, because the failure this setting causes is
+silent on both sides.
+
+1. **At startup**, every node logs a `TEST RUN` warning naming the slot count:
+
+   ```
+   [epoch] TEST RUN: the bridge cycle is a 86400-slot VIRTUAL epoch
+   (cardano.demo_virtual_epoch_slots), not Cardano's five-day one, and the ceremony
+   deadlines are rescaled to fit it. EVERY node of this roster must set the same value —
+   a mismatch splits the DKG namespace. It is refused on mainnet
+   ```
+
+   A node missing this line is on real epochs, whatever its config file says — a misspelled key
+   parses as unset.
+
+2. **`heimdall doctor`** reports it as an advisory (a `WARN`, not a failure — the node still
+   starts).
+
+3. **Across the roster**, `/health` carries the value and peers compare it before publishing
+   anything. A node whose cycle differs is named and excluded up front. This is the check that
+   matters: a namespace split produces no error on either side, so without it you would see only
+   two rosters each waiting for a ceremony the other cannot see.
+
 #### What a shorter cycle does not change
 
 - **`stability_window` does not rescale.** It is a property of Cardano — how far a transaction must
