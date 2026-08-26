@@ -454,12 +454,32 @@ pub struct CardanoConfig {
     /// production path does not do this: `live_stake` drifts continuously, so two
     /// SPOs reading seconds apart derive different weights, a different threshold
     /// and a ceremony that never aggregates. Every node of the roster must
-    /// therefore set it identically. A mismatch is published in the DKG chain-view
-    /// and reported by name rather than left to look like a stalled ceremony, and
-    /// the flag is refused outright on mainnet.
+    /// therefore set it identically. A mismatch is published on `/health` and
+    /// caught by the pre-ceremony handshake — the peer is named and left out
+    /// before anything is generated, rather than the roster discovering it as a
+    /// stalled ceremony — and the flag is refused outright on mainnet.
     ///
     /// Default false. Never set it on a bridge holding real funds.
     pub demo_live_stake: bool,
+    /// TEST-RUN ONLY. Run the bridge's cycle on a VIRTUAL epoch of this many
+    /// Cardano slots instead of the real five-day one.
+    ///
+    /// A test bridge cannot otherwise exercise a key rotation faster than one
+    /// Cardano epoch, because the DKG, the Update-Y and the whole batch grid hang
+    /// off `epoch_start`. With this set the cycle is `tip_slot / slots`, anchored
+    /// at slot 0 so no anchor has to be agreed, and the Config `schedule` is
+    /// rescaled in proportion — see [`crate::epoch::virtual_epoch`].
+    ///
+    /// It is a CONSENSUS input, and the most total one in this file: the DKG
+    /// namespace is `(epoch, threshold, attempt)`, so two nodes on different
+    /// cycles publish into namespaces that never fetch each other and each waits
+    /// for a ceremony the other cannot see. Every node of the roster must set it
+    /// identically; a mismatch is caught in the pre-ceremony handshake and named,
+    /// and the flag is refused outright on mainnet.
+    ///
+    /// Unset (the default) means real Cardano epochs. Never set it on a bridge
+    /// holding real funds.
+    pub demo_virtual_epoch_slots: Option<u64>,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
     pub submit_oracle: bool,
@@ -526,6 +546,53 @@ pub struct CardanoConfig {
     pub fault_proof_srs_path: Option<String>,
 }
 
+impl CardanoConfig {
+    /// The values this node must agree with its peers about and publishes on
+    /// `/health`, as of configuration alone.
+    ///
+    /// All four decide the roster or the epoch it is derived for, and none of
+    /// them is on chain — so a difference is invisible until a ceremony fails to
+    /// converge. Derivable from process start, deliberately: the peer server is
+    /// listening long before the first ceremony entry, and a peer that reads
+    /// these as absent while this node is still booting would exclude it for
+    /// running settings it does not have.
+    ///
+    /// An unparseable `stake_source` reports `None` rather than a guess — the
+    /// daemon refuses to start on one anyway, and a wrong label here would be
+    /// worse than an absent one.
+    #[must_use]
+    pub fn node_facts(&self) -> crate::http::compat::NodeFacts {
+        crate::http::compat::NodeFacts {
+            virtual_epoch_slots: self.demo_virtual_epoch_slots,
+            live_stake: Some(self.demo_live_stake),
+            stake_source: crate::cardano::stake::StakeSource::from_config(
+                self.stake_source.as_deref(),
+            )
+            .ok()
+            .map(crate::cardano::stake::StakeSource::label),
+            exclude_unstaked: Some(self.demo_exclude_unstaked),
+            epoch: None,
+            threshold: None,
+        }
+    }
+}
+
+impl ProtocolConfig {
+    /// How far into a cycle a node can first ENTER a ceremony, in Cardano slots.
+    ///
+    /// `next_window` puts the earliest join at `cycle_start + dkg_window`, and a
+    /// node then waits up to `dkg_join_wait` for the roster's health gate. Slots
+    /// are one second post-Shelley, so the seconds convert directly.
+    ///
+    /// Only a virtual epoch consults it (see
+    /// [`crate::epoch::virtual_epoch::EpochScheme::schedule`]): on a real epoch
+    /// every deadline is days away and the floor cannot bind.
+    #[must_use]
+    pub fn ceremony_floor_slots(&self) -> u64 {
+        self.dkg_window_secs.saturating_add(self.dkg_join_wait_secs)
+    }
+}
+
 impl Default for CardanoConfig {
     fn default() -> Self {
         Self {
@@ -542,6 +609,7 @@ impl Default for CardanoConfig {
             stake_source: None,
             demo_exclude_unstaked: false,
             demo_live_stake: false,
+            demo_virtual_epoch_slots: None,
             submit_oracle: true,
             tm_validity_window_secs: None,
             config_address: None,
@@ -969,7 +1037,26 @@ impl HeimdallConfig {
         // consensus-breaking test flag onto a real-funds bridge. preflight.rs
         // documents this exact bug being fixed on the sibling guard; do not
         // reintroduce it here. Hold to the answer that cannot be ruled out.
+        // The value's own sanity, checked here rather than at first use: a
+        // zero-slot or longer-than-an-epoch cycle is a typo, and finding out at
+        // the first ceremony means finding out five days late.
+        if let Err(why) = crate::epoch::virtual_epoch::EpochScheme::from_slots(
+            self.cardano.demo_virtual_epoch_slots,
+        ) {
+            return Err(ConfigError::UnusableVirtualEpoch(why));
+        }
         let mainnet = self.cardano.is_mainnet().unwrap_or(true);
+        if self.cardano.demo_virtual_epoch_slots.is_some() && mainnet {
+            return Err(ConfigError::TestFlagOnMainnet(
+                "cardano.demo_virtual_epoch_slots runs the bridge on a virtual epoch shorter \
+                 than Cardano's. It exists so a test bridge can exercise a rotation without \
+                 waiting five days, and it renumbers the epoch every ceremony binds to — on a \
+                 real-funds bridge that is a roster split, not a speed-up. If this is NOT a \
+                 mainnet node, cardano.network could not be resolved — an unknown spelling, or \
+                 a network that disagrees with cardano.config_address — and an unresolvable \
+                 network is treated as mainnet here rather than waved through",
+            ));
+        }
         if self.cardano.demo_live_stake && mainnet {
             return Err(ConfigError::TestFlagOnMainnet(
                 "cardano.demo_live_stake weights the DKG roster by live_stake, which drifts \
@@ -1019,6 +1106,9 @@ impl HeimdallConfig {
             retry_backoff_max: RETRY_BACKOFF_MAX,
             identity,
             pegin_policy_id,
+            // Carried so the machine can PUBLISH them in the handshake; the chain
+            // adapter is what actually derives the cycle and reads the stake.
+            node_facts: self.cardano.node_facts(),
             batch_poll_ceiling: BATCH_POLL_CEILING,
             // EpochConfig keeps a concrete value for the demo/mock paths; the daemon reads
             // the published one off the treasury oracle ([CFG-9]).
@@ -1097,6 +1187,8 @@ pub enum ConfigError {
     KeyParse(String),
     /// A test-run flag is set on a network holding real funds.
     TestFlagOnMainnet(&'static str),
+    /// `cardano.demo_virtual_epoch_slots` holds a cycle length nothing can run.
+    UnusableVirtualEpoch(String),
     /// The document sets keys the bridge Config now publishes.
     RetiredKeys(Vec<RetiredKey>),
 }
@@ -1128,6 +1220,9 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "a test-run flag is set on mainnet, and is refused rather than warned about: {why}"
             ),
+            Self::UnusableVirtualEpoch(why) => {
+                write!(f, "cardano.demo_virtual_epoch_slots: {why}")
+            }
             Self::RetiredKeys(keys) => {
                 writeln!(
                     f,
@@ -1290,6 +1385,61 @@ demo_live_stake = true
         let err = HeimdallConfig::from_toml_str(&toml("Mainnet"))
             .expect_err("an unresolvable network must not open the gate");
         assert!(err.to_string().contains("demo_live_stake"), "{err}");
+    }
+
+    /// The virtual epoch is refused on mainnet by the same rule, and for a
+    /// stronger reason: it renumbers the epoch every ceremony binds to, so a
+    /// roster where only some nodes have it does not run a degraded ceremony —
+    /// it runs two, in namespaces that never meet.
+    #[test]
+    fn the_virtual_epoch_is_refused_on_mainnet_and_allowed_elsewhere() {
+        let toml = |network: &str| {
+            format!(
+                r#"
+[cardano]
+network = "{network}"
+blockfrost_url = "http://localhost:3000/api/v0"
+demo_virtual_epoch_slots = 86400
+"#
+            )
+        };
+        let msg = HeimdallConfig::from_toml_str(&toml("mainnet"))
+            .expect_err("mainnet must refuse it")
+            .to_string();
+        assert!(msg.contains("demo_virtual_epoch_slots"), "{msg}");
+        assert!(msg.contains("roster split"), "names WHY: {msg}");
+
+        for n in ["preprod", "preview", "testnet"] {
+            let cfg = HeimdallConfig::from_toml_str(&toml(n))
+                .unwrap_or_else(|e| panic!("{n} must allow it: {e}"));
+            assert_eq!(cfg.cardano.demo_virtual_epoch_slots, Some(86_400));
+        }
+
+        // Same trap as the sibling guard: an unresolvable network is treated as
+        // mainnet, never waved through.
+        let err = HeimdallConfig::from_toml_str(&toml("Mainnet"))
+            .expect_err("an unresolvable network must not open the gate");
+        assert!(
+            err.to_string().contains("demo_virtual_epoch_slots"),
+            "{err}"
+        );
+    }
+
+    /// A cycle length nothing can run is refused at LOAD, not at the first
+    /// ceremony — which on a five-day epoch would mean finding out five days
+    /// late.
+    #[test]
+    fn an_unusable_virtual_epoch_length_is_refused_at_load() {
+        let toml = |slots: u64| {
+            format!("[cardano]\nnetwork = \"preprod\"\ndemo_virtual_epoch_slots = {slots}\n")
+        };
+        for bad in [0, 60, 432_000, 900_000] {
+            let err = HeimdallConfig::from_toml_str(&toml(bad))
+                .expect_err("an unusable cycle length must be refused")
+                .to_string();
+            assert!(err.contains("demo_virtual_epoch_slots"), "{bad}: {err}");
+        }
+        HeimdallConfig::from_toml_str(&toml(86_400)).expect("a day is usable");
     }
 
     /// ...and a config that sets none of them still loads.

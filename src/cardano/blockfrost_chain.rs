@@ -608,9 +608,27 @@ pub struct BlockfrostCardanoChain {
     demo_exclude_unstaked: bool,
     /// TEST-RUN ONLY: weight the DKG roster by `live_stake`. See
     /// [`crate::config::CardanoConfig::demo_live_stake`] — it is a consensus
-    /// input, so every node of the roster must agree, and a mismatch is published
-    /// in the chain-view rather than left to look like a stalled ceremony.
+    /// input, so every node of the roster must agree, and a mismatch is caught in
+    /// the pre-ceremony handshake rather than left to look like a stalled
+    /// ceremony.
     demo_live_stake: bool,
+    /// TEST-RUN ONLY: which cycle the bridge runs on. `Cardano` (the default) is
+    /// the real five-day epoch; `Virtual` shortens it so a test bridge can
+    /// exercise a rotation in hours. See [`crate::epoch::virtual_epoch`].
+    ///
+    /// The split lives HERE and nowhere else: everything above this adapter sees
+    /// one "epoch", and this is the only code that knows it may not be the
+    /// Cardano one. Every `/epochs/{n}` read keeps using the real epoch
+    /// ([`Self::chain_epoch`]); only the ceremony's own label and anchor move.
+    epoch_scheme: crate::epoch::virtual_epoch::EpochScheme,
+    /// How far into a cycle this node can first ENTER a ceremony, in slots —
+    /// `protocol.dkg_window_secs + dkg_join_wait_secs`, at one slot per second.
+    ///
+    /// Held here only so a virtual epoch's rescaled `update_y_deadline` can be
+    /// checked against it: a rotation deadline that falls inside the window a
+    /// node cannot start before is one no honest node can ever meet, and the
+    /// resulting signing window opens already closed without reporting anything.
+    ceremony_floor_slots: u64,
     /// Mnemonic-derived payment key for the Cardano wallet that pays
     /// fees. `None` means publishing is disabled (dry run).
     payment_key: Option<PrivateKey>,
@@ -864,13 +882,22 @@ struct PegOutSource {
     fbtc_unit: String,
 }
 
-/// How many retired peg-in internal keys a node keeps recognising.
+/// How many retired peg-in internal keys a node keeps recognising, on real
+/// Cardano epochs.
 ///
 /// Every entry costs one full Taproot derivation per peg-in request scanned, and
 /// the peg-in address is permissionlessly payable, so the cost is paid on foreign
 /// deposits too. Eight epochs is ~40 days on Cardano — well past the published
 /// refund timeout of any deposit made under such a key, so what falls off the end
 /// is a deposit whose depositor can already take it back.
+///
+/// The justification is a span of TIME, but the unit is CEREMONIES — one key per
+/// epoch. A virtual epoch runs the ceremony many times more often, so the cap is
+/// scaled to hold the same wall-clock span (see
+/// [`BlockfrostCardanoChain::recognised_retired_keys`]); leaving it at eight
+/// there would forget keys after eight cycles — eight days on a 24-hour cycle —
+/// while `pegin_refund_timeout_blocks` is a Bitcoin block count the virtual epoch
+/// does not touch, so a depositor could NOT yet take the deposit back.
 const MAX_RECOGNISED_RETIRED_KEYS: usize = 8;
 
 impl BlockfrostCardanoChain {
@@ -906,6 +933,8 @@ impl BlockfrostCardanoChain {
             stake_source: crate::cardano::stake::StakeSource::Blockfrost,
             demo_exclude_unstaked: false,
             demo_live_stake: false,
+            epoch_scheme: crate::epoch::virtual_epoch::EpochScheme::Cardano,
+            ceremony_floor_slots: crate::config::ProtocolConfig::default().ceremony_floor_slots(),
             payment_key: None,
             wallet_base_address: None,
             treasury_y_51: Mutex::new(None),
@@ -959,6 +988,187 @@ impl BlockfrostCardanoChain {
         self
     }
 
+    /// The REAL Cardano epoch — the index every `/epochs/{n}` read uses.
+    ///
+    /// Distinct from the trait's `current_epoch`, which answers the epoch the
+    /// CEREMONY runs under and may be a virtual one. The two are the same
+    /// number in production; conflating them under a virtual epoch would ask
+    /// Blockfrost for the stake snapshot of an epoch that does not exist.
+    async fn chain_epoch(&self) -> EpochResult<u64> {
+        crate::cardano::bf_http::fetch_current_epoch(&self.bf_base_url, &self.bf_project_id)
+            .await
+            .map_err(|e| EpochError::Chain(format!("fetch current epoch: {e}")))
+    }
+
+    /// Read the DKG context for a ceremony epoch.
+    ///
+    /// The one place the two epochs meet. Every chain read inside
+    /// `fetch_dkg_context` — the stake snapshot, the boundary time the ban
+    /// filter is evaluated at — is indexed by the REAL Cardano epoch, because
+    /// those are Cardano's own indices and a virtual number names an epoch the
+    /// chain has never had. What the ceremony is LABELLED with, and anchors its
+    /// round deadlines to, is the virtual cycle. On a production bridge the two
+    /// are the same number and this does nothing.
+    async fn fetch_ceremony_context(
+        &self,
+        registry: &crate::cardano::roster::RegistryRosterSource,
+        bans: Option<&crate::cardano::ban_list::BanListSource>,
+        epoch: u64,
+        attempt: u32,
+    ) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
+        // Which Cardano epoch the chain reads are indexed by.
+        //
+        // On real epochs the requested epoch IS that epoch, used as given rather
+        // than re-read: the caller asked for a specific one, and a tip that
+        // ticked over between `await_epoch_boundary` and here would otherwise
+        // silently move the ceremony onto the next epoch's stake snapshot and
+        // boundary time.
+        //
+        // A virtual cycle needs a real epoch it cannot simply be handed, and
+        // reading the CURRENT one would take exactly the race just described —
+        // two nodes entering one virtual ceremony seconds apart across a Cardano
+        // boundary would read 300 and 301, and derive different stake snapshots
+        // and ban cutoffs for the same ceremony. So it is derived from the
+        // CYCLE'S ANCHOR instead: the epoch containing the slot this cycle began
+        // at, which is a function of the ceremony epoch and nothing else.
+        let chain_epoch = match self.epoch_scheme.virtual_slots() {
+            Some(slots) => {
+                self.chain_epoch_containing(epoch.saturating_mul(slots))
+                    .await?
+            }
+            None => epoch,
+        };
+        let mut ctx = crate::cardano::dkg_roster::fetch_dkg_context(
+            registry,
+            bans,
+            &self.bf_base_url,
+            &self.bf_project_id,
+            self.stake_source,
+            chain_epoch,
+            attempt,
+            self.demo_exclude_unstaked,
+            self.demo_live_stake,
+        )
+        .await
+        .map_err(eligible_roster_error(epoch, attempt))?;
+        if let Some(anchor_ms) = self.ceremony_anchor_ms(epoch).await? {
+            info!(
+                "[virtual-epoch] ceremony epoch {epoch} (Cardano epoch {chain_epoch}) anchored \
+                 at {anchor_ms} ms — the roster, its stake and the ban cutoff are read under \
+                 the Cardano epoch; only the ceremony's own schedule is virtual"
+            );
+            ctx.epoch = epoch;
+            ctx.schedule_anchor_ms = Some(anchor_ms);
+        }
+        Ok(ctx)
+    }
+
+    /// [`MAX_RECOGNISED_RETIRED_KEYS`], scaled so a virtual epoch keeps the same
+    /// wall-clock span rather than the same number of ceremonies.
+    ///
+    /// The cap exists to bound a per-deposit derivation cost, and its size was
+    /// chosen to outlast the published refund timeout. That timeout is measured
+    /// in Bitcoin blocks and does not shrink with the bridge's cycle, so the cap
+    /// must not either.
+    fn recognised_retired_keys(&self) -> usize {
+        use crate::epoch::virtual_epoch::CARDANO_EPOCH_SLOTS;
+
+        match self.epoch_scheme.virtual_slots() {
+            None => MAX_RECOGNISED_RETIRED_KEYS,
+            Some(slots) => {
+                let per_epoch = usize::try_from(CARDANO_EPOCH_SLOTS.div_ceil(slots.max(1)))
+                    .unwrap_or(1)
+                    .max(1);
+                MAX_RECOGNISED_RETIRED_KEYS.saturating_mul(per_epoch)
+            }
+        }
+    }
+
+    /// The Cardano epoch that contains `slot`.
+    ///
+    /// Derived from the current epoch and its boundary rather than looked up,
+    /// because the arithmetic normalises: a node that reads epoch 300 starting at
+    /// `S` and one that has already rolled to 301 starting at `S + 432000` both
+    /// answer the same epoch for the same slot. That is what makes it usable as a
+    /// consensus input, where reading "the current epoch" is not.
+    ///
+    /// Only a virtual cycle calls it, and only to index chain reads; on a real
+    /// epoch the ceremony epoch already IS the answer.
+    async fn chain_epoch_containing(&self, slot: u64) -> EpochResult<u64> {
+        use crate::epoch::virtual_epoch::CARDANO_EPOCH_SLOTS;
+
+        let now = self.chain_epoch().await?;
+        let start_ms = crate::cardano::bf_http::fetch_epoch_start_ms(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            now,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("epoch {now} boundary: {e}")))?;
+        let (tip_slot, tip_ms) = self.tip_slot_time_ms().await?;
+        let start_slot = crate::cardano::bf_http::slot_at_time(tip_slot, tip_ms, start_ms);
+        Ok(if slot >= start_slot {
+            // Inside the current epoch, or past it if the cycle anchor is ahead
+            // of the tip — which a ceremony entered at its own boundary can be.
+            now.saturating_add((slot - start_slot) / CARDANO_EPOCH_SLOTS)
+        } else {
+            // Whole epochs back from this one's boundary, rounding away from it.
+            let back = (start_slot - slot).div_ceil(CARDANO_EPOCH_SLOTS);
+            now.saturating_sub(back)
+        })
+    }
+
+    /// The tip's `(slot, posix_time_ms)` — the only input a virtual cycle takes,
+    /// which is what lets two nodes agree on one with no anchor to exchange.
+    async fn tip_slot_time_ms(&self) -> EpochResult<(u64, i64)> {
+        crate::cardano::bf_http::fetch_latest_block_slot_time(
+            &self.bf_base_url,
+            &self.bf_project_id,
+        )
+        .await
+        .map(|(slot, secs)| (slot, secs * 1000))
+        .map_err(|e| EpochError::Chain(format!("tip for the virtual epoch: {e}")))
+    }
+
+    /// The chain time a ceremony epoch began, or `None` on real Cardano epochs
+    /// (where `fetch_dkg_context` reads the boundary from `/epochs/{n}`).
+    ///
+    /// Derived from the epoch NUMBER rather than from the tip, so the anchor
+    /// always belongs to the epoch being run — a cycle that ticked over between
+    /// `await_epoch_boundary` and here would otherwise hand the ceremony an
+    /// anchor from the following one. The conversion is the exact post-Shelley
+    /// one-second-per-slot identity, signed so it works for a start slot on
+    /// either side of the tip.
+    async fn ceremony_anchor_ms(&self, epoch: u64) -> EpochResult<Option<i64>> {
+        let Some(slots) = self.epoch_scheme.virtual_slots() else {
+            return Ok(None);
+        };
+        let (tip_slot, tip_ms) = self.tip_slot_time_ms().await?;
+        let start_slot = i128::from(epoch).saturating_mul(i128::from(slots));
+        let delta_ms = (start_slot - i128::from(tip_slot)).saturating_mul(1000);
+        Ok(Some(tip_ms.saturating_add(
+            i64::try_from(delta_ms).unwrap_or(i64::MAX),
+        )))
+    }
+
+    /// The schedule in force for this deployment: the published one, rescaled if
+    /// the bridge runs on a virtual epoch.
+    ///
+    /// One place, so the grid, the Update-Y close and the stuck-TM recovery
+    /// window cannot end up on different versions of it.
+    fn schedule_in_force(
+        &self,
+        raw: &crate::cardano::config_params::ScheduleParams,
+    ) -> EpochResult<crate::cardano::config_params::ScheduleParams> {
+        self.epoch_scheme
+            .schedule(raw, self.ceremony_floor_slots)
+            .map_err(|e| {
+                EpochError::Chain(format!(
+                    "the virtual epoch cannot hold this bridge's schedule: {e}. No batch will                      be built until this is resolved, on every node"
+                ))
+            })
+    }
+
     /// Cardano's `max_tx_size` for the current epoch, cached per epoch (WI-107).
     ///
     /// An error here refuses the batch rather than falling back to a default: a
@@ -967,7 +1177,9 @@ impl BlockfrostCardanoChain {
     /// back-off; guessing costs a signing round that cannot aggregate, with
     /// nothing in the logs pointing at why.
     async fn max_tx_size(&self) -> EpochResult<u64> {
-        let epoch = self.current_epoch().await?;
+        // The REAL epoch: `/epochs/{n}/parameters` is a Cardano index, and a
+        // virtual epoch number would name an epoch the chain has never had.
+        let epoch = self.chain_epoch().await?;
         if let Some((cached_epoch, value)) = *self.max_tx_size_by_epoch.lock().unwrap()
             && cached_epoch == epoch
         {
@@ -1482,6 +1694,23 @@ impl BlockfrostCardanoChain {
         self
     }
 
+    /// TEST-RUN ONLY: run the bridge's cycle on a virtual epoch (see
+    /// [`crate::config::CardanoConfig::demo_virtual_epoch_slots`]). The value is
+    /// validated at config load, so an unusable one never reaches here.
+    #[must_use]
+    pub fn with_epoch_scheme(mut self, scheme: crate::epoch::virtual_epoch::EpochScheme) -> Self {
+        self.epoch_scheme = scheme;
+        self
+    }
+
+    /// The ceremony-entry floor a virtual epoch's Update-Y deadline is checked
+    /// against — see [`Self::ceremony_floor_slots`].
+    #[must_use]
+    pub fn with_ceremony_floor_slots(mut self, slots: u64) -> Self {
+        self.ceremony_floor_slots = slots;
+        self
+    }
+
     /// DEMO-ONLY: exclude eligible pools whose Cardano stake can't be resolved
     /// from the roster (instead of failing the stake-weighted derivation).
     pub fn with_demo_exclude_unstaked(mut self, v: bool) -> Self {
@@ -1960,9 +2189,17 @@ impl CardanoChain for BlockfrostCardanoChain {
     }
 
     async fn current_epoch(&self) -> EpochResult<u64> {
-        crate::cardano::bf_http::fetch_current_epoch(&self.bf_base_url, &self.bf_project_id)
-            .await
-            .map_err(|e| EpochError::Chain(format!("fetch current epoch: {e}")))
+        // The epoch the CEREMONY runs under. On a test bridge that is the
+        // virtual cycle (WI-VMP6J) — every consumer above this adapter treats it
+        // as "the epoch", and it is what the DKG namespace and the Update-Y
+        // message carry. Chain reads keep using `chain_epoch`.
+        match self.epoch_scheme.virtual_slots() {
+            Some(_) => {
+                let (tip_slot, _) = self.tip_slot_time_ms().await?;
+                Ok(self.epoch_scheme.epoch_at(tip_slot).unwrap_or(0))
+            }
+            None => self.chain_epoch().await,
+        }
     }
 
     async fn query_roster(&self, epoch: u64) -> EpochResult<Roster> {
@@ -1976,19 +2213,9 @@ impl CardanoChain for BlockfrostCardanoChain {
         // the fixture, which would let SPOs run DKG on divergent rosters.
         // `attempt` is 0 here; the orchestration layer (WI-014) bumps it on
         // a failed ceremony.
-        let ctx = crate::cardano::dkg_roster::fetch_dkg_context(
-            &registry,
-            bans.as_ref(),
-            &self.bf_base_url,
-            &self.bf_project_id,
-            self.stake_source,
-            epoch,
-            0,
-            self.demo_exclude_unstaked,
-            self.demo_live_stake,
-        )
-        .await
-        .map_err(eligible_roster_error(epoch, 0))?;
+        let ctx = self
+            .fetch_ceremony_context(&registry, bans.as_ref(), epoch, 0)
+            .await?;
         Ok(ctx.to_roster())
     }
 
@@ -2005,19 +2232,10 @@ impl CardanoChain for BlockfrostCardanoChain {
             // WI-012: eligible roster = registry − active bans, FROST threshold
             // stake-weighted. Any failure is hard — never silently fall back to
             // the fixture, which would let SPOs run DKG on divergent rosters.
-            Some(registry) => crate::cardano::dkg_roster::fetch_dkg_context(
-                registry,
-                bans.as_ref(),
-                &self.bf_base_url,
-                &self.bf_project_id,
-                self.stake_source,
-                epoch,
-                attempt,
-                self.demo_exclude_unstaked,
-                self.demo_live_stake,
-            )
-            .await
-            .map_err(eligible_roster_error(epoch, attempt)),
+            Some(registry) => {
+                self.fetch_ceremony_context(registry, bans.as_ref(), epoch, attempt)
+                    .await
+            }
             // No registry configured → fall back to the static roster with equal
             // stake (the quorum gate degrades to a >51%-by-count majority).
             None => Ok(
@@ -2064,9 +2282,12 @@ impl CardanoChain for BlockfrostCardanoChain {
         // which head a TM spends, so two operators on different values build different TM
         // bytes. A bridge publishing 0 (no window) keeps the old block-for-ever behaviour
         // rather than inventing a default.
-        let recovery_window = u64::try_from(config.params.tunables.schedule.tm_recovery_window)
-            .ok()
-            .filter(|secs| *secs > 0);
+        let recovery_window = u64::try_from(
+            self.schedule_in_force(&config.params.tunables.schedule)?
+                .tm_recovery_window,
+        )
+        .ok()
+        .filter(|secs| *secs > 0);
         let TmScan {
             in_flight_spends,
             parse_failures,
@@ -2351,15 +2572,15 @@ impl CardanoChain for BlockfrostCardanoChain {
                 // cap is long past its own refund timeout, so recognising it buys
                 // an operator nothing it can act on.
                 out.reverse();
-                if out.len() > MAX_RECOGNISED_RETIRED_KEYS {
+                let cap = self.recognised_retired_keys();
+                if out.len() > cap {
                     warn!(
-                        "[treasury] {} retired peg-in key(s) beyond the most recent {} are no \
+                        "[treasury] {} retired peg-in key(s) beyond the most recent {cap} are no \
                          longer recognised; a deposit under one is past its own refund timeout \
                          and reads as another bridge's",
-                        out.len() - MAX_RECOGNISED_RETIRED_KEYS,
-                        MAX_RECOGNISED_RETIRED_KEYS
+                        out.len() - cap,
                     );
-                    out.truncate(MAX_RECOGNISED_RETIRED_KEYS);
+                    out.truncate(cap);
                 }
                 out
             },
@@ -2681,8 +2902,18 @@ impl CardanoChain for BlockfrostCardanoChain {
                 .map_err(|e| EpochError::Chain(format!("batch parameter snapshot: {e}")))?;
         let (tm_params, source) =
             config_params::resolve_tm_params(Some(&snapshot), self.local_fee_rate_sat_per_vb);
-        let batch =
-            config_params::batch_at(&self.bf_base_url, &self.bf_project_id, &snapshot).await;
+        // The schedule this deployment runs on, resolved BEFORE the grid so both
+        // read the same one. Rescaled when the bridge is on a virtual epoch, and
+        // refused here — once — if the cycle cannot hold it.
+        let schedule = self.schedule_in_force(&snapshot.config.params.tunables.schedule)?;
+        let batch = config_params::batch_at(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            &snapshot,
+            self.epoch_scheme,
+            &schedule,
+        )
+        .await;
         let max_tx_size = self.max_tx_size().await?;
 
         // Pin this batch's contract identities from the snapshot that just passed
@@ -2692,7 +2923,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         // of the batch", not "as of whenever this node happened to look".
         self.remember_contracts(&snapshot, batch.open());
 
-        let schedule = &snapshot.config.params.tunables.schedule;
+        let schedule = &schedule;
         // `B_i = epoch_start + i × interval`, so the anchor comes back out of any
         // opportunity the grid resolved — cheaper and exactly as accurate as
         // re-reading it, and `batch_at` has already paid for the read.

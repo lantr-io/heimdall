@@ -616,22 +616,25 @@ it seconds apart can derive different thresholds and produce signatures that nev
 Four things make a mistake here visible rather than mysterious:
 
 - Each node logs a `TEST RUN` warning at startup naming the flag.
-- Each node publishes **the threshold it derived** alongside its DKG payloads, and reports by pool
-  id any peer whose threshold differs — naming the flag when that is the cause. This matters
-  because a weight disagreement does **not** show up as a candidate-set disagreement: both nodes
-  see the same members, so without that line it looks like agreement right up until the ceremony
-  fails to aggregate. The same check catches a `stake_source` or `demo_exclude_unstaked`
-  difference, and drift between two correctly-configured nodes.
+- Each node publishes the flag, **and the threshold it derived**, on its `/health` — and every
+  node checks its peers' before the ceremony starts. A peer that disagrees is named by pool id
+  and left out of that ceremony; the ones that agree carry on without it, over a threshold
+  re-derived across whoever is left, and without burning an attempt. This matters because a
+  weight disagreement does **not** show up as a candidate-set disagreement: both nodes see the
+  same members, so without that check it looks like agreement right up until the ceremony fails
+  to aggregate. The same check catches a `stake_source` or `demo_exclude_unstaked` difference —
+  both are published and compared by name — and drift between two correctly-configured nodes.
 - `network = "mainnet"` **refuses to start** with the flag set. It is not warned about, because a
   warning in a journal is not something anyone reads before the first ceremony fails. A network
   heimdall cannot resolve — an unknown spelling, or one that disagrees with your
   `config_address` — is treated as mainnet, so the guard cannot be slipped by a capital letter.
 - `heimdall doctor` and `run-spo --check` report it, so it cannot hide behind "all checks passed".
 
-There is one thing none of that catches: two nodes that both set the flag **correctly** can still
-derive different thresholds, because `live_stake` moves between their two reads. They will see
-each other's thresholds disagree and say so — the ceremony is retried at the next attempt — but
-it is the reason this is a test-bridge setting and not a way to run a bridge.
+Two nodes that both set the flag **correctly** can still derive different thresholds, because
+`live_stake` moves between their two reads. That is caught by the same check, and the log line
+says so explicitly — it is drift, not a build problem, and **do not upgrade anything**; the next
+ceremony entry re-reads and normally agrees. It is the reason this is a test-bridge setting and
+not a way to run a bridge.
 
 ### Turning it off again
 
@@ -646,6 +649,84 @@ node — which will report *the honest majority* as the side that disagrees.
 Stake also activates per-pool at different epochs, so "once your stake has activated" is not a
 moment the roster shares. Agree an epoch boundary with the other operators, change the flag on
 every node before it, and restart them together.
+
+### Not waiting five days per rotation
+
+`demo_live_stake` gets a test roster to its first ceremony. The next wall is the cycle itself: a
+Cardano epoch is **five days on preprod exactly as on mainnet**, and the DKG, the Update-Y and the
+whole batch grid hang off the epoch boundary. Watching one key rotation end to end therefore costs
+five days per attempt.
+
+A test bridge can run a shorter cycle of its own:
+
+```toml
+[cardano]
+demo_virtual_epoch_slots = 86400    # TEST BRIDGES ONLY — a 24-hour cycle
+```
+
+The cycle is derived from the chain, not from your clock: it is `tip_slot / 86400`, counted from
+slot 0, so every node computes the same number from the same tip with nothing to agree on
+beforehand. It must be at least 43200 slots (twelve hours) and shorter than a real epoch; anything
+else is refused when the config loads.
+
+**The ceremony deadlines rescale with it, automatically.** The Config publishes a schedule written
+for a five-day epoch, whose last batch opportunity is four days in — dropped unchanged into a
+24-hour cycle that sits three days past the end of the cycle it belongs to. So the four values
+measured as an offset from the cycle start are scaled by `demo_virtual_epoch_slots / 432000`:
+`dkg_r1_deadline`, `dkg_r2_deadline`, `update_y_deadline` and `final_tm_cutoff`. You do not
+hand-tune anything, which is the point: a rescale derived from two agreed numbers cannot diverge
+between nodes, and hand-copied Config values would.
+
+**Nothing else is scaled, and that is deliberate.** Every other value in the schedule is measured
+against something a shorter bridge cycle does not shorten:
+
+- `tm_batch_interval` stays at the published pitch. It is tied to `stability_window` by
+  `C_i = B_i − stability_window`, and it must stay *above* it — the deposits a cycle leaves over
+  are picked up by the next cycle's **first** batch, which is the last one that runs before the
+  treasury key rotates. Push the pitch below the window and those deposits miss that batch, the
+  key rotates, and they are unsweepable for good. A shorter cycle therefore gets **fewer batch
+  opportunities**, not smaller ones.
+- `tm_recovery_window` stays put: it is how long a submitted Bitcoin transaction may go unconfirmed
+  before the bridge replaces it, and Bitcoin does not confirm faster on a test bridge.
+- `sign_r1_window`, `sign_r2_window` and `leader_slot_t` stay put: they are network round-trip
+  budgets, and peers do not answer faster either.
+
+heimdall refuses to start a cycle its schedule cannot fit — one holding no batch opportunity, one
+whose rotation deadline falls inside the ceremony window a node cannot start before, or one on a
+bridge whose `stability_window` already exceeds its own batch pitch. Each refusal names the value
+and what to change.
+
+**Every node of the roster must set this identically — more so than any other setting in this
+guide.** The DKG namespace is `(epoch, threshold, attempt)`. Two nodes on different cycles compute
+different epoch numbers, so they publish into namespaces that never fetch each other: nothing
+errors on either side, and each simply waits for a ceremony the other cannot see. This is why the
+check is on `/health` and runs before anything is published — a mismatched peer is named and
+excluded up front, rather than discovered by a ceremony that quietly never converges.
+
+The same guards as `demo_live_stake` apply: a `TEST RUN` warning at startup naming the value,
+`heimdall doctor` reporting it, and a **refusal to start** on `network = "mainnet"` (or on any
+network heimdall cannot resolve).
+
+#### What a shorter cycle does not change
+
+- **`stability_window` does not rescale.** It is a property of Cardano — how far a transaction must
+  be behind the tip before it is safe to build on — and Cardano does not settle faster because your
+  bridge's cycle is shorter. A deposit still has to age the published window (currently 2 hours on
+  the shared preprod bridge) before any batch will pick it up, so the wait for a deposit is set by
+  the window, never by the cycle. A bridge whose published window is **larger than its batch
+  interval** is refused a virtual epoch outright: such a bridge already strands the deposits each
+  cycle leaves over, and running its rotation five times as often would only multiply that.
+- **Cardano's own epoch is still the real one.** The stake snapshot, the ban cutoff time and
+  `max_tx_size` are all read under the real Cardano epoch. Only the bridge's own schedule is
+  virtual.
+- **It does not replace `demo_live_stake`.** Stake activation is still two real Cardano boundaries;
+  a shorter bridge cycle does nothing about that.
+
+Turning it off follows the same rule as the flag above: it is a roster-wide value, so change it on
+every node and restart them together, or the roster splits into two cycles that cannot see each
+other. Note that epoch numbers do not line up across the change — a virtual cycle counts from slot
+0 and is a much larger number than a Cardano epoch — so treat the switch as a restart of the
+bridge's ceremony history, not as a continuation of it.
 
 ---
 
@@ -696,7 +777,7 @@ sudo -u heimdall heimdall status --config /etc/heimdall/heimdall.toml
 halves. The first is the same startup report `doctor` renders, from the same code — registration,
 the bridge this node resolved, the ban list, the provider, the key material. The second is what only
 a running daemon knows: the epoch, whether this node **qualified in the ceremony**, where it stands
-on the batch grid, and any peer excluded for running incompatible software.
+on the batch grid, and any peer excluded from it.
 
 If the daemon is not running, `status` says so and still prints the first half. That is a fact worth
 reporting, not an error.
@@ -718,8 +799,12 @@ both:
 * **`dkg NOT in the qualified set`** — this node is up but not signing. Usually its endpoint was
   unreachable from outside when the ceremony ran (step 5), so peers could not fetch its round-1
   payload.
-* **`peers excluded`** — a peer is running software this node will not run a ceremony with.
-  Both sides log it, so the operator on the other end sees the same line. Upgrade the lagging node.
+* **`peers excluded`** — a peer this node will not run a ceremony with. Both sides log it, so the
+  operator on the other end sees the same line, and **the line says which of three things it is**:
+  a different version or blueprint (upgrade the lagging node); a different `demo_live_stake` or
+  `demo_virtual_epoch_slots` (match the setting across the roster); or only a different derived
+  threshold, which is `live_stake` drifting between two reads and needs nothing done — it clears at
+  the next ceremony entry. Do not upgrade a node for the third one.
 
 ### Reading the log
 

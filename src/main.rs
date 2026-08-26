@@ -2097,9 +2097,37 @@ async fn run_spo(
                  so EVERY node of this roster must set it too. It is refused on mainnet"
             );
         }
+        // TEST-RUN ONLY: the virtual epoch. Validated at config load, so a config
+        // that got this far cannot fail here — but it is still reported rather
+        // than unwrapped, because a caller that skipped the load-time check
+        // deserves the reason, not a panic message.
+        let scheme = match heimdall::epoch::virtual_epoch::EpochScheme::from_slots(
+            cfg.cardano.demo_virtual_epoch_slots,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Error: cardano.demo_virtual_epoch_slots: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Some(slots) = scheme.virtual_slots() {
+            // Loud for the same reason demo_live_stake is, only more so: this one
+            // decides the DKG NAMESPACE, so a node that has it and a node that
+            // does not never fetch each other's payloads at all. Neither side
+            // errors; each waits for a ceremony the other cannot see.
+            warn!(
+                "[epoch] TEST RUN: the bridge cycle is a {slots}-slot VIRTUAL epoch \
+                 (cardano.demo_virtual_epoch_slots), not Cardano's five-day one, and the \
+                 ceremony deadlines are rescaled to fit it. EVERY node of this roster must \
+                 set the same value — a mismatch splits the DKG namespace. It is refused on \
+                 mainnet"
+            );
+        }
         bf_chain = bf_chain
             .with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked)
-            .with_demo_live_stake(cfg.cardano.demo_live_stake);
+            .with_demo_live_stake(cfg.cardano.demo_live_stake)
+            .with_epoch_scheme(scheme)
+            .with_ceremony_floor_slots(cfg.protocol.ceremony_floor_slots());
 
         // The bridge Config, read once at startup. It publishes the ban policy
         // (#8 and params[4..=6]), so a node needs no ban keys of its own — and an unreadable
@@ -2460,6 +2488,13 @@ async fn run_spo(
         .state_dir
         .as_deref()
         .map(std::path::PathBuf::from);
+    // Publish the configured half of the handshake NOW, not at the first
+    // ceremony entry. The server below starts listening immediately while the
+    // epoch loop may be minutes from its first roster read, and these values are
+    // compared as definite answers — so a peer polling this node in between would
+    // read them as absent and exclude it for running settings it does not have.
+    // That is the staggered start the health gate exists to wait through.
+    net.shared_state().write().await.facts = cfg.cardano.node_facts();
     let app = router(net.shared_state());
     let bind_addr = &cfg.http.bind_address;
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
@@ -2910,10 +2945,25 @@ fn batch_params(
              sat/vB) — {why}. Co-signers reading a different value build different TM bytes."
         );
     }
+    // The same cycle the daemon runs on, for the same reason the pitch and the
+    // anchor come from the chain: a CLI sweep that resolved a different grid than
+    // its co-signers would freeze a batch none of them reproduce.
+    let scheme = heimdall::epoch::virtual_epoch::EpochScheme::from_slots(
+        cfg.cardano.demo_virtual_epoch_slots,
+    )
+    .map_err(|e| format!("cardano.demo_virtual_epoch_slots: {e}"))?;
+    let schedule = scheme
+        .schedule(
+            &snapshot.config.params.tunables.schedule,
+            cfg.protocol.ceremony_floor_slots(),
+        )
+        .map_err(|e| format!("the virtual epoch cannot hold this bridge's schedule: {e}"))?;
     let batch = rt.block_on(heimdall::cardano::config_params::batch_at(
         &loc.base_url,
         &loc.project_id,
         &snapshot,
+        scheme,
+        &schedule,
     ));
     if let (true, Some(b)) = (verbose, batch.open()) {
         info!(

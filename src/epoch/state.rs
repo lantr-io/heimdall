@@ -655,6 +655,17 @@ pub struct EpochConfig {
     pub identity: SpoIdentity,
     /// Cardano policy ID (script hash) identifying peg-in request UTxOs.
     pub pegin_policy_id: [u8; 28],
+    /// The CONFIGURED half of what this node publishes in the pre-ceremony
+    /// handshake: the roster-weighting inputs and the epoch scheme.
+    ///
+    /// The machine derives nothing from these — the chain adapter owns the
+    /// scheme and the stake reads. They are here so they can be PUBLISHED, and
+    /// they are known from process start, which is the point: the peer server is
+    /// up long before the first ceremony entry, and a peer polled in between
+    /// must not read them as absent and be excluded for running something it is
+    /// not. The live half (the derived `t` and the epoch it belongs to) is added
+    /// at ceremony entry.
+    pub node_facts: crate::http::compat::NodeFacts,
     /// Upper bound on how long the batch loop sleeps between grid checks.
     ///
     /// NOT a protocol value and deliberately not an operator key: it decides read
@@ -748,6 +759,7 @@ impl EpochConfig {
             retry_backoff_max: Duration::from_secs(60),
             identity,
             pegin_policy_id: [0u8; 28],
+            node_facts: crate::http::compat::NodeFacts::default(),
             batch_poll_ceiling: Duration::from_secs(300),
             pegin_refund_timeout_blocks: 4320,
             state_dir: None,

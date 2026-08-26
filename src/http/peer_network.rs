@@ -57,12 +57,6 @@ struct ViewState {
     /// view matches ours again; NOT reset by `set_chain_view`, since one
     /// disagreement can span several attempts.
     divergence_since: BTreeMap<Vec<u8>, Instant>,
-    /// Per-peer `pool_id` → the last threshold we reported a disagreement about.
-    ///
-    /// The fetch path polls every few seconds, and this is an `error!`: without
-    /// throttling one misconfigured peer buries `journalctl -p err`. Keyed on the
-    /// VALUE, not a bool, so a peer whose threshold moves again is reported again.
-    threshold_reported: BTreeMap<Vec<u8>, u16>,
 }
 
 /// Key under which a fetched peer payload's raw bytes are retained for
@@ -146,60 +140,6 @@ impl HttpPeerNetwork {
                 return;
             }
         };
-        // A WEIGHT disagreement, which is not a freshness one. The candidate SET
-        // can be identical on both sides — same digest, same n — while the derived
-        // `t` differs, and that ceremony cannot aggregate: `dkg.rs` drops every
-        // peer whose commitment vector is not `ctx.threshold` long and blames a
-        // "different candidate set", which is false. Causes: a `demo_live_stake`
-        // mismatch, a `stake_source` or `demo_exclude_unstaked` difference, or —
-        // with `demo_live_stake` correctly set on BOTH — plain `live_stake` drift
-        // between two reads seconds apart, which is the hazard the flag's own
-        // documentation names.
-        //
-        // Reported, never folded into the stale/fresher reconcile: no re-read
-        // settles any of them. But it does NOT return either — a node can be both
-        // misconfigured and genuinely behind, and swallowing the digest comparison
-        // below would suppress its stale flag and its divergence alarm.
-        if own.threshold != 0 && peer.threshold != 0 && peer.threshold != own.threshold {
-            let cause = if peer.live_stake != own.live_stake {
-                let (mine, theirs) = if own.live_stake {
-                    ("live_stake (TEST RUN)", "the epoch snapshot")
-                } else {
-                    ("the epoch snapshot", "live_stake (TEST RUN)")
-                };
-                format!(
-                    "cardano.demo_live_stake does not match: we weight by {mine}, the peer by \
-                     {theirs}"
-                )
-            } else if own.live_stake {
-                "both nodes weight by live_stake, which DRIFTS — these were read at different \
-                 moments. Wait for the next attempt, or move the roster back to the epoch \
-                 snapshot"
-                    .to_string()
-            } else {
-                "same candidate set, different weights — check cardano.stake_source and \
-                 cardano.demo_exclude_unstaked on both nodes"
-                    .to_string()
-            };
-            if v.threshold_reported
-                .insert(peer_pool_id.to_vec(), peer.threshold)
-                != Some(peer.threshold)
-            {
-                error!(
-                    "[chain-view] peer {} derived threshold {} and this node {} — their DKG \
-                     round 1 cannot aggregate with ours. {cause}. Note the candidate sets {}, \
-                     so this will not appear as a view disagreement",
-                    hex::encode(peer_pool_id),
-                    peer.threshold,
-                    own.threshold,
-                    if peer.digest == own.digest {
-                        "AGREE"
-                    } else {
-                        "also differ"
-                    },
-                );
-            }
-        }
         if peer.digest == own.digest {
             if v.divergence_since.remove(peer_pool_id).is_some() {
                 info!(
@@ -541,6 +481,10 @@ impl PeerNetwork for HttpPeerNetwork {
         let mut v = self.views.lock().expect("views mutex");
         v.own = Some(view);
         v.stale = false; // fresh ceremony entry → clear the per-attempt verdict
+    }
+
+    async fn set_node_facts(&self, facts: crate::http::compat::NodeFacts) {
+        self.state.write().await.facts = facts;
     }
 
     async fn is_view_stale(&self) -> bool {
@@ -1065,16 +1009,12 @@ mod tests {
             digest: [0xA1; 32],
             n: 4,
             read_time_ms: 100,
-            threshold: 2,
-            live_stake: false,
         })
         .await;
         net2.set_chain_view(ChainView {
             digest: [0xB2; 32],
             n: 3,
             read_time_ms: 200,
-            threshold: 2,
-            live_stake: false,
         })
         .await;
 
@@ -1104,8 +1044,6 @@ mod tests {
             digest: [0xB2; 32],
             n: 3,
             read_time_ms: 300,
-            threshold: 2,
-            live_stake: false,
         })
         .await;
         assert!(
@@ -1114,18 +1052,21 @@ mod tests {
         );
     }
 
-    /// A weight disagreement must be caught even when the candidate sets AGREE,
-    /// and must not disturb the freshness machinery.
+    /// A weight disagreement is caught in the HANDSHAKE, over real HTTP,
+    /// BEFORE either node publishes anything (WI-VMP6J).
     ///
     /// Two nodes can derive different thresholds from an identical member set —
-    /// a `demo_live_stake` mismatch, a `stake_source` difference, or `live_stake`
-    /// drift with the flag correctly set on both. The ceremony then cannot
-    /// aggregate while `compare_view` reports "reconciled", so the derived
-    /// threshold is published and compared. It is NOT a freshness problem, so it
-    /// must not set the stale flag on its own — and it must not SUPPRESS a real
-    /// one either, which is what an early return would do.
+    /// a `demo_live_stake` mismatch, a `demo_virtual_epoch_slots` mismatch, or
+    /// plain `live_stake` drift with the flag correctly set on both. This rode
+    /// on the chain-view briefly, which was the wrong channel twice over: it
+    /// fires only once payloads are already exchanged and the attempt is spent,
+    /// and it never fires at all against a peer that publishes no view. The
+    /// pre-ceremony gate reads it from `/health`, which is un-namespaced and
+    /// answered from process start.
     #[tokio::test]
-    async fn differing_thresholds_are_caught_even_when_the_candidate_sets_agree() {
+    async fn a_weight_disagreement_is_caught_over_health_before_publishing() {
+        use crate::http::compat::{Compatibility, NodeFacts};
+
         let secp = Secp256k1::new();
         let (kp1, pool1, pk1) = identity(&secp, 1);
         let (kp2, pool2, pk2) = identity(&secp, 2);
@@ -1133,96 +1074,82 @@ mod tests {
         let net2 = HttpPeerNetwork::new(Secp256k1::new(), kp2, pool2);
         let url1 = serve(&net1).await;
         let url2 = serve(&net2).await;
-        let ns = DkgNamespace::new(11);
 
-        // IDENTICAL digest, n and read_time — the candidate set agrees and neither
-        // node is behind. Only the derived threshold differs.
-        net1.set_chain_view(ChainView {
-            digest: [0xC3; 32],
-            n: 3,
-            read_time_ms: 500,
-            threshold: 3,
-            live_stake: true,
-        })
-        .await;
-        net2.set_chain_view(ChainView {
-            digest: [0xC3; 32],
-            n: 3,
-            read_time_ms: 500,
-            threshold: 2,
-            live_stake: false,
-        })
-        .await;
+        let facts1 = NodeFacts {
+            virtual_epoch_slots: None,
+            live_stake: Some(true),
+            epoch: Some(11),
+            threshold: Some(3),
+            ..NodeFacts::default()
+        };
+        let facts2 = NodeFacts {
+            virtual_epoch_slots: None,
+            live_stake: Some(false),
+            epoch: Some(11),
+            threshold: Some(2),
+            ..NodeFacts::default()
+        };
+        net1.set_node_facts(facts1).await;
+        net2.set_node_facts(facts2).await;
 
-        let (_s1, pkg1) = dkg::part1(id(1), 3, 2, OsRng).unwrap();
-        let (_s2, pkg2) = dkg::part1(id(2), 3, 2, OsRng).unwrap();
-        net1.publish_dkg_round1(ns, id(1), &pkg1).await.unwrap();
-        net2.publish_dkg_round1(ns, id(2), &pkg2).await.unwrap();
-
+        // Nothing has been published — `dkg` is empty on both — and the verdict is
+        // already available.
         let peer1 = peer_info(1, &pool1, &url1, &pk1);
         let peer2 = peer_info(2, &pool2, &url2, &pk2);
-        let _ = fetch_r1_retrying(&net1, ns, &peer2).await;
-        let _ = fetch_r1_retrying(&net2, ns, &peer1).await;
+        let h2 = net1.check_health(&peer2).await;
+        let h1 = net2.check_health(&peer1).await;
+        assert!(h1.reachable && h2.reachable);
+        assert_eq!(h2.build.live_stake, Some(false));
+        assert_eq!(h2.build.threshold, Some(2));
 
-        // The report fired (it is throttled per peer per value, so the record of
-        // having reported is what the branch leaves behind) ...
-        for net in [&net1, &net2] {
-            let v = net.views.lock().unwrap();
-            assert!(
-                !v.threshold_reported.is_empty(),
-                "a threshold disagreement must be reported; with the branch removed \
-                 compare_view returns at the digest match and this map stays empty"
-            );
-            // ... and neither node was told it is behind: no re-read settles a
-            // weight disagreement, so the settling backoff must not be armed.
-            assert!(!v.stale);
-            assert!(v.divergence_since.is_empty());
+        // Symmetric: each excludes the other, so the two never enter one ceremony.
+        for (health, own) in [(&h2, facts1), (&h1, facts2)] {
+            let Compatibility::Incompatible { reason } = health.compatibility(own) else {
+                panic!("a live_stake mismatch must be incompatible");
+            };
+            assert!(reason.contains("demo_live_stake"), "{reason}");
         }
     }
 
-    /// The weight check must not SWALLOW a genuine stale view. A node can be both
-    /// misconfigured and behind, and an early return would leave it retrying
-    /// against an unsettled tip forever.
+    /// The epoch scheme travels the same way, and is the one value that MUST:
+    /// two nodes on different cycles address DKG namespaces that never meet, so
+    /// no payload-borne detector can ever see the other side.
     #[tokio::test]
-    async fn a_threshold_disagreement_does_not_mask_a_stale_view() {
+    async fn a_virtual_epoch_mismatch_is_caught_over_health() {
+        use crate::http::compat::{Compatibility, NodeFacts};
+
         let secp = Secp256k1::new();
-        let (kp1, pool1, pk1) = identity(&secp, 1);
+        let (kp1, pool1, _pk1) = identity(&secp, 1);
         let (kp2, pool2, pk2) = identity(&secp, 2);
         let net1 = HttpPeerNetwork::new(Secp256k1::new(), kp1, pool1);
         let net2 = HttpPeerNetwork::new(Secp256k1::new(), kp2, pool2);
-        let url1 = serve(&net1).await;
-        let _url2 = serve(&net2).await;
-        let ns = DkgNamespace::new(13);
+        let url2 = serve(&net2).await;
 
-        // net1 is BOTH behind (older read, different digest) AND on a different
-        // threshold. The stale verdict must survive the weight report.
-        net1.set_chain_view(ChainView {
-            digest: [0xD1; 32],
-            n: 4,
-            read_time_ms: 100,
-            threshold: 3,
-            live_stake: true,
-        })
-        .await;
-        net2.set_chain_view(ChainView {
-            digest: [0xD2; 32],
-            n: 3,
-            read_time_ms: 900,
-            threshold: 2,
-            live_stake: false,
+        let mine = NodeFacts {
+            virtual_epoch_slots: Some(86_400),
+            live_stake: Some(true),
+            epoch: Some(4),
+            threshold: Some(2),
+            ..NodeFacts::default()
+        };
+        net2.set_node_facts(NodeFacts {
+            virtual_epoch_slots: None,
+            ..mine
         })
         .await;
 
-        let (_s2, pkg2) = dkg::part1(id(2), 3, 2, OsRng).unwrap();
-        net2.publish_dkg_round1(ns, id(2), &pkg2).await.unwrap();
-        let peer2 = peer_info(2, &pool2, &_url2, &pk2);
-        let _ = fetch_r1_retrying(&net1, ns, &peer2).await;
+        let peer2 = peer_info(2, &pool2, &url2, &pk2);
+        let health = net1.check_health(&peer2).await;
+        let Compatibility::Incompatible { reason } = health.compatibility(mine) else {
+            panic!("a virtual-epoch mismatch must be incompatible");
+        };
+        assert!(reason.contains("86400"), "{reason}");
+        assert!(reason.contains("real Cardano epochs"), "{reason}");
 
-        assert!(
-            net1.is_view_stale().await,
-            "the older-read node is still the stale side, threshold row or not"
-        );
-        let _ = (pool1, pk1, url1);
+        // …and a roster that agrees is compatible, flag set or not.
+        net2.set_node_facts(mine).await;
+        let health = net1.check_health(&peer2).await;
+        assert_eq!(health.compatibility(mine), Compatibility::Compatible);
     }
 
     #[tokio::test]

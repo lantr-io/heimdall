@@ -40,6 +40,95 @@ pub fn base_url(project_id: &str, custom: Option<&str>) -> String {
     }
 }
 
+/// What the backend actually said about a failed request.
+///
+/// A Blockfrost-compatible backend answers errors as JSON —
+/// `{"error": …, "message": …, "status_code": …}` — so the two fields that name
+/// the cause are lifted out of it. The raw body carries the same words, but the
+/// sentence an operator has to act on should not arrive wrapped in JSON
+/// punctuation at the end of a log line.
+///
+/// The status hint matters more than it looks. A quota wall answers 402 on EVERY
+/// endpoint, and a caller that reads the body without checking the status sees a
+/// well-formed JSON object with none of the fields it wanted — which it then
+/// reports as a malformed block. That is not hypothetical: the shared preprod
+/// bridge spent five hours in a 60-second retry loop logging
+/// `blocks/latest: missing/non-numeric slot` while the actual answer was
+/// "Usage is over limit".
+fn backend_error(what: &str, status: reqwest::StatusCode, body: &str) -> String {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let field = |k: &str| -> Option<String> {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(k))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let said = match (field("error"), field("message")) {
+        (Some(e), Some(m)) => format!("{e}: {m}"),
+        (Some(e), None) => e,
+        (None, Some(m)) => m,
+        // Not the JSON shape, or empty. Fall back to the body, trimmed — an HTML
+        // error page from a proxy is still evidence, just not quotable in full.
+        (None, None) => {
+            let t = body.trim();
+            if t.is_empty() {
+                "no body".to_string()
+            } else {
+                t.chars().take(200).collect()
+            }
+        }
+    };
+    let hint = match status.as_u16() {
+        402 => {
+            " — the Blockfrost project is over its plan limit. It resets on the provider's own \
+             schedule; to stop depending on that, point cardano.blockfrost_url at a backend you \
+             run"
+        }
+        403 => {
+            " — the project_id was rejected: check cardano.blockfrost_project_id, and that it \
+                belongs to the network in cardano.network"
+        }
+        429 => " — rate limited by the provider, not an error in the chain data",
+        _ => "",
+    };
+    format!("{what}: HTTP {status} ({said}){hint}")
+}
+
+/// GET a JSON body, with the status checked before it is parsed.
+///
+/// The check is the point. Without it a non-success response is parsed as data,
+/// and every "missing field" error downstream is a lie about what went wrong —
+/// see [`backend_error`].
+async fn get_json(url: &str, project_id: &str, what: &str) -> Result<serde_json::Value, String> {
+    get_json_within(url, project_id, what, None).await
+}
+
+/// [`get_json`] with a per-request timeout, for the reads that carry one.
+async fn get_json_within(
+    url: &str,
+    project_id: &str,
+    what: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<serde_json::Value, String> {
+    let mut req = reqwest::Client::new()
+        .get(url)
+        .header("project_id", project_id);
+    if let Some(t) = timeout {
+        req = req.timeout(t);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("{what} request: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(backend_error(what, status, &body));
+    }
+    resp.json().await.map_err(|e| format!("{what} json: {e}"))
+}
+
 /// Fetch all UTxOs at `address` (paginated), leniently parsed.
 pub async fn fetch_address_utxos(
     base_url: &str,
@@ -62,10 +151,10 @@ pub async fn fetch_address_utxos(
             break; // no UTxOs at this address
         }
         if !status.is_success() {
-            return Err(format!(
-                "utxos http {}: {}",
+            return Err(backend_error(
+                "utxos",
                 status,
-                resp.text().await.unwrap_or_default()
+                &resp.text().await.unwrap_or_default(),
             ));
         }
         let batch: Vec<BfUtxo> = resp.json().await.map_err(|e| format!("utxos json: {e}"))?;
@@ -109,10 +198,10 @@ pub async fn fetch_script_cbor(
         return Ok(None);
     }
     if !resp.status().is_success() {
-        return Err(format!(
-            "script cbor http {}: {}",
+        return Err(backend_error(
+            "script cbor",
             resp.status(),
-            resp.text().await.unwrap_or_default()
+            &resp.text().await.unwrap_or_default(),
         ));
     }
     let v: serde_json::Value = resp
@@ -162,10 +251,10 @@ pub async fn fetch_script_size(
         .await
         .map_err(|e| format!("script request: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "script http {}: {}",
+        return Err(backend_error(
+            "script",
             resp.status(),
-            resp.text().await.unwrap_or_default()
+            &resp.text().await.unwrap_or_default(),
         ));
     }
     let v: serde_json::Value = resp.json().await.map_err(|e| format!("script json: {e}"))?;
@@ -186,10 +275,10 @@ pub async fn fetch_current_epoch(base_url: &str, project_id: &str) -> Result<u64
         .await
         .map_err(|e| format!("epochs/latest request: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "epochs/latest http {}: {}",
+        return Err(backend_error(
+            "epochs/latest",
             resp.status(),
-            resp.text().await.unwrap_or_default()
+            &resp.text().await.unwrap_or_default(),
         ));
     }
     let v: serde_json::Value = resp
@@ -206,15 +295,7 @@ pub async fn fetch_current_epoch(base_url: &str, project_id: &str) -> Result<u64
 /// never a local node clock).
 pub async fn fetch_latest_block_time(base_url: &str, project_id: &str) -> Result<i64, String> {
     let url = format!("{base_url}/blocks/latest");
-    let v: serde_json::Value = reqwest::Client::new()
-        .get(&url)
-        .header("project_id", project_id)
-        .send()
-        .await
-        .map_err(|e| format!("blocks/latest request: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("blocks/latest json: {e}"))?;
+    let v = get_json(&url, project_id, "blocks/latest").await?;
     v.get("time")
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| "blocks/latest: missing/non-numeric `time`".to_string())
@@ -228,15 +309,7 @@ pub async fn fetch_latest_block_slot_time(
     project_id: &str,
 ) -> Result<(u64, i64), String> {
     let url = format!("{base_url}/blocks/latest");
-    let v: serde_json::Value = reqwest::Client::new()
-        .get(&url)
-        .header("project_id", project_id)
-        .send()
-        .await
-        .map_err(|e| format!("blocks/latest request: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("blocks/latest json: {e}"))?;
+    let v = get_json(&url, project_id, "blocks/latest").await?;
     let slot = v
         .get("slot")
         .and_then(serde_json::Value::as_u64)
@@ -263,15 +336,7 @@ pub async fn fetch_tx_output_address(
     index: u32,
 ) -> Result<String, String> {
     let url = format!("{base_url}/txs/{tx_hash}/utxos");
-    let v: serde_json::Value = reqwest::Client::new()
-        .get(&url)
-        .header("project_id", project_id)
-        .send()
-        .await
-        .map_err(|e| format!("txs/{tx_hash}/utxos request: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("txs/{tx_hash}/utxos json: {e}"))?;
+    let v = get_json(&url, project_id, &format!("txs/{tx_hash}/utxos")).await?;
     let outputs = v
         .get("outputs")
         .and_then(serde_json::Value::as_array)
@@ -305,15 +370,7 @@ pub async fn fetch_tx_block_time(
     tx_hash: &str,
 ) -> Result<i64, String> {
     let url = format!("{base_url}/txs/{tx_hash}");
-    let v: serde_json::Value = reqwest::Client::new()
-        .get(&url)
-        .header("project_id", project_id)
-        .send()
-        .await
-        .map_err(|e| format!("txs/{tx_hash} request: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("txs/{tx_hash} json: {e}"))?;
+    let v = get_json(&url, project_id, &format!("txs/{tx_hash}")).await?;
     v.get("block_time")
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| format!("txs/{tx_hash}: missing/non-numeric `block_time`"))
@@ -345,16 +402,13 @@ pub async fn fetch_tx_point(
     // default, so one half-open connection (a NAT timeout, a load-balancer black
     // hole) would hang `query_pegin_requests` — and with it the whole epoch loop —
     // producing no error for the back-off policy to see and no log line.
-    let v: serde_json::Value = reqwest::Client::new()
-        .get(&url)
-        .header("project_id", project_id)
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| format!("txs/{tx_hash} request: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("txs/{tx_hash} json: {e}"))?;
+    let v = get_json_within(
+        &url,
+        project_id,
+        &format!("txs/{tx_hash}"),
+        Some(std::time::Duration::from_secs(15)),
+    )
+    .await?;
     let block_time_secs = v
         .get("block_time")
         .and_then(serde_json::Value::as_i64)
@@ -513,10 +567,10 @@ pub async fn fetch_tx_inclusion(
         return Ok(None);
     }
     if !resp.status().is_success() {
-        return Err(format!(
-            "txs/{tx_hash} http {}: {}",
+        return Err(backend_error(
+            "txs/{tx_hash}",
             resp.status(),
-            resp.text().await.unwrap_or_default()
+            &resp.text().await.unwrap_or_default(),
         ));
     }
     let v: serde_json::Value = resp
@@ -552,10 +606,10 @@ pub async fn fetch_epoch_start_ms(
             .await
             .map_err(|e| format!("{path} request: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!(
-                "{path} http {}: {}",
+            return Err(backend_error(
+                "{path}",
                 resp.status(),
-                resp.text().await.unwrap_or_default()
+                &resp.text().await.unwrap_or_default(),
             ));
         }
         resp.json::<serde_json::Value>()
@@ -629,10 +683,10 @@ pub async fn fetch_epoch_window(base_url: &str, project_id: &str) -> Result<Epoc
                 .await
                 .map_err(|e| format!("{url}: {e}"))?;
             if !resp.status().is_success() {
-                return Err(format!(
-                    "{url}: http {}: {}",
+                return Err(backend_error(
+                    "{url}:",
                     resp.status(),
-                    resp.text().await.unwrap_or_default()
+                    &resp.text().await.unwrap_or_default(),
                 ));
             }
             resp.json::<serde_json::Value>()
@@ -680,10 +734,10 @@ pub async fn fetch_key_deposit(base_url: &str, project_id: &str) -> Result<u64, 
         .await
         .map_err(|e| format!("parameters request: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "parameters http {}: {}",
+        return Err(backend_error(
+            "parameters",
             resp.status(),
-            resp.text().await.unwrap_or_default()
+            &resp.text().await.unwrap_or_default(),
         ));
     }
     let v: serde_json::Value = resp
@@ -793,10 +847,10 @@ pub async fn fetch_max_tx_size(
             .await
             .map_err(|e| format!("{path} request: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!(
-                "{path} http {}: {}",
+            return Err(backend_error(
+                "{path}",
                 resp.status(),
-                resp.text().await.unwrap_or_default()
+                &resp.text().await.unwrap_or_default(),
             ));
         }
         resp.json::<serde_json::Value>()
@@ -856,10 +910,10 @@ pub async fn fetch_cost_models(base_url: &str, project_id: &str) -> Result<Vec<V
         .await
         .map_err(|e| format!("parameters request: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "parameters http {}: {}",
+        return Err(backend_error(
+            "parameters",
             resp.status(),
-            resp.text().await.unwrap_or_default()
+            &resp.text().await.unwrap_or_default(),
         ));
     }
     let v: serde_json::Value = resp
@@ -930,6 +984,74 @@ pub async fn fetch_cost_models(base_url: &str, project_id: &str) -> Result<Vec<V
         out.push(nums);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod backend_error_tests {
+    use super::*;
+
+    /// The line an operator reads at 3am. A quota wall answers 402 with the
+    /// reason in the body, and the message has to carry BOTH the provider's own
+    /// words and what to do about it — the failure that motivated this was five
+    /// hours of a bridge reporting a malformed block instead.
+    #[test]
+    fn a_quota_wall_names_itself_and_what_to_do() {
+        let body =
+            r#"{"error":"Project Over Limit","message":"Usage is over limit.","status_code":402}"#;
+        let e = backend_error("blocks/latest", reqwest::StatusCode::PAYMENT_REQUIRED, body);
+        assert!(e.contains("blocks/latest"), "{e}");
+        assert!(e.contains("Project Over Limit"), "{e}");
+        assert!(e.contains("Usage is over limit."), "{e}");
+        assert!(e.contains("over its plan limit"), "names the cause: {e}");
+        assert!(e.contains("cardano.blockfrost_url"), "names the fix: {e}");
+        // And NOT the thing it used to say, which pointed at the chain data.
+        assert!(!e.contains("missing"), "{e}");
+    }
+
+    /// The other two an operator meets: a rejected key and a rate limit. Both
+    /// are about the provider, and neither is a fault in the chain.
+    #[test]
+    fn the_credential_and_rate_limit_answers_are_distinguished() {
+        let forbidden = backend_error(
+            "epochs/latest",
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":"Forbidden","message":"Invalid project token."}"#,
+        );
+        assert!(forbidden.contains("blockfrost_project_id"), "{forbidden}");
+        assert!(forbidden.contains("cardano.network"), "{forbidden}");
+
+        let limited = backend_error(
+            "epochs/latest",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":"Too Many Requests"}"#,
+        );
+        assert!(limited.contains("rate limited"), "{limited}");
+        assert!(
+            limited.contains("not an error in the chain data"),
+            "{limited}"
+        );
+    }
+
+    /// A backend that is not Blockfrost-shaped — a proxy's HTML error page, or
+    /// nothing at all — still produces evidence rather than an empty parenthesis.
+    #[test]
+    fn a_body_that_is_not_the_expected_shape_is_still_reported() {
+        let html = backend_error(
+            "blocks/latest",
+            reqwest::StatusCode::BAD_GATEWAY,
+            "<html><body>502 Bad Gateway</body></html>",
+        );
+        assert!(html.contains("502 Bad Gateway"), "{html}");
+        let empty = backend_error("blocks/latest", reqwest::StatusCode::BAD_GATEWAY, "   ");
+        assert!(empty.contains("no body"), "{empty}");
+        // Long bodies are trimmed, not pasted whole into a log line.
+        let long = backend_error(
+            "blocks/latest",
+            reqwest::StatusCode::BAD_GATEWAY,
+            &"x".repeat(5_000),
+        );
+        assert!(long.len() < 400, "{}", long.len());
+    }
 }
 
 #[cfg(test)]

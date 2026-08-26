@@ -738,10 +738,19 @@ impl PeerHealth {
         }
     }
 
-    /// The compatibility verdict on this peer's build.
+    /// The compatibility verdict on this peer, against what THIS node runs and
+    /// is configured with.
+    ///
+    /// `own` is a parameter rather than read from a global because the
+    /// deployment half of it ([`crate::http::compat::NodeFacts`]) includes the
+    /// `t` this node just derived, which is live ceremony state — the caller has
+    /// it, and nothing here should go looking for it.
     #[must_use]
-    pub fn compatibility(&self) -> crate::http::compat::Compatibility {
-        crate::http::compat::Compatibility::of(&self.build)
+    pub fn compatibility(
+        &self,
+        own: crate::http::compat::NodeFacts,
+    ) -> crate::http::compat::Compatibility {
+        crate::http::compat::Compatibility::of(&self.build, own)
     }
 }
 
@@ -789,6 +798,18 @@ pub trait PeerNetwork: Send + Sync {
     /// no wire view (the mock) ignores it and [`Self::is_view_stale`] stays
     /// `false`.
     async fn set_chain_view(&self, _view: crate::cardano::dkg_roster::ChainView) {}
+
+    /// Record what this node will run the ceremony with, for peers to read off
+    /// its `/health` before entering one with it.
+    ///
+    /// The counterpart of [`Self::set_chain_view`], and deliberately a separate
+    /// channel: a chain-view rides on a Round-1 payload, so it is only ever seen
+    /// by a peer that already fetched from the same DKG namespace. These values
+    /// decide the namespace itself, so they must travel somewhere un-namespaced
+    /// and be readable before anything is published — see
+    /// [`crate::http::compat`]. Called at each ceremony entry, before the health
+    /// gate. Default no-op for a transport with no health surface (the mock).
+    async fn set_node_facts(&self, _facts: crate::http::compat::NodeFacts) {}
 
     /// Whether, during the ceremony since the last [`Self::set_chain_view`], this
     /// node observed a peer whose chain-view differed AND whose blockchain

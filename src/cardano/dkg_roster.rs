@@ -229,29 +229,6 @@ pub struct ChainView {
     /// lives. Chain-derived (a block time), never a local clock, so it is
     /// comparable across nodes.
     pub read_time_ms: i64,
-    /// The FROST threshold this publisher derived — the size its Round-1
-    /// commitment vector is built to.
-    ///
-    /// This is the DETECTOR for weight disagreements. The digest covers the
-    /// candidate SET, and every way two nodes can disagree about WEIGHTS leaves
-    /// that set identical: a `demo_live_stake` mismatch, a `stake_source` or
-    /// `demo_exclude_unstaked` difference, and — with `demo_live_stake` correctly
-    /// set on BOTH — plain `live_stake` drift between two reads seconds apart. All
-    /// of them give matching digests and different `t`: a ceremony that cannot
-    /// aggregate while the reconcile reports agreement. Publishing `t` catches the
-    /// lot without a flag per cause.
-    ///
-    /// Unlike a digest disagreement none of these is a freshness problem, and no
-    /// amount of re-reading settles them, so they must not enter the
-    /// stale/fresher machinery.
-    ///
-    /// `0` means a publisher that does not report it (an older build) and is never
-    /// compared.
-    pub threshold: u16,
-    /// Whether the publisher weighted by `live_stake` (test runs) or by the epoch
-    /// snapshot. NOT the detector — `threshold` is — but it turns "our thresholds
-    /// differ" into a named cause when it is the cause.
-    pub live_stake: bool,
 }
 
 impl DkgContext {
@@ -266,8 +243,6 @@ impl DkgContext {
             digest: crate::cardano::hash::blake2b_256(&buf),
             n: u16::try_from(self.participants.len()).unwrap_or(u16::MAX),
             read_time_ms: self.read_time_ms,
-            threshold: self.threshold,
-            live_stake: self.live_stake,
         }
     }
 }
@@ -857,7 +832,8 @@ pub async fn fetch_dkg_context(
     // failing the whole roster (`MissingStake`). Default false in production.
     exclude_unstaked: bool,
     // TEST-RUN ONLY: see `fetch_pool_stakes`. Carried into the DkgContext so it
-    // reaches the published chain-view, where a roster-wide mismatch is named.
+    // reaches the pre-ceremony handshake (`http::compat::NodeFacts`), where a
+    // roster-wide mismatch is named before anything is published.
     live_stake: bool,
 ) -> Result<DkgContext, DkgFetchError> {
     // The registry snapshot and the epoch-boundary time are independent — fetch

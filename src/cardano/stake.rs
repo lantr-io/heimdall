@@ -133,6 +133,17 @@ pub enum StakeSource {
 impl StakeSource {
     /// Parse `cardano.stake_source`. `None`/`"blockfrost"` → [`Self::Blockfrost`];
     /// `"yaci_store"`/`"yaci-store"`/`"yaci"` → [`Self::YaciStore`].
+    /// The canonical spelling, for publishing in the pre-ceremony handshake —
+    /// two nodes reading per-pool stake from different backends derive different
+    /// weights from the same registry.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blockfrost => "blockfrost",
+            Self::YaciStore => "yaci_store",
+        }
+    }
+
     pub fn from_config(s: Option<&str>) -> Result<Self, String> {
         match s.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
             None | Some("") | Some("blockfrost") => Ok(Self::Blockfrost),

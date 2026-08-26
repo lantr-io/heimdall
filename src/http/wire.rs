@@ -155,6 +155,13 @@ impl DkgNamespace {
 /// chain reads near a ban) from a corrupt payload, and to schedule a settling
 /// re-read — a hint that only ever makes a node re-read the chain, never adopt
 /// a peer's value.
+///
+/// It carries FRESHNESS and the candidate SET, and nothing else. The derived
+/// `t` and the `live_stake` weighting rode here briefly and have moved to the
+/// pre-ceremony handshake ([`crate::http::compat::NodeFacts`]): they are not
+/// freshness problems — no re-read settles them — and a check that only fires
+/// once payloads are being exchanged fires after the attempt is already spent.
+/// What stays is exactly what `read_time_ms` can act on.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainViewWire {
     /// `blake2b_256` of the eligible `pool_id`s in ceremony order, hex (32 bytes).
@@ -164,19 +171,6 @@ pub struct ChainViewWire {
     /// Chain block-time (Unix ms) this view was read at — the freshness marker.
     /// Older ⇒ read the chain earlier ⇒ the stale side of a disagreement.
     pub view_read_time_ms: i64,
-    /// The FROST threshold this publisher derived — the size its Round-1
-    /// commitment vector is built to. `#[serde(default)]` → `0` from a build that
-    /// predates the field, which reads as "not published" and is never compared.
-    #[serde(default)]
-    pub view_threshold: u16,
-    /// Whether this publisher weighted the roster by `live_stake` (a test run)
-    /// rather than the epoch snapshot.
-    ///
-    /// `#[serde(default)]` so a payload from a build that predates the field reads
-    /// as `false`, which is the production setting — an older peer is assumed to be
-    /// doing the normal thing, never assumed to match us.
-    #[serde(default)]
-    pub view_live_stake: bool,
 }
 
 impl ChainViewWire {
@@ -186,8 +180,6 @@ impl ChainViewWire {
             view_digest: hex::encode(v.digest),
             view_n: v.n,
             view_read_time_ms: v.read_time_ms,
-            view_threshold: v.threshold,
-            view_live_stake: v.live_stake,
         }
     }
 
@@ -197,8 +189,6 @@ impl ChainViewWire {
             digest: hex_n::<32>(&self.view_digest, "view_digest")?,
             n: self.view_n,
             read_time_ms: self.view_read_time_ms,
-            threshold: self.view_threshold,
-            live_stake: self.view_live_stake,
         })
     }
 }
@@ -1115,8 +1105,6 @@ mod tests {
             digest: [0xAA; 32],
             n: 4,
             read_time_ms: 1_000,
-            threshold: 2,
-            live_stake: false,
         };
         let wire_a = build_round1(
             &secp,
@@ -1136,8 +1124,6 @@ mod tests {
             view_digest: hex::encode([0xBB; 32]),
             view_n: 3,
             view_read_time_ms: 2_000,
-            view_threshold: 2,
-            view_live_stake: false,
         });
         assert_ne!(wire_a, wire_b, "the wires differ (in the unsigned view)");
 
@@ -1164,6 +1150,31 @@ mod tests {
         assert!(
             matches!(err, Err(WireError::Field(_))),
             "a view-only difference must never be treated as an equivocation, got {err:?}"
+        );
+    }
+
+    /// The chain-view carries FRESHNESS and the candidate SET, and nothing else
+    /// (WI-VMP6J). The derived `t` and the `live_stake` weighting moved to the
+    /// pre-ceremony handshake; a reader that still expects them here would be
+    /// reading a field nothing writes.
+    #[test]
+    fn the_chain_view_carries_only_freshness_and_the_candidate_set() {
+        let json = serde_json::to_value(ChainViewWire::from_view(&ChainView {
+            digest: [0xAA; 32],
+            n: 4,
+            read_time_ms: 1_000,
+        }))
+        .unwrap();
+        let keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["view_digest", "view_n", "view_read_time_ms"],
+            "{json}"
         );
     }
 

@@ -971,18 +971,24 @@ pub async fn batch_at(
     bf_base_url: &str,
     bf_project_id: &str,
     snapshot: &ParamSnapshot,
+    scheme: crate::epoch::virtual_epoch::EpochScheme,
+    schedule: &ScheduleParams,
 ) -> BatchWindow {
-    let schedule = &snapshot.config.params.tunables.schedule;
-    let epoch_start_slot = match epoch_start_slot(bf_base_url, bf_project_id, snapshot).await {
-        Ok(slot) => slot,
-        Err(e) => {
-            warn!(
-                "[batch] no epoch anchor ({e}) — building without the batch membership cutoff; \
+    // The IN-FORCE schedule is the caller's, already rescaled if this deployment
+    // runs a virtual epoch. It is not rescaled again here: one input must not get
+    // two verdicts, and the caller already refuses a schedule its cycle cannot
+    // hold. All this function adds for a virtual epoch is the ANCHOR.
+    let epoch_start_slot =
+        match epoch_anchor_slot(bf_base_url, bf_project_id, snapshot, scheme).await {
+            Ok(slot) => slot,
+            Err(e) => {
+                warn!(
+                    "[batch] no epoch anchor ({e}) — building without the batch membership cutoff; \
                  peg-out selection falls back to whatever is open at this instant"
-            );
-            return BatchWindow::NoGrid;
-        }
-    };
+                );
+                return BatchWindow::NoGrid;
+            }
+        };
     let Ok(interval) = u64::try_from(schedule.tm_batch_interval) else {
         return BatchWindow::NoGrid;
     };
@@ -1019,6 +1025,23 @@ pub async fn batch_at(
             BatchWindow::Closed { next }
         }
     }
+}
+
+/// Absolute slot the current cycle is anchored at: the Cardano epoch boundary,
+/// or — on a test bridge running a virtual epoch — that cycle's own start.
+///
+/// The virtual case needs no read at all: the anchor is a function of the
+/// snapshot's slot, which every SPO holding this snapshot already agrees on.
+async fn epoch_anchor_slot(
+    bf_base_url: &str,
+    bf_project_id: &str,
+    snapshot: &ParamSnapshot,
+    scheme: crate::epoch::virtual_epoch::EpochScheme,
+) -> Result<u64, String> {
+    if let Some(start) = scheme.start_slot(snapshot.slot) {
+        return Ok(start);
+    }
+    epoch_start_slot(bf_base_url, bf_project_id, snapshot).await
 }
 
 /// Absolute slot of the current epoch's boundary.
@@ -1098,6 +1121,89 @@ mod tests {
                 constr(0, vec![bytes(&[0xc3; 32]), int(0)]),
             ],
         )
+    }
+
+    /// Rebuild the rev-5.5 datum with one `schedule` field replaced.
+    fn config_datum_with_schedule(field: usize, value: PlutusData) -> PlutusData {
+        let mut sched = schedule_data();
+        let PlutusData::Constr(ref mut c) = sched else {
+            unreachable!("schedule_data builds a Constr")
+        };
+        let mut fields = c.fields.clone().to_vec();
+        fields[field] = value;
+        c.fields = pallas_codec::utils::MaybeIndefArray::Indef(fields);
+
+        let PlutusData::Constr(mut outer) = config_datum(7, 1_000, 100_000) else {
+            unreachable!()
+        };
+        let mut top = outer.fields.clone().to_vec();
+        let PlutusData::Constr(ref mut params) = top[1] else {
+            unreachable!("params is a Constr")
+        };
+        let mut pf = params.fields.clone().to_vec();
+        pf[0] = sched;
+        params.fields = pallas_codec::utils::MaybeIndefArray::Indef(pf);
+        outer.fields = pallas_codec::utils::MaybeIndefArray::Indef(top);
+        PlutusData::Constr(outer)
+    }
+
+    /// A schedule the cycle cannot hold is refused BY THE CALLER, before the grid
+    /// is consulted — `batch_at` no longer rescales anything, so one bad input
+    /// produces one verdict instead of two.
+    ///
+    /// The fixture carries the SPEC's `stability_window` (129601) against a 21600
+    /// batch pitch, and that combination is refused a virtual epoch outright: its
+    /// window already exceeds its own pitch, so a cycle's leftover deposits miss
+    /// the one batch that still runs against the outgoing treasury key. That is a
+    /// property of those published parameters rather than of the virtual epoch —
+    /// which is exactly why the virtual epoch declines to multiply it by running
+    /// the rotation five times as often.
+    #[tokio::test]
+    async fn a_virtual_epoch_that_cannot_hold_the_schedule_is_refused_before_the_grid() {
+        use crate::epoch::virtual_epoch::EpochScheme;
+
+        let snap = snapshot_of(&config_datum(7, 1_000, 100_000));
+        let e = EpochScheme::Virtual { slots: 86_400 }
+            .schedule(&snap.config.params.tunables.schedule, 900)
+            .expect_err("the spec window against the spec pitch must refuse");
+        assert!(e.contains("stability_window"), "{e}");
+        assert!(e.contains("unsweepable"), "{e}");
+
+        // With the live preprod window it holds, and a governance cutoff longer
+        // than a Cardano epoch is then the next thing refused.
+        let snap = snapshot_of(&config_datum_with_schedule(9, int(7_200)));
+        EpochScheme::Virtual { slots: 86_400 }
+            .schedule(&snap.config.params.tunables.schedule, 900)
+            .expect("the live preprod window holds a 24h cycle");
+    }
+
+    /// On a virtual epoch the grid is anchored at the CYCLE's start, and it needs
+    /// no chain read to do it — which is why a bogus Blockfrost URL is enough
+    /// here. The PITCH is the published one: `tm_batch_interval` does not
+    /// rescale, because scaling it below `stability_window` strands the deposits
+    /// a cycle leaves over (see `epoch::virtual_epoch`).
+    #[tokio::test]
+    async fn a_virtual_epoch_anchors_the_grid_on_its_own_cycle() {
+        use crate::epoch::virtual_epoch::EpochScheme;
+
+        let scheme = EpochScheme::Virtual { slots: 86_400 };
+        // The LIVE preprod stability_window (7200), not the fixture's
+        // spec-mandated 129601: a virtual epoch is refused outright on a bridge
+        // whose window exceeds its own batch pitch, because such a bridge strands
+        // a cycle's leftover deposits. See `epoch::virtual_epoch`.
+        let mut snap = snapshot_of(&config_datum_with_schedule(9, int(7_200)));
+        // Two full cycles in, plus one published interval so B_1 is behind us.
+        snap.slot = 86_400 * 2 + 22_000;
+        let schedule = scheme
+            .schedule(&snap.config.params.tunables.schedule, 900)
+            .expect("a day holds the published schedule");
+        let w = batch_at("http://127.0.0.1:1", "x", &snap, scheme, &schedule).await;
+        let b = w.open().expect("an opportunity is open inside the cycle");
+        assert_eq!(b.index, 1, "B_1 of THIS cycle, not of the Cardano epoch");
+        assert_eq!(b.slot, 86_400 * 2 + 21_600);
+        // C_1 legitimately reaches back before the cycle start — that is what
+        // picks up the previous cycle's leftovers while the head is still theirs.
+        assert!(b.cutoff_slot < 86_400 * 2 + 21_600);
     }
 
     fn snapshot_of(datum: &PlutusData) -> ParamSnapshot {
