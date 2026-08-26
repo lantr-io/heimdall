@@ -157,7 +157,65 @@ pub fn write_dkg_state(state_dir: &Path, state: &PersistedDkg) -> EpochResult<()
     write_file_0600(&tmp, &json)?;
     std::fs::rename(&tmp, &path)
         .map_err(|e| EpochError::Chain(format!("rename DKG state into place: {e}")))?;
+    // AFTER the rename, and the order is the whole correctness argument.
+    //
+    // A reader samples the generation, then reads the directory, then caches the
+    // result under the sample. Bumping first admits the interleaving where it
+    // samples the new generation, reads the directory before this rename lands,
+    // and caches the OLD set under a generation that says this write is already
+    // visible — stale until the next ceremony, five days later. Bumping last
+    // admits only the harmless one: it caches a fresh set under the old
+    // generation, the bump invalidates it, and the cost is one repeated read.
+    //
+    // A failed write must not bump either, and this placement gives that for
+    // free: the `?`s above return before it.
+    CEREMONY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     Ok(())
+}
+
+/// How many ceremonies this PROCESS has persisted.
+///
+/// The invalidation signal for anything that caches a view of `state_dir`'s
+/// ceremonies — see `BlockfrostCardanoChain::persisted_internal_candidates`,
+/// which is on `query_treasury`'s path and was re-reading and re-deserializing
+/// every ceremony on disk at every poll.
+///
+/// It is a counter and not a directory stat on purpose: a stat is still a
+/// blocking filesystem call on the async worker that also serves this node's peer
+/// endpoints, and the set only changes when [`write_dkg_state`] runs. The bound
+/// of that claim is stated rather than assumed — a ceremony file appearing from
+/// OUTSIDE this process (an operator restoring a state dir under a running
+/// daemon) is not seen until restart, which is the same rule the rest of
+/// `state_dir` already follows.
+#[must_use]
+pub fn ceremony_generation() -> u64 {
+    CEREMONY_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static CEREMONY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The GROUP key of the ceremony persisted for `epoch`, without touching this
+/// node's secret share.
+///
+/// [`PersistedDkg::to_group_keys`] deserializes both packages, and a caller that
+/// only wants to know which key a ceremony produced was paying a `KeyPackage`
+/// deserialization — of the long-lived signing share — purely to drop it. Reading
+/// the public half alone is both cheaper and the smaller handling of a secret.
+///
+/// `Ok(None)` for "no ceremony persisted for that epoch", exactly as
+/// [`read_dkg_state`] reports it.
+pub fn read_dkg_group_key(
+    state_dir: &Path,
+    epoch: u64,
+) -> EpochResult<Option<frost::VerifyingKey>> {
+    let Some(state) = read_dkg_state(state_dir, epoch)? else {
+        return Ok(None);
+    };
+    let bytes = hex::decode(&state.public_key_package_hex)
+        .map_err(|e| EpochError::Frost(format!("PublicKeyPackage hex: {e}")))?;
+    let pkp = frost::keys::PublicKeyPackage::deserialize(&bytes)
+        .map_err(|e| EpochError::Frost(format!("deserialize PublicKeyPackage: {e}")))?;
+    Ok(Some(*pkp.verifying_key()))
 }
 
 /// Read the persisted DKG state for `epoch`, if any. A missing file → `Ok(None)`
@@ -274,6 +332,78 @@ mod tests {
             participants,
         };
         (keys, roster)
+    }
+
+    /// The group key is readable without the secret share, and the proof is that
+    /// it stays readable when the share is unreadable.
+    ///
+    /// `to_group_keys` deserializes both packages, so a caller that only wants to
+    /// know which key a ceremony produced was decoding this node's long-lived
+    /// signing share to drop it — on `query_treasury`'s path, once per persisted
+    /// ceremony, at every poll. Blanking `key_package_hex` separates the two
+    /// claims: one call must now fail and the other must not.
+    #[test]
+    fn the_group_key_is_read_without_touching_the_secret_share() {
+        let (keys, roster) = sample_output();
+        let dir = std::env::temp_dir().join(format!(
+            "persist-groupkey-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut saved = PersistedDkg::from_output(11, 0, &roster, &keys).unwrap();
+        write_dkg_state(&dir, &saved).unwrap();
+        assert_eq!(
+            read_dkg_group_key(&dir, 11).unwrap(),
+            Some(keys.verifying_key),
+            "the cheap read must agree with the full one"
+        );
+
+        saved.key_package_hex = String::new();
+        write_dkg_state(&dir, &saved).unwrap();
+        assert!(
+            read_dkg_state(&dir, 11)
+                .unwrap()
+                .unwrap()
+                .to_group_keys()
+                .is_err(),
+            "with the share blanked, the full read must fail — otherwise this test proves nothing"
+        );
+        assert_eq!(
+            read_dkg_group_key(&dir, 11).unwrap(),
+            Some(keys.verifying_key),
+            "the group key does not depend on the share and must still be readable"
+        );
+
+        assert_eq!(
+            read_dkg_group_key(&dir, 12).unwrap(),
+            None,
+            "no ceremony persisted for that epoch is None, not an error"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The invalidation signal every cache of `state_dir`'s ceremonies keys on.
+    #[test]
+    fn persisting_a_ceremony_moves_the_generation() {
+        let (keys, roster) = sample_output();
+        let dir = std::env::temp_dir().join(format!(
+            "persist-generation-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let before = ceremony_generation();
+        write_dkg_state(
+            &dir,
+            &PersistedDkg::from_output(11, 0, &roster, &keys).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ceremony_generation() > before,
+            "a reader that samples the generation must be able to see that a ceremony landed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
