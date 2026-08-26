@@ -1629,6 +1629,16 @@ async fn epoch_start_phase(
         }
     };
 
+    // Publish what this node is about to run with, BEFORE the resume shortcut
+    // below and before the gate. `/health` is un-namespaced, which is what lets
+    // this reach a peer whose epoch scheme differs — the one mismatch no DKG
+    // payload can ever carry, because the two nodes address namespaces that
+    // never meet. It sits above the resume because a node that restarts
+    // mid-epoch and resumes a persisted ceremony would otherwise never publish
+    // the `t` it is holding, and every peer entering a later attempt would read
+    // a gap where the value should be.
+    peers.set_node_facts(own_node_facts(config, &ctx)).await;
+
     // Restart recovery (WI-014 #5): if this epoch's DKG already ran and was
     // persisted, reload the share and skip straight to PublishKeys — the
     // ceremony is multi-round and expensive, and a mid-epoch crash must not
@@ -1637,13 +1647,6 @@ async fn epoch_start_phase(
     if let Some(resumed) = try_resume_dkg(config, me, epoch)? {
         return Ok(resumed);
     }
-
-    // Publish what this node is about to run with BEFORE the gate below opens, so
-    // a peer entering alongside us compares against the real values rather than
-    // against a gap. `/health` is un-namespaced, which is what lets this reach a
-    // peer whose epoch scheme differs — the one mismatch no DKG payload can ever
-    // carry, because the two nodes address namespaces that never meet.
-    peers.set_node_facts(own_node_facts(config, &ctx)).await;
 
     // N21 health gate: bring the roster up before the ceremony. A staggered
     // process start otherwise freezes divergent live subsets — the early
@@ -1676,6 +1679,13 @@ async fn epoch_start_phase(
                     ctx.participants.len(),
                     narrowed.threshold,
                 );
+                // The gate changed `t`. Republish it, or this node advertises the
+                // pre-narrowing value and reports agreement with a peer that
+                // narrowed to a different survivor set — at the exact moment the
+                // two diverged.
+                peers
+                    .set_node_facts(own_node_facts(config, &narrowed))
+                    .await;
                 narrowed
             }
             None => {
@@ -1770,19 +1780,19 @@ fn next_window(boundary_ms: i64, window: std::time::Duration, now_ms: i64) -> (u
 /// What this node publishes on `/health` for peers to compare against, and
 /// compares their answers to.
 ///
-/// Assembled from the two places the values actually live — the operator's
-/// configuration for the test settings, and the context just read from the chain
-/// for the derived `t`. Built at ceremony entry rather than at start-up because
-/// `t` is not known until the roster is read, and it is the value a drift shows
-/// up in.
+/// The configured half is already in `config.node_facts` and has been published
+/// since the server came up; this adds the live half — the `t` just derived, and
+/// the ceremony epoch it belongs to. The epoch travels with it because a `t`
+/// without one is compared against a peer's PREVIOUS epoch's `t` at every
+/// boundary where the roster's threshold moves.
 fn own_node_facts(
     config: &EpochConfig,
     ctx: &crate::cardano::dkg_roster::DkgContext,
 ) -> crate::http::compat::NodeFacts {
     crate::http::compat::NodeFacts {
-        virtual_epoch_slots: config.virtual_epoch_slots,
-        live_stake: Some(ctx.live_stake),
+        epoch: Some(ctx.epoch),
         threshold: Some(ctx.threshold),
+        ..config.node_facts
     }
 }
 
@@ -6460,14 +6470,26 @@ mod tests {
         let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture));
         let ctx = chain.query_dkg_context(0, 0).await.expect("ctx");
 
-        // A peer reporting a `t` one away from ours — the shape a `live_stake`
-        // drift takes, with every setting on both nodes identical.
+        // A peer reporting a `t` one away from ours FOR THE SAME EPOCH — the
+        // shape a `live_stake` drift takes, with every setting identical.
         let drifted = crate::http::compat::PeerBuild {
+            dkg_threshold_epoch: Some(ctx.epoch),
             threshold: Some(ctx.threshold + 1),
             ..build_of(crate::http::compat::own_version())
         };
-        let excluded = gate_over(&[(3, drifted)]).await;
+        let excluded = gate_over(&[(3, drifted.clone())]).await;
         assert_eq!(excluded, vec![3], "the drifted peer must be dropped");
+
+        // The SAME difference carrying a stale epoch is not a disagreement — a
+        // peer that has not yet crossed the boundary is not misconfigured.
+        let stale = crate::http::compat::PeerBuild {
+            dkg_threshold_epoch: Some(ctx.epoch.wrapping_sub(1)),
+            ..drifted
+        };
+        assert!(
+            gate_over(&[(3, stale)]).await.is_empty(),
+            "a threshold from the previous epoch must not exclude anyone"
+        );
 
         // What the caller then does with it: a smaller candidate set, `t`
         // re-derived over the survivors, and the SAME attempt.

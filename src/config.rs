@@ -546,6 +546,53 @@ pub struct CardanoConfig {
     pub fault_proof_srs_path: Option<String>,
 }
 
+impl CardanoConfig {
+    /// The values this node must agree with its peers about and publishes on
+    /// `/health`, as of configuration alone.
+    ///
+    /// All four decide the roster or the epoch it is derived for, and none of
+    /// them is on chain — so a difference is invisible until a ceremony fails to
+    /// converge. Derivable from process start, deliberately: the peer server is
+    /// listening long before the first ceremony entry, and a peer that reads
+    /// these as absent while this node is still booting would exclude it for
+    /// running settings it does not have.
+    ///
+    /// An unparseable `stake_source` reports `None` rather than a guess — the
+    /// daemon refuses to start on one anyway, and a wrong label here would be
+    /// worse than an absent one.
+    #[must_use]
+    pub fn node_facts(&self) -> crate::http::compat::NodeFacts {
+        crate::http::compat::NodeFacts {
+            virtual_epoch_slots: self.demo_virtual_epoch_slots,
+            live_stake: Some(self.demo_live_stake),
+            stake_source: crate::cardano::stake::StakeSource::from_config(
+                self.stake_source.as_deref(),
+            )
+            .ok()
+            .map(crate::cardano::stake::StakeSource::label),
+            exclude_unstaked: Some(self.demo_exclude_unstaked),
+            epoch: None,
+            threshold: None,
+        }
+    }
+}
+
+impl ProtocolConfig {
+    /// How far into a cycle a node can first ENTER a ceremony, in Cardano slots.
+    ///
+    /// `next_window` puts the earliest join at `cycle_start + dkg_window`, and a
+    /// node then waits up to `dkg_join_wait` for the roster's health gate. Slots
+    /// are one second post-Shelley, so the seconds convert directly.
+    ///
+    /// Only a virtual epoch consults it (see
+    /// [`crate::epoch::virtual_epoch::EpochScheme::schedule`]): on a real epoch
+    /// every deadline is days away and the floor cannot bind.
+    #[must_use]
+    pub fn ceremony_floor_slots(&self) -> u64 {
+        self.dkg_window_secs.saturating_add(self.dkg_join_wait_secs)
+    }
+}
+
 impl Default for CardanoConfig {
     fn default() -> Self {
         Self {
@@ -1059,9 +1106,9 @@ impl HeimdallConfig {
             retry_backoff_max: RETRY_BACKOFF_MAX,
             identity,
             pegin_policy_id,
-            // Carried so the machine can PUBLISH it in the handshake; the chain
-            // adapter is what actually derives the cycle from it.
-            virtual_epoch_slots: self.cardano.demo_virtual_epoch_slots,
+            // Carried so the machine can PUBLISH them in the handshake; the chain
+            // adapter is what actually derives the cycle and reads the stake.
+            node_facts: self.cardano.node_facts(),
             batch_poll_ceiling: BATCH_POLL_CEILING,
             // EpochConfig keeps a concrete value for the demo/mock paths; the daemon reads
             // the published one off the treasury oracle ([CFG-9]).

@@ -1094,31 +1094,6 @@ mod tests {
     /// building equivocation evidence from them is refused — otherwise a benign
     /// cross-view difference would mint a FALSE fault proof against an honest
     /// node, far worse than the churn the view exists to cut.
-    /// The chain-view carries FRESHNESS and the candidate SET, and nothing else
-    /// (WI-VMP6J). The derived `t` and the `live_stake` weighting moved to the
-    /// pre-ceremony handshake; a reader that still expects them here would be
-    /// reading a field nothing writes.
-    #[test]
-    fn the_chain_view_carries_only_freshness_and_the_candidate_set() {
-        let json = serde_json::to_value(ChainViewWire::from_view(&ChainView {
-            digest: [0xAA; 32],
-            n: 4,
-            read_time_ms: 1_000,
-        }))
-        .unwrap();
-        let keys: Vec<&str> = json
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            keys,
-            ["view_digest", "view_n", "view_read_time_ms"],
-            "{json}"
-        );
-    }
-
     #[test]
     fn view_only_difference_is_not_equivocation() {
         let secp = Secp256k1::new();
@@ -1175,6 +1150,31 @@ mod tests {
         assert!(
             matches!(err, Err(WireError::Field(_))),
             "a view-only difference must never be treated as an equivocation, got {err:?}"
+        );
+    }
+
+    /// The chain-view carries FRESHNESS and the candidate SET, and nothing else
+    /// (WI-VMP6J). The derived `t` and the `live_stake` weighting moved to the
+    /// pre-ceremony handshake; a reader that still expects them here would be
+    /// reading a field nothing writes.
+    #[test]
+    fn the_chain_view_carries_only_freshness_and_the_candidate_set() {
+        let json = serde_json::to_value(ChainViewWire::from_view(&ChainView {
+            digest: [0xAA; 32],
+            n: 4,
+            read_time_ms: 1_000,
+        }))
+        .unwrap();
+        let keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["view_digest", "view_n", "view_read_time_ms"],
+            "{json}"
         );
     }
 

@@ -622,8 +622,8 @@ Four things make a mistake here visible rather than mysterious:
   re-derived across whoever is left, and without burning an attempt. This matters because a
   weight disagreement does **not** show up as a candidate-set disagreement: both nodes see the
   same members, so without that check it looks like agreement right up until the ceremony fails
-  to aggregate. The same check catches a `stake_source` or `demo_exclude_unstaked` difference,
-  and drift between two correctly-configured nodes.
+  to aggregate. The same check catches a `stake_source` or `demo_exclude_unstaked` difference —
+  both are published and compared by name — and drift between two correctly-configured nodes.
 - `network = "mainnet"` **refuses to start** with the flag set. It is not warned about, because a
   warning in a journal is not something anyone reads before the first ceremony fails. A network
   heimdall cannot resolve — an unknown spelling, or one that disagrees with your
@@ -666,16 +666,35 @@ demo_virtual_epoch_slots = 86400    # TEST BRIDGES ONLY — a 24-hour cycle
 
 The cycle is derived from the chain, not from your clock: it is `tip_slot / 86400`, counted from
 slot 0, so every node computes the same number from the same tip with nothing to agree on
-beforehand. It must be at least 3600 slots (one hour) and shorter than a real epoch; anything else
-is refused when the config loads.
+beforehand. It must be at least 43200 slots (twelve hours) and shorter than a real epoch; anything
+else is refused when the config loads.
 
-**The schedule rescales with it, automatically.** The Config publishes a schedule written for a
-five-day epoch — a batch every six hours, the last one four days in — and dropped unchanged into a
-24-hour cycle its "last opportunity" would sit three days past the end of the cycle it belongs to.
-heimdall scales every value by `demo_virtual_epoch_slots / 432000`, so a 24-hour cycle gets a batch
-every 72 minutes and 16 opportunities, exactly as a real epoch does. You do not hand-tune anything,
-which is the point: a rescale derived from two agreed numbers cannot diverge between nodes, and
-five hand-copied Config values would.
+**The ceremony deadlines rescale with it, automatically.** The Config publishes a schedule written
+for a five-day epoch, whose last batch opportunity is four days in — dropped unchanged into a
+24-hour cycle that sits three days past the end of the cycle it belongs to. So the four values
+measured as an offset from the cycle start are scaled by `demo_virtual_epoch_slots / 432000`:
+`dkg_r1_deadline`, `dkg_r2_deadline`, `update_y_deadline` and `final_tm_cutoff`. You do not
+hand-tune anything, which is the point: a rescale derived from two agreed numbers cannot diverge
+between nodes, and hand-copied Config values would.
+
+**Nothing else is scaled, and that is deliberate.** Every other value in the schedule is measured
+against something a shorter bridge cycle does not shorten:
+
+- `tm_batch_interval` stays at the published pitch. It is tied to `stability_window` by
+  `C_i = B_i − stability_window`, and it must stay *above* it — the deposits a cycle leaves over
+  are picked up by the next cycle's **first** batch, which is the last one that runs before the
+  treasury key rotates. Push the pitch below the window and those deposits miss that batch, the
+  key rotates, and they are unsweepable for good. A shorter cycle therefore gets **fewer batch
+  opportunities**, not smaller ones.
+- `tm_recovery_window` stays put: it is how long a submitted Bitcoin transaction may go unconfirmed
+  before the bridge replaces it, and Bitcoin does not confirm faster on a test bridge.
+- `sign_r1_window`, `sign_r2_window` and `leader_slot_t` stay put: they are network round-trip
+  budgets, and peers do not answer faster either.
+
+heimdall refuses to start a cycle its schedule cannot fit — one holding no batch opportunity, one
+whose rotation deadline falls inside the ceremony window a node cannot start before, or one on a
+bridge whose `stability_window` already exceeds its own batch pitch. Each refusal names the value
+and what to change.
 
 **Every node of the roster must set this identically — more so than any other setting in this
 guide.** The DKG namespace is `(epoch, threshold, attempt)`. Two nodes on different cycles compute
@@ -693,9 +712,10 @@ network heimdall cannot resolve).
 - **`stability_window` does not rescale.** It is a property of Cardano — how far a transaction must
   be behind the tip before it is safe to build on — and Cardano does not settle faster because your
   bridge's cycle is shorter. A deposit still has to age the published window (currently 2 hours on
-  the shared preprod bridge) before any batch will pick it up. On a cycle shorter than that window
-  every batch reaches back past its own cycle start, which is legal and works, but it means the
-  wait for a deposit is set by the window, never by the cycle.
+  the shared preprod bridge) before any batch will pick it up, so the wait for a deposit is set by
+  the window, never by the cycle. A bridge whose published window is **larger than its batch
+  interval** is refused a virtual epoch outright: such a bridge already strands the deposits each
+  cycle leaves over, and running its rotation five times as often would only multiply that.
 - **Cardano's own epoch is still the real one.** The stake snapshot, the ban cutoff time and
   `max_tx_size` are all read under the real Cardano epoch. Only the bridge's own schedule is
   virtual.

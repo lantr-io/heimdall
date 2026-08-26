@@ -1078,12 +1078,16 @@ mod tests {
         let facts1 = NodeFacts {
             virtual_epoch_slots: None,
             live_stake: Some(true),
+            epoch: Some(11),
             threshold: Some(3),
+            ..NodeFacts::default()
         };
         let facts2 = NodeFacts {
             virtual_epoch_slots: None,
             live_stake: Some(false),
+            epoch: Some(11),
             threshold: Some(2),
+            ..NodeFacts::default()
         };
         net1.set_node_facts(facts1).await;
         net2.set_node_facts(facts2).await;
@@ -1124,7 +1128,9 @@ mod tests {
         let mine = NodeFacts {
             virtual_epoch_slots: Some(86_400),
             live_stake: Some(true),
+            epoch: Some(4),
             threshold: Some(2),
+            ..NodeFacts::default()
         };
         net2.set_node_facts(NodeFacts {
             virtual_epoch_slots: None,

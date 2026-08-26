@@ -38,25 +38,47 @@
 //! [`crate::cardano::blockfrost_chain`]: the adapter reads the chain under the
 //! real epoch and labels the ceremony with the virtual one.
 //!
-//! ## Why the schedule has to rescale with it
+//! ## Which schedule values rescale, and which must not
 //!
 //! The Config `schedule` is written for a five-day epoch: `final_tm_cutoff` is
-//! 345600 slots (four days) and `tm_batch_interval` 21600 (six hours). Dropped
-//! unchanged into a 24-hour cycle the cutoff sits three days past the end of its
-//! own epoch, so the "last opportunity" it names never arrives and the grid
-//! silently never closes. Rescaling by `slots / CARDANO_EPOCH_SLOTS` keeps the
-//! shape of the schedule — the same number of batch opportunities per cycle, the
-//! rounds in the same proportions — and, being derived from two numbers every
-//! node already agrees on, it cannot itself diverge. That is the reason it beats
-//! the alternative of asking operators to hand-tune five Config values
-//! consistently across a roster.
+//! 345600 slots (four days). Dropped unchanged into a 24-hour cycle that sits
+//! three days past the end of its own epoch, so the "last opportunity" the spec
+//! relies on never arrives and the grid silently never closes. So the values
+//! measured as an OFFSET FROM THE CYCLE START rescale by
+//! `slots / CARDANO_EPOCH_SLOTS`: `dkg_r1_deadline`, `dkg_r2_deadline`,
+//! `update_y_deadline`, `final_tm_cutoff`. Being derived from two numbers every
+//! node already agrees on, the rescale cannot itself diverge — which is why it
+//! beats asking operators to hand-tune Config values consistently across a
+//! roster.
 //!
-//! [`ScheduleParams::stability_window`] is the one exception and it is not an
-//! oversight: it is `3k/f` of the HOST chain. Cardano does not settle faster
-//! because the bridge's cycle is shorter, so scaling it would understate how
-//! long a deposit must age before it is safe to spend — a safety value bent to
-//! make a test run faster. It stays exactly as published, and what it costs a
-//! test bridge is set out in the operator guide.
+//! **Everything else stays exactly as published, and the reason is not
+//! symmetry.** Each of the others is measured against something a shorter bridge
+//! cycle does not shorten, and scaling it silently trades correctness for speed:
+//!
+//! * `stability_window` is `3k/f` of the HOST chain. Cardano does not settle
+//!   faster because the bridge's cycle is shorter, so scaling it would understate
+//!   how long a deposit must age before it is safe to spend.
+//! * `tm_batch_interval` is coupled to `stability_window` by `C_i = B_i − W`, so
+//!   it inherits that floor. **This one was scaled in the first version of this
+//!   module and it stranded deposits.** The invariant is `P > W`: the leftovers
+//!   of a cycle — requests whose `s + W` fell past `final_tm_cutoff` — are picked
+//!   up by the NEXT cycle's `B_1`, whose cutoff is `anchor + P − W`. With
+//!   `P > W` that cutoff is after the anchor, so every leftover is caught by
+//!   `B_1`, which runs while the treasury head is still the outgoing key and is
+//!   therefore sweepable. Scale `P` below `W` and the cutoff moves BEFORE the
+//!   anchor: the leftovers miss `B_1`, `B_1` moves the head to the incoming key,
+//!   and at `B_2` those deposits are `Retired` and unsweepable for ever. Real
+//!   epochs never meet this because `P = 21600 > W`.
+//! * `tm_recovery_window` is how long a submitted TM may go unconfirmed before
+//!   the bridge builds a replacement against the same head. It is a BITCOIN
+//!   settlement timeout, compared against wall-clock seconds, and Bitcoin does
+//!   not confirm faster either. Scaled down it would have a node declare its own
+//!   in-flight movement dead at nearly every opportunity and post competitors.
+//! * `sign_r1_window`, `sign_r2_window` and `leader_slot_t` are network
+//!   round-trip budgets. Peers do not answer faster on a test bridge.
+//!
+//! The rule, then: **an offset from the cycle start rescales; a duration
+//! measured against the host chain or the network does not.**
 
 use crate::cardano::config_params::ScheduleParams;
 
@@ -72,10 +94,24 @@ use crate::cardano::config_params::ScheduleParams;
 /// [`EpochScheme::schedule`]'s refusals, not this number's exactness.
 pub const CARDANO_EPOCH_SLOTS: u64 = 432_000;
 
-/// Shortest virtual epoch accepted: one hour. Below this the rescaled schedule
-/// is compressed by more than 100×, and a DKG round would close before the
-/// nodes had finished exchanging packages.
-pub const MIN_VIRTUAL_EPOCH_SLOTS: u64 = 3_600;
+/// Shortest virtual epoch accepted: twelve hours.
+///
+/// Not a taste judgement — it is the floor at which the published preprod
+/// schedule still works, and both binding constraints are checked exactly in
+/// [`EpochScheme::schedule`] rather than assumed away here:
+///
+/// * `tm_batch_interval` does not rescale (see the module doc), so a cycle
+///   shorter than it contains no batch opportunity at all. The published value
+///   is 21600 slots.
+/// * `update_y_deadline` DOES rescale, and it has to stay clear of the ceremony
+///   window grid — a node cannot enter a ceremony before `dkg_window` has
+///   elapsed from the cycle start, so a rotation deadline inside that is one no
+///   node can ever meet.
+///
+/// This constant is the cheap early guard that catches a typo at config load;
+/// the exact checks catch a bridge whose published schedule differs from
+/// preprod's.
+pub const MIN_VIRTUAL_EPOCH_SLOTS: u64 = 43_200;
 
 /// Which cycle the bridge runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -100,8 +136,9 @@ impl EpochScheme {
             None => Ok(Self::Cardano),
             Some(s) if s < MIN_VIRTUAL_EPOCH_SLOTS => Err(format!(
                 "{s} slots is shorter than the {MIN_VIRTUAL_EPOCH_SLOTS}-slot minimum \
-                 (one hour) — the rescaled ceremony rounds would close before the nodes \
-                 could exchange their packages"
+                 (twelve hours) — below it a cycle holds no batch opportunity, because \
+                 tm_batch_interval does not rescale, and the rescaled Update-Y deadline \
+                 falls inside the ceremony window a node cannot start before"
             )),
             Some(s) if s >= CARDANO_EPOCH_SLOTS => Err(format!(
                 "{s} slots is not shorter than a Cardano epoch ({CARDANO_EPOCH_SLOTS} \
@@ -123,17 +160,24 @@ impl EpochScheme {
         }
     }
 
+    /// The cycle length, guarded against the zero a caller could construct the
+    /// variant with directly. [`Self::from_slots`] refuses it, but the variant is
+    /// public and every use below divides by this.
+    fn divisor(self) -> Option<u64> {
+        self.virtual_slots().map(|slots| slots.max(1))
+    }
+
     /// The ceremony epoch at `tip_slot` — `None` on real epochs, where the
     /// chain answers instead.
     #[must_use]
     pub fn epoch_at(self, tip_slot: u64) -> Option<u64> {
-        self.virtual_slots().map(|slots| tip_slot / slots)
+        self.divisor().map(|slots| tip_slot / slots)
     }
 
     /// The slot the current cycle began at, or `None` on real epochs.
     #[must_use]
     pub fn start_slot(self, tip_slot: u64) -> Option<u64> {
-        self.virtual_slots()
+        self.divisor()
             .map(|slots| (tip_slot / slots).saturating_mul(slots))
     }
 
@@ -146,13 +190,21 @@ impl EpochScheme {
 
     /// The schedule in force, rescaled to this cycle.
     ///
-    /// Every value scales except `stability_window` (see the module doc). The
-    /// refusals are the point of returning a `Result`: a schedule that overruns
-    /// its own epoch, or one compressed until a positive value reaches zero, is
-    /// a schedule whose opportunities never arrive, and running it produces a
-    /// bridge that looks alive and moves nothing. Better to say so.
-    pub fn schedule(self, raw: &ScheduleParams) -> Result<ScheduleParams, String> {
-        let Some(slots) = self.virtual_slots() else {
+    /// Only the four cycle-relative offsets move; see the module doc for why the
+    /// rest must not. `ceremony_floor_slots` is how far into a cycle a node can
+    /// first ENTER a ceremony — `protocol.dkg_window_secs` plus the join wait —
+    /// which the caller holds and this needs in order to check the Update-Y
+    /// deadline against it.
+    ///
+    /// The refusals are the point of returning a `Result`. A schedule whose
+    /// opportunities never arrive produces a bridge that looks alive and moves
+    /// nothing, which is worse than one that says why it will not start.
+    pub fn schedule(
+        self,
+        raw: &ScheduleParams,
+        ceremony_floor_slots: u64,
+    ) -> Result<ScheduleParams, String> {
+        let Some(slots) = self.divisor() else {
             return Ok(raw.clone());
         };
         let scale = |v: i64, name: &str| -> Result<i64, String> {
@@ -171,29 +223,71 @@ impl EpochScheme {
             dkg_r1_deadline: scale(raw.dkg_r1_deadline, "dkg_r1_deadline")?,
             dkg_r2_deadline: scale(raw.dkg_r2_deadline, "dkg_r2_deadline")?,
             update_y_deadline: scale(raw.update_y_deadline, "update_y_deadline")?,
-            tm_batch_interval: scale(raw.tm_batch_interval, "tm_batch_interval")?,
-            sign_r1_window: scale(raw.sign_r1_window, "sign_r1_window")?,
-            sign_r2_window: scale(raw.sign_r2_window, "sign_r2_window")?,
-            leader_slot_t: scale(raw.leader_slot_t, "leader_slot_t")?,
-            tm_recovery_window: scale(raw.tm_recovery_window, "tm_recovery_window")?,
             final_tm_cutoff: scale(raw.final_tm_cutoff, "final_tm_cutoff")?,
-            // NOT rescaled — a host-chain settlement depth, not bridge pacing.
+            // NOT rescaled — each is measured against the host chain or the
+            // network, neither of which a shorter bridge cycle speeds up. The
+            // module doc gives the failure each one would cause.
+            tm_batch_interval: raw.tm_batch_interval,
             stability_window: raw.stability_window,
+            tm_recovery_window: raw.tm_recovery_window,
+            sign_r1_window: raw.sign_r1_window,
+            sign_r2_window: raw.sign_r2_window,
+            leader_slot_t: raw.leader_slot_t,
         };
+        let nonneg = |v: i64| u64::try_from(v).unwrap_or(0);
+
+        // THE STRANDING INVARIANT, `P > W`. Below it the next cycle's `B_1`
+        // cutoff falls before its own anchor, so a cycle's leftover deposits miss
+        // the one opportunity that still runs against the outgoing key and are
+        // unsweepable for ever. `tm_batch_interval` no longer rescales, so this
+        // can only trip on a bridge whose published `stability_window` exceeds
+        // its own batch pitch — which is a governance mistake worth naming rather
+        // than silently stranding deposits over.
+        if nonneg(out.stability_window) >= nonneg(out.tm_batch_interval) {
+            return Err(format!(
+                "schedule.stability_window ({}) is not shorter than schedule.tm_batch_interval \
+                 ({}) — a cycle's leftover deposits would miss the next cycle's first batch, \
+                 which is the last one that runs before the treasury head rotates, and would \
+                 be unsweepable for ever",
+                out.stability_window, out.tm_batch_interval
+            ));
+        }
+        // At least one opportunity inside the cycle. `B_1` is one full interval
+        // in, and the interval does not rescale, so a short cycle can contain no
+        // grid line at all.
+        if nonneg(out.tm_batch_interval) >= slots {
+            return Err(format!(
+                "schedule.tm_batch_interval is {} slots, so B_1 falls outside a {slots}-slot \
+                 virtual epoch — the cycle would hold no batch opportunity. The interval does \
+                 not rescale (it is bounded below by stability_window), so the cycle must be \
+                 longer than it",
+                out.tm_batch_interval
+            ));
+        }
         // `B_i ≤ final_tm_cutoff` bounds the grid, so a cutoff at or past the end
         // of the cycle means the epoch's TM work never closes and the "last
-        // opportunity" the spec relies on does not exist. Rescaling makes this
-        // hold for any sane published schedule; it is checked rather than assumed
-        // because the Config is governance-set and could carry a cutoff longer
-        // than an epoch.
-        if out.final_tm_cutoff >= 0
-            && u64::try_from(out.final_tm_cutoff).unwrap_or(u64::MAX) >= slots
-        {
+        // opportunity" the spec relies on does not exist.
+        if nonneg(out.final_tm_cutoff) >= slots {
             return Err(format!(
                 "schedule.final_tm_cutoff rescales to {} slots, which is not inside a \
                  {slots}-slot virtual epoch — the epoch's last batch opportunity would \
                  never arrive",
                 out.final_tm_cutoff
+            ));
+        }
+        // THE CEREMONY FLOOR. A node joins at the next `cycle_start + k·dkg_window`
+        // grid line, so it cannot enter before one window has passed; a rotation
+        // deadline inside that is one no honest node can meet, and the failure is
+        // silent — the signing window opens already closed, which the short-window
+        // diagnostic does not report because it is guarded on a non-zero window.
+        if nonneg(out.update_y_deadline) <= ceremony_floor_slots {
+            return Err(format!(
+                "schedule.update_y_deadline rescales to {} slots, which is inside the \
+                 {ceremony_floor_slots}-slot ceremony window a node cannot enter before \
+                 (protocol.dkg_window_secs + dkg_join_wait_secs) — the rotation would close \
+                 before any node could start one. Lengthen the virtual epoch, or shorten \
+                 protocol.dkg_window_secs on every node",
+                out.update_y_deadline
             ));
         }
         Ok(out)
@@ -220,13 +314,16 @@ mod tests {
         }
     }
 
+    /// `protocol.dkg_window_secs + dkg_join_wait_secs` at their defaults.
+    const FLOOR: u64 = 900;
+
     #[test]
     fn a_real_epoch_scheme_changes_nothing() {
         let s = EpochScheme::Cardano;
         assert_eq!(s.virtual_slots(), None);
         assert_eq!(s.epoch_at(96_000_000), None);
         assert_eq!(s.anchor_slot(95_000_000, 96_000_000), 95_000_000);
-        assert_eq!(s.schedule(&schedule()).unwrap(), schedule());
+        assert_eq!(s.schedule(&schedule(), FLOOR).unwrap(), schedule());
     }
 
     /// The cycle is a pure function of the tip slot, so two nodes reading the
@@ -255,37 +352,52 @@ mod tests {
         }
     }
 
-    /// A 24-hour cycle is a fifth of an epoch, so the schedule is a fifth of
-    /// itself — and the cutoff now lands INSIDE the cycle, which is the whole
-    /// point of rescaling it.
+    /// Exactly the four cycle-relative offsets rescale, and nothing else.
     #[test]
-    fn the_schedule_is_rescaled_in_proportion() {
+    fn only_the_cycle_relative_offsets_are_rescaled() {
         let day = EpochScheme::Virtual { slots: 86_400 };
-        let s = day.schedule(&schedule()).unwrap();
-        assert_eq!(s.tm_batch_interval, 4_320);
-        assert_eq!(s.final_tm_cutoff, 69_120);
+        let s = day.schedule(&schedule(), FLOOR).unwrap();
+        // Scaled: a fifth of an epoch gets a fifth of each offset.
+        assert_eq!(s.dkg_r1_deadline, 720);
+        assert_eq!(s.dkg_r2_deadline, 1_440);
         assert_eq!(s.update_y_deadline, 2_160);
+        assert_eq!(s.final_tm_cutoff, 69_120);
         assert!(
             u64::try_from(s.final_tm_cutoff).unwrap() < 86_400,
             "the cutoff must be inside its own epoch"
         );
-        // The same NUMBER of opportunities as a real epoch: 345600/21600 = 16.
-        assert_eq!(
-            s.final_tm_cutoff / s.tm_batch_interval,
-            schedule().final_tm_cutoff / schedule().tm_batch_interval
-        );
+        // Untouched: each is measured against the host chain or the network.
+        let raw = schedule();
+        assert_eq!(s.tm_batch_interval, raw.tm_batch_interval);
+        assert_eq!(s.stability_window, raw.stability_window);
+        assert_eq!(s.tm_recovery_window, raw.tm_recovery_window);
+        assert_eq!(s.sign_r1_window, raw.sign_r1_window);
+        assert_eq!(s.sign_r2_window, raw.sign_r2_window);
+        assert_eq!(s.leader_slot_t, raw.leader_slot_t);
     }
 
-    /// The host chain does not settle faster because the bridge's cycle is
-    /// shorter. Scaling this would be a safety value bent for a test's
-    /// convenience.
+    /// THE STRANDING INVARIANT, and the reason `tm_batch_interval` stopped being
+    /// rescaled. A cycle's leftovers are picked up by the next cycle's `B_1`,
+    /// whose cutoff is `anchor + P − W`; that has to land at or after the anchor,
+    /// or they miss the last opportunity that still runs against the outgoing
+    /// treasury key and are unsweepable for ever.
     #[test]
-    fn the_stability_window_is_not_rescaled() {
+    fn the_batch_pitch_stays_above_the_stability_window() {
         let day = EpochScheme::Virtual { slots: 86_400 };
-        assert_eq!(
-            day.schedule(&schedule()).unwrap().stability_window,
-            schedule().stability_window
+        let s = day.schedule(&schedule(), FLOOR).unwrap();
+        assert!(
+            s.tm_batch_interval > s.stability_window,
+            "P={} must exceed W={}, or a cycle's leftovers strand",
+            s.tm_batch_interval,
+            s.stability_window
         );
+        // A bridge whose published window exceeds its own pitch is refused rather
+        // than run — the deposits it would strand are not recoverable.
+        let mut raw = schedule();
+        raw.stability_window = raw.tm_batch_interval;
+        let e = day.schedule(&raw, FLOOR).expect_err("must refuse");
+        assert!(e.contains("stability_window"), "{e}");
+        assert!(e.contains("unsweepable"), "{e}");
     }
 
     /// A published cutoff longer than an epoch still overruns after rescaling,
@@ -295,23 +407,56 @@ mod tests {
         let mut raw = schedule();
         raw.final_tm_cutoff = CARDANO_EPOCH_SLOTS as i64 * 2;
         let e = EpochScheme::Virtual { slots: 86_400 }
-            .schedule(&raw)
+            .schedule(&raw, FLOOR)
             .expect_err("must refuse");
         assert!(e.contains("final_tm_cutoff"), "{e}");
         assert!(e.contains("never arrive"), "{e}");
     }
 
-    /// Compression that zeroes a positive value is refused too: a
-    /// `tm_batch_interval` of 0 has no grid at all, and the round windows
-    /// collapse to nothing.
+    /// A cycle that cannot hold one batch opportunity builds nothing, so it is
+    /// refused. `tm_batch_interval` does not rescale, so this is the constraint
+    /// that actually sets the practical floor.
+    #[test]
+    fn a_cycle_shorter_than_the_batch_pitch_is_refused() {
+        let mut raw = schedule();
+        raw.tm_batch_interval = 60_000; // a bridge on a slower grid than preprod
+        let e = EpochScheme::Virtual { slots: 43_200 }
+            .schedule(&raw, FLOOR)
+            .expect_err("must refuse");
+        assert!(e.contains("tm_batch_interval"), "{e}");
+        assert!(e.contains("no batch opportunity"), "{e}");
+    }
+
+    /// The rotation deadline must clear the window a node cannot enter a
+    /// ceremony before, or no honest node can ever meet it — and the failure is
+    /// silent, because the signing window simply opens already closed.
+    #[test]
+    fn an_update_y_deadline_inside_the_ceremony_window_is_refused() {
+        // 43200 slots rescales update_y_deadline to 1080, which clears the
+        // default 900-slot floor…
+        assert!(
+            EpochScheme::Virtual { slots: 43_200 }
+                .schedule(&schedule(), FLOOR)
+                .is_ok()
+        );
+        // …but not a roster that widened its ceremony window.
+        let e = EpochScheme::Virtual { slots: 43_200 }
+            .schedule(&schedule(), 1_200)
+            .expect_err("must refuse");
+        assert!(e.contains("update_y_deadline"), "{e}");
+        assert!(e.contains("ceremony window"), "{e}");
+    }
+
+    /// Compression that zeroes a positive offset is refused: a deadline of 0 is
+    /// one that has already passed.
     #[test]
     fn a_value_compressed_to_zero_is_refused() {
         let mut raw = schedule();
-        raw.leader_slot_t = 1;
-        let e = EpochScheme::Virtual { slots: 3_600 }
-            .schedule(&raw)
+        raw.dkg_r1_deadline = 1;
+        let e = EpochScheme::Virtual { slots: 43_200 }
+            .schedule(&raw, FLOOR)
             .expect_err("must refuse");
-        assert!(e.contains("leader_slot_t"), "{e}");
+        assert!(e.contains("dkg_r1_deadline"), "{e}");
         assert!(e.contains("rescales to 0"), "{e}");
     }
 
@@ -322,11 +467,25 @@ mod tests {
         assert_eq!(EpochScheme::from_slots(None).unwrap(), EpochScheme::Cardano);
         assert!(EpochScheme::from_slots(Some(0)).is_err());
         assert!(EpochScheme::from_slots(Some(60)).is_err());
+        assert!(EpochScheme::from_slots(Some(MIN_VIRTUAL_EPOCH_SLOTS - 1)).is_err());
         assert!(EpochScheme::from_slots(Some(CARDANO_EPOCH_SLOTS)).is_err());
         assert!(EpochScheme::from_slots(Some(CARDANO_EPOCH_SLOTS * 2)).is_err());
         assert_eq!(
             EpochScheme::from_slots(Some(86_400)).unwrap(),
             EpochScheme::Virtual { slots: 86_400 }
         );
+    }
+
+    /// The advertised minimum actually works against the published preprod
+    /// schedule — otherwise it is a number that only looks like a guarantee.
+    #[test]
+    fn the_minimum_cycle_runs_the_published_schedule() {
+        let s = EpochScheme::from_slots(Some(MIN_VIRTUAL_EPOCH_SLOTS)).unwrap();
+        let out = s
+            .schedule(&schedule(), FLOOR)
+            .expect("the minimum must hold the schedule it is chosen for");
+        assert!(u64::try_from(out.tm_batch_interval).unwrap() < MIN_VIRTUAL_EPOCH_SLOTS);
+        assert!(u64::try_from(out.final_tm_cutoff).unwrap() < MIN_VIRTUAL_EPOCH_SLOTS);
+        assert!(u64::try_from(out.update_y_deadline).unwrap() > FLOOR);
     }
 }

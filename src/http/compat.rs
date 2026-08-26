@@ -124,6 +124,22 @@ pub struct NodeFacts {
     /// `cardano.demo_live_stake` — whether the roster is weighted by `live_stake`
     /// (test runs) or by the epoch snapshot.
     pub live_stake: Option<bool>,
+    /// `cardano.stake_source` — which backend per-pool stake is read from.
+    /// Two nodes on different backends weight an identical registry differently.
+    pub stake_source: Option<&'static str>,
+    /// `cardano.demo_exclude_unstaked` — whether a pool with unresolvable stake
+    /// is dropped from the roster or makes the derivation fatal. A difference
+    /// changes the candidate set itself.
+    pub exclude_unstaked: Option<bool>,
+    /// The ceremony epoch [`Self::threshold`] was derived for.
+    ///
+    /// Carried so a stale threshold is never compared against a live one. A node
+    /// publishes its `t` once per ceremony entry and keeps serving it until the
+    /// next; without this tag, a node that crosses an epoch boundary first would
+    /// compare its NEW `t` against a peer's PREVIOUS epoch's `t` and exclude a
+    /// peer that agrees with it — on a production bridge, with no test flag
+    /// anywhere near it.
+    pub epoch: Option<u64>,
     /// The FROST `t` this node derived for the ceremony it is about to enter —
     /// the length its Round-1 commitment vector will have.
     ///
@@ -158,6 +174,16 @@ pub struct PeerBuild {
     /// [`NodeFacts::live_stake`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_stake: Option<bool>,
+    /// [`NodeFacts::stake_source`]. `String` on the wire because a peer may run a
+    /// build that knows a backend this one does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stake_source: Option<String>,
+    /// [`NodeFacts::exclude_unstaked`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_unstaked: Option<bool>,
+    /// [`NodeFacts::epoch`] — which ceremony [`Self::threshold`] belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dkg_threshold_epoch: Option<u64>,
     /// [`NodeFacts::threshold`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<u16>,
@@ -174,6 +200,9 @@ impl PeerBuild {
             threshold_percent: Some(own_threshold_percent()),
             virtual_epoch_slots: facts.virtual_epoch_slots,
             live_stake: facts.live_stake,
+            stake_source: facts.stake_source.map(str::to_string),
+            exclude_unstaked: facts.exclude_unstaked,
+            dkg_threshold_epoch: facts.epoch,
             threshold: facts.threshold,
         }
     }
@@ -203,8 +232,87 @@ impl Compatibility {
     }
 
     /// Pure form, for tests: compare `peer` against `own`.
+    ///
+    /// ORDER MATTERS. The deployment values are compared FIRST, before the
+    /// version is even looked at, because the version check can return
+    /// `Unknown` — which is an admission. A peer running a build that predates
+    /// these fields, or one whose `/health` body could not be parsed, arrives
+    /// here as `PeerBuild::default()`; letting that short-circuit would make the
+    /// epoch-scheme mismatch invisible against exactly the build most likely to
+    /// cause it, and that mismatch is the one no other channel can ever see.
     #[must_use]
     pub fn between(peer: &PeerBuild, own: &PeerBuild) -> Self {
+        // THE EPOCH SCHEME. Compared even when only one side reports it, unlike
+        // the build fields below: absent means "real Cardano epochs", which is a
+        // definite answer rather than a reporting gap — a build that does not
+        // know about virtual epochs is running real ones. Two nodes on different
+        // cycles derive different epoch NUMBERS, and the DKG namespace is
+        // `(epoch, threshold, attempt)`, so they publish into namespaces that
+        // never fetch each other. Nothing errors on either side; the ceremony
+        // simply never has a second participant.
+        if peer.virtual_epoch_slots != own.virtual_epoch_slots {
+            let describe = |v: Option<u64>| match v {
+                Some(s) => format!("a {s}-slot virtual epoch (TEST RUN)"),
+                None => "real Cardano epochs".to_string(),
+            };
+            return Self::Incompatible {
+                reason: format!(
+                    "the peer runs on {} and we run on {} — we would number epochs \
+                     differently, publish into DKG namespaces that never fetch each other, \
+                     and each wait for a ceremony the other cannot see. Set \
+                     cardano.demo_virtual_epoch_slots identically on every node of the roster",
+                    describe(peer.virtual_epoch_slots),
+                    describe(own.virtual_epoch_slots),
+                ),
+            };
+        }
+        // THE ROSTER WEIGHTING, all three inputs to it. Same rule: absent is the
+        // production answer, not a gap. Each gives two nodes a different `t` —
+        // or, for `exclude_unstaked`, a different candidate set — from identical
+        // chain state.
+        if peer.live_stake.unwrap_or(false) != own.live_stake.unwrap_or(false) {
+            let describe = |v: bool| {
+                if v {
+                    "live_stake (TEST RUN)"
+                } else {
+                    "the epoch snapshot"
+                }
+            };
+            return Self::Incompatible {
+                reason: format!(
+                    "the peer weights the roster by {} and we by {} — the candidate set would \
+                     AGREE while the derived thresholds differ, so nothing we exchange can \
+                     aggregate. Set cardano.demo_live_stake identically on every node of the \
+                     roster",
+                    describe(peer.live_stake.unwrap_or(false)),
+                    describe(own.live_stake.unwrap_or(false)),
+                ),
+            };
+        }
+        if let (Some(t), Some(o)) = (peer.stake_source.as_deref(), own.stake_source.as_deref())
+            && t != o
+        {
+            return Self::Incompatible {
+                reason: format!(
+                    "the peer reads per-pool stake from {t} and we from {o} — the same registry \
+                     weighs differently on the two backends, so we derive different FROST \
+                     thresholds. Set cardano.stake_source identically on every node of the \
+                     roster"
+                ),
+            };
+        }
+        if peer.exclude_unstaked.unwrap_or(false) != own.exclude_unstaked.unwrap_or(false) {
+            return Self::Incompatible {
+                reason: format!(
+                    "cardano.demo_exclude_unstaked is {} on the peer and {} here — a pool whose \
+                     stake will not resolve is dropped from one node's candidate set and fatal \
+                     on the other, so we would not even be running the same roster",
+                    peer.exclude_unstaked.unwrap_or(false),
+                    own.exclude_unstaked.unwrap_or(false),
+                ),
+            };
+        }
+
         let Some(theirs) = peer.version.as_deref() else {
             return Self::Unknown;
         };
@@ -245,72 +353,30 @@ impl Compatibility {
                 ),
             };
         }
-        // THE EPOCH SCHEME. Compared even when only one side reports it, unlike
-        // every check above: absent means "real Cardano epochs", which is a
-        // definite answer rather than a reporting gap, and it is the one value
-        // whose mismatch no other detector can ever reach. Two nodes on
-        // different cycles derive different epoch NUMBERS, and the DKG namespace
-        // is `(epoch, threshold, attempt)` — so they publish into namespaces
-        // that never fetch each other. Nothing errors on either side; the
-        // ceremony simply never has a second participant.
-        if peer.virtual_epoch_slots != own.virtual_epoch_slots {
-            let describe = |v: Option<u64>| match v {
-                Some(s) => format!("a {s}-slot virtual epoch (TEST RUN)"),
-                None => "real Cardano epochs".to_string(),
-            };
-            return Self::Incompatible {
-                reason: format!(
-                    "same version {theirs}, but the peer runs on {} and we run on {} — we \
-                     would number epochs differently, publish into DKG namespaces that never \
-                     fetch each other, and each wait for a ceremony the other cannot see. Set \
-                     cardano.demo_virtual_epoch_slots identically on every node of the roster",
-                    describe(peer.virtual_epoch_slots),
-                    describe(own.virtual_epoch_slots),
-                ),
-            };
-        }
-        // THE STAKE WEIGHTING, for the same reason: absent means the epoch
-        // snapshot, which is a definite answer. A mismatch gives two nodes
-        // different weights over an IDENTICAL candidate set, so the digest they
-        // publish agrees while their thresholds do not.
-        if peer.live_stake.unwrap_or(false) != own.live_stake.unwrap_or(false) {
-            let describe = |v: bool| {
-                if v {
-                    "live_stake (TEST RUN)"
-                } else {
-                    "the epoch snapshot"
-                }
-            };
-            return Self::Incompatible {
-                reason: format!(
-                    "same version {theirs}, but the peer weights the roster by {} and we by {} \
-                     — the candidate set would AGREE while the derived thresholds differ, so \
-                     nothing we exchange can aggregate. Set cardano.demo_live_stake identically \
-                     on every node of the roster",
-                    describe(peer.live_stake.unwrap_or(false)),
-                    describe(own.live_stake.unwrap_or(false)),
-                ),
-            };
-        }
         // THE DERIVED `t` itself — the value all of the above exist to protect,
         // compared directly so a cause nobody anticipated is still caught.
         //
-        // Compared only when BOTH report one, because absent here means "has not
-        // read a roster yet", not a disagreement — a node whose peer is still
-        // starting up must not exclude it. And the wording is deliberately not
-        // the upgrade advice the version mismatch gives: with both flags
-        // matching, the remaining cause is `live_stake` drift between two reads
-        // seconds apart, which resolves on its own.
-        if let (Some(t), Some(o)) = (peer.threshold, own.threshold)
+        // Compared only when both report one AND both report it FOR THE SAME
+        // CEREMONY EPOCH. A node publishes its `t` at each ceremony entry and
+        // goes on serving it until the next, so at an epoch boundary the node
+        // that crosses first would otherwise compare this epoch's `t` against a
+        // peer's previous one and exclude a peer that agrees with it. Absent
+        // here means "has not read a roster yet", which is not a disagreement.
+        if let (Some(t), Some(o), Some(pe), Some(oe)) = (
+            peer.threshold,
+            own.threshold,
+            peer.dkg_threshold_epoch,
+            own.dkg_threshold_epoch,
+        ) && pe == oe
             && t != o
         {
             return Self::Incompatible {
                 reason: format!(
-                    "same version {theirs} and the same settings, but the peer derived FROST \
-                     threshold t={t} and we t={o} — commitment vectors of different length, \
-                     which cannot combine. This is NOT a build problem and needs no upgrade: \
-                     with live_stake weighting it is two reads moments apart, and it resolves \
-                     at the next ceremony entry"
+                    "for epoch {pe} the peer derived FROST threshold t={t} and we t={o} — \
+                     commitment vectors of different length, which cannot combine. Every \
+                     setting we compare agrees, so this is NOT a build problem and needs no \
+                     upgrade: under live_stake weighting it is two reads moments apart, and it \
+                     resolves at the next ceremony entry"
                 ),
             };
         }
@@ -346,10 +412,10 @@ mod tests {
     /// a comparison isolates the facts instead of tripping over the version.
     fn build_with(facts: NodeFacts) -> PeerBuild {
         PeerBuild {
-            virtual_epoch_slots: facts.virtual_epoch_slots,
-            live_stake: facts.live_stake,
-            threshold: facts.threshold,
-            ..build("0.1.0", "aa")
+            version: Some("0.1.0".into()),
+            blueprint_digest: Some("aa".into()),
+            threshold_percent: Some(51),
+            ..PeerBuild::own(facts)
         }
     }
 
@@ -477,7 +543,9 @@ mod tests {
     fn a_derived_threshold_is_compared_only_when_both_report_one() {
         let mut peer = build("0.1.0", "aa");
         peer.threshold = None;
+        peer.dkg_threshold_epoch = None;
         let mine = NodeFacts {
+            epoch: Some(7),
             threshold: Some(3),
             ..NodeFacts::default()
         };
@@ -487,6 +555,7 @@ mod tests {
         );
 
         peer.threshold = Some(2);
+        peer.dkg_threshold_epoch = Some(7);
         let Compatibility::Incompatible { reason } =
             Compatibility::between(&peer, &build_with(mine))
         else {
@@ -495,9 +564,96 @@ mod tests {
         assert!(reason.contains("t=2"), "{reason}");
         assert!(reason.contains("t=3"), "{reason}");
         // The wording must NOT send an operator to upgrade a node that is fine:
-        // with both settings matching, the cause is drift and it resolves itself.
+        // with every setting matching, the cause is drift and it resolves itself.
         assert!(reason.contains("needs no upgrade"), "{reason}");
         assert!(!reason.contains("Upgrade"), "{reason}");
+    }
+
+    /// A `t` from a DIFFERENT ceremony epoch is not a disagreement, and treating
+    /// it as one is a PRODUCTION fault with no test flag anywhere near it.
+    ///
+    /// A node publishes its `t` at each ceremony entry and serves it until the
+    /// next. At a boundary where the roster's threshold moves — a fourth SPO
+    /// registers, so `t` goes 2 to 3 — the node that crosses first would compare
+    /// its new `t` against peers still serving the previous epoch's, and exclude
+    /// the very nodes that are about to agree with it.
+    #[test]
+    fn a_threshold_from_another_epoch_is_not_compared() {
+        let mut peer = build("0.1.0", "aa");
+        peer.threshold = Some(2);
+        peer.dkg_threshold_epoch = Some(41); // still on the previous epoch
+        let mine = NodeFacts {
+            epoch: Some(42),
+            threshold: Some(3),
+            ..NodeFacts::default()
+        };
+        assert_eq!(
+            Compatibility::between(&peer, &build_with(mine)),
+            Compatibility::Compatible,
+            "a stale threshold must not exclude a peer that agrees with us"
+        );
+        // Once the peer crosses into the same epoch, a real difference IS caught.
+        peer.dkg_threshold_epoch = Some(42);
+        assert!(Compatibility::between(&peer, &build_with(mine)).is_incompatible());
+    }
+
+    /// The stake BACKEND and the unstaked-exclusion rule are compared too. The
+    /// old chain-view detector named both by name; folding them into an
+    /// undifferentiated `t` difference would tell an operator to wait for
+    /// something that never resolves.
+    #[test]
+    fn the_other_two_weighting_inputs_are_compared_by_name() {
+        let own = NodeFacts {
+            stake_source: Some("blockfrost"),
+            exclude_unstaked: Some(false),
+            ..NodeFacts::default()
+        };
+        let mut peer = build_with(own);
+        peer.stake_source = Some("yaci_store".into());
+        let Compatibility::Incompatible { reason } =
+            Compatibility::between(&peer, &build_with(own))
+        else {
+            panic!("two stake backends cannot derive one threshold");
+        };
+        assert!(reason.contains("stake_source"), "{reason}");
+
+        let mut peer = build_with(own);
+        peer.exclude_unstaked = Some(true);
+        let Compatibility::Incompatible { reason } =
+            Compatibility::between(&peer, &build_with(own))
+        else {
+            panic!("differing exclusion rules are different rosters");
+        };
+        assert!(reason.contains("demo_exclude_unstaked"), "{reason}");
+    }
+
+    /// The deployment values are compared BEFORE the version, so a peer that
+    /// reports no version at all — an older build, or one whose `/health` body
+    /// could not be parsed — is still caught on the epoch scheme.
+    ///
+    /// This is the case the whole channel exists for: that peer is exactly the
+    /// one most likely to be on real epochs while this node is not, and
+    /// `Unknown` is an ADMISSION.
+    #[test]
+    fn a_peer_reporting_no_version_is_still_checked_for_the_epoch_scheme() {
+        let mine = NodeFacts {
+            virtual_epoch_slots: Some(86_400),
+            ..NodeFacts::default()
+        };
+        let v = Compatibility::between(&PeerBuild::default(), &build_with(mine));
+        let Compatibility::Incompatible { reason } = v else {
+            panic!("an unknown build on real epochs must not be admitted: {v:?}");
+        };
+        assert!(reason.contains("86400"), "{reason}");
+        // …and with the scheme agreeing, the missing version is `Unknown` again.
+        let peer = PeerBuild {
+            virtual_epoch_slots: Some(86_400),
+            ..PeerBuild::default()
+        };
+        assert_eq!(
+            Compatibility::between(&peer, &build_with(mine)),
+            Compatibility::Unknown
+        );
     }
 
     /// A peer that reports no threshold is a reporting gap, not a disagreement —
@@ -568,6 +724,7 @@ mod tests {
             virtual_epoch_slots: Some(86_400),
             live_stake: Some(true),
             threshold: Some(3),
+            ..NodeFacts::default()
         };
         for f in [NodeFacts::default(), facts] {
             assert_eq!(

@@ -414,12 +414,17 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         ) {
             problems.push(p);
         }
-        if let Some(p) = test_stake_weighting(cfg.cardano.demo_live_stake) {
-            problems.push(p);
-        }
-        if let Some(p) = test_virtual_epoch(cfg.cardano.demo_virtual_epoch_slots) {
-            problems.push(p);
-        }
+        // TEST-RUN settings are ADVISORIES, not problems. They must be reported —
+        // `doctor` answering "all checks passed" while a flag that decides the
+        // FROST threshold or the epoch number is in force is the wrong answer —
+        // but they must not stop the daemon: `problems` makes this step `Fail`,
+        // and `run_preflight_gate` exits(1) on the first `Fail`, so pushing them
+        // there meant the flags could be set and the node would then refuse to
+        // start on ANY network. The feature would be unreachable by the only
+        // route an operator has to it.
+        let mut advisories: Vec<String> = Vec::new();
+        advisories.extend(test_stake_weighting(cfg.cardano.demo_live_stake));
+        advisories.extend(test_virtual_epoch(cfg.cardano.demo_virtual_epoch_slots));
 
         // Unset state_dir is a REFUSAL, not a warning: the completed-peg-outs trie
         // lives there, and rebuilding it empty makes a node pay an already-paid
@@ -430,7 +435,23 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         }
 
         if problems.is_empty() {
-            b.push(1, "local preflight", Status::Pass, notes.join("; "));
+            // A `Warn` renders as its own line with the advisory under it and
+            // does not stop startup — the same instrument steps 4 and 7 use.
+            if advisories.is_empty() {
+                b.push(1, "local preflight", Status::Pass, notes.join("; "));
+            } else {
+                b.push_fix(
+                    1,
+                    "local preflight",
+                    Status::Warn,
+                    format!(
+                        "{} TEST-RUN setting{} in force",
+                        advisories.len(),
+                        if advisories.len() == 1 { "" } else { "s" }
+                    ),
+                    advisories.join("\n"),
+                );
+            }
         } else {
             // The detail line summarises; the fix lines carry the problems. Putting
             // the benign notes in `detail` here would print a FAIL whose one visible
@@ -444,7 +465,12 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     problems.len(),
                     if problems.len() == 1 { "" } else { "s" }
                 ),
-                problems.join("\n"),
+                problems
+                    .iter()
+                    .chain(advisories.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             );
         }
     }
@@ -1243,6 +1269,52 @@ mod tests {
         assert_eq!(titled[5], "registration status");
         assert_eq!(titled[7], "federation identity");
         assert_eq!(titled[8], "post a movement");
+    }
+
+    /// A TEST-RUN setting must be REPORTED but must not stop the daemon.
+    ///
+    /// It was pushed into `problems`, which makes step 1 a `Fail`, and
+    /// `run_preflight_gate` exits on the first `Fail` — so setting either flag
+    /// made `run-spo` and `doctor` refuse to start on every network, and the
+    /// feature could not be turned on by the one route an operator has to it.
+    #[tokio::test]
+    async fn a_test_run_setting_warns_but_does_not_stop_startup() {
+        let mut cfg = crate::config::HeimdallConfig::default();
+        cfg.cardano.network = Some("preprod".into());
+        cfg.protocol.state_dir = Some("/var/lib/heimdall".into());
+        // Enough for step 1 to pass on its own, so what this test observes is
+        // the flags and nothing else.
+        cfg.cardano.mnemonic = Some("x ".repeat(24).trim().to_string());
+
+        let step1 = |r: &Report| r.steps.iter().find(|s| s.n == 1).cloned().expect("step 1");
+        let clean = preflight(&cfg).await;
+        assert_eq!(
+            step1(&clean).status,
+            Status::Pass,
+            "baseline must pass, or this test proves nothing: {:?}",
+            step1(&clean).fix
+        );
+
+        cfg.cardano.demo_virtual_epoch_slots = Some(86_400);
+        cfg.cardano.demo_live_stake = true;
+        let flagged = preflight(&cfg).await;
+        let s = step1(&flagged);
+        assert_eq!(
+            s.status,
+            Status::Warn,
+            "a test flag must not make preflight refuse to start: {s:?}"
+        );
+        // Later steps fail on this skeleton config (no bridge, not registered) —
+        // what matters is that step 1 is not the one that stops the gate.
+        assert!(
+            flagged.first_failure().is_none_or(|f| f.n != 1),
+            "a test flag must not be what stops startup"
+        );
+        // …and it is still SAID, both of them, so `doctor` cannot answer "all
+        // checks passed" with a consensus-deciding flag in force.
+        let fix = s.fix.clone().unwrap_or_default();
+        assert!(fix.contains("demo_virtual_epoch_slots"), "{fix}");
+        assert!(fix.contains("demo_live_stake"), "{fix}");
     }
 
     #[test]
