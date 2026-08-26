@@ -593,6 +593,25 @@ pub async fn fetch_epoch_start_ms(
     project_id: &str,
     epoch: u64,
 ) -> Result<i64, String> {
+    fetch_epoch_bounds_ms(base_url, project_id, epoch)
+        .await
+        .map(|(start, _)| start)
+}
+
+/// Both of the epoch's boundary times, `(start_ms, end_ms)`, from the one request
+/// [`fetch_epoch_start_ms`] already pays for.
+///
+/// `end_ms` is what lets a caller cache anything keyed to the epoch without
+/// assuming an epoch LENGTH: "is the tip still inside this epoch" is then a
+/// comparison rather than an arithmetic guess, which matters because a devnet's
+/// epochs are nothing like preprod's 432 000 slots. It is `None` where the backend
+/// omits `end_time`, and a caller that cannot bound its cache simply re-reads —
+/// the behaviour it had before this existed.
+pub async fn fetch_epoch_bounds_ms(
+    base_url: &str,
+    project_id: &str,
+    epoch: u64,
+) -> Result<(i64, Option<i64>), String> {
     // yaci-store serves no per-number /epochs/{n} route (404 "Epoch not
     // found") — only /epochs/latest. Fall back to it when the direct route
     // fails, but ONLY accept its start_time when it is for the requested
@@ -645,7 +664,16 @@ pub async fn fetch_epoch_start_ms(
             "epochs/{epoch}: implausible start_time {secs} (want Unix seconds)"
         ));
     }
-    Ok(secs * 1000)
+    // Held to the same plausibility rule as the start, and additionally required
+    // to be AFTER it: an end that fails either test is dropped rather than
+    // returned, because its only use is bounding a cache and a wrong bound there
+    // is worse than no bound.
+    let end = v
+        .get("end_time")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|e| (1_000_000_000..10_000_000_000).contains(e) && *e > secs)
+        .map(|e| e * 1000);
+    Ok((secs * 1000, end))
 }
 
 /// The current slot and the upper validity bound at the epoch boundary, for

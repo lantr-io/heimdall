@@ -2964,6 +2964,8 @@ fn batch_params(
         &snapshot,
         scheme,
         &schedule,
+        // One-shot: nothing to reuse an anchor from, so it resolves its own.
+        None,
     ));
     if let (true, Some(b)) = (verbose, batch.open()) {
         info!(
