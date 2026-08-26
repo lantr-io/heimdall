@@ -702,6 +702,16 @@ pub struct BlockfrostCardanoChain {
     /// [`config_params::CycleAnchor::covers`] compares the tip against the span the
     /// chain reported, so the first tip past the boundary misses.
     epoch_anchor: Mutex<Option<config_params::CycleAnchor>>,
+    /// `(ceremony generation, candidates)` — see
+    /// [`Self::persisted_internal_candidates`].
+    ///
+    /// The fourth cache on this struct and the only one whose cost is not an HTTP
+    /// request: it is a filesystem read and a FROST deserialization per ceremony
+    /// on disk, run on the tokio worker that also drives this node's peer server.
+    /// `query_treasury` needs the list on every call — the retired-key report is
+    /// exactly "the persisted ceremonies minus the live ones" — so it cannot be
+    /// made lazy, only cheap.
+    internal_candidates: Mutex<Option<(u64, Vec<(u64, bitcoin::key::UntweakedPublicKey)>)>>,
     /// The last TM this process submitted, and when. `query_treasury` reports
     /// `btc_confirmed = false` until that txid becomes the Confirmed chain tip, so the
     /// epoch machine waits for its own in-flight TM instead of double-spending the tip.
@@ -999,6 +1009,7 @@ impl BlockfrostCardanoChain {
             head_spk_cache: Mutex::new(None),
             config_cache: Mutex::new(None),
             epoch_anchor: Mutex::new(None),
+            internal_candidates: Mutex::new(None),
             max_tx_size_by_epoch: Mutex::new(None),
             fault_ban_flow: None,
             cpo_policy_id: None,
@@ -1396,31 +1407,60 @@ impl BlockfrostCardanoChain {
         self
     }
 
-    /// The group keys of every ceremony persisted under `state_dir`, newest
-    /// epoch first.
+    /// The group key of every ceremony persisted under `state_dir`, newest epoch
+    /// first — cached for as long as the set cannot have changed.
     ///
     /// Best-effort by design: these are only CANDIDATES, and the head's actual
     /// scriptPubKey decides. A state dir that cannot be read must not turn a
     /// treasury query into a failure — it just leaves the caller with the
     /// candidates it had before.
+    ///
+    /// It sits on `query_treasury`, which four loops poll, and it used to do the
+    /// full job every time: one file read, one `serde_json` parse, two hex decodes
+    /// and TWO FROST deserializations per ceremony on disk — including this node's
+    /// secret `KeyPackage`, decoded only to be dropped. Ceremonies accumulate one
+    /// per epoch and are never pruned (nor should they be: a retired ceremony's key
+    /// is what names a stranded deposit's address), so the per-call cost grew
+    /// without bound while the ANSWER changed once every five days.
+    ///
+    /// [`ceremony_generation`] is the invalidation, and it is exact for the only
+    /// writer a running daemon has — `write_dkg_state`, when its own DKG completes.
+    ///
+    /// [`ceremony_generation`]: crate::epoch::persist::ceremony_generation
     fn persisted_internal_candidates(&self) -> Vec<(u64, bitcoin::key::UntweakedPublicKey)> {
         let Some(dir) = self.state_dir.as_deref() else {
             return Vec::new();
         };
+        // Sampled BEFORE the read, so a ceremony persisted while this call is in
+        // flight invalidates what it is about to store rather than being swallowed
+        // by it.
+        let generation = crate::epoch::persist::ceremony_generation();
+        if let Ok(cache) = self.internal_candidates.lock()
+            && let Some((cached_generation, candidates)) = cache.as_ref()
+            && *cached_generation == generation
+        {
+            return candidates.clone();
+        }
         let Ok(epochs) = crate::epoch::persist::persisted_dkg_epochs(dir) else {
             return Vec::new();
         };
-        epochs
+        let candidates: Vec<_> = epochs
             .into_iter()
             .filter_map(|e| {
-                let state = crate::epoch::persist::read_dkg_state(dir, e)
+                // The PUBLIC half only. Whether a ceremony produced a given key is a
+                // public question, and answering it by deserializing the signing
+                // share was both the expensive way and the careless one.
+                let vk = crate::epoch::persist::read_dkg_group_key(dir, e)
                     .ok()
                     .flatten()?;
-                let keys = state.to_group_keys().ok()?;
-                let g = crate::frost::xonly::group_xonly(&keys.verifying_key).ok()?;
+                let g = crate::frost::xonly::group_xonly(&vk).ok()?;
                 Some((e, g.xonly))
             })
-            .collect()
+            .collect();
+        if let Ok(mut cache) = self.internal_candidates.lock() {
+            *cache = Some((generation, candidates.clone()));
+        }
+        candidates
     }
 
     /// The `bitcoin.fee_rate_sat_per_vb` dev override, for the paths that have no
@@ -3636,6 +3676,84 @@ mod tests {
             expected
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The candidate list is cached, and a ceremony persisted afterwards
+    /// invalidates it.
+    ///
+    /// Both halves matter and they pull against each other. `query_treasury` sits
+    /// under four polling loops and needs this list on every call, so re-reading
+    /// and re-deserializing every ceremony on disk each time is work that grows
+    /// one file per epoch, for ever, to answer a question whose answer changes
+    /// once every five days. But the one time it DOES change is the handoff — the
+    /// moment the node most needs the new key among the candidates — so a cache
+    /// that missed it would fail `query_treasury` outright, exactly as having no
+    /// candidates at all would.
+    ///
+    /// Deleting the state dir between reads is what makes the caching half
+    /// decisive: after that, only a cache can still answer.
+    #[test]
+    fn the_candidate_list_is_cached_until_a_ceremony_is_persisted() {
+        use crate::epoch::persist::{PersistedDkg, write_dkg_state};
+
+        let dir = std::env::temp_dir().join(format!(
+            "wi3a881-candidate-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let chain = bare_chain().with_state_dir(Some(dir.clone()));
+
+        let persist = |epoch: u64| {
+            let keys = dealt_group_keys();
+            write_dkg_state(
+                &dir,
+                &PersistedDkg::from_output(
+                    epoch,
+                    0,
+                    &Roster {
+                        epoch,
+                        min_signers: 2,
+                        max_signers: 3,
+                        participants: Default::default(),
+                    },
+                    &keys,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            crate::frost::xonly::group_xonly(&keys.verifying_key)
+                .unwrap()
+                .xonly
+        };
+
+        let keys = |c: &BlockfrostCardanoChain| {
+            c.persisted_internal_candidates()
+                .into_iter()
+                .map(|(_, k)| k)
+                .collect::<Vec<_>>()
+        };
+
+        let first = persist(6);
+        assert_eq!(keys(&chain), vec![first]);
+
+        // A new ceremony — the handoff. The incoming key has to appear, or the
+        // node cannot reproduce the head it is about to move.
+        let second = persist(7);
+        assert_eq!(
+            keys(&chain),
+            vec![second, first],
+            "persisting a ceremony must invalidate the cache, newest epoch first"
+        );
+
+        // The disk is gone; the answer is not. Nothing but a cache can do that.
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            keys(&chain),
+            vec![second, first],
+            "a call with no ceremony persisted since the last one must not go back to the \
+             filesystem"
+        );
     }
 
     /// A chain with no Bitcoin/Cardano state worth speaking of — enough to reach

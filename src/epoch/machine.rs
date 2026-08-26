@@ -3284,6 +3284,19 @@ async fn build_tm_phase(
     }
 
     // Poll until the previous treasury movement is confirmed on Bitcoin.
+    //
+    // CADENCE: `batch_poll_ceiling`, the same one `await_batch_opportunity` and
+    // `await_rotation_phase` use, and for the same reason — `query_treasury` is
+    // five-plus HTTP round trips and this waits on a Bitcoin confirmation depth,
+    // which is hours away. It was a hardcoded 30 s, which bought no useful
+    // granularity against that wait and cost ~2000 full treasury reads per
+    // movement.
+    //
+    // On a gridded bridge this is a one-shot check: `collect_pegins_phase` lets the
+    // opportunity pass unused when a movement is in flight, so the phase is only
+    // entered after `btc_confirmed` was true. The long wait belongs to the
+    // `NoGrid` path, where there is no opportunity to pass and this IS the wait —
+    // which is exactly where the 30 s mattered most and helped least.
     let treasury = loop {
         let t = chain.query_treasury().await?;
         if t.btc_confirmed {
@@ -3292,9 +3305,10 @@ async fn build_tm_phase(
         crate::epoch_log!(
             me,
             epoch,
-            "BuildTm: previous treasury movement not yet confirmed on Bitcoin, waiting…"
+            "BuildTm: previous treasury movement not yet confirmed on Bitcoin, re-reading in {:?}",
+            config.batch_poll_ceiling
         );
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        tokio::time::sleep(config.batch_poll_ceiling).await;
     };
 
     // Open peg-outs on Cardano. A request UTxO survives at the `peg_out.ak` address until
