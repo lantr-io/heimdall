@@ -952,7 +952,10 @@ pub async fn fetch_param_snapshot_reusing(
             .await
             .map_err(|e| format!("batch snapshot (blocks/latest): {e}"))?;
         let time_ms = tip_secs.saturating_mul(1000);
-        if cached.config_created_ms.is_none_or(|created| created <= time_ms) {
+        if cached
+            .config_created_ms
+            .is_none_or(|created| created <= time_ms)
+        {
             return Ok(ParamSnapshot {
                 slot,
                 time_ms,
@@ -1046,17 +1049,16 @@ pub async fn batch_at(
         Some(a) => Ok(a),
         None => cycle_anchor(bf_base_url, bf_project_id, snapshot, scheme).await,
     };
-    let epoch_start_slot =
-        match resolved {
-            Ok(a) => a.start_slot,
-            Err(e) => {
-                warn!(
-                    "[batch] no epoch anchor ({e}) — building without the batch membership cutoff; \
+    let epoch_start_slot = match resolved {
+        Ok(a) => a.start_slot,
+        Err(e) => {
+            warn!(
+                "[batch] no epoch anchor ({e}) — building without the batch membership cutoff; \
                  peg-out selection falls back to whatever is open at this instant"
-                );
-                return BatchWindow::NoGrid;
-            }
-        };
+            );
+            return BatchWindow::NoGrid;
+        }
+    };
     let Ok(interval) = u64::try_from(schedule.tm_batch_interval) else {
         return BatchWindow::NoGrid;
     };
@@ -1150,8 +1152,8 @@ pub async fn cycle_anchor(
     // exact post-Shelley 1-slot-per-second identity against the snapshot's own
     // (slot, time) pair — the same conversion every other SPO performs on the same
     // chain facts.
-    let (start_ms, end_ms) = bf_http::fetch_epoch_bounds_ms(bf_base_url, bf_project_id, epoch)
-        .await?;
+    let (start_ms, end_ms) =
+        bf_http::fetch_epoch_bounds_ms(bf_base_url, bf_project_id, epoch).await?;
     let to_slot = |ms| bf_http::slot_at_time(snapshot.slot, snapshot.time_ms, ms);
     Ok(CycleAnchor {
         epoch,
@@ -1184,7 +1186,10 @@ mod tests {
         };
         assert!(a.covers(1_000), "the first slot of the cycle is inside it");
         assert!(a.covers(1_999), "so is the last");
-        assert!(!a.covers(2_000), "the boundary slot belongs to the next cycle");
+        assert!(
+            !a.covers(2_000),
+            "the boundary slot belongs to the next cycle"
+        );
         assert!(
             !a.covers(999),
             "a tip before the start is a rollback, not this cycle"
