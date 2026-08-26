@@ -778,6 +778,21 @@ impl EpochConfig {
 pub enum EpochError {
     Frost(String),
     TmBuild(String),
+    /// The FROZEN BATCH cannot produce a movement, and no retry of the same batch
+    /// can change that: the inputs are fixed for the opportunity, so the same
+    /// computation runs over the same bytes and reaches the same refusal.
+    ///
+    /// DISTINCT from [`Self::TmBuild`], which is everything else that goes wrong
+    /// while building — a trie file that could not be read, a root compared
+    /// against a chain read that has since moved on, a treasury balance that was
+    /// short a moment ago. Those clear on their own and MUST stay retriable; this
+    /// one does not, and retrying it is what turned a logged refusal into the
+    /// 2026-08-26 preprod outage.
+    ///
+    /// Kept deliberately narrow — the two trie-root conflicts and the byte budget.
+    /// Widening it costs a batch opportunity every time the guess is wrong, so a
+    /// new member has to be a function of the frozen batch and nothing else.
+    BatchRejected(String),
     // TODO: track which peers failed to deliver so the cascade / slashing
     // path can identify the misbehaving party. Today `PollTimeout` only
     // carries aggregate counts.
@@ -877,6 +892,7 @@ impl std::fmt::Display for EpochError {
         match self {
             Self::Frost(s) => write!(f, "FROST: {s}"),
             Self::TmBuild(s) => write!(f, "Bitcoin tx build failed: {s}"),
+            Self::BatchRejected(s) => write!(f, "this batch cannot produce a movement: {s}"),
             Self::PollTimeout { got, need } => {
                 write!(f, "peer poll timed out: got {got}, need {need}")
             }

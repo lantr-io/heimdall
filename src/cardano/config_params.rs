@@ -908,7 +908,9 @@ pub async fn fetch_param_snapshot(
     address: &str,
     nft_unit: &str,
 ) -> Result<ParamSnapshot, String> {
-    fetch_param_snapshot_reusing(bf_base_url, bf_project_id, address, nft_unit, None).await
+    fetch_param_snapshot_reusing(bf_base_url, bf_project_id, address, nft_unit, None)
+        .await
+        .map(|(snapshot, _)| snapshot)
 }
 
 /// The Config half of a [`ParamSnapshot`], kept between reads.
@@ -940,13 +942,19 @@ pub struct CachedConfig {
 /// The ordering guard still runs against `reuse`, because it can still fire: a
 /// rollback can put the tip BEHIND the reused Config's creation, and that is
 /// exactly the case where the reuse must be abandoned rather than papered over.
+///
+/// Returns whether the Config half actually came from `reuse`. The caller decides
+/// what to cache on the strength of that, and it is NOT the same question as
+/// "did the caller offer a reuse": this function abandons the offer on the
+/// rollback path, and a caller that assumed otherwise would throw away the fresh
+/// read it just paid for and serve the rolled-back Config again on the next poll.
 pub async fn fetch_param_snapshot_reusing(
     bf_base_url: &str,
     bf_project_id: &str,
     address: &str,
     nft_unit: &str,
     reuse: Option<&CachedConfig>,
-) -> Result<ParamSnapshot, String> {
+) -> Result<(ParamSnapshot, bool), String> {
     if let Some(cached) = reuse {
         let (slot, tip_secs) = bf_http::fetch_latest_block_slot_time(bf_base_url, bf_project_id)
             .await
@@ -956,12 +964,15 @@ pub async fn fetch_param_snapshot_reusing(
             .config_created_ms
             .is_none_or(|created| created <= time_ms)
         {
-            return Ok(ParamSnapshot {
-                slot,
-                time_ms,
-                config: cached.config.clone(),
-                config_created_ms: cached.config_created_ms,
-            });
+            return Ok((
+                ParamSnapshot {
+                    slot,
+                    time_ms,
+                    config: cached.config.clone(),
+                    config_created_ms: cached.config_created_ms,
+                },
+                true,
+            ));
         }
         warn!(
             "[config] the tip (slot {slot}, {time_ms} ms) is behind the Config UTxO {} this node \
@@ -1009,7 +1020,7 @@ pub async fn fetch_param_snapshot_reusing(
                 last = Some(snapshot);
                 tokio::time::sleep(std::time::Duration::from_secs(SNAPSHOT_RETRY_SECS)).await;
             }
-            _ => return Ok(snapshot),
+            _ => return Ok((snapshot, false)),
         }
     }
     Err(format!(
@@ -1124,6 +1135,19 @@ impl CycleAnchor {
         self.end_slot
             .is_some_and(|end| tip_slot >= self.start_slot && tip_slot <= end)
     }
+
+    /// Whether this anchor fails to contain `tip_slot` — the test a FRESH read
+    /// must pass before it is used or stored.
+    ///
+    /// Deliberately not `!covers`: an anchor with no `end_slot` covers nothing
+    /// (there is no bound to reuse it within) yet does not straddle, because its
+    /// START is still a usable grid anchor. What this rejects is an anchor that
+    /// cannot belong to the snapshot at all — the epoch turnover, where the two
+    /// reads behind a resolved anchor land on opposite sides of the boundary.
+    #[must_use]
+    pub fn straddles(&self, tip_slot: u64) -> bool {
+        self.start_slot > tip_slot || self.end_slot.is_some_and(|end| end < tip_slot)
+    }
 }
 
 /// Resolve the cycle `snapshot`'s tip falls in.
@@ -1155,19 +1179,97 @@ pub async fn cycle_anchor(
     let (start_ms, end_ms) =
         bf_http::fetch_epoch_bounds_ms(bf_base_url, bf_project_id, epoch).await?;
     let to_slot = |ms| bf_http::slot_at_time(snapshot.slot, snapshot.time_ms, ms);
-    Ok(CycleAnchor {
+    let anchor = CycleAnchor {
         epoch,
         start_slot: to_slot(start_ms),
         // The boundary slot belongs to the NEXT cycle, so the last slot of this
         // one is the slot before it.
         end_slot: end_ms.map(|ms| to_slot(ms).saturating_sub(1)),
-    })
+    };
+    // The anchor must actually CONTAIN the snapshot it was resolved for.
+    //
+    // The two reads above happen after `snapshot`'s (slot, time) pair was taken,
+    // so at a turnover they can straddle the boundary: `fetch_current_epoch`
+    // answers N+1 while the snapshot is still in N, and the result is a cycle that
+    // starts after the tip it is meant to place. Everything downstream then goes
+    // wrong quietly — the grid is laid off the wrong `E`, `update_y_close_slot`
+    // is computed from the wrong cycle start, and `max_tx_size` takes its epoch
+    // from here, so the byte budget can come from N+1's parameters while every
+    // peer still reads N. A boundary is exactly when protocol parameters change,
+    // and a divergent budget is a batch no co-signer reproduces.
+    //
+    // Refusing costs one tick, which the next poll retries against a snapshot on
+    // the other side of the boundary.
+    if anchor.straddles(snapshot.slot) {
+        return Err(format!(
+            "the epoch boundary read straddles this snapshot: epoch {epoch} spans slots {}..={} \
+             but the snapshot is at slot {} — re-reading rather than placing the cycle against a \
+             boundary the tip is not inside",
+            anchor.start_slot,
+            anchor
+                .end_slot
+                .map_or_else(|| "?".to_string(), |e| e.to_string()),
+            snapshot.slot,
+        ));
+    }
+    Ok(anchor)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cardano::plutus::{bytes, constr, int};
+
+    /// A freshly resolved anchor has to contain the snapshot it was resolved for.
+    ///
+    /// `cycle_anchor` reads `/epochs/latest` and then `/epochs/{n}`, both AFTER the
+    /// snapshot's (slot, time) pair was taken, so at a turnover they can land on
+    /// opposite sides of the boundary: the epoch number says N+1 while the tip is
+    /// still in N. Everything downstream then goes wrong quietly — the grid is laid
+    /// off the wrong `E`, the rotation deadline is computed from the wrong cycle
+    /// start, and `max_tx_size` takes its epoch from here, so the byte budget can
+    /// come from N+1's parameters while every peer still reads N. A boundary is
+    /// exactly when protocol parameters change, and a divergent budget is a batch
+    /// no co-signer reproduces.
+    #[test]
+    fn an_anchor_that_does_not_contain_its_snapshot_is_refused() {
+        let a = CycleAnchor {
+            epoch: 500,
+            start_slot: 1_000,
+            end_slot: Some(1_999),
+        };
+        assert!(
+            !a.straddles(1_000),
+            "the first slot of the cycle is inside it"
+        );
+        assert!(!a.straddles(1_999), "so is the last");
+        assert!(
+            a.straddles(999),
+            "a cycle starting after the tip is the turnover race: the epoch number moved between \
+             the snapshot and the boundary read"
+        );
+        assert!(
+            a.straddles(2_000),
+            "a cycle that ended before the tip is the same race, later"
+        );
+        assert!(
+            !CycleAnchor {
+                end_slot: None,
+                ..a
+            }
+            .straddles(5_000),
+            "an unbounded anchor is not reusable, but its START is still a usable grid anchor — \
+             which is why this is not simply `!covers`"
+        );
+        assert!(
+            CycleAnchor {
+                end_slot: None,
+                ..a
+            }
+            .straddles(999),
+            "unbounded or not, a cycle cannot start after the tip it is placing"
+        );
+    }
 
     /// The anchor cache is bounded by a boundary the CHAIN reported, never by an
     /// assumed epoch length.
