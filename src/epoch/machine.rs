@@ -227,6 +227,19 @@ async fn drive_to_movement(
     let me = config.identity.identifier;
     let mut phase = start;
     let mut backoff = RETRY_BACKOFF_MIN;
+    // The phase whose last attempt failed, while it is still outstanding.
+    //
+    // It is what makes the ramp below a ramp. `backoff` used to reset on ANY
+    // successful step, and a failure that alternates with a success — the shape
+    // every batch-loop failure has, because the loop re-enters at `CollectPegins`
+    // and fails again at `BuildTm` — reset it every single time. The ramp to
+    // `retry_backoff_max` was therefore dead code in the one case it exists for:
+    // a permanent condition retried at RETRY_BACKOFF_MIN, for ever. On preprod
+    // that ran ~400 full chain-read passes an hour and exhausted the day's
+    // Blockfrost allowance in about two hours.
+    //
+    // Progress is getting PAST the phase that failed, not re-entering it.
+    let mut failed_in: Option<&'static str> = None;
     // The opportunity this call INHERITED — the one the previous movement used,
     // when we are resuming a daemon's batch loop. It is not ours to give back; see
     // the error arm.
@@ -329,6 +342,9 @@ async fn drive_to_movement(
             _ => {}
         }
         let spent_here = rotation_spent == Some(current_epoch(&phase));
+        // Captured before the phase is moved into the step, so both arms below can
+        // say which phase the outcome belongs to.
+        let stepped = phase.name();
         match step_phase(
             phase,
             chain,
@@ -349,7 +365,14 @@ async fn drive_to_movement(
                     handoff_retries = 0;
                 }
                 phase = next;
-                backoff = RETRY_BACKOFF_MIN; // progress → reset
+                // Reset only when the phase that failed has now succeeded (or
+                // nothing was outstanding, where this is a no-op). Re-entering
+                // `CollectPegins` after a `BuildTm` failure is the failure's own
+                // consequence, not recovery from it.
+                if step_clears_ramp(failed_in, stepped) {
+                    backoff = RETRY_BACKOFF_MIN;
+                    failed_in = None;
+                }
             }
             Ok(Step::Done(tm, resume)) => return Ok((tm, resume)),
             // EVERY in-loop error backs off and re-enters the loop, which never
@@ -377,6 +400,21 @@ async fn drive_to_movement(
             // validation and must fail before the loop is entered — not here,
             // where the only correct answer is to keep trying.
             Err(e) => {
+                failed_in = Some(stepped);
+                // A build that failed on the batch's OWN contents fails the same
+                // way every time it is rebuilt: the batch is frozen, so the inputs
+                // are byte-identical and so is the verdict. Retrying it is not a
+                // retry, it is the same computation. The way back in is the next
+                // SYNCHRONIZED entry, exactly as for a spent round below — a later
+                // opportunity re-freezes against a chain that has moved, which is
+                // the only thing that can change the answer.
+                //
+                // This is the other half of the preprod incident: an already-swept
+                // deposit re-offered by `query_pegin_requests` raised `Conflict` in
+                // `root_after_inputs`, the opportunity was handed back, and the
+                // node rebuilt the identical batch every few seconds for the whole
+                // round-1 window.
+                let deterministic = matches!(e.cause(), EpochError::TmBuild(_));
                 // A SPENT round has published commitments its peers are still
                 // serving, so this node may not walk it again alone: it has to
                 // rejoin them at the next SYNCHRONIZED entry. That is the next
@@ -451,11 +489,24 @@ async fn drive_to_movement(
                     );
                     backoff = RETRY_BACKOFF_MIN; // the settling wait replaces the ramp
                     config.dkg_reconcile_backoff
+                } else if deterministic {
+                    crate::epoch_warn!(
+                        me,
+                        current_epoch(&EpochPhase::Idle),
+                        "{stepped} failed on the frozen batch ({e}) — identical inputs give an \
+                         identical verdict, so this opportunity is spent rather than rebuilt. \
+                         Backing off {:?}, then waiting for the next opportunity from {}.",
+                        backoff,
+                        resume.as_ref().map_or("Idle", EpochPhase::name)
+                    );
+                    let w = backoff;
+                    backoff = (backoff * 2).min(config.retry_backoff_max);
+                    w
                 } else {
                     crate::epoch_warn!(
                         me,
                         current_epoch(&EpochPhase::Idle),
-                        "chain read failed ({e}); backing off {:?} then re-entering {}",
+                        "{stepped} failed ({e}); backing off {:?} then re-entering {}",
                         backoff,
                         resume.as_ref().map_or("Idle", EpochPhase::name)
                     );
@@ -470,12 +521,16 @@ async fn drive_to_movement(
                 // already succeeded, and clearing that one would build a second
                 // movement for a batch this node has already served.
                 //
-                // A SPENT round is the exception: handing the opportunity back
-                // would rebuild the same frozen batch, hence the same sighashes
-                // and the same namespace, and republish into a round the peers
-                // have moved on from. Keeping the marker sends this node to the
-                // NEXT opportunity, which every node enters together.
-                if *built != inherited && !round_spent {
+                // Two exceptions, and they are the same argument twice. A SPENT
+                // round: handing the opportunity back would rebuild the same frozen
+                // batch, hence the same sighashes and the same namespace, and
+                // republish into a round the peers have moved on from. A
+                // DETERMINISTIC build failure: the rebuild is the same computation
+                // over the same bytes and reaches the same refusal, so the retry is
+                // pure cost. Keeping the marker sends this node to the NEXT
+                // opportunity, which every node enters together and which freezes
+                // against a chain that has moved.
+                if *built != inherited && !round_spent && !deterministic {
                     built.clear();
                 }
                 // Re-enter THIS epoch when its ceremony is still in hand and the
@@ -510,6 +565,22 @@ async fn drive_to_movement(
             }
         }
     }
+}
+
+/// Whether a phase that just succeeded clears the retry ramp.
+///
+/// Only the phase that FAILED can clear it. Anything else is a phase the failure
+/// itself sent the loop back through: `drive_to_movement` re-enters at
+/// `CollectPegins`, so a `BuildTm` failure is always followed by a `CollectPegins`
+/// success, and treating that as progress reset the ramp on every single turn. The
+/// exponential to `retry_backoff_max` was dead in the one case it exists for — a
+/// condition that does not clear — and the loop ran at `RETRY_BACKOFF_MIN` for as
+/// long as the condition lasted.
+///
+/// `None` is "nothing outstanding", where this is a no-op: the ramp is already at
+/// its minimum.
+fn step_clears_ramp(failed_in: Option<&'static str>, stepped: &'static str) -> bool {
+    failed_in.is_none_or(|f| f == stepped)
 }
 
 /// Dispatch one phase to its handler. Pure routing — the retry/backoff policy
@@ -8248,6 +8319,92 @@ mod tests {
             "a spent round must be published once and then left for the next \
              opportunity: {published} round-1 publications"
         );
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    /// The ramp must survive a failure that alternates with a success.
+    ///
+    /// Every batch-loop failure has that shape — the loop re-enters at
+    /// `CollectPegins` and fails again at `BuildTm` — so a rule that reset on any
+    /// successful step pinned the retry interval at `RETRY_BACKOFF_MIN` for as long
+    /// as the failing condition lasted.
+    #[test]
+    fn only_the_phase_that_failed_clears_the_retry_ramp() {
+        assert!(
+            !step_clears_ramp(Some("BuildTm"), "CollectPegins"),
+            "re-entering CollectPegins is the BuildTm failure's own consequence, not recovery \
+             from it"
+        );
+        assert!(
+            step_clears_ramp(Some("BuildTm"), "BuildTm"),
+            "the phase that failed having now succeeded is exactly what recovery is"
+        );
+        assert!(
+            step_clears_ramp(None, "CollectPegins"),
+            "with nothing outstanding the ramp is already at its minimum"
+        );
+    }
+
+    /// A build that fails on the batch's OWN contents spends its opportunity
+    /// rather than handing it back.
+    ///
+    /// The batch is frozen, so a rebuild is the same computation over the same
+    /// bytes and reaches the same refusal. Handing the opportunity back turns that
+    /// into a hot loop, and the loop is not free: each pass is a full round of
+    /// chain reads. On preprod, 2026-08-26, a peg-in the SPI trie already recorded
+    /// as swept was re-offered by `query_pegin_requests`, `root_after_inputs`
+    /// raised `Conflict`, and three nodes re-entered `CollectPegins` every few
+    /// seconds — roughly 400 passes an hour each, which spent the day's Blockfrost
+    /// allowance by 02:10 UTC and stopped the bridge until the quota reset.
+    ///
+    /// The contrast is with `a_failure_gives_back_its_own_opportunity_but_never_a_
+    /// served_one`, and the dividing line is the same one a spent round draws: give
+    /// the opportunity back when a retry can reach a different answer, keep it when
+    /// it cannot.
+    ///
+    /// Counting peg-in queries is what makes this decisive — one query is one pass
+    /// through `CollectPegins`, so a node that rebuilds shows up as a count that
+    /// climbs with wall-clock time instead of one that stops.
+    #[tokio::test]
+    async fn a_deterministic_build_failure_spends_its_opportunity_instead_of_looping() {
+        let fixture = demo_static_fixture(2, 2, 18_900);
+        // The chain attests a completed-peg-outs root no empty trie can produce, so
+        // `cross_check_bridge_roots` refuses inside `BuildTm` — every time, for the
+        // same reason, however often the batch is rebuilt.
+        let stale_root = [0x5au8; 32];
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        let mut sources = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> =
+                Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(stale_root));
+            let source = Arc::new(MockCardanoPegInSource::new());
+            sources.push(Arc::clone(&source));
+            let pegin: Arc<dyn CardanoPegInSource> = source;
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        // Past the ramp's first wait (RETRY_BACKOFF_MIN, 2 s) with seconds to
+        // spare, so a node that hands the opportunity back spends them rebuilding
+        // at `fast_config`'s 20 ms ceiling — hundreds of passes.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        for (i, source) in sources.iter().enumerate() {
+            let queries = source.query_count();
+            assert!(
+                queries <= 3,
+                "node {} made {queries} passes through CollectPegins for one opportunity — a \
+                 refusal the frozen batch reproduces exactly must be taken once",
+                i + 1
+            );
+        }
         for h in handles {
             h.abort();
         }

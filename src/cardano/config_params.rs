@@ -908,6 +908,68 @@ pub async fn fetch_param_snapshot(
     address: &str,
     nft_unit: &str,
 ) -> Result<ParamSnapshot, String> {
+    fetch_param_snapshot_reusing(bf_base_url, bf_project_id, address, nft_unit, None).await
+}
+
+/// The Config half of a [`ParamSnapshot`], kept between reads.
+///
+/// The TIP half is never kept: it is what the batch is pinned to and it is one
+/// request. This is the Config UTxO, the ordering-guard time that came with it,
+/// and the two facts a refresh policy decides against — the tip the read was taken
+/// at and the cycle it was taken in.
+#[derive(Clone, Debug)]
+pub struct CachedConfig {
+    pub config: ConfigView,
+    pub config_created_ms: Option<i64>,
+    /// Tip slot at which the Config was actually fetched. It does NOT move when
+    /// the entry is reused, which is what makes "was this read taken before the
+    /// opportunity now open" answerable.
+    pub read_slot: u64,
+    /// `CycleAnchor::start_slot` in force at that read.
+    pub anchor_slot: u64,
+}
+
+/// [`fetch_param_snapshot`], optionally reusing a Config already read.
+///
+/// The Config UTxO changes only when governance moves it, while the tip moves
+/// every block — so on a node polling the batch grid every few minutes, re-reading
+/// the Config on every poll is two requests per turn spent to learn nothing. The
+/// caller decides when it must be re-read (see
+/// `BlockfrostChain::query_batch_snapshot`); this only honours the decision.
+///
+/// The ordering guard still runs against `reuse`, because it can still fire: a
+/// rollback can put the tip BEHIND the reused Config's creation, and that is
+/// exactly the case where the reuse must be abandoned rather than papered over.
+pub async fn fetch_param_snapshot_reusing(
+    bf_base_url: &str,
+    bf_project_id: &str,
+    address: &str,
+    nft_unit: &str,
+    reuse: Option<&CachedConfig>,
+) -> Result<ParamSnapshot, String> {
+    if let Some(cached) = reuse {
+        let (slot, tip_secs) = bf_http::fetch_latest_block_slot_time(bf_base_url, bf_project_id)
+            .await
+            .map_err(|e| format!("batch snapshot (blocks/latest): {e}"))?;
+        let time_ms = tip_secs.saturating_mul(1000);
+        if cached
+            .config_created_ms
+            .is_none_or(|created| created <= time_ms)
+        {
+            return Ok(ParamSnapshot {
+                slot,
+                time_ms,
+                config: cached.config.clone(),
+                config_created_ms: cached.config_created_ms,
+            });
+        }
+        warn!(
+            "[config] the tip (slot {slot}, {time_ms} ms) is behind the Config UTxO {} this node \
+             last read — re-reading it rather than reusing a snapshot the chain has rolled back \
+             past",
+            cached.config.utxo,
+        );
+    }
     let mut last: Option<ParamSnapshot> = None;
     for attempt in 1..=SNAPSHOT_ATTEMPTS {
         let (slot, tip_secs) = bf_http::fetch_latest_block_slot_time(bf_base_url, bf_project_id)
@@ -973,22 +1035,30 @@ pub async fn batch_at(
     snapshot: &ParamSnapshot,
     scheme: crate::epoch::virtual_epoch::EpochScheme,
     schedule: &ScheduleParams,
+    // The cycle anchor, when the caller already holds one for this tip. A caller
+    // that caches it (the epoch machine does — it is constant for the whole cycle)
+    // passes it here and pays no read; `None` resolves it the way this function
+    // always has.
+    anchor: Option<CycleAnchor>,
 ) -> BatchWindow {
     // The IN-FORCE schedule is the caller's, already rescaled if this deployment
     // runs a virtual epoch. It is not rescaled again here: one input must not get
     // two verdicts, and the caller already refuses a schedule its cycle cannot
     // hold. All this function adds for a virtual epoch is the ANCHOR.
-    let epoch_start_slot =
-        match epoch_anchor_slot(bf_base_url, bf_project_id, snapshot, scheme).await {
-            Ok(slot) => slot,
-            Err(e) => {
-                warn!(
-                    "[batch] no epoch anchor ({e}) — building without the batch membership cutoff; \
+    let resolved = match anchor {
+        Some(a) => Ok(a),
+        None => cycle_anchor(bf_base_url, bf_project_id, snapshot, scheme).await,
+    };
+    let epoch_start_slot = match resolved {
+        Ok(a) => a.start_slot,
+        Err(e) => {
+            warn!(
+                "[batch] no epoch anchor ({e}) — building without the batch membership cutoff; \
                  peg-out selection falls back to whatever is open at this instant"
-                );
-                return BatchWindow::NoGrid;
-            }
-        };
+            );
+            return BatchWindow::NoGrid;
+        }
+    };
     let Ok(interval) = u64::try_from(schedule.tm_batch_interval) else {
         return BatchWindow::NoGrid;
     };
@@ -1027,46 +1097,112 @@ pub async fn batch_at(
     }
 }
 
-/// Absolute slot the current cycle is anchored at: the Cardano epoch boundary,
-/// or — on a test bridge running a virtual epoch — that cycle's own start.
+/// Where a cycle sits on the chain: which epoch it is, and the slots it spans.
+///
+/// The span is what makes the anchor CACHEABLE. "Is the tip still in this cycle"
+/// is then a comparison against a boundary the chain reported, not arithmetic
+/// against an assumed epoch length — preprod and mainnet run 432 000-slot epochs
+/// and a devnet does not, so an assumed length would silently pin a devnet node to
+/// a boundary it left hours ago.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CycleAnchor {
+    /// The ceremony epoch this cycle is labelled with.
+    pub epoch: u64,
+    /// First slot of the cycle — the grid's `E`, from which every `B_i` is placed.
+    pub start_slot: u64,
+    /// Last slot of the cycle, where the backend reports the boundary. `None`
+    /// leaves the anchor uncacheable, and a caller then re-reads exactly as it did
+    /// before this type existed.
+    pub end_slot: Option<u64>,
+}
+
+impl CycleAnchor {
+    /// Whether `tip_slot` is still inside this cycle — i.e. whether a cached copy
+    /// of this anchor may be reused at that tip.
+    #[must_use]
+    pub fn covers(&self, tip_slot: u64) -> bool {
+        self.end_slot
+            .is_some_and(|end| tip_slot >= self.start_slot && tip_slot <= end)
+    }
+}
+
+/// Resolve the cycle `snapshot`'s tip falls in.
 ///
 /// The virtual case needs no read at all: the anchor is a function of the
 /// snapshot's slot, which every SPO holding this snapshot already agrees on.
-async fn epoch_anchor_slot(
+pub async fn cycle_anchor(
     bf_base_url: &str,
     bf_project_id: &str,
     snapshot: &ParamSnapshot,
     scheme: crate::epoch::virtual_epoch::EpochScheme,
-) -> Result<u64, String> {
-    if let Some(start) = scheme.start_slot(snapshot.slot) {
-        return Ok(start);
+) -> Result<CycleAnchor, String> {
+    if let (Some(start), Some(epoch), Some(slots)) = (
+        scheme.start_slot(snapshot.slot),
+        scheme.epoch_at(snapshot.slot),
+        scheme.virtual_slots(),
+    ) {
+        return Ok(CycleAnchor {
+            epoch,
+            start_slot: start,
+            end_slot: Some(start.saturating_add(slots).saturating_sub(1)),
+        });
     }
-    epoch_start_slot(bf_base_url, bf_project_id, snapshot).await
-}
-
-/// Absolute slot of the current epoch's boundary.
-///
-/// Blockfrost reports the boundary as a TIME, so it is converted with the exact
-/// post-Shelley 1-slot-per-second identity against the snapshot's own (slot, time)
-/// pair — the same conversion every other SPO performs on the same chain facts.
-async fn epoch_start_slot(
-    bf_base_url: &str,
-    bf_project_id: &str,
-    snapshot: &ParamSnapshot,
-) -> Result<u64, String> {
     let epoch = bf_http::fetch_current_epoch(bf_base_url, bf_project_id).await?;
-    let start_ms = bf_http::fetch_epoch_start_ms(bf_base_url, bf_project_id, epoch).await?;
-    Ok(bf_http::slot_at_time(
-        snapshot.slot,
-        snapshot.time_ms,
-        start_ms,
-    ))
+    // Blockfrost reports the boundaries as TIMES, so both are converted with the
+    // exact post-Shelley 1-slot-per-second identity against the snapshot's own
+    // (slot, time) pair — the same conversion every other SPO performs on the same
+    // chain facts.
+    let (start_ms, end_ms) =
+        bf_http::fetch_epoch_bounds_ms(bf_base_url, bf_project_id, epoch).await?;
+    let to_slot = |ms| bf_http::slot_at_time(snapshot.slot, snapshot.time_ms, ms);
+    Ok(CycleAnchor {
+        epoch,
+        start_slot: to_slot(start_ms),
+        // The boundary slot belongs to the NEXT cycle, so the last slot of this
+        // one is the slot before it.
+        end_slot: end_ms.map(|ms| to_slot(ms).saturating_sub(1)),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cardano::plutus::{bytes, constr, int};
+
+    /// The anchor cache is bounded by a boundary the CHAIN reported, never by an
+    /// assumed epoch length.
+    ///
+    /// Preprod and mainnet run 432 000-slot epochs and a devnet does not, so an
+    /// assumed length would hold a devnet node to a boundary it left hours ago —
+    /// and the anchor is what places every `B_i` and the rotation deadline. An
+    /// anchor the backend could not bound covers nothing, so it is never cached and
+    /// the next turn simply reads it again.
+    #[test]
+    fn a_cycle_anchor_is_reusable_only_inside_the_span_the_chain_reported() {
+        let a = CycleAnchor {
+            epoch: 500,
+            start_slot: 1_000,
+            end_slot: Some(1_999),
+        };
+        assert!(a.covers(1_000), "the first slot of the cycle is inside it");
+        assert!(a.covers(1_999), "so is the last");
+        assert!(
+            !a.covers(2_000),
+            "the boundary slot belongs to the next cycle"
+        );
+        assert!(
+            !a.covers(999),
+            "a tip before the start is a rollback, not this cycle"
+        );
+        assert!(
+            !CycleAnchor {
+                end_slot: None,
+                ..a
+            }
+            .covers(1_500),
+            "an unbounded anchor has no test for when it stops being true, so it is never reusable"
+        );
+    }
 
     fn schedule_data() -> PlutusData {
         constr(
@@ -1197,7 +1333,7 @@ mod tests {
         let schedule = scheme
             .schedule(&snap.config.params.tunables.schedule, 900)
             .expect("a day holds the published schedule");
-        let w = batch_at("http://127.0.0.1:1", "x", &snap, scheme, &schedule).await;
+        let w = batch_at("http://127.0.0.1:1", "x", &snap, scheme, &schedule, None).await;
         let b = w.open().expect("an opportunity is open inside the cycle");
         assert_eq!(b.index, 1, "B_1 of THIS cycle, not of the Cardano epoch");
         assert_eq!(b.slot, 86_400 * 2 + 21_600);

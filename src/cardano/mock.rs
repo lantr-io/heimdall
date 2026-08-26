@@ -25,6 +25,11 @@ pub struct MockCardanoPegInSource {
     /// stand-in for a provider hiccup, so a test can drive the epoch loop's
     /// retriable-error path instead of only its happy one.
     fail_next: AtomicU32,
+    /// How many times the source has been asked. One query is one pass through
+    /// `CollectPegins`, which makes this the cheapest measure of how often the
+    /// epoch loop is re-entering the phase — the thing a retry policy is meant to
+    /// bound.
+    queries: AtomicU32,
 }
 
 impl MockCardanoPegInSource {
@@ -45,6 +50,11 @@ impl MockCardanoPegInSource {
     pub fn fail_next(&self, n: u32) {
         self.fail_next.store(n, Ordering::Release);
     }
+
+    /// How many times this source has been queried, failures included.
+    pub fn query_count(&self) -> u32 {
+        self.queries.load(Ordering::Acquire)
+    }
 }
 
 #[async_trait]
@@ -53,6 +63,7 @@ impl CardanoPegInSource for MockCardanoPegInSource {
         &self,
         _policy_id: &[u8; 28],
     ) -> EpochResult<Vec<CardanoPegInRequest>> {
+        self.queries.fetch_add(1, Ordering::AcqRel);
         if self
             .fail_next
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))

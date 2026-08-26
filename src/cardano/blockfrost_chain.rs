@@ -681,6 +681,27 @@ pub struct BlockfrostCardanoChain {
     /// the ledger's own rules, which is the same property that makes reading it
     /// per epoch deterministic across SPOs in the first place.
     max_tx_size_by_epoch: Mutex<Option<(u64, u64)>>,
+    /// The bridge Config as `query_batch_snapshot` last read it off the wire.
+    ///
+    /// The batch-opportunity poll runs every `batch_poll_ceiling` (5 min) for the
+    /// whole of a `tm_batch_interval` (6 h on preprod), and re-reading the Config
+    /// on each turn spent two requests to learn that a UTxO only governance can
+    /// move had not moved. It is now re-read at the two moments its value can
+    /// change what this node does — the start of a cycle, and the opportunity a
+    /// movement is about to be built at — and reused in between. See
+    /// [`config_refresh_due`].
+    ///
+    /// That is a pin, not merely a saving: every co-signer of one `B_i` now builds
+    /// from a Config read at or after the SAME `B_i`, instead of from whenever each
+    /// node's poll happened to land.
+    config_cache: Mutex<Option<config_params::CachedConfig>>,
+    /// The cycle anchor, cached for the cycle it describes.
+    ///
+    /// Sound for the same reason `max_tx_size_by_epoch` above is: an epoch's own
+    /// boundaries do not move while the tip is inside it. Self-invalidating too —
+    /// [`config_params::CycleAnchor::covers`] compares the tip against the span the
+    /// chain reported, so the first tip past the boundary misses.
+    epoch_anchor: Mutex<Option<config_params::CycleAnchor>>,
     /// The last TM this process submitted, and when. `query_treasury` reports
     /// `btc_confirmed = false` until that txid becomes the Confirmed chain tip, so the
     /// epoch machine waits for its own in-flight TM instead of double-spending the tip.
@@ -773,6 +794,35 @@ fn script_enterprise_address(hash: &[u8; 28], mainnet: bool) -> String {
 /// singleton view: the decoded BridgeState plus the Cardano UTxO holding it
 /// (the [PTM-7] mint reference input). Shared by the epoch daemon and the CLI
 /// sweep, so both resolve the treasury head the same way.
+/// Whether a reused Config must be re-read before this snapshot may be used.
+///
+/// Two triggers, and they are the two moments at which a Config value can change
+/// what this node does:
+///
+///  - **A new cycle.** Every schedule offset is measured from the cycle start, so
+///    a Config carried over from the previous cycle places this cycle's grid — and
+///    its rotation deadline — against a stale anchor.
+///  - **An opportunity the read predates.** The Config decides the fee, the two
+///    selection floors and the contract identities a movement is built from, and a
+///    movement built at `B_i` must be built from a Config as of `B_i`. That is what
+///    makes two co-signers of one opportunity reproduce each other's bytes.
+///
+/// Between those the Config is reused. It is a UTxO only governance moves, and a
+/// governance move that lands mid-cycle then takes effect for every SPO at the
+/// same anchor instead of at whenever each node's poll happened to land.
+fn config_refresh_due(
+    cached: &config_params::CachedConfig,
+    anchor: Option<config_params::CycleAnchor>,
+    batch: &crate::epoch::batch::BatchWindow,
+) -> bool {
+    // With no anchor there is no cycle to compare and no grid to place an
+    // opportunity on. Nothing here can show the reuse is still good, so it is not
+    // claimed to be.
+    let Some(anchor) = anchor else { return true };
+    anchor.start_slot != cached.anchor_slot
+        || batch.open().is_some_and(|b| b.slot > cached.read_slot)
+}
+
 pub async fn fetch_config_singleton(
     bf_base_url: &str,
     bf_project_id: &str,
@@ -947,6 +997,8 @@ impl BlockfrostCardanoChain {
             last_submitted_txid: Mutex::new(None),
             last_boundary_epoch: Mutex::new(None),
             head_spk_cache: Mutex::new(None),
+            config_cache: Mutex::new(None),
+            epoch_anchor: Mutex::new(None),
             max_tx_size_by_epoch: Mutex::new(None),
             fault_ban_flow: None,
             cpo_policy_id: None,
@@ -1169,6 +1221,53 @@ impl BlockfrostCardanoChain {
             })
     }
 
+    /// The Config this node last read off the wire, if the cache still holds one.
+    fn cached_config(&self) -> Option<config_params::CachedConfig> {
+        self.config_cache.lock().ok().and_then(|c| c.clone())
+    }
+
+    /// The cycle `snapshot`'s tip falls in, read at most once per cycle.
+    ///
+    /// `None` means the boundary could not be read: the caller degrades to a grid
+    /// without a membership cutoff, which is what an unreadable boundary has always
+    /// cost. It is not cached, so the next turn tries again.
+    async fn cycle_anchor(
+        &self,
+        snapshot: &config_params::ParamSnapshot,
+    ) -> Option<config_params::CycleAnchor> {
+        if let Some(a) = self.epoch_anchor.lock().ok().and_then(|a| *a)
+            && a.covers(snapshot.slot)
+        {
+            return Some(a);
+        }
+        match config_params::cycle_anchor(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            snapshot,
+            self.epoch_scheme,
+        )
+        .await
+        {
+            Ok(a) => {
+                // Only a bounded anchor is worth keeping: without `end_slot` there
+                // is no test for when it stops being true.
+                if a.end_slot.is_some()
+                    && let Ok(mut slot) = self.epoch_anchor.lock()
+                {
+                    *slot = Some(a);
+                }
+                Some(a)
+            }
+            Err(e) => {
+                warn!(
+                    "[batch] no epoch anchor ({e}) — building without the batch membership \
+                     cutoff; peg-out selection falls back to whatever is open at this instant"
+                );
+                None
+            }
+        }
+    }
+
     /// Cardano's `max_tx_size` for the current epoch, cached per epoch (WI-107).
     ///
     /// An error here refuses the batch rather than falling back to a default: a
@@ -1176,10 +1275,26 @@ impl BlockfrostCardanoChain {
     /// one computes a set no peer reproduces. Failing loudly costs one tick of
     /// back-off; guessing costs a signing round that cannot aggregate, with
     /// nothing in the logs pointing at why.
-    async fn max_tx_size(&self) -> EpochResult<u64> {
+    async fn max_tx_size(&self, anchor: Option<config_params::CycleAnchor>) -> EpochResult<u64> {
         // The REAL epoch: `/epochs/{n}/parameters` is a Cardano index, and a
         // virtual epoch number would name an epoch the chain has never had.
-        let epoch = self.chain_epoch().await?;
+        //
+        // On a Cardano scheme the cycle anchor IS that epoch, and it is already
+        // cached for the epoch's span — so the value below was cached per epoch
+        // while the request that learned WHICH epoch went out on every turn of the
+        // poll. A virtual cycle's label is not a Cardano epoch number and can never
+        // stand in for one, so that scheme still reads.
+        let epoch = match anchor {
+            Some(a)
+                if matches!(
+                    self.epoch_scheme,
+                    crate::epoch::virtual_epoch::EpochScheme::Cardano
+                ) =>
+            {
+                a.epoch
+            }
+            _ => self.chain_epoch().await?,
+        };
         if let Some((cached_epoch, value)) = *self.max_tx_size_by_epoch.lock().unwrap()
             && cached_epoch == epoch
         {
@@ -2896,25 +3011,61 @@ impl CardanoChain for BlockfrostCardanoChain {
                 ));
             }
         };
-        let snapshot =
-            config_params::fetch_param_snapshot(&self.bf_base_url, &self.bf_project_id, addr, unit)
-                .await
-                .map_err(|e| EpochError::Chain(format!("batch parameter snapshot: {e}")))?;
+        // Two attempts at most: the first may build the grid from a REUSED Config,
+        // and the grid is what says whether that reuse was allowed. When it says
+        // no, the second attempt reads the Config fresh and the same test cannot
+        // fire again. See `config_refresh_due`.
+        let mut reuse = self.cached_config();
+        let (snapshot, anchor, schedule, batch) = loop {
+            let snapshot = config_params::fetch_param_snapshot_reusing(
+                &self.bf_base_url,
+                &self.bf_project_id,
+                addr,
+                unit,
+                reuse.as_ref(),
+            )
+            .await
+            .map_err(|e| EpochError::Chain(format!("batch parameter snapshot: {e}")))?;
+            // An unreadable boundary degrades to "no grid" exactly as it did when
+            // `batch_at` resolved it: the cutoff is what is lost, not the bridge.
+            let anchor = self.cycle_anchor(&snapshot).await;
+            // The schedule this deployment runs on, resolved BEFORE the grid so both
+            // read the same one. Rescaled when the bridge is on a virtual epoch, and
+            // refused here — once — if the cycle cannot hold it.
+            let schedule = self.schedule_in_force(&snapshot.config.params.tunables.schedule)?;
+            let batch = match anchor {
+                Some(a) => {
+                    config_params::batch_at(
+                        &self.bf_base_url,
+                        &self.bf_project_id,
+                        &snapshot,
+                        self.epoch_scheme,
+                        &schedule,
+                        Some(a),
+                    )
+                    .await
+                }
+                None => crate::epoch::batch::BatchWindow::NoGrid,
+            };
+            match reuse.as_ref() {
+                Some(cached) if config_refresh_due(cached, anchor, &batch) => reuse = None,
+                _ => break (snapshot, anchor, schedule, batch),
+            }
+        };
+        // Only a read off the wire updates the cache. Carrying `read_slot` forward
+        // on a reuse would push it past every future `B_i` and the refresh would
+        // never come due again.
+        if let (None, Some(a)) = (reuse.as_ref(), anchor) {
+            *self.config_cache.lock().unwrap() = Some(config_params::CachedConfig {
+                config: snapshot.config.clone(),
+                config_created_ms: snapshot.config_created_ms,
+                read_slot: snapshot.slot,
+                anchor_slot: a.start_slot,
+            });
+        }
         let (tm_params, source) =
             config_params::resolve_tm_params(Some(&snapshot), self.local_fee_rate_sat_per_vb);
-        // The schedule this deployment runs on, resolved BEFORE the grid so both
-        // read the same one. Rescaled when the bridge is on a virtual epoch, and
-        // refused here — once — if the cycle cannot hold it.
-        let schedule = self.schedule_in_force(&snapshot.config.params.tunables.schedule)?;
-        let batch = config_params::batch_at(
-            &self.bf_base_url,
-            &self.bf_project_id,
-            &snapshot,
-            self.epoch_scheme,
-            &schedule,
-        )
-        .await;
-        let max_tx_size = self.max_tx_size().await?;
+        let max_tx_size = self.max_tx_size(anchor).await?;
 
         // Pin this batch's contract identities from the snapshot that just passed
         // the ordering guard. Everything scanned until the next opportunity now
@@ -2924,15 +3075,6 @@ impl CardanoChain for BlockfrostCardanoChain {
         self.remember_contracts(&snapshot, batch.open());
 
         let schedule = &schedule;
-        // `B_i = epoch_start + i × interval`, so the anchor comes back out of any
-        // opportunity the grid resolved — cheaper and exactly as accurate as
-        // re-reading it, and `batch_at` has already paid for the read.
-        let interval = u64::try_from(schedule.tm_batch_interval).unwrap_or(0);
-        let epoch_start_slot = batch
-            .open()
-            .or_else(|| batch.next())
-            .filter(|_| interval > 0)
-            .map(|b| b.slot.saturating_sub(b.index.saturating_mul(interval)));
         Ok(BatchSnapshot {
             now_ms: snapshot.time_ms,
             slot: snapshot.slot,
@@ -2949,10 +3091,10 @@ impl CardanoChain for BlockfrostCardanoChain {
             // E-relative in the Config; absolute here, so every SPO's rotation
             // ceremony closes against the same slot. `None` where the deployment
             // has no epoch anchor to add it to.
-            update_y_close_slot: epoch_start_slot.and_then(|e| {
+            update_y_close_slot: anchor.and_then(|a| {
                 u64::try_from(schedule.update_y_deadline)
                     .ok()
-                    .map(|d| e + d)
+                    .map(|d| a.start_slot + d)
             }),
             source,
         })
@@ -3527,6 +3669,72 @@ mod tests {
             },
             None,
         )
+    }
+
+    /// The Config is re-read at the two moments its value can change what this
+    /// node does — a new cycle, and an opportunity the last read predates — and
+    /// reused in between.
+    ///
+    /// Reused is the common case by a wide margin: the poll runs every
+    /// `batch_poll_ceiling` (5 min) for the whole of a `tm_batch_interval` (6 h on
+    /// preprod), so all but one turn per opportunity now costs one request for the
+    /// tip instead of five.
+    #[test]
+    fn the_config_is_re_read_at_a_new_cycle_and_at_a_new_opportunity() {
+        use super::config_refresh_due;
+        use crate::cardano::config_params::{
+            CachedConfig, ConfigUtxoRef, ConfigView, CycleAnchor, test_config_params,
+        };
+        use crate::epoch::batch::{BatchSlot, BatchWindow};
+
+        let cached = |read_slot: u64, anchor_slot: u64| CachedConfig {
+            config: ConfigView {
+                params: test_config_params(),
+                utxo: ConfigUtxoRef {
+                    tx_hash: "ab".repeat(32),
+                    index: 0,
+                },
+            },
+            config_created_ms: Some(1_699_000_000_000),
+            read_slot,
+            anchor_slot,
+        };
+        let anchor = |start: u64| CycleAnchor {
+            epoch: 500,
+            start_slot: start,
+            end_slot: Some(start + 431_999),
+        };
+        let open_at = |slot: u64| BatchWindow::Open {
+            batch: BatchSlot {
+                index: 2,
+                slot,
+                cutoff_slot: slot - 100,
+            },
+            next: None,
+        };
+        let c = cached(5_100, 5_000);
+
+        assert!(
+            !config_refresh_due(&c, Some(anchor(5_000)), &open_at(5_000)),
+            "a read taken inside the open opportunity is the pin every co-signer needs"
+        );
+        assert!(
+            config_refresh_due(&c, Some(anchor(5_000)), &open_at(6_000)),
+            "a movement built at B_i must be built from a Config read at or after B_i"
+        );
+        assert!(
+            config_refresh_due(&c, Some(anchor(437_000)), &open_at(5_000)),
+            "every schedule offset is measured from the cycle start, so a carried-over Config \
+             places the new cycle's grid against a stale anchor"
+        );
+        assert!(
+            !config_refresh_due(&c, Some(anchor(5_000)), &BatchWindow::Closed { next: None }),
+            "waiting between opportunities in one cycle must cost no Config read at all"
+        );
+        assert!(
+            config_refresh_due(&c, None, &BatchWindow::NoGrid),
+            "with no anchor and no grid nothing here can show the reuse is still good"
+        );
     }
 
     /// The refresh has nowhere to read from unless the Config locator is set, and
