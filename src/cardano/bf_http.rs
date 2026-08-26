@@ -664,16 +664,42 @@ pub async fn fetch_epoch_bounds_ms(
             "epochs/{epoch}: implausible start_time {secs} (want Unix seconds)"
         ));
     }
-    // Held to the same plausibility rule as the start, and additionally required
-    // to be AFTER it: an end that fails either test is dropped rather than
-    // returned, because its only use is bounding a cache and a wrong bound there
-    // is worse than no bound.
+    // See `usable_epoch_end` for why the SPAN is bounded and not just the value.
     let end = v
         .get("end_time")
         .and_then(serde_json::Value::as_i64)
-        .filter(|e| (1_000_000_000..10_000_000_000).contains(e) && *e > secs)
+        .and_then(|e| usable_epoch_end(secs, e))
         .map(|e| e * 1000);
+    if end.is_none() {
+        tracing::debug!(
+            "epochs/{epoch}: no usable `end_time` — the cycle anchor will be re-read every poll"
+        );
+    }
     Ok((secs * 1000, end))
+}
+
+/// `end_time` if it can bound a cache, `None` otherwise.
+///
+/// Three tests, and the third is the one that matters. The reported end must be
+/// plausible Unix seconds and must be AFTER the start — but it must also describe
+/// a SPAN no longer than a Cardano epoch, because `end_time` is the only thing
+/// that ever makes a cached cycle anchor expire.
+///
+/// One far-future value — a projection, a sentinel, a proxy filling in a field it
+/// does not have — produces an anchor that covers every future tip, and the node
+/// then never re-reads the boundary again for the life of the process: the grid
+/// runs past `final_tm_cutoff` so no movement is ever built, the rotation deadline
+/// stays in the past, the Config is never refreshed, and `max_tx_size` stays
+/// pinned to a dead epoch. Only a restart clears it. A span that is merely too
+/// SHORT costs one wasted re-read per epoch. The asymmetry is total, so the bound
+/// goes here.
+#[must_use]
+pub fn usable_epoch_end(start_secs: i64, end_secs: i64) -> Option<i64> {
+    let max_span = i64::try_from(crate::epoch::virtual_epoch::CARDANO_EPOCH_SLOTS).ok()?;
+    ((1_000_000_000..10_000_000_000).contains(&end_secs)
+        && end_secs > start_secs
+        && end_secs.saturating_sub(start_secs) <= max_span)
+        .then_some(end_secs)
 }
 
 /// The current slot and the upper validity bound at the epoch boundary, for
@@ -1016,6 +1042,53 @@ pub async fn fetch_cost_models(base_url: &str, project_id: &str) -> Result<Vec<V
 
 #[cfg(test)]
 mod backend_error_tests {
+    use super::usable_epoch_end;
+
+    /// The cached cycle anchor expires only because `end_time` says so, which
+    /// makes an over-long span the one error that never self-heals.
+    #[test]
+    fn an_epoch_end_is_usable_only_if_it_bounds_a_real_cycle() {
+        const START: i64 = 1_700_000_000;
+        const EPOCH: i64 = 432_000; // 5 days of one-second slots
+
+        assert_eq!(
+            usable_epoch_end(START, START + EPOCH),
+            Some(START + EPOCH),
+            "a full Cardano epoch is exactly what preprod and mainnet report"
+        );
+        assert_eq!(
+            usable_epoch_end(START, START + 3_600),
+            Some(START + 3_600),
+            "a devnet's shorter epoch is fine — too short only costs a re-read"
+        );
+        assert_eq!(
+            usable_epoch_end(START, START + EPOCH + 1),
+            None,
+            "one second past an epoch is already a span no Cardano chain has, and a span that is \
+             too long never expires"
+        );
+        assert_eq!(
+            usable_epoch_end(START, 9_999_999_999),
+            None,
+            "a plausible-but-far-future sentinel is the case that pins the grid until restart"
+        );
+        assert_eq!(
+            usable_epoch_end(START, START),
+            None,
+            "an end at the start bounds nothing"
+        );
+        assert_eq!(
+            usable_epoch_end(START, START - 1),
+            None,
+            "nor does one before it"
+        );
+        assert_eq!(
+            usable_epoch_end(START, 1_700_000_000_000),
+            None,
+            "milliseconds in a seconds field must not be read as a 50-millennium epoch"
+        );
+    }
+
     use super::*;
 
     /// The line an operator reads at 3am. A quota wall answers 402 with the

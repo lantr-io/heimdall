@@ -694,6 +694,17 @@ pub struct BlockfrostCardanoChain {
     /// That is a pin, not merely a saving: every co-signer of one `B_i` now builds
     /// from a Config read at or after the SAME `B_i`, instead of from whenever each
     /// node's poll happened to land.
+    ///
+    /// It has a cost worth stating, because it is a log line an operator waits on.
+    /// `remember_contracts`' "a bridge Config Update has landed and this node is
+    /// NOT on it yet" compares the batch pin against the snapshot's Config UTxO,
+    /// and on a reused read those are the same UTxO — so the notice no longer
+    /// arrives within a poll of the governance transaction. It arrives at the next
+    /// Config READ, which [`config_refresh_due`] bounds to the next opportunity or
+    /// one `tm_batch_interval`, whichever is sooner. The content was always "the
+    /// next opportunity adopts it", so what changed is latency, not what the
+    /// operator can act on; preserving the old latency would mean reading the
+    /// Config on every poll, which is the thing this cache exists to stop.
     config_cache: Mutex<Option<config_params::CachedConfig>>,
     /// The cycle anchor, cached for the cycle it describes.
     ///
@@ -711,7 +722,7 @@ pub struct BlockfrostCardanoChain {
     /// `query_treasury` needs the list on every call — the retired-key report is
     /// exactly "the persisted ceremonies minus the live ones" — so it cannot be
     /// made lazy, only cheap.
-    internal_candidates: Mutex<Option<(u64, Vec<(u64, bitcoin::key::UntweakedPublicKey)>)>>,
+    internal_candidates: Mutex<Option<(u64, CeremonyKeys)>>,
     /// The last TM this process submitted, and when. `query_treasury` reports
     /// `btc_confirmed = false` until that txid becomes the Confirmed chain tip, so the
     /// epoch machine waits for its own in-flight TM instead of double-spending the tip.
@@ -795,6 +806,50 @@ fn script_enterprise_address(hash: &[u8; 28], mainnet: bool) -> String {
         .expect("bech32 encode script address")
 }
 
+/// The group key of each ceremony this node has persisted, newest epoch first.
+type CeremonyKeys = Vec<(u64, bitcoin::key::UntweakedPublicKey)>;
+
+/// Whether a reused Config must be re-read before this snapshot may be used.
+///
+/// Three triggers. The first two are the moments a Config value can change what
+/// this node does; the third is what keeps the other two from being the only
+/// answer.
+///
+///  - **A new cycle.** Every schedule offset is measured from the cycle start, so
+///    a Config carried over from the previous cycle places this cycle's grid — and
+///    its rotation deadline — against a stale anchor.
+///  - **An opportunity the read predates.** The Config decides the fee, the two
+///    selection floors and the contract identities a movement is built from, and a
+///    movement built at `B_i` must be built from a Config as of `B_i`. That is what
+///    makes two co-signers of one opportunity reproduce each other's bytes.
+///  - **An interval's worth of slots since the read.** Without this the predicate
+///    is self-referential in a way that bites: the grid it tests against is placed
+///    using the CACHED Config's own schedule, so a governance change to
+///    `tm_batch_interval` is invisible to a warm node — it keeps spacing `B_i` the
+///    old way and never sees an opportunity it predates — while a node that
+///    restarted reads the new schedule and spaces them differently. The two then
+///    freeze different sets at different slots and their FROST shares cannot
+///    aggregate. It also covers the long stretches where `batch.open()` is `None`
+///    and the second trigger simply cannot fire: before `B_1`, past
+///    `final_tm_cutoff`, and across the whole rotation window.
+///
+/// Between those the Config is reused. It is a UTxO only governance moves, and a
+/// governance move that lands mid-cycle then takes effect for every SPO at the
+/// same anchor instead of at whenever each node's poll happened to land.
+fn config_refresh_due(
+    cached: Option<&config_params::CachedConfig>,
+    anchor: config_params::CycleAnchor,
+    batch: &crate::epoch::batch::BatchWindow,
+    tip_slot: u64,
+    interval: u64,
+) -> bool {
+    // Nothing cached is nothing to reuse.
+    let Some(cached) = cached else { return true };
+    anchor.start_slot != cached.anchor_slot
+        || batch.open().is_some_and(|b| b.slot > cached.read_slot)
+        || (interval > 0 && tip_slot.saturating_sub(cached.read_slot) >= interval)
+}
+
 /// Read the Config UTxO, then locate + decode the bridge-state singleton it
 /// names ([PAR-1]): derive the enterprise address of `bridge_state_policy`
 /// (Config field 3 — both deploy paths create the singleton there, stake part
@@ -804,35 +859,6 @@ fn script_enterprise_address(hash: &[u8; 28], mainnet: bool) -> String {
 /// singleton view: the decoded BridgeState plus the Cardano UTxO holding it
 /// (the [PTM-7] mint reference input). Shared by the epoch daemon and the CLI
 /// sweep, so both resolve the treasury head the same way.
-/// Whether a reused Config must be re-read before this snapshot may be used.
-///
-/// Two triggers, and they are the two moments at which a Config value can change
-/// what this node does:
-///
-///  - **A new cycle.** Every schedule offset is measured from the cycle start, so
-///    a Config carried over from the previous cycle places this cycle's grid — and
-///    its rotation deadline — against a stale anchor.
-///  - **An opportunity the read predates.** The Config decides the fee, the two
-///    selection floors and the contract identities a movement is built from, and a
-///    movement built at `B_i` must be built from a Config as of `B_i`. That is what
-///    makes two co-signers of one opportunity reproduce each other's bytes.
-///
-/// Between those the Config is reused. It is a UTxO only governance moves, and a
-/// governance move that lands mid-cycle then takes effect for every SPO at the
-/// same anchor instead of at whenever each node's poll happened to land.
-fn config_refresh_due(
-    cached: &config_params::CachedConfig,
-    anchor: Option<config_params::CycleAnchor>,
-    batch: &crate::epoch::batch::BatchWindow,
-) -> bool {
-    // With no anchor there is no cycle to compare and no grid to place an
-    // opportunity on. Nothing here can show the reuse is still good, so it is not
-    // claimed to be.
-    let Some(anchor) = anchor else { return true };
-    anchor.start_slot != cached.anchor_slot
-        || batch.open().is_some_and(|b| b.slot > cached.read_slot)
-}
-
 pub async fn fetch_config_singleton(
     bf_base_url: &str,
     bf_project_id: &str,
@@ -1427,7 +1453,7 @@ impl BlockfrostCardanoChain {
     /// writer a running daemon has — `write_dkg_state`, when its own DKG completes.
     ///
     /// [`ceremony_generation`]: crate::epoch::persist::ceremony_generation
-    fn persisted_internal_candidates(&self) -> Vec<(u64, bitcoin::key::UntweakedPublicKey)> {
+    fn persisted_internal_candidates(&self) -> CeremonyKeys {
         let Some(dir) = self.state_dir.as_deref() else {
             return Vec::new();
         };
@@ -1435,29 +1461,56 @@ impl BlockfrostCardanoChain {
         // flight invalidates what it is about to store rather than being swallowed
         // by it.
         let generation = crate::epoch::persist::ceremony_generation();
-        if let Ok(cache) = self.internal_candidates.lock()
-            && let Some((cached_generation, candidates)) = cache.as_ref()
+        let previous = self.internal_candidates.lock().ok().and_then(|c| c.clone());
+        if let Some((cached_generation, candidates)) = previous.as_ref()
             && *cached_generation == generation
         {
             return candidates.clone();
         }
-        let Ok(epochs) = crate::epoch::persist::persisted_dkg_epochs(dir) else {
-            return Vec::new();
+        // "A state dir that cannot be read must not turn a treasury query into a
+        // failure — it just leaves the caller with the candidates it had before",
+        // and before this the code returned NOTHING instead. That mattered most at
+        // the worst moment: the cache is only consulted past the generation check,
+        // so this path is reached just after a ceremony landed — the handoff, when
+        // the head is locked under a key only this list carries. Losing every
+        // candidate there fails `query_treasury` outright on all four polling
+        // loops, which is exactly what the sentence above forbids.
+        let previous_list = || {
+            previous
+                .as_ref()
+                .map(|(_, c)| c.clone())
+                .unwrap_or_default()
         };
+        let Ok(epochs) = crate::epoch::persist::persisted_dkg_epochs(dir) else {
+            return previous_list();
+        };
+        let mut complete = true;
         let candidates: Vec<_> = epochs
             .into_iter()
             .filter_map(|e| {
                 // The PUBLIC half only. Whether a ceremony produced a given key is a
                 // public question, and answering it by deserializing the signing
                 // share was both the expensive way and the careless one.
-                let vk = crate::epoch::persist::read_dkg_group_key(dir, e)
-                    .ok()
-                    .flatten()?;
-                let g = crate::frost::xonly::group_xonly(&vk).ok()?;
-                Some((e, g.xonly))
+                match crate::epoch::persist::read_dkg_group_key(dir, e) {
+                    Ok(Some(vk)) => crate::frost::xonly::group_xonly(&vk)
+                        .ok()
+                        .map(|g| (e, g.xonly)),
+                    // The file named itself and then could not be read or decoded.
+                    // A ceremony that is on disk but missing from the list is the
+                    // failure mode this whole list exists to prevent, so the result
+                    // is used but NOT remembered.
+                    Ok(None) | Err(_) => {
+                        complete = false;
+                        None
+                    }
+                }
             })
             .collect();
-        if let Ok(mut cache) = self.internal_candidates.lock() {
+        // Only a COMPLETE read is cached. `ceremony_generation` moves solely when
+        // this process persists a ceremony — a node that never runs its own DKG
+        // never moves it at all — so a short list stored here would outlive the
+        // transient that shortened it by days, or by the life of the process.
+        if complete && let Ok(mut cache) = self.internal_candidates.lock() {
             *cache = Some((generation, candidates.clone()));
         }
         candidates
@@ -3056,8 +3109,8 @@ impl CardanoChain for BlockfrostCardanoChain {
         // no, the second attempt reads the Config fresh and the same test cannot
         // fire again. See `config_refresh_due`.
         let mut reuse = self.cached_config();
-        let (snapshot, anchor, schedule, batch) = loop {
-            let snapshot = config_params::fetch_param_snapshot_reusing(
+        let (snapshot, reused, anchor, schedule, batch) = loop {
+            let (snapshot, reused) = config_params::fetch_param_snapshot_reusing(
                 &self.bf_base_url,
                 &self.bf_project_id,
                 addr,
@@ -3087,16 +3140,43 @@ impl CardanoChain for BlockfrostCardanoChain {
                 }
                 None => crate::epoch::batch::BatchWindow::NoGrid,
             };
-            match reuse.as_ref() {
-                Some(cached) if config_refresh_due(cached, anchor, &batch) => reuse = None,
-                _ => break (snapshot, anchor, schedule, batch),
+            // Without an anchor the second pass cannot reach a different answer —
+            // it would re-read the Config, fail the same boundary read, and produce
+            // `NoGrid` again. Going round would make the DEGRADED path cost more
+            // requests than this function did before it cached anything, and the
+            // thing that makes a boundary unreadable is a 429, so the poll would
+            // answer quota exhaustion by raising its own request rate.
+            //
+            // The reuse is not stranded by breaking early: it is simply not tested
+            // this turn, and the first turn whose boundary reads resumes testing it
+            // — where the staleness bound then fires on the slots that went by.
+            let Some(a) = anchor else {
+                break (snapshot, reused, anchor, schedule, batch);
+            };
+            let interval = u64::try_from(schedule.tm_batch_interval).unwrap_or(0);
+            if reused && config_refresh_due(reuse.as_ref(), a, &batch, snapshot.slot, interval) {
+                reuse = None;
+                continue;
             }
+            break (snapshot, reused, anchor, schedule, batch);
         };
-        // Only a read off the wire updates the cache. Carrying `read_slot` forward
-        // on a reuse would push it past every future `B_i` and the refresh would
-        // never come due again.
-        if let (None, Some(a)) = (reuse.as_ref(), anchor) {
-            *self.config_cache.lock().unwrap() = Some(config_params::CachedConfig {
+        // Cache only what was actually read off the wire, and only when it can be
+        // bounded.
+        //
+        // `reused` is the function's own answer, not "did we offer a reuse": the
+        // rollback path abandons the offer and pays for a fresh read, and treating
+        // that as a reuse would discard it and serve the rolled-back Config again
+        // next poll. Carrying `read_slot` forward on a genuine reuse would push it
+        // past every future `B_i` so the refresh never came due again.
+        //
+        // A snapshot whose `config_created_ms` could not be read is not cached at
+        // all: that field IS the rollback guard, and baking a `None` into the cache
+        // would disable the guard for the whole reuse window rather than for the
+        // one read that failed.
+        if let (false, Some(a), Some(_)) = (reused, anchor, snapshot.config_created_ms)
+            && let Ok(mut cache) = self.config_cache.lock()
+        {
+            *cache = Some(config_params::CachedConfig {
                 config: snapshot.config.clone(),
                 config_created_ms: snapshot.config_created_ms,
                 read_slot: snapshot.slot,
@@ -3831,27 +3911,63 @@ mod tests {
             next: None,
         };
         let c = cached(5_100, 5_000);
+        // A cycle long enough that the staleness bound is not what fires below.
+        let pitch = 21_600u64;
 
         assert!(
-            !config_refresh_due(&c, Some(anchor(5_000)), &open_at(5_000)),
+            !config_refresh_due(Some(&c), anchor(5_000), &open_at(5_000), 5_200, pitch),
             "a read taken inside the open opportunity is the pin every co-signer needs"
         );
         assert!(
-            config_refresh_due(&c, Some(anchor(5_000)), &open_at(6_000)),
+            config_refresh_due(Some(&c), anchor(5_000), &open_at(6_000), 6_100, pitch),
             "a movement built at B_i must be built from a Config read at or after B_i"
         );
         assert!(
-            config_refresh_due(&c, Some(anchor(437_000)), &open_at(5_000)),
+            config_refresh_due(Some(&c), anchor(437_000), &open_at(5_000), 437_100, pitch),
             "every schedule offset is measured from the cycle start, so a carried-over Config \
              places the new cycle's grid against a stale anchor"
         );
         assert!(
-            !config_refresh_due(&c, Some(anchor(5_000)), &BatchWindow::Closed { next: None }),
+            !config_refresh_due(
+                Some(&c),
+                anchor(5_000),
+                &BatchWindow::Closed { next: None },
+                5_200,
+                pitch
+            ),
             "waiting between opportunities in one cycle must cost no Config read at all"
         );
         assert!(
-            config_refresh_due(&c, None, &BatchWindow::NoGrid),
-            "with no anchor and no grid nothing here can show the reuse is still good"
+            config_refresh_due(None, anchor(5_000), &BatchWindow::NoGrid, 5_200, pitch),
+            "nothing cached is nothing to reuse"
+        );
+
+        // The staleness bound — the only trigger that can fire while no opportunity
+        // is open, and the only one not decided using the cached Config's OWN
+        // schedule. Without it a warm node never notices a governance change to
+        // `tm_batch_interval`: it keeps spacing B_i the old way and so never sees an
+        // opportunity its read predates, while a node that restarted spaces them the
+        // new way. The two freeze different sets and cannot aggregate.
+        assert!(
+            !config_refresh_due(
+                Some(&c),
+                anchor(5_000),
+                &BatchWindow::Closed { next: None },
+                5_100 + pitch - 1,
+                pitch
+            ),
+            "just inside an interval of the last read is still a pin"
+        );
+        assert!(
+            config_refresh_due(
+                Some(&c),
+                anchor(5_000),
+                &BatchWindow::Closed { next: None },
+                5_100 + pitch,
+                pitch
+            ),
+            "an interval's worth of slots with nothing open must still re-read: the rotation \
+             window is that long and no opportunity opens inside it"
         );
     }
 

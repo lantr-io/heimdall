@@ -124,6 +124,15 @@ impl BuiltBatch {
         self.0 = Some((epoch, index));
     }
 
+    /// Whether the marked build was the no-grid one, whatever epoch it was in.
+    ///
+    /// The epoch is deliberately not compared: the question this answers is "is
+    /// there a next opportunity to send this node to", and on a chain with no grid
+    /// the answer is no in every epoch.
+    fn is_no_grid(self) -> bool {
+        matches!(self.0, Some((_, Self::NO_GRID)))
+    }
+
     /// Forget the marker after a FAILED attempt: a build that produced no
     /// movement must not consume its opportunity, so the next poll retries the
     /// same `B_i` instead of waiting out the interval. (A posted-but-unconfirmed
@@ -400,21 +409,41 @@ async fn drive_to_movement(
             // validation and must fail before the loop is entered — not here,
             // where the only correct answer is to keep trying.
             Err(e) => {
+                // A failure in a DIFFERENT phase is a different problem, and starts
+                // its own ramp. `failed_in` spans a whole call to this function —
+                // `Idle`, a boundary wait, a DKG, the next epoch's `PublishKeys` —
+                // so without this a `BuildTm` ramp that reached
+                // `retry_backoff_max` would still be in force for the first
+                // transient 502 in `Dkg(Round1)`, against round deadlines measured
+                // in minutes.
+                if failed_in != Some(stepped) {
+                    backoff = RETRY_BACKOFF_MIN;
+                }
                 failed_in = Some(stepped);
-                // A build that failed on the batch's OWN contents fails the same
-                // way every time it is rebuilt: the batch is frozen, so the inputs
-                // are byte-identical and so is the verdict. Retrying it is not a
-                // retry, it is the same computation. The way back in is the next
-                // SYNCHRONIZED entry, exactly as for a spent round below — a later
-                // opportunity re-freezes against a chain that has moved, which is
-                // the only thing that can change the answer.
+                // A verdict on the FROZEN BATCH fails the same way every time it
+                // is rebuilt: the inputs are fixed for the opportunity, so the same
+                // computation runs over the same bytes. Retrying it is not a retry.
+                // The way back in is the next SYNCHRONIZED entry, exactly as for a
+                // spent round below — a later opportunity re-freezes against a
+                // chain that has moved, which is the only thing that can change the
+                // answer.
                 //
                 // This is the other half of the preprod incident: an already-swept
                 // deposit re-offered by `query_pegin_requests` raised `Conflict` in
                 // `root_after_inputs`, the opportunity was handed back, and the
                 // node rebuilt the identical batch every few seconds for the whole
                 // round-1 window.
-                let deterministic = matches!(e.cause(), EpochError::TmBuild(_));
+                //
+                // BOTH conditions are required, and each without the other is a
+                // liveness bug. The PHASE, because a batch is only frozen once
+                // `BuildTm` is entered — `settle_pending_tm` runs inside
+                // `CollectPegins` AFTER the opportunity is marked, so a trie-write
+                // blip there would otherwise spend an opportunity taken
+                // milliseconds earlier, and say it "failed on the frozen batch"
+                // about a batch that was never frozen. The VARIANT, because
+                // `TmBuild` is the catch-all for filesystem I/O and for comparisons
+                // against live chain reads, none of which a retry reproduces.
+                let deterministic = rejects_the_batch(stepped, e.cause());
                 // A SPENT round has published commitments its peers are still
                 // serving, so this node may not walk it again alone: it has to
                 // rejoin them at the next SYNCHRONIZED entry. That is the next
@@ -487,7 +516,11 @@ async fn drive_to_movement(
                         config.dkg_reconcile_backoff,
                         resume.as_ref().map_or("Idle", EpochPhase::name)
                     );
-                    backoff = RETRY_BACKOFF_MIN; // the settling wait replaces the ramp
+                    // The settling wait replaces the ramp, so clear BOTH halves of
+                    // its state — leaving `failed_in` set would say a ramp is
+                    // outstanding while `backoff` says it is not.
+                    backoff = RETRY_BACKOFF_MIN;
+                    failed_in = None;
                     config.dkg_reconcile_backoff
                 } else if deterministic {
                     crate::epoch_warn!(
@@ -525,12 +558,26 @@ async fn drive_to_movement(
                 // round: handing the opportunity back would rebuild the same frozen
                 // batch, hence the same sighashes and the same namespace, and
                 // republish into a round the peers have moved on from. A
-                // DETERMINISTIC build failure: the rebuild is the same computation
-                // over the same bytes and reaches the same refusal, so the retry is
-                // pure cost. Keeping the marker sends this node to the NEXT
-                // opportunity, which every node enters together and which freezes
-                // against a chain that has moved.
-                if *built != inherited && !round_spent && !deterministic {
+                // DETERMINISTIC rejection: the rebuild is the same computation over
+                // the same bytes and reaches the same refusal, so the retry is pure
+                // cost. Keeping the marker sends this node to the NEXT opportunity,
+                // which every node enters together and which freezes against a
+                // chain that has moved.
+                //
+                // "The NEXT opportunity" is the whole justification, and on a chain
+                // with no grid there ISN'T one: `await_batch_opportunity` answers
+                // `EpochOver` for a marked `NO_GRID`, so the phase returns `Idle`
+                // and the node waits out the epoch boundary — up to five days for
+                // one refusal. That is reachable from a transient failure, because
+                // an unreadable epoch boundary degrades to `NoGrid`. So the
+                // deterministic case hands the opportunity back there and lets the
+                // RAMP bound it instead: retried, but at `retry_backoff_max` rather
+                // than continuously. A spent round still keeps it — republishing
+                // into a round the peers have left is harmful, not merely wasteful,
+                // so waiting out the epoch is the lesser cost.
+                if *built != inherited
+                    && !spends_the_opportunity(round_spent, deterministic, *built)
+                {
                     built.clear();
                 }
                 // Re-enter THIS epoch when its ceremony is still in hand and the
@@ -581,6 +628,39 @@ async fn drive_to_movement(
 /// its minimum.
 fn step_clears_ramp(failed_in: Option<&'static str>, stepped: &'static str) -> bool {
     failed_in.is_none_or(|f| f == stepped)
+}
+
+/// Whether a failure is a verdict on the FROZEN BATCH — one that rebuilding
+/// cannot change.
+///
+/// Both halves are required, and each without the other is a liveness bug. The
+/// PHASE, because a batch is only frozen once `BuildTm` is entered:
+/// `settle_pending_tm` runs inside `CollectPegins` AFTER the opportunity is
+/// marked, so without this a trie-write blip would spend an opportunity taken
+/// milliseconds earlier. The VARIANT, because `EpochError::TmBuild` is the
+/// catch-all for filesystem I/O and for comparisons against live chain reads,
+/// neither of which a retry reproduces.
+fn rejects_the_batch(stepped: &'static str, cause: &EpochError) -> bool {
+    stepped == "BuildTm" && matches!(cause, EpochError::BatchRejected(_))
+}
+
+/// Whether a failed attempt keeps its batch opportunity instead of handing it
+/// back.
+///
+/// Keeping it means "rejoin everyone at the NEXT opportunity", and that is the
+/// whole justification — so it holds only where a next opportunity exists. On a
+/// chain with no grid there is none: `await_batch_opportunity` answers
+/// `EpochOver` for a marked `NO_GRID`, the phase returns `Idle`, and the node
+/// waits out the epoch boundary. Up to five days, for one refusal, and reachable
+/// from a transient failure because an unreadable epoch boundary degrades to
+/// `NoGrid`.
+///
+/// So a rejected batch hands the opportunity back there and lets the retry ramp
+/// bound it instead. A SPENT round still keeps it either way: republishing into a
+/// round the peers have left is harmful rather than merely wasteful, which makes
+/// waiting out the epoch the lesser cost.
+fn spends_the_opportunity(round_spent: bool, rejected: bool, built: BuiltBatch) -> bool {
+    round_spent || (rejected && !built.is_no_grid())
 }
 
 /// Dispatch one phase to its handler. Pure routing — the retry/backoff policy
@@ -3283,32 +3363,54 @@ async fn build_tm_phase(
         ));
     }
 
-    // Poll until the previous treasury movement is confirmed on Bitcoin.
+    // Wait for the previous treasury movement to confirm — but only where waiting
+    // can still lead anywhere.
     //
-    // CADENCE: `batch_poll_ceiling`, the same one `await_batch_opportunity` and
-    // `await_rotation_phase` use, and for the same reason — `query_treasury` is
-    // five-plus HTTP round trips and this waits on a Bitcoin confirmation depth,
-    // which is hours away. It was a hardcoded 30 s, which bought no useful
-    // granularity against that wait and cost ~2000 full treasury reads per
-    // movement.
+    // WITH A GRID there is nothing to wait for. `collect_pegins_phase` already let
+    // the opportunity pass unused if a movement was in flight, so reaching here
+    // with `btc_confirmed == false` means it went in flight in the gap between that
+    // check and this one — a peer took this `B_i`. Round 1 closes at the ABSOLUTE
+    // slot `B_i + sign_r1_window`, so sleeping here does not wait for the
+    // movement, it waits out this node's own signing window and then publishes
+    // commitments into a session nobody else is in (the WI-W8ZC4 failure). Give the
+    // opportunity up instead and rejoin everyone at the next one. The marker stays
+    // set, which is what sends this node to `B_{i+1}`.
     //
-    // On a gridded bridge this is a one-shot check: `collect_pegins_phase` lets the
-    // opportunity pass unused when a movement is in flight, so the phase is only
-    // entered after `btc_confirmed` was true. The long wait belongs to the
-    // `NoGrid` path, where there is no opportunity to pass and this IS the wait —
-    // which is exactly where the 30 s mattered most and helped least.
+    // WITHOUT A GRID there is no next opportunity and no window to overshoot, so
+    // this IS the wait, and its cadence is `batch_poll_ceiling` — the one
+    // `await_batch_opportunity` and `await_rotation_phase` already use for
+    // `query_treasury`, which is five-plus HTTP round trips against a Bitcoin
+    // confirmation depth hours away. It was a hardcoded 30 s: no useful
+    // granularity, ~2000 full treasury reads per movement.
     let treasury = loop {
         let t = chain.query_treasury().await?;
         if t.btc_confirmed {
             break t;
         }
-        crate::epoch_log!(
+        let Some(b) = batch else {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "BuildTm: previous treasury movement not yet confirmed on Bitcoin, re-reading in \
+                 {:?}",
+                config.batch_poll_ceiling
+            );
+            tokio::time::sleep(config.batch_poll_ceiling).await;
+            continue;
+        };
+        crate::epoch_warn!(
             me,
             epoch,
-            "BuildTm: previous treasury movement not yet confirmed on Bitcoin, re-reading in {:?}",
-            config.batch_poll_ceiling
+            "  batch B_{} is given up: a movement went in flight between collection and the \
+             build, and this batch's round 1 closes at a fixed slot — waiting for it would spend \
+             the round with nobody to sign alongside. Rejoining at the next opportunity.",
+            b.index
         );
-        tokio::time::sleep(config.batch_poll_ceiling).await;
+        return Ok(EpochPhase::CollectPegins {
+            epoch,
+            roster,
+            group_keys,
+        });
     };
 
     // Open peg-outs on Cardano. A request UTxO survives at the `peg_out.ak` address until
@@ -3558,7 +3660,21 @@ async fn build_tm_phase(
         &cpo_trie,
         &spi_trie,
     )
-    .map_err(|e| EpochError::TmBuild(e.to_string()))?;
+    .map_err(|e| {
+        // Only the two trie-root conflicts are verdicts on the FROZEN BATCH:
+        // `build_tm` is pure over the frozen inputs plus this node's tries, so a
+        // rebuild reaches them again. `InsufficientFunds` and `DustOutput` are
+        // measured against a treasury balance re-read on every pass, and
+        // `MalformedUnsignedTm`/`FederationLeafSpend` are deployment faults — all
+        // of those must stay retriable.
+        use crate::bitcoin::tm_builder::TmBuildError;
+        match e {
+            TmBuildError::CpoRoot(_) | TmBuildError::SpiRoot(_) => {
+                EpochError::BatchRejected(e.to_string())
+            }
+            other => EpochError::TmBuild(other.to_string()),
+        }
+    })?;
 
     // Surface peg-outs `build_tm`'s output-level skip rule dropped (non-standard
     // destination, sub-dust after the fee). Every SPO drops the same set — that is
@@ -3598,7 +3714,7 @@ async fn build_tm_phase(
     let built_pegins = (unsigned.tx.input.len() as u64).saturating_sub(1);
     let built_pegouts = (unsigned.tx.output.len() as u64).saturating_sub(2);
     if !budget.fits(built_pegins, built_pegouts) {
-        return Err(EpochError::TmBuild(format!(
+        return Err(EpochError::BatchRejected(format!(
             "built movement is over the byte budget: {built_pegins} peg-in(s) and \
              {built_pegouts} peg-out(s) assemble to {} Post-TM bytes against a max_tx_size of {} \
              (non-batch overhead {}). The batch was frozen inside the budget, so the size model \
@@ -3748,7 +3864,23 @@ fn rotation_window(
     clock: &Arc<dyn Clock>,
     snapshot: &crate::epoch::traits::BatchSnapshot,
 ) -> crate::epoch::state::SigningWindow {
-    let r2 = snapshot.update_y_close_slot.unwrap_or_else(|| {
+    // The published deadline is used only while it still leaves room for round 1.
+    // One already past does not BOUND a round, it annihilates it:
+    // `SigningWindow::from_slots` reports a close in the past as NOW, so both rounds
+    // shut on entry and this node publishes a commitment into a session nobody is in
+    // — spending the round for nothing.
+    //
+    // That state is reachable. `update_y_close_slot` is `epoch_start + deadline`,
+    // an absolute slot with no dependence on the batch grid, so it is `Some` and in
+    // the past for the whole stretch after `update_y_deadline` — where
+    // `PublishKeys` can still be re-entered from `AwaitRotation`, and where the
+    // WI-113 succession path reads a snapshot at an arbitrary point in the cycle.
+    // Past it, the live window is the honest answer for a rotation running late,
+    // and is the shape this had before the deadline was anchor-derived.
+    let published = snapshot
+        .update_y_close_slot
+        .filter(|close| *close > snapshot.slot.saturating_add(snapshot.sign_r2_window));
+    let r2 = published.unwrap_or_else(|| {
         snapshot
             .slot
             .saturating_add(snapshot.sign_r1_window)
@@ -8361,67 +8493,65 @@ mod tests {
         );
     }
 
-    /// A build that fails on the batch's OWN contents spends its opportunity
-    /// rather than handing it back.
+    /// The two conditions that decide whether a failed attempt keeps its batch
+    /// opportunity, and the two ways each of them is wrong on its own.
     ///
-    /// The batch is frozen, so a rebuild is the same computation over the same
-    /// bytes and reaches the same refusal. Handing the opportunity back turns that
-    /// into a hot loop, and the loop is not free: each pass is a full round of
-    /// chain reads. On preprod, 2026-08-26, a peg-in the SPI trie already recorded
-    /// as swept was re-offered by `query_pegin_requests`, `root_after_inputs`
-    /// raised `Conflict`, and three nodes re-entered `CollectPegins` every few
-    /// seconds — roughly 400 passes an hour each, which spent the day's Blockfrost
-    /// allowance by 02:10 UTC and stopped the bridge until the quota reset.
-    ///
-    /// The contrast is with `a_failure_gives_back_its_own_opportunity_but_never_a_
-    /// served_one`, and the dividing line is the same one a spent round draws: give
-    /// the opportunity back when a retry can reach a different answer, keep it when
-    /// it cannot.
-    ///
-    /// Counting peg-in queries is what makes this decisive — one query is one pass
-    /// through `CollectPegins`, so a node that rebuilds shows up as a count that
-    /// climbs with wall-clock time instead of one that stops.
-    #[tokio::test]
-    async fn a_deterministic_build_failure_spends_its_opportunity_instead_of_looping() {
-        let fixture = demo_static_fixture(2, 2, 18_900);
-        // The chain attests a completed-peg-outs root no empty trie can produce, so
-        // `cross_check_bridge_roots` refuses inside `BuildTm` — every time, for the
-        // same reason, however often the batch is rebuilt.
-        let stale_root = [0x5au8; 32];
-        let hub = MockPeerHub::new();
-        let mut handles = Vec::new();
-        let mut sources = Vec::new();
-        for i in 1..=2u16 {
-            let id = Identifier::try_from(i).unwrap();
-            let chain: Arc<dyn CardanoChain> =
-                Arc::new(MockCardanoChain::new(fixture.clone()).with_cpo_root(stale_root));
-            let source = Arc::new(MockCardanoPegInSource::new());
-            sources.push(Arc::clone(&source));
-            let pegin: Arc<dyn CardanoPegInSource> = source;
-            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
-            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
-            let config = fast_config(id);
-            handles.push(tokio::spawn(async move {
-                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
-            }));
-        }
-        // Past the ramp's first wait (RETRY_BACKOFF_MIN, 2 s) with seconds to
-        // spare, so a node that hands the opportunity back spends them rebuilding
-        // at `fast_config`'s 20 ms ceiling — hundreds of passes.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        for (i, source) in sources.iter().enumerate() {
-            let queries = source.query_count();
-            assert!(
-                queries <= 3,
-                "node {} made {queries} passes through CollectPegins for one opportunity — a \
-                 refusal the frozen batch reproduces exactly must be taken once",
-                i + 1
-            );
-        }
-        for h in handles {
-            h.abort();
-        }
+    /// Keeping it means "rejoin everyone at the NEXT opportunity". Spending an
+    /// opportunity that a rebuild WOULD have produced a movement for is a missed
+    /// movement; spending one where there is no next opportunity is a node parked
+    /// until the epoch boundary, up to five days. Both are liveness bugs, so the
+    /// rule is pinned from both sides rather than measured end to end — an
+    /// end-to-end count cannot tell "took the refusal once" from "parked for the
+    /// epoch", and an earlier version of this test could not either.
+    #[test]
+    fn only_a_rejected_batch_with_a_next_opportunity_spends_it() {
+        let gridded = {
+            let mut b = BuiltBatch::default();
+            b.mark(7, 3);
+            b
+        };
+        let no_grid = {
+            let mut b = BuiltBatch::default();
+            b.mark(7, BuiltBatch::NO_GRID);
+            b
+        };
+
+        assert!(
+            rejects_the_batch("BuildTm", &EpochError::BatchRejected("spi root".into())),
+            "a verdict on the frozen batch, raised where the batch is frozen"
+        );
+        assert!(
+            !rejects_the_batch(
+                "CollectPegins",
+                &EpochError::BatchRejected("spi root".into())
+            ),
+            "settle_pending_tm runs here AFTER the opportunity is marked — nothing is frozen yet, \
+             so this must not spend it"
+        );
+        assert!(
+            !rejects_the_batch("BuildTm", &EpochError::TmBuild("trie write: ENOSPC".into())),
+            "TmBuild is the catch-all for filesystem I/O and live chain comparisons, which a \
+             retry does reproduce differently"
+        );
+
+        assert!(
+            spends_the_opportunity(false, true, gridded),
+            "a rejected batch on a grid rejoins its peers at B_i+1"
+        );
+        assert!(
+            !spends_the_opportunity(false, true, no_grid),
+            "with no grid there is no next opportunity, so spending it parks the node until the \
+             epoch boundary — hand it back and let the ramp bound the retry"
+        );
+        assert!(
+            spends_the_opportunity(true, false, no_grid),
+            "a spent round keeps its opportunity even with no grid: republishing into a round the \
+             peers have left is harmful, not merely wasteful"
+        );
+        assert!(
+            !spends_the_opportunity(false, false, gridded),
+            "an ordinary transient failure hands the opportunity back, as it always has"
+        );
     }
 
     /// WI-097's acceptance. Two Treasury Movements in ONE epoch, off ONE ceremony,
