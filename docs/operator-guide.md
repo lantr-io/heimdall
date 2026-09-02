@@ -780,6 +780,40 @@ Everything above is written for a bridge with real stake and a five-day epoch. A
 weight the roster by live delegation and run a shorter cycle; both are roster-wide settings and
 refused on mainnet. See [Running a test bridge](#appendix-running-a-test-bridge).
 
+### Leaving
+
+Registration is reversible. `deregister-spo` burns your membership token, unlinks your registry
+node and removes your Bifrost identity from the treasury's identity root — which frees that
+identity, so the same key can register again later.
+
+```bash
+# on the node, if the cold key is here:
+sudo -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml
+# …then --submit
+```
+
+Your **cold** key authorises the exit, alone. Nothing signs with the Bifrost identity, so losing
+that key does not trap you in the registry. If the cold key lives on another machine — which is
+where it should live — sign there and submit here:
+
+```bash
+# on the air-gapped machine:
+heimdall sign-revocation --cold-skey path/to/cold.skey
+# it prints --cold-vkey / --cold-sig; pass both to deregister-spo on the node
+```
+
+Three things to know before you run it:
+
+- **Finish the epoch you are in.** The roster was frozen at the epoch boundary and this
+  transaction does not reach back into it. Until the next boundary you still owe that epoch's DKG
+  and signing duties: keep the daemon running until then. A node that stops early is a *fault*,
+  not an exit.
+- **The deposit comes back to whoever pays for the transaction.** Your registry node's locked ADA
+  is freed into the change output, so it lands at the wallet that funds the exit.
+- **This is the voluntary door.** A roster-initiated removal (misbehaviour, `apply-ban`) is a
+  different mechanism with different consequences; you do not use this command for it, and it
+  cannot undo one.
+
 ---
 
 ## 7. Start it

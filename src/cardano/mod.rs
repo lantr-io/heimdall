@@ -21,6 +21,7 @@ pub mod btc_rpc;
 pub mod config_params;
 pub mod cpo_history;
 pub mod cpo_trie;
+pub mod deregister_spo;
 pub mod dkg_roster;
 pub mod fault_proof;
 pub mod federation;
