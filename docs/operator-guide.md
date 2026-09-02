@@ -55,9 +55,10 @@ match what you see. This path follows the Debian package route; Docker differs o
 config lives ([step 1](#1-install), [step 7](#7-start-it)).
 
 ```bash
-# From the bridge's deployment notes:
-export BRIDGE_CONFIG_ADDRESS="addr_test1…"          # the Config script address
-export BRIDGE_CONFIG_POLICY="…"                      # the Config NFT policy id, 56 hex
+# The bridge to join. These defaults name the shared preprod test bridge as deployed
+# today; joining any other bridge, replace them from its deployment notes.
+export BRIDGE_CONFIG_ADDRESS="addr_test1wrvvq6mstvqgnwx6xts6za2shsxn5nl20xv4pr37j4nf6yqgpyh9f"
+export BRIDGE_CONFIG_POLICY="d8c06b705b0089b8da32e1a17550bc0d3a4fea7999508e3e95669d10"
 # Yours:
 export BLOCKFROST_PROJECT_ID="preprod…"              # or a Dolos in front of your own node, see §3
 export MY_URL="http://spo.example.com:18500"         # public, and WITH an explicit :port
