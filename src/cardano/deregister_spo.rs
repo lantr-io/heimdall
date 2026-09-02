@@ -309,23 +309,21 @@ pub fn build_deregister_spo_tx(
     // supplied here could only ever disagree.
     let bifrost_id_pk = list
         .get(&pool_id)
-        .ok_or(RegistryError::NotRegistered)?
+        .expect("plan_remove above already refused an unregistered pool_id")
         .bifrost_id_pk
         .clone();
 
+    // Both names came out of `plan_remove`, which read this same snapshot, so
+    // neither lookup can miss — the panic message says which invariant broke
+    // rather than inventing a chain-shaped error for a local one.
     let find = |name: &[u8]| {
         elements
             .iter()
             .find(|u| u.asset_name == name)
-            .ok_or_else(|| {
-                DeregisterSpoError::Build(format!(
-                    "element {} vanished from the snapshot",
-                    hex::encode(name)
-                ))
-            })
+            .expect("plan_remove names elements from this snapshot")
     };
-    let anchor = find(&plan.anchor_asset_name)?;
-    let node = find(&plan.removed_asset_name)?;
+    let anchor = find(&plan.anchor_asset_name);
+    let node = find(&plan.removed_asset_name);
 
     // Treasury leg: rebuild the identity trie from the (pre-removal) list and
     // derive the post-deregistration datum + removal proof.
@@ -942,6 +940,64 @@ mod tests {
         )
     }
 
+    /// The continued treasury state output: its datum is what `treasury.ak`'s
+    /// RegistryUpdate branch compares, so a test that never decodes it would
+    /// not notice the identity root landing in the wrong output.
+    fn decode_treasury_output(tx: &Tx, index: usize) -> TreasuryInfoDatum {
+        use pallas_primitives::conway::{DatumOption, PseudoTransactionOutput};
+        let PseudoTransactionOutput::PostAlonzo(o) = &tx.transaction_body.outputs[index] else {
+            panic!("expected post-alonzo output");
+        };
+        let Some(DatumOption::Data(d)) = &o.datum_option else {
+            panic!("expected inline datum");
+        };
+        TreasuryInfoDatum::from_plutus_data(&d.0).unwrap()
+    }
+
+    /// Everything the mint leg must carry: `(policy, asset_name, amount)`.
+    fn decode_mint(tx: &Tx) -> (Vec<u8>, Vec<u8>, i64) {
+        let mint = tx.transaction_body.mint.as_ref().expect("mint present");
+        let policies: Vec<_> = mint.iter().collect();
+        assert_eq!(policies.len(), 1, "one policy only");
+        let assets: Vec<_> = policies[0].1.iter().collect();
+        assert_eq!(assets.len(), 1, "one asset only");
+        (
+            policies[0].0.to_vec(),
+            assets[0].0.to_vec(),
+            i64::from(assets[0].1),
+        )
+    }
+
+    /// The redeemer's indices must point at the right inputs in EVERY input
+    /// permutation, not just the one the mid-list fixture happens to produce —
+    /// `registration_input_index` and `registration_anchor_input_index` swap
+    /// between them, and a transposition there fails only on chain.
+    fn assert_redeemer_points_at_inputs(
+        tx: &Tx,
+        anchor_txid: [u8; 32],
+        node_txid: [u8; 32],
+    ) -> (i64, i64) {
+        let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
+        let (node_in, anchor_in, anchor_out, treasury_in, treasury_out) =
+            decoded_deregister_redeemer(tx);
+        assert_eq!(
+            inputs[anchor_in as usize].transaction_id.as_slice(),
+            anchor_txid,
+            "anchor is not at registration_anchor_input_index"
+        );
+        assert_eq!(
+            inputs[node_in as usize].transaction_id.as_slice(),
+            node_txid,
+            "removed node is not at registration_input_index"
+        );
+        assert_eq!(
+            inputs[treasury_in as usize].transaction_id.as_slice(),
+            [0xdd; 32],
+            "treasury is not at treasury_input_index"
+        );
+        (anchor_out, treasury_out)
+    }
+
     fn decode_element_output(tx: &Tx, index: usize) -> (u64, RegistryElement) {
         use pallas_primitives::conway::{DatumOption, PseudoTransactionOutput};
         let PseudoTransactionOutput::PostAlonzo(o) = &tx.transaction_body.outputs[index] else {
@@ -974,35 +1030,29 @@ mod tests {
         assert_eq!(built.bifrost_id_pk, SELF_PK);
         assert_eq!(built.freed_lovelace, 2_800_000);
 
-        // Inputs sort 11(anchor) < 22(node) < aa(fee) < dd(treasury).
-        let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
-        assert_eq!(inputs.len(), 4);
-        let (node_in, anchor_in, anchor_out, treasury_in, treasury_out) =
-            decoded_deregister_redeemer(&tx);
-        assert_eq!(
-            inputs[anchor_in as usize].transaction_id.as_slice(),
-            [0x33; 32]
-        );
-        assert_eq!(
-            inputs[node_in as usize].transaction_id.as_slice(),
-            [0x22; 32]
-        );
-        assert_eq!(
-            inputs[treasury_in as usize].transaction_id.as_slice(),
-            [0xdd; 32]
-        );
+        // Here the node (0x22) sorts BEFORE its anchor (0x33) — the permutation
+        // in which registration_input_index < registration_anchor_input_index.
+        assert_eq!(tx.transaction_body.inputs.len(), 4);
+        let (anchor_out, treasury_out) =
+            assert_redeemer_points_at_inputs(&tx, [0x33; 32], [0x22; 32]);
         assert_eq!((anchor_out, treasury_out), (0, 1));
 
         // Mint: exactly (registry policy, pool_id, -1). A burn, not a mint —
         // that sign is [DRG-1].
-        let mint = tx.transaction_body.mint.as_ref().expect("mint present");
-        let policies: Vec<_> = mint.iter().collect();
-        assert_eq!(policies.len(), 1);
-        assert_eq!(policies[0].0.as_slice(), registry.hash);
-        let assets: Vec<_> = policies[0].1.iter().collect();
-        assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].0.as_slice(), pool_id);
-        assert_eq!(i64::from(assets[0].1), -1);
+        assert_eq!(
+            decode_mint(&tx),
+            (registry.hash.to_vec(), pool_id.to_vec(), -1)
+        );
+
+        // The continued treasury output carries the new root and NOTHING else
+        // changed: treasury.ak's RegistryUpdate compares the frost key too, and
+        // a builder that touched it would be rejected on chain.
+        let continued = decode_treasury_output(&tx, treasury_out as usize);
+        assert_eq!(
+            continued.bifrost_identity_root,
+            built.new_bifrost_identity_root
+        );
+        assert_eq!(continued.current_spos_frost_key, vec![0xAB; 32]);
 
         // Output[0]: continued anchor — the predecessor's data, its lovelace
         // unchanged (anchor_lovelace_change == 0 on-chain), link jumped over
@@ -1035,7 +1085,7 @@ mod tests {
         let registry = registry_script();
         let policy = registry.hash_hex();
         let (elements, pairs, _) = chain(&policy, false, true);
-        let (built, tx, _, _) =
+        let (built, tx, registry, _) =
             build_against(elements, &pairs, &test_sig()).expect("build deregister tx");
 
         assert_eq!(built.anchor_asset_name, REGISTRATION_ROOT_KEY);
@@ -1043,6 +1093,21 @@ mod tests {
         assert_eq!(lovelace, 2_600_000);
         assert_eq!(element.data, ElementData::Root);
         assert_eq!(element.link.as_deref(), Some(&HIGH_KEY[..]));
+
+        // The OTHER permutation: the anchor (0x11, the root) sorts before the
+        // removed node (0x22), so the two registry indices swap relative to the
+        // mid-list case. Both must still point where the validator will look.
+        let (anchor_out, treasury_out) =
+            assert_redeemer_points_at_inputs(&tx, [0x11; 32], [0x22; 32]);
+        assert_eq!((anchor_out, treasury_out), (0, 1));
+        assert_eq!(
+            decode_mint(&tx),
+            (registry.hash.to_vec(), test_pool_id().to_vec(), -1)
+        );
+        assert_eq!(
+            decode_treasury_output(&tx, treasury_out as usize).bifrost_identity_root,
+            built.new_bifrost_identity_root
+        );
     }
 
     /// The last node out leaves the root pointing nowhere — the list is empty
@@ -1063,6 +1128,15 @@ mod tests {
             mpf::Trie::from_pairs(Vec::<(Vec<u8>, Vec<u8>)>::new())
                 .unwrap()
                 .root_hash()
+        );
+
+        let (anchor_out, treasury_out) =
+            assert_redeemer_points_at_inputs(&tx, [0x11; 32], [0x22; 32]);
+        assert_eq!((anchor_out, treasury_out), (0, 1));
+        assert_eq!(decode_mint(&tx).2, -1);
+        assert_eq!(
+            decode_treasury_output(&tx, treasury_out as usize).bifrost_identity_root,
+            built.new_bifrost_identity_root
         );
     }
 

@@ -6417,7 +6417,13 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
                     println!("registry ref:      {found} (discovered at this wallet)");
                 }
                 RefScriptOrigin::Deployer(addr) => {
+                    // Same warning register-spo prints: it is kept SPENDABLE on
+                    // purpose, so the deployer can reclaim it and break this
+                    // path. An exit needs it exactly as a join does.
                     println!("registry ref:      {found} (the bridge deployer's, at {addr})");
+                    println!(
+                        "                   nothing to deploy — but that UTxO is theirs to spend"
+                    );
                 }
             }
             Some(found.outref())
@@ -6451,6 +6457,47 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
     };
     let built =
         build_deregister_spo_tx(&req).map_err(|e| format!("build deregister_spo tx: {e}"))?;
+
+    // What an exit costs the ROSTER, which is not visible in the transaction.
+    //
+    // `spo_bans.ak` requires a LIVE registration node for the accused pool as a
+    // reference input — `validate_registered_pool_ref`, in both the first-ban
+    // and the re-ban branch. This transaction burns that node's NFT, so once it
+    // confirms no ApplyBan naming this pool can be built again, ever: an
+    // outstanding fault proof becomes unenforceable and an existing ban can no
+    // longer escalate. Say so, and report what can be checked.
+    //
+    // Only half of it CAN be checked here. An unspent FaultProof token sits at
+    // its minter's own wallet with no datum, under a name that is
+    // blake2b_256(pool_id || evidence_hash) — so "is someone about to ban me"
+    // has no off-chain query. The ban list does.
+    println!();
+    let ban_policy = config_view.params.bans.spo_bans_policy_id;
+    let ban_addr = heimdall::cardano::blueprint::script_enterprise_address(&ban_policy, network);
+    match rt.block_on(bf_http::fetch_address_utxos(&base_url, pid, &ban_addr)) {
+        Ok(ban_utxos) => {
+            match heimdall::cardano::ban_list::ban_snapshot(&ban_utxos, &hex::encode(ban_policy)) {
+                Ok(list) => match list.get(&pool_id) {
+                    Some(node) => println!(
+                        "ban record:        THIS POOL IS IN THE BAN LIST (ban_counter={}, \
+                         until={}{}). Leaving now makes that ban unescalatable: a re-ban needs \
+                         this registration node as a reference input.",
+                        node.ban_counter,
+                        node.ban_until_time,
+                        if node.permanent { ", PERMANENT" } else { "" }
+                    ),
+                    None => println!("ban record:        none for this pool"),
+                },
+                Err(e) => println!("ban record:        unreadable ({e}) — cannot say"),
+            }
+        }
+        Err(e) => println!("ban record:        unreadable ({e}) — cannot say"),
+    }
+    println!(
+        "                   NOTE: this exit burns the registry node that `apply-ban` needs as \
+         a reference input, so no ban for this pool can be applied after it confirms."
+    );
+    println!();
 
     let anchor = if built.anchor_asset_name == REGISTRATION_ROOT_KEY {
         "reg-root (registry root)".to_string()

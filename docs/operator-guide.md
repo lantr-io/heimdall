@@ -947,6 +947,12 @@ sudo -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml
 # prints what it is about to do; add --submit to actually post it
 ```
 
+Like registering, this needs the registry reference script on chain — it finds the same one your
+registration used. If that was the bridge deployer's and they have since reclaimed it, the command
+says so, and `deploy-registry-ref` puts a new one up (~55 ADA, itself reclaimable). It also reports
+whether this pool has a ban record, and what leaving means for one; read that output before adding
+`--submit`.
+
 Your **cold** key authorises the exit, alone — nothing signs with the Bifrost identity, so losing
 that key does not trap you in the registry, and there is no minimum-stake check on the way out. If
 the cold key lives on another machine, which is where it should live, sign there and submit here:
