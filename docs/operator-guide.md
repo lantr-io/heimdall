@@ -591,6 +591,9 @@ daemon.** Do it now, before enabling the service.
 > (sized to the datum) and pays fees. It is not a dry run. Step 1 below locks more, but at your own
 > address, and is reclaimable.
 
+It is also reversible: [Leaving the bridge](#leaving-the-bridge) in step 8 gives the registry node's
+ADA back and frees your Bifrost identity to register again.
+
 Every command below prints the transaction and stops unless you add `--submit`. Run each without
 `--submit` first and read what it is about to do.
 
@@ -780,40 +783,6 @@ Everything above is written for a bridge with real stake and a five-day epoch. A
 weight the roster by live delegation and run a shorter cycle; both are roster-wide settings and
 refused on mainnet. See [Running a test bridge](#appendix-running-a-test-bridge).
 
-### Leaving
-
-Registration is reversible. `deregister-spo` burns your membership token, unlinks your registry
-node and removes your Bifrost identity from the treasury's identity root — which frees that
-identity, so the same key can register again later.
-
-```bash
-# on the node, if the cold key is here:
-sudo -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml
-# …then --submit
-```
-
-Your **cold** key authorises the exit, alone. Nothing signs with the Bifrost identity, so losing
-that key does not trap you in the registry. If the cold key lives on another machine — which is
-where it should live — sign there and submit here:
-
-```bash
-# on the air-gapped machine:
-heimdall sign-revocation --cold-skey path/to/cold.skey
-# it prints --cold-vkey / --cold-sig; pass both to deregister-spo on the node
-```
-
-Three things to know before you run it:
-
-- **Finish the epoch you are in.** The roster was frozen at the epoch boundary and this
-  transaction does not reach back into it. Until the next boundary you still owe that epoch's DKG
-  and signing duties: keep the daemon running until then. A node that stops early is a *fault*,
-  not an exit.
-- **The deposit comes back to whoever pays for the transaction.** Your registry node's locked ADA
-  is freed into the change output, so it lands at the wallet that funds the exit.
-- **This is the voluntary door.** A roster-initiated removal (misbehaviour, `apply-ban`) is a
-  different mechanism with different consequences; you do not use this command for it, and it
-  cannot undo one.
-
 ---
 
 ## 7. Start it
@@ -963,6 +932,60 @@ diffed at all. The service restarts only if it was already running. `apt purge` 
 excluded from every ceremony until they match – and the exclusion is reported on *both* sides as
 the other one lagging. Agree a commit and an epoch boundary with the other operators, and restart
 every node before it. Upgrading one node ahead of the roster removes it from the roster.
+
+### Leaving the bridge
+
+Registration is reversible, and leaving is a sequence, not a command: **exit on chain first, keep
+running to the epoch boundary, stop after it.** Doing those in the other order is a fault.
+
+**1. Post the exit.** `deregister-spo` burns your membership token, unlinks your registry node from
+the on-chain list and removes your Bifrost identity from the treasury's identity root — freeing
+that identity, so the same key can register again later.
+
+```bash
+sudo -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml
+# prints what it is about to do; add --submit to actually post it
+```
+
+Your **cold** key authorises the exit, alone — nothing signs with the Bifrost identity, so losing
+that key does not trap you in the registry, and there is no minimum-stake check on the way out. If
+the cold key lives on another machine, which is where it should live, sign there and submit here:
+
+```bash
+# on the machine holding the cold key:
+heimdall sign-revocation --cold-skey /path/to/cold.skey
+# prints --cold-vkey / --cold-sig; pass both to deregister-spo on the node
+```
+
+**2. Keep the node running until the next epoch boundary.** The roster for the current epoch was
+frozen before your exit and this transaction does not reach back into it: you still owe that
+epoch's DKG rounds and your signature on its Treasury Movements. A node that stops here looks
+exactly like a node that failed, and is treated as one. Watch for the boundary, then confirm you
+are out:
+
+```bash
+sudo -u heimdall heimdall show-roster --config /etc/heimdall/heimdall.toml
+```
+
+**3. Stop it.**
+
+```bash
+sudo systemctl disable --now heimdall
+```
+
+The state directory still holds your DKG shares from the epochs you served. Keep it if you might
+come back or may be asked to prove what you did; `sudo apt purge heimdall` deliberately leaves
+`/var/lib/heimdall` and the `heimdall` user behind, so removing the package is not enough to erase
+it — see [State](#state).
+
+Two more things worth knowing:
+
+- **The deposit comes back to whoever pays for the transaction.** Your registry node's locked ADA
+  is freed into the change output, so it lands at the wallet that funded the exit — not
+  automatically at the address that registered you, if those differ.
+- **This is the voluntary door.** A roster-initiated removal for misbehaviour (`apply-ban`) is a
+  different mechanism with different consequences: you do not use this command for it, and it
+  cannot undo one.
 
 ---
 
