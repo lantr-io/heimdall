@@ -1451,6 +1451,8 @@ impl BlockfrostCardanoChain {
     ///
     /// [`ceremony_generation`] is the invalidation, and it is exact for the only
     /// writer a running daemon has — `write_dkg_state`, when its own DKG completes.
+    /// It is counted per state dir, so a ceremony written to a different one does
+    /// not invalidate this cache.
     ///
     /// [`ceremony_generation`]: crate::epoch::persist::ceremony_generation
     fn persisted_internal_candidates(&self) -> CeremonyKeys {
@@ -1460,7 +1462,7 @@ impl BlockfrostCardanoChain {
         // Sampled BEFORE the read, so a ceremony persisted while this call is in
         // flight invalidates what it is about to store rather than being swallowed
         // by it.
-        let generation = crate::epoch::persist::ceremony_generation();
+        let generation = crate::epoch::persist::ceremony_generation(dir);
         let previous = self.internal_candidates.lock().ok().and_then(|c| c.clone());
         if let Some((cached_generation, candidates)) = previous.as_ref()
             && *cached_generation == generation
@@ -3825,6 +3827,31 @@ mod tests {
             vec![second, first],
             "persisting a ceremony must invalidate the cache, newest epoch first"
         );
+
+        // A ceremony landing in SOMEONE ELSE'S state dir is not news about this
+        // one. It reads as pedantry against a daemon, which has one state dir —
+        // but this suite runs many in one process, and while the generation was a
+        // single global counter, any concurrent test that persisted a ceremony
+        // invalidated this cache and made the read below go to disk.
+        let other = dir.with_extension("other");
+        let _ = std::fs::remove_dir_all(&other);
+        write_dkg_state(
+            &other,
+            &PersistedDkg::from_output(
+                9,
+                0,
+                &Roster {
+                    epoch: 9,
+                    min_signers: 2,
+                    max_signers: 3,
+                    participants: Default::default(),
+                },
+                &dealt_group_keys(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&other);
 
         // The disk is gone; the answer is not. Nothing but a cache can do that.
         let _ = std::fs::remove_dir_all(&dir);

@@ -16,6 +16,7 @@
 //! only needed to re-derive the share (which we instead reload directly) or to
 //! build fault proofs (WI-019, which reads the transport's own evidence store).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use frost_secp256k1_tr as frost;
@@ -169,11 +170,11 @@ pub fn write_dkg_state(state_dir: &Path, state: &PersistedDkg) -> EpochResult<()
     //
     // A failed write must not bump either, and this placement gives that for
     // free: the `?`s above return before it.
-    CEREMONY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    bump_ceremony_generation(state_dir);
     Ok(())
 }
 
-/// How many ceremonies this PROCESS has persisted.
+/// How many ceremonies this PROCESS has persisted **into `state_dir`**.
 ///
 /// The invalidation signal for anything that caches a view of `state_dir`'s
 /// ceremonies — see `BlockfrostCardanoChain::persisted_internal_candidates`,
@@ -187,12 +188,40 @@ pub fn write_dkg_state(state_dir: &Path, state: &PersistedDkg) -> EpochResult<()
 /// OUTSIDE this process (an operator restoring a state dir under a running
 /// daemon) is not seen until restart, which is the same rule the rest of
 /// `state_dir` already follows.
+///
+/// It is counted PER DIRECTORY because that is what the signal means: a cache of
+/// one directory's ceremonies is not stale because some other directory got one.
+/// A daemon has a single state dir, so this changes nothing for it — but the test
+/// suite runs many state dirs in one process, and under a single global counter
+/// every test that persisted a ceremony invalidated every other test's cache,
+/// which made a cache-hit assertion fail whenever the two happened to interleave.
+/// The key is the path as given, not canonicalized: the callers that share a
+/// counter are the ones that share a `state_dir` value, which is how the daemon
+/// carries it.
 #[must_use]
-pub fn ceremony_generation() -> u64 {
-    CEREMONY_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+pub fn ceremony_generation(state_dir: &Path) -> u64 {
+    ceremony_generations()
+        .get(state_dir)
+        .copied()
+        .unwrap_or_default()
 }
 
-static CEREMONY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn bump_ceremony_generation(state_dir: &Path) {
+    *ceremony_generations()
+        .entry(state_dir.to_path_buf())
+        .or_default() += 1;
+}
+
+/// The generations, locked. Poisoning is recovered from rather than propagated:
+/// a panic elsewhere must not turn every later `query_treasury` into a failure,
+/// and the worst a torn count can cost is one extra directory read.
+fn ceremony_generations() -> std::sync::MutexGuard<'static, HashMap<PathBuf, u64>> {
+    static CEREMONY_GENERATIONS: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, u64>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    CEREMONY_GENERATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// The GROUP key of the ceremony persisted for `epoch`, without touching this
 /// node's secret share.
@@ -393,14 +422,14 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let before = ceremony_generation();
+        let before = ceremony_generation(&dir);
         write_dkg_state(
             &dir,
             &PersistedDkg::from_output(11, 0, &roster, &keys).unwrap(),
         )
         .unwrap();
         assert!(
-            ceremony_generation() > before,
+            ceremony_generation(&dir) > before,
             "a reader that samples the generation must be able to see that a ceremony landed"
         );
         let _ = std::fs::remove_dir_all(&dir);
