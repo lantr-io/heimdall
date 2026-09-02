@@ -185,6 +185,29 @@ Two routes, same binary, same config file content. They differ only in where the
 how it gets there. Pick one — do not run both against the same bridge. A third route, building
 from source, is [below](#building-from-source).
 
+### Where the releases are
+
+**<https://github.com/lantr-io/heimdall/releases>** — that page is what tells you the `<version>`
+to substitute into the commands below. `…/releases/latest` redirects to the newest one.
+
+Every release is one workflow run over one commit, and it publishes the same binary three ways:
+
+| where | what |
+|---|---|
+| release assets | `heimdall` — the static x86_64 musl binary — plus `heimdall.sha256` |
+| release assets | `heimdall_<version>-1_amd64.deb` plus `heimdall.deb.sha256` |
+| [Packages](https://github.com/lantr-io/heimdall/pkgs/container/heimdall) | `ghcr.io/lantr-io/heimdall:<version>`, the image — listed under the repository, not on the release page |
+
+They are not three builds. The `.deb` wraps the published binary and the image copies it, so the
+checksum you verify below is the same file in all three, and `heimdall --version` prints the same
+string — the version plus the commit it was built from — whichever route you took.
+
+Versions are milestones (`0.1-M5`), not semantic-versioning promises. This bridge has not run on
+mainnet; the on-chain protocol can still change between releases, and a node that no longer speaks
+the bridge's protocol drops out of the roster rather than failing loudly. Read the release notes
+before upgrading a node that is registered and signing. To hear about new ones without polling:
+**Watch → Custom → Releases** on the repository.
+
 ### Debian package
 
 ```bash
@@ -216,8 +239,9 @@ docker run --rm ghcr.io/lantr-io/heimdall:<version> \
 The image ships no config and no secrets. You bind-mount the config read-only and name a volume
 for state; the full `docker run` line is in [step 7](#7-start-it).
 
-There is **no APT repository** — upgrading means downloading the next `.deb`. See
-[deploy/README.md](../deploy/README.md) for the per-route reference, including the NixOS module.
+There is **no APT repository** — upgrading means downloading the next `.deb` from the same
+releases page. See [deploy/README.md](../deploy/README.md) for the per-route reference, including
+the NixOS module.
 
 ### Building from source
 
@@ -888,6 +912,9 @@ command; it is not a state you can wait out.
 confirmation takes ~17 hours, and the node must be free to restart during them.
 
 ### Upgrades
+
+New versions appear at <https://github.com/lantr-io/heimdall/releases> — same four assets, same
+verification as [step 1](#where-the-releases-are). Nothing on this machine polls for them.
 
 ```bash
 sudo apt install ./heimdall_<newer>-1_amd64.deb

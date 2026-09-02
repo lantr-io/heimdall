@@ -29,8 +29,8 @@ below.
 sudo apt install ./heimdall_<version>_amd64.deb    # or: sudo dpkg -i … && sudo apt -f install
 ```
 
-Grab the `.deb` from the release page (alongside `heimdall` and the checksums), or build one from
-a binary you already have:
+Grab the `.deb` from the [releases page](https://github.com/lantr-io/heimdall/releases) (alongside
+`heimdall` and the checksums), or build one from a binary you already have:
 
 ```bash
 deploy/build-linux.sh                # → deploy/out/heimdall (static musl)
