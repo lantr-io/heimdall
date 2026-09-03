@@ -4088,6 +4088,78 @@ fn cross_check_treasury(
 ///   make the recovery path depend on a Bitcoin node that the architecture says
 ///   an SPO does not run, which is exactly backwards for the command that exists
 ///   for when things have gone wrong.
+/// Refuse when the rebuilt treasury tree does not match what the head actually
+/// pays to. See the call site for why this is worth an extra RPC round trip.
+///
+/// Silent about an outpoint Bitcoin cannot describe: no `bitcoin.rpc_url`, a node
+/// without `-txindex`, an RPC that does not answer. "Cannot tell" is not
+/// "mismatch", and blocking a real recovery on a missing transaction index would
+/// be the worse error — the same rule `csv_depth_verdict` follows.
+fn check_treasury_script(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+    outpoint: &bitcoin::OutPoint,
+    derived: &bitcoin::ScriptBuf,
+    derived_addr: &bitcoin::Address,
+) -> Result<(), String> {
+    let Ok(rpc) = btc_rpc_config(cfg) else {
+        println!(
+            "  treasury script: derived {derived_addr} — NOT checked against Bitcoin \
+             (bitcoin.rpc_url is unset). Confirm this is where the treasury is before signing."
+        );
+        return Ok(());
+    };
+    let on_chain = match rt.block_on(heimdall::cardano::btc_rpc::fetch_output_script_pubkey(
+        &rpc, outpoint,
+    )) {
+        Ok(found) => found,
+        Err(e) => {
+            println!(
+                "  treasury script: derived {derived_addr} — NOT checked, the Bitcoin RPC did \
+                 not answer: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let note = treasury_script_verdict(on_chain.as_ref(), derived, derived_addr, outpoint)?;
+    println!("  {note}");
+    Ok(())
+}
+
+/// The verdict for a rebuilt treasury script against Bitcoin's copy (or none).
+///
+/// Pure so the refusal can be pinned by a test, for the same reason
+/// [`csv_depth_verdict`] is: it is the branch that saves a whole `t`-of-`n`
+/// session, and the branch nobody exercises by hand — reproducing it means a real
+/// treasury under a key the operator got wrong.
+fn treasury_script_verdict(
+    on_chain: Option<&bitcoin::ScriptBuf>,
+    derived: &bitcoin::ScriptBuf,
+    derived_addr: &bitcoin::Address,
+    outpoint: &bitcoin::OutPoint,
+) -> Result<String, String> {
+    let Some(on_chain) = on_chain else {
+        return Ok(format!(
+            "treasury script: derived {derived_addr} — NOT checked, Bitcoin has no output \
+             {outpoint} to compare against (a node without -txindex will say this)."
+        ));
+    };
+    if on_chain == derived {
+        return Ok(format!(
+            "treasury script: matches the head on Bitcoin ({derived_addr})"
+        ));
+    }
+    Err(format!(
+        "the treasury tree rebuilt here does not match {outpoint} on Bitcoin.\n  derived:  {} \
+         ({derived_addr})\n  on chain: {}\nOne of --y51, y_federation or federation_csv_blocks \
+         is wrong for this treasury. --y51 defaults to y_federation, which is only correct for a \
+         treasury that has never rotated — `show-treasury` prints the current Y_51. Refusing \
+         before the signing session rather than after it.",
+        hex::encode(derived.as_bytes()),
+        hex::encode(on_chain.as_bytes()),
+    ))
+}
+
 fn check_federation_csv_depth(
     rt: &tokio::runtime::Runtime,
     cfg: &HeimdallConfig,
@@ -4286,6 +4358,15 @@ fn run_federation_spend(
     let treasury_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
     let treasury_addr =
         bitcoin::Address::p2tr_tweaked(spend_info.output_key(), cfg.bitcoin.parsed_network());
+    // Prove the tree before anyone signs it. The tree is a function of three
+    // values — Y_51, y_fed and the CSV delay — and `--y51` in particular is
+    // hand-supplied here, defaulting to y_fed, which is only right for a treasury
+    // that has never rotated. Any one of them wrong yields a perfectly well-formed
+    // transaction spending an address the treasury is not at, and nothing catches
+    // that until the network rejects it — after a t-of-n session among members
+    // coordinating out of band. Compared against Bitcoin's own copy of the output,
+    // which is the only witness that settles it.
+    check_treasury_script(&rt, cfg, &outpoint, &treasury_spk, &treasury_addr)?;
 
     // Treasury-only, no peg-ins/peg-outs => single output[0] = treasury.
     let unsigned = build_tm(
@@ -8826,7 +8907,7 @@ mod tests {
     use super::{
         MOVER_KEY_MISMATCH, cross_check_treasury, csv_depth_verdict, mover_key_mismatch_error,
         parse_cardano_outref, parse_hex_n, parse_key32, parse_treasury_override, pool_id_bech32,
-        ref_script_already_deployed,
+        ref_script_already_deployed, treasury_script_verdict,
     };
 
     /// The packaged unit must actually START.
@@ -9032,6 +9113,52 @@ mod tests {
         assert!(e.contains("44 more"), "should name the deficit: {e}");
 
         let note = csv_depth_verdict(None, 144, &txid).expect("unknown depth must not refuse");
+        assert!(note.contains("NOT checked"), "{note}");
+    }
+
+    /// The same rule one step earlier, on the TREASURY TREE rather than its depth
+    /// (WI-Y3JJK): a rebuilt script that provably disagrees with the head refuses,
+    /// one that matches continues, and an outpoint Bitcoin cannot describe is
+    /// "cannot tell" rather than a mismatch.
+    ///
+    /// The refusal is what makes `--y51`'s default safe to keep. It defaults to
+    /// `y_federation`, which is correct only for a treasury that has never
+    /// rotated; on a rotated one the derived tree is a different address, and
+    /// without this the first sign of trouble is a network rejection after `t`
+    /// members have already signed.
+    #[test]
+    fn a_rebuilt_treasury_tree_is_refused_when_it_disagrees_with_bitcoin() {
+        use bitcoin::hashes::Hash;
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0xab; 32]),
+            vout: 0,
+        };
+        let derived = bitcoin::ScriptBuf::from_bytes(vec![0x51, 0x20, 0x11]);
+        let other = bitcoin::ScriptBuf::from_bytes(vec![0x51, 0x20, 0x22]);
+        let addr = bitcoin::Address::from_script(
+            &bitcoin::ScriptBuf::new_p2tr_tweaked(
+                bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+                    bitcoin::key::UntweakedPublicKey::from_slice(&[2u8; 32]).unwrap(),
+                ),
+            ),
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
+
+        let note = treasury_script_verdict(Some(&derived), &derived, &addr, &outpoint)
+            .expect("a matching script must continue");
+        assert!(note.contains("matches the head"), "{note}");
+
+        let e = treasury_script_verdict(Some(&other), &derived, &addr, &outpoint)
+            .expect_err("a disagreeing script must refuse before the signing session");
+        assert!(e.contains("--y51"), "should name the likeliest cause: {e}");
+        assert!(
+            e.contains("512011") && e.contains("512022"),
+            "should print both scripts so the operator can tell which is which: {e}"
+        );
+
+        let note = treasury_script_verdict(None, &derived, &addr, &outpoint)
+            .expect("an outpoint Bitcoin cannot describe must not refuse");
         assert!(note.contains("NOT checked"), "{note}");
     }
 

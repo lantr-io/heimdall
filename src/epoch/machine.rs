@@ -283,6 +283,12 @@ async fn drive_to_movement(
     // far short of an epoch.
     const HANDOFF_RETRIES: u32 = 6;
     let mut handoff_retries = 0u32;
+    // Consecutive movements the 51% mode could not sign (WI-Y3JJK). Counted
+    // because the answer to a treasury the roster cannot move is a FEDERATION
+    // spend, which no daemon performs — see the warning below — so the only thing
+    // standing between a stuck treasury and an operator reaching for it is this
+    // number being visible.
+    let mut unsigned_movements = 0u32;
     // The epoch whose rotation round this node has already SPENT (published a
     // commitment into and then failed). Set on the first such failure, which
     // re-enters `PublishKeys` once — with the ceremony disabled — purely to see
@@ -373,6 +379,14 @@ async fn drive_to_movement(
                 if matches!(next, EpochPhase::CollectPegins { .. }) {
                     handoff_retries = 0;
                 }
+                // A signature exists, so the 51% mode is working. Reset here
+                // rather than at `RecordMovement`: what the count is about is
+                // whether the roster can still SIGN, and posting is permissionless
+                // and separately reported.
+                if matches!(next, EpochPhase::Submit { .. }) {
+                    unsigned_movements = 0;
+                    config.health.update(|h| h.unsigned_movements = 0);
+                }
                 phase = next;
                 // Reset only when the phase that failed has now succeeded (or
                 // nothing was outstanding, where this is a no-op). Re-entering
@@ -461,6 +475,30 @@ async fn drive_to_movement(
                         h.dkg_qualified = Some(false);
                         h.activity = "DKG did not complete for this node".into();
                     });
+                }
+                // The 51% mode gave up on a movement. Say so ONCE per movement,
+                // and say what the fallback actually is — because the fallback is
+                // not something this process will do.
+                //
+                // The spec puts the federation mode out of band: it "does not use
+                // the SPO HTTP endpoints" and "has no signing namespace at all".
+                // It is a spend of the CSV leaf under `Y_federation`, and it is a
+                // SPEND — which this daemon never performs, under any flag. So the
+                // daemon's whole duty here is to make the condition legible and
+                // name the command, with its precondition, rather than to act.
+                if stepped.starts_with("Sign") {
+                    unsigned_movements += 1;
+                    let n = unsigned_movements;
+                    config.health.update(|h| h.unsigned_movements = n);
+                    crate::epoch_warn!(
+                        me,
+                        current_epoch(&EpochPhase::Idle),
+                        "the 51% mode did not sign this movement ({e}) — {n} consecutive now. If \
+                         this does not clear, the treasury moves only through the federation's \
+                         emergency path: `heimdall federation-spend`, which needs the treasury \
+                         UTxO to be federation_csv_blocks deep on Bitcoin and every federation \
+                         member to run it with the same --signers. No daemon does this."
+                    );
                 }
                 let round_spent = e.round_is_spent();
                 if round_spent && matches!(resume, Some(EpochPhase::PublishKeys { .. })) {

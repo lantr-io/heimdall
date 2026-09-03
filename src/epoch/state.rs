@@ -406,6 +406,22 @@ impl SigningWindow {
 ///
 /// Nor is there an inter-mode timer to add: "the overall bound for the cascade
 /// is therefore implicit… with no extra inter-mode timer" (§Threshold failover).
+///
+/// **Nor does the daemon ENTER federation mode on its own** (WI-Y3JJK, asked and
+/// answered). Two reasons, and either would be enough. The mode is a spend of the
+/// treasury, and this daemon never spends — not behind `--auto-deploy`, not
+/// behind anything; every spend is an operator running a command. And the mode's
+/// preconditions are not this node's to evaluate: the CSV leaf is only spendable
+/// once the head is `federation_csv_blocks` deep on BITCOIN, which an SPO running
+/// no Bitcoin node cannot see, and the members must agree a signer set out of
+/// band because FROST binds each share to it. An automatic sweep on "the 51% mode
+/// failed" would be the emergency path to the treasury fired by a timeout.
+///
+/// What the daemon owes instead is LEGIBILITY, and that it does: a movement the
+/// 51% mode could not sign is counted in `NodeState::unsigned_movements` and
+/// named in a warning that points at `heimdall federation-spend` and its
+/// precondition. `federation-spend` then checks the CSV depth and the rebuilt
+/// treasury tree against Bitcoin before any member signs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CascadeLevel {
     Quorum51,
