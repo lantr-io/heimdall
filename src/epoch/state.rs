@@ -6,7 +6,7 @@
 //! In-memory-only material (FROST secret packages, key packages,
 //! nonces) is deliberately excluded from that contract.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use frost::Identifier;
@@ -280,10 +280,27 @@ pub enum SigningRound {
 /// a single signature), hence exactly one deadline; heimdall still publishes per
 /// input — that layout change is WI-042 — but the DEADLINE is now per round,
 /// which is what removes the compounding.
+/// ## Why the attempts live here too (WI-EJSVJ)
+///
+/// A Round-2 shortfall re-runs Round 1 for the same movement at the same `B_i`,
+/// so attempt `a`'s deadlines are attempt 0's shifted by `a × (sign_r1_window +
+/// sign_r2_window)`. That arithmetic belongs beside the deadlines it shifts, and
+/// nowhere else: the whole reason the window is not a `Duration` is that every
+/// participant must mean the same moment, and an attempt each node offsets its own
+/// way reintroduces exactly the divergence anchoring removed.
 #[derive(Debug, Clone, Copy)]
 pub struct SigningWindow {
     pub round1_close: Instant,
     pub round2_close: Instant,
+    /// Distance from one attempt's deadlines to the next's: `sign_r1_window +
+    /// sign_r2_window`. Zero where the deployment publishes no schedule, which is
+    /// consistent with `max_attempts` being 1 there.
+    attempt_stride: Duration,
+    /// `max_sign_attempts` — how many goes fit at this opportunity before the
+    /// posting margin runs out. Never zero: a schedule too tight for one attempt
+    /// still runs one, because a late movement is a liveness cost and an
+    /// unattempted one is a certain failure.
+    max_attempts: u64,
 }
 
 impl SigningWindow {
@@ -313,15 +330,59 @@ impl SigningWindow {
             // Never before round 1: a Config whose windows are degenerate must not
             // give round 2 less room than the round it follows.
             round2_close: after(round2_close_slot.max(round1_close_slot)),
+            // One attempt, no stride — the shape every caller that does not budget
+            // retries gets, and the only shape the rotation ceremony has (its
+            // window is bounded by `update_y_deadline`, which leaves room for
+            // exactly one go by construction).
+            attempt_stride: Duration::ZERO,
+            max_attempts: 1,
         }
     }
 
+    /// A window from explicit close instants, with room for a single attempt.
+    ///
+    /// For tests, and for the rotation ceremony's fixtures: production windows are
+    /// absolute slots off the chain schedule, which is what [`Self::from_slots`]
+    /// is for.
     #[must_use]
-    pub fn close_of(&self, round: SigningRound) -> Instant {
-        match round {
+    pub fn at(round1_close: Instant, round2_close: Instant) -> Self {
+        Self {
+            round1_close,
+            round2_close,
+            attempt_stride: Duration::ZERO,
+            max_attempts: 1,
+        }
+    }
+
+    /// Add the retry budget to a window built by [`Self::from_slots`].
+    ///
+    /// `stride` is `sign_r1_window + sign_r2_window` as a duration — the caller
+    /// converts from slots, exactly as [`Self::from_slots`] does, so this type
+    /// deals only in time. `max_attempts` is clamped up to 1 for the reason given
+    /// on the field.
+    #[must_use]
+    pub fn with_attempts(mut self, stride: Duration, max_attempts: u64) -> Self {
+        self.attempt_stride = stride;
+        self.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    /// When `round` closes in `attempt`. Attempt 0 is the window as built.
+    #[must_use]
+    pub fn close_of(&self, round: SigningRound, attempt: u64) -> Instant {
+        let base = match round {
             SigningRound::Round1 => self.round1_close,
             SigningRound::Round2 => self.round2_close,
-        }
+        };
+        base + self
+            .attempt_stride
+            .saturating_mul(u32::try_from(attempt).unwrap_or(u32::MAX))
+    }
+
+    /// How many attempts this opportunity has room for, at least 1.
+    #[must_use]
+    pub fn max_attempts(&self) -> u64 {
+        self.max_attempts
     }
 }
 
@@ -483,6 +544,25 @@ pub enum EpochPhase {
         tm: TreasuryMovement,
         round: SigningRound,
         collected: SignCollected,
+        /// Which go at this batch opportunity this is, 0-based (WI-EJSVJ).
+        ///
+        /// Bumped only by a Round-2 shortfall, and it costs a full re-run of
+        /// Round 1 with fresh nonces — the abandoned attempt's commitments are
+        /// published and therefore spent, whatever happens next.
+        attempt: u64,
+        /// Members of the signing roster this movement will not ask again.
+        ///
+        /// One entry per member that joined `S1` in an earlier attempt and then
+        /// published no valid Round 2 share before the deadline. It grows
+        /// monotonically, which is what makes the cascade terminate, and it dies
+        /// with the movement: it is not a ban, it mints no `FaultProof`, and the
+        /// next opportunity starts from the full roster again.
+        ///
+        /// A member that published nothing in Round 1 is NOT in here. Round 1
+        /// closes on the threshold, so silence costs the round nothing and is not
+        /// evidence of anything; only commit-then-withhold is (spec §Round-2
+        /// shortfall opens a new attempt).
+        excluded: BTreeSet<Identifier>,
         /// Carried to `Submit`, which elects the submission cascade with it.
         /// See [`EpochPhase::Submit::tm_sequence`].
         tm_sequence: u64,
@@ -819,21 +899,26 @@ pub enum EpochError {
     /// A signing round failed AFTER this node published its round-1 commitment,
     /// so the round is SPENT: this node must not walk it again on its own.
     ///
-    /// The signing namespace is `(epoch, session, message)` with no attempt
-    /// counter, and peers keep serving the payloads they published. A second
-    /// local pass therefore publishes a FRESH commitment and reads its peers'
-    /// FIRST one — and `poll_sign_round` never re-fetches a peer it already has,
-    /// so the retry does not race: it deterministically builds a `SigningPackage`
-    /// no peer built, and the binding factors guarantee it will not aggregate.
-    /// Retrying is not merely useless, it is indistinguishable from progress.
+    /// Peers keep serving the payloads they published, so a second pass at the
+    /// SAME namespace publishes a FRESH commitment and reads its peers' FIRST
+    /// one — and `poll_sign_round` never re-fetches a peer it already has, so the
+    /// retry does not race: it deterministically builds a `SigningPackage` no peer
+    /// built, and the binding factors guarantee it will not aggregate. Retrying
+    /// the same namespace is not merely useless, it is indistinguishable from
+    /// progress (WI-048).
     ///
-    /// The way back in is a SYNCHRONIZED entry, where every node republishes at
-    /// once: the next batch-grid opportunity for a TM, the next epoch boundary
+    /// A retry at a DIFFERENT namespace is the safe one, and the signing
+    /// namespace now carries the `attempt` counter that makes it addressable
+    /// (WI-EJSVJ). `sign_phase` uses it for the one failure where every node
+    /// agrees on the new set — a Round-2 shortfall — and that path never reaches
+    /// here. What still reaches here is everything else: a round that cannot be
+    /// re-entered on an agreed set, or one whose attempt budget is gone.
+    ///
+    /// The way back in is then a SYNCHRONIZED entry, where every node republishes
+    /// at once: the next batch-grid opportunity for a TM, the next epoch boundary
     /// for a rotation. Both are spec behaviour — an unused opportunity costs
     /// latency, and a rotation that does not land leaves the old key in place
-    /// with "no halt, no special state". See WI-048; an attempt counter in the
-    /// namespace (WI-077's chain-anchored windows would supply an agreed one)
-    /// is what would make a local retry safe.
+    /// with "no halt, no special state".
     RoundSpent {
         round: u8,
         /// What actually went wrong, kept AS AN ERROR rather than as its
@@ -995,12 +1080,50 @@ mod tests {
         let now = Instant::now();
         let w = SigningWindow::from_slots(now, 0, 10, 20);
         assert_eq!(
-            w.close_of(SigningRound::Round1),
+            w.close_of(SigningRound::Round1, 0),
             now + Duration::from_secs(10)
         );
         assert_eq!(
-            w.close_of(SigningRound::Round2),
+            w.close_of(SigningRound::Round2, 0),
             now + Duration::from_secs(20)
+        );
+    }
+
+    /// Attempt `a`'s deadlines are attempt 0's shifted by `a × stride`, so two
+    /// nodes that agree on `B_i` and the published windows agree on every
+    /// attempt's deadlines without exchanging anything (WI-EJSVJ).
+    #[test]
+    fn a_later_attempt_shifts_both_deadlines_by_the_stride() {
+        let now = Instant::now();
+        // r1 at +10, r2 at +20, so the stride a real schedule gives is 20.
+        let w = SigningWindow::from_slots(now, 0, 10, 20).with_attempts(Duration::from_secs(20), 3);
+        assert_eq!(w.max_attempts(), 3);
+        assert_eq!(
+            w.close_of(SigningRound::Round1, 1),
+            now + Duration::from_secs(30)
+        );
+        assert_eq!(
+            w.close_of(SigningRound::Round2, 1),
+            now + Duration::from_secs(40)
+        );
+        // Attempt 2's round 1 opens after attempt 1's round 2 shut, never inside
+        // it — which is what stops two attempts polling the same window.
+        assert!(w.close_of(SigningRound::Round1, 2) > w.close_of(SigningRound::Round2, 1));
+    }
+
+    /// A window nobody gave a budget to runs exactly one attempt, and asking for
+    /// zero still yields one: a movement signed late costs latency, an
+    /// unattempted one is a certain failure.
+    #[test]
+    fn a_window_always_has_room_for_one_attempt() {
+        let now = Instant::now();
+        assert_eq!(SigningWindow::from_slots(now, 0, 10, 20).max_attempts(), 1);
+        assert_eq!(SigningWindow::at(now, now).max_attempts(), 1);
+        assert_eq!(
+            SigningWindow::from_slots(now, 0, 10, 20)
+                .with_attempts(Duration::from_secs(20), 0)
+                .max_attempts(),
+            1
         );
     }
 

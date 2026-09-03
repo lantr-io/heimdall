@@ -438,7 +438,7 @@ fn gc_dkg_blobs(
 /// `E-1` must not be starved by this node rolling over to `E`. Two epochs is
 /// a bounded window, which is the point: the map used to have none.
 fn gc_sign_blobs(
-    sign: &mut std::collections::BTreeMap<(u64, u64, u32, RoundKey), String>,
+    sign: &mut std::collections::BTreeMap<crate::http::server::SignKey, String>,
     epoch: u64,
 ) {
     sign.retain(|k, _| k.0 + 1 >= epoch);
@@ -573,8 +573,16 @@ impl PeerNetwork for HttpPeerNetwork {
         .map_err(peer_err)?;
         let json = serde_json::to_string(&wire).map_err(peer_err)?;
         let mut s = self.state.write().await;
-        s.sign
-            .insert((ns.epoch, ns.sequence, ns.session, RoundKey::Round1), json);
+        s.sign.insert(
+            (
+                ns.epoch,
+                ns.sequence,
+                ns.attempt,
+                ns.session,
+                RoundKey::Round1,
+            ),
+            json,
+        );
         gc_sign_blobs(&mut s.sign, ns.epoch);
         Ok(())
     }
@@ -596,8 +604,16 @@ impl PeerNetwork for HttpPeerNetwork {
         .map_err(peer_err)?;
         let json = serde_json::to_string(&wire).map_err(peer_err)?;
         let mut s = self.state.write().await;
-        s.sign
-            .insert((ns.epoch, ns.sequence, ns.session, RoundKey::Round2), json);
+        s.sign.insert(
+            (
+                ns.epoch,
+                ns.sequence,
+                ns.attempt,
+                ns.session,
+                RoundKey::Round2,
+            ),
+            json,
+        );
         gc_sign_blobs(&mut s.sign, ns.epoch);
         Ok(())
     }
@@ -789,10 +805,12 @@ impl PeerNetwork for HttpPeerNetwork {
         peer: &SpoInfo,
     ) -> EpochResult<Option<frost_secp256k1_tr::round1::SigningCommitments>> {
         let url = format!(
-            "{}/sign/{}/{}/round1/{}/{}.json",
+            "{}/sign/{}/{}/{}/{}/round1/{}/{}.json",
             peer.bifrost_url,
             ns.epoch,
             ns.sequence,
+            crate::http::canonical::SIGN_MODE_51,
+            ns.attempt,
             ns.session,
             hex::encode(&peer.pool_id)
         );
@@ -828,10 +846,12 @@ impl PeerNetwork for HttpPeerNetwork {
         peer: &SpoInfo,
     ) -> EpochResult<Option<frost_secp256k1_tr::round2::SignatureShare>> {
         let url = format!(
-            "{}/sign/{}/{}/round2/{}/{}.json",
+            "{}/sign/{}/{}/{}/{}/round2/{}/{}.json",
             peer.bifrost_url,
             ns.epoch,
             ns.sequence,
+            crate::http::canonical::SIGN_MODE_51,
+            ns.attempt,
             ns.session,
             hex::encode(&peer.pool_id)
         );
@@ -1228,7 +1248,7 @@ mod tests {
         let kp_other =
             frost_secp256k1_tr::keys::KeyPackage::try_from(shares[&id(2)].clone()).unwrap();
 
-        let ns = SignNamespace::new(7, 1, 0, [0x5a; 32]);
+        let ns = SignNamespace::new(7, 1, 0, 0, [0x5a; 32]);
         let (nonces, commitments) = participant::sign_round1(&kp, &mut rng);
         // The other signer's commitments never leave this test — a 2-of-2 share
         // can only be computed from a full signing package.
@@ -1265,7 +1285,7 @@ mod tests {
 
         // Same epoch and session, different message — a second TM in the epoch.
         // The blob is served (the URL is identical) but must not verify.
-        let other_tm = SignNamespace::new(7, 1, 0, [0x5b; 32]);
+        let other_tm = SignNamespace::new(7, 1, 0, 0, [0x5b; 32]);
         assert!(
             net2.fetch_sign_round1(other_tm, &peer1)
                 .await
@@ -1274,12 +1294,26 @@ mod tests {
             "a commitment must not carry over to a different message under the same URL"
         );
 
-        // The next ATTEMPT at the same movement (WI-W8ZC4). Everything the
+        // The next OPPORTUNITY at the same movement (WI-W8ZC4). Everything the
         // message can express is identical here — a rebuild at the following
         // batch opportunity is byte-identical when the chain has not moved — so
         // this is the case the check above cannot make. The sequence is in the
         // URL, so it is not even served, let alone verified.
-        let next_attempt = SignNamespace::new(7, 2, 0, [0x5a; 32]);
+        let next_opportunity = SignNamespace::new(7, 2, 0, 0, [0x5a; 32]);
+        assert!(
+            net2.fetch_sign_round1(next_opportunity, &peer1)
+                .await
+                .unwrap()
+                .is_none(),
+            "a commitment published at one opportunity must not be read by the next"
+        );
+
+        // And the next ATTEMPT at the SAME opportunity (WI-EJSVJ) — the case the
+        // sequence cannot cover, because a Round-2 shortfall re-runs Round 1
+        // against the same `B_i` over the same movement. Reading attempt 0's
+        // commitment here would mix a spent nonce into a package built from fresh
+        // ones.
+        let next_attempt = SignNamespace::new(7, 1, 1, 0, [0x5a; 32]);
         assert!(
             net2.fetch_sign_round1(next_attempt, &peer1)
                 .await
@@ -1325,11 +1359,14 @@ mod tests {
     /// must not be starved by this node rolling over to `E`.
     #[test]
     fn the_sign_store_keeps_two_epochs_and_drops_the_rest() {
-        let mut sign: std::collections::BTreeMap<(u64, u64, u32, RoundKey), String> = [
-            ((6u64, 1u64, 0u32, RoundKey::Round1), "ancient".to_string()),
-            ((7, 1, 0, RoundKey::Round1), "previous".to_string()),
-            ((7, 1, 1, RoundKey::Round2), "previous".to_string()),
-            ((8, 1, 0, RoundKey::Round1), "current".to_string()),
+        let mut sign: std::collections::BTreeMap<crate::http::server::SignKey, String> = [
+            (
+                (6u64, 1u64, 0u64, 0u32, RoundKey::Round1),
+                "ancient".to_string(),
+            ),
+            ((7, 1, 0, 0, RoundKey::Round1), "previous".to_string()),
+            ((7, 1, 0, 1, RoundKey::Round2), "previous".to_string()),
+            ((8, 1, 0, 0, RoundKey::Round1), "current".to_string()),
         ]
         .into_iter()
         .collect();
@@ -1337,7 +1374,7 @@ mod tests {
         gc_sign_blobs(&mut sign, 8);
 
         assert!(
-            sign.contains_key(&(8, 1, 0, RoundKey::Round1)),
+            sign.contains_key(&(8, 1, 0, 0, RoundKey::Round1)),
             "the epoch being published must survive its own GC"
         );
         assert_eq!(
@@ -1347,7 +1384,7 @@ mod tests {
              boundary"
         );
         assert!(
-            !sign.contains_key(&(6, 1, 0, RoundKey::Round1)),
+            !sign.contains_key(&(6, 1, 0, 0, RoundKey::Round1)),
             "an epoch two behind can have no live round and must be dropped"
         );
     }
@@ -1375,7 +1412,7 @@ mod tests {
 
         for epoch in [40u64, 41, 42] {
             net1.publish_sign_round1(
-                SignNamespace::new(epoch, 1, 0, [0x11; 32]),
+                SignNamespace::new(epoch, 1, 0, 0, [0x11; 32]),
                 id(1),
                 commitments,
             )

@@ -781,9 +781,9 @@ pub fn round2_equivocation_evidence(
 /// `(epoch, session)` is not unique on its own — an epoch runs many treasury
 /// movements and each has an input 0. See [`canonical`] for why that matters.
 ///
-/// `sequence` is the analogue of [`DkgNamespace::attempt`], and it exists for
-/// the same reason: two goes at the same thing must not share an address. The
-/// message alone cannot separate them, because a rebuilt movement is
+/// `sequence` and `attempt` are the analogues of [`DkgNamespace::attempt`], and
+/// they exist for the same reason: two goes at the same thing must not share an
+/// address. The message alone cannot separate them, because a rebuilt movement is
 /// BYTE-IDENTICAL when nothing about the chain has changed — same head, same
 /// Config fee rate, same output — so it hashes to the same sighash. Without
 /// `sequence`, a node that published a commitment at one batch opportunity keeps
@@ -800,6 +800,22 @@ pub struct SignNamespace {
     /// `session` already separates it) and for a deployment with no grid (which
     /// makes exactly one movement per epoch).
     pub sequence: u64,
+    /// Which go at THIS opportunity this is, 0-based (WI-EJSVJ).
+    ///
+    /// `sequence` separates two batch opportunities; this separates two attempts
+    /// inside one. They are different failures and both are reachable: the first
+    /// is a movement rebuilt at `B_(i+1)`, the second is a Round-2 shortfall — a
+    /// member of `S1` that committed in Round 1 and then published no share, which
+    /// a crash between the deadlines produces as readily as malice.
+    ///
+    /// A shortfall cannot be answered by aggregating over the survivors: the
+    /// signing package IS `S1`'s commitment list, so a partial sum does not verify
+    /// against `R`, and making it verify would mean recomputing shares on already
+    /// published nonces — which reveals them. The only safe answer is a new
+    /// attempt with fresh commitments, and it needs its own namespace or the
+    /// abandoned attempt's payloads verify against it (spec §Round-2 shortfall
+    /// opens a new attempt).
+    pub attempt: u64,
     /// TM input index, or [`crate::epoch::rotation::UPDATE_Y_SESSION`].
     pub session: u32,
     /// The exact 32 bytes this session signs: a BIP-341 sighash, or the
@@ -817,10 +833,17 @@ pub const UPDATE_Y_SESSION: u32 = u32::MAX;
 
 impl SignNamespace {
     #[must_use]
-    pub fn new(epoch: u64, sequence: u64, session: u32, message: [u8; SIGN_MESSAGE_LEN]) -> Self {
+    pub fn new(
+        epoch: u64,
+        sequence: u64,
+        attempt: u64,
+        session: u32,
+        message: [u8; SIGN_MESSAGE_LEN],
+    ) -> Self {
         Self {
             epoch,
             sequence,
+            attempt,
             session,
             message,
         }
@@ -829,10 +852,17 @@ impl SignNamespace {
     /// How this session is named in trace output.
     #[must_use]
     pub fn session_label(&self) -> String {
-        if self.session == UPDATE_Y_SESSION {
+        let what = if self.session == UPDATE_Y_SESSION {
             "update-y".to_string()
         } else {
             format!("input {}", self.session)
+        };
+        // Named only once it is not the first go, so the ordinary line stays the
+        // line operators already know, and a retry is visible at a glance.
+        if self.attempt == 0 {
+            what
+        } else {
+            format!("{what} attempt {}", self.attempt)
         }
     }
 }
@@ -897,6 +927,7 @@ pub fn build_sign_round1(
     let canonical_bytes = canonical::sign_round1(
         ns.epoch,
         ns.sequence,
+        ns.attempt,
         ns.session,
         my_pool_id,
         u64::from(my_identifier),
@@ -931,6 +962,7 @@ pub fn verify_sign_round1(
     let canonical_bytes = canonical::sign_round1(
         ns.epoch,
         ns.sequence,
+        ns.attempt,
         ns.session,
         peer_pool_id,
         u64::from(peer_identifier),
@@ -956,6 +988,7 @@ pub fn build_sign_round2(
     let canonical_bytes = canonical::sign_round2(
         ns.epoch,
         ns.sequence,
+        ns.attempt,
         ns.session,
         my_pool_id,
         u64::from(my_identifier),
@@ -984,6 +1017,7 @@ pub fn verify_sign_round2(
     let canonical_bytes = canonical::sign_round2(
         ns.epoch,
         ns.sequence,
+        ns.attempt,
         ns.session,
         peer_pool_id,
         u64::from(peer_identifier),

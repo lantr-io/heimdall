@@ -178,10 +178,12 @@ pub fn round2(
 
 /// `epoch || session || pool_id || identifier || message` — the header shared
 /// by both signing-round layouts (integers 8-byte big-endian).
+#[allow(clippy::too_many_arguments)]
 fn push_sign_header(
     out: &mut Vec<u8>,
     epoch: u64,
     sequence: u64,
+    attempt: u64,
     session: u32,
     pool_id: &[u8; POOL_ID_LEN],
     identifier: u64,
@@ -189,26 +191,44 @@ fn push_sign_header(
 ) {
     out.extend_from_slice(&epoch.to_be_bytes());
     out.extend_from_slice(&sequence.to_be_bytes());
+    // The spec's layout is `epoch || txid || mode || attempt || pool_id`, and the
+    // mode is written even though it cannot vary: §Signing namespaces keeps the
+    // field "so that adding a future threshold mode does not change any byte
+    // layout", and the federation mode has no signing namespace at all.
+    out.extend_from_slice(&SIGN_MODE_51.to_be_bytes());
+    out.extend_from_slice(&attempt.to_be_bytes());
     out.extend_from_slice(&u64::from(session).to_be_bytes());
     out.extend_from_slice(pool_id);
     out.extend_from_slice(&identifier.to_be_bytes());
     out.extend_from_slice(message);
 }
 
-const SIGN_HEADER_LEN: usize = 8 + 8 + 8 + POOL_ID_LEN + 8 + SIGN_MESSAGE_LEN;
+/// The only signing mode that has a namespace. See [`push_sign_header`].
+pub const SIGN_MODE_51: u64 = 51;
+
+const SIGN_HEADER_LEN: usize = 8 + 8 + 8 + 8 + 8 + POOL_ID_LEN + 8 + SIGN_MESSAGE_LEN;
 
 /// Signing Round 1 canonical bytes: this signer's two nonce commitments,
 /// bound to the `(epoch, sequence, session, pool_id, identifier, message)`
 /// domain.
 ///
 /// `sequence` is in the header, not merely in the URL, because it is what makes
-/// two ATTEMPTS at the same message different sessions (WI-W8ZC4). A retried
-/// movement is byte-identical, so `message` repeats; without `sequence` a
-/// commitment published for an earlier attempt verifies against the later one
+/// two BATCH OPPORTUNITIES at the same message different sessions (WI-W8ZC4). A
+/// rebuilt movement is byte-identical, so `message` repeats; without `sequence` a
+/// commitment published at an earlier opportunity verifies against the later one
 /// and mixes into its signing package.
+///
+/// `attempt` is here for the same reason at a finer grain (WI-EJSVJ): a Round-2
+/// shortfall re-runs Round 1 for the SAME movement at the SAME opportunity, so
+/// `(epoch, sequence, session, message)` all repeat and only the attempt differs.
+/// A commitment from the abandoned attempt that verified against the new one
+/// would be mixed into a package built from fresh nonces, and nothing would
+/// aggregate.
+#[allow(clippy::too_many_arguments)]
 pub fn sign_round1(
     epoch: u64,
     sequence: u64,
+    attempt: u64,
     session: u32,
     pool_id: &[u8; POOL_ID_LEN],
     identifier: u64,
@@ -219,7 +239,7 @@ pub fn sign_round1(
     let mut out = Vec::with_capacity(TAG_S1.len() + SIGN_HEADER_LEN + 2 * POINT_LEN);
     out.extend_from_slice(TAG_S1);
     push_sign_header(
-        &mut out, epoch, sequence, session, pool_id, identifier, message,
+        &mut out, epoch, sequence, attempt, session, pool_id, identifier, message,
     );
     out.extend_from_slice(hiding);
     out.extend_from_slice(binding);
@@ -228,9 +248,11 @@ pub fn sign_round1(
 
 /// Signing Round 2 canonical bytes: this signer's signature share, bound to
 /// the same domain as its Round 1 commitments.
+#[allow(clippy::too_many_arguments)]
 pub fn sign_round2(
     epoch: u64,
     sequence: u64,
+    attempt: u64,
     session: u32,
     pool_id: &[u8; POOL_ID_LEN],
     identifier: u64,
@@ -240,7 +262,7 @@ pub fn sign_round2(
     let mut out = Vec::with_capacity(TAG_S2.len() + SIGN_HEADER_LEN + SHARE_LEN);
     out.extend_from_slice(TAG_S2);
     push_sign_header(
-        &mut out, epoch, sequence, session, pool_id, identifier, message,
+        &mut out, epoch, sequence, attempt, session, pool_id, identifier, message,
     );
     out.extend_from_slice(share);
     out
@@ -361,13 +383,21 @@ mod tests {
     const SIGN_TAG_LEN: usize = 15; // "bifrost-sign-rN"
 
     fn s1(epoch: u64, session: u32, id: u64, msg: [u8; 32]) -> Vec<u8> {
-        s1_at(epoch, 1, session, id, msg)
+        s1_at(epoch, 1, 0, session, id, msg)
     }
 
-    fn s1_at(epoch: u64, sequence: u64, session: u32, id: u64, msg: [u8; 32]) -> Vec<u8> {
+    fn s1_at(
+        epoch: u64,
+        sequence: u64,
+        attempt: u64,
+        session: u32,
+        id: u64,
+        msg: [u8; 32],
+    ) -> Vec<u8> {
         sign_round1(
             epoch,
             sequence,
+            attempt,
             session,
             &pid(1),
             id,
@@ -390,10 +420,20 @@ mod tests {
         assert_eq!(
             &bytes[SIGN_TAG_LEN + 8..SIGN_TAG_LEN + 16],
             &1u64.to_be_bytes(),
-            "sequence next — what separates two attempts at one message"
+            "sequence next — what separates two batch opportunities at one message"
         );
         assert_eq!(
             &bytes[SIGN_TAG_LEN + 16..SIGN_TAG_LEN + 24],
+            &SIGN_MODE_51.to_be_bytes(),
+            "then the mode, in the spec's position, even though it cannot vary"
+        );
+        assert_eq!(
+            &bytes[SIGN_TAG_LEN + 24..SIGN_TAG_LEN + 32],
+            &0u64.to_be_bytes(),
+            "then the attempt — what separates two goes at one opportunity"
+        );
+        assert_eq!(
+            &bytes[SIGN_TAG_LEN + 32..SIGN_TAG_LEN + 40],
             &2u64.to_be_bytes(),
             "then the session"
         );
@@ -417,12 +457,17 @@ mod tests {
         // The field the message cannot stand in for: a movement rebuilt at the
         // next opportunity is byte-identical, so only this separates the two
         // attempts (WI-W8ZC4).
-        assert_ne!(base, s1_at(9, 2, 2, 5, [0x11; 32]), "sequence");
+        assert_ne!(base, s1_at(9, 2, 0, 2, 5, [0x11; 32]), "sequence");
+        // The field the sequence cannot stand in for: a Round-2 shortfall re-runs
+        // Round 1 at the SAME opportunity over the same movement, so only this
+        // separates the abandoned attempt from the new one (WI-EJSVJ).
+        assert_ne!(base, s1_at(9, 1, 1, 2, 5, [0x11; 32]), "attempt");
         assert_ne!(
             base,
             sign_round1(
                 9,
                 1,
+                0,
                 2,
                 &pid(2),
                 5,
@@ -436,7 +481,7 @@ mod tests {
 
     #[test]
     fn sign_round2_length_and_prefix() {
-        let bytes = sign_round2(9, 1, 2, &pid(1), 5, &[0x11; 32], &[0xcc; SHARE_LEN]);
+        let bytes = sign_round2(9, 1, 0, 2, &pid(1), 5, &[0x11; 32], &[0xcc; SHARE_LEN]);
         assert_eq!(&bytes[..SIGN_TAG_LEN], TAG_S2);
         assert_eq!(bytes.len(), SIGN_TAG_LEN + SIGN_HEADER_LEN + SHARE_LEN);
         assert_eq!(&bytes[bytes.len() - SHARE_LEN..], &[0xcc; SHARE_LEN]);

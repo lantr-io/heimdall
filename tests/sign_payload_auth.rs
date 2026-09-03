@@ -48,15 +48,16 @@ fn identity(secp: &Secp256k1<All>, tag: u8) -> Identity {
     }
 }
 
-/// A namespace at the first batch opportunity — what almost every case here
-/// needs, since the sequence only matters where two ATTEMPTS are compared.
+/// A namespace at the first batch opportunity, first attempt — what almost every
+/// case here needs, since the sequence and the attempt only matter where two goes
+/// at one message are compared.
 fn ns(epoch: u64, session: u32, msg: u8) -> SignNamespace {
-    ns_at(epoch, 1, session, msg)
+    ns_at(epoch, 1, 0, session, msg)
 }
 
-/// A namespace at a named batch sequence.
-fn ns_at(epoch: u64, sequence: u64, session: u32, msg: u8) -> SignNamespace {
-    SignNamespace::new(epoch, sequence, session, [msg; 32])
+/// A namespace at a named batch sequence and attempt.
+fn ns_at(epoch: u64, sequence: u64, attempt: u64, session: u32, msg: u8) -> SignNamespace {
+    SignNamespace::new(epoch, sequence, attempt, session, [msg; 32])
 }
 
 /// One signer's commitments for a session.
@@ -197,10 +198,18 @@ fn round1_does_not_replay_into_another_session() {
         // The one the message cannot catch: a movement rebuilt at the next
         // opportunity when nothing on chain has changed is byte-identical, so
         // its sighash — and therefore `message` — is the SAME. Only the
-        // sequence separates the two attempts (WI-W8ZC4).
+        // sequence separates the two (WI-W8ZC4).
         (
-            "the next attempt at the same movement",
-            ns_at(42, 2, 0, 0x11),
+            "the next opportunity at the same movement",
+            ns_at(42, 2, 0, 0, 0x11),
+        ),
+        // And the one the SEQUENCE cannot catch: a Round-2 shortfall re-runs
+        // Round 1 at the same opportunity, so the sequence repeats too and only
+        // the attempt separates the spent commitments from the fresh ones
+        // (WI-EJSVJ).
+        (
+            "the next attempt at the same opportunity",
+            ns_at(42, 1, 1, 0, 0x11),
         ),
     ] {
         assert!(
@@ -309,7 +318,8 @@ fn round2_does_not_replay_into_another_session() {
         ns(8, 3, 0x22),
         ns(7, 4, 0x22),
         ns(7, 3, 0x23),
-        ns_at(7, 2, 3, 0x22),
+        ns_at(7, 2, 0, 3, 0x22),
+        ns_at(7, 1, 1, 3, 0x22),
     ] {
         assert!(
             verify_sign_round2(&secp, &me.pool_id, &me.xonly, other, 1, &wire).is_err(),

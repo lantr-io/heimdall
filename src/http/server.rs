@@ -36,18 +36,25 @@ pub struct AppState {
     pub own_pool_id_hex: String,
     /// Published DKG payload JSON, keyed by `(epoch, threshold, attempt, round)`.
     pub dkg: BTreeMap<(u64, u64, u64, RoundKey), String>,
-    /// Published signing payload JSON, keyed by `(epoch, sequence, session,
-    /// round)` — one FROST session per TM input, plus the reserved rotation
-    /// session. Folds the round into the key exactly as `dkg` above does, so
-    /// serving needs no branch. Stored as the pre-signed JSON string for the
-    /// same reason DKG payloads are: the publisher signs canonical bytes, and
+    /// Published signing payload JSON, keyed by `(epoch, sequence, attempt,
+    /// session, round)` — one FROST session per TM input, plus the reserved
+    /// rotation session. Folds the round into the key exactly as `dkg` above
+    /// does, so serving needs no branch. Stored as the pre-signed JSON string for
+    /// the same reason DKG payloads are: the publisher signs canonical bytes, and
     /// the server must hand back exactly what was signed, not a
     /// re-serialization of it.
     ///
     /// `sequence` is in the key for the same reason `attempt` is in `dkg`'s: a
-    /// retried movement is byte-identical, so without it the second attempt
-    /// reads the first's commitments (WI-W8ZC4).
-    pub sign: BTreeMap<(u64, u64, u32, RoundKey), String>,
+    /// movement rebuilt at the next opportunity is byte-identical, so without it
+    /// the second one reads the first's commitments (WI-W8ZC4). `attempt` is the
+    /// same guard one level down — a Round-2 shortfall re-runs Round 1 at the
+    /// SAME opportunity, so `sequence` repeats too and only this separates the
+    /// abandoned commitments from the fresh ones (WI-EJSVJ).
+    ///
+    /// The `mode` segment of the URL is deliberately NOT here: the federation
+    /// mode has no signing namespace, so it cannot vary, and the route rejects
+    /// anything but `51` rather than letting a wrong value read the right blob.
+    pub sign: BTreeMap<SignKey, String>,
     /// What this deployment runs with, for peers to compare before entering a
     /// ceremony with it (WI-VMP6J). Written at each ceremony entry by
     /// `PeerNetwork::set_node_facts`; empty until the first one, which readers
@@ -64,6 +71,10 @@ pub struct AppState {
 
 pub type SharedState = Arc<RwLock<AppState>>;
 
+/// Address of one served signing payload: the namespace's URL-visible part (the
+/// sighash is not in the path) plus the round. See [`AppState::sign`].
+pub type SignKey = (u64, u64, u64, u32, RoundKey);
+
 pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -75,12 +86,16 @@ pub fn router(state: SharedState) -> Router {
             "/dkg/{epoch}/{threshold}/{attempt}/round2/{file}",
             get(get_dkg2),
         )
+        // `{mode}` and `{attempt}` sit where the spec puts them
+        // (`/sign/<epoch>/<txid>/<mode>/<attempt>/round1/…`); the trailing
+        // `{session}` is heimdall's per-input split, which the spec folds into one
+        // array under a single signature (WI-042).
         .route(
-            "/sign/{epoch}/{sequence}/round1/{session}/{file}",
+            "/sign/{epoch}/{sequence}/{mode}/{attempt}/round1/{session}/{file}",
             get(get_sign1),
         )
         .route(
-            "/sign/{epoch}/{sequence}/round2/{session}/{file}",
+            "/sign/{epoch}/{sequence}/{mode}/{attempt}/round2/{session}/{file}",
             get(get_sign2),
         )
         .with_state(state)
@@ -174,19 +189,28 @@ async fn get_dkg2(
 /// Serve one signing-round blob. Like the DKG routes, the `<pool_id>.json`
 /// segment must name THIS server — it only ever holds its own payloads, so any
 /// other pool_id is a 404 rather than someone else's bytes under the wrong name.
+#[allow(clippy::too_many_arguments)]
 async fn serve_sign(
     state: SharedState,
     round: RoundKey,
     epoch: u64,
     sequence: u64,
+    mode: u64,
+    attempt: u64,
     session: u32,
     file: String,
 ) -> Result<impl IntoResponse, StatusCode> {
+    // A mode this node cannot sign in is a 404, not a segment to ignore. Ignoring
+    // it would serve the 51%-mode blob under any mode number a caller invented,
+    // which is the kind of aliasing the namespace exists to prevent.
+    if mode != crate::http::canonical::SIGN_MODE_51 {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let s = state.read().await;
     check_pool_id(&file, &s.own_pool_id_hex)?;
     let body = s
         .sign
-        .get(&(epoch, sequence, session, round))
+        .get(&(epoch, sequence, attempt, session, round))
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(([(header::CONTENT_TYPE, "application/json")], body))
@@ -194,14 +218,34 @@ async fn serve_sign(
 
 async fn get_sign1(
     State(state): State<SharedState>,
-    Path((epoch, sequence, session, file)): Path<(u64, u64, u32, String)>,
+    Path((epoch, sequence, mode, attempt, session, file)): Path<(u64, u64, u64, u64, u32, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    serve_sign(state, RoundKey::Round1, epoch, sequence, session, file).await
+    serve_sign(
+        state,
+        RoundKey::Round1,
+        epoch,
+        sequence,
+        mode,
+        attempt,
+        session,
+        file,
+    )
+    .await
 }
 
 async fn get_sign2(
     State(state): State<SharedState>,
-    Path((epoch, sequence, session, file)): Path<(u64, u64, u32, String)>,
+    Path((epoch, sequence, mode, attempt, session, file)): Path<(u64, u64, u64, u64, u32, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    serve_sign(state, RoundKey::Round2, epoch, sequence, session, file).await
+    serve_sign(
+        state,
+        RoundKey::Round2,
+        epoch,
+        sequence,
+        mode,
+        attempt,
+        session,
+        file,
+    )
+    .await
 }
