@@ -275,6 +275,22 @@ pub async fn sign_phase(
                     "  <- have all round1 commitments, advancing to round2"
                 );
             } else {
+                // Logged and NOT carried into `excluded`, deliberately. Round 1
+                // closes on the threshold, so an absence here costs the round
+                // nothing, and the spec is explicit that it is not evidence of
+                // anything: a member down at one attempt may be back at the next,
+                // which is what the retry is for.
+                //
+                // It does mean a later attempt polls the silent member again and
+                // waits out the full round-1 deadline instead of returning early —
+                // and that is the design, not an oversight to optimise away. The
+                // deadline is what FIXES `S1`; returning early is only safe when
+                // everyone polled has answered, because "everyone" is the one
+                // subset two nodes cannot disagree about. Dropping last attempt's
+                // absentees from the poll is exclusion under another name, and it
+                // breaks in the case it is meant to help: a member that recovers by
+                // attempt 1 publishes into a namespace nobody reads, believes it is
+                // in `S1`, and aggregates against a package no one else built.
                 let mut listed: Vec<String> = absent_signers
                     .iter()
                     .map(|(id, missed)| format!("{} ({missed}/{num_inputs})", id_short(*id)))
@@ -575,6 +591,16 @@ fn open_next_attempt(
         // Everything from the abandoned attempt goes, nonces included: the new
         // attempt is a new namespace, so its commitments must be new too. Keeping
         // a nonce across the two is the exact hazard this path exists to avoid.
+        //
+        // Every input is re-signed, including any that already aggregated before
+        // the shortfall — and that is required, not merely simple. Which inputs a
+        // node finished is a function of how far it got through a SERIAL loop
+        // before the shared deadline, not of anything published, so two nodes
+        // routinely differ: skipping "the ones I already have" would have them
+        // publish round-1 commitments for different input ranges and build
+        // different `S1`s for the overlap. It is also rarely costly — the inputs
+        // share one round-2 deadline, so a member absent on every input stalls at
+        // input 0 and nothing downstream ever ran.
         collected: SignCollected::default(),
         attempt: next,
         excluded,
@@ -1705,17 +1731,39 @@ mod tests {
 
     /// A window with room for `max_attempts` goes, laid off `now`.
     ///
-    /// Round 1 gets seconds and round 2 a fraction of one, which is lopsided for a
+    /// Round 1 gets a second and round 2 a fraction of one, which is lopsided for a
     /// production schedule and right for this: `poll_sign_round` returns as soon as
     /// everyone has answered, so the only deadline a test actually WAITS OUT is the
-    /// one with a member missing behind it — round 2's. Round 1's window is
-    /// generous so that three nodes doing FROST arithmetic on one runtime cannot
-    /// miss it and turn a retry test into a scheduling test.
+    /// one with a member missing behind it — round 2's. Round 1 is given room to
+    /// spare so three nodes doing FROST arithmetic on one runtime cannot miss it and
+    /// turn a retry test into a scheduling test.
+    ///
+    /// Both are only reachable alongside [`fast_poll`]: at the default 5-second poll
+    /// interval a 1-second window is SAMPLED ONCE (WI-112) and the round closes on
+    /// whoever happened to answer before the first fetch.
     fn retryable_window(max_attempts: u64) -> crate::epoch::state::SigningWindow {
         let now = std::time::Instant::now();
-        let r1 = std::time::Duration::from_secs(10);
+        let r1 = std::time::Duration::from_secs(1);
         let r2 = r1 + std::time::Duration::from_millis(300);
         crate::epoch::state::SigningWindow::at(now + r1, now + r2).with_attempts(r2, max_attempts)
+    }
+
+    /// A demo config that polls fast enough for [`retryable_window`]'s deadlines.
+    ///
+    /// `demo_default` polls every 5 seconds, which is a production cadence against
+    /// production windows. Left at that, each retry test spends its whole run
+    /// asleep between fetches — the three of them cost ~48 s of pure waiting — and
+    /// worse, round 2's window falls below one poll interval, so the round is
+    /// decided by scheduling luck rather than by the deadline. Every other
+    /// multi-node test in this module lowers it for the same reason.
+    fn fast_poll(id: Identifier) -> EpochConfig {
+        let mut config = EpochConfig::demo_default(SpoIdentity {
+            identifier: id,
+            bifrost_id_pk: Vec::new(),
+            port: 0,
+        });
+        config.poll_interval = std::time::Duration::from_millis(5);
+        config
     }
 
     /// Drive one node's `Sign` phase to a terminal state, starting at attempt 0.
@@ -1830,11 +1878,7 @@ mod tests {
             } else {
                 base
             });
-            let config = EpochConfig::demo_default(SpoIdentity {
-                identifier: id,
-                bifrost_id_pk: Vec::new(),
-                port: 0,
-            });
+            let config = fast_poll(id);
             let roster = roster.clone();
             let tm = tm.clone();
             handles.push(tokio::spawn(async move {
@@ -1886,11 +1930,7 @@ mod tests {
         for gk in group_keys_all {
             let id = *gk.key_package.identifier();
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
-            let config = EpochConfig::demo_default(SpoIdentity {
-                identifier: id,
-                bifrost_id_pk: Vec::new(),
-                port: 0,
-            });
+            let config = fast_poll(id);
             let roster = roster.clone();
             let tm = tm.clone();
             let clock = clock.clone();
@@ -1969,11 +2009,7 @@ mod tests {
             } else {
                 base
             });
-            let config = EpochConfig::demo_default(SpoIdentity {
-                identifier: id,
-                bifrost_id_pk: Vec::new(),
-                port: 0,
-            });
+            let config = fast_poll(id);
             let roster = roster.clone();
             let tm = tm.clone();
             handles.push(tokio::spawn(async move {
