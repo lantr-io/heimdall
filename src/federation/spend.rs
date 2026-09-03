@@ -97,7 +97,10 @@ pub async fn frost_sign(
             me: crate::frost::identifier_u16(me),
         });
     }
-    let ns = SignNamespace::new(0, 0, FEDERATION_SESSION, message);
+    // Attempt 0: the federation ceremony is driven by an operator command, not by
+    // the batch grid, so it has no `B_(i+1)` to budget retries against — a second
+    // go is a second invocation, which picks its own signer set explicitly.
+    let ns = SignNamespace::new(0, 0, 0, FEDERATION_SESSION, message);
     let spo_roster = roster.to_roster();
     let co_signers: Vec<SpoInfo> = signers
         .iter()

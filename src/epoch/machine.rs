@@ -283,6 +283,12 @@ async fn drive_to_movement(
     // far short of an epoch.
     const HANDOFF_RETRIES: u32 = 6;
     let mut handoff_retries = 0u32;
+    // Consecutive movements the 51% mode could not sign (WI-Y3JJK). Counted
+    // because the answer to a treasury the roster cannot move is a FEDERATION
+    // spend, which no daemon performs — see the warning below — so the only thing
+    // standing between a stuck treasury and an operator reaching for it is this
+    // number being visible.
+    let mut unsigned_movements = 0u32;
     // The epoch whose rotation round this node has already SPENT (published a
     // commitment into and then failed). Set on the first such failure, which
     // re-enters `PublishKeys` once — with the ceremony disabled — purely to see
@@ -373,6 +379,14 @@ async fn drive_to_movement(
                 if matches!(next, EpochPhase::CollectPegins { .. }) {
                     handoff_retries = 0;
                 }
+                // A signature exists, so the 51% mode is working. Reset here
+                // rather than at `RecordMovement`: what the count is about is
+                // whether the roster can still SIGN, and posting is permissionless
+                // and separately reported.
+                if matches!(next, EpochPhase::Submit { .. }) {
+                    unsigned_movements = 0;
+                    config.health.update(|h| h.unsigned_movements = 0);
+                }
                 phase = next;
                 // Reset only when the phase that failed has now succeeded (or
                 // nothing was outstanding, where this is a no-op). Re-entering
@@ -461,6 +475,30 @@ async fn drive_to_movement(
                         h.dkg_qualified = Some(false);
                         h.activity = "DKG did not complete for this node".into();
                     });
+                }
+                // The 51% mode gave up on a movement. Say so ONCE per movement,
+                // and say what the fallback actually is — because the fallback is
+                // not something this process will do.
+                //
+                // The spec puts the federation mode out of band: it "does not use
+                // the SPO HTTP endpoints" and "has no signing namespace at all".
+                // It is a spend of the CSV leaf under `Y_federation`, and it is a
+                // SPEND — which this daemon never performs, under any flag. So the
+                // daemon's whole duty here is to make the condition legible and
+                // name the command, with its precondition, rather than to act.
+                if stepped.starts_with("Sign") {
+                    unsigned_movements += 1;
+                    let n = unsigned_movements;
+                    config.health.update(|h| h.unsigned_movements = n);
+                    crate::epoch_warn!(
+                        me,
+                        current_epoch(&EpochPhase::Idle),
+                        "the 51% mode did not sign this movement ({e}) — {n} consecutive now. If \
+                         this does not clear, the treasury moves only through the federation's \
+                         emergency path: `heimdall federation-spend`, which needs the treasury \
+                         UTxO to be federation_csv_blocks deep on Bitcoin and every federation \
+                         member to run it with the same --signers. No daemon does this."
+                    );
                 }
                 let round_spent = e.round_is_spent();
                 if round_spent && matches!(resume, Some(EpochPhase::PublishKeys { .. })) {
@@ -786,6 +824,8 @@ async fn step_phase(
             tm,
             round,
             collected,
+            attempt,
+            excluded,
         } => {
             sign_phase(
                 peers,
@@ -800,6 +840,8 @@ async fn step_phase(
                 tm,
                 round,
                 collected,
+                attempt,
+                excluded,
                 tm_sequence,
                 window,
             )
@@ -3808,6 +3850,31 @@ async fn build_tm_phase(
         tm.fulfilled.len(),
     );
 
+    // Read before the roster moves into the phase — the retry budget shrinks with
+    // the roster, because the posting margin it reserves is the leader cascade's
+    // worst case over it. See `max_sign_attempts`.
+    let roster_size = signing_roster.max_signers;
+    let window = signing_window(clock, &snapshot, batch, roster_size);
+    // Said HERE, where the schedule is read, rather than left to be discovered at
+    // a deadline. One attempt is the pre-WI-EJSVJ shape: any single member that
+    // commits in round 1 and then goes quiet — a crash does it as readily as
+    // malice — denies the movement outright, because a round-2 shortfall cannot be
+    // aggregated over the survivors and there is no room to re-run round 1.
+    if batch.is_some() && window.max_attempts() < 2 {
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "  the published schedule leaves room for ONE signing attempt at this opportunity \
+             (tm_batch_interval vs {} + {} per attempt, less {} × {} slots of posting margin) — \
+             a single member that commits and then withholds denies this movement, with no \
+             second attempt to exclude it from. Widen tm_batch_interval or shorten the sign \
+             windows.",
+            snapshot.sign_r1_window,
+            snapshot.sign_r2_window,
+            roster_size,
+            snapshot.leader_slot_t,
+        );
+    }
     Ok(EpochPhase::Sign {
         epoch,
         roster: signing_roster,
@@ -3817,10 +3884,14 @@ async fn build_tm_phase(
         tm,
         round: SigningRound::Round1,
         collected: SignCollected::default(),
+        // The first go, with nobody excluded. Both advance only on a Round-2
+        // shortfall — see `signing::open_next_attempt`.
+        attempt: 0,
+        excluded: std::collections::BTreeSet::new(),
         // The signing windows are fixed HERE, off the same snapshot the batch was
         // frozen against, so both rounds measure from the batch opportunity every
         // SPO agrees on rather than from whenever each node reaches them.
-        window: signing_window(clock, &snapshot, batch),
+        window,
         // The batch grid index IS the movement's sequence within the epoch: it is
         // 1-based and every SPO derives it from the same chain state, which is
         // what the election needs. A deployment with no grid has one movement per
@@ -3907,11 +3978,73 @@ fn signing_window(
     clock: &Arc<dyn Clock>,
     snapshot: &crate::epoch::traits::BatchSnapshot,
     batch: Option<crate::epoch::batch::BatchSlot>,
+    roster_size: u16,
 ) -> crate::epoch::state::SigningWindow {
     let anchor = batch.map_or(snapshot.slot, |b| b.slot);
     let r1 = anchor.saturating_add(snapshot.sign_r1_window);
     let r2 = r1.saturating_add(snapshot.sign_r2_window);
+    let stride = snapshot
+        .sign_r1_window
+        .saturating_add(snapshot.sign_r2_window);
     crate::epoch::state::SigningWindow::from_slots(clock.now(), snapshot.slot, r1, r2)
+        .with_attempts(
+            std::time::Duration::from_secs(stride),
+            max_sign_attempts(snapshot, batch, roster_size),
+        )
+}
+
+/// How many signing attempts this opportunity has room for (WI-EJSVJ, spec
+/// §Round-2 shortfall opens a new attempt):
+///
+/// ```text
+/// max(1, ⌊(tm_batch_interval − roster_size × leader_slot_T) / (sign_r1_window + sign_r2_window)⌋)
+/// ```
+///
+/// Every term is published — the windows and `leader_slot_T` in the Config
+/// schedule, the roster size on chain — so every SPO derives the same bound
+/// without any local setting, which is the point: a per-operator retry budget
+/// would have two nodes open different attempts and aggregate different packages.
+///
+/// The subtracted term is the leader cascade's worst case, and it is the posting
+/// margin: an attempt whose round 2 closes with no room left for the cascade to
+/// walk the roster produces a signature nobody posts before `B_(i+1)` supersedes
+/// it. It is linear in the roster size, so a large roster with a coarse
+/// `leader_slot_T` can eat the whole interval — which is the constraint doing its
+/// job, not a defect to smooth over.
+///
+/// The floor of 1 is deliberate. A schedule too tight for even one attempt still
+/// runs one: a movement signed late is a liveness cost, an unattempted one is a
+/// certain failure. But a schedule that admits only one attempt is exactly the
+/// single-defector denial the retry exists to remove, so it is worth an operator's
+/// attention — `wait_for_roster_health` reports it at ceremony entry.
+fn max_sign_attempts(
+    snapshot: &crate::epoch::traits::BatchSnapshot,
+    batch: Option<crate::epoch::batch::BatchSlot>,
+    roster_size: u16,
+) -> u64 {
+    let stride = snapshot
+        .sign_r1_window
+        .saturating_add(snapshot.sign_r2_window);
+    // No grid means no `B_(i+1)` to be superseded by and no interval to divide,
+    // so there is no budget to derive: one attempt, as before.
+    let (Some(b), Some(next)) = (batch, next_opportunity(snapshot)) else {
+        return 1;
+    };
+    if stride == 0 {
+        return 1;
+    }
+    let interval = next.saturating_sub(b.slot);
+    let margin = u64::from(roster_size).saturating_mul(snapshot.leader_slot_t);
+    (interval.saturating_sub(margin) / stride).max(1)
+}
+
+/// `B_(i+1)`, when the grid names one. See [`max_sign_attempts`].
+fn next_opportunity(snapshot: &crate::epoch::traits::BatchSnapshot) -> Option<u64> {
+    match snapshot.batch {
+        crate::epoch::batch::BatchWindow::Open { next, .. }
+        | crate::epoch::batch::BatchWindow::Closed { next } => next.map(|n| n.slot),
+        crate::epoch::batch::BatchWindow::NoGrid => None,
+    }
 }
 
 /// Whether somebody has already posted a movement this node no longer needs to.
@@ -8174,6 +8307,57 @@ mod tests {
         s
     }
 
+    /// The retry budget is derived from published values and nothing else
+    /// (WI-EJSVJ): the two sign windows and `leader_slot_T` come out of the Config
+    /// schedule, the roster size off chain, and the grid pitch is `B_(i+1) − B_i`.
+    /// Two nodes therefore compute the same bound with no local setting to
+    /// disagree about — which they must, or they open different attempts and
+    /// aggregate different packages.
+    #[test]
+    fn the_retry_budget_comes_out_of_the_published_schedule() {
+        let bi = crate::epoch::batch::BatchSlot {
+            index: 1,
+            slot: 5_000_000,
+            cutoff_slot: 4_900_000,
+        };
+        // A grid whose pitch is `pitch` slots, with `leader_slot_t` published.
+        let snap = |pitch: u64, leader_slot_t: u64| {
+            let mut s = snapshot_at(bi.slot);
+            s.leader_slot_t = leader_slot_t;
+            s.batch = crate::epoch::batch::BatchWindow::Open {
+                batch: bi,
+                next: Some(crate::epoch::batch::BatchSlot {
+                    index: 2,
+                    slot: bi.slot + pitch,
+                    cutoff_slot: bi.slot + pitch - 100_000,
+                }),
+            };
+            s
+        };
+        // 90 slots per attempt (60 + 30). A 1000-slot pitch less a 3 × 10 margin
+        // leaves 970, so ten attempts fit.
+        assert_eq!(max_sign_attempts(&snap(1000, 10), Some(bi), 3), 10);
+        // The margin is linear in the roster: the same pitch with 30 members and a
+        // coarse hop reserves 900 slots, leaving room for one.
+        assert_eq!(max_sign_attempts(&snap(1000, 30), Some(bi), 30), 1);
+        // And it can consume the interval outright — which is the constraint doing
+        // its job, not a defect: a roster this size cannot be posted for within
+        // one pitch, so there is nothing to spend a second attempt on.
+        assert_eq!(max_sign_attempts(&snap(1000, 60), Some(bi), 100), 1);
+    }
+
+    /// No grid means no `B_(i+1)` to be superseded by, so there is no budget to
+    /// derive and the answer is the pre-WI-EJSVJ one: a single attempt.
+    #[test]
+    fn without_a_grid_there_is_one_signing_attempt() {
+        let s = snapshot_at(5_000_000);
+        assert_eq!(max_sign_attempts(&s, None, 3), 1);
+        assert_eq!(
+            signing_window(&(Arc::new(SystemClock) as Arc<dyn Clock>), &s, None, 3).max_attempts(),
+            1
+        );
+    }
+
     /// WI-077's acceptance case at this level: the window is anchored on the
     /// BATCH OPPORTUNITY, so a node's own position only shortens its wait.
     ///
@@ -8193,7 +8377,7 @@ mod tests {
         };
         let wait_of = |read_at: u64| {
             let before = clock.now();
-            let w = signing_window(&clock, &snapshot_at(read_at), Some(batch));
+            let w = signing_window(&clock, &snapshot_at(read_at), Some(batch), 3);
             (w.round1_close - before, w.round2_close - before)
         };
         let (at_bi, _) = wait_of(batch.slot);
@@ -8220,7 +8404,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let wait_of = |read_at: u64| {
             let before = clock.now();
-            signing_window(&clock, &snapshot_at(read_at), None).round1_close - before
+            signing_window(&clock, &snapshot_at(read_at), None, 3).round1_close - before
         };
         assert_eq!(wait_of(5_000_000).as_secs(), 60);
         assert_eq!(

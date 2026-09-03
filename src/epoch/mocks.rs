@@ -1036,6 +1036,13 @@ pub struct MockPeerNetwork {
     /// DKG normally. Models the peer that goes dark exactly at a signing round,
     /// which is what forces the round past its deadline on everyone else.
     mute_sign: bool,
+    /// This node publishes its signing Round 1 and then nothing else. Models
+    /// COMMIT-THEN-WITHHOLD: the member that joins `S1`, so honest nodes build
+    /// their package around it, and then never publishes a share. It is the one
+    /// absence a threshold cannot absorb — Round 1 closes on `min_signers`, but
+    /// Round 2 needs every member of the package — and a peer that simply CRASHES
+    /// between the two deadlines is indistinguishable from it (WI-EJSVJ).
+    withhold_sign_round2: bool,
     /// This node publishes nothing for the ROTATION session only — it co-signs
     /// treasury movements normally. Models the outgoing member that sits out the
     /// Update-Y (banned, deregistered, restarted with a wiped state_dir) without
@@ -1062,6 +1069,7 @@ impl MockPeerNetwork {
             me,
             hub,
             mute_sign: false,
+            withhold_sign_round2: false,
             mute_rotation: false,
             unreachable: std::collections::BTreeSet::new(),
             unreachable_sign_only: std::collections::BTreeSet::new(),
@@ -1072,6 +1080,13 @@ impl MockPeerNetwork {
     #[must_use]
     pub fn muting_sign_publishes(mut self) -> Self {
         self.mute_sign = true;
+        self
+    }
+
+    /// See [`MockPeerNetwork::withhold_sign_round2`].
+    #[must_use]
+    pub fn withholding_sign_round2(mut self) -> Self {
+        self.withhold_sign_round2 = true;
         self
     }
 
@@ -1196,7 +1211,10 @@ impl PeerNetwork for MockPeerNetwork {
         _identifier: Identifier,
         share: frost_secp256k1_tr::round2::SignatureShare,
     ) -> EpochResult<()> {
-        if self.mute_sign || (self.mute_rotation && ns.session == UPDATE_Y_SESSION) {
+        if self.mute_sign
+            || self.withhold_sign_round2
+            || (self.mute_rotation && ns.session == UPDATE_Y_SESSION)
+        {
             return Ok(());
         }
         with_slot(&self.hub, self.me, |s| {

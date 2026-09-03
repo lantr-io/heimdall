@@ -42,6 +42,47 @@ pub async fn fetch_tx_confirmations(
         .and_then(serde_json::Value::as_u64))
 }
 
+/// The `scriptPubKey` an outpoint actually pays to, straight off Bitcoin.
+///
+/// `Ok(None)` is "cannot tell" — the node has no such transaction, or no output
+/// at that index — and must NOT be read as a mismatch, for the same reason
+/// `fetch_tx_confirmations` returning `None` is not read as zero: a node without
+/// `-txindex` knows nothing about an outpoint it did not create.
+///
+/// It exists so a federation recovery can prove it rebuilt the RIGHT Taproot tree
+/// before `t` of `n` members burn a signing session on the wrong one. The tree
+/// depends on three values an operator may have to supply by hand under pressure
+/// — `Y_51`, `Y_federation` and the CSV delay — and getting any of them wrong
+/// produces a perfectly well-formed transaction that spends an address the
+/// treasury is not at.
+pub async fn fetch_output_script_pubkey(
+    rpc: &BtcRpcConfig,
+    outpoint: &bitcoin::OutPoint,
+) -> EpochResult<Option<bitcoin::ScriptBuf>> {
+    let json = rpc_call(
+        rpc,
+        "getrawtransaction",
+        serde_json::json!([outpoint.txid.to_string(), true]),
+    )
+    .await?;
+    let Some(hex_str) = json
+        .get("result")
+        .and_then(|r| r.get("vout"))
+        .and_then(|v| v.get(outpoint.vout as usize))
+        .and_then(|o| o.get("scriptPubKey"))
+        .and_then(|s| s.get("hex"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        EpochError::Chain(format!(
+            "btc rpc returned a non-hex scriptPubKey for {outpoint}: {e}"
+        ))
+    })?;
+    Ok(Some(bitcoin::ScriptBuf::from_bytes(bytes)))
+}
+
 /// One JSON-RPC round trip, returning the whole envelope so callers can read
 /// `result` themselves. Errors carry the node's own message: a `getrawtransaction`
 /// refusal is usually "No such mempool or blockchain transaction… use -txindex",

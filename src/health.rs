@@ -82,6 +82,16 @@ pub struct NodeState {
     /// node's chain state: it is registered, unbanned, reachable, and simply not
     /// being talked to.
     pub excluded_peers: Vec<String>,
+    /// Consecutive treasury movements the 51% mode could not sign (WI-Y3JJK).
+    ///
+    /// Zero once a movement reaches a signature. A number that keeps climbing is
+    /// the one condition whose answer is not in this process: the treasury then
+    /// moves only through the federation's CSV-leaf spend, which is an operator
+    /// action (`heimdall federation-spend`) because the daemon never spends and
+    /// the spec puts that mode out of band. It is a queryable field for the same
+    /// reason `dkg_qualified` is — a warn line scrolls away, and by the time
+    /// anyone looks the log is gone.
+    pub unsigned_movements: u32,
     /// POSIX ms when the loop last did something worth calling progress —
     /// reached a batch opportunity, finished a ceremony, posted a movement.
     ///
@@ -179,6 +189,14 @@ pub fn render(state: &NodeState) -> String {
             None => "— (no ceremony yet this epoch)",
         }
     ));
+    if state.unsigned_movements > 0 {
+        out.push_str(&format!(
+            "movements       {} consecutive NOT signed by the 51% mode — if this keeps climbing \
+             the treasury moves only via `heimdall federation-spend` (operator action; no daemon \
+             spends)\n",
+            state.unsigned_movements
+        ));
+    }
     out.push_str(&format!(
         "last progress   {}\n",
         state
@@ -295,6 +313,27 @@ mod tests {
         assert!(text.contains("not signing"), "{text}");
     }
 
+    /// A treasury the roster can no longer move is the one condition whose answer
+    /// is not in this process, so the line has to say what to reach for. Absent
+    /// while the count is zero — a healthy node should not carry a standing
+    /// mention of the emergency path.
+    #[test]
+    fn unsigned_movements_name_the_path_that_is_left() {
+        let quiet = render(&NodeState::default());
+        assert!(!quiet.contains("federation-spend"), "{quiet}");
+
+        let stuck = render(&NodeState {
+            unsigned_movements: 3,
+            ..Default::default()
+        });
+        assert!(stuck.contains("3 consecutive NOT signed"), "{stuck}");
+        assert!(stuck.contains("federation-spend"), "{stuck}");
+        assert!(
+            stuck.contains("no daemon spends"),
+            "must say it will not happen by itself: {stuck}"
+        );
+    }
+
     /// An excluded peer is reported with its reason, because that failure is
     /// invisible from the excluded node's own chain state.
     #[test]
@@ -375,6 +414,7 @@ mod tests {
             }),
             dkg_qualified: Some(true),
             excluded_peers: vec!["spo=cd34: blueprint differs".into()],
+            unsigned_movements: 2,
             last_progress_ms: Some(1_700_000_000_000),
             activity: "waiting".into(),
         };

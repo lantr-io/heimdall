@@ -492,7 +492,15 @@ async fn frost_sign_message(
     // Sequence 0: the rotation happens at most once per epoch and its
     // reserved `session` already separates it from every movement, so it
     // needs no grid index to tell two of them apart (WI-W8ZC4).
-    let ns = SignNamespace::new(epoch, 0, UPDATE_Y_SESSION, *msg);
+    //
+    // Attempt 0, and only 0. The retry a Round-2 shortfall opens for a MOVEMENT
+    // (WI-EJSVJ) has room because the batch grid leaves some between `B_i` and
+    // `B_(i+1)`; the rotation has no grid, and `rotation_window` already lays its
+    // single pair of deadlines against `update_y_deadline`, so a second go would
+    // have to run past the moment the Update-Y was meant to exist by. A rotation
+    // that does not land is spec behaviour — the old key carries over, "no halt,
+    // no special state" — and `machine`'s `rotation_spent` gate already says so.
+    let ns = SignNamespace::new(epoch, 0, 0, UPDATE_Y_SESSION, *msg);
 
     // Never `rng.rng(..)`: the context would be `update-y:epoch={epoch}`, constant
     // across the re-entries WI-047 introduced, so under `--deterministic` a retry
@@ -536,7 +544,7 @@ async fn frost_sign_message(
         ns,
         me,
         Quorum::of(&peer_infos, roster.min_signers),
-        window.close_of(crate::epoch::state::SigningRound::Round1),
+        window.close_of(crate::epoch::state::SigningRound::Round1, 0),
         &mut round1,
     )
     .await
@@ -585,7 +593,7 @@ async fn frost_sign_message(
         ns,
         me,
         Quorum::all(&s1),
-        window.close_of(crate::epoch::state::SigningRound::Round2),
+        window.close_of(crate::epoch::state::SigningRound::Round2, 0),
         &mut round2,
     )
     .await
@@ -613,14 +621,14 @@ mod tests {
     /// schedule (WI-077), which a unit test has no chain to read.
     fn test_window(ms: u64) -> crate::epoch::state::SigningWindow {
         let now = std::time::Instant::now();
-        crate::epoch::state::SigningWindow {
-            round1_close: now + std::time::Duration::from_millis(ms),
+        crate::epoch::state::SigningWindow::at(
+            now + std::time::Duration::from_millis(ms),
             // Strictly after round 1, as a real window is: round 2 closes at
             // `B_i + sign_r1_window + sign_r2_window`. Giving both rounds the
             // same instant leaves round 2 no window at all and it times out
             // having polled nobody.
-            round2_close: now + std::time::Duration::from_millis(2 * ms),
-        }
+            now + std::time::Duration::from_millis(2 * ms),
+        )
     }
 
     use super::*;

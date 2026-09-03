@@ -12,7 +12,7 @@
 //! before handing anything back, binding each payload to its
 //! `(epoch, input, sighash, pool_id, identifier)` domain.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use frost::Identifier;
@@ -52,14 +52,18 @@ pub(crate) fn spent(round: u8) -> impl Fn(EpochError) -> EpochError {
 
 /// Drive one sub-round of the signing phase for all TM inputs.
 ///
-/// TODO: signing cascade is not implemented. Today `sign_phase` only
-/// exercises `CascadeLevel::Quorum51`; on timeout it returns `PollTimeout`
-/// and the state machine aborts. A real implementation should catch
-/// the timeout from `poll_sign_round{1,2}` and fall through to
-/// `Federation` (script-path spend after `federation_csv_blocks`).
-/// NOTE for whoever writes it: match on `e.cause()`, not on `e` — [`spent`]
-/// wraps a timeout in `RoundSpent`, and `EpochError::cause()` is what sees
-/// through it.
+/// A Round-2 shortfall does not end the movement: it opens the next attempt over
+/// the survivors, with fresh commitments in a fresh namespace. See
+/// [`open_next_attempt`] for why that is the only safe answer and why the
+/// exclusion is shaped the way it is.
+///
+/// It does not fall through to a FEDERATION mode, and there is nothing here to
+/// add one to: per the spec the federation mode "does not use the SPO HTTP
+/// endpoints" and "has no signing namespace at all" — it is an out-of-band spend
+/// of the CSV leaf under `Y_federation`, posted permissionlessly like any other
+/// movement, which heimdall then observes as an ordinary TM. See
+/// [`CascadeLevel`], which records the same thing where the type would otherwise
+/// invite a second variant.
 ///
 /// TODO: misbehavior detection. FROST errors here currently surface as
 /// `EpochError::Frost(String)` with the identity lost. The identifiable
@@ -88,6 +92,10 @@ pub async fn sign_phase(
     mut tm: TreasuryMovement,
     round: SigningRound,
     mut collected: SignCollected,
+    // Which go at this opportunity this is, and who this movement will not ask
+    // again — see `EpochPhase::Sign::attempt` / `::excluded` (WI-EJSVJ).
+    attempt: u64,
+    excluded: BTreeSet<Identifier>,
     // Carried through to `Submit`, which elects the submission cascade with it.
     tm_sequence: u64,
     // When each round closes, from the chain schedule (WI-077). Read ONCE here
@@ -142,10 +150,35 @@ pub async fn sign_phase(
             // gate unchanged once a leader-proposed TM arrives over the wire.
             verify_spi_root(config, me, epoch, &tm)?;
 
+            // A later attempt asks fewer members, so check the threshold is still
+            // reachable BEFORE publishing a commitment. Waiting out the window
+            // instead would reach the same verdict, but it spends the round to get
+            // there: the nonces are published and this node then cannot join the
+            // next opportunity's first attempt cleanly. The threshold itself never
+            // moves across attempts — excluding a member changes who may sign,
+            // never how many must (spec §Failure handling).
+            let eligible = roster.participants.len().saturating_sub(excluded.len());
+            if eligible < roster.min_signers as usize {
+                crate::epoch_warn!(
+                    me,
+                    epoch,
+                    "Sign attempt {attempt}: {eligible} of {} members remain after excluding {} \
+                     round-2 non-publisher(s), below the {} required — the 51% mode is over for \
+                     this movement.",
+                    roster.participants.len(),
+                    excluded.len(),
+                    roster.min_signers,
+                );
+                return Err(EpochError::PollTimeout {
+                    got: eligible,
+                    need: roster.min_signers as usize,
+                });
+            }
+
             crate::epoch_log!(
                 me,
                 epoch,
-                "Sign round1: generating nonce commitments for {} input(s)",
+                "Sign round1 (attempt {attempt}): generating nonce commitments for {} input(s)",
                 num_inputs
             );
             // Generate and publish this SPO's nonce commitments for every input.
@@ -174,7 +207,7 @@ pub async fn sign_phase(
                 let mark = |e| if published_any { spent(1)(e) } else { e };
                 peers
                     .publish_sign_round1(
-                        input_namespace(epoch, tm_sequence, &tm, i),
+                        input_namespace(epoch, tm_sequence, attempt, &tm, i),
                         me,
                         commitments,
                     )
@@ -184,8 +217,15 @@ pub async fn sign_phase(
                 crate::epoch_debug!(me, epoch, "  -> published commitments for input {i}");
             }
 
-            // Poll peers for round 1 commitments on every input.
-            let peer_infos = roster.peers_of(me);
+            // Poll peers for round 1 commitments on every input — every peer the
+            // roster has, less the ones an earlier attempt at THIS movement
+            // watched commit and then withhold (WI-EJSVJ). A member that was
+            // merely silent is not in `excluded` and is asked again.
+            let peer_infos: Vec<&crate::epoch::state::SpoInfo> = roster
+                .peers_of(me)
+                .into_iter()
+                .filter(|p| !excluded.contains(&p.identifier))
+                .collect();
             // No member is required (WI-104). Posting is permissionless, so any
             // node holding the aggregate can post it and an absent member costs a
             // cascade hop, not the round. This used to require the leader,
@@ -204,7 +244,7 @@ pub async fn sign_phase(
                     "  waiting for round1 commitments on input {i} from {} peer(s)...",
                     peer_infos.len()
                 );
-                let ns = input_namespace(epoch, tm_sequence, &tm, i);
+                let ns = input_namespace(epoch, tm_sequence, attempt, &tm, i);
                 let map = collected.round1.entry(i).or_default();
                 // S1 for this input: whoever published by the deadline, at least
                 // `min_signers` of them.
@@ -215,7 +255,7 @@ pub async fn sign_phase(
                     ns,
                     me,
                     Quorum::of(&peer_infos, roster.min_signers),
-                    window.close_of(SigningRound::Round1),
+                    window.close_of(SigningRound::Round1, attempt),
                     map,
                 )
                 .await
@@ -235,6 +275,22 @@ pub async fn sign_phase(
                     "  <- have all round1 commitments, advancing to round2"
                 );
             } else {
+                // Logged and NOT carried into `excluded`, deliberately. Round 1
+                // closes on the threshold, so an absence here costs the round
+                // nothing, and the spec is explicit that it is not evidence of
+                // anything: a member down at one attempt may be back at the next,
+                // which is what the retry is for.
+                //
+                // It does mean a later attempt polls the silent member again and
+                // waits out the full round-1 deadline instead of returning early —
+                // and that is the design, not an oversight to optimise away. The
+                // deadline is what FIXES `S1`; returning early is only safe when
+                // everyone polled has answered, because "everyone" is the one
+                // subset two nodes cannot disagree about. Dropping last attempt's
+                // absentees from the poll is exclusion under another name, and it
+                // breaks in the case it is meant to help: a member that recovers by
+                // attempt 1 publishes into a namespace nobody reads, believes it is
+                // in `S1`, and aggregates against a package no one else built.
                 let mut listed: Vec<String> = absent_signers
                     .iter()
                     .map(|(id, missed)| format!("{} ({missed}/{num_inputs})", id_short(*id)))
@@ -261,6 +317,8 @@ pub async fn sign_phase(
                 tm,
                 round: SigningRound::Round2,
                 collected,
+                attempt,
+                excluded,
             })
         }
 
@@ -268,7 +326,8 @@ pub async fn sign_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "Sign round2: computing tweaked signature shares for {} input(s)",
+                "Sign round2 (attempt {attempt}): computing tweaked signature shares for {} \
+                 input(s)",
                 num_inputs
             );
             // For each input: build SigningPackage, compute this SPO's
@@ -279,7 +338,14 @@ pub async fn sign_phase(
             // failure below is SPENT — see `spent`. The loop is wrapped once
             // rather than each `?` tagged individually, so a fallible step added
             // later inherits the marker instead of quietly escaping it.
-            let signed: EpochResult<()> = async {
+            // `Ok(Some(..))` is a ROUND-2 SHORTFALL: those members of `S1`
+            // committed and then published no share by the deadline, so this
+            // attempt cannot be aggregated — see `open_next_attempt`. It is not an
+            // error at this level because the answer to it is a new attempt, not a
+            // failure, and only the caller below knows whether one is left. The
+            // timeout rides along so that the case with no attempt left still
+            // fails with the counts the round actually saw.
+            let signed: EpochResult<Option<(BTreeSet<Identifier>, EpochError)>> = async {
                 for i in 0..num_inputs as u32 {
                     let commitments = collected
                         .round1
@@ -320,7 +386,7 @@ pub async fn sign_phase(
 
                     collected.round2.entry(i).or_default().insert(me, share);
 
-                    let ns = input_namespace(epoch, tm_sequence, &tm, i);
+                    let ns = input_namespace(epoch, tm_sequence, attempt, &tm, i);
                     peers.publish_sign_round2(ns, me, share).await?;
                     crate::epoch_debug!(me, epoch, "    -> published share for input {i}");
 
@@ -347,17 +413,30 @@ pub async fn sign_phase(
                         s1.len()
                     );
                     let shares = collected.round2.entry(i).or_default();
-                    poll_sign_round(
+                    let polled = poll_sign_round(
                         peers,
                         clock,
                         config,
                         ns,
                         me,
                         Quorum::all(&s1),
-                        window.close_of(SigningRound::Round2),
+                        window.close_of(SigningRound::Round2, attempt),
                         shares,
                     )
-                    .await?;
+                    .await;
+                    if let Err(e) = polled {
+                        // Only a closed deadline names a shortfall. Anything else
+                        // is a genuine failure of this round and stays one.
+                        if !matches!(e.cause(), EpochError::PollTimeout { .. }) {
+                            return Err(e);
+                        }
+                        let missing: BTreeSet<Identifier> = s1
+                            .iter()
+                            .map(|p| p.identifier)
+                            .filter(|id| !shares.contains_key(id))
+                            .collect();
+                        return Ok(Some((missing, e)));
+                    }
 
                     // Aggregate.
                     let signature = participant::sign_aggregate_with_tweak(
@@ -379,10 +458,27 @@ pub async fn sign_phase(
 
                     tm.signatures[i as usize] = Some(signature);
                 }
-                Ok(())
+                Ok(None)
             }
             .await;
-            signed.map_err(spent(2))?;
+
+            if let Some((missing, timeout)) = signed.map_err(spent(2))? {
+                return open_next_attempt(
+                    me,
+                    epoch,
+                    roster,
+                    tm_sequence,
+                    window,
+                    cascade,
+                    group_keys,
+                    epoch_keys,
+                    tm,
+                    attempt,
+                    excluded,
+                    missing,
+                    timeout,
+                );
+            }
 
             Ok(EpochPhase::Submit {
                 epoch,
@@ -394,6 +490,121 @@ pub async fn sign_phase(
             })
         }
     }
+}
+
+/// Answer a Round-2 shortfall: re-enter Round 1 at `attempt + 1` without the
+/// members that committed and then withheld (WI-EJSVJ, spec §Round-2 shortfall
+/// opens a new attempt).
+///
+/// ## Why a new attempt, and not aggregation over the survivors
+///
+/// The `SigningPackage` IS `S1`'s list of Round-1 commitments: the binding
+/// factors, the group commitment `R` and the challenge are all hashes over that
+/// list, and every share was computed against it. Dropping a member of `S1` from
+/// the sum leaves a value that does not verify against `R` — a partial `S1` is not
+/// a weaker signature, it is not a signature. Making it verify would mean asking
+/// the survivors to recompute their shares against a package over the smaller set,
+/// on the SAME nonce pair they already published. Two responses on one nonce
+/// reveal the share, so that trades a stalled movement for the treasury key. The
+/// only safe answer is fresh commitments, which need their own namespace.
+///
+/// ## Why the excluded set is what it is
+///
+/// It grows monotonically, so the eligible set strictly shrinks and this cannot
+/// loop: each defector costs one attempt, once. It holds only members that reached
+/// `S1` and then went quiet — a member that published nothing in Round 1 was never
+/// in the package, cost the round nothing, and is asked again. And it dies with the
+/// movement: this is not a ban, it mints no `FaultProof`, and the next opportunity
+/// starts from the full roster.
+///
+/// Every honest node derives the same set from the same published payloads at the
+/// same chain-anchored deadline, which is what lets them build one package. Two
+/// nodes that briefly disagree — one fetched a share a moment before the deadline,
+/// one did not — cost liveness, not safety: both attempts sign the same unsigned
+/// transaction against the same head, and at most one movement per head can ever
+/// confirm.
+///
+/// This needs no malice to fire. A member that CRASHES between the two deadlines
+/// looks exactly like one that withholds, which on a large roster makes it the
+/// expected case rather than the adversarial one.
+#[allow(clippy::too_many_arguments)]
+fn open_next_attempt(
+    me: Identifier,
+    epoch: u64,
+    roster: Roster,
+    tm_sequence: u64,
+    window: crate::epoch::state::SigningWindow,
+    cascade: CascadeLevel,
+    group_keys: GroupKeys,
+    epoch_keys: EpochKeys,
+    tm: TreasuryMovement,
+    attempt: u64,
+    mut excluded: BTreeSet<Identifier>,
+    missing: BTreeSet<Identifier>,
+    // The round's own timeout, kept so an exhausted budget fails with the counts
+    // the poll actually closed on rather than with numbers made up here.
+    timeout: EpochError,
+) -> EpochResult<EpochPhase> {
+    let named = |set: &BTreeSet<Identifier>| {
+        set.iter()
+            .map(|id| id_short(*id).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let next = attempt + 1;
+    // Out of room before the posting margin runs out. The movement is not signed
+    // and the round is spent, so the way back in is the next opportunity — where
+    // the full roster is asked again, because the exclusions were this movement's.
+    if next >= window.max_attempts() {
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "Sign round2 (attempt {attempt}): no round-2 share from [{}] and the opportunity has \
+             room for {} attempt(s) — this movement is not signed. The next batch opportunity \
+             starts again from the full roster.",
+            named(&missing),
+            window.max_attempts(),
+        );
+        return Err(spent(2)(timeout));
+    }
+    excluded.extend(missing.iter().copied());
+    let eligible = roster.participants.len().saturating_sub(excluded.len());
+    crate::epoch_warn!(
+        me,
+        epoch,
+        "Sign round2 (attempt {attempt}): no round-2 share from [{}] after they committed in \
+         round 1 — this attempt cannot aggregate (the package is S1's commitments, and a partial \
+         sum does not verify). Opening attempt {next} over the remaining {eligible} member(s) \
+         with fresh commitments.",
+        named(&missing),
+    );
+    Ok(EpochPhase::Sign {
+        epoch,
+        roster,
+        tm_sequence,
+        window,
+        cascade,
+        group_keys,
+        epoch_keys,
+        tm,
+        round: SigningRound::Round1,
+        // Everything from the abandoned attempt goes, nonces included: the new
+        // attempt is a new namespace, so its commitments must be new too. Keeping
+        // a nonce across the two is the exact hazard this path exists to avoid.
+        //
+        // Every input is re-signed, including any that already aggregated before
+        // the shortfall — and that is required, not merely simple. Which inputs a
+        // node finished is a function of how far it got through a SERIAL loop
+        // before the shared deadline, not of anything published, so two nodes
+        // routinely differ: skipping "the ones I already have" would have them
+        // publish round-1 commitments for different input ranges and build
+        // different `S1`s for the overlap. It is also rarely costly — the inputs
+        // share one round-2 deadline, so a member absent on every input stalls at
+        // input 0 and nothing downstream ever ran.
+        collected: SignCollected::default(),
+        attempt: next,
+        excluded,
+    })
 }
 
 /// Recompute the completed-peg-outs root this TM should commit, from THIS node's
@@ -524,13 +735,22 @@ fn verify_spi_root(
 /// The namespace one input's FROST session publishes under.
 ///
 /// `tm_sequence` — the batch grid index this movement was built at — is part of
-/// it, and that is what separates two ATTEMPTS at the same movement. A rebuild
-/// at the next opportunity is byte-identical when the chain has not moved, so
-/// `(epoch, session, sighash)` repeats exactly; the sequence does not, and every
-/// SPO derives it from the same grid rather than from its own retry count
+/// it, and that is what separates two OPPORTUNITIES at the same movement. A
+/// rebuild at the next opportunity is byte-identical when the chain has not moved,
+/// so `(epoch, session, sighash)` repeats exactly; the sequence does not, and
+/// every SPO derives it from the same grid rather than from its own retry count
 /// (WI-W8ZC4).
-fn input_namespace(epoch: u64, tm_sequence: u64, tm: &TreasuryMovement, i: u32) -> SignNamespace {
-    SignNamespace::new(epoch, tm_sequence, i, tm.sighashes[i as usize])
+///
+/// `attempt` separates two goes WITHIN one opportunity, where even the sequence
+/// repeats — see [`open_next_attempt`].
+fn input_namespace(
+    epoch: u64,
+    tm_sequence: u64,
+    attempt: u64,
+    tm: &TreasuryMovement,
+    i: u32,
+) -> SignNamespace {
+    SignNamespace::new(epoch, tm_sequence, attempt, i, tm.sighashes[i as usize])
 }
 
 /// The payload one signing round collects from each peer, and how to fetch it.
@@ -843,12 +1063,12 @@ mod tests {
     /// one from, and only needs the round to end.
     fn test_window(ms: u64) -> crate::epoch::state::SigningWindow {
         let now = std::time::Instant::now();
-        crate::epoch::state::SigningWindow {
-            round1_close: now + std::time::Duration::from_millis(ms),
+        crate::epoch::state::SigningWindow::at(
+            now + std::time::Duration::from_millis(ms),
             // Strictly after round 1, as a real window is — see the twin helper
             // in `rotation`.
-            round2_close: now + std::time::Duration::from_millis(2 * ms),
-        }
+            now + std::time::Duration::from_millis(2 * ms),
+        )
     }
 
     use super::*;
@@ -892,7 +1112,7 @@ mod tests {
         });
         config.poll_interval = std::time::Duration::from_millis(5);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let ns = SignNamespace::new(7, 1, 0, [0xa1u8; 32]);
+        let ns = SignNamespace::new(7, 1, 0, 0, [0xa1u8; 32]);
 
         // SPO 3 publishes; the leader (SPO 1) never does. That is a threshold
         // subset {2,3} of a 2-of-3 roster — enough signers, wrong ones.
@@ -1064,7 +1284,7 @@ mod tests {
             &peers,
             &clock,
             &config,
-            SignNamespace::new(7, 1, 0, [0xd4u8; 32]),
+            SignNamespace::new(7, 1, 0, 0, [0xd4u8; 32]),
             me,
             Quorum::of(&peer_infos, roster.min_signers),
             std::time::Instant::now() + std::time::Duration::from_millis(100),
@@ -1105,10 +1325,7 @@ mod tests {
         });
 
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        let expired = crate::epoch::state::SigningWindow {
-            round1_close: past,
-            round2_close: past,
-        };
+        let expired = crate::epoch::state::SigningWindow::at(past, past);
         let started = std::time::Instant::now();
         let err = sign_phase(
             &peers,
@@ -1126,6 +1343,8 @@ mod tests {
             tm,
             SigningRound::Round1,
             SignCollected::default(),
+            0,
+            BTreeSet::new(),
             0,
             expired,
         )
@@ -1172,10 +1391,7 @@ mod tests {
         // round-1 commitments and then fails alone — the session is spent, and
         // the commitments outlive it.
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        let expired = crate::epoch::state::SigningWindow {
-            round1_close: past,
-            round2_close: past,
-        };
+        let expired = crate::epoch::state::SigningWindow::at(past, past);
         for gk in &group_keys_all {
             let id = *gk.key_package.identifier();
             let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
@@ -1196,6 +1412,8 @@ mod tests {
                 tm.clone(),
                 SigningRound::Round1,
                 SignCollected::default(),
+                0,
+                BTreeSet::new(),
                 1,
                 expired,
             )
@@ -1217,7 +1435,7 @@ mod tests {
         for peer in roster.participants.values() {
             assert!(
                 observer
-                    .fetch_sign_round1(SignNamespace::new(0, 1, 0, tm.sighashes[0]), peer)
+                    .fetch_sign_round1(SignNamespace::new(0, 1, 0, 0, tm.sighashes[0]), peer)
                     .await
                     .unwrap()
                     .is_some(),
@@ -1232,7 +1450,7 @@ mod tests {
         for peer in roster.participants.values() {
             assert!(
                 observer
-                    .fetch_sign_round1(SignNamespace::new(0, 2, 0, tm.sighashes[0]), peer)
+                    .fetch_sign_round1(SignNamespace::new(0, 2, 0, 0, tm.sighashes[0]), peer)
                     .await
                     .unwrap()
                     .is_none(),
@@ -1268,6 +1486,8 @@ mod tests {
                     tm,
                     round: SigningRound::Round1,
                     collected: SignCollected::default(),
+                    attempt: 0,
+                    excluded: BTreeSet::new(),
                 };
                 loop {
                     phase = match phase {
@@ -1282,6 +1502,8 @@ mod tests {
                             tm,
                             round,
                             collected,
+                            attempt,
+                            excluded,
                         } => sign_phase(
                             &peers,
                             &clock,
@@ -1295,6 +1517,8 @@ mod tests {
                             tm,
                             round,
                             collected,
+                            attempt,
+                            excluded,
                             tm_sequence,
                             window,
                         )
@@ -1487,7 +1711,7 @@ mod tests {
             &peers,
             &clock,
             &config,
-            SignNamespace::new(7, 1, 0, [0xc3u8; 32]),
+            SignNamespace::new(7, 1, 0, 0, [0xc3u8; 32]),
             me,
             Quorum::of(&peer_infos, roster.min_signers),
             expired,
@@ -1503,6 +1727,314 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "a past deadline must close the round at once, not run a timer of its own"
         );
+    }
+
+    /// A window with room for `max_attempts` goes, laid off `now`.
+    ///
+    /// Round 1 gets a second and round 2 a fraction of one, which is lopsided for a
+    /// production schedule and right for this: `poll_sign_round` returns as soon as
+    /// everyone has answered, so the only deadline a test actually WAITS OUT is the
+    /// one with a member missing behind it — round 2's. Round 1 is given room to
+    /// spare so three nodes doing FROST arithmetic on one runtime cannot miss it and
+    /// turn a retry test into a scheduling test.
+    ///
+    /// Both are only reachable alongside [`fast_poll`]: at the default 5-second poll
+    /// interval a 1-second window is SAMPLED ONCE (WI-112) and the round closes on
+    /// whoever happened to answer before the first fetch.
+    fn retryable_window(max_attempts: u64) -> crate::epoch::state::SigningWindow {
+        let now = std::time::Instant::now();
+        let r1 = std::time::Duration::from_secs(1);
+        let r2 = r1 + std::time::Duration::from_millis(300);
+        crate::epoch::state::SigningWindow::at(now + r1, now + r2).with_attempts(r2, max_attempts)
+    }
+
+    /// A demo config that polls fast enough for [`retryable_window`]'s deadlines.
+    ///
+    /// `demo_default` polls every 5 seconds, which is a production cadence against
+    /// production windows. Left at that, each retry test spends its whole run
+    /// asleep between fetches — the three of them cost ~48 s of pure waiting — and
+    /// worse, round 2's window falls below one poll interval, so the round is
+    /// decided by scheduling luck rather than by the deadline. Every other
+    /// multi-node test in this module lowers it for the same reason.
+    fn fast_poll(id: Identifier) -> EpochConfig {
+        let mut config = EpochConfig::demo_default(SpoIdentity {
+            identifier: id,
+            bifrost_id_pk: Vec::new(),
+            port: 0,
+        });
+        config.poll_interval = std::time::Duration::from_millis(5);
+        config
+    }
+
+    /// Drive one node's `Sign` phase to a terminal state, starting at attempt 0.
+    ///
+    /// Returns the movement if it reached `Submit`, and the highest attempt the
+    /// node opened — which is the thing under test: an attempt that never opened
+    /// is a retry that did not happen, and a `Submit` at attempt 0 would mean the
+    /// shortfall was never noticed.
+    async fn drive_sign(
+        peers: Arc<dyn PeerNetwork>,
+        config: EpochConfig,
+        roster: Roster,
+        gk: GroupKeys,
+        tm: TreasuryMovement,
+        window: crate::epoch::state::SigningWindow,
+    ) -> (EpochResult<TreasuryMovement>, u64) {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let mut highest = 0;
+        let mut phase = EpochPhase::Sign {
+            epoch: 0,
+            tm_sequence: 1,
+            window,
+            roster: roster.clone(),
+            cascade: CascadeLevel::Quorum51,
+            group_keys: gk.clone(),
+            epoch_keys: EpochKeys {
+                roster,
+                group_keys: gk,
+            },
+            tm,
+            round: SigningRound::Round1,
+            collected: SignCollected::default(),
+            attempt: 0,
+            excluded: BTreeSet::new(),
+        };
+        loop {
+            phase = match phase {
+                EpochPhase::Sign {
+                    epoch,
+                    roster,
+                    cascade,
+                    tm_sequence,
+                    window,
+                    group_keys,
+                    epoch_keys,
+                    tm,
+                    round,
+                    collected,
+                    attempt,
+                    excluded,
+                } => {
+                    highest = highest.max(attempt);
+                    match sign_phase(
+                        &peers,
+                        &clock,
+                        &rng,
+                        &config,
+                        epoch,
+                        roster,
+                        cascade,
+                        group_keys,
+                        epoch_keys,
+                        tm,
+                        round,
+                        collected,
+                        attempt,
+                        excluded,
+                        tm_sequence,
+                        window,
+                    )
+                    .await
+                    {
+                        Ok(next) => next,
+                        Err(e) => return (Err(e), highest),
+                    }
+                }
+                EpochPhase::Submit { tm, .. } => return (Ok(tm), highest),
+                other => panic!("unexpected: {}", other.name()),
+            };
+        }
+    }
+
+    /// The denial this exists to remove: one member of a 2-of-3 roster commits in
+    /// Round 1 — which puts it in `S1`, and honest nodes have no way to keep a
+    /// committer out — and then publishes no share.
+    ///
+    /// Before WI-EJSVJ that ended the movement: Round 2 needs every member of the
+    /// package, `S1` is uncapped so it is the whole roster on a healthy one, and
+    /// the round was spent so the batch opportunity was gone. Now the shortfall
+    /// opens attempt 1 over the survivors with fresh commitments, and the two
+    /// honest members sign.
+    ///
+    /// The withholder does not get the signature either, and on a multi-input
+    /// movement that follows without any rule aimed at it: the honest members
+    /// block on input 0 until the round-2 deadline, so they never publish input
+    /// 1's share, and the withholder — which raced ahead on the share it computed
+    /// but did not publish — then sees THEM as the shortfall. Its own exclusion
+    /// set leaves it below threshold and it stops. Withholding costs the honest
+    /// majority one attempt and costs the withholder the movement.
+    #[tokio::test]
+    async fn a_member_that_commits_then_withholds_is_excluded_and_the_movement_still_signs() {
+        let (roster, group_keys_all, tm, hub) = dkg_and_movement(3, 2).await;
+        let withholder = Identifier::try_from(3u16).unwrap();
+
+        let mut handles = Vec::new();
+        for gk in group_keys_all {
+            let id = *gk.key_package.identifier();
+            let base = MockPeerNetwork::new(id, hub.clone());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(if id == withholder {
+                base.withholding_sign_round2()
+            } else {
+                base
+            });
+            let config = fast_poll(id);
+            let roster = roster.clone();
+            let tm = tm.clone();
+            handles.push(tokio::spawn(async move {
+                let w = retryable_window(3);
+                (id, drive_sign(peers, config, roster, gk, tm, w).await)
+            }));
+        }
+
+        let mut honest = 0;
+        for h in handles {
+            let (id, (outcome, highest)) = h.await.unwrap();
+            if id == withholder {
+                assert!(
+                    outcome.is_err(),
+                    "the withholder must not end up holding the signature it denied everyone else"
+                );
+                continue;
+            }
+            let signed = outcome.unwrap_or_else(|e| panic!("spo {id:?} failed: {e:?}"));
+            assert!(
+                signed.signatures.iter().all(Option::is_some),
+                "spo {id:?} must reach a fully signed movement"
+            );
+            assert_eq!(
+                highest, 1,
+                "an honest member must notice the shortfall and open exactly one more attempt"
+            );
+            honest += 1;
+        }
+        assert_eq!(honest, 2, "both honest members must have signed");
+    }
+
+    /// The same failure with no malice in it: a member publishes Round 1 and then
+    /// the process is gone. Its peers cannot tell this apart from withholding —
+    /// both are "in the package, no share by the deadline" — which is why the
+    /// answer has to be the same one, and why on a large roster this is the
+    /// EXPECTED case rather than the adversarial one.
+    ///
+    /// Driven without the mock knob on purpose: the crashed node runs Round 1 and
+    /// is then simply never stepped again, so nothing about the recovery depends
+    /// on a test double behaving in a particular way.
+    #[tokio::test]
+    async fn a_member_that_crashes_between_the_rounds_costs_one_attempt_not_the_movement() {
+        let (roster, group_keys_all, tm, hub) = dkg_and_movement(3, 2).await;
+        let crashed = Identifier::try_from(3u16).unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+        let mut handles = Vec::new();
+        for gk in group_keys_all {
+            let id = *gk.key_package.identifier();
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let config = fast_poll(id);
+            let roster = roster.clone();
+            let tm = tm.clone();
+            let clock = clock.clone();
+            handles.push(tokio::spawn(async move {
+                let w = retryable_window(3);
+                if id == crashed {
+                    // Round 1 only: commitments are published, and then this node
+                    // never comes back.
+                    let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+                    let _ = sign_phase(
+                        &peers,
+                        &clock,
+                        &rng,
+                        &config,
+                        0,
+                        roster.clone(),
+                        CascadeLevel::Quorum51,
+                        gk.clone(),
+                        EpochKeys {
+                            roster,
+                            group_keys: gk,
+                        },
+                        tm,
+                        SigningRound::Round1,
+                        SignCollected::default(),
+                        0,
+                        BTreeSet::new(),
+                        1,
+                        w,
+                    )
+                    .await
+                    .expect("round 1 publishes and closes on the threshold");
+                    return (id, None);
+                }
+                let (outcome, highest) = drive_sign(peers, config, roster, gk, tm, w).await;
+                (id, Some((outcome, highest)))
+            }));
+        }
+
+        let mut survivors = 0;
+        for h in handles {
+            let (id, result) = h.await.unwrap();
+            let Some((outcome, highest)) = result else {
+                continue;
+            };
+            let signed = outcome.unwrap_or_else(|e| panic!("spo {id:?} failed: {e:?}"));
+            assert!(signed.signatures.iter().all(Option::is_some));
+            assert_eq!(
+                highest, 1,
+                "the crash costs exactly one attempt, not the movement"
+            );
+            survivors += 1;
+        }
+        assert_eq!(survivors, 2, "both honest members must have signed");
+    }
+
+    /// A schedule with room for one attempt is the pre-WI-EJSVJ behaviour, and it
+    /// must stay reachable rather than being papered over: the movement is not
+    /// signed, the error is marked SPENT so the epoch loop rejoins its peers at
+    /// the next synchronized entry, and the exclusions die with the movement.
+    ///
+    /// This is why `max_sign_attempts` is worth an operator's attention — a
+    /// `tm_batch_interval` too tight for two attempts reproduces exactly the
+    /// single-defector denial the retry exists to remove.
+    #[tokio::test]
+    async fn one_attempt_of_budget_leaves_the_movement_unsigned() {
+        let (roster, group_keys_all, tm, hub) = dkg_and_movement(3, 2).await;
+        let withholder = Identifier::try_from(3u16).unwrap();
+
+        let mut handles = Vec::new();
+        for gk in group_keys_all {
+            let id = *gk.key_package.identifier();
+            let base = MockPeerNetwork::new(id, hub.clone());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(if id == withholder {
+                base.withholding_sign_round2()
+            } else {
+                base
+            });
+            let config = fast_poll(id);
+            let roster = roster.clone();
+            let tm = tm.clone();
+            handles.push(tokio::spawn(async move {
+                let w = retryable_window(1);
+                (id, drive_sign(peers, config, roster, gk, tm, w).await)
+            }));
+        }
+
+        for h in handles {
+            let (id, (outcome, highest)) = h.await.unwrap();
+            if id == withholder {
+                assert!(outcome.is_err(), "nobody gets a signature out of this");
+                continue;
+            }
+            let err = outcome.expect_err("no budget for a second attempt");
+            assert!(
+                err.round_is_spent(),
+                "round 1 was published, so the way back in is the next opportunity: {err:?}"
+            );
+            assert!(
+                matches!(err.cause(), EpochError::PollTimeout { .. }),
+                "the cause must survive the spent marker: {err:?}"
+            );
+            assert_eq!(highest, 0, "no second attempt may open without the budget");
+        }
     }
 
     /// aggregated Schnorr signature must verify under the tweaked output
@@ -1543,6 +2075,8 @@ mod tests {
                     tm,
                     round: SigningRound::Round1,
                     collected: SignCollected::default(),
+                    attempt: 0,
+                    excluded: BTreeSet::new(),
                 };
                 loop {
                     phase = match phase {
@@ -1557,6 +2091,8 @@ mod tests {
                             tm,
                             round,
                             collected,
+                            attempt,
+                            excluded,
                         } => sign_phase(
                             &peers,
                             &clock,
@@ -1570,6 +2106,8 @@ mod tests {
                             tm,
                             round,
                             collected,
+                            attempt,
+                            excluded,
                             tm_sequence,
                             window,
                         )
