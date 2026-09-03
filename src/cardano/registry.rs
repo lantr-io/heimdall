@@ -96,6 +96,9 @@ pub enum RegistryError {
     // -- insert planning --
     /// The pool_id already has a registration node.
     AlreadyRegistered,
+    // -- remove planning --
+    /// The pool_id has no registration node to remove.
+    NotRegistered,
 }
 
 impl std::fmt::Display for RegistryError {
@@ -121,6 +124,7 @@ impl std::fmt::Display for RegistryError {
             Self::NotAscending(k) => write!(f, "chain not ascending at key {}", hex::encode(k)),
             Self::UnreachableNodes(n) => write!(f, "{n} node(s) unreachable from root"),
             Self::AlreadyRegistered => write!(f, "pool_id already registered"),
+            Self::NotRegistered => write!(f, "pool_id is not registered"),
         }
     }
 }
@@ -400,6 +404,55 @@ impl RegistryList {
             },
         })
     }
+
+    /// Plan the removal of `pool_id`: find the element that links TO it and
+    /// produce the datum the continued anchor must carry.
+    ///
+    /// The mirror of [`Self::plan_insert`], and on-chain
+    /// (`linked_list.remove`, `spos-registry.ak`'s `Deregister`) it is checked
+    /// as the same shape run backwards: the continued anchor keeps its data
+    /// and takes over the removed node's link, and the removed node's NFT —
+    /// asset name `pool_id`, which is the membership token — is burnt.
+    ///
+    /// The anchor is the predecessor in KEY order, which in a chain-checked
+    /// list is the same element as the one holding the link, so this needs no
+    /// walk: `check_chain` has already established that they agree.
+    pub fn plan_remove(&self, pool_id: &[u8]) -> Result<RegistryRemove, RegistryError> {
+        let removed = self
+            .nodes
+            .get(pool_id)
+            .ok_or(RegistryError::NotRegistered)?;
+
+        let (anchor_asset_name, anchor_data) = match self
+            .nodes
+            .range::<[u8], _>((
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Excluded(pool_id),
+            ))
+            .next_back()
+        {
+            Some((key, entry)) => (key.clone(), ElementData::Node(entry.data.clone())),
+            None => (REGISTRATION_ROOT_KEY.to_vec(), ElementData::Root),
+        };
+        // The predecessor by key is the predecessor by link, or `check_chain`
+        // would have rejected this snapshot before `plan_remove` was reachable.
+        debug_assert_eq!(
+            match anchor_asset_name.as_slice() {
+                k if k == REGISTRATION_ROOT_KEY => self.root_link.as_deref(),
+                k => self.nodes.get(k).and_then(|e| e.link.as_deref()),
+            },
+            Some(pool_id)
+        );
+
+        Ok(RegistryRemove {
+            anchor_asset_name,
+            continued_anchor: RegistryElement {
+                data: anchor_data,
+                link: removed.link.clone(),
+            },
+            removed_asset_name: pool_id.to_vec(),
+        })
+    }
 }
 
 /// The linked-list half of a register_spo tx: which element UTxO to spend as
@@ -416,6 +469,24 @@ pub struct RegistryInsert {
     pub new_node_asset_name: Vec<u8>,
     /// Datum of the new registration node output.
     pub new_node: RegistryElement,
+}
+
+/// The linked-list half of a deregister_spo tx: which element UTxO to spend as
+/// the anchor, the datum its continued output must carry, and the element
+/// whose NFT is burnt. Both named elements are spent — the anchor to rewrite
+/// its link, the removed node to destroy it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryRemove {
+    /// Asset name of the anchor element's NFT ([`REGISTRATION_ROOT_KEY`] when
+    /// the removed node is the first in the list) — identifies the UTxO to
+    /// spend and continue.
+    pub anchor_asset_name: Vec<u8>,
+    /// Datum of the continued anchor output: data unchanged, link → whatever
+    /// the removed node pointed at.
+    pub continued_anchor: RegistryElement,
+    /// Asset name of the removed node's NFT (= pool_id = the membership token
+    /// burnt by the `Deregister` mint).
+    pub removed_asset_name: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -742,6 +813,156 @@ mod tests {
             list.plan_insert(REGISTRATION_ROOT_KEY, node_data(9)),
             Err(RegistryError::BadNodeKey(_))
         ));
+    }
+
+    /// Assert the conditions `linked_list.remove` checks on-chain for a
+    /// planned removal against the pre-removal anchor and node elements.
+    fn assert_onchain_remove_ok(
+        anchor_before: &RegistryElement,
+        removed_before: &RegistryElement,
+        plan: &RegistryRemove,
+        removed_key: &[u8],
+    ) {
+        // The anchor keeps its data — only the link moves.
+        assert_eq!(plan.continued_anchor.data, anchor_before.data);
+        // …and takes over the removed node's link, closing the gap.
+        assert_eq!(plan.continued_anchor.link, removed_before.link);
+        // The burnt token is the removed node's own NFT.
+        assert_eq!(plan.removed_asset_name, removed_key);
+        // The anchor is the element that pointed AT the removed node.
+        assert_eq!(anchor_before.link.as_deref(), Some(removed_key));
+        match &anchor_before.data {
+            ElementData::Root => assert_eq!(plan.anchor_asset_name, REGISTRATION_ROOT_KEY),
+            ElementData::Node(_) => assert!(plan.anchor_asset_name.as_slice() < removed_key),
+        }
+    }
+
+    #[test]
+    fn plan_remove_first_node_anchors_on_root() {
+        let list = three_node_list();
+        let plan = list.plan_remove(b"aa-pool").unwrap();
+        assert_onchain_remove_ok(
+            &root_elem(Some(b"aa-pool")).1,
+            &node_elem(b"aa-pool", 0, Some(b"bb-pool")).1,
+            &plan,
+            b"aa-pool",
+        );
+        assert_eq!(plan.continued_anchor.link.as_deref(), Some(&b"bb-pool"[..]));
+    }
+
+    #[test]
+    fn plan_remove_mid_list_anchors_on_predecessor() {
+        let list = three_node_list();
+        let plan = list.plan_remove(b"bb-pool").unwrap();
+        assert_onchain_remove_ok(
+            &node_elem(b"aa-pool", 0, Some(b"bb-pool")).1,
+            &node_elem(b"bb-pool", 1, Some(b"cc-pool")).1,
+            &plan,
+            b"bb-pool",
+        );
+        assert_eq!(plan.anchor_asset_name, b"aa-pool");
+    }
+
+    #[test]
+    fn plan_remove_last_node_leaves_the_anchor_pointing_nowhere() {
+        let list = three_node_list();
+        let plan = list.plan_remove(b"cc-pool").unwrap();
+        assert_onchain_remove_ok(
+            &node_elem(b"bb-pool", 1, Some(b"cc-pool")).1,
+            &node_elem(b"cc-pool", 2, None).1,
+            &plan,
+            b"cc-pool",
+        );
+        assert_eq!(plan.continued_anchor.link, None);
+    }
+
+    #[test]
+    fn plan_remove_the_only_node_empties_the_list() {
+        let list = RegistryList::from_elements([
+            root_elem(Some(b"aa-pool")),
+            node_elem(b"aa-pool", 0, None),
+        ])
+        .unwrap();
+        let plan = list.plan_remove(b"aa-pool").unwrap();
+        assert_eq!(plan.anchor_asset_name, REGISTRATION_ROOT_KEY);
+        assert_eq!(plan.continued_anchor.data, ElementData::Root);
+        assert_eq!(plan.continued_anchor.link, None);
+    }
+
+    #[test]
+    fn plan_remove_refuses_a_pool_that_is_not_in_the_list() {
+        let list = three_node_list();
+        assert!(matches!(
+            list.plan_remove(b"dd-pool"),
+            Err(RegistryError::NotRegistered)
+        ));
+        assert!(matches!(
+            list.plan_remove(REGISTRATION_ROOT_KEY),
+            Err(RegistryError::NotRegistered)
+        ));
+    }
+
+    /// Register then deregister leaves the list exactly as it was found. The
+    /// point is not the datums but the ROOT this enables: `identity_pairs` is
+    /// what the treasury's `bifrost_identity_root` is rebuilt from, so a list
+    /// that does not come back byte-identical is a root that does not either,
+    /// and the freed `bifrost_id_pk` could not be registered again ([DRG-4]).
+    #[test]
+    fn insert_then_remove_restores_the_list() {
+        let before = three_node_list();
+        let insert = before.plan_insert(b"bx-pool", node_data(9)).unwrap();
+
+        // Apply the insert to the snapshot: anchor rewritten, new node added.
+        let mut elements: Vec<(Vec<u8>, RegistryElement)> = vec![
+            (
+                insert.anchor_asset_name.clone(),
+                insert.continued_anchor.clone(),
+            ),
+            (insert.new_node_asset_name.clone(), insert.new_node.clone()),
+        ];
+        for (key, data, link) in [
+            (
+                REGISTRATION_ROOT_KEY.to_vec(),
+                ElementData::Root,
+                before.root_link.clone(),
+            ),
+            (
+                b"aa-pool".to_vec(),
+                ElementData::Node(node_data(0)),
+                Some(b"bb-pool".to_vec()),
+            ),
+            (
+                b"bb-pool".to_vec(),
+                ElementData::Node(node_data(1)),
+                Some(b"cc-pool".to_vec()),
+            ),
+            (b"cc-pool".to_vec(), ElementData::Node(node_data(2)), None),
+        ] {
+            if key != insert.anchor_asset_name {
+                elements.push((key, RegistryElement { data, link }));
+            }
+        }
+        let after_insert = RegistryList::from_elements(elements.clone()).unwrap();
+        assert_eq!(after_insert.len(), 4);
+
+        let remove = after_insert.plan_remove(b"bx-pool").unwrap();
+        let restored = RegistryList::from_elements(elements.into_iter().filter_map(|(k, e)| {
+            if k == remove.removed_asset_name {
+                None
+            } else if k == remove.anchor_asset_name {
+                Some((k, remove.continued_anchor.clone()))
+            } else {
+                Some((k, e))
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(restored.root_link, before.root_link);
+        assert_eq!(restored.identity_pairs(), before.identity_pairs());
+        assert_eq!(
+            restored.iter().collect::<Vec<_>>(),
+            before.iter().collect::<Vec<_>>()
+        );
     }
 
     // R1c glue: the list yields (bifrost_id_pk → pool_id) pairs the identity

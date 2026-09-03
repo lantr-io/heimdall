@@ -305,6 +305,48 @@ pub fn apply_registration(
     Ok((new_datum, absence_proof))
 }
 
+/// Compute the post-deregistration `treasury_info` datum and the
+/// `bifrost_identity_removal_proof` for deleting `bifrost_id_pk → pool_id`.
+///
+/// The exact inverse of [`apply_registration`], and it differs in the ONE way
+/// the on-chain check does: the proof is a MEMBERSHIP proof of the pair being
+/// removed, not an absence proof, and the new root is the walk of that proof
+/// with the element gone. `spos-registry.ak`'s `Deregister` recomputes
+/// `mpf.delete(old_root, bifrost_id_pk, pool_id, proof)` and requires the
+/// treasury output datum to carry the result.
+///
+/// Removing rather than tombstoning is what frees the identity: spec [DRG-4]
+/// asks for it precisely so the same `bifrost_id_pk` can be registered again
+/// later.
+pub fn apply_deregistration(
+    current: &TreasuryInfoDatum,
+    identity_trie: &mpf::Trie,
+    bifrost_id_pk: &[u8],
+    pool_id: &[u8],
+) -> Result<(TreasuryInfoDatum, mpf::Proof), TreasuryInfoError> {
+    if identity_trie.root_hash() != current.bifrost_identity_root {
+        return Err(TreasuryInfoError::RootMismatch);
+    }
+    let removal_proof = identity_trie
+        .prove_membership(bifrost_id_pk)
+        .map_err(TreasuryInfoError::Mpf)?;
+    // The proof must be of THIS pair. `prove_membership` proves whatever value
+    // the trie holds for the key, so a caller that passed a pool_id the trie
+    // does not agree with would otherwise build a tx the validator rejects for
+    // reasons the error would not name.
+    if mpf::including(bifrost_id_pk, pool_id, &removal_proof).map_err(TreasuryInfoError::Mpf)?
+        != current.bifrost_identity_root
+    {
+        return Err(TreasuryInfoError::RootMismatch);
+    }
+    let new_root = mpf::excluding(bifrost_id_pk, &removal_proof).map_err(TreasuryInfoError::Mpf)?;
+    let new_datum = TreasuryInfoDatum {
+        bifrost_identity_root: new_root,
+        ..current.clone()
+    };
+    Ok((new_datum, removal_proof))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +480,70 @@ mod tests {
         assert!(matches!(
             apply_registration(&current, &trie, b"spo-0", b"pool-0"),
             Err(TreasuryInfoError::Mpf(mpf::MpfError::KeyPresent))
+        ));
+    }
+
+    // The mirror of the R1c core, and the property the exit depends on: the
+    // removal proof rebuilds the OLD root WITH the pair and the NEW root
+    // without it, and the pair is back where it started after a
+    // register/deregister round trip ([DRG-4] — the identity is freed, not
+    // tombstoned).
+    #[test]
+    fn apply_deregistration_updates_root_and_yields_valid_proof() {
+        let trie = mpf::Trie::from_pairs(pairs(30)).unwrap();
+        let current = sample_datum(trie.root_hash());
+
+        let (new_datum, proof) =
+            apply_deregistration(&current, &trie, b"spo-7", b"pool-7").unwrap();
+
+        assert_eq!(
+            mpf::including(b"spo-7", b"pool-7", &proof).unwrap(),
+            current.bifrost_identity_root
+        );
+        assert_eq!(
+            mpf::excluding(b"spo-7", &proof).unwrap(),
+            new_datum.bifrost_identity_root
+        );
+        assert_ne!(
+            new_datum.bifrost_identity_root,
+            current.bifrost_identity_root
+        );
+        assert_eq!(
+            new_datum.current_spos_frost_key,
+            current.current_spos_frost_key
+        );
+
+        // Round trip: registering the freed identity again returns the root to
+        // exactly where it was, which is what "can be registered again later"
+        // has to mean for a Merkle root.
+        let after = mpf::Trie::from_pairs(
+            pairs(30)
+                .into_iter()
+                .filter(|(k, _)| k.as_slice() != b"spo-7"),
+        )
+        .unwrap();
+        assert_eq!(after.root_hash(), new_datum.bifrost_identity_root);
+        let (back, _) = apply_registration(&new_datum, &after, b"spo-7", b"pool-7").unwrap();
+        assert_eq!(back.bifrost_identity_root, current.bifrost_identity_root);
+    }
+
+    #[test]
+    fn apply_deregistration_rejects_a_stale_trie_an_absent_key_and_the_wrong_pool() {
+        let trie = mpf::Trie::from_pairs(pairs(10)).unwrap();
+        assert!(matches!(
+            apply_deregistration(&sample_datum([9u8; 32]), &trie, b"spo-0", b"pool-0"),
+            Err(TreasuryInfoError::RootMismatch)
+        ));
+        let current = sample_datum(trie.root_hash());
+        assert!(matches!(
+            apply_deregistration(&current, &trie, b"never-registered", b"pool-0"),
+            Err(TreasuryInfoError::Mpf(mpf::MpfError::KeyAbsent))
+        ));
+        // The key is registered, but to a different pool_id than the caller
+        // claims — the on-chain delete would reject it, so this does too.
+        assert!(matches!(
+            apply_deregistration(&current, &trie, b"spo-0", b"pool-9"),
+            Err(TreasuryInfoError::RootMismatch)
         ));
     }
 

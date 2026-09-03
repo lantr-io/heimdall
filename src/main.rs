@@ -636,6 +636,65 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Build (and with --submit, broadcast) the deregister_spo tx: leave the
+    /// registry. Burns this pool's membership token, unlinks its registration
+    /// node and removes its bifrost identity from the treasury
+    /// bifrost_identity_root, freeing that identity to register again later.
+    ///
+    /// Authorized by the pool COLD key alone (an Ed25519 signature over
+    /// "bifrost-revoke" || pool_id), so an SPO that lost its bifrost key can
+    /// still leave. There is no min-stake gate here — that one is registration
+    /// only.
+    ///
+    /// It does NOT retract a roster already frozen for the current epoch: this
+    /// node still owes that epoch's DKG and signing duties, and switching it
+    /// off before the boundary is a fault, not an exit.
+    DeregisterSpo {
+        #[arg(long)]
+        config: Option<String>,
+        /// Override the embedded contract blueprint with a `plutus.json` file.
+        #[arg(long)]
+        blueprint: Option<String>,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
+        /// that parameterizes the registry policy (and through it treasury_info).
+        #[arg(long)]
+        registry_bootstrap: Option<String>,
+        /// Pool cold signing key: 32-byte hex, or a path to a file holding that
+        /// hex or a cardano-cli TextEnvelope. Omit for the air-gapped flow
+        /// (--cold-vkey + --cold-sig, produced by `sign-revocation`).
+        #[arg(long)]
+        cold_skey: Option<String>,
+        /// Air-gapped: 32-byte cold verification key, hex (or the .vkey file).
+        #[arg(long)]
+        cold_vkey: Option<String>,
+        /// Air-gapped: 64-byte Ed25519 signature (hex) over the revocation
+        /// message. Run without it first to print the exact message to sign.
+        #[arg(long)]
+        cold_sig: Option<String>,
+        /// Override the registry reference-script UTxO (<tx_hash>:<index>).
+        /// Discovered automatically otherwise, as for register-spo.
+        #[arg(long)]
+        registry_ref: Option<String>,
+        /// Actually submit via Blockfrost (default: print the tx only).
+        #[arg(long)]
+        submit: bool,
+    },
+    /// Sign a deregistration with the pool COLD key, on the machine that holds
+    /// it — the exit counterpart of `sign-registration`. Prints the
+    /// --cold-vkey/--cold-sig pair for `deregister-spo`, which can then run on
+    /// a node that has never seen the cold key.
+    ///
+    /// The signature commits to nothing but the pool id, so it stays valid for
+    /// the life of the pool key: it is a standing authorization to leave, and
+    /// wants the same care as the key itself.
+    SignRevocation {
+        #[arg(long)]
+        config: Option<String>,
+        /// Pool cold SIGNING key: a `cold.skey` TextEnvelope, a path to one, or
+        /// raw 32-byte hex. Falls back to `cardano.cold_skey_path`.
+        #[arg(long)]
+        cold_skey: Option<String>,
+    },
     /// Update-Y: rotate `current_spos_frost_key` in the treasury_info state UTxO
     /// to the incoming roster's Y_51' (the DKG key handoff — §Update-Y). The
     /// OUTGOING key signs (BIP340) a domain-tagged message committing to the
@@ -1179,6 +1238,42 @@ fn run_sign_registration(
     Ok(())
 }
 
+/// Sign a deregistration off the node: Ed25519 over `"bifrost-revoke" || pool_id`
+/// with the pool cold key. The exit counterpart of [`run_sign_registration`],
+/// and it needs strictly less — no bifrost key, no URL, because the contract
+/// asks the operational key for nothing when its owner leaves.
+fn run_sign_revocation(cfg: &HeimdallConfig, cold_skey: Option<&str>) -> Result<(), String> {
+    use heimdall::cardano::deregister_spo::{sign_revocation, verify_revocation};
+    use pallas_crypto::key::ed25519;
+
+    let cold_src = cold_skey
+        .or(cfg.cardano.cold_skey_path.as_deref())
+        .ok_or("no cold key: pass --cold-skey or set cardano.cold_skey_path")?;
+    let cold = ed25519::SecretKey::from(parse_key32(cold_src, "--cold-skey")?);
+
+    let sig = sign_revocation(&cold);
+    // The same verification spos-registry.ak runs. It cannot fail for a key this
+    // command just signed with, which is the point: if it ever does, the message
+    // construction here and there have diverged, and that must not reach a chain.
+    let pool_id = verify_revocation(&sig)
+        .map_err(|e| format!("self-check failed, refusing to print: {e}"))?;
+
+    println!(
+        "pool id:  {} ({})",
+        hex::encode(pool_id),
+        pool_id_bech32(&pool_id)
+    );
+    println!();
+    println!("Pass these to `deregister-spo` on the node:");
+    println!();
+    println!("    --cold-vkey {} \\", hex::encode(sig.cold_vkey));
+    println!("    --cold-sig {}", hex::encode(sig.cold_sig));
+    println!();
+    println!("This signature commits to the pool id and nothing else, so it stays valid until the");
+    println!("cold key changes. Keep it as private as the key that made it.");
+    Ok(())
+}
+
 /// Whether this wallet already holds a reference script for `script_hash_hex`.
 ///
 /// The deploy commands are otherwise unconditional, so running one twice parks a
@@ -1601,6 +1696,38 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_register_spo(&cfg, &args) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::DeregisterSpo {
+            config,
+            blueprint,
+            registry_bootstrap,
+            cold_skey,
+            cold_vkey,
+            cold_sig,
+            registry_ref,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            let args = DeregisterSpoArgs {
+                blueprint,
+                registry_bootstrap,
+                cold_skey,
+                cold_vkey,
+                cold_sig,
+                registry_ref,
+                submit,
+            };
+            if let Err(e) = run_deregister_spo(&cfg, &args) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::SignRevocation { config, cold_skey } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_sign_revocation(&cfg, cold_skey.as_deref()) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -5341,6 +5468,17 @@ struct RegisterSpoArgs {
     submit: bool,
 }
 
+/// deregister-spo CLI inputs.
+struct DeregisterSpoArgs {
+    blueprint: Option<String>,
+    registry_bootstrap: Option<String>,
+    cold_skey: Option<String>,
+    cold_vkey: Option<String>,
+    cold_sig: Option<String>,
+    registry_ref: Option<String>,
+    submit: bool,
+}
+
 /// apply-ban CLI inputs.
 struct ApplyBanArgs {
     blueprint: Option<String>,
@@ -6100,6 +6238,305 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
     finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex)
+}
+
+/// Build (and with `--submit`, broadcast) the deregister_spo tx: burn the
+/// membership token, unlink the registration node and remove the bifrost
+/// identity from the treasury's `bifrost_identity_root`.
+///
+/// Mirrors [`run_register_spo`] and differs in three deliberate ways: only the
+/// cold key signs (spec [DRG-2] — the bifrost key does not consent to its own
+/// removal, so a lost operational key is not a life sentence), there is no
+/// min-stake gate (that is a registration policy), and no epoch validity window
+/// (the spec leaves the interval unconstrained — an exit binds to no snapshot).
+fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
+    use heimdall::cardano::deregister_spo::{
+        DeregisterSpoRequest, RevocationSignature, build_deregister_spo_tx, revocation_message,
+        verify_revocation,
+    };
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::ref_script::{RefScriptOrigin, find_ref_script_anywhere};
+    use heimdall::cardano::register_spo::pool_id_from_cold_vkey;
+    use heimdall::cardano::registry::REGISTRATION_ROOT_KEY;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+    use pallas_crypto::key::ed25519;
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
+    let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(&registry_bootstrap),
+        )?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let treasury = treasury_info_script(
+        &blueprint_json,
+        &tsy_tx_id,
+        u64::from(tsy_index),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+    let registry = spos_registry_script(
+        &blueprint_json,
+        &reg_tx_id,
+        u64::from(reg_index),
+        &treasury.hash,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+
+    // ── the cold identity: a local secret key, or the air-gapped halves ──
+    let cold_skey_src = args
+        .cold_skey
+        .as_deref()
+        .or(cfg.cardano.cold_skey_path.as_deref());
+    let cold_skey: Option<ed25519::SecretKey> = cold_skey_src
+        .map(|arg| parse_key32(arg, "--cold-skey").map(ed25519::SecretKey::from))
+        .transpose()?;
+    let cold_vkey_src = args
+        .cold_vkey
+        .as_deref()
+        .or(cfg.cardano.cold_vkey_path.as_deref());
+    let cold_vkey: [u8; 32] = match (&cold_skey, cold_vkey_src) {
+        (Some(sk), None) => sk.public_key().into(),
+        (None, Some(vk)) => parse_key32(vk, "--cold-vkey")?,
+        (Some(sk), Some(vk)) => {
+            let derived: [u8; 32] = sk.public_key().into();
+            if parse_key32(vk, "--cold-vkey")? != derived {
+                return Err("--cold-vkey does not match --cold-skey".into());
+            }
+            derived
+        }
+        (None, None) => {
+            return Err(
+                "provide --cold-skey, or --cold-vkey (+ --cold-sig) for the air-gapped flow. \
+                 `heimdall sign-revocation` produces both on the machine that holds the cold key"
+                    .into(),
+            );
+        }
+    };
+
+    let pool_id = pool_id_from_cold_vkey(&cold_vkey);
+    let message = revocation_message(&pool_id);
+    let cold_sig: [u8; 64] = match (&cold_skey, args.cold_sig.as_deref()) {
+        (Some(sk), _) => sk
+            .sign(&message)
+            .as_ref()
+            .try_into()
+            .expect("ed25519 signature is 64 bytes"),
+        (None, Some(sig)) => parse_hex_n(sig, "--cold-sig")?,
+        (None, None) => {
+            return Err(format!(
+                "no --cold-skey/--cold-sig. Air-gapped: Ed25519-sign this message with the \
+                 pool cold key (or run `heimdall sign-revocation` there) and re-run with \
+                 --cold-sig:\n  message (hex): {}",
+                hex::encode(&message)
+            ));
+        }
+    };
+    let sig = RevocationSignature {
+        cold_vkey,
+        cold_sig,
+    };
+    verify_revocation(&sig).map_err(|e| format!("revocation signature: {e}"))?;
+
+    println!(
+        "pool id:           {} ({})",
+        hex::encode(pool_id),
+        pool_id_bech32(&pool_id)
+    );
+    println!("registry policy:   {}", registry.hash_hex());
+    println!("treasury policy:   {}", treasury.hash_hex());
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    // ── chain state ──
+    let network = network_of(&wallet_addr);
+    let registry_addr = registry.enterprise_address(network);
+    let treasury_addr = treasury.enterprise_address(network);
+    let wallet_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let registry_utxos = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
+        .map_err(|e| format!("registry UTxO query: {e}"))?;
+    let treasury_utxos = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &treasury_addr))
+        .map_err(|e| format!("treasury UTxO query: {e}"))?;
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    // The registry script is needed for two spends AND the burn — it must be
+    // referenced, and it is found the same way register-spo finds it (WI-091).
+    let registry_ref = match args.registry_ref.as_deref() {
+        Some(s) => {
+            let (tx_id, index) =
+                parse_cardano_outref(s).map_err(|e| format!("--registry-ref: {e}"))?;
+            let outref = (hex::encode(tx_id), index);
+            println!(
+                "registry ref:      {}#{} (--registry-ref)",
+                outref.0, outref.1
+            );
+            Some(outref)
+        }
+        None => {
+            let hash = registry.hash_hex();
+            let found = rt
+                .block_on(find_ref_script_anywhere(
+                    &base_url,
+                    pid,
+                    &wallet_addr,
+                    Some(&registry_bootstrap),
+                    &hash,
+                ))
+                .map_err(|e| format!("reference-script lookup: {e}"))?;
+            let (found, origin) = found.ok_or_else(|| {
+                format!(
+                    "no reference script for the registry ({hash}), at {wallet_addr} or at the \
+                     wallet this bridge was deployed from.\n\
+                     Deploy one, or pass an existing one as --registry-ref <txid:ix>:\n\
+                     \x20 heimdall deploy-registry-ref --config <file> --submit",
+                )
+            })?;
+            match &origin {
+                RefScriptOrigin::OwnWallet => {
+                    println!("registry ref:      {found} (discovered at this wallet)");
+                }
+                RefScriptOrigin::Deployer(addr) => {
+                    // Same warning register-spo prints: it is kept SPENDABLE on
+                    // purpose, so the deployer can reclaim it and break this
+                    // path. An exit needs it exactly as a join does.
+                    println!("registry ref:      {found} (the bridge deployer's, at {addr})");
+                    println!(
+                        "                   nothing to deploy — but that UTxO is theirs to spend"
+                    );
+                }
+            }
+            Some(found.outref())
+        }
+    };
+
+    // Rev 5.5 [DRG-5]: the treasury's RegistryUpdate branch reads the registry
+    // policy from the Config datum, so the tx must reference the Config UTxO.
+    let config_view = rt
+        .block_on(config_view_async(cfg))?
+        .ok_or("deregister-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
+
+    let req = DeregisterSpoRequest {
+        registry_script: &registry,
+        treasury_script: &treasury,
+        // [CFG-4] constant, not a flag — see run_register_spo.
+        treasury_asset_name_hex: &hex::encode(
+            heimdall::cardano::config_params::TREASURY_INFO_ASSET_NAME,
+        ),
+        config_ref: (config_view.utxo.tx_hash.clone(), config_view.utxo.index),
+        registry_utxos: &registry_utxos,
+        treasury_utxos: &treasury_utxos,
+        wallet_address: &wallet_addr,
+        wallet_utxos: &wallet_utxos,
+        key: &key,
+        sig: &sig,
+        invalid_before: None,
+        invalid_hereafter: None,
+        registry_ref,
+        cost_models: Some(cost_models),
+    };
+    let built =
+        build_deregister_spo_tx(&req).map_err(|e| format!("build deregister_spo tx: {e}"))?;
+
+    // What an exit costs the ROSTER, which is not visible in the transaction.
+    //
+    // `spo_bans.ak` requires a LIVE registration node for the accused pool as a
+    // reference input — `validate_registered_pool_ref`, in both the first-ban
+    // and the re-ban branch. This transaction burns that node's NFT, so once it
+    // confirms no ApplyBan naming this pool can be built again, ever: an
+    // outstanding fault proof becomes unenforceable and an existing ban can no
+    // longer escalate. Say so, and report what can be checked.
+    //
+    // Only half of it CAN be checked here. An unspent FaultProof token sits at
+    // its minter's own wallet with no datum, under a name that is
+    // blake2b_256(pool_id || evidence_hash) — so "is someone about to ban me"
+    // has no off-chain query. The ban list does.
+    println!();
+    let ban_policy = config_view.params.bans.spo_bans_policy_id;
+    let ban_addr = heimdall::cardano::blueprint::script_enterprise_address(&ban_policy, network);
+    match rt.block_on(bf_http::fetch_address_utxos(&base_url, pid, &ban_addr)) {
+        Ok(ban_utxos) => {
+            match heimdall::cardano::ban_list::ban_snapshot(&ban_utxos, &hex::encode(ban_policy)) {
+                Ok(list) => match list.get(&pool_id) {
+                    Some(node) => println!(
+                        "ban record:        THIS POOL IS IN THE BAN LIST (ban_counter={}, \
+                         until={}{}). Leaving now makes that ban unescalatable: a re-ban needs \
+                         this registration node as a reference input.",
+                        node.ban_counter,
+                        node.ban_until_time,
+                        if node.permanent { ", PERMANENT" } else { "" }
+                    ),
+                    None => println!("ban record:        none for this pool"),
+                },
+                Err(e) => println!("ban record:        unreadable ({e}) — cannot say"),
+            }
+        }
+        Err(e) => println!("ban record:        unreadable ({e}) — cannot say"),
+    }
+    println!(
+        "                   NOTE: this exit burns the registry node that `apply-ban` needs as \
+         a reference input, so no ban for this pool can be applied after it confirms."
+    );
+    println!();
+
+    let anchor = if built.anchor_asset_name == REGISTRATION_ROOT_KEY {
+        "reg-root (registry root)".to_string()
+    } else {
+        hex::encode(&built.anchor_asset_name)
+    };
+    println!("anchor element:    {anchor}");
+    println!(
+        "bifrost identity:  {} (freed)",
+        hex::encode(&built.bifrost_id_pk)
+    );
+    println!(
+        "new identity root: {}",
+        hex::encode(built.new_bifrost_identity_root)
+    );
+    println!(
+        "burning token:     {}.{}",
+        registry.hash_hex(),
+        hex::encode(built.pool_id)
+    );
+    println!(
+        "deposit refunded:  {} lovelace → {} (the change address of this tx)",
+        built.freed_lovelace, wallet_addr
+    );
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    let out = finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex);
+    if out.is_ok() && args.submit {
+        // The one thing an exiting operator can still get wrong, and it is not
+        // in the transaction: the roster for the CURRENT epoch was frozen at its
+        // boundary and this removal does not reach back into it.
+        println!();
+        println!(
+            "Keep this node running until the next epoch boundary. The roster for the current \
+             epoch was frozen before this transaction, so this SPO still owes its DKG and \
+             signing duties for it — leaving early is a fault, not an exit."
+        );
+    }
+    out
 }
 
 struct UpdateYArgs {
