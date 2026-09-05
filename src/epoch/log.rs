@@ -13,8 +13,14 @@
 //! [`crate::logging`]. Use `epoch_log!` for protocol progress, `epoch_debug!`
 //! for per-peer and per-packet detail, `epoch_warn!` when the node degrades or
 //! drops something, `epoch_error!` when it gives up.
+//!
+//! `epoch_event!` is the fifth: `info`, but under [`crate::logging::EVENT_TARGET`]
+//! so the handful of lines an operator wants pushed to them can be selected on
+//! their own — see there for what qualifies.
 
 use frost_secp256k1_tr::Identifier;
+
+use crate::epoch::state::SpoInfo;
 
 /// Render an `Identifier` as the small integer participant index (1, 2, 3, …)
 /// for trace output. The same value the wire layer binds into canonical bytes —
@@ -43,6 +49,27 @@ pub fn short_hex(data: &[u8], take: usize) -> String {
 macro_rules! epoch_log {
     ($me:expr, $epoch:expr, $($arg:tt)*) => {{
         ::tracing::info!(
+            "[spo={} epoch={}] {}",
+            $crate::epoch::log::id_short($me),
+            $epoch,
+            format_args!($($arg)*)
+        );
+    }};
+}
+
+/// An operator-facing protocol event: a DKG round opening with its participant
+/// list, the key and address a ceremony produced, a treasury movement built,
+/// posted or confirmed. `info`, under [`crate::logging::EVENT_TARGET`], with the
+/// same `[spo=N epoch=E]` prefix as the rest.
+///
+/// One event is ONE line and says everything it has to say by itself. A relay
+/// forwards lines, not stretches of log, so an event that leans on the
+/// `epoch_log!` lines around it arrives out of context.
+#[macro_export]
+macro_rules! epoch_event {
+    ($me:expr, $epoch:expr, $($arg:tt)*) => {{
+        ::tracing::info!(
+            target: $crate::logging::EVENT_TARGET,
             "[spo={} epoch={}] {}",
             $crate::epoch::log::id_short($me),
             $epoch,
@@ -89,6 +116,46 @@ macro_rules! epoch_error {
             format_args!($($arg)*)
         );
     }};
+}
+
+/// A DKG participant list as one clause — `#1 pool1… http://…, #2 …` — in
+/// identifier order, which is the order the roster assigned. The full bech32
+/// pool id, not a prefix: an operator reading this in a channel is matching it
+/// against a pool they know or pasting it into an explorer, and either wants
+/// the whole string.
+pub fn describe_participants<'a>(
+    participants: impl IntoIterator<Item = (&'a Identifier, &'a SpoInfo)>,
+) -> String {
+    participants
+        .into_iter()
+        .map(|(id, info)| {
+            format!(
+                "#{} {} {}",
+                id_short(*id),
+                pool_label(&info.pool_id),
+                info.bifrost_url
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `pool1…` for a 28-byte pool id. Fixtures predating WI-013 carry none, and a
+/// malformed one is shown as it is rather than hidden.
+pub fn pool_label(pool_id: &[u8]) -> String {
+    match <[u8; 28]>::try_from(pool_id) {
+        Ok(id) => crate::cardano::hash::pool_id_bech32(&id),
+        Err(_) if pool_id.is_empty() => "(no pool id)".to_string(),
+        Err(_) => hex::encode(pool_id),
+    }
+}
+
+/// `#1 #3 #4` — a set of participants by index, in the order given.
+pub fn id_list<'a>(ids: impl IntoIterator<Item = &'a Identifier>) -> String {
+    ids.into_iter()
+        .map(|id| format!("#{}", id_short(*id)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Peers whose fetch is CURRENTLY failing in a round, and why.
@@ -138,5 +205,54 @@ impl Unreachable {
             .map(|(id, why)| format!("{} ({why})", id_short(*id)))
             .collect();
         format!(" UNREACHABLE (up but erroring): {}.", listed.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn ident(n: u16) -> Identifier {
+        Identifier::try_from(n).unwrap()
+    }
+
+    #[test]
+    fn participants_render_in_identifier_order_with_full_pool_ids() {
+        let mut roster = BTreeMap::new();
+        for (n, byte) in [(2u16, 0x22u8), (1, 0x11)] {
+            roster.insert(
+                ident(n),
+                SpoInfo {
+                    identifier: ident(n),
+                    pool_id: vec![byte; 28],
+                    bifrost_url: format!("http://spo{n}.example:1850{n}"),
+                    bifrost_id_pk: Vec::new(),
+                },
+            );
+        }
+        let line = describe_participants(roster.iter());
+        let (first, second) = line.split_once(", ").unwrap();
+        assert!(first.starts_with("#1 pool1"), "{line}");
+        assert!(first.ends_with(" http://spo1.example:18501"), "{line}");
+        assert!(second.starts_with("#2 pool1"), "{line}");
+        // A bech32 pool id is 56 characters and stays whole.
+        let pool = first.split(' ').nth(1).unwrap();
+        assert_eq!(pool.len(), 56, "{pool}");
+        assert_eq!(pool, pool_label(&[0x11; 28]));
+    }
+
+    #[test]
+    fn a_missing_or_malformed_pool_id_is_said_not_hidden() {
+        assert_eq!(pool_label(&[]), "(no pool id)");
+        assert_eq!(pool_label(&[0xab, 0xcd]), "abcd");
+    }
+
+    #[test]
+    fn id_list_is_hash_prefixed_indices() {
+        let ids = [ident(1), ident(3), ident(4)];
+        assert_eq!(id_list(ids.iter()), "#1 #3 #4");
+        assert_eq!(id_list(std::iter::empty()), "");
     }
 }

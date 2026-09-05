@@ -1,0 +1,25 @@
+[package]
+name = "heimdall-discord"
+version = "0.1.0"
+edition = "2024"
+description = "Relay a heimdall node's protocol events and warnings from its log to a Discord channel"
+license = "Apache-2.0"
+repository = "https://github.com/lantr-io/heimdall"
+publish = false
+
+# Deliberately NOT a member of the heimdall workspace and NOT a heimdall
+# subcommand. heimdall is the security-critical process: it holds the signing
+# share and speaks to peers, and an operator will not want it opening an
+# outbound connection to a chat service from inside their network. This tool
+# reads what heimdall wrote — a log file, the journal, a pipe — and needs
+# nothing else, so it can run as a different user, in a different sandbox, or
+# on a different host.
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net"] }
+
+[profile.release]
+strip = true

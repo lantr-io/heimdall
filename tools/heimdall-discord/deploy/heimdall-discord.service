@@ -1,0 +1,35 @@
+[Unit]
+Description=heimdall-discord — relay heimdall's events and warnings to a Discord channel
+Documentation=https://github.com/lantr-io/heimdall/tree/main/tools/heimdall-discord
+After=network-online.target
+Wants=network-online.target
+
+# A relay that cannot reach its webhook restarts, and one with a bad URL would do
+# so for ever: five failures in five minutes leaves the unit `failed` instead.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Nothing on disk is the relay's, so it needs no account of its own. The journal
+# group is what `--unit` needs to read another unit's log.
+DynamicUser=yes
+SupplementaryGroups=systemd-journal
+
+# The webhook URL and the arguments. Kept out of the unit so `systemctl cat`
+# and `ps` never show the URL.
+EnvironmentFile=/etc/default/heimdall-discord
+ExecStart=/usr/local/bin/heimdall-discord $HEIMDALL_DISCORD_ARGS
+
+Restart=on-failure
+RestartSec=10
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# For --file sources, add the log directory here (read-only is enough):
+#ReadOnlyPaths=/var/log/heimdall
+
+[Install]
+WantedBy=multi-user.target

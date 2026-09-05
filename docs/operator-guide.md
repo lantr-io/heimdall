@@ -872,6 +872,20 @@ journalctl -u heimdall -p warning  # what degraded first
 docker logs -f heimdall            # the container equivalent
 ```
 
+The lines worth reading without reading everything — a DKG round opening and who is in it, the
+group key and treasury address it produced, an Update-Y posted, a treasury movement built, posted
+or confirmed — carry the target `heimdall::event`, one line each, and stay at `info` under any
+bare level:
+
+```bash
+journalctl -u heimdall -o cat | grep 'heimdall::event:'
+```
+
+To have them (and every warning) pushed to a Discord channel instead of read, run
+[`tools/heimdall-discord`](../tools/heimdall-discord/README.md) beside the node or on any host
+that sees its log. It is a separate program by design: heimdall never opens a connection to a
+chat service, and the relay never touches a key or a config.
+
 Turn detail up without editing a conffile — set `RUST_LOG` in `/etc/default/heimdall` (or
 `systemctl edit heimdall`) and restart. A bare level is scoped to heimdall and leaves its
 dependencies quiet; `RUST_LOG="warn,heimdall::cardano::blockfrost_chain=debug"` follows one

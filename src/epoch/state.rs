@@ -748,6 +748,10 @@ pub struct EpochConfig {
     /// `config::RETRY_BACKOFF_MAX`; tests shrink it so a bounded retry budget is
     /// observable in milliseconds rather than minutes.
     pub retry_backoff_max: Duration,
+    /// Which Bitcoin network the treasury lives on — used only to render
+    /// addresses in the operator-facing event lines. Nothing derives a key or
+    /// a script from it.
+    pub bitcoin_network: bitcoin::Network,
     pub identity: SpoIdentity,
     /// Cardano policy ID (script hash) identifying peg-in request UTxOs.
     pub pegin_policy_id: [u8; 28],
@@ -853,6 +857,7 @@ impl EpochConfig {
             dkg_reconcile_backoff: Duration::from_secs(30),
             poll_interval: Duration::from_millis(5000),
             retry_backoff_max: Duration::from_secs(60),
+            bitcoin_network: bitcoin::Network::Regtest,
             identity,
             pegin_policy_id: [0u8; 28],
             node_facts: crate::http::compat::NodeFacts::default(),
