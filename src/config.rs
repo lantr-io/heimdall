@@ -1104,6 +1104,7 @@ impl HeimdallConfig {
             dkg_reconcile_backoff: Duration::from_secs(self.protocol.dkg_reconcile_backoff_secs),
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
             retry_backoff_max: RETRY_BACKOFF_MAX,
+            bitcoin_network: self.bitcoin.parsed_network(),
             identity,
             pegin_policy_id,
             // Carried so the machine can PUBLISH them in the handshake; the chain

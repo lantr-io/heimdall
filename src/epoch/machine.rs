@@ -957,6 +957,16 @@ fn settle_pending_tm(
     );
     advance_cpo_trie(config, dir, &pending)?;
     advance_spi_trie(config, dir, &pending)?;
+    crate::epoch_event!(
+        me,
+        pending.epoch,
+        "TM confirmed: txid {} — treasury head is now {} ({} peg-out(s) completed, {} deposit(s) \
+         swept)",
+        pending.txid,
+        treasury.outpoint,
+        pending.fulfilled.len(),
+        pending.swept.len().saturating_sub(1),
+    );
     PendingTm::clear(dir)
         .map_err(|e| EpochError::TmBuild(format!("pending treasury movement: {e}")))?;
     Ok(())
@@ -1717,12 +1727,21 @@ async fn try_succession_handoff(
     // to the federation. `min_signers` losers is enough to do it without the
     // winner.
     match chain.submit_update_y(&plan, &signature).await {
-        Ok(tx) => crate::epoch_log!(
-            log_id,
-            epoch,
-            "  HANDOFF POSTED: tx {tx} — the treasury is now the SPO roster's. This node's \
-             federation share stops being the treasury's authority from here"
-        ),
+        Ok(tx) => {
+            crate::epoch_log!(
+                log_id,
+                epoch,
+                "  HANDOFF POSTED: tx {tx} — the treasury is now the SPO roster's. This node's \
+                 federation share stops being the treasury's authority from here"
+            );
+            crate::epoch_event!(
+                log_id,
+                epoch,
+                "Update-Y posted (federation handoff): cardano tx {tx} — treasury key {} -> {}",
+                hex::encode(plan.current_key.serialize()),
+                hex::encode(plan.new_key.serialize())
+            );
+        }
         Err(e) => crate::epoch_warn!(
             log_id,
             epoch,
@@ -2154,6 +2173,13 @@ async fn publish_keys_phase(
                 hex::encode(new_spend.output_key().to_x_only_public_key().serialize()),
                 hex::encode(new_spk.as_bytes())
             );
+            crate::epoch_event!(
+                me,
+                epoch,
+                "New treasury address {} (Y_51={}) — this epoch's handoff pays the treasury there",
+                treasury_address(&new_spk, config.bitcoin_network),
+                hex::encode(y_51.serialize())
+            );
         }
         Err(e) => crate::epoch_debug!(
             me,
@@ -2319,6 +2345,13 @@ async fn publish_keys_phase(
             }
             let tx_id = chain.submit_update_y(&plan, &signature).await?;
             crate::epoch_log!(me, epoch, "  Update-Y submitted: cardano tx {tx_id}");
+            crate::epoch_event!(
+                me,
+                epoch,
+                "Update-Y posted: cardano tx {tx_id} — treasury key {} -> {}",
+                hex::encode(plan.current_key.serialize()),
+                hex::encode(plan.new_key.serialize())
+            );
             // Wait for it to appear before letting the batch loop read the datum.
             // `submit_update_y` returns on ACCEPTANCE, and the next thing
             // `build_tm_phase` does is pay the entire treasury to whatever
@@ -3807,6 +3840,17 @@ async fn build_tm_phase(
         hex::encode(tm.cpo_root),
         tm.fulfilled.len(),
     );
+    crate::epoch_event!(
+        me,
+        epoch,
+        "TM built: txid {} — {} input(s) ({} deposit(s) swept), {} output(s), {} peg-out(s) paid; \
+         signing starts",
+        tm.txid,
+        num_inputs,
+        num_inputs.saturating_sub(1),
+        tm.unsigned_tx.output.len(),
+        tm.fulfilled.len(),
+    );
 
     Ok(EpochPhase::Sign {
         epoch,
@@ -4142,6 +4186,16 @@ async fn submit_phase(
     }
     let hint: Vec<[u8; 36]> = tm.fulfilled.iter().map(|f| f.outpoint).collect();
     chain.submit_signed_tm(&tx_bytes, &hint).await?;
+    crate::epoch_event!(
+        me,
+        epoch,
+        "TM posted: txid {} — Post-TM submitted ({} bytes; {} peg-out(s) paid, {} deposit(s) \
+         swept); awaiting Bitcoin confirmation",
+        tm.txid,
+        tx_bytes.len(),
+        tm.fulfilled.len(),
+        tm.num_inputs().saturating_sub(1),
+    );
 
     // Persist the witnessed tx back into `tm` so callers can inspect it.
     tm.unsigned_tx = signed_tx;
@@ -4153,6 +4207,15 @@ async fn submit_phase(
         epoch_keys,
         tm,
     })
+}
+
+/// The Taproot address of a treasury scriptPubKey on this node's Bitcoin
+/// network, for the operator-facing event lines. A P2TR script always has an
+/// address, so the fallback is defensive only.
+fn treasury_address(spk: &bitcoin::ScriptBuf, network: bitcoin::Network) -> String {
+    bitcoin::Address::from_script(spk, network)
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| hex::encode(spk.as_bytes()))
 }
 
 /// Best-effort extraction of the epoch number from a phase, used by
