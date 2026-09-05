@@ -268,6 +268,35 @@ Note what is *not* a log: `show-treasury`, `show-roster`, `show-config-params` a
 output of the one-shot commands are reports printed on stdout, untimestamped and never silenced
 by a log level, so they stay parseable by a script.
 
+### The event lines
+
+The few lines worth an interruption — a DKG round opening and who is in it, the group key and
+treasury address it produced, an Update-Y posted, a treasury movement built, posted or
+confirmed — are written at `info` under the tracing target `heimdall::event`, one line each:
+
+```bash
+journalctl -u heimdall -o cat | grep 'heimdall::event:'
+```
+
+A bare `RUST_LOG`/`--log-level` keeps that target at `info` however quiet the rest is, so a node
+at `warn` still records what it did; only a full directive (`warn,heimdall=warn`) silences it.
+
+## Discord notifications
+
+heimdall itself posts nothing anywhere: it is the security-critical process and should not be
+opening connections to a chat service from inside an operator's network. The relay is a separate
+program, [`tools/heimdall-discord`](../tools/heimdall-discord/README.md), that reads the log — a
+file, a unit's journal, or stdin — and posts the event lines plus everything at `warn` or above
+to a webhook. It needs no config, no key and no chain access, and can run as another user or on
+another host.
+
+```bash
+export DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/<id>/<token>'
+heimdall-discord --unit heimdall                                   # this package's unit
+heimdall-discord --unit heimdall@spo1 --unit heimdall@spo2         # template instances
+heimdall-discord --file spo1=/var/log/heimdall/spo1.log --dry-run  # a file; print, don't post
+```
+
 ## Notes
 
 - **Config is secret.** `heimdall-bip322.toml` holds the Blockfrost project id and the wallet
