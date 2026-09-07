@@ -147,6 +147,10 @@ impl std::fmt::Display for ExclusionReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExcludedSpo {
     pub pool_id: Vec<u8>,
+    /// The dropped registration's bifrost key. Carried alongside `pool_id`
+    /// because a node identifies ITSELF by this — `SpoIdentity` holds no pool
+    /// id — so it is what lets a node ask "was I the one dropped, and why".
+    pub bifrost_id_pk: Vec<u8>,
     pub reason: ExclusionReason,
 }
 
@@ -268,6 +272,7 @@ fn filter_eligible(
         if active_bans.contains(&spo.pool_id) {
             excluded.push(ExcludedSpo {
                 pool_id: spo.pool_id.clone(),
+                bifrost_id_pk: spo.bifrost_id_pk.clone(),
                 reason: ExclusionReason::Banned,
             });
             continue;
@@ -283,6 +288,7 @@ fn filter_eligible(
             }),
             Err(why) => excluded.push(ExcludedSpo {
                 pool_id: spo.pool_id.clone(),
+                bifrost_id_pk: spo.bifrost_id_pk.clone(),
                 reason: ExclusionReason::BadUrl(why),
             }),
         }
@@ -300,6 +306,7 @@ fn filter_eligible(
             let url = e.bifrost_url.clone();
             excluded.push(ExcludedSpo {
                 pool_id: e.pool_id.clone(),
+                bifrost_id_pk: e.bifrost_id_pk.clone(),
                 reason: ExclusionReason::DuplicateUrl(url),
             });
         } else {
@@ -399,6 +406,7 @@ pub fn derive_dkg_context(
         if !has_stake {
             excluded.push(ExcludedSpo {
                 pool_id: e.pool_id.clone(),
+                bifrost_id_pk: e.bifrost_id_pk.clone(),
                 reason: ExclusionReason::NoStake,
             });
         }
@@ -1268,6 +1276,7 @@ mod tests {
             ctx.excluded,
             vec![ExcludedSpo {
                 pool_id: vec![0xBB; 28],
+                bifrost_id_pk: vec![0x22; 32],
                 reason: ExclusionReason::Banned,
             }]
         );
@@ -1296,7 +1305,7 @@ mod tests {
         assert_eq!(ctx.participants.len(), 2);
         assert!(matches!(
             ctx.excluded.as_slice(),
-            [ExcludedSpo { pool_id, reason: ExclusionReason::BadUrl(_) }] if *pool_id == vec![0xBB; 28]
+            [ExcludedSpo { pool_id, reason: ExclusionReason::BadUrl(_), .. }] if *pool_id == vec![0xBB; 28]
         ));
     }
 

@@ -13,7 +13,7 @@ use frost::Identifier;
 use frost_secp256k1_tr as frost;
 use serde::{Deserialize, Serialize};
 
-use crate::cardano::dkg_roster::DkgContext;
+use crate::cardano::dkg_roster::{DkgContext, ExclusionReason};
 use crate::cardano::pegin_datum::ParsedPegIn;
 
 // ---------------------------------------------------------------------------
@@ -913,6 +913,35 @@ pub enum EpochError {
         eligible: usize,
         reason: String,
     },
+    /// This node holds a bifrost key that this epoch's eligible set does not
+    /// contain, so there is no ceremony seat for it — separated from
+    /// [`Self::DkgAborted`] because the two mean opposite things to an operator.
+    /// A ceremony that aborted is a fault to look at; an absent seat is a fact
+    /// about who this node IS.
+    ///
+    /// `excluded` is what makes that fact actionable, and it is carried here
+    /// rather than re-derived downstream because only the Round-0 context knows
+    /// it. `Some(reason)` is a REGISTERED pool dropped from the set — banned,
+    /// bad or duplicate URL, no stake yet — which is an alarm: the node is up,
+    /// looks healthy, and is not signing. `None` is a key the registry never
+    /// named, which for a federation member is not a fault at all but its
+    /// permanent, correct state on a Phase-2 bridge.
+    ///
+    /// Nothing downstream may guess between those two from the node's own
+    /// config: a federation share is loaded unconditionally (`main.rs`, "WHICH
+    /// phase the bridge is in is chain state the machine reads per epoch"), so a
+    /// node can hold one AND be a registered pool, and taking `phase1_signer` as
+    /// proof of "no seat by design" would silence that pool's ban.
+    ///
+    /// Still routed through `dkg_unavailable`, because a PHASE-1 federation
+    /// member reaches its signing seat by exactly this route: no registry entry,
+    /// no roster seat, and the fallback then finds the treasury still locked
+    /// under `y_federation`.
+    NotInEligibleSet {
+        epoch: u64,
+        eligible: usize,
+        excluded: Option<ExclusionReason>,
+    },
     Peer(String),
     Chain(String),
     Transition(String),
@@ -1013,6 +1042,24 @@ impl std::fmt::Display for EpochError {
                 "DKG aborted at epoch {epoch} attempt {attempt}: {qualified}/{eligible} qualified \
                  ({reason})"
             ),
+            Self::NotInEligibleSet {
+                epoch,
+                eligible,
+                excluded,
+            } => match excluded {
+                // Registered and dropped: name the cause, which is the whole
+                // point of keeping this distinct from a bare "not eligible".
+                Some(reason) => write!(
+                    f,
+                    "no ceremony seat at epoch {epoch}: this node's registration was dropped \
+                     from the {eligible} eligible participant(s) — {reason}"
+                ),
+                None => write!(
+                    f,
+                    "no ceremony seat at epoch {epoch}: this node's bifrost key is not in the \
+                     registry, so it is not among the {eligible} eligible participant(s)"
+                ),
+            },
             Self::Peer(s) => write!(f, "peer network: {s}"),
             Self::Chain(s) => write!(f, "chain: {s}"),
             Self::Transition(s) => write!(f, "invalid phase transition: {s}"),

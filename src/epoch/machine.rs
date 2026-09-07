@@ -470,10 +470,27 @@ async fn drive_to_movement(
                 // running and looks fine, so this is the thing it hurts most to
                 // learn late — and a warn line scrolls away where a queryable
                 // field does not.
-                if matches!(e, EpochError::DkgAborted { .. }) {
+                // `NotInEligibleSet` belongs here for the same reason: a node
+                // dropped from the registry's eligible set is precisely "running
+                // and not signing", and it reaches the loop as its own variant
+                // now. Leaving it out would report `dkg — (no ceremony yet this
+                // epoch)` at a banned node for every epoch of its ban.
+                if matches!(
+                    e,
+                    EpochError::DkgAborted { .. } | EpochError::NotInEligibleSet { .. }
+                ) {
                     config.health.update(|h| {
                         h.dkg_qualified = Some(false);
-                        h.activity = "DKG did not complete for this node".into();
+                        h.activity = match &e {
+                            EpochError::NotInEligibleSet {
+                                excluded: Some(reason),
+                                ..
+                            } => format!("no ceremony seat: {reason}"),
+                            EpochError::NotInEligibleSet { .. } => {
+                                "no ceremony seat: this key is not in the registry".into()
+                            }
+                            _ => "DKG did not complete for this node".into(),
+                        };
                     });
                 }
                 // The 51% mode gave up on a movement. Say so ONCE per movement,
@@ -1233,11 +1250,13 @@ async fn await_rotation_phase(
 
 /// Did the DKG path fail in a way the federation could cover for?
 ///
-/// `DkgAborted` is the ceremony giving up — no viable candidate set, or this node
-/// outside it. `PollTimeout` is the rounds running out of time waiting for peers,
-/// which on a genesis bridge is what "nobody is there" looks like. Both mean the
-/// epoch will produce no group key, which is precisely when the federation should
-/// be asked instead.
+/// `DkgAborted` is the ceremony giving up — no viable candidate set, or one too
+/// small to rerun. `NotInEligibleSet` is this node having no seat in it at all,
+/// which is how a federation member arrives: it holds no registration, so the
+/// registry never names it. `PollTimeout` is the rounds running out of time
+/// waiting for peers, which on a genesis bridge is what "nobody is there" looks
+/// like. All three mean this node's epoch will produce no group key, which is
+/// precisely when the federation should be asked instead.
 ///
 /// Everything else is deliberately excluded. A `Chain` error means we could not
 /// read the registry, not that it is empty — falling back on it would take the
@@ -1247,7 +1266,9 @@ async fn await_rotation_phase(
 fn dkg_unavailable(e: &EpochError) -> bool {
     matches!(
         e,
-        EpochError::DkgAborted { .. } | EpochError::PollTimeout { .. }
+        EpochError::DkgAborted { .. }
+            | EpochError::PollTimeout { .. }
+            | EpochError::NotInEligibleSet { .. }
     )
 }
 
@@ -1333,6 +1354,59 @@ async fn phase1_fallback(
         // the federation can make to a roster that cannot make it. What actually
         // decides whether this node signs is the share check below, against
         // `y_51`.
+        //
+        // One case here is not a failure and must not be reported as one: a
+        // FEDERATION member on a Phase-2 bridge. It has no registry entry by
+        // design — `main.rs` gave it a federation seat precisely because the
+        // roster had none for it — so every boundary it asks for a ceremony
+        // seat, is told there is none, and arrives here. That is the permanent
+        // steady state of a federation once the roster owns the treasury: the
+        // handoff this federation existed to make has already happened. Raising
+        // the roster's diagnostic at it reads as a ban, which is untrue of this
+        // node, and repeats every epoch for the life of the bridge.
+        //
+        // Three things must all hold, and each excludes a case that MUST still
+        // be heard:
+        //
+        //   `excluded: None` — the registry never named this key. A registered
+        //   pool that was dropped carries `Some(reason)` and keeps its alarm,
+        //   even though it may also hold a federation share (they are loaded
+        //   unconditionally, so the share alone proves nothing).
+        //
+        //   a federation share — without one there is no federation seat to be
+        //   idle in, and the node keeps the diagnostic that applies to it.
+        //
+        //   the share is NOT of the key holding the treasury — because the phase
+        //   test above is "not the CURRENT y_federation", which a treasury still
+        //   locked under a SUPERSEDED federation key also satisfies. There the
+        //   federation is not retired at all and the stale-share `Transition`
+        //   below is the right answer, so fall through to it.
+        if let EpochError::NotInEligibleSet { excluded: None, .. } = &dkg_err
+            && let Some(fed) = config.phase1_signer.as_ref()
+            && group_xonly(&fed.group_keys.verifying_key)
+                .map_err(EpochError::Frost)?
+                .xonly
+                != treasury.y_51
+        {
+            crate::epoch_log!(
+                log_id,
+                epoch,
+                "  no ceremony seat, and none needed: the treasury is held by SPO roster key \
+                 {}, not by Config y_federation {}, so this FEDERATION seat has nothing to \
+                 sign. Idling until the next epoch boundary",
+                hex::encode(treasury.y_51.serialize()),
+                hex::encode(treasury.config_y_fed.serialize())
+            );
+            // Said in the queryable field too. This state lasts the life of the
+            // bridge, so a log line is exactly the wrong place to leave it: a
+            // watchdog reading `last_progress_ms` needs to know this node is
+            // idle BY DESIGN, not stuck.
+            config.health.update(|h| {
+                h.dkg_qualified = Some(false);
+                h.activity = "retired federation: no ceremony seat, nothing to sign".into();
+            });
+            return Ok(EpochPhase::Idle);
+        }
         return Err(dkg_err);
     }
 
@@ -1828,14 +1902,21 @@ async fn epoch_start_phase(
             // retriable, so the loop backs off and re-enters Idle, and a
             // temporary ban that later expires lets us rejoin automatically.
             None => {
-                return Err(EpochError::DkgAborted {
+                // WHY there is no seat, decided here because this is the only
+                // place that holds the answer: `ctx.excluded` lists the
+                // REGISTERED pools this epoch dropped, with reasons. A hit means
+                // this node is registered and was dropped — an alarm. A miss
+                // means the registry never named this key, which is what a
+                // federation member looks like by construction.
+                let excluded = ctx
+                    .excluded
+                    .iter()
+                    .find(|x| x.bifrost_id_pk == config.identity.bifrost_id_pk)
+                    .map(|x| x.reason.clone());
+                return Err(EpochError::NotInEligibleSet {
                     epoch,
-                    attempt: 0,
-                    qualified: 0,
                     eligible: ctx.participants.len(),
-                    reason:
-                        "this node is not in the eligible set (banned / deregistered / excluded)"
-                            .into(),
+                    excluded,
                 });
             }
         }
@@ -4377,6 +4458,7 @@ fn _hash_used() -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cardano::dkg_roster::ExclusionReason;
     use crate::cardano::mock::MockCardanoPegInSource;
     use crate::epoch::fixture::demo_static_fixture;
     use crate::epoch::mocks::{
@@ -5427,6 +5509,170 @@ mod tests {
         assert!(
             matches!(err, EpochError::DkgAborted { .. }),
             "the ORIGINAL DKG error, not something about a federation that is done: {err}"
+        );
+    }
+
+    /// The other half of the retired-federation branch, and the one that ran
+    /// every epoch on preprod: the federation is not merely done, it never had a
+    /// ceremony seat to lose. A federation member holds no registry entry BY
+    /// DESIGN, so `epoch_start_phase` answers `NotInEligibleSet` at every
+    /// boundary for the life of the bridge.
+    ///
+    /// Re-raising there reported "banned / deregistered / excluded" at a node
+    /// that is none of those, once per epoch, at WARN. It has to idle quietly
+    /// instead — and idle rather than back off, because nothing about the answer
+    /// changes before the next boundary re-reads the treasury.
+    #[tokio::test]
+    async fn a_federation_with_no_seat_idles_instead_of_reporting_a_ban() {
+        let (signer, fed_keys) = phase1_signer_for(2, 3);
+        let (_, roster_keys) = group_for(0xb0, 2, 3);
+        let y_fed = xonly_of(&fed_keys);
+        let y_roster = xonly_of(&roster_keys);
+
+        let mut config = fast_config(Identifier::try_from(1u16).unwrap());
+        config.phase1_signer = Some(signer);
+
+        // Phase 2: datum and head are both the roster's.
+        let chain = chain_at(19390, y_roster, y_roster, y_fed, 0);
+
+        let next = phase1_fallback(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            9,
+            EpochError::NotInEligibleSet {
+                epoch: 9,
+                eligible: 4,
+                excluded: None,
+            },
+        )
+        .await
+        .expect("a federation with no seat has nothing to report");
+        assert!(
+            matches!(next, EpochPhase::Idle),
+            "expected a quiet idle to the next boundary, got {next:?}"
+        );
+    }
+
+    /// The gate that `phase1_signer` alone could not express. A node can hold a
+    /// federation share AND be a registered pool — shares are loaded
+    /// unconditionally — so when that pool is genuinely banned it must keep its
+    /// alarm rather than inherit the retired federation's silence. The
+    /// discriminator is the reason carried on the error, not the share.
+    #[tokio::test]
+    async fn a_federation_member_that_is_also_a_banned_pool_still_raises() {
+        let (signer, fed_keys) = phase1_signer_for(2, 3);
+        let (_, roster_keys) = group_for(0xb0, 2, 3);
+        let y_fed = xonly_of(&fed_keys);
+        let y_roster = xonly_of(&roster_keys);
+
+        let mut config = fast_config(Identifier::try_from(1u16).unwrap());
+        config.phase1_signer = Some(signer);
+
+        let chain = chain_at(19390, y_roster, y_roster, y_fed, 0);
+
+        let err = phase1_fallback(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            9,
+            EpochError::NotInEligibleSet {
+                epoch: 9,
+                eligible: 4,
+                excluded: Some(ExclusionReason::Banned),
+            },
+        )
+        .await
+        .expect_err("a banned pool must hear about it even holding a federation share");
+        assert!(
+            matches!(
+                err,
+                EpochError::NotInEligibleSet {
+                    excluded: Some(ExclusionReason::Banned),
+                    ..
+                }
+            ),
+            "expected the ban to survive the federation gate, got {err}"
+        );
+    }
+
+    /// The Phase-1 route, which is what every federation member actually walks
+    /// on a bridge whose treasury the roster has not taken yet. It reaches the
+    /// fallback by `NotInEligibleSet` — no registration, so no seat — and must
+    /// still arrive at a movement. Every other fallback test feeds `aborted()`,
+    /// so without this the variant's own documented purpose is unexercised.
+    #[tokio::test]
+    async fn a_phase_1_federation_still_signs_when_it_has_no_seat() {
+        let (signer, fed_keys) = phase1_signer_for(2, 3);
+        let me = *fed_keys.key_package.identifier();
+        let y_fed = xonly_of(&fed_keys);
+
+        let mut config = fast_config(Identifier::try_from(1u16).unwrap());
+        config.identity.bifrost_id_pk = signer.roster.participants[&me].bifrost_id_pk.clone();
+        config.phase1_signer = Some(signer);
+
+        // Phase 1: the treasury is still the federation's, datum and head alike.
+        let chain = chain_at(19390, y_fed, y_fed, y_fed, 0);
+
+        let next = phase1_fallback(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            9,
+            EpochError::NotInEligibleSet {
+                epoch: 9,
+                eligible: 0,
+                excluded: None,
+            },
+        )
+        .await
+        .expect("a Phase-1 federation reaches its seat by exactly this error");
+        assert!(
+            !matches!(next, EpochPhase::Idle),
+            "a Phase-1 federation must go on to make the movement, not idle: {next:?}"
+        );
+    }
+
+    /// The gate is BOTH halves. A node with no federation share that is not in
+    /// the eligible set is a roster node that has been banned or deregistered —
+    /// the one case where "you have no seat" is news the operator needs. It must
+    /// still surface as an error rather than inherit the federation's silence.
+    #[tokio::test]
+    async fn a_non_member_with_no_seat_still_raises() {
+        let (_, roster_keys) = group_for(0xb0, 2, 3);
+        let (_, fed_keys) = phase1_signer_for(2, 3);
+        let y_roster = xonly_of(&roster_keys);
+        let y_fed = xonly_of(&fed_keys);
+
+        let config = fast_config(Identifier::try_from(1u16).unwrap());
+        assert!(config.phase1_signer.is_none(), "no federation share");
+
+        let chain = chain_at(19390, y_roster, y_roster, y_fed, 0);
+
+        let err = phase1_fallback(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            9,
+            EpochError::NotInEligibleSet {
+                epoch: 9,
+                eligible: 4,
+                excluded: None,
+            },
+        )
+        .await
+        .expect_err("a banned roster node must hear about it");
+        assert!(
+            matches!(err, EpochError::NotInEligibleSet { .. }),
+            "expected the seat diagnostic, got {err}"
         );
     }
 
