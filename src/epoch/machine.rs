@@ -2759,6 +2759,8 @@ async fn collect_pegins_phase(
     let mut skipped_swept = 0usize;
     let mut deferred = 0usize;
     let mut stranded = 0usize;
+    // Of those, the ones this node has not reported before — see the warning below.
+    let mut newly_stranded = 0usize;
     // One libsecp256k1 context for the whole scan: `recognise_pegin` may try
     // several trees per request, and building one per attempt dominated the cost.
     let secp = bitcoin::key::Secp256k1::new();
@@ -2794,6 +2796,27 @@ async fn collect_pegins_phase(
                     match origin {
                         PeginKeyOrigin::Retired => {
                             stranded += 1;
+                            // Said ONCE per deposit, not once per batch. A retired
+                            // key never becomes current again, so this condition is
+                            // permanent and every 3-hour opportunity re-derives the
+                            // same answer — which published the same warning ~24
+                            // times a day across a roster, drowning the events an
+                            // operator actually has to act on. The standing fact
+                            // lives in `/health` (`stranded_pegins`); the log
+                            // carries the transition into that set, which is the
+                            // part that is news.
+                            let key = format!("{}:{}", parsed.btc_txid, parsed.btc_vout);
+                            let first_time = {
+                                let mut fresh = false;
+                                config.health.update(|h| {
+                                    fresh = h.stranded_pegins.insert(key.clone());
+                                });
+                                fresh
+                            };
+                            if !first_time {
+                                continue;
+                            }
+                            newly_stranded += 1;
                             // Deliberately not "lost": every peg-in tree carries the
                             // federation's emergency-sweep leaf as well as the
                             // depositor's refund, and `PeginTreeParams::validate`
@@ -2920,12 +2943,16 @@ async fn collect_pegins_phase(
             deferred
         );
     }
-    if stranded > 0 {
+    // Only when something ENTERED the set this pass: the per-deposit warnings it
+    // points at ("see the warnings above") are themselves only printed once, so a
+    // summary on every batch would refer to lines that are not there.
+    if newly_stranded > 0 {
         crate::epoch_warn!(
             me,
             epoch,
             "  {} peg-in(s) sit at a retired address and CANNOT be swept — see the warnings \
-             above",
+             above. {} in total now; /health lists them",
+            newly_stranded,
             stranded
         );
     }
@@ -5757,9 +5784,17 @@ mod tests {
         let pegin: Arc<dyn CardanoPegInSource> = Arc::new(source);
 
         let mut built = BuiltBatch::default();
-        let next = collect_pegins_phase(&chain, &pegin, &config, 9, roster, keys, &mut built)
-            .await
-            .expect("collection must not fail on any of the three");
+        let next = collect_pegins_phase(
+            &chain,
+            &pegin,
+            &config,
+            9,
+            roster.clone(),
+            keys.clone(),
+            &mut built,
+        )
+        .await
+        .expect("collection must not fail on any of the three");
         let EpochPhase::BuildTm { frozen_pegins, .. } = next else {
             panic!("expected BuildTm, got {}", next.name());
         };
@@ -5781,6 +5816,29 @@ mod tests {
             "every input of a movement is signed with one key package, so a batched peg-in's \
              internal key must be the head's"
         );
+
+        // (iv) The stranded deposit is recorded as a STANDING condition, and
+        // recorded once. Its key never becomes current again, so every 3-hour
+        // batch re-derives the same answer — which used to republish the same
+        // warning ~24 times a day across a roster. The set is what `/health`
+        // reports and what the log keys its once-only warning on, so a second
+        // pass over the same deposit must leave it exactly as it was.
+        let after_first = config.health.snapshot().stranded_pegins;
+        assert_eq!(
+            after_first.len(),
+            1,
+            "exactly the retired deposit is recorded, not the deferred one: {after_first:?}"
+        );
+        let recorded = after_first.iter().next().expect("one entry").clone();
+
+        let mut built2 = BuiltBatch::default();
+        let _ = collect_pegins_phase(&chain, &pegin, &config, 9, roster, keys, &mut built2).await;
+        let after_second = config.health.snapshot().stranded_pegins;
+        assert_eq!(
+            after_second, after_first,
+            "a second batch must add nothing — the deposit was already reported ({recorded})"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

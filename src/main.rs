@@ -853,6 +853,12 @@ enum Commands {
         /// Falls back to cardano.registry_bootstrap.
         #[arg(long)]
         registry_bootstrap: Option<String>,
+        /// Print ONLY the registered bifrost_urls, deduplicated and sorted, one
+        /// per line — and nothing else, so the output can be piped. Everything
+        /// the full report says about policies, bans and the derived roster is
+        /// left out; this is the peer set as the registry states it.
+        #[arg(long)]
+        urls: bool,
     },
     /// Scan binocular's on-chain peg-in requests over N2C, then build → sign →
     /// (optionally) broadcast the Treasury Movement sweeping the treasury + all
@@ -1834,9 +1840,10 @@ fn main() {
             config,
             blueprint,
             registry_bootstrap,
+            urls,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) = run_show_roster(&cfg, blueprint, registry_bootstrap) {
+            if let Err(e) = run_show_roster(&cfg, blueprint, registry_bootstrap, urls) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -7197,6 +7204,7 @@ fn run_show_roster(
     cfg: &HeimdallConfig,
     blueprint: Option<String>,
     registry_bootstrap: Option<String>,
+    urls_only: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
     use heimdall::cardano::roster::RegistryRosterSource;
@@ -7230,22 +7238,48 @@ fn run_show_roster(
              --treasury-nft-name, or point cardano.config_address at a bridge that \
              publishes them",
         )?;
-    println!("registry policy:   {}", source.registry_policy_hex);
-    println!("registry address:  {}", source.registry_address);
-    println!("treasury_info:     {}", source.treasury_info_address);
-    println!(
-        "registry source:   {}",
-        if bridge_config.is_some() {
-            "bridge Config #9-#10"
-        } else {
-            "LOCAL heimdall.toml registry keys"
-        }
-    );
+    // `--urls` is a pipe, not a report: every line it prints has to be a URL, so
+    // the provenance header is suppressed rather than reordered. It stays on
+    // stdout with nothing on stderr, so a caller can read it directly.
+    if !urls_only {
+        println!("registry policy:   {}", source.registry_policy_hex);
+        println!("registry address:  {}", source.registry_address);
+        println!("treasury_info:     {}", source.treasury_info_address);
+        println!(
+            "registry source:   {}",
+            if bridge_config.is_some() {
+                "bridge Config #9-#10"
+            } else {
+                "LOCAL heimdall.toml registry keys"
+            }
+        );
+    }
 
     let epoch = rt.block_on(bf_http::fetch_current_epoch(&base_url, pid))?;
     let snapshot = rt
         .block_on(source.fetch_snapshot(&base_url, pid))
         .map_err(|e| e.to_string())?;
+
+    if urls_only {
+        // The REGISTERED set, not the eligible one: this answers "who has
+        // published an endpoint", which is the question asked when checking
+        // reachability or chasing a DuplicateUrl exclusion. Deduplicated
+        // because two registrations sharing a URL is a real state — and the
+        // one that gets BOTH of them dropped from the ceremony — so a caller
+        // counting lines here should see the endpoint count, not the pool
+        // count. The full report is where the pools are named.
+        let mut urls: Vec<String> = snapshot
+            .spos
+            .iter()
+            .map(|spo| String::from_utf8_lossy(&spo.bifrost_url).into_owned())
+            .collect();
+        urls.sort();
+        urls.dedup();
+        for url in urls {
+            println!("{url}");
+        }
+        return Ok(());
+    }
 
     println!("current epoch:     {epoch}");
     println!(
