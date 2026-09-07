@@ -15,7 +15,9 @@
 # Env knobs (all optional):
 #   BIN              path to the built binary        (default: deploy/out/heimdall)
 #   OUT_DIR          where to write the .deb         (default: dirname of BIN)
-#   VERSION          upstream version, e.g. 0.2.0    (default: Cargo.toml version + git sha)
+#   VERSION          upstream version, e.g. 0.2.0    (default: Cargo.toml version +
+#                                                    commit date, count and sha)
+#   DEB_EPOCH        debian epoch, '' for none       (default: 1 — see below)
 #   DEB_REVISION     debian revision                 (default: 1)
 #   ARCH             package architecture            (default: amd64)
 #   DEB_MAINTAINER   "Name <email>"                  (default: git config, else Lantr)
@@ -39,14 +41,35 @@ command -v dpkg-deb >/dev/null 2>&1 || {
 }
 
 # ── Version ─────────────────────────────────────────────────────────────────
-# A Debian upstream_version must start with a digit, so a bare `git describe`
-# short SHA ("abc1234") cannot be used on its own. Fall back to the Cargo.toml
-# version with the commit appended after '+', which is both legal and sortable.
+# A Debian upstream_version must start with a digit, so a bare short SHA
+# ("abc1234") cannot be used on its own. It also must not be used as the ONLY
+# thing that varies, which is what this used to do: a sha is hex, and hex does
+# not order. "b8a6e25" compares GREATER than the "1162f34" committed twelve days
+# later, so dpkg announced every deploy as
+#
+#     dpkg: warning: downgrading heimdall from 0.1.0+b8a6e25-1 to 0.1.0+1162f34-1
+#
+# which `dpkg -i` tolerates but `apt upgrade` refuses outright.
+#
+# So order by something that only ever increases: the commit's own date first,
+# then the number of commits behind it, which breaks same-day ties and is
+# monotonic along a branch. The sha stays on the end as what it actually is —
+# an identifier, not an ordinal.
 if [ -z "${VERSION:-}" ]; then
     base="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
     [ -n "$base" ] || base="0.0.0"
+    stamp="$(git show -s --format=%cd --date=format:%Y%m%d HEAD 2>/dev/null || true)"
+    count="$(git rev-list --count HEAD 2>/dev/null || true)"
     sha="$(git rev-parse --short HEAD 2>/dev/null || true)"
-    if [ -n "$sha" ]; then VERSION="${base}+${sha}"; else VERSION="$base"; fi
+    if [ -n "$stamp" ] && [ -n "$count" ] && [ -n "$sha" ]; then
+        VERSION="${base}+${stamp}.${count}.g${sha}"
+    elif [ -n "$sha" ]; then
+        # No usable history (a shallow or exported tree). Still legal, still
+        # unique, just not ordered — better than refusing to build.
+        VERSION="${base}+g${sha}"
+    else
+        VERSION="$base"
+    fi
 fi
 case "$VERSION" in
 [0-9]*) ;;
@@ -56,6 +79,25 @@ case "$VERSION" in
     ;;
 esac
 PKG_VERSION="${VERSION}-${DEB_REVISION}"
+
+# ── Epoch ───────────────────────────────────────────────────────────────────
+# Debian's escape hatch for "the versioning scheme itself was wrong". Every
+# version carrying an epoch sorts above every version without one, whatever the
+# rest says — which is the only way out of the hole the sha-named packages dug:
+# the fixed scheme starts with a digit, and dpkg sorts a digit-initial part
+# BELOW a letter-initial one, so `0.1.0+20260907…` is still "older" than the
+# `0.1.0+b8a6e25` already installed on the preprod boxes. With the epoch it is
+# not, and every future build orders normally.
+#
+# An epoch is permanent: it can never be removed, only carried. That is the
+# price, and it is the standard one for this mistake. Set DEB_EPOCH= (empty) to
+# build without it.
+DEB_EPOCH="${DEB_EPOCH-1}"
+if [ -n "$DEB_EPOCH" ]; then
+    CONTROL_VERSION="${DEB_EPOCH}:${PKG_VERSION}"
+else
+    CONTROL_VERSION="$PKG_VERSION"
+fi
 
 # ── Maintainer ──────────────────────────────────────────────────────────────
 if [ -z "${DEB_MAINTAINER:-}" ]; then
@@ -113,7 +155,7 @@ INSTALLED_SIZE="$(du -sk "$STAGE/usr" "$STAGE/etc" "$STAGE/lib" "$STAGE/var" | a
 
 cat >"$STAGE/DEBIAN/control" <<EOF
 Package: heimdall
-Version: $PKG_VERSION
+Version: $CONTROL_VERSION
 Architecture: $ARCH
 Maintainer: $DEB_MAINTAINER
 Installed-Size: $INSTALLED_SIZE
