@@ -2321,7 +2321,7 @@ fn lovelace_of(utxo: &crate::cardano::bf_http::BfUtxo) -> u64 {
 /// eligible SPOs to run a ceremony, which is precisely the state a bridge is in
 /// from genesis until its operators register. Reporting it as `Chain` made it
 /// fatal, and that stranded the one route built for exactly this state –
-/// `phase1_fallback` keys off `dkg_unavailable`, which matches `DkgAborted`, so
+/// `phase1_fallback` keys off `dkg_unavailable`, one of whose arms is `DkgAborted`, so
 /// an under-populated registry has to arrive as an ABORTED CEREMONY for the
 /// federation to be asked to sign (WI-095/WI-098).
 ///
