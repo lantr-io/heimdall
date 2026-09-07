@@ -19,6 +19,17 @@
 //! **Verbosity without a rebuild.** `--log-level`, else `RUST_LOG`, else
 //! `[log] level` in the config file.
 //!
+//! **A channel for the few lines that matter.** The protocol events an operator
+//! wants pushed rather than read — a DKG round opening with its participant
+//! list, the group key and treasury address it produced, a treasury movement
+//! built, posted or confirmed — are emitted at `info` under the dedicated target
+//! [`EVENT_TARGET`] (`heimdall::event`) by [`crate::epoch_event!`]. A bare level
+//! keeps that target at `info` however quiet the rest is, so `warn` reads as
+//! "warnings, plus what the node did". heimdall itself sends them nowhere: the
+//! relay that posts them to a Discord channel is a separate program
+//! (`tools/heimdall-discord`) that reads the log, so a node's own process never
+//! opens an outbound connection it would not otherwise have.
+//!
 //! Logs are not the same thing as command output: `heimdall show-treasury`
 //! prints a report because the operator asked for it, and that stays on stdout
 //! as plain text — untimestamped, and never silenced by a log level.
@@ -34,6 +45,13 @@ use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::config::LogConfig;
+
+/// The tracing target of the operator-facing protocol events (see the module
+/// docs). A dedicated target rather than a field, so one string selects them
+/// everywhere: in a `RUST_LOG` directive, as the `target` of a JSON line, and as
+/// the `heimdall::event: ` prefix of a plain or journal line — which is what
+/// `tools/heimdall-discord` matches on.
+pub const EVENT_TARGET: &str = "heimdall::event";
 
 // ── Format selection ────────────────────────────────────────────────
 
@@ -98,12 +116,17 @@ fn cli() -> &'static CliOverrides {
 /// was trying to read. Anything that looks like a real directive — it contains
 /// `=` or `,` — is passed through untouched, so `RUST_LOG=debug,heimdall=trace`
 /// still does what a Rust developer expects.
+///
+/// A bare level also pins [`EVENT_TARGET`] at `info`: `--log-level warn` is
+/// "warnings, plus what the node did", not silence about a completed DKG or a
+/// posted movement. A full directive is used verbatim, so `warn,heimdall=warn`
+/// is how to silence the events too.
 fn filter_directive(raw: &str) -> String {
     let raw = raw.trim();
     if raw.contains('=') || raw.contains(',') {
         raw.to_string()
     } else {
-        format!("warn,heimdall={raw}")
+        format!("warn,heimdall={raw},{EVENT_TARGET}=info")
     }
 }
 
@@ -454,13 +477,77 @@ mod tests {
 
     #[test]
     fn bare_level_is_scoped_to_heimdall_but_directives_pass_through() {
-        assert_eq!(filter_directive("debug"), "warn,heimdall=debug");
-        assert_eq!(filter_directive("  info "), "warn,heimdall=info");
+        assert_eq!(
+            filter_directive("debug"),
+            "warn,heimdall=debug,heimdall::event=info"
+        );
+        assert_eq!(
+            filter_directive("  info "),
+            "warn,heimdall=info,heimdall::event=info"
+        );
         assert_eq!(filter_directive("heimdall=trace"), "heimdall=trace");
         assert_eq!(
             filter_directive("debug,heimdall::cardano=trace"),
             "debug,heimdall::cardano=trace"
         );
+    }
+
+    /// `--log-level warn` keeps the event channel open: the point of a
+    /// dedicated target is that a quiet node still records what it did.
+    #[test]
+    fn a_bare_warn_level_still_passes_events() {
+        let buf = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(filter_directive("warn")))
+            .with_writer(buf.clone())
+            .event_format(TextFormat { journal: true })
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "heimdall::event", "moved");
+            tracing::info!("quiet");
+            tracing::warn!("loud");
+        });
+        let out = buf.contents();
+        assert!(out.contains("<6>heimdall::event: moved"), "{out}");
+        assert!(out.contains("<4>heimdall::logging::tests: loud"), "{out}");
+        assert!(!out.contains("quiet"), "{out}");
+    }
+
+    /// The shapes `tools/heimdall-discord` parses, pinned here so a change to
+    /// either formatter fails a test in THIS crate rather than silencing the
+    /// relay in production. Its own tests carry these same literals.
+    #[test]
+    fn event_lines_keep_the_shape_the_relay_parses() {
+        let text = render(true, || {
+            tracing::info!(target: "heimdall::event", "[spo=1 epoch=307] DKG complete");
+        });
+        assert_eq!(text, "<6>heimdall::event: [spo=1 epoch=307] DKG complete\n");
+
+        let plain = render(false, || {
+            tracing::info!(target: "heimdall::event", "[spo=1 epoch=307] DKG complete");
+        });
+        assert_eq!(
+            &plain[20..],
+            "  INFO heimdall::event: [spo=1 epoch=307] DKG complete\n",
+            "{plain}"
+        );
+
+        let buf = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_writer(buf.clone())
+            .with_max_level(Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "heimdall::event", "[spo=1 epoch=307] DKG complete");
+        });
+        let json: serde_json::Value = serde_json::from_str(buf.contents().trim()).unwrap();
+        assert_eq!(json["level"], "INFO");
+        assert_eq!(json["target"], "heimdall::event");
+        assert_eq!(json["fields"]["message"], "[spo=1 epoch=307] DKG complete");
+        assert!(json["timestamp"].is_string(), "{json}");
     }
 
     #[test]

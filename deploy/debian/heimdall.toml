@@ -358,6 +358,12 @@ bind = "127.0.0.1:18580"
 #
 # You rarely need to edit this file to change it: RUST_LOG in
 # /etc/default/heimdall overrides it and survives package upgrades.
+#
+# Whatever the level, the operator-facing event lines (target "heimdall::event":
+# a DKG round and its participants, the new key and treasury address, a movement
+# built / posted / confirmed) stay at info — they are one line each and are what
+# tools/heimdall-discord relays to a channel. Only a full directive that names
+# heimdall ("warn,heimdall=warn") turns them off.
 level = "info"
 
 # auto | plain | journal | json. LEAVE THIS ALONE under systemd.

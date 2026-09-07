@@ -110,6 +110,14 @@ pub async fn dkg_phase(
                 roster.max_signers,
                 roster.min_signers
             );
+            crate::epoch_event!(
+                me,
+                epoch,
+                "DKG round1 (attempt {attempt}) started: n={} t={}, participants: {}",
+                roster.max_signers,
+                roster.min_signers,
+                crate::epoch::log::describe_participants(roster.participants.iter())
+            );
 
             // Publish THIS node's chain-view for the ceremony (candidate-set
             // digest + count + the chain read-time it was resolved at). The
@@ -358,6 +366,22 @@ pub async fn dkg_phase(
                 "DKG round2 (attempt {attempt}): computing per-peer secret shares from round1 \
                  packages"
             );
+            {
+                // Who made it into this round: the peers whose round-1 package
+                // this node holds, plus itself. After an in-place narrowing the
+                // roster is already the reduced set, so `n` is that set's size.
+                let mut published: BTreeSet<Identifier> =
+                    collected.round1_peers.keys().copied().collect();
+                published.insert(me);
+                crate::epoch_event!(
+                    me,
+                    epoch,
+                    "DKG round2 (attempt {attempt}) started: round1 packages in from {} of {} ({})",
+                    published.len(),
+                    roster.max_signers,
+                    crate::epoch::log::id_list(&published)
+                );
+            }
 
             let secret = collected
                 .round1_mine
@@ -506,6 +530,13 @@ pub async fn dkg_phase(
                 epoch,
                 "DKG part3 (attempt {attempt}): combining shares into final KeyPackage + group key"
             );
+            crate::epoch_event!(
+                me,
+                epoch,
+                "DKG part3 (attempt {attempt}) started: round2 shares in from {} of {}",
+                collected.round2_peers.len() + 1,
+                roster.max_signers
+            );
 
             let round2_secret = collected
                 .round2_mine
@@ -559,6 +590,14 @@ pub async fn dkg_phase(
                 epoch,
                 "  -> my signing share is bound to spo={}, threshold {}",
                 id_short(*key_package.identifier()),
+                key_package.min_signers()
+            );
+            crate::epoch_event!(
+                me,
+                epoch,
+                "DKG complete (attempt {attempt}): Y_51={} — {} share-holder(s), threshold {}",
+                hex::encode(&vk_bytes),
+                roster.max_signers,
                 key_package.min_signers()
             );
 

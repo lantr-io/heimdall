@@ -1,0 +1,16 @@
+# /etc/default/heimdall-discord — environment for heimdall-discord.service.
+#
+# Keep it 0600 root:root: the webhook URL is a bearer secret — anyone holding it
+# can post to the channel. The unit reads this file as root before dropping to
+# its dynamic user, so the relay itself never needs to open it.
+
+# The Discord webhook to post to (Channel settings → Integrations → Webhooks).
+DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/<id>/<token>"
+
+# What to follow and what to relay. One --unit per node, e.g. for the .deb's
+# unit "--unit heimdall", or for template instances
+# "--unit heimdall@spo1 --unit heimdall@spo2 --unit heimdall@spo3". Every
+# message is prefixed with the unit it came from. `--min-level error` drops
+# warnings; `--no-events` leaves only warnings and errors; --file follows a log
+# file instead (see the README).
+HEIMDALL_DISCORD_ARGS="--unit heimdall"

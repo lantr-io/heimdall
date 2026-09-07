@@ -45,9 +45,32 @@ jobs:
       - name: cargo test
         run: cargo test --locked
 
+  # tools/heimdall-discord is its own crate on purpose (it must not be part of
+  # the daemon), so the jobs above never touch it.
+  tool-discord:
+    name: tools/heimdall-discord
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/heimdall-discord
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/heimdall-discord
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --locked
+
   notify:
     name: discord
-    needs: [lint, test]
+    needs: [lint, test, tool-discord]
     if: always()
     runs-on: ubuntu-latest
     env:
