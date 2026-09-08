@@ -45,6 +45,7 @@
 //! below — `last_progress_ms` moves or it does not — and that is what an
 //! operator's monitoring should alert on.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,16 @@ pub struct NodeState {
     /// which is the thing it hurts most to learn late, because the node keeps
     /// running and looks fine.
     pub dkg_qualified: Option<bool>,
+    /// Deposits that have stranded at a retired peg-in address, as
+    /// `"<btc_txid>:<vout>"`.
+    ///
+    /// A standing condition, not an event: the key a stranded deposit sits under
+    /// never becomes current again, so every batch re-derives the same answer.
+    /// Kept here so the log can say it ONCE — a deposit is warned about when it
+    /// ENTERS this set — while the fact stays queryable for as long as it holds.
+    /// `/health` is the right home for exactly this: "a warn line scrolls away,
+    /// and by the time anyone looks the log is gone".
+    pub stranded_pegins: BTreeSet<String>,
     /// Peers excluded from the ceremony by the pre-ceremony handshake (WI-067),
     /// as `"spo=<short id>: <reason>"`.
     ///
@@ -179,6 +190,16 @@ pub fn render(state: &NodeState) -> String {
             ));
         }
         None => out.push_str("grid            — (no batch grid resolved yet)\n"),
+    }
+    if !state.stranded_pegins.is_empty() {
+        out.push_str(&format!(
+            "stranded peg-ins {} — at a retired address, unsweepable by any movement; \
+             recovery is the federation leaf or the depositor's refund\n",
+            state.stranded_pegins.len()
+        ));
+        for d in &state.stranded_pegins {
+            out.push_str(&format!("                {d}\n"));
+        }
     }
     out.push_str(&format!(
         "dkg             {}\n",
@@ -407,6 +428,10 @@ mod tests {
     fn the_state_round_trips_as_json() {
         let state = NodeState {
             epoch: Some(9),
+            // Non-empty on purpose: `heimdall status` reads this over the wire,
+            // so a stranded deposit has to survive the round trip to be reported
+            // at all.
+            stranded_pegins: BTreeSet::from(["abc123:0".to_string()]),
             grid: Some(GridPosition {
                 slot: 5_000_000,
                 batch: Some(2),
