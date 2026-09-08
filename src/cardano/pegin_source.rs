@@ -20,10 +20,43 @@ use crate::epoch::state::EpochResult;
 
 /// A Cardano UTxO reference: `(tx_hash, output_index)`. 32-byte hash
 /// to match pallas' `Hash<32>` / `TransactionInput.transaction_id`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CardanoOutRef {
     pub tx_hash: [u8; 32],
     pub output_index: u32,
+}
+
+impl std::fmt::Display for CardanoOutRef {
+    /// `<tx_hash hex>#<index>` — the form cardano-cli takes and every explorer
+    /// shows, so an outref in a log line can be pasted straight into a query.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured rather than field-accessed on purpose. `PartialEq`, `Ord`
+        // and `Hash` are still derived, so a field added later would be COMPARED
+        // but not PRINTED — and the first sign of that is an `assert_eq!` failure
+        // whose left and right render identically, which is exactly the
+        // undebuggable output this impl exists to remove. This way a new field is
+        // a compile error here instead.
+        let Self {
+            tx_hash,
+            output_index,
+        } = self;
+        write!(f, "{}#{}", hex::encode(tx_hash), output_index)
+    }
+}
+
+/// Written out rather than derived, and identical to [`std::fmt::Display`].
+///
+/// The derive prints `tx_hash` as a 32-element list of DECIMAL bytes, so an
+/// operator got `CardanoOutRef { tx_hash: [157, 22, 73, ...], output_index: 0 }`
+/// where they needed a transaction id — unreadable, un-greppable, and
+/// un-pasteable. Making the DEBUG form hex too is what fixes it everywhere at
+/// once: `{:?}` reaches this type through log lines, `anyhow` context, and
+/// assertion failures alike, and a hex outref is the more useful text in all
+/// three.
+impl std::fmt::Debug for CardanoOutRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
 }
 
 /// A peg-in request as seen on Cardano: the UTxO that carries it and
@@ -62,4 +95,51 @@ pub trait CardanoPegInSource: Send + Sync {
         &self,
         policy_id: &[u8; 28],
     ) -> EpochResult<Vec<CardanoPegInRequest>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both forms are hex, and both are the SAME text.
+    ///
+    /// Pinned because the failure it replaces was silent: `#[derive(Debug)]`
+    /// rendered `tx_hash` as 32 decimal bytes, and every `{:?}` in a log line
+    /// printed `CardanoOutRef { tx_hash: [157, 22, 73, ...], output_index: 0 }`
+    /// where an operator needed a transaction id. Restoring the derive would
+    /// reintroduce that without breaking anything a compiler can see.
+    #[test]
+    fn an_outref_prints_as_a_pasteable_txid() {
+        let mut tx_hash = [0u8; 32];
+        tx_hash[0] = 0x9d;
+        tx_hash[1] = 0x16;
+        tx_hash[31] = 0xf4;
+        let outref = CardanoOutRef {
+            tx_hash,
+            // Non-zero, because `#0` is also what an implementation that
+            // hardcoded the separator-and-index would print: the index has to
+            // discriminate, or the second half of the format is not pinned.
+            output_index: 7,
+        };
+
+        let shown = outref.to_string();
+        assert_eq!(
+            shown, "9d160000000000000000000000000000000000000000000000000000000000f4#7",
+            "the cardano-cli / explorer form, so it can be pasted into a query"
+        );
+        assert_eq!(
+            format!("{outref:?}"),
+            shown,
+            "`{{:?}}` reaches this type through logs, error context and assertion \
+             failures — it must not fall back to a list of decimal bytes"
+        );
+        // The one form the exact match above does NOT cover: `{:#?}` is a
+        // separate path through the formatter, and a DERIVED Debug answers it
+        // with the multi-line byte array this type was changed to stop printing.
+        assert_eq!(
+            format!("{outref:#?}"),
+            shown,
+            "the alternate/pretty form must not expand back into fields"
+        );
+    }
 }

@@ -2779,7 +2779,7 @@ async fn collect_pegins_phase(
                     crate::epoch_debug!(
                         me,
                         epoch,
-                        "  skipped peg-in {:?}: deposit {}:{} was already swept",
+                        "  skipped peg-in {}: deposit {}:{} was already swept",
                         req.cardano_utxo,
                         parsed.btc_txid,
                         parsed.btc_vout
@@ -2810,7 +2810,7 @@ async fn collect_pegins_phase(
                             crate::epoch_warn!(
                                 me,
                                 epoch,
-                                "  peg-in {:?} deposits {} sat ({}:{}) at an address this \
+                                "  peg-in {} deposits {} sat ({}:{}) at an address this \
                                  bridge no longer sweeps — internal key {}, Q_auth {}. No \
                                  movement signs under that key, so recovery is the federation \
                                  leaf after {} blocks or the depositor's refund after {}",
@@ -2835,7 +2835,7 @@ async fn collect_pegins_phase(
                             crate::epoch_debug!(
                                 me,
                                 epoch,
-                                "  deferring peg-in {:?}: it pays the address the bridge now \
+                                "  deferring peg-in {}: it pays the address the bridge now \
                                  publishes, which the current head cannot spend",
                                 req.cardano_utxo
                             );
@@ -2876,7 +2876,7 @@ async fn collect_pegins_phase(
                     crate::epoch_warn!(
                         me,
                         epoch,
-                        "  dropped peg-in {loser:?}: deposit {}:{} is also claimed by {winner:?}, \
+                        "  dropped peg-in {loser}: deposit {}:{} is also claimed by {winner}, \
                          which is earlier in the batch's FIFO order — a movement cannot spend one \
                          outpoint twice, and the earlier request is the one that can be eligible",
                         deposit_txid,
@@ -2888,7 +2888,7 @@ async fn collect_pegins_phase(
                 accepted.insert(req.cardano_utxo.clone(), parsed);
             }
             Err(e) => {
-                crate::epoch_warn!(me, epoch, "  dropped peg-in {:?}: {}", req.cardano_utxo, e);
+                crate::epoch_warn!(me, epoch, "  dropped peg-in {}: {}", req.cardano_utxo, e);
             }
         }
     }
