@@ -245,7 +245,7 @@ fn run() -> Result<(), String> {
 
 fn main() {
     // Before anything else: the config-load failure below has to be levelled too.
-    heimdall::logging::init_tool();
+    heimdall::logging::init_tool(env!("CARGO_CRATE_NAME"));
     if let Err(e) = run() {
         error!("{e}");
         std::process::exit(1);

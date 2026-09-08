@@ -122,15 +122,28 @@ fn cli() -> &'static CliOverrides {
 /// posted movement. A full directive is used verbatim, so `warn,heimdall=warn`
 /// is how to silence the events too.
 fn filter_directive(raw: &str) -> String {
+    filter_directive_for(raw, None)
+}
+
+/// [`filter_directive`], plus one more target held at the same level.
+///
+/// `extra` is how a TOOL gets its own `info!` through: the bare form covers
+/// `heimdall` (the library) but not `depositor` or `register-pool`, whose events
+/// carry their own crate name as the target. A full directive (one containing
+/// `=` or `,`) is still passed through untouched — an operator who wrote one
+/// means it.
+fn filter_directive_for(raw: &str, extra: Option<&str>) -> String {
     let raw = raw.trim();
     if raw.contains('=') || raw.contains(',') {
-        raw.to_string()
-    } else {
-        format!("warn,heimdall={raw},{EVENT_TARGET}=info")
+        return raw.to_string();
+    }
+    match extra {
+        Some(t) => format!("warn,heimdall={raw},{t}={raw},{EVENT_TARGET}=info"),
+        None => format!("warn,heimdall={raw},{EVENT_TARGET}=info"),
     }
 }
 
-fn resolve_filter(cfg: &LogConfig) -> EnvFilter {
+fn resolve_filter(cfg: &LogConfig, extra: Option<&str>) -> EnvFilter {
     let raw = cli()
         .level
         .clone()
@@ -140,12 +153,12 @@ fn resolve_filter(cfg: &LogConfig) -> EnvFilter {
                 .filter(|s| !s.trim().is_empty())
         })
         .unwrap_or_else(|| cfg.level.clone());
-    let directive = filter_directive(&raw);
+    let directive = filter_directive_for(&raw, extra);
     // A typo in a level must not silently disable logging, and it is too early
     // to log the complaint — fall back to the default and say so on stderr.
     EnvFilter::try_new(&directive).unwrap_or_else(|e| {
         eprintln!("warning: ignoring invalid log level {raw:?} ({e}); using \"info\"");
-        EnvFilter::new(filter_directive("info"))
+        EnvFilter::new(filter_directive_for("info", extra))
     })
 }
 
@@ -176,11 +189,11 @@ fn resolve_format(cfg: &LogConfig) -> LogFormat {
 
 // ── Init ────────────────────────────────────────────────────────────
 
-fn install<W>(cfg: &LogConfig, writer: W)
+fn install<W>(cfg: &LogConfig, extra_target: Option<&str>, writer: W)
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
-    let filter = resolve_filter(cfg);
+    let filter = resolve_filter(cfg, extra_target);
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(writer);
@@ -203,7 +216,7 @@ where
 /// Install the process-wide subscriber, logging to stdout. Idempotent: a second
 /// call is a no-op, so a test or a tool that loads two configs does not panic.
 pub fn init(cfg: &LogConfig) {
-    install(cfg, std::io::stdout);
+    install(cfg, None, std::io::stdout);
 }
 
 /// Install the subscriber for a pipe-friendly one-shot tool, logging to
@@ -215,8 +228,18 @@ pub fn init(cfg: &LogConfig) {
 /// split is the tool's interface, not the accident this module exists to fix.
 /// The daemon's one-stream rule is about journald ordering; a tool at the head
 /// of a pipeline has no journald and no ordering problem.
-pub fn init_tool() {
-    install(&LogConfig::default(), std::io::stderr);
+///
+/// `target` is the calling binary's tracing target — its own crate name, which
+/// for a `src/bin/*.rs` is the file stem. It has to be named because
+/// [`filter_directive`] builds `warn,heimdall=<level>,…`: that covers the
+/// library a tool calls into, but NOT the tool's own module path, so every
+/// `info!` in `depositor` or `register-pool` was filtered to `warn` and their
+/// whole diagnostic output — the peg-in address included — went nowhere. A tool
+/// whose only useful output is invisible at its own default level is worse than
+/// a silent one, because it looks like it ran and printed nothing.
+pub fn init_tool(target: &str) {
+    let cfg = LogConfig::default();
+    install(&cfg, Some(target), std::io::stderr);
 }
 
 // ── Text formatter ──────────────────────────────────────────────────
@@ -329,6 +352,40 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    /// A tool's own events have to survive its own default filter.
+    ///
+    /// `depositor` prints the peg-in address — the whole reason it is run — at
+    /// `info!` on the `depositor` target. The bare directive covers `heimdall`
+    /// and nothing else, so before this every one of those lines was filtered to
+    /// `warn` and the tool appeared to run and print nothing.
+    #[test]
+    fn a_tools_own_target_survives_its_default_filter() {
+        let bare = super::filter_directive_for("info", None);
+        assert!(
+            !bare.contains("depositor"),
+            "the daemon's directive names only the library: {bare}"
+        );
+
+        let tool = super::filter_directive_for("info", Some("depositor"));
+        assert!(
+            tool.contains("depositor=info"),
+            "a tool must hold its OWN target at the chosen level: {tool}"
+        );
+        assert!(
+            tool.contains("heimdall=info"),
+            "and still see the library it calls into: {tool}"
+        );
+
+        // A full directive is the operator's, and is passed through untouched —
+        // adding to it would override what they explicitly asked for.
+        let explicit = "warn,heimdall::epoch=debug";
+        assert_eq!(
+            super::filter_directive_for(explicit, Some("depositor")),
+            explicit,
+            "an explicit directive must not be rewritten"
+        );
+    }
+
     use std::sync::{Arc, Mutex};
 
     use super::*;
