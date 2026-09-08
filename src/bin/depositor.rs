@@ -85,7 +85,7 @@ struct Cli {
     /// well-formed address no federation will ever touch, which is worse than refusing to
     /// run. The other two tree inputs are `--y-federation` and `--federation-csv-blocks`.
     #[arg(long)]
-    frost_key: String,
+    frost_key: Option<String>,
 
     /// The federation fallback key `Y_federation`, 32-byte x-only hex — the key in the
     /// deposit tree's EMERGENCY-SWEEP leaf, not the internal key. Published as the
@@ -96,7 +96,7 @@ struct Cli {
     /// absent value builds a well-formed P2TR that neither the federation can sweep nor
     /// this depositor can refund.
     #[arg(long)]
-    y_federation: String,
+    y_federation: Option<String>,
 
     /// The CSV delay of the deposit tree's DEPOSITOR REFUND leaf, in blocks — the
     /// bridge's Config `params.pegin_refund_timeout_blocks` ([CFG-9]).
@@ -104,7 +104,7 @@ struct Cli {
     /// A flag for the same reason as the rest: it is hashed into the deposit address.
     /// It must exceed `--federation-csv-blocks`.
     #[arg(long)]
-    refund_timeout_blocks: u16,
+    refund_timeout_blocks: Option<u16>,
 
     /// The CSV delay of the deposit tree's federation leaf, in blocks — the bridge's
     /// Config `params.federation_csv_blocks`.
@@ -114,7 +114,7 @@ struct Cli {
     /// correctly configured node (WI-069 moved it on chain), so reading it from there would
     /// either refuse to run or silently use a value the bridge does not publish.
     #[arg(long)]
-    federation_csv_blocks: u16,
+    federation_csv_blocks: Option<u16>,
 
     /// Depositor's funding key in Bitcoin WIF format. Its BIP-86 Taproot
     /// output key is what the OP_RETURN beacon carries and what the peg-in
@@ -165,7 +165,7 @@ struct Utxo {
 
 fn main() {
     // Before anything else: the config-load failure below has to be levelled too.
-    heimdall::logging::init_tool();
+    heimdall::logging::init_tool(env!("CARGO_CRATE_NAME"));
     if let Err(e) = run() {
         error!("{e}");
         std::process::exit(1);
@@ -177,18 +177,59 @@ fn run() -> Result<(), String> {
 
     let cfg = HeimdallConfig::from_file(&cli.config).map_err(|e| e.to_string())?;
     let network = cfg.bitcoin.parsed_network();
-    let refund_timeout = cli.refund_timeout_blocks;
-
     let secp = Secp256k1::new();
+    // Created here rather than at the first broadcast: resolving the deposit tree
+    // from the chain is itself async, and that happens before anything is built.
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
 
-    // The peg-in Taproot internal key is the FROST group key Y_51 — NOT the federation
-    // key Y_fed, which sits in the emergency-sweep LEAF. Both have to be passed in: they
-    // are consensus values the daemon reconstructs every deposit address from
-    // (`parse_pegin_request`), so getting either from anywhere else silently produces
-    // deposits no federation can sweep.
-    let y_51 = parse_xonly("--frost-key", &cli.frost_key)?;
-    let y_federation = parse_xonly("--y-federation", &cli.y_federation)?;
-    let federation_csv_blocks = cli.federation_csv_blocks;
+    // The deposit address is decided by four values, and every one of them is
+    // published: Y_51 in the treasury_info datum, Y_federation and
+    // federation_csv_blocks in Config #11, the refund timeout in [CFG-9]. So read
+    // them from the chain, and let the flags OVERRIDE rather than supply.
+    //
+    // The direction matters. Y_51 rotates at every handoff, and a deposit built
+    // under the previous one is a well-formed P2TR that the bridge cannot sweep
+    // and the depositor cannot touch until the refund timeout — which is how a
+    // 15468 sat deposit stranded on 2026-08-28. Requiring the operator to paste a
+    // rotating key made the common path the dangerous one.
+    //
+    // The overrides stay because this is a test utility: building a deposit under
+    // a stale or wrong key is how the stranded-deposit and refund paths get
+    // exercised at all, and that has to remain possible ON PURPOSE.
+    let from_chain = match rt.block_on(heimdall::cardano::bridge_view::pegin_tree_from_chain(&cfg))
+    {
+        Ok(t) => Some(t),
+        Err(e) => {
+            // Not fatal on its own: a fully-specified command line needs no chain
+            // at all, which is what the fixture tests use. Fatal only if something
+            // is still missing below.
+            info!("could not read the bridge's published peg-in tree ({e})");
+            None
+        }
+    };
+
+    let pick_key =
+        |flag: &str, given: &Option<String>, chain: Option<UntweakedPublicKey>| match given {
+            Some(hex) => parse_xonly(flag, hex).map(|k| (k, "override")),
+            None => chain
+                .map(|k| (k, "chain"))
+                .ok_or_else(|| format!("{flag} is required: the bridge publishes no value for it")),
+        };
+    let (y_51, y_51_src) = pick_key("--frost-key", &cli.frost_key, from_chain.map(|t| t.y_51))?;
+    let (y_federation, y_fed_src) = pick_key(
+        "--y-federation",
+        &cli.y_federation,
+        from_chain.map(|t| t.y_federation),
+    )?;
+    let federation_csv_blocks = cli
+        .federation_csv_blocks
+        .or(from_chain.map(|t| t.federation_csv_blocks))
+        .ok_or("--federation-csv-blocks is required: the bridge publishes no value for it")?;
+    let refund_timeout = cli
+        .refund_timeout_blocks
+        .or(from_chain.map(|t| t.refund_timeout))
+        .ok_or("--refund-timeout-blocks is required: the bridge publishes no value for it")?;
+
     let pegin_tree = PeginTreeParams {
         y_51,
         y_federation,
@@ -197,6 +238,10 @@ fn run() -> Result<(), String> {
     };
     // One rule, one message, shared with every other deriver.
     pegin_tree.validate()?;
+    info!(
+        "peg-in tree: Y_51 from {y_51_src}, Y_federation from {y_fed_src}, \
+         csv={federation_csv_blocks}, refund={refund_timeout}"
+    );
 
     let wif = read_wif(&cli)?;
     let depositor_priv =
@@ -241,8 +286,6 @@ fn run() -> Result<(), String> {
         Address::p2tr(&secp, depositor_xonly, None, network)
     );
     info!("depositor P2WPKH:    {depositor_p2wpkh}");
-
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
 
     let deposit_amount = Amount::from_sat(cli.deposit_amount_sat);
     // The federation rejects peg-in outputs below its 330-sat dust threshold
