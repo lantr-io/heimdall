@@ -8316,7 +8316,7 @@ fn run_sweep_pegins(
                     .and_then(|t| parse_pegin_request(req, t).ok())
                 {
                     Some(fed) => warn!(
-                        "  peg-in {:?} pays the FEDERATION address ({}:{}, {} sat) — this \
+                        "  peg-in request {} pays the FEDERATION address (deposit {}:{}, {} sat) — this \
                          bridge's deposit, but this mover signs under Y_51 only and one \
                          movement signs every input with one key. The federation must move it",
                         req.cardano_utxo,
@@ -8324,7 +8324,7 @@ fn run_sweep_pegins(
                         fed.btc_vout,
                         fed.value.to_sat(),
                     ),
-                    None => warn!("  dropped peg-in {:?}: {e}", req.cardano_utxo),
+                    None => warn!("  dropped peg-in request {}: {e}", req.cardano_utxo),
                 }
                 continue;
             }
@@ -8335,7 +8335,7 @@ fn run_sweep_pegins(
         };
         if excluded.contains(&outpoint) {
             info!(
-                "  excluded peg-in {}:{} — {} sat (--exclude-pegin: already in treasury)",
+                "  excluded peg-in deposit {}:{} — {} sat (--exclude-pegin: already in treasury)",
                 parsed.btc_txid,
                 parsed.btc_vout,
                 parsed.value.to_sat(),
@@ -8344,7 +8344,7 @@ fn run_sweep_pegins(
         }
         if auto_consumed.contains(&outpoint) {
             println!(
-                "  auto-skip peg-in {}:{} — {} sat (already in the swept peg-ins trie or \
+                "  auto-skip peg-in deposit {}:{} — {} sat (already in the swept peg-ins trie or \
                  committed to a live in-flight TM; its PIR just lingers unminted)",
                 parsed.btc_txid,
                 parsed.btc_vout,
@@ -8353,7 +8353,7 @@ fn run_sweep_pegins(
             continue;
         }
         info!(
-            "  peg-in {}:{} — {} sat (depositor {})",
+            "  peg-in deposit {}:{} — {} sat (depositor {})",
             parsed.btc_txid,
             parsed.btc_vout,
             parsed.value.to_sat(),
