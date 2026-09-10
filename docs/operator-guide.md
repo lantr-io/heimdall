@@ -109,6 +109,13 @@ config_nft_asset_name = "424946434647"   # "BIFCFG"
 min_stake_lovelace = 1000000000          # your own registration gate, in lovelace
 cold_skey_path = "/etc/heimdall/pool-cold.skey"   # or cold_vkey_path, for the air-gapped flow
 
+# CONSENSUS INPUTS — the shared preprod test bridge above runs both, and every
+# node of its roster must carry the SAME values or the peers exclude each other
+# at the pre-ceremony handshake. Joining a different bridge, take these from its
+# deployment notes; a bridge on real Cardano epochs sets neither. See §3.
+demo_live_stake = true                   # TEST BRIDGES ONLY
+demo_virtual_epoch_slots = 86400         # TEST BRIDGES ONLY — a 24-hour cycle
+
 [http]
 bind_address = "0.0.0.0"
 EOF
@@ -383,6 +390,19 @@ network = "preprod"
 config_address = "addr_test1…"
 config_nft_policy_id = "…"
 config_nft_asset_name = "424946434647"   # "BIFCFG"
+
+# CONSENSUS INPUTS. Not preferences: every node of the roster must carry the
+# SAME values or the peers exclude each other at the pre-ceremony handshake —
+# your node registers, stays reachable, and is simply never talked to. Take
+# them from the bridge's deployment notes, exactly as written there.
+#
+# The shared preprod test bridge this guide's defaults name runs BOTH:
+demo_live_stake = true              # TEST BRIDGES ONLY
+demo_virtual_epoch_slots = 86400    # TEST BRIDGES ONLY — a 24-hour cycle
+#
+# A bridge on real Cardano epochs sets neither, and mainnet refuses both. See
+# [Appendix: running a test bridge](#appendix-running-a-test-bridge) for what
+# each one does and what it costs.
 
 # Your own minimum-stake gate for registration, in lovelace.
 min_stake_lovelace = 1000000000
@@ -1032,7 +1052,7 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 |---|---|
 | the service will not start | `journalctl -u heimdall -p err`, then re-run the step-4 check — it names the failing check and what to fix |
 | starts, then nothing happens for days | expected; see *Quiet is normal* |
-| peers seem not to see you | step 5 — is the registered port open and reachable *from outside*? |
+| peers seem not to see you | first step 5 — is the registered port open and reachable *from outside*? If it is, compare `demo_live_stake` and `demo_virtual_epoch_slots` against the rest of the roster (§3): they are consensus inputs, so a node that differs is registered, reachable, and deliberately never talked to. Both sides log `⚠ EXCLUDING`, so the roster sees it too |
 | `[3/9] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
 | `[6/9] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
 | `no reference script for the registry` right after `deploy-registry-ref` succeeded | the provider's address listing has not shown the script yet – pass the outpoint the deploy printed, `--registry-ref <tx_hash>:0` (step 6) |
