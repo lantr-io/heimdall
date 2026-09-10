@@ -142,8 +142,7 @@ pub fn describe_participants<'a>(
         .join(", ")
 }
 
-/// The SUBSET of a roster named by `ids`, rendered like
-/// [`describe_participants`] — `#N pool1… http://…` — in index order.
+/// The SUBSET of a roster named by `ids`, as `#N <url>`, in index order.
 ///
 /// Exists because the DKG's later rounds used to print bare indices
 /// (`(#1 #2 #3)`) while Round 1 printed the full list. An operator reading the
@@ -151,6 +150,12 @@ pub fn describe_participants<'a>(
 /// WHICH node was missing, and matching an index back to a URL meant scrolling
 /// to the Round-1 line for the same attempt — an index is positional, so it is
 /// only meaningful next to the roster it came from.
+///
+/// The URL and not the pool id, deliberately: these lines say who was PRESENT,
+/// and the URL is the thing an operator acts on — it is what they reach for to
+/// check whether a node is up. A bech32 pool id is 56 characters, so carrying
+/// both would treble the length of a line that already repeats per round, for
+/// an identifier that Round 1 has already published alongside the same index.
 ///
 /// An id with no entry in the roster is shown as `#N (not in roster)` rather
 /// than dropped: a set that names someone the roster does not is a bug worth
@@ -162,12 +167,7 @@ pub fn describe_selected<'a>(
 ) -> String {
     ids.into_iter()
         .map(|id| match roster.get(id) {
-            Some(info) => format!(
-                "#{} {} {}",
-                id_short(*id),
-                pool_label(&info.pool_id),
-                info.bifrost_url
-            ),
+            Some(info) => format!("#{} {}", id_short(*id), info.bifrost_url),
             None => format!("#{} (not in roster)", id_short(*id)),
         })
         .collect::<Vec<_>>()
@@ -301,8 +301,11 @@ mod tests {
         // The realistic case: one member did not publish.
         let kept = [ident(1), ident(3)];
         let line = describe_selected(kept.iter(), &roster);
-        assert!(line.contains("#1 pool1"), "{line}");
-        assert!(line.contains("http://spo1.example:18501"), "{line}");
+        assert!(line.starts_with("#1 http://spo1.example:18501"), "{line}");
+        assert!(
+            !line.contains("pool1"),
+            "these lines carry the URL only — Round 1 already published the pool id: {line}"
+        );
         assert!(line.contains("http://spo3.example:18503"), "{line}");
         assert!(
             !line.contains("spo2"),

@@ -613,8 +613,13 @@ pub async fn dkg_phase(
                 // The set that came THROUGH the ceremony, which is not always the
                 // set that entered it: a failed attempt reruns over a reduced
                 // candidate set, so this is the list that matters for the epoch —
-                // who can actually sign a movement.
-                crate::epoch::log::describe_participants(roster.participants.iter())
+                // who can actually sign a movement. URLs only, like the rounds
+                // above: Round 1 already published the pool ids against the same
+                // indices.
+                crate::epoch::log::describe_selected(
+                    roster.participants.keys(),
+                    &roster.participants
+                )
             );
 
             let group_keys = GroupKeys {
