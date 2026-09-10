@@ -55,20 +55,54 @@ command -v dpkg-deb >/dev/null 2>&1 || {
 # then the number of commits behind it, which breaks same-day ties and is
 # monotonic along a branch. The sha stays on the end as what it actually is —
 # an identifier, not an ordinal.
+#
+# The BASE is the last release tag, not the Cargo.toml version, and that is the
+# half that took a second go to get right. Releases are named from the tag
+# series ("0.1-M5.3"); snapshots used the Cargo.toml version ("0.1.0+..."). Two
+# numbering schemes with different bases cannot order against each other, and
+# these two ordered the wrong way round: dpkg sorts '-' (0x2D) before '.'
+# (0x2E), so EVERY "0.1-M*" release ranked below EVERY "0.1.0+*" snapshot, and
+# installing an official release over a locally built one looked like a
+# downgrade.
+#
+# Naming a snapshot after the release it FOLLOWS fixes that by construction:
+#
+#   0.1-M5.3        the release
+#   0.1-M5.3+2026…  a snapshot built after it   -> above M5.3, below M5.4
+#   0.1-M5.4        the next release
+#
+# '+' is what puts it above the release it names, and the next tag's own number
+# is what keeps it below the release after that. Nothing has to be kept in sync
+# by hand: `git describe` already answers "which release is this built on top
+# of", and the binary's own --version has always used it.
 if [ -z "${VERSION:-}" ]; then
-    base="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
-    [ -n "$base" ] || base="0.0.0"
-    stamp="$(git show -s --format=%cd --date=format:%Y%m%d HEAD 2>/dev/null || true)"
-    count="$(git rev-list --count HEAD 2>/dev/null || true)"
-    sha="$(git rev-parse --short HEAD 2>/dev/null || true)"
-    if [ -n "$stamp" ] && [ -n "$count" ] && [ -n "$sha" ]; then
-        VERSION="${base}+${stamp}.${count}.g${sha}"
-    elif [ -n "$sha" ]; then
-        # No usable history (a shallow or exported tree). Still legal, still
-        # unique, just not ordered — better than refusing to build.
-        VERSION="${base}+g${sha}"
+    # Exactly ON a tag: this IS that release, so build it under that name and
+    # nothing else — a rebuild of a release must not outrank the release.
+    exact="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+    if [ -n "$exact" ]; then
+        VERSION="${exact#v}"
     else
-        VERSION="$base"
+        base="$(git describe --tags --abbrev=0 HEAD 2>/dev/null || true)"
+        base="${base#v}"
+        if [ -z "$base" ]; then
+            # No tags reachable (a shallow clone, or before the first release).
+            # Cargo.toml is the only base left; it orders against other
+            # untagged builds, which is all it can promise.
+            base="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+            [ -n "$base" ] || base="0.0.0"
+        fi
+        stamp="$(git show -s --format=%cd --date=format:%Y%m%d HEAD 2>/dev/null || true)"
+        count="$(git rev-list --count HEAD 2>/dev/null || true)"
+        sha="$(git rev-parse --short HEAD 2>/dev/null || true)"
+        if [ -n "$stamp" ] && [ -n "$count" ] && [ -n "$sha" ]; then
+            VERSION="${base}+${stamp}.${count}.g${sha}"
+        elif [ -n "$sha" ]; then
+            # No usable history (a shallow or exported tree). Still legal, still
+            # unique, just not ordered — better than refusing to build.
+            VERSION="${base}+g${sha}"
+        else
+            VERSION="$base"
+        fi
     fi
 fi
 case "$VERSION" in
