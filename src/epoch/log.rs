@@ -18,6 +18,8 @@
 //! so the handful of lines an operator wants pushed to them can be selected on
 //! their own — see there for what qualifies.
 
+use std::collections::BTreeMap;
+
 use frost_secp256k1_tr::Identifier;
 
 use crate::epoch::state::SpoInfo;
@@ -140,6 +142,38 @@ pub fn describe_participants<'a>(
         .join(", ")
 }
 
+/// The SUBSET of a roster named by `ids`, rendered like
+/// [`describe_participants`] — `#N pool1… http://…` — in index order.
+///
+/// Exists because the DKG's later rounds used to print bare indices
+/// (`(#1 #2 #3)`) while Round 1 printed the full list. An operator reading the
+/// Discord relay could see that a round went ahead with three of four, but not
+/// WHICH node was missing, and matching an index back to a URL meant scrolling
+/// to the Round-1 line for the same attempt — an index is positional, so it is
+/// only meaningful next to the roster it came from.
+///
+/// An id with no entry in the roster is shown as `#N (not in roster)` rather
+/// than dropped: a set that names someone the roster does not is a bug worth
+/// seeing, and silently rendering fewer entries than the count beside it would
+/// hide exactly that.
+pub fn describe_selected<'a>(
+    ids: impl IntoIterator<Item = &'a Identifier>,
+    roster: &BTreeMap<Identifier, SpoInfo>,
+) -> String {
+    ids.into_iter()
+        .map(|id| match roster.get(id) {
+            Some(info) => format!(
+                "#{} {} {}",
+                id_short(*id),
+                pool_label(&info.pool_id),
+                info.bifrost_url
+            ),
+            None => format!("#{} (not in roster)", id_short(*id)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// `pool1…` for a 28-byte pool id. Fixtures predating WI-013 carry none, and a
 /// malformed one is shown as it is rather than hidden.
 pub fn pool_label(pool_id: &[u8]) -> String {
@@ -241,6 +275,51 @@ mod tests {
         let pool = first.split(' ').nth(1).unwrap();
         assert_eq!(pool.len(), 56, "{pool}");
         assert_eq!(pool, pool_label(&[0x11; 28]));
+    }
+
+    /// The subset a later DKG round went ahead with, named rather than numbered.
+    ///
+    /// Round 1 prints the whole roster with URLs; the rounds after it used to
+    /// print bare indices, so "3 of 4" told an operator that someone was missing
+    /// but not who — and an index only means anything beside the roster it came
+    /// from.
+    #[test]
+    fn a_selected_subset_names_who_it_kept_and_who_it_does_not_know() {
+        let mut roster = BTreeMap::new();
+        for (n, byte) in [(1u16, 0x11u8), (2, 0x22), (3, 0x33)] {
+            roster.insert(
+                ident(n),
+                SpoInfo {
+                    identifier: ident(n),
+                    pool_id: vec![byte; 28],
+                    bifrost_url: format!("http://spo{n}.example:1850{n}"),
+                    bifrost_id_pk: Vec::new(),
+                },
+            );
+        }
+
+        // The realistic case: one member did not publish.
+        let kept = [ident(1), ident(3)];
+        let line = describe_selected(kept.iter(), &roster);
+        assert!(line.contains("#1 pool1"), "{line}");
+        assert!(line.contains("http://spo1.example:18501"), "{line}");
+        assert!(line.contains("http://spo3.example:18503"), "{line}");
+        assert!(
+            !line.contains("spo2"),
+            "the absent member must not appear: {line}"
+        );
+        assert_eq!(
+            line.split(", ").count(),
+            kept.len(),
+            "the list has to be as long as the count printed beside it: {line}"
+        );
+
+        // An id the roster does not know is SHOWN, not dropped — otherwise the
+        // list would be shorter than the count and hide the disagreement.
+        let stray = [ident(1), ident(9)];
+        let line = describe_selected(stray.iter(), &roster);
+        assert!(line.contains("#9 (not in roster)"), "{line}");
+        assert_eq!(line.split(", ").count(), 2, "{line}");
     }
 
     #[test]

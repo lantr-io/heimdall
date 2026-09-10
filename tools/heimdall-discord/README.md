@@ -25,9 +25,9 @@ The `heimdall::event` lines, at `info` — one line each, self-contained:
 | event | when |
 |---|---|
 | `DKG round1 (attempt N) started: n=… t=…, participants: #1 pool1… http://…, …` | the ceremony opens; the participant list is the roster, in index order |
-| `DKG round2 (attempt N) started: round1 packages in from 3 of 3 (#1 #2 #3)` | who made it into round 2 |
-| `DKG part3 (attempt N) started: round2 shares in from 3 of 3` | shares in, combining |
-| `DKG complete (attempt N): Y_51=…, 3 share-holder(s), threshold 2` | the group key |
+| `DKG round2 (attempt N) started: round1 packages in from 3 of 4: #1 pool1… http://…, …` | who made it into round 2, named |
+| `DKG part3 (attempt N) started: round2 shares in from 3 of 4: #1 pool1… http://…, …` | whose shares arrived |
+| `DKG complete (attempt N): Y_51=…, 3 share-holder(s), threshold 2. Final roster: #1 pool1… http://…, …` | the group key, and who holds a share of it |
 | `New treasury address tb1p… (Y_51=…)` | where this epoch's handoff pays the treasury |
 | `Update-Y posted: cardano tx … — treasury key … -> …` | the rotation is on Cardano (also the federation-handoff form) |
 | `TM built: txid … — 3 input(s) (2 deposit(s) swept), 2 output(s), 1 peg-out(s) paid; signing starts` | a treasury movement is assembled |

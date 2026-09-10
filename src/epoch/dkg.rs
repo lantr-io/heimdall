@@ -376,10 +376,10 @@ pub async fn dkg_phase(
                 crate::epoch_event!(
                     me,
                     epoch,
-                    "DKG round2 (attempt {attempt}) started: round1 packages in from {} of {} ({})",
+                    "DKG round2 (attempt {attempt}) started: round1 packages in from {} of {}: {}",
                     published.len(),
                     roster.max_signers,
-                    crate::epoch::log::id_list(&published)
+                    crate::epoch::log::describe_selected(&published, &roster.participants)
                 );
             }
 
@@ -533,9 +533,19 @@ pub async fn dkg_phase(
             crate::epoch_event!(
                 me,
                 epoch,
-                "DKG part3 (attempt {attempt}) started: round2 shares in from {} of {}",
+                "DKG part3 (attempt {attempt}) started: round2 shares in from {} of {}: {}",
                 collected.round2_peers.len() + 1,
-                roster.max_signers
+                roster.max_signers,
+                {
+                    // This node's own share is held locally, not fetched, so it
+                    // is not in `round2_peers` — but it IS one of the senders
+                    // the count includes, and leaving it out would print a list
+                    // one shorter than the number beside it.
+                    let mut senders: std::collections::BTreeSet<Identifier> =
+                        collected.round2_peers.keys().copied().collect();
+                    senders.insert(me);
+                    crate::epoch::log::describe_selected(&senders, &roster.participants)
+                }
             );
 
             let round2_secret = collected
@@ -595,10 +605,16 @@ pub async fn dkg_phase(
             crate::epoch_event!(
                 me,
                 epoch,
-                "DKG complete (attempt {attempt}): Y_51={} — {} share-holder(s), threshold {}",
+                "DKG complete (attempt {attempt}): Y_51={} — {} share-holder(s), threshold {}. \
+                 Final roster: {}",
                 hex::encode(&vk_bytes),
                 roster.max_signers,
-                key_package.min_signers()
+                key_package.min_signers(),
+                // The set that came THROUGH the ceremony, which is not always the
+                // set that entered it: a failed attempt reruns over a reduced
+                // candidate set, so this is the list that matters for the epoch —
+                // who can actually sign a movement.
+                crate::epoch::log::describe_participants(roster.participants.iter())
             );
 
             let group_keys = GroupKeys {
