@@ -1880,6 +1880,31 @@ async fn epoch_start_phase(
     // entry (which also refreshes the roster after an aborted window).
     let ctx = chain.query_dkg_context(epoch, 0).await?;
 
+    // Say who the registry holds, but ONLY when it changed. A steady roster
+    // would otherwise republish the same line every boundary, and this one is
+    // long; a pool joining, leaving, being banned, or having its stake activate
+    // is rare and is exactly what an operator wants interrupting them.
+    //
+    // The comparison is against `/health`, so it survives across epochs without
+    // threading state through the phase functions — and the same string is what
+    // `/health` serves, so the two cannot disagree about what was last seen.
+    {
+        let described = crate::epoch::log::describe_registry(&ctx);
+        let changed = {
+            let mut changed = false;
+            config.health.update(|h| {
+                if h.registry != described {
+                    h.registry.clone_from(&described);
+                    changed = true;
+                }
+            });
+            changed
+        };
+        if changed {
+            crate::epoch_event!(config.identity.identifier, epoch, "registry: {described}");
+        }
+    }
+
     // Re-derive THIS node's index from the CURRENT context, every epoch. The
     // FROST index is positional — rank in the sorted eligible set — so it
     // shifts whenever the set changes: a ban removes an earlier member and

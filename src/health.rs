@@ -69,6 +69,15 @@ pub struct NodeState {
     /// which is the thing it hurts most to learn late, because the node keeps
     /// running and looks fine.
     pub dkg_qualified: Option<bool>,
+    /// The registry as the last ceremony entry read it — the exact text of the
+    /// `registry:` event, so `/health` answers "who is registered, who is
+    /// eligible, and why not" without waiting for the next boundary.
+    ///
+    /// Doubles as the change detector: the event fires when this string differs
+    /// from what the ceremony just computed, so a steady roster is silent and a
+    /// pool joining, leaving, being banned or having its stake activate is one
+    /// line. Empty until the first ceremony entry.
+    pub registry: String,
     /// Deposits that have stranded at a retired peg-in address, as
     /// `"<btc_txid>:<vout>"`.
     ///
@@ -190,6 +199,9 @@ pub fn render(state: &NodeState) -> String {
             ));
         }
         None => out.push_str("grid            — (no batch grid resolved yet)\n"),
+    }
+    if !state.registry.is_empty() {
+        out.push_str(&format!("registry        {}\n", state.registry));
     }
     if !state.stranded_pegins.is_empty() {
         out.push_str(&format!(
@@ -432,6 +444,7 @@ mod tests {
             // so a stranded deposit has to survive the round trip to be reported
             // at all.
             stranded_pegins: BTreeSet::from(["abc123:0".to_string()]),
+            registry: "4 registered, all eligible: #1 http://a.example:18500".to_string(),
             grid: Some(GridPosition {
                 slot: 5_000_000,
                 batch: Some(2),

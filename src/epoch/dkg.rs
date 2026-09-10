@@ -116,7 +116,17 @@ pub async fn dkg_phase(
                 "DKG round1 (attempt {attempt}) started: n={} t={}, participants: {}",
                 roster.max_signers,
                 roster.min_signers,
-                crate::epoch::log::describe_participants(roster.participants.iter())
+                // URLs only, like every other round line. This used to carry the
+                // pool id too, on the reasoning that Round 1 publishes the full
+                // identity once and the later rounds can then just cite an
+                // index. Those rounds carry URLs now, so nothing depends on this
+                // line establishing an index -> pool mapping — and it was the
+                // longest message the relay sends: 405 characters for four SPOs,
+                // 56% of it bech32. `show-roster` prints pool ids on demand.
+                crate::epoch::log::describe_selected(
+                    roster.participants.keys(),
+                    &roster.participants
+                )
             );
 
             // Publish THIS node's chain-view for the ceremony (candidate-set
@@ -376,10 +386,10 @@ pub async fn dkg_phase(
                 crate::epoch_event!(
                     me,
                     epoch,
-                    "DKG round2 (attempt {attempt}) started: round1 packages in from {} of {} ({})",
+                    "DKG round2 (attempt {attempt}) started: round1 packages in from {} of {}: {}",
                     published.len(),
                     roster.max_signers,
-                    crate::epoch::log::id_list(&published)
+                    crate::epoch::log::describe_selected(&published, &roster.participants)
                 );
             }
 
@@ -533,9 +543,19 @@ pub async fn dkg_phase(
             crate::epoch_event!(
                 me,
                 epoch,
-                "DKG part3 (attempt {attempt}) started: round2 shares in from {} of {}",
+                "DKG part3 (attempt {attempt}) started: round2 shares in from {} of {}: {}",
                 collected.round2_peers.len() + 1,
-                roster.max_signers
+                roster.max_signers,
+                {
+                    // This node's own share is held locally, not fetched, so it
+                    // is not in `round2_peers` — but it IS one of the senders
+                    // the count includes, and leaving it out would print a list
+                    // one shorter than the number beside it.
+                    let mut senders: std::collections::BTreeSet<Identifier> =
+                        collected.round2_peers.keys().copied().collect();
+                    senders.insert(me);
+                    crate::epoch::log::describe_selected(&senders, &roster.participants)
+                }
             );
 
             let round2_secret = collected
@@ -595,10 +615,21 @@ pub async fn dkg_phase(
             crate::epoch_event!(
                 me,
                 epoch,
-                "DKG complete (attempt {attempt}): Y_51={} — {} share-holder(s), threshold {}",
+                "DKG complete (attempt {attempt}): Y_51={} — {} share-holder(s), threshold {}. \
+                 Final roster: {}",
                 hex::encode(&vk_bytes),
                 roster.max_signers,
-                key_package.min_signers()
+                key_package.min_signers(),
+                // The set that came THROUGH the ceremony, which is not always the
+                // set that entered it: a failed attempt reruns over a reduced
+                // candidate set, so this is the list that matters for the epoch —
+                // who can actually sign a movement. URLs only, like the rounds
+                // above: Round 1 already published the pool ids against the same
+                // indices.
+                crate::epoch::log::describe_selected(
+                    roster.participants.keys(),
+                    &roster.participants
+                )
             );
 
             let group_keys = GroupKeys {
