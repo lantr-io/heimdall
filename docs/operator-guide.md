@@ -70,11 +70,19 @@ export HEIMDALL_MNEMONIC="…"                         # the funded wallet – n
 ```bash
 sudo apt install ./heimdall_<version>-1_amd64.deb
 heimdall --version
-curl -s http://<any registered peer>:<port>/health     # its version and blueprint_digest must equal yours
+
+# Who to compare against: the registry's peers, read from the chain, one URL per
+# line and nothing else. It reads the bridge from the config, so run it once
+# step 3 has written one; before that, take a URL from the bridge's deployment notes.
+sudo -u heimdall heimdall show-roster --config /etc/heimdall/heimdall.toml --urls
+curl -s <one of those URLs>/health     # its version and blueprint_digest must equal yours
 ```
 
 Expect: `heimdall <sha> (<sha> <date>)`, and the peer's `"version"` and `"blueprint_digest"`
-match what your node will publish (step 7 shows yours).
+match what your node will publish (step 7 shows yours). Any one peer will do — a roster that
+disagrees with itself about the build cannot hold a ceremony, so they all match or nothing runs.
+Dropping `--urls` gives the full report instead: policies, bans and the derived roster
+([§6](#6-register), where you use it to confirm your own registration).
 
 **2. Identity key** – [§2](#2-create-your-bifrost-identity-key).
 
