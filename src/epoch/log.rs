@@ -174,6 +174,43 @@ pub fn describe_selected<'a>(
         .join(", ")
 }
 
+/// The registry as this ceremony reads it: who is eligible, and who is
+/// registered but is NOT, with the reason.
+///
+/// The reason half is the point. A pool that registers and is then dropped —
+/// banned, a bad or duplicate `bifrost_url`, no stake at this snapshot — appears
+/// in `registered` and not in `eligible`, and until this nothing said which it
+/// was or why. The operator of that pool sees their node do nothing at all, and
+/// the roster sees a count that does not match. `NoStake` is the cruellest of
+/// them, because it is not a fault: it is what every registration looks like
+/// until its stake activates, so the honest answer is "we see you, wait".
+///
+/// URLs for the eligible, pool ids for the excluded: an excluded pool may have
+/// been dropped BECAUSE of its URL, so the pool id is the identifier that is
+/// certainly still meaningful.
+pub fn describe_registry(ctx: &crate::cardano::dkg_roster::DkgContext) -> String {
+    let eligible = ctx
+        .participants
+        .iter()
+        .map(|p| format!("#{} {}", p.index, p.bifrost_url))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let registered = ctx.participants.len() + ctx.excluded.len();
+    if ctx.excluded.is_empty() {
+        return format!("{registered} registered, all eligible: {eligible}");
+    }
+    let excluded = ctx
+        .excluded
+        .iter()
+        .map(|x| format!("{} ({})", pool_label(&x.pool_id), x.reason))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{registered} registered, {} eligible: {eligible} — NOT eligible: {excluded}",
+        ctx.participants.len()
+    )
+}
+
 /// `pool1…` for a 28-byte pool id. Fixtures predating WI-013 carry none, and a
 /// malformed one is shown as it is rather than hidden.
 pub fn pool_label(pool_id: &[u8]) -> String {
@@ -323,6 +360,57 @@ mod tests {
         let line = describe_selected(stray.iter(), &roster);
         assert!(line.contains("#9 (not in roster)"), "{line}");
         assert_eq!(line.split(", ").count(), 2, "{line}");
+    }
+
+    /// The registry line, and specifically the half that did not exist before:
+    /// a pool that registered and is NOT eligible, with the reason.
+    #[test]
+    fn the_registry_line_says_who_is_not_eligible_and_why() {
+        use crate::cardano::dkg_roster::{
+            DkgContext, DkgParticipant, ExcludedSpo, ExclusionReason,
+        };
+
+        let participant = |n: u16, byte: u8| DkgParticipant {
+            index: n,
+            identifier: ident(n),
+            pool_id: vec![byte; 28],
+            bifrost_id_pk: vec![byte; 32],
+            bifrost_url: format!("http://spo{n}.example:1850{n}"),
+            active_stake: 20_000_000,
+        };
+        let mut ctx = DkgContext {
+            epoch: 1543,
+            attempt: 0,
+            threshold: 2,
+            total_stake: 40_000_000,
+            participants: vec![participant(1, 0x11), participant(2, 0x22)],
+            excluded: Vec::new(),
+            schedule_anchor_ms: None,
+            read_time_ms: 0,
+            live_stake: false,
+        };
+
+        // A steady roster reads as one clause, no "NOT eligible" tail.
+        let line = describe_registry(&ctx);
+        assert!(line.starts_with("2 registered, all eligible:"), "{line}");
+        assert!(line.contains("#1 http://spo1.example:18501"), "{line}");
+        assert!(!line.contains("NOT eligible"), "{line}");
+
+        // A pool that registered and is waiting for its stake: named, with the
+        // reason, because "we see you, wait" is the whole point of the line.
+        ctx.excluded.push(ExcludedSpo {
+            pool_id: vec![0x33; 28],
+            bifrost_id_pk: vec![0x33; 32],
+            reason: ExclusionReason::NoStake,
+        });
+        let line = describe_registry(&ctx);
+        assert!(line.starts_with("3 registered, 2 eligible:"), "{line}");
+        assert!(line.contains("NOT eligible:"), "{line}");
+        assert!(line.contains(&pool_label(&[0x33; 28])), "{line}");
+        assert!(
+            line.contains("activates two epoch boundaries later"),
+            "the reason has to be the actionable one, not just a label: {line}"
+        );
     }
 
     #[test]
