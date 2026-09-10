@@ -116,7 +116,17 @@ pub async fn dkg_phase(
                 "DKG round1 (attempt {attempt}) started: n={} t={}, participants: {}",
                 roster.max_signers,
                 roster.min_signers,
-                crate::epoch::log::describe_participants(roster.participants.iter())
+                // URLs only, like every other round line. This used to carry the
+                // pool id too, on the reasoning that Round 1 publishes the full
+                // identity once and the later rounds can then just cite an
+                // index. Those rounds carry URLs now, so nothing depends on this
+                // line establishing an index -> pool mapping — and it was the
+                // longest message the relay sends: 405 characters for four SPOs,
+                // 56% of it bech32. `show-roster` prints pool ids on demand.
+                crate::epoch::log::describe_selected(
+                    roster.participants.keys(),
+                    &roster.participants
+                )
             );
 
             // Publish THIS node's chain-view for the ceremony (candidate-set

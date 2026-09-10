@@ -120,28 +120,6 @@ macro_rules! epoch_error {
     }};
 }
 
-/// A DKG participant list as one clause — `#1 pool1… http://…, #2 …` — in
-/// identifier order, which is the order the roster assigned. The full bech32
-/// pool id, not a prefix: an operator reading this in a channel is matching it
-/// against a pool they know or pasting it into an explorer, and either wants
-/// the whole string.
-pub fn describe_participants<'a>(
-    participants: impl IntoIterator<Item = (&'a Identifier, &'a SpoInfo)>,
-) -> String {
-    participants
-        .into_iter()
-        .map(|(id, info)| {
-            format!(
-                "#{} {} {}",
-                id_short(*id),
-                pool_label(&info.pool_id),
-                info.bifrost_url
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// The SUBSET of a roster named by `ids`, as `#N <url>`, in index order.
 ///
 /// Exists because the DKG's later rounds used to print bare indices
@@ -289,37 +267,6 @@ mod tests {
         Identifier::try_from(n).unwrap()
     }
 
-    #[test]
-    fn participants_render_in_identifier_order_with_full_pool_ids() {
-        let mut roster = BTreeMap::new();
-        for (n, byte) in [(2u16, 0x22u8), (1, 0x11)] {
-            roster.insert(
-                ident(n),
-                SpoInfo {
-                    identifier: ident(n),
-                    pool_id: vec![byte; 28],
-                    bifrost_url: format!("http://spo{n}.example:1850{n}"),
-                    bifrost_id_pk: Vec::new(),
-                },
-            );
-        }
-        let line = describe_participants(roster.iter());
-        let (first, second) = line.split_once(", ").unwrap();
-        assert!(first.starts_with("#1 pool1"), "{line}");
-        assert!(first.ends_with(" http://spo1.example:18501"), "{line}");
-        assert!(second.starts_with("#2 pool1"), "{line}");
-        // A bech32 pool id is 56 characters and stays whole.
-        let pool = first.split(' ').nth(1).unwrap();
-        assert_eq!(pool.len(), 56, "{pool}");
-        assert_eq!(pool, pool_label(&[0x11; 28]));
-    }
-
-    /// The subset a later DKG round went ahead with, named rather than numbered.
-    ///
-    /// Round 1 prints the whole roster with URLs; the rounds after it used to
-    /// print bare indices, so "3 of 4" told an operator that someone was missing
-    /// but not who — and an index only means anything beside the roster it came
-    /// from.
     #[test]
     fn a_selected_subset_names_who_it_kept_and_who_it_does_not_know() {
         let mut roster = BTreeMap::new();
