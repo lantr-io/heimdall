@@ -495,6 +495,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             (7, "key handoff (Update-Y)"),
             (8, "federation identity"),
             (9, "post a movement"),
+            (10, "local tries"),
         ] {
             b.push(n, title, Status::Skipped, "needs a Cardano provider");
         }
@@ -1061,6 +1062,102 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         }
     }
 
+    // ── 10. the local tries ──────────────────────────────────────────────
+    // A node whose cpo/spi trie does not match the chain refuses to attest, and
+    // refuses every root its peers propose — it reaches BuildTm and stops there,
+    // so it never signs and never appears in a Sign round. From its own side
+    // that looks like an idle node; from the roster's it is one absent member.
+    //
+    // This is here because an EMPTY trie matches a bridge that has no history
+    // yet, so the fault is invisible until the first peg-out completes and the
+    // root moves off zero. spo4 was provisioned with no trie files at all on
+    // 2026-08-27 and nobody noticed for two weeks: 221 BuildTm failures, never
+    // one Sign phase, while the bridge ran a member short of what everyone
+    // believed. A cold start is exactly when this is cheap to say.
+    match (&config, cfg.protocol.state_dir.as_deref()) {
+        (None, _) => b.push(
+            10,
+            "local tries",
+            Status::Skipped,
+            "the Config did not resolve, so the bridge-state policy is unknown (step 3)",
+        ),
+        (_, None) => b.push(
+            10,
+            "local tries",
+            Status::Skipped,
+            "no protocol.state_dir, so there is nowhere for the tries to live (step 1)",
+        ),
+        (Some(view), Some(dir)) => {
+            let dir = std::path::Path::new(dir);
+            let history = crate::cardano::cpo_history::BlockfrostHistory::new(
+                &project_id,
+                cfg.cardano.blockfrost_url.as_deref(),
+            );
+            let policy = hex::encode(view.params.bridge_state_policy);
+            match crate::cardano::bridge_state::fetch_bridge_state(&history, &policy).await {
+                Err(e) => b.push(
+                    10,
+                    "local tries",
+                    Status::Warn,
+                    format!(
+                        "could not read the bridge-state singleton to compare against ({e}) —                          the node will make the same check at its first movement"
+                    ),
+                ),
+                Ok(chain) => {
+                    let cpo = crate::cardano::cpo_trie::CpoTrie::load(dir)
+                        .ok()
+                        .flatten()
+                        .map(|t| (t.root(), t.len()));
+                    let spi = crate::cardano::spi_trie::SpiTrie::load(dir)
+                        .ok()
+                        .flatten()
+                        .map(|t| (t.root(), t.len()));
+                    let mut bad: Vec<String> = Vec::new();
+                    for (what, local, want, rebuild) in [
+                        ("cpo", cpo, chain.cpo_root, "reconstruct-cpo-trie"),
+                        ("spi", spi, chain.spi_root, "reconstruct-spi-trie"),
+                    ] {
+                        match local {
+                            None if want == [0u8; 32] => {}
+                            None => bad.push(format!(
+                                "no {what}-trie.json, but the chain holds {} — run `{rebuild}`",
+                                hex::encode(want)
+                            )),
+                            Some((root, _)) if root != want => bad.push(format!(
+                                "{what} root {} != the chain's {} — run `{rebuild}`",
+                                hex::encode(root),
+                                hex::encode(want)
+                            )),
+                            Some(_) => {}
+                        }
+                    }
+                    if bad.is_empty() {
+                        b.push(
+                            10,
+                            "local tries",
+                            Status::Pass,
+                            format!(
+                                "cpo and spi match the bridge-state singleton (cpo_root {})",
+                                hex::encode(chain.cpo_root)
+                            ),
+                        );
+                    } else {
+                        b.push_fix(
+                            10,
+                            "local tries",
+                            Status::Fail,
+                            bad.join("; "),
+                            "Until the tries match, this node reaches BuildTm and stops: it \
+                             signs nothing and the roster counts it absent. The rebuild reads \
+                             chain history and checks every step against the root each movement \
+                             attested, so it cannot invent state.",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     Report { steps: b.steps }
 }
 
@@ -1245,7 +1342,45 @@ mod tests {
     /// check (there are no operator copies left to verify), taking the count from
     /// nine to eight, and WI-HJ1N5 added "post a movement" to take it back to
     /// nine — which this test pins, since the early return lists the steps by
-    /// hand and would otherwise drift again.
+    /// hand and would otherwise drift again. "local tries" took it to ten.
+    /// The comparison step 10 makes, in isolation from the network.
+    ///
+    /// The case worth pinning is the FIRST one: an absent trie is correct while
+    /// the chain holds an all-zero root, and only becomes a fault once history
+    /// exists. That is precisely why the real failure hid for two weeks — the
+    /// node was wrong from the day it was provisioned, and the chain did not
+    /// disagree with it until the first peg-out completed.
+    #[test]
+    fn an_absent_trie_is_only_a_fault_once_the_chain_has_history() {
+        // (local root, chain root) -> is it a fault?
+        let empty = [0u8; 32];
+        let some = [0xc8u8; 32];
+
+        let verdict = |local: Option<[u8; 32]>, want: [u8; 32]| -> bool {
+            match local {
+                None if want == [0u8; 32] => false,
+                None => true,
+                Some(root) if root != want => true,
+                Some(_) => false,
+            }
+        };
+
+        assert!(
+            !verdict(None, empty),
+            "no trie against a bridge with no history is correct, not a fault"
+        );
+        assert!(
+            verdict(None, some),
+            "no trie against a bridge that HAS history is the two-week bug"
+        );
+        assert!(
+            verdict(Some(empty), some),
+            "an empty trie against real history is the same fault, spelled differently"
+        );
+        assert!(!verdict(Some(some), some), "a matching trie passes");
+        assert!(verdict(Some(some), empty), "so does the mirror image");
+    }
+
     #[tokio::test]
     async fn the_no_provider_report_accounts_for_every_step() {
         let cfg = HeimdallConfig::default();
@@ -1255,10 +1390,10 @@ mod tests {
         );
         let report = preflight(&cfg).await;
         let numbers: Vec<u8> = report.steps.iter().map(|s| s.n).collect();
-        assert_eq!(numbers, (1..=9).collect::<Vec<u8>>(), "{numbers:?}");
+        assert_eq!(numbers, (1..=10).collect::<Vec<u8>>(), "{numbers:?}");
         // Every rendered line's step number is within the total it prints.
         let total = report.steps.len();
-        assert_eq!(total, 9);
+        assert_eq!(total, 10);
         for s in &report.steps {
             assert!(usize::from(s.n) <= total, "step {} of {total}", s.n);
         }
