@@ -100,9 +100,20 @@ pub fn select_fee(
 }
 
 /// Find a pure-ADA collateral UTxO (>= 5 ADA) that is NOT among `spent_inputs`.
-/// Collateral must be pure-ADA and disjoint from the tx's regular inputs — a
-/// UTxO cannot be both a spent input and a collateral input, and the ledger
-/// rejects such a tx at phase 1.
+///
+/// Pure-ADA is OUR restriction, not the ledger's. Since Babbage (CIP-40) the
+/// ada-only rule applies to the collateral BALANCE — `sum(collateral inputs) -
+/// collateral_return` — so a token-bearing UTxO is legal collateral as long as
+/// the tx carries a `collateral_return` (body field 16) handing every token
+/// back. We cannot emit one: whisky's pallas backend ignores
+/// `collateral_return_address` and hardcodes the body's `collateral_return` to
+/// `None`, so `set_collateral_return_address` is a silent no-op here. Until
+/// that changes, token-bearing UTxOs are unusable as collateral and a wallet
+/// whose ADA all sits behind native tokens cannot post a script tx (WI-20260910-5DRP6).
+///
+/// Disjointness from the regular inputs is belt-and-braces, not a ledger rule:
+/// no phase-1 predicate forbids the overlap (collateral is only consumed when
+/// the inputs are not), but every wallet keeps them apart and so do we.
 pub fn select_collateral<'a>(
     wallet_utxos: &'a [WalletUtxo],
     spent_inputs: &[&WalletUtxo],

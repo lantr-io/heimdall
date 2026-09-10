@@ -87,11 +87,19 @@ pub struct WalletUtxo {
     pub output_index: u32,
     pub lovelace: u64,
     /// True when the UTxO holds only ADA (no native tokens) AND carries no
-    /// reference script. Collateral inputs must be pure-ADA (a token-bearing
-    /// pick triggers `CollateralContainsNonADA`), and coin selection must skip
-    /// ref-script UTxOs entirely: spending one incurs the Conway per-byte
-    /// ref-script fee that generic fee estimation doesn't account for
-    /// (`FeeTooSmallUTxO`), and consumes a deployed reference script.
+    /// reference script. Three separate reasons to demand it, only one of them
+    /// the ledger's:
+    ///
+    /// - As a FEE input: whisky declares inputs lovelace-only, so any native
+    ///   token on a spent input is dropped from the value balance and the tx
+    ///   does not balance. A builder limitation, and a hard one.
+    /// - As COLLATERAL: the ledger's ada-only rule is on the collateral
+    ///   balance, not the inputs, so tokens are fine when the tx carries a
+    ///   `collateral_return`. We cannot emit one (see `select_collateral`), so
+    ///   here too it degenerates to pure-ADA.
+    /// - Either way: spending a ref-script UTxO incurs the Conway per-byte
+    ///   ref-script fee that generic fee estimation doesn't account for
+    ///   (`FeeTooSmallUTxO`), and consumes a deployed reference script.
     pub pure_ada: bool,
 }
 
