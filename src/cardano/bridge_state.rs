@@ -419,6 +419,16 @@ pub enum TriesStatus {
         detail: Vec<String>,
         missing: Vec<&'static str>,
     },
+    /// A file exists and cannot be parsed — truncated by a crash, unreadable
+    /// after a permission change, or written by a version this build does not
+    /// understand.
+    ///
+    /// Its own case, not `Diverged`, for two reasons. The operator's fix is
+    /// different: "this node's state disagrees with the chain" sends someone
+    /// hunting a consensus fault when the answer is `chown`. And the CHAIN may
+    /// not have moved at all, so a movement this node posted can still be in
+    /// flight — which decides whether its pending record may be dropped.
+    Unreadable { detail: Vec<String> },
 }
 
 /// Compare the tries in `state_dir` against the roots the bridge-state
@@ -438,13 +448,14 @@ pub fn local_tries_status(
 
     let mut missing: Vec<&'static str> = Vec::new();
     let mut detail: Vec<String> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
     for (what, local, want) in [
         ("cpo", cpo.map_err(|e| e.to_string()), chain_cpo_root),
         ("spi", spi.map_err(|e| e.to_string()), chain_spi_root),
     ] {
         match local {
-            Err(e) => detail.push(format!("{what}-trie.json cannot be read: {e}")),
-            Ok(None) if want == [0u8; 32] => {}
+            Err(e) => unreadable.push(format!("{what}-trie.json cannot be read: {e}")),
+            Ok(None) if want == crate::cardano::cpo_trie::EMPTY_ROOT => {}
             Ok(None) => missing.push(what),
             Ok(Some(root)) if root != want => detail.push(format!(
                 "{what} root {} != the chain's {}",
@@ -454,7 +465,11 @@ pub fn local_tries_status(
             Ok(Some(_)) => {}
         }
     }
-    if !detail.is_empty() {
+    if !unreadable.is_empty() {
+        // Ahead of the others: an unparseable file is the fault to report, and
+        // whatever the other trie says cannot be acted on until it is fixed.
+        TriesStatus::Unreadable { detail: unreadable }
+    } else if !detail.is_empty() {
         TriesStatus::Diverged { detail, missing }
     } else if !missing.is_empty() {
         TriesStatus::NeverSeeded { missing }
@@ -520,6 +535,40 @@ mod tries_status_tests {
         };
         assert_eq!(detail.len(), 2, "{detail:?}");
         assert!(detail[0].contains("cpo root"), "{detail:?}");
+    }
+
+    /// The combination `Diverged.missing` exists to carry, and the one the
+    /// earlier version silently dropped: an operator diagnosing this by hand
+    /// has to hear that the second file is GONE, not only that the first
+    /// disagrees.
+    #[test]
+    fn one_trie_diverged_and_the_other_absent_reports_both() {
+        let d = dir("mixed");
+        CpoTrie::empty().save(&d).unwrap();
+        let TriesStatus::Diverged { detail, missing } =
+            local_tries_status(&d, [0xc8u8; 32], [0x26u8; 32])
+        else {
+            panic!("a stale cpo trie beside an absent spi trie is diverged");
+        };
+        assert_eq!(detail.len(), 1, "{detail:?}");
+        assert!(detail[0].starts_with("cpo root"), "{detail:?}");
+        assert_eq!(missing, vec!["spi"], "the absent file must not be dropped");
+    }
+
+    /// A file that exists and cannot be parsed is its own fault: the operator's
+    /// fix is `chown`, not a consensus investigation, and the chain may not
+    /// have moved at all — which decides whether a pending record may be
+    /// dropped.
+    #[test]
+    fn an_unparseable_file_is_not_a_disagreement() {
+        let d = dir("unreadable");
+        std::fs::write(d.join("cpo-trie.json"), b"not json").unwrap();
+        SpiTrie::empty().save(&d).unwrap();
+        let status = local_tries_status(&d, [0xc8u8; 32], SpiTrie::empty().root());
+        let TriesStatus::Unreadable { detail } = status else {
+            panic!("got {status:?}, wanted Unreadable");
+        };
+        assert!(detail[0].contains("cannot be read"), "{detail:?}");
     }
 
     #[test]

@@ -1149,12 +1149,6 @@ async fn fetch_node_state(bind: &str) -> Result<heimdall::health::NodeState, Str
         .map_err(|e| format!("unreadable answer: {e}"))
 }
 
-/// Run the WI-053 startup checks and refuse to start if any of them failed.
-///
-/// Prints the whole report either way — an operator watching a fresh install needs
-/// to see WHICH bridge and WHICH contracts this node resolved, not merely that it
-/// started. Nothing here spends: steps 4 and 6 — the reference script and the
-/// registration — name the command and stop.
 /// Bring the cumulative tries up to the chain before the startup gate looks at
 /// them, rebuilding from Cardano history when they are absent or behind.
 ///
@@ -1171,10 +1165,14 @@ async fn fetch_node_state(bind: &str) -> Result<heimdall::health::NodeState, Str
 /// refuses to persist a root the bridge-state singleton does not attest, so it
 /// cannot invent state. A new node seeds itself here too.
 ///
-/// LOUD on purpose. A node that heals this at every start is losing state
-/// between runs — a failing disk, a deploy that wipes the state dir — and
-/// silently repairing it is how spo4 went unnoticed for two weeks. The event
-/// goes to the operator's log and out to Discord.
+/// LOUD on purpose, and in TWO places. A node that heals this at every start
+/// is losing state between runs — a failing disk, a deploy that wipes the
+/// state dir — and silently repairing it is how spo4 went unnoticed for two
+/// weeks. The log line is only half of it: a relay pointed at the journal is
+/// OUR deployment, not something a third-party SPO will have, and for them a
+/// warn line scrolls away unread. So the fact is also a gauge on `/health`
+/// (`tries_rebuilt_at_startup`), which a monitoring check can scrape and
+/// `heimdall status` prints — log on change, gauge in health, as elsewhere.
 ///
 /// Never fatal. A rebuild that fails leaves the tries as they were, and the
 /// preflight gate immediately after is what refuses to start and says why —
@@ -1231,9 +1229,20 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
 
     let dir = std::path::Path::new(dir);
     let status = local_tries_status(dir, chain.cpo_root, chain.spi_root);
-    let diverged = matches!(status, TriesStatus::Diverged { .. });
+    // A file that exists is evidence, whether it disagrees or cannot be parsed:
+    // keep a copy before the rebuild overwrites it.
+    let keep_a_copy = matches!(
+        status,
+        TriesStatus::Diverged { .. } | TriesStatus::Unreadable { .. }
+    );
+    // The pending record may only be dropped once the chain has MOVED PAST this
+    // node, which a root mismatch or a never-seeded node proves and an
+    // unreadable file does not: there, a movement this node posted can still be
+    // genuinely in flight, and its record is the only thing that will fold it.
+    let chain_moved_on = !matches!(status, TriesStatus::Unreadable { .. });
     let what = match status {
         TriesStatus::InSync => return None,
+        TriesStatus::Unreadable { detail } => detail.join("; "),
         TriesStatus::NeverSeeded { missing } => {
             format!("never seeded ({} absent)", missing.join(", "))
         }
@@ -1253,9 +1262,13 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
     );
     // A file this node WROTE and the chain contradicts is evidence — of what it
     // held, and so of whether it ever signed a wrong root. The rebuild
-    // overwrites in place, so set it aside first. Only when diverged: a node
-    // that was never seeded has nothing to preserve.
-    if diverged {
+    // overwrites in place, so take a COPY first.
+    //
+    // Copy rather than move, deliberately: moving them aside would mean a
+    // rebuild that fails leaves the node with NO tries, which breaks this
+    // function's "leaves them as they were" contract and flips the next
+    // start's diagnosis from "diverged" to the far gentler "never seeded".
+    if keep_a_copy {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -1265,9 +1278,9 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
                 continue;
             }
             let to = dir.join(format!("{name}.superseded-{stamp}"));
-            match std::fs::rename(&from, &to) {
-                Ok(()) => warn!("  kept the superseded {name} as {}", to.display()),
-                Err(e) => warn!("  could not set {name} aside before rebuilding: {e}"),
+            match std::fs::copy(&from, &to) {
+                Ok(_) => warn!("  kept a copy of the superseded {name} as {}", to.display()),
+                Err(e) => warn!("  could not copy {name} aside before rebuilding: {e}"),
             }
         }
     }
@@ -1295,7 +1308,7 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
     // record expects it, so the tries match and this function returned above.
     // Anything the record described that DID confirm is already in the rebuilt
     // tries — they came from chain history.
-    if let Err(e) = PendingTm::clear(dir) {
+    if chain_moved_on && let Err(e) = PendingTm::clear(dir) {
         warn!(
             target: "heimdall::event",
             "tries rebuilt, but the stale pending-movement record could not be removed: {e}. \
@@ -1303,25 +1316,25 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
         );
     }
 
-    // Claim they match only having LOOKED. Each walk cross-checks against its
-    // own read of the singleton, which is not the same as both files agreeing
-    // with it afterwards — the singleton can advance between the two walks.
-    match local_tries_status(dir, chain.cpo_root, chain.spi_root) {
-        TriesStatus::InSync => warn!(
-            target: "heimdall::event",
-            "tries rebuilt from chain history and now match the bridge-state singleton. If \
-             this happens at every start, this node is losing its state directory between runs"
-        ),
-        still => warn!(
-            target: "heimdall::event",
-            "tries rebuilt, but they still do not match the singleton ({still:?}) — most \
-             likely a movement confirmed while this node was rebuilding. The startup checks \
-             below decide whether it can run; a restart will try again"
-        ),
-    }
+    // Deliberately NOT re-checked here. `chain` is the snapshot read before the
+    // rebuild, and each walk cross-checked against its OWN read of the
+    // singleton — so comparing the new files to the old snapshot contradicts
+    // the gate, which is about to re-read it and report step 10 properly. One
+    // verdict, from the reader whose job that is.
+    warn!(
+        target: "heimdall::event",
+        "tries rebuilt from chain history; the startup checks below confirm them. If this \
+         happens at every start, this node is losing its state directory between runs"
+    );
     Some(what)
 }
 
+/// Run the WI-053 startup checks and refuse to start if any of them failed.
+///
+/// Prints the whole report either way — an operator watching a fresh install needs
+/// to see WHICH bridge and WHICH contracts this node resolved, not merely that it
+/// started. Nothing here spends: steps 4 and 6 — the reference script and the
+/// registration — name the command and stop.
 fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let report = rt.block_on(heimdall::preflight::preflight(cfg));
@@ -2120,6 +2133,12 @@ fn main() {
             // the other SPOs). And running it AFTER `resolve_arg` would be nearly
             // useless: that exits the process on the first unset key, so the
             // operator would get one bare line instead of the whole picture.
+            // Same self-heal as `run-spo`: the mover builds and posts movements,
+            // so a trie behind the chain makes it just as inert, and leaving one
+            // daemon to fix itself while the other exits would be two answers to
+            // one fault. NOT in `doctor`: that is read-only, and operators run it
+            // against the state directory of a node that is already running.
+            catch_up_tries(&cfg);
             if let Err(e) = run_preflight_gate(&cfg) {
                 error!("Error: {e}");
                 std::process::exit(1);
@@ -2160,11 +2179,6 @@ fn main() {
             // Exactly the daemon's gate. `Err` here has already printed the whole
             // report, so this only has to set the exit code and say the one thing
             // the report cannot: that these were the startup checks.
-            // Same self-heal as `run-spo`: the mover builds and posts
-            // movements, so a trie behind the chain makes it just as inert,
-            // and leaving one daemon to fix itself while the other exits
-            // would be two answers to one fault.
-            catch_up_tries(&cfg);
             match run_preflight_gate(&cfg) {
                 Ok(()) => println!(
                     "\nall startup checks passed — this node is configured for the bridge above"

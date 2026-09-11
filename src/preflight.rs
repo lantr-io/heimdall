@@ -1123,17 +1123,23 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                         chain.cpo_root,
                         chain.spi_root,
                     );
-                    let (bad, diverged) = match &status {
-                        crate::cardano::bridge_state::TriesStatus::InSync => (Vec::new(), false),
+                    // Three faults, three fixes — `advice` says which.
+                    let (bad, advice) = match &status {
+                        crate::cardano::bridge_state::TriesStatus::InSync => {
+                            (Vec::new(), TriesFault::NeverSeeded)
+                        }
                         crate::cardano::bridge_state::TriesStatus::NeverSeeded { missing } => {
-                            (vec![absent_line(missing, &chain)], false)
+                            (vec![absent_line(missing, &chain)], TriesFault::NeverSeeded)
                         }
                         crate::cardano::bridge_state::TriesStatus::Diverged { detail, missing } => {
                             let mut bad = detail.clone();
                             if !missing.is_empty() {
                                 bad.push(absent_line(missing, &chain));
                             }
-                            (bad, true)
+                            (bad, TriesFault::Diverged)
+                        }
+                        crate::cardano::bridge_state::TriesStatus::Unreadable { detail } => {
+                            (detail.clone(), TriesFault::Unreadable)
                         }
                     };
                     if bad.is_empty() {
@@ -1152,7 +1158,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             "local tries",
                             Status::Fail,
                             bad.join("; "),
-                            tries_fix_advice(diverged),
+                            tries_fix_advice(advice),
                         );
                     }
                 }
@@ -1216,27 +1222,42 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     Report { steps: b.steps }
 }
 
-/// The wallet's UTxOs, for the collateral count in step 11. Read-only, and the
-/// same derivation the builders use — a step reporting on collateral must be
-/// looking at the wallet the transaction will actually spend from.
-/// What step 10 tells the operator to do, by which of the two faults it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriesFault {
+    NeverSeeded,
+    Diverged,
+    Unreadable,
+}
+
+/// What step 10 tells the operator to do, by which of the three faults it is.
 ///
 /// Public to the module's tests, and the ONLY copy: a test that restates these
 /// strings passes whichever branch production takes, which is how a mirror
 /// drifts from the thing it mirrors.
-fn tries_fix_advice(diverged: bool) -> &'static str {
-    if diverged {
-        "This node's state DISAGREES with the chain, which is not the same as a node that \
+fn tries_fix_advice(fault: TriesFault) -> &'static str {
+    match fault {
+        TriesFault::Unreadable => {
+            "A trie file EXISTS and cannot be parsed — truncated by a crash, unreadable after \
+             a permission change, or written by a version this build does not understand. \
+             This is not a disagreement with the chain: check the file's owner and mode \
+             first (the daemon runs as `heimdall`). `run-spo` keeps a copy and rebuilds from \
+             chain history at startup, but a node that cannot read its own state directory \
+             will be back here on the next restart."
+        }
+        TriesFault::Diverged => {
+            "This node's state DISAGREES with the chain, which is not the same as a node that \
          has never been seeded. Until they match it reaches BuildTm and stops: it signs \
          nothing and the roster counts it absent. `run-spo` rebuilds both from chain history \
          at startup; `heimdall reconstruct-tries` does it now, checking every step against \
-         the root each movement attested."
-    } else {
-        "EXPECTED on a node that has not run before: the two tries are cumulative, and a new \
+             the root each movement attested."
+        }
+        TriesFault::NeverSeeded => {
+            "EXPECTED on a node that has not run before: the two tries are cumulative, and a new \
          node cannot invent what the bridge has already paid and swept. `run-spo` seeds them \
          itself at startup, so this clears on the first real start; `heimdall \
          reconstruct-tries` does it now if you would rather seed first. Nothing is wrong \
-         with this node yet; it just has no starting point."
+             with this node yet; it just has no starting point."
+        }
     }
 }
 
@@ -1269,6 +1290,9 @@ fn absent_line(
     )
 }
 
+/// The wallet's UTxOs, for the collateral count in step 11. Read-only, and the
+/// same derivation the builders use — a step reporting on collateral must be
+/// looking at the wallet the transaction will actually spend from.
 async fn wallet_collateral_utxos(
     addr: &Result<String, String>,
     base_url: &str,
@@ -1508,7 +1532,7 @@ mod tests {
     /// rather than only a recovery one.
     #[test]
     fn never_seeded_and_diverged_are_diagnosed_differently() {
-        let never_seeded = tries_fix_advice(false);
+        let never_seeded = tries_fix_advice(TriesFault::NeverSeeded);
         assert!(never_seeded.contains("EXPECTED"), "{never_seeded}");
         assert!(never_seeded.contains("reconstruct-tries"), "{never_seeded}");
         assert!(
@@ -1516,13 +1540,30 @@ mod tests {
             "a new node is not a diverged one: {never_seeded}"
         );
 
-        let diverged = tries_fix_advice(true);
+        let diverged = tries_fix_advice(TriesFault::Diverged);
         assert!(diverged.contains("DISAGREES"), "{diverged}");
         assert!(diverged.contains("reconstruct-tries"), "{diverged}");
         assert!(
             !diverged.contains("EXPECTED"),
             "divergence is never expected: {diverged}"
         );
+    }
+
+    /// The message must cite the root of the trie that is actually missing.
+    /// Quoting `cpo_root` for an absent SPI trie produced
+    /// `no spi-trie.json, and the bridge has history (cpo_root 0000…0000)` —
+    /// self-contradicting, and never showing the real evidence.
+    #[test]
+    fn the_absent_line_cites_the_root_of_the_missing_trie() {
+        let chain = crate::cardano::bridge_state::BridgeState {
+            spi_root: [0x26u8; 32],
+            cpo_root: [0u8; 32],
+            treasury_utxo_id: [0u8; 36],
+            treasury_amount: 0,
+        };
+        let line = absent_line(&["spi"], &chain);
+        assert!(line.contains("spi_root 2626"), "{line}");
+        assert!(!line.contains("cpo_root"), "the wrong evidence: {line}");
     }
 
     #[tokio::test]
