@@ -1089,7 +1089,7 @@ mod tests {
         let accused_pool_id = evidence.accused_pool_id().to_vec();
         let script = fault_verifier_script();
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address(&key);
+        let addr = wallet_address(&key, pallas_addresses::Network::Testnet);
         let utxos = wallet_utxos();
         let reg_tx = "cc".repeat(32);
         let built = build_fault_proof_mint_tx(&FaultProofMintRequest {

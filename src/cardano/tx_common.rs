@@ -213,7 +213,20 @@ pub fn build_collateral_top_up(
 /// Whether a bech32 address is a testnet address (`addr_test…` HRP).
 #[must_use]
 pub fn is_testnet_address(wallet_address: &str) -> bool {
-    wallet_address.starts_with("addr_test")
+    // Case-INSENSITIVE: bech32 is defined over either case, and an all-uppercase
+    // address is valid and parses fine. A `starts_with("addr_test")` on one of
+    // those reads as mainnet, which would tag every derived script address for
+    // the wrong network. `resolve_wallet` canonicalizes the wallet address, so
+    // this is belt-and-braces for the other things that reach here.
+    // `as_bytes().get(..9)` rather than `a[..9]`: this is `pub`, reached from
+    // six call sites with operator- and chain-supplied strings, and slicing a
+    // str at a byte index that is not a char boundary PANICS. The old
+    // `starts_with` could not, and neither may its replacement.
+    wallet_address
+        .trim()
+        .as_bytes()
+        .get(..9)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"addr_test"))
 }
 
 /// The `pallas_addresses::Network` implied by a bech32 wallet address.
@@ -708,7 +721,8 @@ mod tests {
     fn signer() -> (PrivateKey, String) {
         (
             derive_payment_key(TEST_MNEMONIC).unwrap(),
-            wallet_address_from_mnemonic(TEST_MNEMONIC).unwrap(),
+            wallet_address_from_mnemonic(TEST_MNEMONIC, pallas_addresses::Network::Testnet)
+                .unwrap(),
         )
     }
 

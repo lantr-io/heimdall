@@ -717,7 +717,7 @@ mod tests {
     fn build_round1_fault_proof_mint_tx() {
         let script = script();
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address(&key);
+        let addr = wallet_address(&key, pallas_addresses::Network::Testnet);
         let pool = [0x11; 28];
         let evidence_hash = [0x33; 32];
         let mut canonical = vec![0xAA; 128];
@@ -758,7 +758,7 @@ mod tests {
     fn build_fault_proof_mint_tx_can_use_reference_script() {
         let script = script();
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address(&key);
+        let addr = wallet_address(&key, pallas_addresses::Network::Testnet);
         let pool = [0x11; 28];
         let evidence_hash = [0x33; 32];
         let mut canonical = vec![0xAA; 128];

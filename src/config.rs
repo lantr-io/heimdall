@@ -396,6 +396,31 @@ pub struct CardanoConfig {
     pub socket_path: Option<String>,
     pub network_magic: Option<u64>,
     pub mnemonic: Option<String>,
+    /// Path to a cardano-cli `payment.skey` — the ALTERNATIVE to
+    /// [`CardanoConfig::mnemonic`], and exactly one of the two must resolve.
+    ///
+    /// Preferred by most operators, and not only out of habit: a mnemonic has
+    /// to live in this file or in `$HEIMDALL_MNEMONIC`, and an environment
+    /// variable is readable from `systemctl show` and `/proc/<pid>/environ`. A
+    /// path is not a secret; the 0600 file it names is.
+    ///
+    /// The file is a cardano-cli text envelope. `PaymentSigningKeyShelley_ed25519`
+    /// and its `..._bip32` extended form are accepted; anything else is refused
+    /// by name, so a stake or cold key in this slot cannot quietly sign.
+    pub payment_skey_path: Option<String>,
+    /// The address the wallet's funds are at. REQUIRED with
+    /// [`CardanoConfig::payment_skey_path`]; with a mnemonic it is an optional
+    /// cross-check, and must equal the address that mnemonic derives.
+    ///
+    /// A signing key alone does not say where the money is: an SPO's funds
+    /// normally sit at a CIP-1852 BASE address built from payment.vkey AND
+    /// stake.vkey, and the stake half is not in the signing key. Rather than
+    /// ask for a second file, take the address the operator already knows —
+    /// then CHECK it: its payment credential must be the hash of the key, and
+    /// its network tag must agree with the configured network, since every
+    /// script address is tagged from this one. A mismatch is refused rather
+    /// than left to surface much later as an empty wallet.
+    pub wallet_address: Option<String>,
     /// Path to this pool's Ed25519 COLD signing key, used by `register-spo`
     /// (and revocation) when `--cold-skey` is not given.
     ///
@@ -481,7 +506,7 @@ pub struct CardanoConfig {
     /// holding real funds.
     pub demo_virtual_epoch_slots: Option<u64>,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
-    /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
+    /// Requires `blockfrost_project_id` and a wallet key. Default: true.
     pub submit_oracle: bool,
     /// Validity window (seconds) for posted TM txs (`invalid_hereafter`/`created` = latest +
     /// window). `None` → 1800 (preprod/mainnet). MUST be small (e.g. 90) on a short-epoch
@@ -603,6 +628,8 @@ impl Default for CardanoConfig {
             socket_path: None,
             network_magic: None,
             mnemonic: None,
+            payment_skey_path: None,
+            wallet_address: None,
             cold_skey_path: None,
             cold_vkey_path: None,
             min_stake_lovelace: None,
@@ -1019,7 +1046,32 @@ impl HeimdallConfig {
             .try_into()
             .map_err(|e| ConfigError::Parse(String::new(), e))?;
         cfg.refuse_test_flags_on_mainnet()?;
+        cfg.refuse_ambiguous_wallet_key()?;
         Ok(cfg)
+    }
+
+    /// Refuse a config that names BOTH a mnemonic and a payment key.
+    ///
+    /// Only the "both" half is checked here. "Neither" cannot be: the mnemonic
+    /// may arrive in `$HEIMDALL_MNEMONIC`, which this parser cannot see, and
+    /// commands that never touch a wallet — `show-roster`, most of `doctor` —
+    /// must keep working without one. That half belongs where the wallet is
+    /// actually resolved.
+    ///
+    /// Refusing beats precedence. A rule like "the skey wins" means an operator
+    /// who migrated and left the old key in place signs with whichever one the
+    /// code happens to prefer, and the only symptom is transactions from an
+    /// address they were not expecting.
+    fn refuse_ambiguous_wallet_key(&self) -> Result<(), ConfigError> {
+        if self.cardano.mnemonic.is_some() && self.cardano.payment_skey_path.is_some() {
+            return Err(ConfigError::AmbiguousWalletKey(
+                "cardano.mnemonic and cardano.payment_skey_path are both set, and they are \
+                 alternatives — heimdall has one wallet. Delete whichever is not in use; if \
+                 that is the mnemonic, check $HEIMDALL_MNEMONIC and /etc/default/heimdall too."
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Refuse a test-run flag on a network holding real funds.
@@ -1140,6 +1192,35 @@ impl HeimdallConfig {
     }
 }
 
+/// Refuse a secret key file that group or other can read.
+///
+/// Shared by the bifrost identity key and the Cardano wallet key. Two copies
+/// of a security gate means a later tightening — following symlinks
+/// differently, checking the containing directory — lands on one key and not
+/// the other. Returns the offending mode so each caller can report it in its
+/// own error type.
+///
+/// Unix only: there is no portable equivalent, and refusing to load a key on
+/// a platform that cannot express the check would be worse than loading it.
+pub fn refuse_group_readable(path: &std::path::Path) -> Result<(), (String, u32)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let display = path.display().to_string();
+        let Ok(meta) = std::fs::metadata(path) else {
+            // Unreadable is the caller's error to report, with its own
+            // message: it knows which key this is.
+            return Ok(());
+        };
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err((display, mode));
+        }
+    }
+    let _ = path;
+    Ok(())
+}
+
 /// Load a bifrost identity keypair from a `0600` hex key file.
 ///
 /// On unix the file must not be group/other-accessible (any bit in `0o077`
@@ -1150,18 +1231,8 @@ pub fn load_bifrost_keypair_from(
     path: &std::path::Path,
 ) -> Result<bitcoin::secp256k1::Keypair, ConfigError> {
     let display = path.display().to_string();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path).map_err(|e| ConfigError::Io(display.clone(), e))?;
-        let mode = meta.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            return Err(ConfigError::KeyPermsTooOpen {
-                path: display,
-                mode,
-            });
-        }
-    }
+    refuse_group_readable(path)
+        .map_err(|(path, mode)| ConfigError::KeyPermsTooOpen { path, mode })?;
     let contents =
         std::fs::read_to_string(path).map_err(|e| ConfigError::Io(display.clone(), e))?;
     let bytes = hex::decode(contents.trim())
@@ -1190,6 +1261,8 @@ pub enum ConfigError {
     TestFlagOnMainnet(&'static str),
     /// `cardano.demo_virtual_epoch_slots` holds a cycle length nothing can run.
     UnusableVirtualEpoch(String),
+    /// The config names two wallet keys, which are alternatives.
+    AmbiguousWalletKey(String),
     /// The document sets keys the bridge Config now publishes.
     RetiredKeys(Vec<RetiredKey>),
 }
@@ -1224,6 +1297,7 @@ impl std::fmt::Display for ConfigError {
             Self::UnusableVirtualEpoch(why) => {
                 write!(f, "cardano.demo_virtual_epoch_slots: {why}")
             }
+            Self::AmbiguousWalletKey(why) => write!(f, "{why}"),
             Self::RetiredKeys(keys) => {
                 writeln!(
                     f,
@@ -1257,11 +1331,39 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Two wallet keys is not a precedence question. Whichever one the code
+    /// preferred, an operator who migrated and left the old key behind would
+    /// sign from an address they were not expecting, and nothing would say so.
+    #[test]
+    fn both_wallet_keys_are_refused_rather_than_ranked() {
+        let toml = r#"
+[cardano]
+mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+payment_skey_path = "/etc/heimdall/payment.skey"
+"#;
+        let err = HeimdallConfig::from_toml_str(toml).expect_err("alternatives, not a pair");
+        let msg = err.to_string();
+        assert!(msg.contains("cardano.mnemonic"), "{msg}");
+        assert!(msg.contains("cardano.payment_skey_path"), "{msg}");
+        assert!(
+            msg.contains("$HEIMDALL_MNEMONIC"),
+            "names where else to look: {msg}"
+        );
+    }
+
+    /// Neither is NOT a load-time error: the mnemonic may arrive in the
+    /// environment, and `show-roster` needs no wallet at all.
+    #[test]
+    fn neither_wallet_key_still_parses() {
+        HeimdallConfig::from_toml_str("[cardano]\nnetwork = \"preprod\"\n")
+            .expect("resolved later, not at parse");
+    }
 
     /// The three ban-schedule keys are REFUSED, not ignored. Ignoring them is
     /// how an operator ends up believing a ban duration they typed is in force
     /// while the node enforces the bridge's — or worse, derives a ban address no
     /// deployment has and reads back an empty ban list.
+
     #[test]
     fn retired_ban_schedule_keys_are_refused_with_their_replacement() {
         for key in [

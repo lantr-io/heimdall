@@ -51,7 +51,6 @@ use crate::cardano::treasury_datum::{
     ConfirmedTm, TreasuryConfig, TreasuryDatumError, UnconfirmedTm, parse_confirmed_tm_datum,
     parse_unconfirmed_tm,
 };
-use crate::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 use crate::epoch::state::{EpochError, EpochResult, Roster};
 use crate::epoch::traits::{
     BatchSnapshot, CardanoChain, EpochBoundaryEvent, PegOutRequestUtxo, TreasuryUtxo,
@@ -247,8 +246,16 @@ impl DkgFaultBanFlow {
         // derivation above produces. A configured value still wins; unset means
         // "find it", which is what removes the last typed outrefs from an
         // operator's config (WI-091).
+        // ONE wallet resolution for all four lookups below. Each used to do
+        // its own, so a skey-configured node read, parsed and validated its
+        // signing key four times — and a mnemonic one ran four Icarus PBKDF2
+        // derivations — to recover an address the config already holds.
+        let wallet = crate::cardano::wallet::resolve_wallet(cardano).map(|w| w.address);
+        let wallet_address = wallet.as_deref();
+
         let spo_bans_ref = resolve_script_ref(
             cardano,
+            wallet_address,
             one_shot,
             &cardano.spo_bans_ref,
             &spo_bans,
@@ -257,6 +264,7 @@ impl DkgFaultBanFlow {
         .await?;
         let round1_fault_ref = resolve_script_ref(
             cardano,
+            wallet_address,
             one_shot,
             &cardano.fault_verifier_round1_ref,
             &round1_fault,
@@ -265,6 +273,7 @@ impl DkgFaultBanFlow {
         .await?;
         let round2_fault_ref = resolve_script_ref(
             cardano,
+            wallet_address,
             one_shot,
             &cardano.fault_verifier_round2_ref,
             &round2_fault,
@@ -273,6 +282,7 @@ impl DkgFaultBanFlow {
         .await?;
         let equivocation_fault_ref = resolve_script_ref(
             cardano,
+            wallet_address,
             one_shot,
             &cardano.fault_verifier_equivocation_ref,
             &equivocation_fault,
@@ -340,6 +350,7 @@ fn req_fault_config<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str
 /// the chain also offers a candidate would be worse than either.
 async fn resolve_script_ref(
     cardano: &crate::config::CardanoConfig,
+    wallet_address: Result<&str, &String>,
     one_shot: &str,
     configured: &Option<String>,
     script: &crate::cardano::blueprint::ParameterizedScript,
@@ -353,16 +364,12 @@ async fn resolve_script_ref(
         .as_deref()
         .ok_or_else(|| format!("{what} reference script is unset and there is no chain to find it on: set cardano.blockfrost_project_id, or cardano.{what}_ref"))?;
     let base_url = crate::cardano::bf_http::base_url(pid, cardano.blockfrost_url.as_deref());
-    let mnemonic = cardano
-        .mnemonic
-        .clone()
-        .or_else(|| {
-            std::env::var("HEIMDALL_MNEMONIC")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-        })
-        .ok_or_else(|| format!("{what} reference script is unset and this node has no wallet to look in: set cardano.mnemonic / $HEIMDALL_MNEMONIC, or cardano.{what}_ref"))?;
-    let wallet = crate::cardano::wallet::wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = wallet_address.map_err(|e| {
+        format!(
+            "{what} reference script is unset and this node has no wallet to look in: {e}, \
+             or set cardano.{what}_ref"
+        )
+    })?;
     let hash = script.hash_hex();
     let found = crate::cardano::ref_script::find_ref_script_anywhere(
         &base_url,
@@ -629,7 +636,7 @@ pub struct BlockfrostCardanoChain {
     /// node cannot start before is one no honest node can ever meet, and the
     /// resulting signing window opens already closed without reporting anything.
     ceremony_floor_slots: u64,
-    /// Mnemonic-derived payment key for the Cardano wallet that pays
+    /// The wallet's payment key — from a mnemonic or a `payment.skey` for the Cardano wallet that pays
     /// fees. `None` means publishing is disabled (dry run).
     payment_key: Option<PrivateKey>,
     /// Full CIP-1852 base address (`payment_pkh + staking_pkh`) derived
@@ -1253,7 +1260,8 @@ impl BlockfrostCardanoChain {
             .schedule(raw, self.ceremony_floor_slots)
             .map_err(|e| {
                 EpochError::Chain(format!(
-                    "the virtual epoch cannot hold this bridge's schedule: {e}. No batch will                      be built until this is resolved, on every node"
+                    "the virtual epoch cannot hold this bridge's schedule: {e}. No batch \
+                     will be built until this is resolved, on every node"
                 ))
             })
     }
@@ -1935,17 +1943,14 @@ impl BlockfrostCardanoChain {
         self
     }
 
-    /// Configure publishing from a BIP-39 mnemonic. The payment key is
-    /// derived at `m/1852'/1815'/0'/0/0` (CIP-1852). The wallet base
-    /// address (payment_pkh + staking_pkh) is derived for UTxO queries.
-    pub fn with_mnemonic(mut self, mnemonic: &str) -> EpochResult<Self> {
-        let key = derive_payment_key(mnemonic)
-            .map_err(|e| EpochError::Chain(format!("derive payment key: {e}")))?;
-        let base_addr = wallet_address_from_mnemonic(mnemonic)
-            .map_err(|e| EpochError::Chain(format!("derive wallet address: {e}")))?;
-        self.payment_key = Some(key);
-        self.wallet_base_address = Some(base_addr);
-        Ok(self)
+    /// Configure publishing from the node's resolved wallet — a mnemonic's
+    /// derived key and base address, or a `payment.skey` and the address the
+    /// operator gave for it. Which of the two it was is settled in
+    /// [`crate::cardano::wallet::resolve_wallet`]; this only spends it.
+    pub fn with_wallet(mut self, wallet: crate::cardano::wallet::Wallet) -> Self {
+        self.payment_key = Some(wallet.key);
+        self.wallet_base_address = Some(wallet.address);
+        self
     }
 
     /// Read + decode the bridge Config UTxO (`cardano::config_params`).
@@ -2019,7 +2024,11 @@ impl BlockfrostCardanoChain {
     /// Fetch all UTxOs at the wallet base address.
     async fn query_wallet_utxos(&self) -> EpochResult<Vec<WalletUtxo>> {
         let wallet_addr = self.wallet_base_address.as_deref().ok_or_else(|| {
-            EpochError::Chain("no wallet address — was with_mnemonic called?".into())
+            EpochError::Chain(
+                "no wallet address — this chain was built without a wallet (see \
+                 `resolve_wallet`)"
+                    .into(),
+            )
         })?;
 
         // Raw HTTP + lenient parse (tolerates backends like yaci-devkit that omit `tx_index`).
@@ -2099,7 +2108,11 @@ impl BlockfrostCardanoChain {
         evidence: crate::epoch::traits::DkgFaultEvidence,
     ) -> EpochResult<()> {
         let key = self.payment_key.as_ref().ok_or_else(|| {
-            EpochError::Chain("cardano.mnemonic required for DKG fault ban flow".into())
+            EpochError::Chain(
+                "no wallet key, and the DKG fault ban flow must pay a fee — set \
+                 cardano.payment_skey_path or cardano.mnemonic"
+                    .into(),
+            )
         })?;
         let wallet_addr = self
             .wallet_base_address
@@ -2859,7 +2872,9 @@ impl CardanoChain for BlockfrostCardanoChain {
         })?;
         let key = self.payment_key.as_ref().ok_or_else(|| {
             EpochError::Chain(
-                "cardano.mnemonic is required to pay the Update-Y fee (dry-run node)".into(),
+                "no wallet key to pay the Update-Y fee (dry-run node) — set \
+                 cardano.payment_skey_path or cardano.mnemonic"
+                    .into(),
             )
         })?;
         let wallet_addr = self
@@ -3299,7 +3314,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             Some(k) => k,
             None => {
                 warn!(
-                    "[submit] no mnemonic configured — skipping Cardano oracle publish (dry run)"
+                    "[submit] no wallet key configured — skipping Cardano oracle publish (dry run)"
                 );
                 return Ok(());
             }

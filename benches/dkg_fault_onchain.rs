@@ -441,7 +441,7 @@ fn run_full_tx_benchmark(
     limits: ExUnits,
 ) -> Vec<BudgetReport> {
     let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-    let wallet_address = wallet_address(&key);
+    let wallet_address = wallet_address(&key, pallas_addresses::Network::Testnet);
     let wallet_utxos = bench_wallet_utxos();
     let accused_pool_id: [u8; 28] = evidence
         .accused_pool_id()

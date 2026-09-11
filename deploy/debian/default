@@ -27,10 +27,16 @@
 # restart argument.
 HEIMDALL_ARGS=""
 
-# Cardano wallet mnemonic. Precedence is: cardano.mnemonic in heimdall.toml >
-# $HEIMDALL_MNEMONIC — so setting it here only takes effect while cardano.mnemonic
-# stays commented out in /etc/heimdall/heimdall.toml. That is the intended
-# arrangement: the seed lives here, not in the file dpkg tracks.
+# Cardano wallet mnemonic — ONE of the two ways to give heimdall its wallet key.
+# Among mnemonic sources the precedence is: cardano.mnemonic in heimdall.toml >
+# $HEIMDALL_MNEMONIC, so setting it here takes effect while cardano.mnemonic stays
+# commented out. That is the intended arrangement: the seed lives here, not in the
+# file dpkg tracks.
+#
+# THERE IS NO PRECEDENCE AGAINST cardano.payment_skey_path. The two are
+# alternatives, and setting both is refused at startup — the daemon will not run.
+# So if you migrate to a key file, CLEAR this variable; leaving it set is the one
+# mistake that stops the node rather than being quietly ignored.
 #HEIMDALL_MNEMONIC="word word word ..."
 
 # Log verbosity, overriding [log].level in /etc/heimdall/heimdall.toml. This is

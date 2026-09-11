@@ -1043,7 +1043,7 @@ mod tests {
         let bans = spo_bans_script();
         let policy_hex = bans.hash_hex();
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address(&key);
+        let addr = wallet_address(&key, pallas_addresses::Network::Testnet);
         // The one-shot that parameterizes spo_bans must be an unspent wallet UTxO.
         let one_shot_tx = "aa".repeat(32);
         let w = wallet(); // aa..#0 (50 ADA) + bb..#1 (6 ADA)
@@ -1166,7 +1166,7 @@ mod tests {
             lovelace: 2_000_000,
         };
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address(&key);
+        let addr = wallet_address(&key, pallas_addresses::Network::Testnet);
         let w = wallet();
         let req = request(
             &bans,
@@ -1262,7 +1262,7 @@ mod tests {
             lovelace: 2_000_000,
         };
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address(&key);
+        let addr = wallet_address(&key, pallas_addresses::Network::Testnet);
         let w = wallet();
         let mut req = request(
             &bans,
@@ -1327,7 +1327,7 @@ mod tests {
             lovelace: 2_000_000,
         };
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address(&key);
+        let addr = wallet_address(&key, pallas_addresses::Network::Testnet);
         let w = wallet();
         let req = request(
             &bans,
@@ -1374,7 +1374,7 @@ mod tests {
         let policy_hex = bans.hash_hex();
         let pool = [0x55u8; 28];
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address(&key);
+        let addr = wallet_address(&key, pallas_addresses::Network::Testnet);
         let w = wallet();
         let fault_utxo = FaultProofUtxo {
             tx_hash: "cc".repeat(32),

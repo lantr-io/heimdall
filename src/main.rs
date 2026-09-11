@@ -347,8 +347,10 @@ enum Commands {
         #[arg(long, default_value_t = 60)]
         serve_after_secs: u64,
     },
-    /// Print the Cardano wallet base address + payment key hash (the TM-NFT mint
-    /// authority) derived from the configured mnemonic / $HEIMDALL_MNEMONIC.
+    /// Print the Cardano wallet address + payment key hash (the TM-NFT mint
+    /// authority), and which config key supplied the signing key:
+    /// `cardano.payment_skey_path`, or a mnemonic from `cardano.mnemonic` /
+    /// $HEIMDALL_MNEMONIC.
     WalletAddress {
         #[arg(long)]
         config: Option<String>,
@@ -1389,16 +1391,15 @@ fn main() {
             if let Some(ref v) = cardano_mnemonic {
                 cfg.cardano.mnemonic = Some(v.clone());
             }
-            // Env var fallback: keep the real seed out of heimdall.toml
-            // and the repo. Precedence: CLI --cardano-mnemonic > TOML
-            // cardano.mnemonic > $HEIMDALL_MNEMONIC.
-            if cfg.cardano.mnemonic.is_none() {
-                if let Ok(v) = std::env::var("HEIMDALL_MNEMONIC") {
-                    if !v.trim().is_empty() {
-                        cfg.cardano.mnemonic = Some(v);
-                    }
-                }
-            }
+            // $HEIMDALL_MNEMONIC is NOT copied into the config here. It used
+            // to be, and that made `resolve_wallet` report the wallet as
+            // coming from `cardano.mnemonic` — so `doctor` and `run-spo
+            // --check` gave two different answers about one config, and the
+            // two-key refusal named a TOML key the operator had never
+            // uncommented. The resolver reads the variable itself and
+            // attributes it correctly. Among mnemonic sources the precedence
+            // is unchanged: CLI --cardano-mnemonic > cardano.mnemonic >
+            // $HEIMDALL_MNEMONIC.
 
             // WI-053's startup gate, which used to run only in `run-mover`.
             // This is the packaged daemon now, so it is the one that has to
@@ -1536,22 +1537,16 @@ fn main() {
         }
         Commands::WalletAddress { config } => {
             let cfg = load_config(config.as_deref());
-            let mnemonic = resolve_mnemonic(&cfg).unwrap_or_else(|e| {
-                error!("Error: {e}");
-                std::process::exit(1);
-            });
-            match (
-                heimdall::cardano::wallet::wallet_address_from_mnemonic(&mnemonic),
-                heimdall::cardano::wallet::derive_payment_key(&mnemonic),
-            ) {
-                (Ok(addr), Ok(key)) => {
-                    println!("wallet base address: {addr}");
+            match heimdall::cardano::wallet::resolve_wallet(&cfg.cardano) {
+                Ok(wallet) => {
+                    println!("wallet address:   {}", wallet.address);
                     println!(
-                        "payment key hash:    {}",
-                        heimdall::cardano::wallet::pub_key_hash_hex(&key)
+                        "payment key hash: {}",
+                        heimdall::cardano::wallet::pub_key_hash_hex(&wallet.key)
                     );
+                    println!("key from:         {}", wallet.source);
                 }
-                (Err(e), _) | (_, Err(e)) => {
+                Err(e) => {
                     error!("Error: {e}");
                     std::process::exit(1);
                 }
@@ -2225,13 +2220,19 @@ async fn run_spo(
         bf_chain =
             bf_chain.with_pegout_source(&bridge.pegout_script_address, &bridge.bridged_token_unit);
 
-        if let Some(mnemonic) = &cfg.cardano.mnemonic {
-            let wallet_addr = heimdall::cardano::wallet::wallet_address_from_mnemonic(mnemonic)
-                .expect("cardano.mnemonic must be a valid BIP-39 mnemonic");
-            info!("Cardano wallet address: {wallet_addr}");
-            bf_chain = bf_chain
-                .with_mnemonic(mnemonic)
-                .expect("cardano.mnemonic must be a valid BIP-39 mnemonic");
+        // A node with no wallet key still runs — it just cannot post. Report
+        // which source is live rather than skipping in silence, because
+        // "nothing was ever posted" is otherwise indistinguishable from a
+        // quiet ceremony.
+        match heimdall::cardano::wallet::resolve_wallet(&cfg.cardano) {
+            Ok(wallet) => {
+                info!(
+                    "Cardano wallet address: {} (key from {})",
+                    wallet.address, wallet.source
+                );
+                bf_chain = bf_chain.with_wallet(wallet);
+            }
+            Err(e) => warn!("no Cardano wallet, so this node cannot post: {e}"),
         }
 
         bf_chain = bf_chain.with_submit_config(cfg.cardano.submit_oracle);
@@ -4575,20 +4576,6 @@ fn frost_federation_signature(
     ))
 }
 
-/// The Cardano wallet mnemonic: `cardano.mnemonic` from config, else
-/// `$HEIMDALL_MNEMONIC`.
-fn resolve_mnemonic(cfg: &HeimdallConfig) -> Result<String, String> {
-    cfg.cardano
-        .mnemonic
-        .clone()
-        .or_else(|| {
-            std::env::var("HEIMDALL_MNEMONIC")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-        })
-        .ok_or_else(|| "no mnemonic (set cardano.mnemonic or $HEIMDALL_MNEMONIC)".to_string())
-}
-
 /// Parse `<cardano_tx_hash>:<index>` into a 32-byte tx id + output index.
 /// The index is bounded to `u32` (the ledger's output-index width) so a typo
 /// can never silently wrap into a negative Plutus Int downstream.
@@ -4619,11 +4606,9 @@ fn run_bootstrap_treasury_info(
     use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
     use heimdall::cardano::publish::WalletUtxo;
     use heimdall::cardano::treasury_bootstrap::{bootstrap_datum, build_treasury_bootstrap_tx};
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
@@ -4826,11 +4811,9 @@ fn run_bootstrap_registry(
     use heimdall::cardano::blueprint::spos_registry_script;
     use heimdall::cardano::publish::WalletUtxo;
     use heimdall::cardano::register_spo::build_registry_bootstrap_tx;
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
@@ -4917,11 +4900,9 @@ fn run_bootstrap_ban_list(
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{spo_bans_script, spos_registry_script};
     use heimdall::cardano::publish::WalletUtxo;
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
 
@@ -5085,11 +5066,9 @@ fn run_ensure_collateral(cfg: &HeimdallConfig, submit: bool) -> Result<(), Strin
         COLLATERAL_LOVELACE, COLLATERAL_UTXOS_WANTED, build_collateral_top_up,
         collateral_candidates,
     };
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
 
     let pid = cfg
         .cardano
@@ -5151,11 +5130,9 @@ fn run_deploy_registry_ref(
     use heimdall::cardano::blueprint::spos_registry_script;
     use heimdall::cardano::publish::WalletUtxo;
     use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
@@ -5244,7 +5221,6 @@ fn run_deploy_fault_ref(
     };
     use heimdall::cardano::publish::WalletUtxo;
     use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
@@ -5284,9 +5260,8 @@ fn run_deploy_fault_ref(
         return Ok(());
     }
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
     let pid = cfg
         .cardano
         .blockfrost_project_id
@@ -5344,7 +5319,6 @@ fn run_deploy_spo_bans_ref(
     };
     use heimdall::cardano::publish::WalletUtxo;
     use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
@@ -5398,9 +5372,8 @@ fn run_deploy_spo_bans_ref(
         return Ok(());
     }
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
     let pid = cfg
         .cardano
         .blockfrost_project_id
@@ -5462,7 +5435,6 @@ fn run_init_scripts(
     };
     use heimdall::cardano::publish::WalletUtxo;
     use heimdall::cardano::tx_common::is_testnet_address;
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
     // Derive spo_bans exactly as deploy-spo-bans-ref and
     // DkgFaultBanFlow::from_config do — recomputing the fault-verifier policy
@@ -5503,10 +5475,10 @@ fn run_init_scripts(
     )
     .map_err(|e| format!("parameterize spo_bans: {e}"))?;
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
-    let mainnet = !is_testnet_address(&wallet_addr);
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
+    // From the config, not sniffed back out of the address we just derived.
+    let mainnet = cfg.cardano.is_mainnet()?;
 
     let scripts = vec![WithdrawScript {
         name: "spo_bans",
@@ -6044,12 +6016,10 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     };
     use heimdall::cardano::registry::REGISTRATION_ROOT_KEY;
     use heimdall::cardano::stake::{StakeSource, check_min_stake_with, fetch_pool_stake_src};
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
     use pallas_crypto::key::ed25519;
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
     let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
@@ -6438,12 +6408,10 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
     use heimdall::cardano::ref_script::{RefScriptOrigin, find_ref_script_anywhere};
     use heimdall::cardano::register_spo::pool_id_from_cold_vkey;
     use heimdall::cardano::registry::REGISTRATION_ROOT_KEY;
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
     use pallas_crypto::key::ed25519;
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
     let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
@@ -6746,11 +6714,9 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     use heimdall::cardano::treasury_info::update_y_sig_msg;
     use heimdall::cardano::treasury_spend::find_treasury_state;
     use heimdall::cardano::update_y::{UpdateYAuthorizer, UpdateYRequest, build_update_y_tx};
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
     let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
@@ -6919,11 +6885,9 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
         fault_verifier_script, spo_bans_script, spos_registry_script,
     };
     use heimdall::cardano::publish::WalletUtxo;
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
     let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
@@ -7137,11 +7101,9 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
         build_fault_proof_mint_tx,
     };
     use heimdall::cardano::publish::WalletUtxo;
-    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
-    let mnemonic = resolve_mnemonic(cfg)?;
-    let key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_addr) = (wallet.key, wallet.address);
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
     let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
@@ -8861,11 +8823,10 @@ fn run_sweep_pegins(
             Some(bridge.bridge_state_policy_id.as_str()),
             cfg.cardano.kupo_url.as_deref(),
         );
-        if let Some(mnemonic) = &cfg.cardano.mnemonic {
-            chain = chain
-                .with_mnemonic(mnemonic)
-                .map_err(|e| format!("with_mnemonic: {e}"))?;
-        }
+        chain = chain.with_wallet(
+            heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)
+                .map_err(|e| format!("wallet: {e}"))?,
+        );
         // No Bitcoin wiring: this posts the TM to CARDANO, and the watchtower relays
         // the signed bytes from the record (WI-086). `--existing-tm-hex` used to need
         // a guard here against re-broadcasting somebody else's already-confirmed

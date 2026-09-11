@@ -294,21 +294,6 @@ fn missing_locator_keys(cfg: &HeimdallConfig) -> Vec<&'static str> {
     missing
 }
 
-/// Whether a wallet mnemonic is reachable, and from where.
-///
-/// Mirrors the binary's precedence exactly — `cardano.mnemonic` wins over
-/// `$HEIMDALL_MNEMONIC` — because reporting a different source than the one the
-/// daemon will actually use is worse than not reporting at all.
-fn mnemonic_source(cfg: &HeimdallConfig) -> Option<&'static str> {
-    if cfg.cardano.mnemonic.is_some() {
-        return Some("cardano.mnemonic");
-    }
-    match std::env::var("HEIMDALL_MNEMONIC") {
-        Ok(v) if !v.trim().is_empty() => Some("$HEIMDALL_MNEMONIC"),
-        _ => None,
-    }
-}
-
 /// Locate the Config UTxO and require it to be **unique**.
 ///
 /// `config_params::find_config_utxo` takes the first match, which is right on the
@@ -345,6 +330,10 @@ fn find_unique_config_utxo<'a>(utxos: &'a [BfUtxo], nft_unit: &str) -> Result<&'
 /// gate aborts, `heimdall doctor` prints and exits non-zero.
 pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     let mut b = Builder { steps: Vec::new() };
+    // The wallet, resolved once in step 1 and reused by steps 4 and 11. Three
+    // independent resolves meant three BIP-39 derivations, or three reads of
+    // the signing key, for one report.
+    let wallet_addr: Result<String, String>;
 
     // ── 1. Local preflight ────────────────────────────────────────────────
     // Cheapest checks, worst failures if deferred: everything below needs the
@@ -353,13 +342,28 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         let mut notes = Vec::new();
         let mut problems = Vec::new();
 
-        match mnemonic_source(cfg) {
-            Some(src) => notes.push(format!("mnemonic from {src}")),
-            None => problems.push(
-                "no wallet mnemonic: set cardano.mnemonic or $HEIMDALL_MNEMONIC \
-                 (/etc/default/heimdall in the Debian package)"
-                    .to_string(),
-            ),
+        // Resolved ONCE, here, and threaded to steps 4 and 11. The resolver is
+        // the only thing that knows which of the two ways in is live, so
+        // asking it is also how the source gets reported — a second opinion
+        // about that is how the two drift apart.
+        let wallet = crate::cardano::wallet::resolve_wallet(&cfg.cardano);
+        wallet_addr = match &wallet {
+            Ok(w) => Ok(w.address.clone()),
+            Err(e) => Err(e.clone()),
+        };
+        match &wallet {
+            Ok(w) => notes.push(format!(
+                "wallet key from {}, address {}",
+                w.source, w.address
+            )),
+            // The /etc/default hint belongs ONLY to "no key at all". Appended
+            // to every error it misdirects: a 0644 key file, or an address
+            // that does not pair with its key, has nothing to do with that
+            // file — and this is the command whose job is to name the fix.
+            Err(e) if e.starts_with("no wallet key") => {
+                problems.push(format!("{e} (/etc/default/heimdall in the Debian package)"));
+            }
+            Err(e) => problems.push(e.clone()),
         }
 
         match &cfg.bifrost.skey_path {
@@ -404,7 +408,12 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         let mainnet = match cfg.cardano.is_mainnet() {
             Ok(m) => m,
             Err(e) => {
-                problems.push(e);
+                // Once. The wallet resolution above propagates the same error
+                // on the mnemonic path, and printing one fault as two reads
+                // as two faults.
+                if !problems.iter().any(|p| p.contains(&e)) {
+                    problems.push(e);
+                }
                 true
             }
         };
@@ -663,7 +672,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         ),
         Ok(Some(src)) => {
             let hash = &src.registry_policy_hex;
-            match wallet_ref_script(cfg, &base_url, &project_id, hash).await {
+            match wallet_ref_script(wallet_addr.as_deref(), &base_url, &project_id, hash).await {
                 Err(e) => b.push(4, "reference script", Status::Warn, e),
                 Ok(Some(r)) => b.push(
                     4,
@@ -1170,7 +1179,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     // offer. spo4 met exactly that at midnight, with no prior warning — its ADA
     // was all behind legacy fSAT. `ensure-collateral` splits the wallet out of
     // it, and needs no collateral itself to do so (WI-20260910-5DRP6).
-    match wallet_collateral_utxos(cfg, &base_url, &project_id).await {
+    match wallet_collateral_utxos(&wallet_addr, &base_url, &project_id).await {
         Err(e) => b.push(
             11,
             "wallet collateral",
@@ -1220,33 +1229,18 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
 /// same derivation the builders use — a step reporting on collateral must be
 /// looking at the wallet the transaction will actually spend from.
 async fn wallet_collateral_utxos(
-    cfg: &HeimdallConfig,
+    addr: &Result<String, String>,
     base_url: &str,
     project_id: &str,
 ) -> Result<Vec<crate::cardano::publish::WalletUtxo>, String> {
-    let addr = wallet_address(cfg)?;
-    let raw = bf_http::fetch_address_utxos(base_url, project_id, &addr)
+    let addr = addr.as_deref().map_err(String::clone)?;
+    let raw = bf_http::fetch_address_utxos(base_url, project_id, addr)
         .await
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
     Ok(raw
         .iter()
         .map(crate::cardano::publish::WalletUtxo::from_bf)
         .collect())
-}
-
-/// The operator's wallet address, from whichever source the config names.
-/// Steps 4 and 11 both report on this wallet and must not be able to disagree
-/// about which one it is.
-fn wallet_address(cfg: &HeimdallConfig) -> Result<String, String> {
-    let Some(src) = mnemonic_source(cfg) else {
-        return Err("no wallet mnemonic".into());
-    };
-    let mnemonic = match src {
-        "cardano.mnemonic" => cfg.cardano.mnemonic.clone().unwrap_or_default(),
-        _ => std::env::var("HEIMDALL_MNEMONIC").unwrap_or_default(),
-    };
-    crate::cardano::wallet::wallet_address_from_mnemonic(&mnemonic)
-        .map_err(|e| format!("derive wallet address: {e}"))
 }
 
 /// Look for the registry reference script at the operator's own wallet address —
@@ -1257,18 +1251,20 @@ fn wallet_address(cfg: &HeimdallConfig) -> Result<String, String> {
 /// reference script healthy must be looking at the UTxO the transaction will
 /// actually reference.
 async fn wallet_ref_script(
-    cfg: &HeimdallConfig,
+    addr: Result<&str, &String>,
     base_url: &str,
     project_id: &str,
     script_hash: &str,
 ) -> Result<Option<RefScriptUtxo>, String> {
-    let addr =
-        wallet_address(cfg).map_err(|e| format!("{e} — cannot locate the reference script"))?;
-    crate::cardano::ref_script::wallet_ref_script(base_url, project_id, &addr, script_hash).await
+    let addr = addr.map_err(|e| format!("{e} — cannot locate the reference script"))?;
+    crate::cardano::ref_script::wallet_ref_script(base_url, project_id, addr, script_hash).await
 }
 
 #[cfg(test)]
 mod tests {
+    /// The standard BIP-39 vector. Step 1 DERIVES from the mnemonic now, so a
+    /// placeholder string fails the very check these tests hold constant.
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     /// WI-054 acceptance: `heimdall doctor` and the daemon's startup gate are the
     /// SAME reader, so they cannot disagree about what is wrong.
@@ -1500,7 +1496,7 @@ mod tests {
         cfg.protocol.state_dir = Some("/var/lib/heimdall".into());
         // Enough for step 1 to pass on its own, so what this test observes is
         // the flags and nothing else.
-        cfg.cardano.mnemonic = Some("x ".repeat(24).trim().to_string());
+        cfg.cardano.mnemonic = Some(TEST_MNEMONIC.to_string());
 
         let step1 = |r: &Report| r.steps.iter().find(|s| s.n == 1).cloned().expect("step 1");
         let clean = preflight(&cfg).await;
@@ -1593,6 +1589,10 @@ mod tests {
 
 #[cfg(test)]
 mod startup_refusal_tests {
+    /// The standard BIP-39 vector. Step 1 DERIVES from the mnemonic now, so a
+    /// placeholder string fails the very check these tests hold constant.
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
     use super::*;
     use crate::config::HeimdallConfig;
 
@@ -1644,7 +1644,7 @@ mod startup_refusal_tests {
         // Everything else step 1 inspects, satisfied: a mnemonic source, no
         // bifrost key (a note, not a problem), no blueprint. Default is preprod,
         // so the mainnet threshold guard stays silent.
-        cfg.cardano.mnemonic = Some("test test test".into());
+        cfg.cardano.mnemonic = Some(TEST_MNEMONIC.to_string());
 
         let step1 = |r: Report| r.steps.into_iter().find(|s| s.n == 1).expect("step 1");
 
@@ -1668,7 +1668,7 @@ mod startup_refusal_tests {
     #[tokio::test]
     async fn step_1_refuses_a_network_it_cannot_resolve() {
         let mut cfg = HeimdallConfig::default();
-        cfg.cardano.mnemonic = Some("test test test".into());
+        cfg.cardano.mnemonic = Some(TEST_MNEMONIC.to_string());
         cfg.protocol.state_dir = Some("/var/lib/heimdall".into());
 
         let step1 = |r: Report| r.steps.into_iter().find(|s| s.n == 1).expect("step 1");

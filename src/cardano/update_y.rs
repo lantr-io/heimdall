@@ -415,7 +415,7 @@ mod tests {
     fn test_wallet() -> (PrivateKey, String, Vec<WalletUtxo>) {
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let key = derive_payment_key(mnemonic).unwrap();
-        let addr = crate::cardano::wallet::wallet_address(&key);
+        let addr = crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
         let utxos = vec![
             WalletUtxo::from_bf(&ada_bf_utxo(&"aa".repeat(32), 50_000_000)),
             WalletUtxo::from_bf(&ada_bf_utxo(&"bb".repeat(32), 50_000_000)),

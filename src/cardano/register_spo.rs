@@ -1179,7 +1179,8 @@ mod tests {
         }];
 
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let wallet_addr = crate::cardano::wallet::wallet_address(&key);
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
         let wallet_utxos = vec![
             WalletUtxo {
                 tx_hash: "aa".repeat(32),
@@ -1448,7 +1449,8 @@ mod tests {
         let policy = registry.hash_hex();
         let pool_id = test_pool_id();
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let wallet_addr = crate::cardano::wallet::wallet_address(&key);
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
         let wallet_utxos = vec![
             WalletUtxo {
                 tx_hash: "aa".repeat(32),
@@ -1573,7 +1575,8 @@ mod tests {
     fn build_registry_bootstrap_end_to_end() {
         let registry = registry_script();
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let wallet_addr = crate::cardano::wallet::wallet_address(&key);
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
         // The script fixture is parameterized with (0xbb…bb, 3) — the one-shot
         // must be exactly that outpoint.
         let one_shot = WalletUtxo {
@@ -1666,7 +1669,8 @@ mod tests {
     fn registry_bootstrap_requires_the_exact_one_shot() {
         let registry = registry_script();
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let wallet_addr = crate::cardano::wallet::wallet_address(&key);
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
         let utxos = vec![WalletUtxo {
             tx_hash: "cc".repeat(32),
             output_index: 0,
