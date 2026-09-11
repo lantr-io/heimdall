@@ -78,6 +78,22 @@ pub struct NodeState {
     /// pool joining, leaving, being banned or having its stake activate is one
     /// line. Empty until the first ceremony entry.
     pub registry: String,
+    /// Why this node had to rebuild its cumulative tries when it started, or
+    /// `None` when they were already current — the normal case.
+    ///
+    /// A gauge, not an event, for the reason the rest of this struct exists: a
+    /// warn line scrolls away. The log says it once at startup; this answers
+    /// "did it happen" for as long as the process runs, which is what a
+    /// monitoring check can actually scrape and what `heimdall status` prints.
+    ///
+    /// It matters because rebuilding is normal ONCE — a new node, or one that
+    /// was stopped while a movement completed — and a symptom every time: a
+    /// node that reports this at each restart is losing its state directory
+    /// between runs. Not persisted, deliberately: the fault it detects wipes
+    /// the state directory, so a counter kept there would be wiped with it.
+    /// One process, one answer; an operator alerting on "this field is set"
+    /// sees every restart that needed a rebuild.
+    pub tries_rebuilt_at_startup: Option<String>,
     /// Deposits that have stranded at a retired peg-in address, as
     /// `"<btc_txid>:<vout>"`.
     ///
@@ -202,6 +218,13 @@ pub fn render(state: &NodeState) -> String {
     }
     if !state.registry.is_empty() {
         out.push_str(&format!("registry        {}\n", state.registry));
+    }
+    if let Some(why) = &state.tries_rebuilt_at_startup {
+        out.push_str(&format!("tries           REBUILT at startup — {why}\n"));
+        out.push_str(
+            "                (normal once; at every restart it means this node is losing \
+             its state directory)\n",
+        );
     }
     if !state.stranded_pegins.is_empty() {
         out.push_str(&format!(
@@ -445,6 +468,10 @@ mod tests {
             // at all.
             stranded_pegins: BTreeSet::from(["abc123:0".to_string()]),
             registry: "4 registered, all eligible: #1 http://a.example:18500".to_string(),
+            // Non-empty for the same reason: an operator whose monitoring
+            // scrapes this must see it over the wire, not only in the log the
+            // daemon wrote at startup.
+            tries_rebuilt_at_startup: Some("never seeded (cpo, spi absent)".to_string()),
             grid: Some(GridPosition {
                 slot: 5_000_000,
                 batch: Some(2),

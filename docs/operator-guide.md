@@ -571,6 +571,63 @@ This runs eleven startup checks and prints all of them with the exact command th
 then exits non-zero if any failed. It reads the chain and **posts nothing** — a missing reference
 script and an unregistered SPO are both reported, never deployed or registered for you.
 
+`heimdall doctor` runs the same checks the daemon runs when it starts, by calling the same code, so
+the two cannot disagree about what is wrong. `run-spo --check` is the same thing reached from the
+other direction, if you would rather not type a second command name. When something goes wrong
+later, `heimdall doctor` is the first output to capture.
+
+```
+[1/11]  local preflight           PASS  wallet key from cardano.payment_skey_path, address addr_test1q…; bifrost identity key loaded
+[2/11]  cardano connectivity      PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
+[3/11]  resolve the Config        PASS  2dce4027…#0 (12 fields, fee_rate 1 sat/vB); peg-in requests at addr_test1…
+[4/11]  reference script          …
+[5/11]  ban list                  PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (detection only)
+[6/11]  registration status       …
+[7/11]  key handoff (Update-Y)    …
+[8/11]  federation identity       PASS  Y_fed 37b381ac…, csv 144 blocks — published in the Config datum
+[9/11]  post a movement           PASS  TM validator f691433e… on chain, 4032 bytes, verified against Config #5
+[10/11] local tries               PASS  cpo and spi match the bridge-state singleton (cpo_root c88736be…)
+[11/11] wallet collateral         PASS  2 ada-only UTxO(s) of >= 5000000 lovelace across 3 UTxO(s)
+```
+
+Step 3's field count is the datum's, and **more than twelve is normal** — the Config grows by
+appending, and a reader decodes the twelve it knows and ignores the rest. Fewer than twelve is a
+bridge older than this build, and it fails.
+
+Step 3 is the one that earns its keep: it resolves the Config UTxO, and everything the node knows
+about the bridge follows from it. Step 5 confirms your roster is ban-filtered — it fails if the
+registry is configured without a ban list, since that node could not agree with its peers on who is
+in the DKG.
+Step 6 tells you whether this node is registered; it never spends — it names the command and stops.
+
+Step 9 asks the question the rest of the report does not: **can this node actually post the
+movement it would sign?** Minting the TM NFT needs the treasury-movement validator itself, not
+just its hash, and the node fetches it from the chain by the hash the Config publishes (#5),
+refusing any bytes that do not hash back to it. Nothing here is yours to configure — that is the
+point. It used to be a CBOR string pasted into the config file, and a node missing it passed every
+other check, took a full turn in a signing ceremony, and failed at the mint, having already
+broadcast the Bitcoin transaction. That is why this one is a **FAIL** and not a warning.
+
+Only `FAIL` blocks startup. A `WARN` is worth reading, and steps 4 and 7 are the two you will most
+often see one on:
+
+- **Step 4 (`reference script`)** warns when the registry reference script is not deployed at your
+  wallet. That script is only needed to *register*; a running daemon reads the roster without it.
+- **Step 7 (`key handoff`)** warns when this node cannot compile the `treasury_info` script. It
+  still runs DKG and signs — but if it is elected leader for an epoch, the Update-Y that hands the
+  treasury to the new group key fails, and the handoff does not happen. Set
+  `cardano.config_nft_policy_id` to clear it — the one-shot the script compiles from is Config
+  #12, and the node reads it from there.
+
+`protocol.state_dir` is **not** in that list any more. It used to warn; it is now a step 1
+**FAIL**, because what it costs is a second payment of an already-paid peg-out rather than a
+degraded feature, and a warning is the wrong instrument for a fault whose symptom arrives an
+epoch later on a different machine.
+
+Do not continue until this passes.
+
+---
+
 ### The node seeds its own state
 
 The two tries are cumulative — the bridge's record of what has already been paid and already been
@@ -594,10 +651,17 @@ Every movement is on chain, so nothing here needs you. The walk refuses to persi
 singleton does not attest, so it cannot invent state either, and a node already in sync does
 nothing at all — one read, no rebuild.
 
-**Both lines are warnings on purpose, and they reach Discord.** A node that rebuilds once is a new
+**It is reported twice, because a log line scrolls away.** A node that rebuilds once is a new
 node, or one that missed a batch. A node that rebuilds at *every* start is losing its state
-directory between runs — a wiped volume, a deploy that recreates `/var/lib/heimdall` — and that is
-worth knowing about, so it is said loudly rather than healed in silence.
+directory between runs — a wiped volume, a deploy that recreates `/var/lib/heimdall` — and that
+is worth knowing about, so it is said rather than healed in silence:
+
+- in the **log**, at startup, marked so that whatever you point at your journal picks it up;
+- and as a **gauge on `/health`**, `tries_rebuilt_at_startup`, which `heimdall status` prints
+  and a monitoring check can scrape for as long as the process runs.
+
+The second is the one that survives. Alert on that field being set and you hear about every
+restart that needed a rebuild; rely on reading the journal and you will not.
 
 `heimdall doctor` and `run-spo --check` do **not** do this. They are read-only, and a command you
 run to see what a start *would* do must not change the state directory first — so on a new node
@@ -1006,7 +1070,7 @@ WI-058]**, which adds a periodic heartbeat and a `heimdall status` command, beca
 |---|---|
 | bifrost identity key | re-registration |
 | DKG signing share | the current epoch — the node sits out until the next boundary |
-| `cpo-trie.json`, `spi-trie.json` | a rebuild: nothing — `run-spo` rebuilds both from chain history at its next start, loudly ([The node seeds its own state](#the-node-seeds-its-own-state)) |
+| `cpo-trie.json`, `spi-trie.json` | nothing to do by hand — `run-spo` rebuilds both from chain history at its next start, and says so ([The node seeds its own state](#the-node-seeds-its-own-state)) |
 | `pending-tm.json` | the fold for one posted movement, which then needs the same rebuild |
 
 Back the directory up. The two tries are **cumulative** — they are the bridge's record of what has

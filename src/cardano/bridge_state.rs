@@ -408,17 +408,17 @@ pub enum TriesStatus {
     /// Files absent where the chain has history. Every new node starts here,
     /// and it is not a fault in the node — it has no starting point yet.
     NeverSeeded { missing: Vec<&'static str> },
-    /// Files present and disagreeing. Different in kind: this node holds state
-    /// the chain contradicts, and it can neither build nor co-sign until it is
-    /// reconciled.
-    Diverged { detail: Vec<String> },
-}
-
-impl TriesStatus {
-    #[must_use]
-    pub fn in_sync(&self) -> bool {
-        matches!(self, Self::InSync)
-    }
+    /// At least one file present and disagreeing. Different in kind: this node
+    /// holds state the chain contradicts, and it can neither build nor co-sign
+    /// until it is reconciled.
+    ///
+    /// `missing` rides along rather than being dropped: one trie diverged and
+    /// the other absent is a real combination, and an operator diagnosing by
+    /// hand needs to hear about both files, not the louder one.
+    Diverged {
+        detail: Vec<String>,
+        missing: Vec<&'static str>,
+    },
 }
 
 /// Compare the tries in `state_dir` against the roots the bridge-state
@@ -455,7 +455,7 @@ pub fn local_tries_status(
         }
     }
     if !detail.is_empty() {
-        TriesStatus::Diverged { detail }
+        TriesStatus::Diverged { detail, missing }
     } else if !missing.is_empty() {
         TriesStatus::NeverSeeded { missing }
     } else {
@@ -504,7 +504,6 @@ mod tries_status_tests {
                 missing: vec!["cpo", "spi"]
             }
         );
-        assert!(!status.in_sync());
     }
 
     /// Present and disagreeing is a different kind of fault: this node holds
@@ -514,7 +513,8 @@ mod tries_status_tests {
         let d = dir("diverged");
         CpoTrie::empty().save(&d).unwrap();
         SpiTrie::empty().save(&d).unwrap();
-        let TriesStatus::Diverged { detail } = local_tries_status(&d, [0xc8u8; 32], [0x26u8; 32])
+        let TriesStatus::Diverged { detail, .. } =
+            local_tries_status(&d, [0xc8u8; 32], [0x26u8; 32])
         else {
             panic!("empty tries against a bridge with history disagree");
         };

@@ -1125,16 +1125,15 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     );
                     let (bad, diverged) = match &status {
                         crate::cardano::bridge_state::TriesStatus::InSync => (Vec::new(), false),
-                        crate::cardano::bridge_state::TriesStatus::NeverSeeded { missing } => (
-                            vec![format!(
-                                "no {}-trie.json, and the bridge has history (cpo_root {})",
-                                missing.join("-trie.json, no "),
-                                hex::encode(chain.cpo_root)
-                            )],
-                            false,
-                        ),
-                        crate::cardano::bridge_state::TriesStatus::Diverged { detail } => {
-                            (detail.clone(), true)
+                        crate::cardano::bridge_state::TriesStatus::NeverSeeded { missing } => {
+                            (vec![absent_line(missing, &chain)], false)
+                        }
+                        crate::cardano::bridge_state::TriesStatus::Diverged { detail, missing } => {
+                            let mut bad = detail.clone();
+                            if !missing.is_empty() {
+                                bad.push(absent_line(missing, &chain));
+                            }
+                            (bad, true)
                         }
                     };
                     if bad.is_empty() {
@@ -1148,23 +1147,13 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             ),
                         );
                     } else {
-                        let fix = if !diverged {
-                            "EXPECTED on a node that has not run before: the two tries are \
-                             cumulative, and a new node cannot invent what the bridge has \
-                             already paid and swept. Run `heimdall reconstruct-tries` — it \
-                             builds both from chain history and refuses to persist a root the \
-                             bridge-state singleton does not attest, so it cannot invent state \
-                             either. Nothing is wrong with this node yet; it just has no \
-                             starting point."
-                        } else {
-                            "This node's state DISAGREES with the chain, which is not the same \
-                             as a node that has never been seeded. Until they match it reaches \
-                             BuildTm and stops: it signs nothing and the roster counts it \
-                             absent. `heimdall reconstruct-tries` rebuilds both from chain \
-                             history, checking every step against the root each movement \
-                             attested."
-                        };
-                        b.push_fix(10, "local tries", Status::Fail, bad.join("; "), fix);
+                        b.push_fix(
+                            10,
+                            "local tries",
+                            Status::Fail,
+                            bad.join("; "),
+                            tries_fix_advice(diverged),
+                        );
                     }
                 }
             }
@@ -1230,6 +1219,56 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
 /// The wallet's UTxOs, for the collateral count in step 11. Read-only, and the
 /// same derivation the builders use — a step reporting on collateral must be
 /// looking at the wallet the transaction will actually spend from.
+/// What step 10 tells the operator to do, by which of the two faults it is.
+///
+/// Public to the module's tests, and the ONLY copy: a test that restates these
+/// strings passes whichever branch production takes, which is how a mirror
+/// drifts from the thing it mirrors.
+fn tries_fix_advice(diverged: bool) -> &'static str {
+    if diverged {
+        "This node's state DISAGREES with the chain, which is not the same as a node that \
+         has never been seeded. Until they match it reaches BuildTm and stops: it signs \
+         nothing and the roster counts it absent. `run-spo` rebuilds both from chain history \
+         at startup; `heimdall reconstruct-tries` does it now, checking every step against \
+         the root each movement attested."
+    } else {
+        "EXPECTED on a node that has not run before: the two tries are cumulative, and a new \
+         node cannot invent what the bridge has already paid and swept. `run-spo` seeds them \
+         itself at startup, so this clears on the first real start; `heimdall \
+         reconstruct-tries` does it now if you would rather seed first. Nothing is wrong \
+         with this node yet; it just has no starting point."
+    }
+}
+
+/// "no X-trie.json, and the bridge has history (…)" — citing the root that
+/// actually shows the history, per trie.
+///
+/// Quoting `cpo_root` whatever is missing produces
+/// `no spi-trie.json, and the bridge has history (cpo_root 0000…)` on a bridge
+/// that has swept peg-ins but completed no peg-out: self-contradicting, and
+/// never showing the root that is the real evidence.
+fn absent_line(
+    missing: &[&'static str],
+    chain: &crate::cardano::bridge_state::BridgeState,
+) -> String {
+    let roots: Vec<String> = missing
+        .iter()
+        .map(|what| {
+            let root = if *what == "cpo" {
+                chain.cpo_root
+            } else {
+                chain.spi_root
+            };
+            format!("{what}_root {}", hex::encode(root))
+        })
+        .collect();
+    format!(
+        "no {}-trie.json, and the bridge has history ({})",
+        missing.join("-trie.json, no "),
+        roots.join(", ")
+    )
+}
+
 async fn wallet_collateral_utxos(
     addr: &Result<String, String>,
     base_url: &str,
@@ -1469,7 +1508,7 @@ mod tests {
     /// rather than only a recovery one.
     #[test]
     fn never_seeded_and_diverged_are_diagnosed_differently() {
-        let never_seeded = advice(&[], true);
+        let never_seeded = tries_fix_advice(false);
         assert!(never_seeded.contains("EXPECTED"), "{never_seeded}");
         assert!(never_seeded.contains("reconstruct-tries"), "{never_seeded}");
         assert!(
@@ -1477,30 +1516,13 @@ mod tests {
             "a new node is not a diverged one: {never_seeded}"
         );
 
-        let diverged = advice(&["cpo root aa != the chain's bb".into()], false);
+        let diverged = tries_fix_advice(true);
         assert!(diverged.contains("DISAGREES"), "{diverged}");
         assert!(diverged.contains("reconstruct-tries"), "{diverged}");
         assert!(
             !diverged.contains("EXPECTED"),
             "divergence is never expected: {diverged}"
         );
-    }
-
-    /// The advice step 10 attaches, mirroring the branch in `preflight`.
-    fn advice(diverged: &[String], _missing: bool) -> &'static str {
-        if diverged.is_empty() {
-            "EXPECTED on a node that has not run before: the two tries are cumulative, and a \
-             new node cannot invent what the bridge has already paid and swept. Run `heimdall \
-             reconstruct-tries` — it builds both from chain history and refuses to persist a \
-             root the bridge-state singleton does not attest, so it cannot invent state \
-             either. Nothing is wrong with this node yet; it just has no starting point."
-        } else {
-            "This node's state DISAGREES with the chain, which is not the same as a node that \
-             has never been seeded. Until they match it reaches BuildTm and stops: it signs \
-             nothing and the roster counts it absent. `heimdall reconstruct-tries` rebuilds \
-             both from chain history, checking every step against the root each movement \
-             attested."
-        }
     }
 
     #[tokio::test]

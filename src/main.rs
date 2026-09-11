@@ -918,6 +918,22 @@ enum Commands {
         #[arg(long = "exclude-pegin")]
         exclude_pegin: Vec<String>,
     },
+    /// Seed BOTH cumulative tries from Cardano history — what a new node runs
+    /// once before its first start, and what a node whose state directory lost
+    /// them runs to get back.
+    ///
+    /// Just `reconstruct-cpo-trie` followed by `reconstruct-spi-trie`. It
+    /// exists because they are one step, not two: a node needs both to build a
+    /// movement, the startup check reports them together, and an operator
+    /// running only the first is left with a node that still will not start.
+    ReconstructTries {
+        #[arg(long)]
+        config: Option<String>,
+        /// Print both reconstructed roots and entry counts without writing
+        /// either file.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Rebuild the completed-peg-outs trie from Cardano history and persist it to
     /// `protocol.state_dir`.
     ///
@@ -935,22 +951,6 @@ enum Commands {
     /// Both run the SAME algorithm. Every step is checked against the root each
     /// Treasury Movement attested, so a garbled data-availability hint costs time,
     /// never correctness.
-    /// Seed BOTH cumulative tries from Cardano history — what a new node runs
-    /// once before its first start, and what a node whose state directory lost
-    /// them runs to get back.
-    ///
-    /// Just `reconstruct-cpo-trie` followed by `reconstruct-spi-trie`. It
-    /// exists because they are one step, not two: a node needs both to build a
-    /// movement, the startup check reports them together, and an operator
-    /// running only the first is left with a node that still will not start.
-    ReconstructTries {
-        #[arg(long)]
-        config: Option<String>,
-        /// Print both reconstructed roots and entry counts without writing
-        /// either file.
-        #[arg(long)]
-        dry_run: bool,
-    },
     ReconstructCpoTrie {
         #[arg(long)]
         config: Option<String>,
@@ -1179,39 +1179,71 @@ async fn fetch_node_state(bind: &str) -> Result<heimdall::health::NodeState, Str
 /// Never fatal. A rebuild that fails leaves the tries as they were, and the
 /// preflight gate immediately after is what refuses to start and says why —
 /// one voice for that, not two.
-fn catch_up_tries(cfg: &HeimdallConfig) {
+fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
     use heimdall::cardano::bridge_state::{TriesStatus, local_tries_status};
+    use heimdall::epoch::pending_tm::PendingTm;
 
-    let Some(dir) = cfg.protocol.state_dir.as_deref() else {
-        return;
-    };
+    // Every early return here means "I could not even look", which is NOT the
+    // same as "they were in sync" — and the health gauge reads `None` as the
+    // latter. Say so, so a node whose catch-up never ran is distinguishable
+    // from a healthy one. Whether any of these is fatal is the gate's to rule
+    // on, not this function's.
+    let dir = cfg.protocol.state_dir.as_deref()?; // no state dir: step 10 skips too
     let Some(project_id) = cfg.cardano.blockfrost_project_id.clone() else {
-        return;
+        warn!("tries catch-up skipped: no cardano.blockfrost_project_id to read the chain with");
+        return None;
     };
-    let Ok(bridge) = resolve_bridge_contracts(cfg) else {
-        return; // The gate reports an unresolvable Config far better than this could.
+    let bridge = match resolve_bridge_contracts(cfg) {
+        Ok(b) => b,
+        // The gate reports an unresolvable Config far better than this could.
+        Err(e) => {
+            warn!("tries catch-up skipped: the bridge Config did not resolve ({e})");
+            return None;
+        }
     };
-    let Ok(rt) = tokio::runtime::Runtime::new() else {
-        return;
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            warn!("tries catch-up skipped: no tokio runtime ({e})");
+            return None;
+        }
     };
     let history = heimdall::cardano::cpo_history::BlockfrostHistory::new(
         &project_id,
         cfg.cardano.blockfrost_url.as_deref(),
     );
-    let Ok(chain) = rt.block_on(heimdall::cardano::bridge_state::fetch_bridge_state(
+    let chain = match rt.block_on(heimdall::cardano::bridge_state::fetch_bridge_state(
         &history,
         &bridge.bridge_state_policy_id,
-    )) else {
-        return; // Provider trouble: step 10 reports it as a Warn.
+    )) {
+        Ok(c) => c,
+        Err(e) => {
+            // The likeliest skip, and the one where the tries most plausibly
+            // ARE behind — so it is said, not swallowed.
+            warn!(
+                target: "heimdall::event",
+                "tries catch-up skipped: could not read the bridge-state singleton to compare \
+                 against ({e}). This node may be starting with tries behind the chain"
+            );
+            return None;
+        }
     };
 
     let dir = std::path::Path::new(dir);
-    let what = match local_tries_status(dir, chain.cpo_root, chain.spi_root) {
-        TriesStatus::InSync => return,
+    let status = local_tries_status(dir, chain.cpo_root, chain.spi_root);
+    let diverged = matches!(status, TriesStatus::Diverged { .. });
+    let what = match status {
+        TriesStatus::InSync => return None,
         TriesStatus::NeverSeeded { missing } => {
             format!("never seeded ({} absent)", missing.join(", "))
         }
-        TriesStatus::Diverged { detail } => detail.join("; "),
+        TriesStatus::Diverged { detail, missing } => {
+            let mut all = detail;
+            if !missing.is_empty() {
+                all.push(format!("{} absent", missing.join(", ")));
+            }
+            all.join("; ")
+        }
     };
 
     warn!(
@@ -1219,21 +1251,75 @@ fn catch_up_tries(cfg: &HeimdallConfig) {
         "local tries behind the chain — {what}. Rebuilding both from Cardano history \
          before starting; this node could neither build nor co-sign until they match"
     );
-    if let Err(e) =
-        run_reconstruct_cpo_trie(cfg, false).and_then(|()| run_reconstruct_spi_trie(cfg, false))
+    // A file this node WROTE and the chain contradicts is evidence — of what it
+    // held, and so of whether it ever signed a wrong root. The rebuild
+    // overwrites in place, so set it aside first. Only when diverged: a node
+    // that was never seeded has nothing to preserve.
+    if diverged {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        for name in ["cpo-trie.json", "spi-trie.json"] {
+            let from = dir.join(name);
+            if !from.exists() {
+                continue;
+            }
+            let to = dir.join(format!("{name}.superseded-{stamp}"));
+            match std::fs::rename(&from, &to) {
+                Ok(()) => warn!("  kept the superseded {name} as {}", to.display()),
+                Err(e) => warn!("  could not set {name} aside before rebuilding: {e}"),
+            }
+        }
+    }
+
+    if let Err(e) = run_reconstruct_cpo_trie(cfg, false, false)
+        .and_then(|()| run_reconstruct_spi_trie(cfg, false, false))
     {
         warn!(
             target: "heimdall::event",
             "rebuilding the tries from chain history FAILED: {e}. Startup checks below \
-         decide whether this node can run"
+             decide whether this node can run"
         );
-        return;
+        return Some(format!("{what} — rebuild FAILED: {e}"));
     }
-    warn!(
-        target: "heimdall::event",
-        "tries rebuilt from chain history and now match the bridge-state singleton. If \
-         this happens at every start, this node is losing its state directory between runs"
-    );
+
+    // The pending record MUST go with the rebuild, or the catch-up wedges the
+    // node it just healed. `settle_pending_tm` folds that record and checks the
+    // result against the root the record committed; a trie rebuilt PAST that
+    // movement reaches a different root, so the fold is refused,
+    // `PendingTm::clear` is never reached, and every later start repeats the
+    // rebuild, reports success, and jams in the same place.
+    //
+    // Safe to drop: a rebuild only happens when the chain has moved past this
+    // node. A movement still genuinely in flight leaves the head where the
+    // record expects it, so the tries match and this function returned above.
+    // Anything the record described that DID confirm is already in the rebuilt
+    // tries — they came from chain history.
+    if let Err(e) = PendingTm::clear(dir) {
+        warn!(
+            target: "heimdall::event",
+            "tries rebuilt, but the stale pending-movement record could not be removed: {e}. \
+             Delete pending-tm.json by hand, or this node will refuse to fold its next movement"
+        );
+    }
+
+    // Claim they match only having LOOKED. Each walk cross-checks against its
+    // own read of the singleton, which is not the same as both files agreeing
+    // with it afterwards — the singleton can advance between the two walks.
+    match local_tries_status(dir, chain.cpo_root, chain.spi_root) {
+        TriesStatus::InSync => warn!(
+            target: "heimdall::event",
+            "tries rebuilt from chain history and now match the bridge-state singleton. If \
+             this happens at every start, this node is losing its state directory between runs"
+        ),
+        still => warn!(
+            target: "heimdall::event",
+            "tries rebuilt, but they still do not match the singleton ({still:?}) — most \
+             likely a movement confirmed while this node was rebuilding. The startup checks \
+             below decide whether it can run; a restart will try again"
+        ),
+    }
+    Some(what)
 }
 
 fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
@@ -1510,9 +1596,7 @@ fn main() {
             // and an operator running it to see what a start WOULD do must
             // not have it quietly change the state directory first. Under
             // `--check` the gate reports the tries as they actually stand.
-            if !check {
-                catch_up_tries(&cfg);
-            }
+            let tries_rebuilt = if check { None } else { catch_up_tries(&cfg) };
             if let Err(e) = run_preflight_gate(&cfg) {
                 error!("Error: {e}");
                 std::process::exit(1);
@@ -1526,7 +1610,13 @@ fn main() {
             }
 
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_spo(cfg, index, deterministic, inject_fault));
+            rt.block_on(run_spo(
+                cfg,
+                index,
+                deterministic,
+                inject_fault,
+                tries_rebuilt,
+            ));
         }
         Commands::BootstrapTreasury {
             config,
@@ -2070,6 +2160,11 @@ fn main() {
             // Exactly the daemon's gate. `Err` here has already printed the whole
             // report, so this only has to set the exit code and say the one thing
             // the report cannot: that these were the startup checks.
+            // Same self-heal as `run-spo`: the mover builds and posts
+            // movements, so a trie behind the chain makes it just as inert,
+            // and leaving one daemon to fix itself while the other exits
+            // would be two answers to one fault.
+            catch_up_tries(&cfg);
             match run_preflight_gate(&cfg) {
                 Ok(()) => println!(
                     "\nall startup checks passed — this node is configured for the bridge above"
@@ -2098,8 +2193,8 @@ fn main() {
             let cfg = load_config(config.as_deref());
             // Both, in order, and stop at the first failure: the second walk
             // reads the same chain, so whatever broke the first breaks it too.
-            let both = run_reconstruct_cpo_trie(&cfg, dry_run)
-                .and_then(|()| run_reconstruct_spi_trie(&cfg, dry_run));
+            let both = run_reconstruct_cpo_trie(&cfg, dry_run, true)
+                .and_then(|()| run_reconstruct_spi_trie(&cfg, dry_run, true));
             if let Err(e) = both {
                 error!("Error: {e}");
                 std::process::exit(1);
@@ -2114,14 +2209,14 @@ fn main() {
         }
         Commands::ReconstructCpoTrie { config, dry_run } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) = run_reconstruct_cpo_trie(&cfg, dry_run) {
+            if let Err(e) = run_reconstruct_cpo_trie(&cfg, dry_run, true) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Commands::ReconstructSpiTrie { config, dry_run } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) = run_reconstruct_spi_trie(&cfg, dry_run) {
+            if let Err(e) = run_reconstruct_spi_trie(&cfg, dry_run, true) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -2192,6 +2287,9 @@ async fn run_spo(
     index: Option<u16>,
     deterministic: bool,
     inject_fault: Option<String>,
+    // Why the startup catch-up rebuilt this node's tries, for the health
+    // surface — see `heimdall::health::NodeState::tries_rebuilt_at_startup`.
+    tries_rebuilt: Option<String>,
 ) {
     // The treasury's federation identity: the treasury_info datum where the bridge
     // has one, this node's `[bitcoin]` keys otherwise (WI-069). Fatal on failure —
@@ -2793,6 +2891,9 @@ async fn run_spo(
     // from it, so node-operator state does not belong there. Loopback by
     // default; see `[health]`.
     let health = heimdall::health::HealthHandle::new();
+    if let Some(why) = tries_rebuilt {
+        health.update(|h| h.tries_rebuilt_at_startup = Some(why));
+    }
     if cfg.health.enabled {
         tokio::spawn(heimdall::health::serve(
             cfg.health.bind.clone(),
@@ -7768,7 +7869,11 @@ fn run_mover(
 /// than no rebuild, because the node would sign roots derived from a set it
 /// believes is complete. Every TM's running root is checked against the root that
 /// TM attested, so an unexplainable movement aborts the run and names itself.
-fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), String> {
+fn run_reconstruct_cpo_trie(
+    cfg: &HeimdallConfig,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<(), String> {
     use heimdall::cardano::cpo_history::{BlockfrostHistory, CpoHistorySource, KupoHistory};
     use heimdall::cardano::cpo_trie::{ReconstructConfig, reconstruct};
 
@@ -7822,7 +7927,9 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
     // `reconstruct` itself logs the active backend and its endpoint before its
     // first read, so every caller reports it identically and this command does not
     // repeat the line.
-    println!("reconstructing the completed-peg-outs trie");
+    if verbose {
+        println!("reconstructing the completed-peg-outs trie");
+    }
     let trie = rt
         .block_on(reconstruct(source.as_ref(), &recon))
         .map_err(|e| e.to_string())?;
@@ -7832,7 +7939,7 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
         hex::encode(trie.root()),
         trie.len()
     );
-    for (por_id, value) in trie.entries() {
+    for (por_id, value) in trie.entries().filter(|_| verbose) {
         println!("    {} -> {}", hex::encode(por_id), hex::encode(value));
     }
 
@@ -7861,7 +7968,11 @@ fn run_reconstruct_cpo_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
 /// Same backend selection and the same harvest/walk as `reconstruct-cpo-trie`;
 /// the entries are each confirmed TM's inputs per [SPI-1]/[SPI-3], and the
 /// finished root must equal the singleton's attested `spi_root`.
-fn run_reconstruct_spi_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), String> {
+fn run_reconstruct_spi_trie(
+    cfg: &HeimdallConfig,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<(), String> {
     use heimdall::cardano::cpo_history::{BlockfrostHistory, CpoHistorySource, KupoHistory};
     use heimdall::cardano::cpo_trie::reconstruct_spi;
 
@@ -7887,7 +7998,9 @@ fn run_reconstruct_spi_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
     };
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
-    println!("reconstructing the swept peg-ins trie");
+    if verbose {
+        println!("reconstructing the swept peg-ins trie");
+    }
     let trie = rt
         .block_on(reconstruct_spi(source.as_ref(), tm_address, &policy))
         .map_err(|e| e.to_string())?;
@@ -7897,7 +8010,7 @@ fn run_reconstruct_spi_trie(cfg: &HeimdallConfig, dry_run: bool) -> Result<(), S
         hex::encode(trie.root()),
         trie.len()
     );
-    for (peg_in, value) in trie.entries() {
+    for (peg_in, value) in trie.entries().filter(|_| verbose) {
         println!("    {} -> {}", hex::encode(peg_in), hex::encode(value));
     }
 
