@@ -356,7 +356,14 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 "wallet key from {}, address {}",
                 w.source, w.address
             )),
-            Err(e) => problems.push(format!("{e} (/etc/default/heimdall in the Debian package)")),
+            // The /etc/default hint belongs ONLY to "no key at all". Appended
+            // to every error it misdirects: a 0644 key file, or an address
+            // that does not pair with its key, has nothing to do with that
+            // file — and this is the command whose job is to name the fix.
+            Err(e) if e.starts_with("no wallet key") => {
+                problems.push(format!("{e} (/etc/default/heimdall in the Debian package)"));
+            }
+            Err(e) => problems.push(e.clone()),
         }
 
         match &cfg.bifrost.skey_path {
@@ -401,7 +408,12 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         let mainnet = match cfg.cardano.is_mainnet() {
             Ok(m) => m,
             Err(e) => {
-                problems.push(e);
+                // Once. The wallet resolution above propagates the same error
+                // on the mnemonic path, and printing one fault as two reads
+                // as two faults.
+                if !problems.iter().any(|p| p.contains(&e)) {
+                    problems.push(e);
+                }
                 true
             }
         };

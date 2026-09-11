@@ -347,8 +347,10 @@ enum Commands {
         #[arg(long, default_value_t = 60)]
         serve_after_secs: u64,
     },
-    /// Print the Cardano wallet base address + payment key hash (the TM-NFT mint
-    /// authority) derived from the configured mnemonic / $HEIMDALL_MNEMONIC.
+    /// Print the Cardano wallet address + payment key hash (the TM-NFT mint
+    /// authority), and which config key supplied the signing key:
+    /// `cardano.payment_skey_path`, or a mnemonic from `cardano.mnemonic` /
+    /// $HEIMDALL_MNEMONIC.
     WalletAddress {
         #[arg(long)]
         config: Option<String>,
@@ -1389,19 +1391,15 @@ fn main() {
             if let Some(ref v) = cardano_mnemonic {
                 cfg.cardano.mnemonic = Some(v.clone());
             }
-            // Env var fallback: keep the real seed out of heimdall.toml and
-            // the repo. Among MNEMONIC sources the precedence is CLI
-            // --cardano-mnemonic > TOML cardano.mnemonic > $HEIMDALL_MNEMONIC.
-            // There is no precedence against cardano.payment_skey_path: these
-            // assignments happen after config load, so `resolve_wallet` — not
-            // the loader — is what refuses the pair.
-            if cfg.cardano.mnemonic.is_none() {
-                if let Ok(v) = std::env::var("HEIMDALL_MNEMONIC") {
-                    if !v.trim().is_empty() {
-                        cfg.cardano.mnemonic = Some(v);
-                    }
-                }
-            }
+            // $HEIMDALL_MNEMONIC is NOT copied into the config here. It used
+            // to be, and that made `resolve_wallet` report the wallet as
+            // coming from `cardano.mnemonic` — so `doctor` and `run-spo
+            // --check` gave two different answers about one config, and the
+            // two-key refusal named a TOML key the operator had never
+            // uncommented. The resolver reads the variable itself and
+            // attributes it correctly. Among mnemonic sources the precedence
+            // is unchanged: CLI --cardano-mnemonic > cardano.mnemonic >
+            // $HEIMDALL_MNEMONIC.
 
             // WI-053's startup gate, which used to run only in `run-mover`.
             // This is the packaged daemon now, so it is the one that has to
@@ -5479,7 +5477,8 @@ fn run_init_scripts(
 
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
-    let mainnet = !is_testnet_address(&wallet_addr);
+    // From the config, not sniffed back out of the address we just derived.
+    let mainnet = cfg.cardano.is_mainnet()?;
 
     let scripts = vec![WithdrawScript {
         name: "spo_bans",

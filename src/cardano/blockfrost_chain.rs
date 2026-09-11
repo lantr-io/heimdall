@@ -246,8 +246,16 @@ impl DkgFaultBanFlow {
         // derivation above produces. A configured value still wins; unset means
         // "find it", which is what removes the last typed outrefs from an
         // operator's config (WI-091).
+        // ONE wallet resolution for all four lookups below. Each used to do
+        // its own, so a skey-configured node read, parsed and validated its
+        // signing key four times — and a mnemonic one ran four Icarus PBKDF2
+        // derivations — to recover an address the config already holds.
+        let wallet = crate::cardano::wallet::resolve_wallet(cardano).map(|w| w.address);
+        let wallet_address = wallet.as_deref();
+
         let spo_bans_ref = resolve_script_ref(
             cardano,
+            wallet_address,
             one_shot,
             &cardano.spo_bans_ref,
             &spo_bans,
@@ -256,6 +264,7 @@ impl DkgFaultBanFlow {
         .await?;
         let round1_fault_ref = resolve_script_ref(
             cardano,
+            wallet_address,
             one_shot,
             &cardano.fault_verifier_round1_ref,
             &round1_fault,
@@ -264,6 +273,7 @@ impl DkgFaultBanFlow {
         .await?;
         let round2_fault_ref = resolve_script_ref(
             cardano,
+            wallet_address,
             one_shot,
             &cardano.fault_verifier_round2_ref,
             &round2_fault,
@@ -272,6 +282,7 @@ impl DkgFaultBanFlow {
         .await?;
         let equivocation_fault_ref = resolve_script_ref(
             cardano,
+            wallet_address,
             one_shot,
             &cardano.fault_verifier_equivocation_ref,
             &equivocation_fault,
@@ -339,6 +350,7 @@ fn req_fault_config<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str
 /// the chain also offers a candidate would be worse than either.
 async fn resolve_script_ref(
     cardano: &crate::config::CardanoConfig,
+    wallet_address: Result<&str, &String>,
     one_shot: &str,
     configured: &Option<String>,
     script: &crate::cardano::blueprint::ParameterizedScript,
@@ -352,11 +364,12 @@ async fn resolve_script_ref(
         .as_deref()
         .ok_or_else(|| format!("{what} reference script is unset and there is no chain to find it on: set cardano.blockfrost_project_id, or cardano.{what}_ref"))?;
     let base_url = crate::cardano::bf_http::base_url(pid, cardano.blockfrost_url.as_deref());
-    let wallet = crate::cardano::wallet::resolve_wallet(cardano)
-        .map_err(|e| {
-            format!("{what} reference script is unset and this node has no wallet to look in: {e}, or set cardano.{what}_ref")
-        })?
-        .address;
+    let wallet = wallet_address.map_err(|e| {
+        format!(
+            "{what} reference script is unset and this node has no wallet to look in: {e}, \
+             or set cardano.{what}_ref"
+        )
+    })?;
     let hash = script.hash_hex();
     let found = crate::cardano::ref_script::find_ref_script_anywhere(
         &base_url,
@@ -623,7 +636,7 @@ pub struct BlockfrostCardanoChain {
     /// node cannot start before is one no honest node can ever meet, and the
     /// resulting signing window opens already closed without reporting anything.
     ceremony_floor_slots: u64,
-    /// Mnemonic-derived payment key for the Cardano wallet that pays
+    /// The wallet's payment key — from a mnemonic or a `payment.skey` for the Cardano wallet that pays
     /// fees. `None` means publishing is disabled (dry run).
     payment_key: Option<PrivateKey>,
     /// Full CIP-1852 base address (`payment_pkh + staking_pkh`) derived
@@ -3301,7 +3314,7 @@ impl CardanoChain for BlockfrostCardanoChain {
             Some(k) => k,
             None => {
                 warn!(
-                    "[submit] no mnemonic configured — skipping Cardano oracle publish (dry run)"
+                    "[submit] no wallet key configured — skipping Cardano oracle publish (dry run)"
                 );
                 return Ok(());
             }

@@ -218,8 +218,15 @@ pub fn is_testnet_address(wallet_address: &str) -> bool {
     // those reads as mainnet, which would tag every derived script address for
     // the wrong network. `resolve_wallet` canonicalizes the wallet address, so
     // this is belt-and-braces for the other things that reach here.
-    let a = wallet_address.trim();
-    a.len() >= 9 && a[..9].eq_ignore_ascii_case("addr_test")
+    // `as_bytes().get(..9)` rather than `a[..9]`: this is `pub`, reached from
+    // six call sites with operator- and chain-supplied strings, and slicing a
+    // str at a byte index that is not a char boundary PANICS. The old
+    // `starts_with` could not, and neither may its replacement.
+    wallet_address
+        .trim()
+        .as_bytes()
+        .get(..9)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"addr_test"))
 }
 
 /// The `pallas_addresses::Network` implied by a bech32 wallet address.

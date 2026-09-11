@@ -50,8 +50,12 @@ What it installs:
 | `/lib/systemd/system/heimdall.service` | the unit |
 | `/etc/heimdall/heimdall.toml` | bridge config, dpkg conffile, `0640 root:heimdall` |
 | `/etc/default/heimdall` | `$HEIMDALL_ARGS` + `$HEIMDALL_MNEMONIC`, conffile, `0640` |
-| `/etc/heimdall/payment.skey` | optional cardano-cli wallet key, `0600` — the alternative to a mnemonic |
 | `/var/lib/heimdall` | state (`state_dir`), `0700 heimdall` |
+
+The package installs no wallet key. If you use `cardano.payment_skey_path` instead of a
+mnemonic, put your own `payment.skey` wherever that key points and make it readable by the
+unit's user: `chown heimdall: … && chmod 600 …`. A root-owned `0600` key is unreadable to
+`User=heimdall` and the daemon reports only `Permission denied`.
 
 **The service is installed disabled, and that is deliberate.** heimdall cannot run before it has a
 bridge configuration and key material, so enabling it on install would guarantee a failed unit on

@@ -21,6 +21,8 @@ use pallas_addresses::{
 use pallas_wallet::{PrivateKey, hd::Bip32PrivateKey};
 
 use crate::cardano::hash::blake2b_224;
+use zeroize::Zeroizing;
+
 use crate::config::CardanoConfig;
 
 /// The node's wallet: what signs, where the funds are, and which config key
@@ -60,14 +62,34 @@ impl std::fmt::Debug for Wallet {
 /// static. This is where "neither" surfaces, because `$HEIMDALL_MNEMONIC` is
 /// invisible to the TOML parser and plenty of commands need no wallet at all.
 pub fn resolve_wallet(cfg: &CardanoConfig) -> Result<Wallet, String> {
+    resolve_wallet_from(cfg, std::env::var("HEIMDALL_MNEMONIC").ok())
+}
+
+/// The resolver proper, with the environment passed IN rather than read.
+///
+/// The seam exists for the tests. `$HEIMDALL_MNEMONIC` is process-global and
+/// cargo runs tests on parallel threads, so a test that removed it to assert
+/// "no wallet key" raced every other test reading it — and `set_var` /
+/// `remove_var` beside a concurrent `var` is undefined behaviour, not merely
+/// flaky. Passing the value makes every test deterministic on a box where an
+/// operator has the variable exported, which on an SPO host is the norm.
+pub fn resolve_wallet_from(
+    cfg: &CardanoConfig,
+    env_mnemonic: Option<String>,
+) -> Result<Wallet, String> {
     // The authoritative "exactly one" check. `refuse_ambiguous_wallet_key`
     // makes the same call at config load, which is where an operator wants to
     // hear it — but the load-time check sees only the TOML, and `run-spo`
     // injects `--cardano-mnemonic` and `$HEIMDALL_MNEMONIC` into the config
     // AFTER it. Without this, migrating to a skey while leaving the mnemonic
     // in /etc/default/heimdall silently resolved to the skey.
-    let mnemonic = mnemonic_from(cfg);
-    if let (Some(path), Some((_, src))) = (cfg.payment_skey_path.as_deref(), mnemonic.as_ref()) {
+    let mnemonic = mnemonic_from(cfg, env_mnemonic);
+    let skey_path = cfg
+        .payment_skey_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    if let (Some(path), Some((_, src))) = (skey_path, mnemonic.as_ref()) {
         return Err(format!(
             "two wallet keys: cardano.payment_skey_path ({path}) and a mnemonic from {src}. \
              They are alternatives — heimdall has one wallet, and choosing by precedence \
@@ -75,7 +97,7 @@ pub fn resolve_wallet(cfg: &CardanoConfig) -> Result<Wallet, String> {
         ));
     }
 
-    if let Some(path) = cfg.payment_skey_path.as_deref() {
+    if let Some(path) = skey_path {
         let key = payment_key_from_skey_file(path)?;
         let address = cfg.wallet_address.clone().ok_or_else(|| {
             "cardano.payment_skey_path is set but cardano.wallet_address is not — a \
@@ -137,13 +159,23 @@ pub fn resolve_wallet(cfg: &CardanoConfig) -> Result<Wallet, String> {
 
 /// The mnemonic and which key supplied it. `cardano.mnemonic` wins over the
 /// environment, as it always has.
-#[must_use]
-pub fn mnemonic_from(cfg: &CardanoConfig) -> Option<(String, &'static str)> {
-    if let Some(m) = cfg.mnemonic.clone() {
+///
+/// An EMPTY value is no value, on both branches. The shipped
+/// `deploy/debian/heimdall.toml` offers `#mnemonic = ""` as the line to
+/// uncomment, so an operator who uncomments it and then configures a key file
+/// would otherwise be refused for setting "two wallet keys", one of which is
+/// a blank string.
+fn mnemonic_from(
+    cfg: &CardanoConfig,
+    env_mnemonic: Option<String>,
+) -> Option<(String, &'static str)> {
+    if let Some(m) = cfg.mnemonic.clone()
+        && !m.trim().is_empty()
+    {
         return Some((m, "cardano.mnemonic"));
     }
-    match std::env::var("HEIMDALL_MNEMONIC") {
-        Ok(v) if !v.trim().is_empty() => Some((v, "$HEIMDALL_MNEMONIC")),
+    match env_mnemonic {
+        Some(v) if !v.trim().is_empty() => Some((v, "$HEIMDALL_MNEMONIC")),
         _ => None,
     }
 }
@@ -198,10 +230,18 @@ fn checked_address(cfg: &CardanoConfig, address: &str, key: &PrivateKey) -> Resu
 
     // The DECODED tag, not the prefix: see above.
     let addr_mainnet = matches!(sh.network(), Network::Mainnet);
-    // Only where the config has an opinion. `is_mainnet()` errs on an unknown
-    // network spelling and on `blockfrost_url` without `network`, and neither
-    // is reason to reject an address that is otherwise fine.
-    if let Ok(mainnet) = cfg.is_mainnet()
+    // `is_mainnet()` fails two different ways and they deserve different
+    // answers. When `cardano.network` is SET, the operator stated a network:
+    // honour it, and let an unknown spelling refuse — swallowing that is how
+    // `network = "Mainnet"` would sail past this check, which is the bug
+    // preflight's sibling guard documents. When it is UNSET the network is
+    // merely inferred, and an address that cannot be cross-checked is not a
+    // reason to reject an otherwise valid one.
+    let configured = match cfg.network.as_deref() {
+        Some(_) => Some(cfg.is_mainnet()?),
+        None => cfg.is_mainnet().ok(),
+    };
+    if let Some(mainnet) = configured
         && addr_mainnet != mainnet
     {
         return Err(format!(
@@ -226,25 +266,14 @@ fn checked_address(cfg: &CardanoConfig, address: &str, key: &PrivateKey) -> Resu
 /// `cardano-cli` does not always create these 0600, and a `cp` from the pool
 /// directory rarely preserves it. The bifrost identity key is held to the same
 /// rule (`ConfigError::KeyPermsTooOpen`).
-#[cfg(unix)]
 fn refuse_open_perms(path: &str) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta =
-        std::fs::metadata(path).map_err(|e| format!("cardano.payment_skey_path {path}: {e}"))?;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(format!(
+    crate::config::refuse_group_readable(std::path::Path::new(path)).map_err(|(path, mode)| {
+        format!(
             "cardano.payment_skey_path {path} is mode {mode:04o} — group- or world-readable. \
              This is a wallet signing key and the file's permissions are the only thing \
              protecting it: chmod 600 it"
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn refuse_open_perms(_path: &str) -> Result<(), String> {
-    Ok(())
+        )
+    })
 }
 
 /// Load a cardano-cli text-envelope signing key.
@@ -257,8 +286,16 @@ fn refuse_open_perms(_path: &str) -> Result<(), String> {
 /// signature for the wrong credential, which is worse than an error.
 pub fn payment_key_from_skey_file(path: &str) -> Result<PrivateKey, String> {
     refuse_open_perms(path)?;
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cardano.payment_skey_path {path}: {e}"))?;
+    // Every intermediate holds the secret, and the argument for using a file
+    // at all is that the key is protected. A `String` and a `Vec` dropped
+    // without wiping leave the key in freed heap, where a core dump or a
+    // later allocation in a long-lived daemon can still find it — so each is
+    // wiped on the way out. The `[u8; 32]` handed to pallas is zeroized by
+    // its own type.
+    let text = Zeroizing::new(
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("cardano.payment_skey_path {path}: {e}"))?,
+    );
     let env: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("{path} is not a text envelope: {e}"))?;
     let kind = env
@@ -269,10 +306,13 @@ pub fn payment_key_from_skey_file(path: &str) -> Result<PrivateKey, String> {
         .get("cborHex")
         .and_then(|c| c.as_str())
         .ok_or_else(|| format!("{path} has no \"cborHex\" field"))?;
-    let cbor = hex::decode(cbor_hex.trim()).map_err(|e| format!("{path} cborHex: {e}"))?;
-    let raw: Vec<u8> = pallas_codec::minicbor::decode::<pallas_codec::utils::Bytes>(&cbor)
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("{path} cborHex is not a CBOR byte string: {e}"))?;
+    let cbor =
+        Zeroizing::new(hex::decode(cbor_hex.trim()).map_err(|e| format!("{path} cborHex: {e}"))?);
+    let raw = Zeroizing::new(
+        pallas_codec::minicbor::decode::<pallas_codec::utils::Bytes>(&cbor)
+            .map(|b| b.to_vec())
+            .map_err(|e| format!("{path} cborHex is not a CBOR byte string: {e}"))?,
+    );
 
     match kind {
         "PaymentSigningKeyShelley_ed25519" => {
@@ -446,44 +486,6 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
-    /// Removes `$HEIMDALL_MNEMONIC` for the duration of a test and puts it
-    /// back, holding a lock while it does.
-    ///
-    /// EVERY test that calls [`resolve_wallet`] needs this, not only the one
-    /// asserting "no wallet key". The resolver reads the environment as a
-    /// mnemonic source, so on a box where the variable is exported — an SPO
-    /// host, or any shell that sourced `/etc/default/heimdall`, which is the
-    /// setup the operator guide recommends — a skey fixture trips the
-    /// two-key refusal and the test fails for a reason that has nothing to do
-    /// with what it is checking.
-    ///
-    /// The lock is the other half: the environment is process-global and
-    /// cargo runs these on parallel threads, so without it one test's removal
-    /// lands inside another's resolve.
-    struct NoAmbientMnemonic {
-        prev: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    impl NoAmbientMnemonic {
-        fn take() -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var("HEIMDALL_MNEMONIC").ok();
-            unsafe { std::env::remove_var("HEIMDALL_MNEMONIC") };
-            Self { prev, _lock: lock }
-        }
-    }
-
-    impl Drop for NoAmbientMnemonic {
-        fn drop(&mut self) {
-            if let Some(v) = self.prev.take() {
-                unsafe { std::env::set_var("HEIMDALL_MNEMONIC", v) };
-            }
-        }
-    }
-
     fn cardano_cfg() -> crate::config::CardanoConfig {
         crate::config::HeimdallConfig::default().cardano
     }
@@ -492,7 +494,6 @@ mod tests {
     /// the address the operator gave is used as-is.
     #[test]
     fn a_payment_skey_and_an_address_make_a_wallet() {
-        let _guard = NoAmbientMnemonic::take();
         let seed = [7u8; 32];
         let key = PrivateKey::from(pallas_crypto::key::ed25519::SecretKey::from(seed));
         let addr = wallet_address(&key, Network::Testnet);
@@ -505,7 +506,7 @@ mod tests {
         ));
         cfg.wallet_address = Some(addr.clone());
 
-        let w = resolve_wallet(&cfg).expect("resolves");
+        let w = resolve_wallet_from(&cfg, None).expect("resolves");
         assert_eq!(w.address, addr);
         assert_eq!(w.source, "cardano.payment_skey_path");
         assert_eq!(pub_key_hash_hex(&w.key), pub_key_hash_hex(&key));
@@ -515,7 +516,6 @@ mod tests {
     /// must not produce a wallet nothing can spend from.
     #[test]
     fn an_address_that_is_not_the_keys_is_refused() {
-        let _guard = NoAmbientMnemonic::take();
         let other = PrivateKey::from(pallas_crypto::key::ed25519::SecretKey::from([9u8; 32]));
 
         let mut cfg = cardano_cfg();
@@ -526,7 +526,7 @@ mod tests {
         ));
         cfg.wallet_address = Some(wallet_address(&other, Network::Testnet));
 
-        let err = resolve_wallet(&cfg).expect_err("not a pair");
+        let err = resolve_wallet_from(&cfg, None).expect_err("not a pair");
         assert!(err.contains("not a pair"), "{err}");
     }
 
@@ -548,14 +548,13 @@ mod tests {
 
     #[test]
     fn a_skey_without_an_address_says_why_one_is_needed() {
-        let _guard = NoAmbientMnemonic::take();
         let mut cfg = cardano_cfg();
         cfg.payment_skey_path = Some(skey_file(
             "no-address",
             "PaymentSigningKeyShelley_ed25519",
             &format!("5820{}", hex::encode([7u8; 32])),
         ));
-        let err = resolve_wallet(&cfg).expect_err("no address");
+        let err = resolve_wallet_from(&cfg, None).expect_err("no address");
         assert!(err.contains("cardano.wallet_address"), "{err}");
     }
 
@@ -567,8 +566,7 @@ mod tests {
     /// would pass a wallet back instead of the error it is asserting on.
     #[test]
     fn no_key_at_all_names_both_ways_in() {
-        let _guard = NoAmbientMnemonic::take();
-        let err = resolve_wallet(&cardano_cfg()).expect_err("nothing configured");
+        let err = resolve_wallet_from(&cardano_cfg(), None).expect_err("nothing configured");
         assert!(err.contains("payment_skey_path"), "{err}");
         assert!(err.contains("mnemonic"), "{err}");
     }
@@ -579,7 +577,6 @@ mod tests {
     /// migrated operator silently keep signing with the skey.
     #[test]
     fn two_keys_are_refused_even_when_the_loader_never_saw_both() {
-        let _guard = NoAmbientMnemonic::take();
         let mut cfg = cardano_cfg();
         cfg.payment_skey_path = Some(skey_file(
             "two-keys",
@@ -587,7 +584,7 @@ mod tests {
             &format!("5820{}", hex::encode([7u8; 32])),
         ));
         cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
-        let err = resolve_wallet(&cfg).expect_err("alternatives");
+        let err = resolve_wallet_from(&cfg, None).expect_err("alternatives");
         assert!(err.contains("two wallet keys"), "{err}");
     }
 
@@ -595,7 +592,6 @@ mod tests {
     /// address, so one on the wrong network is not a cosmetic mismatch.
     #[test]
     fn an_address_on_the_wrong_network_is_refused() {
-        let _guard = NoAmbientMnemonic::take();
         let key = PrivateKey::from(pallas_crypto::key::ed25519::SecretKey::from([7u8; 32]));
         let mut cfg = cardano_cfg();
         cfg.payment_skey_path = Some(skey_file(
@@ -605,8 +601,40 @@ mod tests {
         ));
         cfg.wallet_address = Some(wallet_address(&key, Network::Testnet));
         cfg.network = Some("mainnet".into());
-        let err = resolve_wallet(&cfg).expect_err("testnet address on a mainnet node");
+        let err = resolve_wallet_from(&cfg, None).expect_err("testnet address on a mainnet node");
         assert!(err.contains("configured for mainnet"), "{err}");
+    }
+
+    /// The environment is a mnemonic source, and an empty one is not.
+    #[test]
+    fn the_environment_supplies_a_mnemonic_and_is_labelled_as_such() {
+        let cfg = cardano_cfg();
+        let w = resolve_wallet_from(&cfg, Some(TEST_MNEMONIC.to_string())).expect("resolves");
+        assert_eq!(w.source, "$HEIMDALL_MNEMONIC");
+
+        assert!(
+            resolve_wallet_from(&cfg, Some("   ".to_string())).is_err(),
+            "blank is not a mnemonic"
+        );
+    }
+
+    /// `deploy/debian/heimdall.toml` offers `#mnemonic = ""` as the line to
+    /// uncomment, so an operator can easily end up with a blank one beside a
+    /// real key file. That must not read as "two wallet keys".
+    #[test]
+    fn an_empty_mnemonic_is_not_a_second_wallet_key() {
+        let key = PrivateKey::from(pallas_crypto::key::ed25519::SecretKey::from([7u8; 32]));
+        let mut cfg = cardano_cfg();
+        cfg.payment_skey_path = Some(skey_file(
+            "empty-mnemonic",
+            "PaymentSigningKeyShelley_ed25519",
+            &format!("5820{}", hex::encode([7u8; 32])),
+        ));
+        cfg.wallet_address = Some(wallet_address(&key, Network::Testnet));
+        cfg.mnemonic = Some(String::new());
+
+        let w = resolve_wallet_from(&cfg, None).expect("a blank mnemonic is no mnemonic");
+        assert_eq!(w.source, "cardano.payment_skey_path");
     }
 
     /// Bech32 is case-insensitive and pallas parses an uppercase address
@@ -616,7 +644,6 @@ mod tests {
     /// canonicalized so the cheap prefix tests elsewhere stay correct.
     #[test]
     fn an_uppercase_address_is_still_checked_and_is_stored_canonical() {
-        let _guard = NoAmbientMnemonic::take();
         let key = PrivateKey::from(pallas_crypto::key::ed25519::SecretKey::from([7u8; 32]));
         let lower = wallet_address(&key, Network::Testnet);
 
@@ -630,13 +657,13 @@ mod tests {
 
         // Accepted, but normalized — otherwise network_from_address says mainnet.
         cfg.network = Some("preprod".into());
-        let w = resolve_wallet(&cfg).expect("uppercase is a valid bech32 address");
+        let w = resolve_wallet_from(&cfg, None).expect("uppercase is a valid bech32 address");
         assert_eq!(w.address, lower, "stored canonical, not as pasted");
         assert!(crate::cardano::tx_common::is_testnet_address(&w.address));
 
         // And the network check is no longer silently skipped for it.
         cfg.network = Some("mainnet".into());
-        let err = resolve_wallet(&cfg).expect_err("uppercase testnet on a mainnet node");
+        let err = resolve_wallet_from(&cfg, None).expect_err("uppercase testnet on a mainnet node");
         assert!(err.contains("configured for mainnet"), "{err}");
     }
 
@@ -662,12 +689,11 @@ mod tests {
     /// one from payment.vkey alone, so this is an easy paste to get wrong.
     #[test]
     fn an_address_that_is_not_the_mnemonics_own_is_refused() {
-        let _guard = NoAmbientMnemonic::take();
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
         let mut cfg = cardano_cfg();
         cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
         cfg.wallet_address = Some(wallet_address(&key, Network::Testnet));
-        let err = resolve_wallet(&cfg).expect_err("enterprise != base");
+        let err = resolve_wallet_from(&cfg, None).expect_err("enterprise != base");
         assert!(
             err.contains("is not the address this mnemonic derives"),
             "{err}"
@@ -675,7 +701,10 @@ mod tests {
 
         cfg.wallet_address =
             Some(wallet_address_from_mnemonic(TEST_MNEMONIC, Network::Testnet).unwrap());
-        assert!(resolve_wallet(&cfg).is_ok(), "its own address is fine");
+        assert!(
+            resolve_wallet_from(&cfg, None).is_ok(),
+            "its own address is fine"
+        );
     }
 
     /// The skey path never derives an address, so it must not need a network
@@ -683,7 +712,6 @@ mod tests {
     /// that loads today and worked before this change.
     #[test]
     fn a_skey_needs_no_resolvable_network() {
-        let _guard = NoAmbientMnemonic::take();
         let key = PrivateKey::from(pallas_crypto::key::ed25519::SecretKey::from([7u8; 32]));
         let mut cfg = cardano_cfg();
         cfg.payment_skey_path = Some(skey_file(
@@ -698,7 +726,7 @@ mod tests {
             "the fixture must be unresolvable"
         );
         assert!(
-            resolve_wallet(&cfg).is_ok(),
+            resolve_wallet_from(&cfg, None).is_ok(),
             "and the skey path must not care"
         );
     }
@@ -707,29 +735,27 @@ mod tests {
     /// a constant, which is why mainnet could not work.
     #[test]
     fn the_network_tag_comes_from_the_config() {
-        let _guard = NoAmbientMnemonic::take();
         let mut cfg = cardano_cfg();
         cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
         cfg.blockfrost_project_id = Some("preprod_xxx".into());
         assert!(
-            resolve_wallet(&cfg)
+            resolve_wallet_from(&cfg, None)
                 .unwrap()
                 .address
                 .starts_with("addr_test1")
         );
 
         cfg.network = Some("mainnet".into());
-        let addr = resolve_wallet(&cfg).unwrap().address;
+        let addr = resolve_wallet_from(&cfg, None).unwrap().address;
         assert!(addr.starts_with("addr1"), "got {addr}");
     }
 
     /// A mnemonic-configured node is untouched by any of this.
     #[test]
     fn a_mnemonic_still_resolves_to_its_base_address() {
-        let _guard = NoAmbientMnemonic::take();
         let mut cfg = cardano_cfg();
         cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
-        let w = resolve_wallet(&cfg).expect("resolves");
+        let w = resolve_wallet_from(&cfg, None).expect("resolves");
         assert_eq!(w.source, "cardano.mnemonic");
         assert_eq!(
             w.address,

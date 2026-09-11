@@ -506,7 +506,7 @@ pub struct CardanoConfig {
     /// holding real funds.
     pub demo_virtual_epoch_slots: Option<u64>,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
-    /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
+    /// Requires `blockfrost_project_id` and a wallet key. Default: true.
     pub submit_oracle: bool,
     /// Validity window (seconds) for posted TM txs (`invalid_hereafter`/`created` = latest +
     /// window). `None` → 1800 (preprod/mainnet). MUST be small (e.g. 90) on a short-epoch
@@ -1192,6 +1192,35 @@ impl HeimdallConfig {
     }
 }
 
+/// Refuse a secret key file that group or other can read.
+///
+/// Shared by the bifrost identity key and the Cardano wallet key. Two copies
+/// of a security gate means a later tightening — following symlinks
+/// differently, checking the containing directory — lands on one key and not
+/// the other. Returns the offending mode so each caller can report it in its
+/// own error type.
+///
+/// Unix only: there is no portable equivalent, and refusing to load a key on
+/// a platform that cannot express the check would be worse than loading it.
+pub fn refuse_group_readable(path: &std::path::Path) -> Result<(), (String, u32)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let display = path.display().to_string();
+        let Ok(meta) = std::fs::metadata(path) else {
+            // Unreadable is the caller's error to report, with its own
+            // message: it knows which key this is.
+            return Ok(());
+        };
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err((display, mode));
+        }
+    }
+    let _ = path;
+    Ok(())
+}
+
 /// Load a bifrost identity keypair from a `0600` hex key file.
 ///
 /// On unix the file must not be group/other-accessible (any bit in `0o077`
@@ -1202,18 +1231,8 @@ pub fn load_bifrost_keypair_from(
     path: &std::path::Path,
 ) -> Result<bitcoin::secp256k1::Keypair, ConfigError> {
     let display = path.display().to_string();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path).map_err(|e| ConfigError::Io(display.clone(), e))?;
-        let mode = meta.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            return Err(ConfigError::KeyPermsTooOpen {
-                path: display,
-                mode,
-            });
-        }
-    }
+    refuse_group_readable(path)
+        .map_err(|(path, mode)| ConfigError::KeyPermsTooOpen { path, mode })?;
     let contents =
         std::fs::read_to_string(path).map_err(|e| ConfigError::Io(display.clone(), e))?;
     let bytes = hex::decode(contents.trim())
