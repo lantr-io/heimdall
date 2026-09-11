@@ -68,7 +68,7 @@ use crate::cardano::treasury_spend::{TreasurySpendError, find_treasury_state, tr
 use crate::cardano::tx_common::{
     BootstrapError, OneShotBootstrapParams, build_oneshot_bootstrap_tx, element_lovelace,
     network_from_address, select_collateral, select_fee, sign_built_tx as common_sign_built_tx,
-    whisky_network,
+    wallet_input_amount, whisky_network,
 };
 use crate::cardano::wallet::pub_key_hash_hex;
 
@@ -625,10 +625,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
                 tx_in: TxInParameter {
                     tx_hash: fee_utxo.tx_hash.clone(),
                     tx_index: fee_utxo.output_index,
-                    amount: Some(vec![Asset::new_from_str(
-                        "lovelace",
-                        &fee_utxo.lovelace.to_string(),
-                    )]),
+                    amount: Some(wallet_input_amount(fee_utxo)),
                     address: Some(req.wallet_address.to_string()),
                 },
             }),
@@ -640,10 +637,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
             tx_in: TxInParameter {
                 tx_hash: coll_utxo.tx_hash.clone(),
                 tx_index: coll_utxo.output_index,
-                amount: Some(vec![Asset::new_from_str(
-                    "lovelace",
-                    &coll_utxo.lovelace.to_string(),
-                )]),
+                amount: Some(wallet_input_amount(coll_utxo)),
                 address: Some(req.wallet_address.to_string()),
             },
         }],
@@ -844,10 +838,7 @@ pub fn build_ref_script_deploy_tx(
             tx_in: TxInParameter {
                 tx_hash: fee_utxo.tx_hash.clone(),
                 tx_index: fee_utxo.output_index,
-                amount: Some(vec![Asset::new_from_str(
-                    "lovelace",
-                    &fee_utxo.lovelace.to_string(),
-                )]),
+                amount: Some(wallet_input_amount(fee_utxo)),
                 address: Some(wallet_address.to_string()),
             },
         })],
@@ -1194,14 +1185,16 @@ mod tests {
                 tx_hash: "aa".repeat(32),
                 output_index: 0,
                 lovelace: 50_000_000,
-                pure_ada: true,
+                tokens: Default::default(),
+                has_ref_script: false,
             },
             // Distinct pure-ADA collateral — the fee input can't double as collateral.
             WalletUtxo {
                 tx_hash: "bb".repeat(32),
                 output_index: 1,
                 lovelace: 6_000_000,
-                pure_ada: true,
+                tokens: Default::default(),
+                has_ref_script: false,
             },
         ];
 
@@ -1461,14 +1454,16 @@ mod tests {
                 tx_hash: "aa".repeat(32),
                 output_index: 0,
                 lovelace: 50_000_000,
-                pure_ada: true,
+                tokens: Default::default(),
+                has_ref_script: false,
             },
             // Distinct pure-ADA collateral — the fee input can't double as collateral.
             WalletUtxo {
                 tx_hash: "bb".repeat(32),
                 output_index: 1,
                 lovelace: 6_000_000,
-                pure_ada: true,
+                tokens: Default::default(),
+                has_ref_script: false,
             },
         ];
         let sigs = test_sigs();
@@ -1585,7 +1580,8 @@ mod tests {
             tx_hash: "bb".repeat(32),
             output_index: 3,
             lovelace: 50_000_000,
-            pure_ada: true,
+            tokens: Default::default(),
+            has_ref_script: false,
         };
         // A distinct pure-ADA UTxO for collateral — collateral cannot reuse the
         // one-shot (a UTxO can't be both a spent input and collateral).
@@ -1593,7 +1589,8 @@ mod tests {
             tx_hash: "cc".repeat(32),
             output_index: 0,
             lovelace: 6_000_000,
-            pure_ada: true,
+            tokens: Default::default(),
+            has_ref_script: false,
         };
         let utxos = vec![one_shot, collateral_utxo];
 
@@ -1674,7 +1671,8 @@ mod tests {
             tx_hash: "cc".repeat(32),
             output_index: 0,
             lovelace: 50_000_000,
-            pure_ada: true,
+            tokens: Default::default(),
+            has_ref_script: false,
         }];
         let err = build_registry_bootstrap_tx(
             &registry,

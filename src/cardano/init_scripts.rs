@@ -239,7 +239,8 @@ mod tests {
             tx_hash: "a".repeat(64),
             output_index: 0,
             lovelace,
-            pure_ada: true,
+            tokens: Default::default(),
+            has_ref_script: false,
         }
     }
 

@@ -838,6 +838,22 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Split the wallet enough ada-only UTxOs to keep posting script
+    /// transactions: one to pay the fee, one to offer as collateral. Does
+    /// nothing when it already has them.
+    ///
+    /// A wallet whose ADA all sits behind native tokens cannot post a script tx
+    /// at all — collateral has to be ada-only here, because whisky cannot emit
+    /// the `collateral_return` that would let a token-bearing UTxO serve. This
+    /// tx runs no script, so it needs no collateral itself and can always be
+    /// built; the tokens ride through to the change output (WI-20260910-5DRP6).
+    EnsureCollateral {
+        #[arg(long)]
+        config: Option<String>,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
     /// Read + verify the on-chain SPO registry and print the DKG roster:
     /// reconstructs the spos_registry linked list, cross-checks the rebuilt
     /// identity-trie root against the treasury_info datum, and orders
@@ -1832,6 +1848,13 @@ fn main() {
                 submit,
             };
             if let Err(e) = run_fault_proof_mint(&cfg, &args) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::EnsureCollateral { config, submit } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_ensure_collateral(&cfg, submit) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -5050,6 +5073,76 @@ fn run_bootstrap_ban_list(
 }
 
 /// Build (and with `submit`, broadcast) the registry reference-script deploy.
+/// `heimdall ensure-collateral`: keep the wallet able to post script txs.
+///
+/// The check is "at least two ada-only UTxOs of >= 5 ADA", because a UTxO
+/// cannot be both the fee input and the collateral input. Falling below that is
+/// not a funding problem — the wallet can hold thousands of ADA and still be
+/// stuck, if every UTxO carries a native token. See WI-20260910-5DRP6.
+fn run_ensure_collateral(cfg: &HeimdallConfig, submit: bool) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::tx_common::{
+        COLLATERAL_LOVELACE, COLLATERAL_UTXOS_WANTED, build_collateral_top_up,
+        collateral_candidates,
+    };
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+
+    let total: u64 = wallet_utxos.iter().map(|u| u.lovelace).sum();
+    let with_tokens = wallet_utxos.iter().filter(|u| !u.tokens.is_empty()).count();
+    let candidates = collateral_candidates(&wallet_utxos).len();
+    println!("wallet:      {wallet_addr}");
+    println!(
+        "holds:       {total} lovelace across {} UTxO(s), {with_tokens} carrying native tokens",
+        wallet_utxos.len()
+    );
+    println!(
+        "collateral:  {candidates} ada-only UTxO(s) of >= {COLLATERAL_LOVELACE} lovelace \
+         (want {COLLATERAL_UTXOS_WANTED})"
+    );
+
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let built = build_collateral_top_up(&wallet_utxos, &wallet_addr, &key, &Some(cost_models))?;
+    let Some(built) = built else {
+        println!("nothing to do — the wallet can already pay a fee and post collateral.");
+        return Ok(());
+    };
+
+    println!(
+        "splitting:   {} new ada-only UTxO(s) of {COLLATERAL_LOVELACE} lovelace; the tokens go \
+         back to the change output",
+        built.created
+    );
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+    if !submit {
+        println!("(dry run — pass --submit to broadcast via Blockfrost)");
+        return Ok(());
+    }
+    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
+    println!("submitted: tx_hash={tx_hash}");
+    println!("a minute later, re-run this command: it should report nothing to do.");
+    Ok(())
+}
+
 fn run_deploy_registry_ref(
     cfg: &HeimdallConfig,
     blueprint_path: Option<&str>,

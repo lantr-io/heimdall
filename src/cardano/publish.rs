@@ -31,10 +31,11 @@ use pallas_codec::utils::{Bytes, NonEmptySet};
 use pallas_primitives::conway::{Tx, VKeyWitness};
 use pallas_traverse::ComputeHash;
 use pallas_wallet::PrivateKey;
+use std::collections::BTreeMap;
 use whisky::*;
 use whisky_pallas::WhiskyPallas;
 
-use crate::cardano::tx_common::whisky_network;
+use crate::cardano::tx_common::{wallet_input_amount, whisky_network};
 use crate::cardano::wallet::pub_key_hash_hex;
 use crate::epoch::state::{EpochError, EpochResult};
 
@@ -86,21 +87,21 @@ pub struct WalletUtxo {
     pub tx_hash: String,
     pub output_index: u32,
     pub lovelace: u64,
-    /// True when the UTxO holds only ADA (no native tokens) AND carries no
-    /// reference script. Three separate reasons to demand it, only one of them
-    /// the ledger's:
+    /// Every native token on this UTxO: whisky unit
+    /// (`<policy_id><asset_name_hex>`) -> quantity, exactly as Blockfrost
+    /// reports it. Empty for an ada-only UTxO.
     ///
-    /// - As a FEE input: whisky declares inputs lovelace-only, so any native
-    ///   token on a spent input is dropped from the value balance and the tx
-    ///   does not balance. A builder limitation, and a hard one.
-    /// - As COLLATERAL: the ledger's ada-only rule is on the collateral
-    ///   balance, not the inputs, so tokens are fine when the tx carries a
-    ///   `collateral_return`. We cannot emit one (see `select_collateral`), so
-    ///   here too it degenerates to pure-ADA.
-    /// - Either way: spending a ref-script UTxO incurs the Conway per-byte
-    ///   ref-script fee that generic fee estimation doesn't account for
-    ///   (`FeeTooSmallUTxO`), and consumes a deployed reference script.
-    pub pure_ada: bool,
+    /// These are DECLARED on the input (see `wallet_input_amount`) so whisky
+    /// balances them into the change output. Dropping them here — which is
+    /// what this type used to do — is what made a token-bearing UTxO unusable
+    /// for anything: its tokens vanished from the value balance and the tx
+    /// could not balance.
+    pub tokens: BTreeMap<String, String>,
+    /// The UTxO carries a reference script. Coin selection skips these whatever
+    /// else they hold: spending one incurs the Conway per-byte ref-script fee
+    /// that generic fee estimation cannot see (`FeeTooSmallUTxO`), and consumes
+    /// a deployed reference script.
+    pub has_ref_script: bool,
 }
 
 impl WalletUtxo {
@@ -115,14 +116,33 @@ impl WalletUtxo {
             .find(|a| a.unit == "lovelace")
             .map(|a| a.quantity.parse().unwrap_or(0))
             .unwrap_or(0);
-        let pure_ada =
-            u.amount.iter().all(|a| a.unit == "lovelace") && u.reference_script_hash.is_none();
+        let tokens = u
+            .amount
+            .iter()
+            .filter(|a| a.unit != "lovelace")
+            .map(|a| (a.unit.clone(), a.quantity.clone()))
+            .collect();
         WalletUtxo {
             tx_hash: u.tx_hash.clone(),
             output_index: u.output_index,
             lovelace,
-            pure_ada,
+            tokens,
+            has_ref_script: u.reference_script_hash.is_some(),
         }
+    }
+
+    /// Ada-only and free of a reference script — what COLLATERAL still has to
+    /// be here.
+    ///
+    /// Not the ledger's rule. Since Babbage (CIP-40) the ada-only test applies
+    /// to the collateral BALANCE (`sum(collateral inputs) - collateral_return`),
+    /// so a token-bearing UTxO is legal collateral whenever the tx hands the
+    /// tokens back in a `collateral_return`. whisky's pallas backend cannot
+    /// emit that field, so we need one ada-only UTxO to point at — which is
+    /// what `ensure-collateral` exists to guarantee (WI-20260910-5DRP6).
+    #[must_use]
+    pub fn pure_ada(&self) -> bool {
+        self.tokens.is_empty() && !self.has_ref_script
     }
 }
 
@@ -271,11 +291,11 @@ pub fn build_oracle_update_tx(
         .max_by_key(|u| u.lovelace)
         .ok_or_else(|| EpochError::Chain("no wallet UTxOs for fee payment".into()))?;
 
-    // Collateral: required for Plutus minting. Must be PURE ADA (a token-bearing UTxO triggers
-    // CollateralContainsNonADA) with >= 5 ADA. Can be the same as the fee input.
+    // Collateral: required for Plutus minting, and ada-only because whisky cannot emit the
+    // `collateral_return` that would let it carry tokens. Can be the same as the fee input.
     let coll_utxo = wallet_utxos
         .iter()
-        .find(|u| u.lovelace >= 5_000_000 && u.pure_ada)
+        .find(|u| u.lovelace >= crate::cardano::tx_common::COLLATERAL_LOVELACE && u.pure_ada())
         .ok_or_else(|| {
             EpochError::Chain("no pure-ADA wallet UTxO with >= 5 ADA for collateral".into())
         })?;
@@ -291,10 +311,7 @@ pub fn build_oracle_update_tx(
             tx_in: TxInParameter {
                 tx_hash: fee_utxo.tx_hash.clone(),
                 tx_index: fee_utxo.output_index,
-                amount: Some(vec![Asset::new_from_str(
-                    "lovelace",
-                    &fee_utxo.lovelace.to_string(),
-                )]),
+                amount: Some(wallet_input_amount(fee_utxo)),
                 address: Some(wallet_address.to_string()),
             },
         })],
@@ -311,10 +328,7 @@ pub fn build_oracle_update_tx(
             tx_in: TxInParameter {
                 tx_hash: coll_utxo.tx_hash.clone(),
                 tx_index: coll_utxo.output_index,
-                amount: Some(vec![Asset::new_from_str(
-                    "lovelace",
-                    &coll_utxo.lovelace.to_string(),
-                )]),
+                amount: Some(wallet_input_amount(coll_utxo)),
                 address: Some(wallet_address.to_string()),
             },
         }],

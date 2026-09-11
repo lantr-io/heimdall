@@ -496,6 +496,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             (8, "federation identity"),
             (9, "post a movement"),
             (10, "local tries"),
+            (11, "wallet collateral"),
         ] {
             b.push(n, title, Status::Skipped, "needs a Cardano provider");
         }
@@ -1158,6 +1159,59 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         }
     }
 
+    // 11. The wallet can still post a script transaction.
+    //
+    // Two ada-only UTxOs, because a UTxO cannot be both the fee input and the
+    // collateral input. This is NOT a balance check and a rich wallet fails it
+    // routinely: collateral has to be ada-only (whisky cannot emit the
+    // `collateral_return` that would let a token-bearing UTxO serve), so an
+    // operator holding thousands of ADA behind a native token has nothing to
+    // offer. spo4 met exactly that at midnight, with no prior warning — its ADA
+    // was all behind legacy fSAT. `ensure-collateral` splits the wallet out of
+    // it, and needs no collateral itself to do so (WI-20260910-5DRP6).
+    match wallet_collateral_utxos(cfg, &base_url, &project_id).await {
+        Err(e) => b.push(
+            11,
+            "wallet collateral",
+            Status::Warn,
+            format!("could not read the wallet's UTxOs to count collateral ({e})"),
+        ),
+        Ok(utxos) => {
+            let candidates = crate::cardano::tx_common::collateral_candidates(&utxos).len();
+            let with_tokens = utxos.iter().filter(|u| !u.tokens.is_empty()).count();
+            if candidates >= crate::cardano::tx_common::COLLATERAL_UTXOS_WANTED {
+                b.push(
+                    11,
+                    "wallet collateral",
+                    Status::Pass,
+                    format!(
+                        "{candidates} ada-only UTxO(s) of >= {} lovelace across {} UTxO(s)",
+                        crate::cardano::tx_common::COLLATERAL_LOVELACE,
+                        utxos.len()
+                    ),
+                );
+            } else {
+                b.push_fix(
+                    11,
+                    "wallet collateral",
+                    Status::Warn,
+                    format!(
+                        "only {candidates} ada-only UTxO(s) of >= {} lovelace ({} of {} UTxOs \
+                         carry native tokens) — a script tx needs one to pay the fee and a \
+                         DISTINCT one for collateral",
+                        crate::cardano::tx_common::COLLATERAL_LOVELACE,
+                        with_tokens,
+                        utxos.len()
+                    ),
+                    "Run `heimdall ensure-collateral --submit`: it splits ada-only UTxOs off \
+                     whatever the wallet holds, tokens included, and runs no script so it needs \
+                     no collateral itself. Until then Update-Y, registration and ban posts fail \
+                     to build — the node keeps signing, so nothing else looks wrong.",
+                );
+            }
+        }
+    }
+
     Report { steps: b.steps }
 }
 
@@ -1168,6 +1222,32 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
 /// performs the same one to build its transaction (WI-056): a step that reports the
 /// reference script healthy must be looking at the UTxO the transaction will
 /// actually reference.
+/// The wallet's UTxOs, for the collateral count in step 11. Read-only, and the
+/// same derivation the builders use — a step reporting on collateral must be
+/// looking at the wallet the transaction will actually spend from.
+async fn wallet_collateral_utxos(
+    cfg: &HeimdallConfig,
+    base_url: &str,
+    project_id: &str,
+) -> Result<Vec<crate::cardano::publish::WalletUtxo>, String> {
+    let Some(src) = mnemonic_source(cfg) else {
+        return Err("no wallet mnemonic".into());
+    };
+    let mnemonic = match src {
+        "cardano.mnemonic" => cfg.cardano.mnemonic.clone().unwrap_or_default(),
+        _ => std::env::var("HEIMDALL_MNEMONIC").unwrap_or_default(),
+    };
+    let addr = crate::cardano::wallet::wallet_address_from_mnemonic(&mnemonic)
+        .map_err(|e| format!("derive wallet address: {e}"))?;
+    let raw = bf_http::fetch_address_utxos(base_url, project_id, &addr)
+        .await
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    Ok(raw
+        .iter()
+        .map(crate::cardano::publish::WalletUtxo::from_bf)
+        .collect())
+}
+
 async fn wallet_ref_script(
     cfg: &HeimdallConfig,
     base_url: &str,
@@ -1390,10 +1470,10 @@ mod tests {
         );
         let report = preflight(&cfg).await;
         let numbers: Vec<u8> = report.steps.iter().map(|s| s.n).collect();
-        assert_eq!(numbers, (1..=10).collect::<Vec<u8>>(), "{numbers:?}");
+        assert_eq!(numbers, (1..=11).collect::<Vec<u8>>(), "{numbers:?}");
         // Every rendered line's step number is within the total it prints.
         let total = report.steps.len();
-        assert_eq!(total, 10);
+        assert_eq!(total, 11);
         for s in &report.steps {
             assert!(usize::from(s.n) <= total, "step {} of {total}", s.n);
         }

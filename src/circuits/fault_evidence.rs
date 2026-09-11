@@ -1066,13 +1066,15 @@ mod tests {
                 tx_hash: "aa".repeat(32),
                 output_index: 0,
                 lovelace: 50_000_000,
-                pure_ada: true,
+                tokens: Default::default(),
+                has_ref_script: false,
             },
             WalletUtxo {
                 tx_hash: "bb".repeat(32),
                 output_index: 1,
                 lovelace: 6_000_000,
-                pure_ada: true,
+                tokens: Default::default(),
+                has_ref_script: false,
             },
         ]
     }

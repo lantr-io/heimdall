@@ -43,7 +43,7 @@ use whisky_pallas::WhiskyPallas;
 
 use crate::cardano::hash::{blake2b_224, blake2b_256, pool_id_bech32};
 use crate::cardano::publish::WalletUtxo;
-use crate::cardano::tx_common::{sign_built_tx, whisky_network};
+use crate::cardano::tx_common::{sign_built_tx, wallet_input_amount, whisky_network};
 use crate::cardano::wallet::pub_key_hash_hex;
 
 /// A 32-byte ed25519 seed → a `Normal` (non-HD) signing key, usable both as a
@@ -171,11 +171,11 @@ impl std::fmt::Display for RegisterPoolError {
 
 impl std::error::Error for RegisterPoolError {}
 
-/// Select pure-ADA wallet UTxOs (richest first) until they cover `needed`
-/// lovelace. Token-/ref-script-bearing UTxOs are skipped (inputs are declared
-/// lovelace-only).
+/// Select wallet UTxOs (richest first) until they cover `needed` lovelace.
+/// Native tokens ride along into the change output; only reference-script
+/// UTxOs are skipped, for the unpriced Conway per-byte fee.
 fn select_inputs(wallet_utxos: &[WalletUtxo], needed: u64) -> Result<Vec<&WalletUtxo>, String> {
-    let mut pure: Vec<&WalletUtxo> = wallet_utxos.iter().filter(|u| u.pure_ada).collect();
+    let mut pure: Vec<&WalletUtxo> = wallet_utxos.iter().filter(|u| !u.has_ref_script).collect();
     pure.sort_by_key(|u| std::cmp::Reverse(u.lovelace));
     let mut picked = Vec::new();
     let mut sum = 0u64;
@@ -248,10 +248,7 @@ pub fn build_register_pool_tx(
                     tx_in: TxInParameter {
                         tx_hash: u.tx_hash.clone(),
                         tx_index: u.output_index,
-                        amount: Some(vec![Asset::new_from_str(
-                            "lovelace",
-                            &u.lovelace.to_string(),
-                        )]),
+                        amount: Some(wallet_input_amount(u)),
                         address: Some(req.wallet_address.to_string()),
                     },
                 })
@@ -322,7 +319,8 @@ mod tests {
             tx_hash: tx.to_string(),
             output_index: ix,
             lovelace,
-            pure_ada: true,
+            tokens: Default::default(),
+            has_ref_script: false,
         }
     }
 
