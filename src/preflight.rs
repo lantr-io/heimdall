@@ -1101,7 +1101,8 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     "local tries",
                     Status::Warn,
                     format!(
-                        "could not read the bridge-state singleton to compare against ({e}) —                          the node will make the same check at its first movement"
+                        "could not read the bridge-state singleton to compare against ({e}) \
+                         — the node will make the same check at its first movement"
                     ),
                 ),
                 Ok(chain) => {
@@ -1215,13 +1216,6 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     Report { steps: b.steps }
 }
 
-/// Look for the registry reference script at the operator's own wallet address —
-/// `deploy-registry-ref` key-locks it there so it stays reclaimable.
-///
-/// The lookup itself lives in [`crate::cardano::ref_script`] because `register-spo`
-/// performs the same one to build its transaction (WI-056): a step that reports the
-/// reference script healthy must be looking at the UTxO the transaction will
-/// actually reference.
 /// The wallet's UTxOs, for the collateral count in step 11. Read-only, and the
 /// same derivation the builders use — a step reporting on collateral must be
 /// looking at the wallet the transaction will actually spend from.
@@ -1230,15 +1224,7 @@ async fn wallet_collateral_utxos(
     base_url: &str,
     project_id: &str,
 ) -> Result<Vec<crate::cardano::publish::WalletUtxo>, String> {
-    let Some(src) = mnemonic_source(cfg) else {
-        return Err("no wallet mnemonic".into());
-    };
-    let mnemonic = match src {
-        "cardano.mnemonic" => cfg.cardano.mnemonic.clone().unwrap_or_default(),
-        _ => std::env::var("HEIMDALL_MNEMONIC").unwrap_or_default(),
-    };
-    let addr = crate::cardano::wallet::wallet_address_from_mnemonic(&mnemonic)
-        .map_err(|e| format!("derive wallet address: {e}"))?;
+    let addr = wallet_address(cfg)?;
     let raw = bf_http::fetch_address_utxos(base_url, project_id, &addr)
         .await
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
@@ -1248,21 +1234,36 @@ async fn wallet_collateral_utxos(
         .collect())
 }
 
+/// The operator's wallet address, from whichever source the config names.
+/// Steps 4 and 11 both report on this wallet and must not be able to disagree
+/// about which one it is.
+fn wallet_address(cfg: &HeimdallConfig) -> Result<String, String> {
+    let Some(src) = mnemonic_source(cfg) else {
+        return Err("no wallet mnemonic".into());
+    };
+    let mnemonic = match src {
+        "cardano.mnemonic" => cfg.cardano.mnemonic.clone().unwrap_or_default(),
+        _ => std::env::var("HEIMDALL_MNEMONIC").unwrap_or_default(),
+    };
+    crate::cardano::wallet::wallet_address_from_mnemonic(&mnemonic)
+        .map_err(|e| format!("derive wallet address: {e}"))
+}
+
+/// Look for the registry reference script at the operator's own wallet address —
+/// `deploy-registry-ref` key-locks it there so it stays reclaimable.
+///
+/// The lookup itself lives in [`crate::cardano::ref_script`] because `register-spo`
+/// performs the same one to build its transaction (WI-056): a step that reports the
+/// reference script healthy must be looking at the UTxO the transaction will
+/// actually reference.
 async fn wallet_ref_script(
     cfg: &HeimdallConfig,
     base_url: &str,
     project_id: &str,
     script_hash: &str,
 ) -> Result<Option<RefScriptUtxo>, String> {
-    let Some(src) = mnemonic_source(cfg) else {
-        return Err("no wallet mnemonic — cannot locate the reference script".into());
-    };
-    let mnemonic = match src {
-        "cardano.mnemonic" => cfg.cardano.mnemonic.clone().unwrap_or_default(),
-        _ => std::env::var("HEIMDALL_MNEMONIC").unwrap_or_default(),
-    };
-    let addr = crate::cardano::wallet::wallet_address_from_mnemonic(&mnemonic)
-        .map_err(|e| format!("derive wallet address: {e}"))?;
+    let addr =
+        wallet_address(cfg).map_err(|e| format!("{e} — cannot locate the reference script"))?;
     crate::cardano::ref_script::wallet_ref_script(base_url, project_id, &addr, script_hash).await
 }
 

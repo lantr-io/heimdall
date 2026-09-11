@@ -285,11 +285,20 @@ pub fn build_oracle_update_tx(
     );
     let asset_unit = format!("{treasury_policy_id}{treasury_asset_name_hex}");
 
-    // Pick the richest wallet UTxO as the fee-paying input.
-    let fee_utxo = wallet_utxos
-        .iter()
-        .max_by_key(|u| u.lovelace)
-        .ok_or_else(|| EpochError::Chain("no wallet UTxOs for fee payment".into()))?;
+    // Min-UTxO scales with output size — the inline datum carries the whole signed BTC tx, so a
+    // flat 2 ADA is too small (BabbageOutputTooSmallUTxO). Approximate Conway min-UTxO
+    // (coinsPerUTxOByte = 4310) generously from the datum size, with a 2-ADA floor.
+    let datum_bytes = (datum_hex.len() / 2) as u64;
+    let oracle_lovelace = std::cmp::max(2_000_000u64, (datum_bytes + 600) * 4310);
+
+    // Fee input via the shared rule. It was open-coded here as "richest UTxO", which was
+    // survivable only while the provider pre-filtered the wallet to ada-only: that filter also
+    // excluded reference-script UTxOs. It no longer does, and the registry ref script is parked
+    // at THIS wallet holding ~55 ADA, so the richest UTxO is often exactly the one that must
+    // never be spent — it would be consumed and the tx rejected for the unpriced Conway
+    // per-byte ref-script fee.
+    let fee_utxo = crate::cardano::tx_common::select_fee(wallet_utxos, oracle_lovelace + 1_000_000)
+        .map_err(EpochError::Chain)?;
 
     // Collateral: required for Plutus minting, and ada-only because whisky cannot emit the
     // `collateral_return` that would let it carry tokens. Can be the same as the fee input.
@@ -297,14 +306,12 @@ pub fn build_oracle_update_tx(
         .iter()
         .find(|u| u.lovelace >= crate::cardano::tx_common::COLLATERAL_LOVELACE && u.pure_ada())
         .ok_or_else(|| {
-            EpochError::Chain("no pure-ADA wallet UTxO with >= 5 ADA for collateral".into())
+            EpochError::Chain(
+                "no ada-only wallet UTxO with >= 5 ADA for collateral — run \
+                 `heimdall ensure-collateral`"
+                    .into(),
+            )
         })?;
-
-    // Min-UTxO scales with output size — the inline datum carries the whole signed BTC tx, so a
-    // flat 2 ADA is too small (BabbageOutputTooSmallUTxO). Approximate Conway min-UTxO
-    // (coinsPerUTxOByte = 4310) generously from the datum size, with a 2-ADA floor.
-    let datum_bytes = (datum_hex.len() / 2) as u64;
-    let oracle_lovelace = std::cmp::max(2_000_000u64, (datum_bytes + 600) * 4310);
 
     let body = TxBuilderBody {
         inputs: vec![TxIn::PubKeyTxIn(PubKeyTxIn {

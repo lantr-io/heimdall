@@ -181,10 +181,11 @@ pub fn build_treasury_bootstrap_tx(
                 one_shot.0, one_shot.1
             ))
         })?;
-    if !fee_utxo.pure_ada() {
+    if !fee_utxo.tokens.is_empty() {
         return Err(EpochError::Chain(format!(
-            "the treasury one-shot outpoint {}:{} carries native tokens; this builder emits an \
-             ADA-only change output, so the tx would fail value conservation",
+            "the treasury one-shot outpoint {}:{} carries native tokens; this is a once-per-bridge \
+             ceremony against an outpoint the Config dictates, so it refuses a one-shot whose \
+             value holds anything but ADA rather than balancing tokens through the change",
             one_shot.0, one_shot.1
         )));
     }
@@ -207,7 +208,11 @@ pub fn build_treasury_bootstrap_tx(
         .iter()
         .find(|u| u.lovelace >= crate::cardano::tx_common::COLLATERAL_LOVELACE && u.pure_ada())
         .ok_or_else(|| {
-            EpochError::Chain("no pure-ADA wallet UTxO with >= 5 ADA for collateral".into())
+            EpochError::Chain(
+                "no ada-only wallet UTxO with >= 5 ADA for collateral — run \
+                 `heimdall ensure-collateral`"
+                    .into(),
+            )
         })?;
 
     // Min-UTxO: the datum is small (~150 bytes) but the locked value persists

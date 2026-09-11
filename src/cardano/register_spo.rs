@@ -407,16 +407,16 @@ fn tx_id_bytes(tx_hash: &str) -> Result<[u8; 32], RegisterSpoError> {
         .ok_or_else(|| RegisterSpoError::Build(format!("bad tx hash: {tx_hash}")))
 }
 
-/// Pick the fee input (richest clean wallet UTxO) and a pure-ADA collateral.
-/// Both picks skip token-bearing and reference-script UTxOs (`pure_ada`) — a
-/// ref-script spend incurs the Conway per-byte fee the builder doesn't price.
+/// Pick the fee input and an ada-only collateral, both via the shared rules.
+/// They differ: the fee input may carry native tokens (declared on the input,
+/// returned in the change), collateral may not. Neither may carry a reference
+/// script — that spend incurs the Conway per-byte fee the builder doesn't price.
 fn select_fee_and_collateral(
     wallet_utxos: &[WalletUtxo],
     min_fee_lovelace: u64,
 ) -> Result<(&WalletUtxo, &WalletUtxo), RegisterSpoError> {
     let fee_utxo = select_fee(wallet_utxos, min_fee_lovelace).map_err(RegisterSpoError::Wallet)?;
-    // Collateral must be pure-ADA and DISTINCT from the fee input — a UTxO cannot
-    // be both a spent input and collateral.
+    // Collateral must be ada-only and DISTINCT from the fee input.
     let coll_utxo =
         select_collateral(wallet_utxos, &[fee_utxo]).map_err(RegisterSpoError::Wallet)?;
     Ok((fee_utxo, coll_utxo))

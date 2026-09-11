@@ -376,30 +376,10 @@ fn select_fee_and_collateral(
     wallet_utxos: &[WalletUtxo],
     min_fee_lovelace: u64,
 ) -> Result<(&WalletUtxo, &WalletUtxo), FaultProofMintError> {
-    let fee_utxo = wallet_utxos
-        .iter()
-        .filter(|u| !u.has_ref_script)
-        .max_by_key(|u| u.lovelace)
-        .ok_or_else(|| FaultProofMintError::Wallet("no clean wallet UTxOs for fees".into()))?;
-    if fee_utxo.lovelace < min_fee_lovelace {
-        return Err(FaultProofMintError::Wallet(format!(
-            "largest wallet UTxO ({} lovelace) cannot cover the proof output plus fees",
-            fee_utxo.lovelace
-        )));
-    }
-    let coll_utxo = wallet_utxos
-        .iter()
-        .find(|u| {
-            u.lovelace >= crate::cardano::tx_common::COLLATERAL_LOVELACE
-                && u.pure_ada()
-                && !(u.tx_hash == fee_utxo.tx_hash && u.output_index == fee_utxo.output_index)
-        })
-        .ok_or_else(|| {
-            FaultProofMintError::Wallet(
-                "no pure-ADA wallet UTxO with >= 5 ADA for collateral, distinct from the fee input"
-                    .into(),
-            )
-        })?;
+    let fee_utxo = crate::cardano::tx_common::select_fee(wallet_utxos, min_fee_lovelace)
+        .map_err(FaultProofMintError::Wallet)?;
+    let coll_utxo = crate::cardano::tx_common::select_collateral(wallet_utxos, &[fee_utxo])
+        .map_err(FaultProofMintError::Wallet)?;
     Ok((fee_utxo, coll_utxo))
 }
 

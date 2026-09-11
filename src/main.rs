@@ -5072,7 +5072,6 @@ fn run_bootstrap_ban_list(
     finish_tx(cfg, pid, &rt, submit, &built.signed_tx_hex)
 }
 
-/// Build (and with `submit`, broadcast) the registry reference-script deploy.
 /// `heimdall ensure-collateral`: keep the wallet able to post script txs.
 ///
 /// The check is "at least two ada-only UTxOs of >= 5 ADA", because a UTxO
@@ -5133,16 +5132,14 @@ fn run_ensure_collateral(cfg: &HeimdallConfig, submit: bool) -> Result<(), Strin
         built.created
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
-    if !submit {
-        println!("(dry run — pass --submit to broadcast via Blockfrost)");
-        return Ok(());
+    finish_tx(cfg, pid, &rt, submit, &built.signed_tx_hex)?;
+    if submit {
+        println!("a minute later, re-run this command: it should report nothing to do.");
     }
-    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
-    println!("submitted: tx_hash={tx_hash}");
-    println!("a minute later, re-run this command: it should report nothing to do.");
     Ok(())
 }
 
+/// Build (and with `submit`, broadcast) the registry reference-script deploy.
 fn run_deploy_registry_ref(
     cfg: &HeimdallConfig,
     blueprint_path: Option<&str>,

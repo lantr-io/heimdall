@@ -32,6 +32,25 @@ pub const COLLATERAL_LOVELACE: u64 = 5_000_000;
 /// let a single UTxO be both.
 pub const COLLATERAL_UTXOS_WANTED: usize = 2;
 
+/// Lovelace to hold back for the change output when an input carries native
+/// tokens. The change inherits them, and Conway prices an output by its
+/// serialized size, so a multi-asset change output's min-UTxO is well above a
+/// bare one's ~0.86 ADA — each distinct asset adds a policy id, an asset name
+/// and map overhead. Budgeted loosely on purpose: over-reserving costs an
+/// operator nothing, under-reserving costs a rejected transaction whose only
+/// message is whisky's "inputs less than outputs + fee".
+///
+/// Zero for an ada-only input, so every ada-only path keeps the margins it was
+/// tuned with.
+#[must_use]
+pub fn token_change_floor(tokens: usize) -> u64 {
+    if tokens == 0 {
+        0
+    } else {
+        1_000_000 + 500_000 * tokens as u64
+    }
+}
+
 /// The wallet's usable collateral candidates: ada-only, no reference script,
 /// and fat enough to post.
 pub fn collateral_candidates(wallet_utxos: &[WalletUtxo]) -> Vec<&WalletUtxo> {
@@ -47,8 +66,6 @@ pub struct CollateralTopUp {
     pub signed_tx_hex: String,
     /// Ada-only outputs the tx creates, each of [`COLLATERAL_LOVELACE`].
     pub created: usize,
-    /// Collateral candidates the wallet had before it.
-    pub had: usize,
 }
 
 /// Build a self-payment that splits the wallet enough ada-only UTxOs to keep
@@ -61,47 +78,77 @@ pub struct CollateralTopUp {
 /// collateral at all — only a fee input, and since a fee input may now carry
 /// tokens, it can always be built. The tokens ride through to the change
 /// output; what comes back is clean ADA.
+///
+/// Spends the wallet's OTHER UTxOs in preference to its existing collateral
+/// candidates, and mints only the shortfall. Consuming a candidate to re-create
+/// it would be pure loss, and demanding the full set from a wallet that is one
+/// short turns a workable top-up into "fund the wallet".
 pub fn build_collateral_top_up(
     wallet_utxos: &[WalletUtxo],
     wallet_address: &str,
     key: &PrivateKey,
     cost_models: &Option<Vec<Vec<i64>>>,
 ) -> Result<Option<CollateralTopUp>, String> {
-    let had = collateral_candidates(wallet_utxos).len();
+    let candidates = collateral_candidates(wallet_utxos);
+    let had = candidates.len();
     if had >= COLLATERAL_UTXOS_WANTED {
         return Ok(None);
     }
+    let is_candidate = |u: &WalletUtxo| {
+        candidates
+            .iter()
+            .any(|c| c.tx_hash == u.tx_hash && c.output_index == u.output_index)
+    };
 
-    // Always mint the full set rather than only the shortfall: an existing
-    // candidate may well be the richest UTxO and get spent as the fee input,
-    // and re-creating one we did not have to is harmless.
-    let created = COLLATERAL_UTXOS_WANTED;
-    let split = created as u64 * COLLATERAL_LOVELACE;
+    // Two passes. The first leaves the existing candidates alone and mints only
+    // what is missing; it is what almost every wallet needs. The second is for
+    // a wallet whose funds ARE its candidates, where preserving them is not an
+    // option and the whole set has to be re-cut.
+    let mut plan = None;
+    for spend_candidates in [false, true] {
+        let created = if spend_candidates {
+            COLLATERAL_UTXOS_WANTED
+        } else {
+            COLLATERAL_UTXOS_WANTED - had
+        };
+        let mut pool: Vec<&WalletUtxo> = wallet_utxos
+            .iter()
+            .filter(|u| !u.has_ref_script && (spend_candidates || !is_candidate(u)))
+            .collect();
+        pool.sort_by_key(|u| std::cmp::Reverse(u.lovelace));
 
-    // The change output inherits every token the inputs carry, and a
-    // token-bearing output's min-UTxO is higher than a bare one's. Leave it
-    // room rather than discovering the floor from a rejected tx.
-    let change_floor = element_lovelace(0);
-    let needed = split + change_floor + 1_000_000;
-
-    let mut picked: Vec<&WalletUtxo> = Vec::new();
-    let mut sum = 0u64;
-    let mut by_value: Vec<&WalletUtxo> =
-        wallet_utxos.iter().filter(|u| !u.has_ref_script).collect();
-    by_value.sort_by_key(|u| std::cmp::Reverse(u.lovelace));
-    for u in by_value {
-        if sum >= needed {
+        let mut picked: Vec<&WalletUtxo> = Vec::new();
+        let mut sum = 0u64;
+        let mut kinds: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let split = created as u64 * COLLATERAL_LOVELACE;
+        for u in pool {
+            let needed = split + 1_000_000 + token_change_floor(kinds.len());
+            if sum >= needed {
+                break;
+            }
+            sum = sum.saturating_add(u.lovelace);
+            kinds.extend(u.tokens.keys().map(String::as_str));
+            picked.push(u);
+        }
+        if sum >= split + 1_000_000 + token_change_floor(kinds.len()) {
+            plan = Some((created, picked));
             break;
         }
-        sum = sum.saturating_add(u.lovelace);
-        picked.push(u);
     }
-    if sum < needed {
+
+    let Some((created, picked)) = plan else {
+        let total: u64 = wallet_utxos
+            .iter()
+            .filter(|u| !u.has_ref_script)
+            .map(|u| u.lovelace)
+            .sum();
         return Err(format!(
-            "wallet holds {sum} lovelace across {} spendable UTxO(s) — not enough to split              {created} collateral UTxOs of {COLLATERAL_LOVELACE} plus fees (needs >= {needed}).              Fund the wallet",
-            picked.len()
+            "wallet holds {total} lovelace in spendable UTxOs — not enough to split \
+             {} ada-only UTxO(s) of {COLLATERAL_LOVELACE} plus fees and the change output's \
+             min-UTxO. Fund the wallet",
+            COLLATERAL_UTXOS_WANTED - had
         ));
-    }
+    };
 
     let body = TxBuilderBody {
         inputs: picked
@@ -160,7 +207,6 @@ pub fn build_collateral_top_up(
     Ok(Some(CollateralTopUp {
         signed_tx_hex,
         created,
-        had,
     }))
 }
 
@@ -240,11 +286,17 @@ pub fn select_fee(
         .filter(|u| !u.has_ref_script)
         .max_by_key(|u| u.lovelace)
         .ok_or_else(|| "no wallet UTxO available for the fee input".to_string())?;
-    if fee.lovelace < min_fee_lovelace {
+    // A token-bearing fee input means the change output carries those tokens,
+    // and its min-UTxO is higher than the bare one every caller's margin was
+    // sized against. Charge for it here, once, rather than in six call sites.
+    let needed = min_fee_lovelace.saturating_add(token_change_floor(fee.tokens.len()));
+    if fee.lovelace < needed {
         return Err(format!(
-            "largest wallet UTxO ({} lovelace) cannot cover the outputs plus fees \
-             (needs >= {min_fee_lovelace}) — fund the wallet or consolidate UTxOs",
-            fee.lovelace
+            "largest wallet UTxO ({} lovelace, {} token kind(s)) cannot cover the outputs, \
+             fees and the change output's min-UTxO (needs >= {needed}) — fund the wallet or \
+             consolidate UTxOs",
+            fee.lovelace,
+            fee.tokens.len()
         ));
     }
     Ok(fee)
@@ -297,8 +349,8 @@ pub fn select_collateral<'a>(
                     .any(|s| s.tx_hash == u.tx_hash && s.output_index == u.output_index)
         })
         .ok_or_else(|| {
-            "no pure-ADA wallet UTxO with >= 5 ADA for collateral, distinct from the \
-             spending inputs"
+            "no ada-only wallet UTxO with >= 5 ADA for collateral, distinct from the \
+             spending inputs — run `heimdall ensure-collateral`"
                 .to_string()
         })
 }
@@ -404,17 +456,25 @@ pub fn build_oneshot_bootstrap_tx(
         })?;
     // The one-shot cannot be swapped (it parameterizes the policy). It MAY carry
     // a reference script — that case is handled by `one_shot_ref_script_size`,
-    // which prices the Conway ref-script fee in below; a supplied size is the
-    // caller's signal that a non-pure-ADA one-shot is the intended ref-script
-    // case. It must NOT carry native tokens, though: the builder declares inputs
-    // lovelace-only, so tokens would be dropped from the value balance. `pure_ada`
-    // can't tell tokens from a ref script, so reject only when it is non-pure-ADA
-    // AND no ref-script size was supplied (i.e. effectively token-bearing).
-    if !one_shot.pure_ada() && p.one_shot_ref_script_size.is_none() {
+    // which prices the Conway ref-script fee in below.
+    //
+    // Tokens on it are refused, but no longer because they would be dropped:
+    // the input declares its full value a few lines down and whisky balances
+    // them into the change. This is a ceremony path that runs once per bridge
+    // against an outpoint the protocol dictates, so it stays narrow on purpose
+    // — there is no coin selection here to be flexible about, and a surprise in
+    // the value of the one-shot is worth stopping for.
+    if !one_shot.tokens.is_empty() {
         return Err(BootstrapError::Wallet(format!(
-            "{} bootstrap outref {}#{} is not a pure-ADA UTxO and no reference-script size was \
-             supplied — the one-shot must hold only ADA, else its native tokens are dropped from \
-             the value balance",
+            "{} bootstrap outref {}#{} carries native tokens — the one-shot for a bridge \
+             bootstrap must hold only ADA",
+            p.outref_label, p.bootstrap_tx_hash, p.bootstrap_output_index
+        )));
+    }
+    if one_shot.has_ref_script && p.one_shot_ref_script_size.is_none() {
+        return Err(BootstrapError::Wallet(format!(
+            "{} bootstrap outref {}#{} carries a reference script and no size was supplied — \
+             without it the Conway per-byte ref-script fee is unpriced and the tx underpays",
             p.outref_label, p.bootstrap_tx_hash, p.bootstrap_output_index
         )));
     }
@@ -620,44 +680,142 @@ mod tests {
         assert_eq!(amount[1].quantity(), "42");
     }
 
+    /// Decode a built body into `(lovelace, distinct asset count)` per output,
+    /// so the tests can assert what actually reaches the chain rather than
+    /// that a hex string is non-empty.
+    fn outputs_of(signed_tx_hex: &str) -> Vec<(u64, usize)> {
+        use pallas_primitives::conway::{PseudoTransactionOutput, Tx, Value};
+        let bytes = hex::decode(signed_tx_hex).expect("hex");
+        let tx: Tx = minicbor::decode(&bytes).expect("cbor");
+        tx.transaction_body
+            .outputs
+            .iter()
+            .map(|o| {
+                let value = match o {
+                    PseudoTransactionOutput::PostAlonzo(o) => &o.value,
+                    PseudoTransactionOutput::Legacy(_) => panic!("unexpected legacy output"),
+                };
+                match value {
+                    Value::Coin(c) => (*c, 0),
+                    Value::Multiasset(c, assets) => {
+                        (*c, assets.iter().map(|(_, a)| a.len()).sum::<usize>())
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn signer() -> (PrivateKey, String) {
+        (
+            derive_payment_key(TEST_MNEMONIC).unwrap(),
+            wallet_address_from_mnemonic(TEST_MNEMONIC).unwrap(),
+        )
+    }
+
     #[test]
     fn a_wallet_that_can_already_post_collateral_is_left_alone() {
         let wallet = vec![
             utxo(0, COLLATERAL_LOVELACE, &[]),
             utxo(1, COLLATERAL_LOVELACE, &[]),
         ];
-        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address_from_mnemonic(TEST_MNEMONIC).unwrap();
+        let (key, addr) = signer();
         let built = build_collateral_top_up(&wallet, &addr, &key, &None).unwrap();
         assert!(built.is_none(), "nothing to split");
     }
 
     /// The spo4 case, and the point of the whole exercise: every lovelace sits
-    /// behind a native token, so there is no collateral and — before this —
-    /// no way to make one, because making one needed one. This tx runs no
-    /// script, so it needs no collateral to build.
+    /// behind a native token, so there is no collateral and — before this — no
+    /// way to make one, because making one needed one. This tx runs no script,
+    /// so it needs no collateral to build.
+    ///
+    /// Asserts the OUTPUTS, not just that something was built: two ada-only
+    /// UTxOs of exactly the collateral size, and the token landing in the
+    /// change. A wrong value balance here is the failure mode this change
+    /// introduces, so it is the thing worth pinning.
     #[test]
     fn a_wallet_whose_ada_is_all_behind_tokens_can_still_split_itself_collateral() {
         let wallet = vec![utxo(0, 11_000_000_000, &[(FSAT, "42")])];
         assert!(collateral_candidates(&wallet).is_empty(), "stuck, before");
 
-        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address_from_mnemonic(TEST_MNEMONIC).unwrap();
+        let (key, addr) = signer();
         let built = build_collateral_top_up(&wallet, &addr, &key, &None)
             .expect("builds")
             .expect("something to do");
-        assert_eq!(built.had, 0);
         assert_eq!(built.created, COLLATERAL_UTXOS_WANTED);
-        assert!(!built.signed_tx_hex.is_empty());
+
+        let outs = outputs_of(&built.signed_tx_hex);
+        let collateral: Vec<_> = outs
+            .iter()
+            .filter(|(c, n)| *c == COLLATERAL_LOVELACE && *n == 0)
+            .collect();
+        assert_eq!(
+            collateral.len(),
+            COLLATERAL_UTXOS_WANTED,
+            "two ada-only outputs of exactly the collateral size: {outs:?}"
+        );
+        let token_bearing: Vec<_> = outs.iter().filter(|(_, n)| *n > 0).collect();
+        assert_eq!(
+            token_bearing.len(),
+            1,
+            "the token rides into exactly one change output: {outs:?}"
+        );
+        assert!(
+            token_bearing[0].0 >= 1_000_000,
+            "the change output keeps enough ADA to exist: {outs:?}"
+        );
+    }
+
+    /// Only the shortfall is minted. Consuming an existing candidate to
+    /// re-create it would be pure loss, and demanding the full set turns a
+    /// workable top-up into "fund the wallet".
+    #[test]
+    fn a_wallet_one_short_mints_one_and_keeps_what_it_has() {
+        let wallet = vec![
+            utxo(0, COLLATERAL_LOVELACE, &[]),
+            utxo(1, 50_000_000, &[(FSAT, "42")]),
+        ];
+        assert_eq!(collateral_candidates(&wallet).len(), 1);
+
+        let (key, addr) = signer();
+        let built = build_collateral_top_up(&wallet, &addr, &key, &None)
+            .expect("builds")
+            .expect("one short");
+        assert_eq!(built.created, 1, "mint the shortfall, not the whole set");
+
+        let outs = outputs_of(&built.signed_tx_hex);
+        assert_eq!(
+            outs.iter()
+                .filter(|(c, n)| *c == COLLATERAL_LOVELACE && *n == 0)
+                .count(),
+            1,
+            "{outs:?}"
+        );
+    }
+
+    /// A token-bearing fee input is charged for the change output it forces,
+    /// because that output's min-UTxO is higher than the bare one every
+    /// caller's margin was sized against.
+    #[test]
+    fn a_token_bearing_fee_input_must_also_cover_the_change_output() {
+        let bare = vec![utxo(0, 2_000_000, &[])];
+        assert!(
+            select_fee(&bare, 2_000_000).is_ok(),
+            "ada-only: margin as tuned"
+        );
+
+        let tokened = vec![utxo(0, 2_000_000, &[(FSAT, "42")])];
+        let err = select_fee(&tokened, 2_000_000).expect_err("not enough for the change output");
+        assert!(err.contains("min-UTxO"), "{err}");
+        assert!(select_fee(&[utxo(0, 9_000_000, &[(FSAT, "42")])], 2_000_000).is_ok());
     }
 
     /// An empty wallet is a funding problem, and says so rather than failing
     /// somewhere further in.
     #[test]
     fn an_unfunded_wallet_is_named_as_such() {
-        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address_from_mnemonic(TEST_MNEMONIC).unwrap();
+        let (key, addr) = signer();
         let err = build_collateral_top_up(&[], &addr, &key, &None).expect_err("cannot split");
         assert!(err.contains("Fund the wallet"), "{err}");
+        assert!(!err.contains("  "), "no lost line continuations: {err}");
     }
 }
