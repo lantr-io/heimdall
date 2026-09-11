@@ -1247,7 +1247,8 @@ impl BlockfrostCardanoChain {
             .schedule(raw, self.ceremony_floor_slots)
             .map_err(|e| {
                 EpochError::Chain(format!(
-                    "the virtual epoch cannot hold this bridge's schedule: {e}. No batch will                      be built until this is resolved, on every node"
+                    "the virtual epoch cannot hold this bridge's schedule: {e}. No batch \
+                     will be built until this is resolved, on every node"
                 ))
             })
     }
@@ -2010,7 +2011,11 @@ impl BlockfrostCardanoChain {
     /// Fetch all UTxOs at the wallet base address.
     async fn query_wallet_utxos(&self) -> EpochResult<Vec<WalletUtxo>> {
         let wallet_addr = self.wallet_base_address.as_deref().ok_or_else(|| {
-            EpochError::Chain("no wallet address — was with_mnemonic called?".into())
+            EpochError::Chain(
+                "no wallet address — this chain was built without a wallet (see \
+                 `resolve_wallet`)"
+                    .into(),
+            )
         })?;
 
         // Raw HTTP + lenient parse (tolerates backends like yaci-devkit that omit `tx_index`).
@@ -2090,7 +2095,11 @@ impl BlockfrostCardanoChain {
         evidence: crate::epoch::traits::DkgFaultEvidence,
     ) -> EpochResult<()> {
         let key = self.payment_key.as_ref().ok_or_else(|| {
-            EpochError::Chain("cardano.mnemonic required for DKG fault ban flow".into())
+            EpochError::Chain(
+                "no wallet key, and the DKG fault ban flow must pay a fee — set \
+                 cardano.payment_skey_path or cardano.mnemonic"
+                    .into(),
+            )
         })?;
         let wallet_addr = self
             .wallet_base_address
@@ -2850,7 +2859,9 @@ impl CardanoChain for BlockfrostCardanoChain {
         })?;
         let key = self.payment_key.as_ref().ok_or_else(|| {
             EpochError::Chain(
-                "cardano.mnemonic is required to pay the Update-Y fee (dry-run node)".into(),
+                "no wallet key to pay the Update-Y fee (dry-run node) — set \
+                 cardano.payment_skey_path or cardano.mnemonic"
+                    .into(),
             )
         })?;
         let wallet_addr = self

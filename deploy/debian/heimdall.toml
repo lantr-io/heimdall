@@ -9,8 +9,9 @@
 # are joining. The daemon exits with a message naming the missing key rather than
 # guessing, so uncomment as you go.
 #
-# SECRETS: keep the wallet mnemonic OUT of this file and in
-# /etc/default/heimdall as $HEIMDALL_MNEMONIC (see cardano.mnemonic below).
+# SECRETS: the wallet key never belongs in this file. Point
+# cardano.payment_skey_path at a 0600 key file, or keep a mnemonic in
+# /etc/default/heimdall as $HEIMDALL_MNEMONIC (see the wallet section below).
 #
 # After editing:  heimdall run-spo --config /etc/heimdall/heimdall.toml --check
 # to run every startup check and exit, then `systemctl enable --now heimdall`.
@@ -139,12 +140,24 @@ poll_interval_ms = 5000
 # prefix and let the fault-proof safety gate fail open.
 #network = "mainnet"
 
-# Cardano wallet mnemonic — the wallet that pays fees and holds this SPO's
-# registration deposit.
+# The wallet that pays fees and holds this SPO's registration deposit. TWO ways
+# to give heimdall its key, and EXACTLY ONE must be set — both is refused at
+# startup, because choosing by precedence would mean signing from an address
+# you were not expecting.
 #
-# PREFER /etc/default/heimdall: heimdall falls back to $HEIMDALL_MNEMONIC only
-# when this key is absent, so uncommenting it here DISABLES the environment
-# variable. Left commented, the seed never enters a dpkg-tracked file.
+# (a) PREFERRED — the cardano-cli key you already run the pool with. The path
+#     is not a secret; the file is, so heimdall refuses it unless it is 0600.
+#     The address is required alongside it: a signing key does not say where
+#     the funds are, and yours are almost certainly at the base address built
+#     from payment.vkey AND stake.vkey. heimdall checks the two are a pair.
+#payment_skey_path = "/etc/heimdall/payment.skey"
+#wallet_address = "addr_test1q..."
+#
+# (b) A BIP-39 mnemonic. Leave this key commented and put the seed in
+#     /etc/default/heimdall as $HEIMDALL_MNEMONIC: heimdall falls back to the
+#     environment only when this key is absent, so uncommenting it here
+#     DISABLES the variable. Left commented, the seed never enters a
+#     dpkg-tracked file.
 #mnemonic = ""
 
 # Path to this pool's Ed25519 COLD signing key, used by `register-spo` (and

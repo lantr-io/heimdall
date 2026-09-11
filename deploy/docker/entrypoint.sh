@@ -55,7 +55,8 @@ then mount it read-only, alongside a NAMED volume for the DKG share:
       -p 18500:18500 \\
       <image>
 
-If you keep the mnemonic out of the file (recommended), pass it as
+Keep the wallet key out of the file. Either mount a 0600 cardano-cli key and
+set cardano.payment_skey_path + cardano.wallet_address, or pass a mnemonic as
 -e HEIMDALL_MNEMONIC=... instead.
 EOF
     # EX_CONFIG. This does not by itself defeat a restart policy — docker restarts

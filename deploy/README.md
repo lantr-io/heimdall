@@ -50,6 +50,7 @@ What it installs:
 | `/lib/systemd/system/heimdall.service` | the unit |
 | `/etc/heimdall/heimdall.toml` | bridge config, dpkg conffile, `0640 root:heimdall` |
 | `/etc/default/heimdall` | `$HEIMDALL_ARGS` + `$HEIMDALL_MNEMONIC`, conffile, `0640` |
+| `/etc/heimdall/payment.skey` | optional cardano-cli wallet key, `0600` — the alternative to a mnemonic |
 | `/var/lib/heimdall` | state (`state_dir`), `0700 heimdall` |
 
 **The service is installed disabled, and that is deliberate.** heimdall cannot run before it has a

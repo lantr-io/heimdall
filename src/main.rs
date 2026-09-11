@@ -1389,9 +1389,12 @@ fn main() {
             if let Some(ref v) = cardano_mnemonic {
                 cfg.cardano.mnemonic = Some(v.clone());
             }
-            // Env var fallback: keep the real seed out of heimdall.toml
-            // and the repo. Precedence: CLI --cardano-mnemonic > TOML
-            // cardano.mnemonic > $HEIMDALL_MNEMONIC.
+            // Env var fallback: keep the real seed out of heimdall.toml and
+            // the repo. Among MNEMONIC sources the precedence is CLI
+            // --cardano-mnemonic > TOML cardano.mnemonic > $HEIMDALL_MNEMONIC.
+            // There is no precedence against cardano.payment_skey_path: these
+            // assignments happen after config load, so `resolve_wallet` — not
+            // the loader — is what refuses the pair.
             if cfg.cardano.mnemonic.is_none() {
                 if let Ok(v) = std::env::var("HEIMDALL_MNEMONIC") {
                     if !v.trim().is_empty() {
@@ -8821,9 +8824,10 @@ fn run_sweep_pegins(
             Some(bridge.bridge_state_policy_id.as_str()),
             cfg.cardano.kupo_url.as_deref(),
         );
-        if let Ok(wallet) = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano) {
-            chain = chain.with_wallet(wallet);
-        }
+        chain = chain.with_wallet(
+            heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)
+                .map_err(|e| format!("wallet: {e}"))?,
+        );
         // No Bitcoin wiring: this posts the TM to CARDANO, and the watchtower relays
         // the signed bytes from the record (WI-086). `--existing-tm-hex` used to need
         // a guard here against re-broadcasting somebody else's already-confirmed

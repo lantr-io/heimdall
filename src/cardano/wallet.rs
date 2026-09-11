@@ -30,7 +30,9 @@ pub struct Wallet {
     /// Bech32. Every builder spends from it, pays change back to it, and every
     /// UTxO query reads it.
     pub address: String,
-    /// For `doctor` and step 1 — which of the two sources is live.
+    /// Which config key supplied the signing key. `doctor` and preflight step
+    /// 1 report it, so an operator can see WHICH of the two ways in is live
+    /// rather than inferring it.
     pub source: &'static str,
 }
 
@@ -58,11 +60,20 @@ impl std::fmt::Debug for Wallet {
 /// static. This is where "neither" surfaces, because `$HEIMDALL_MNEMONIC` is
 /// invisible to the TOML parser and plenty of commands need no wallet at all.
 pub fn resolve_wallet(cfg: &CardanoConfig) -> Result<Wallet, String> {
-    let network = if cfg.is_mainnet()? {
-        Network::Mainnet
-    } else {
-        Network::Testnet
-    };
+    // The authoritative "exactly one" check. `refuse_ambiguous_wallet_key`
+    // makes the same call at config load, which is where an operator wants to
+    // hear it — but the load-time check sees only the TOML, and `run-spo`
+    // injects `--cardano-mnemonic` and `$HEIMDALL_MNEMONIC` into the config
+    // AFTER it. Without this, migrating to a skey while leaving the mnemonic
+    // in /etc/default/heimdall silently resolved to the skey.
+    let mnemonic = mnemonic_from(cfg);
+    if let (Some(path), Some((_, src))) = (cfg.payment_skey_path.as_deref(), mnemonic.as_ref()) {
+        return Err(format!(
+            "two wallet keys: cardano.payment_skey_path ({path}) and a mnemonic from {src}. \
+             They are alternatives — heimdall has one wallet, and choosing by precedence \
+             would sign from an address you were not expecting. Remove one"
+        ));
+    }
 
     if let Some(path) = cfg.payment_skey_path.as_deref() {
         let key = payment_key_from_skey_file(path)?;
@@ -72,7 +83,14 @@ pub fn resolve_wallet(cfg: &CardanoConfig) -> Result<Wallet, String> {
              base address whose stake half is not in the key"
                 .to_string()
         })?;
+        // No `is_mainnet()` here: this path never derives an address, so a
+        // config that cannot resolve its network is still perfectly usable.
+        // The address carries its own tag, and `network_from_address` is what
+        // the builders read downstream — but check it against the config where
+        // the config has an opinion, since a testnet address on a mainnet node
+        // would silently retag every script address derived from it.
         check_address_matches_key(&address, &key)?;
+        check_address_network(cfg, &address)?;
         return Ok(Wallet {
             key,
             address,
@@ -80,26 +98,67 @@ pub fn resolve_wallet(cfg: &CardanoConfig) -> Result<Wallet, String> {
         });
     }
 
-    let (mnemonic, source) = mnemonic_from(cfg).ok_or_else(|| {
+    let (mnemonic, source) = mnemonic.ok_or_else(|| {
         "no wallet key: set cardano.payment_skey_path (with cardano.wallet_address), \
          or cardano.mnemonic, or $HEIMDALL_MNEMONIC"
             .to_string()
     })?;
     let key = derive_payment_key(&mnemonic)?;
-    // A configured address still wins, and is still checked — an operator
-    // moving off the mnemonic can set it first and confirm the two agree.
-    let address = match cfg.wallet_address.clone() {
-        Some(addr) => {
-            check_address_matches_key(&addr, &key)?;
-            addr
-        }
-        None => wallet_address_from_mnemonic(&mnemonic, network)?,
+    // Deriving DOES need the network, and guessing is the bug this replaced.
+    let network = if cfg.is_mainnet()? {
+        Network::Mainnet
+    } else {
+        Network::Testnet
     };
+    let derived = wallet_address_from_mnemonic(&mnemonic, network)?;
+    // A configured address alongside a mnemonic is a cross-check, not an
+    // override: it must be the SAME address. Accepting any address with a
+    // matching payment credential would let an enterprise address — which
+    // `cardano-cli address build` happily produces from payment.vkey alone —
+    // move the node off the base address holding its funds.
+    if let Some(addr) = cfg.wallet_address.as_deref()
+        && addr != derived
+    {
+        {
+            return Err(format!(
+                "cardano.wallet_address {addr} is not the address this mnemonic derives \
+                 ({derived}). With a mnemonic the key is a cross-check, not an override — \
+                 an address over the same payment key but a different (or absent) stake \
+                 part is a different wallet, and it is not the one holding your funds"
+            ));
+        }
+    }
     Ok(Wallet {
         key,
-        address,
+        address: derived,
         source,
     })
+}
+
+/// Refuse an address whose network tag contradicts the config.
+///
+/// Only when the config HAS an opinion: `is_mainnet()` errs on an unknown
+/// network spelling and on `blockfrost_url` without `network`, and neither is
+/// reason to reject an address that is otherwise fine. Where it does resolve,
+/// a disagreement is decisive — the wallet address is read back by
+/// `network_from_address` to tag script addresses, so a testnet address on a
+/// mainnet node would quietly retag the registry and the ban list.
+fn check_address_network(cfg: &CardanoConfig, address: &str) -> Result<(), String> {
+    let Ok(mainnet) = cfg.is_mainnet() else {
+        return Ok(());
+    };
+    let addr_mainnet = address.starts_with("addr1");
+    let addr_testnet = address.starts_with("addr_test1");
+    if (addr_mainnet || addr_testnet) && addr_mainnet != mainnet {
+        return Err(format!(
+            "cardano.wallet_address {address} is {}, but this node is configured for {} — \
+             every script address is tagged from this one, so the registry and the ban list \
+             would resolve to valid-looking addresses holding nothing",
+            if addr_mainnet { "mainnet" } else { "a testnet" },
+            if mainnet { "mainnet" } else { "a testnet" }
+        ));
+    }
+    Ok(())
 }
 
 /// The mnemonic and which key supplied it. `cardano.mnemonic` wins over the
@@ -154,14 +213,45 @@ fn check_address_matches_key(address: &str, key: &PrivateKey) -> Result<(), Stri
     }
 }
 
+/// Refuse a signing key any other user can read.
+///
+/// The whole argument for pointing at a file instead of an environment
+/// variable is that the file's permissions are the protection — so a key at
+/// 0644 makes the feature worse than the mnemonic it replaced, not better.
+/// `cardano-cli` does not always create these 0600, and a `cp` from the pool
+/// directory rarely preserves it. The bifrost identity key is held to the same
+/// rule (`ConfigError::KeyPermsTooOpen`).
+#[cfg(unix)]
+fn refuse_open_perms(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("cardano.payment_skey_path {path}: {e}"))?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "cardano.payment_skey_path {path} is mode {mode:04o} — group- or world-readable. \
+             This is a wallet signing key and the file's permissions are the only thing \
+             protecting it: chmod 600 it"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn refuse_open_perms(_path: &str) -> Result<(), String> {
+    Ok(())
+}
+
 /// Load a cardano-cli text-envelope signing key.
 ///
 /// Accepts the plain Shelley payment key (32-byte ed25519 secret) and its
-/// extended BIP32 form (96 bytes: 64-byte key + 32-byte chain code, of which
-/// only the key is needed to sign). Every other envelope `type` is refused BY
-/// NAME: a stake or cold key here would produce a perfectly valid signature
-/// for the wrong credential, which is worse than an error.
+/// extended BIP32 form, whose payload cardano-cli writes as 128 bytes —
+/// 64-byte extended key, 32-byte chain code, 32-byte public key — of which
+/// only the leading 64 are needed to sign. Every other envelope `type` is
+/// refused BY NAME: a stake or cold key here would produce a perfectly valid
+/// signature for the wrong credential, which is worse than an error.
 pub fn payment_key_from_skey_file(path: &str) -> Result<PrivateKey, String> {
+    refuse_open_perms(path)?;
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cardano.payment_skey_path {path}: {e}"))?;
     let env: serde_json::Value =
@@ -273,9 +363,8 @@ pub fn wallet_address_from_mnemonic(mnemonic: &str, network: Network) -> Result<
         .expect("bech32 encode wallet address"))
 }
 
-/// Testnet enterprise (no staking part) bech32 address for a payment
-/// key. Used for Blockfrost UTxO queries when only the payment key is
-/// available.
+/// Enterprise (no staking part) bech32 address for a payment key, on the
+/// given network. Used where only the payment key is available.
 pub fn wallet_address(key: &PrivateKey, network: Network) -> String {
     let pk_bytes: [u8; 32] = key.public_key().into();
     let pkh = blake2b_224(&pk_bytes);
@@ -343,7 +432,34 @@ mod tests {
             ),
         )
         .unwrap();
+        // 0600, as the loader now insists a real one is.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         path.to_string_lossy().into_owned()
+    }
+
+    /// Removes `$HEIMDALL_MNEMONIC` for the duration of a test and puts it
+    /// back. Tests share one process, so a test asserting "no wallet key"
+    /// would otherwise depend on the developer's shell.
+    struct NoAmbientMnemonic(Option<String>);
+
+    impl NoAmbientMnemonic {
+        fn take() -> Self {
+            let prev = std::env::var("HEIMDALL_MNEMONIC").ok();
+            unsafe { std::env::remove_var("HEIMDALL_MNEMONIC") };
+            Self(prev)
+        }
+    }
+
+    impl Drop for NoAmbientMnemonic {
+        fn drop(&mut self) {
+            if let Some(v) = self.0.take() {
+                unsafe { std::env::set_var("HEIMDALL_MNEMONIC", v) };
+            }
+        }
     }
 
     fn cardano_cfg() -> crate::config::CardanoConfig {
@@ -420,11 +536,111 @@ mod tests {
 
     /// "Neither" is resolved here, not at config load: $HEIMDALL_MNEMONIC is
     /// invisible to the TOML parser.
+    ///
+    /// The variable is cleared for the duration, because on an SPO box — the
+    /// setup the operator guide recommends — it is exported, and the test
+    /// would pass a wallet back instead of the error it is asserting on.
     #[test]
     fn no_key_at_all_names_both_ways_in() {
+        let _guard = NoAmbientMnemonic::take();
         let err = resolve_wallet(&cardano_cfg()).expect_err("nothing configured");
         assert!(err.contains("payment_skey_path"), "{err}");
         assert!(err.contains("mnemonic"), "{err}");
+    }
+
+    /// Two wallet keys is refused HERE too, not only at config load. `run-spo`
+    /// injects `--cardano-mnemonic` and `$HEIMDALL_MNEMONIC` into the config
+    /// after the loader has had its look, so the loader's check alone let a
+    /// migrated operator silently keep signing with the skey.
+    #[test]
+    fn two_keys_are_refused_even_when_the_loader_never_saw_both() {
+        let mut cfg = cardano_cfg();
+        cfg.payment_skey_path = Some(skey_file(
+            "two-keys",
+            "PaymentSigningKeyShelley_ed25519",
+            &format!("5820{}", hex::encode([7u8; 32])),
+        ));
+        cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
+        let err = resolve_wallet(&cfg).expect_err("alternatives");
+        assert!(err.contains("two wallet keys"), "{err}");
+    }
+
+    /// The address is read back by `network_from_address` to tag every script
+    /// address, so one on the wrong network is not a cosmetic mismatch.
+    #[test]
+    fn an_address_on_the_wrong_network_is_refused() {
+        let key = PrivateKey::from(pallas_crypto::key::ed25519::SecretKey::from([7u8; 32]));
+        let mut cfg = cardano_cfg();
+        cfg.payment_skey_path = Some(skey_file(
+            "wrong-network",
+            "PaymentSigningKeyShelley_ed25519",
+            &format!("5820{}", hex::encode([7u8; 32])),
+        ));
+        cfg.wallet_address = Some(wallet_address(&key, Network::Testnet));
+        cfg.network = Some("mainnet".into());
+        let err = resolve_wallet(&cfg).expect_err("testnet address on a mainnet node");
+        assert!(err.contains("configured for mainnet"), "{err}");
+    }
+
+    /// A key file anyone can read defeats the reason for using a file at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_readable_key_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = skey_file(
+            "open-perms",
+            "PaymentSigningKeyShelley_ed25519",
+            &format!("5820{}", hex::encode([7u8; 32])),
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = payment_key_from_skey_file(&path).err().expect("0644");
+        assert!(err.contains("0644"), "{err}");
+        assert!(err.contains("chmod 600"), "{err}");
+    }
+
+    /// With a mnemonic the address is a cross-check, not an override. An
+    /// enterprise address over the same payment key passes the credential
+    /// test and is still the wrong wallet — `cardano-cli address build` makes
+    /// one from payment.vkey alone, so this is an easy paste to get wrong.
+    #[test]
+    fn an_address_that_is_not_the_mnemonics_own_is_refused() {
+        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
+        let mut cfg = cardano_cfg();
+        cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
+        cfg.wallet_address = Some(wallet_address(&key, Network::Testnet));
+        let err = resolve_wallet(&cfg).expect_err("enterprise != base");
+        assert!(
+            err.contains("is not the address this mnemonic derives"),
+            "{err}"
+        );
+
+        cfg.wallet_address =
+            Some(wallet_address_from_mnemonic(TEST_MNEMONIC, Network::Testnet).unwrap());
+        assert!(resolve_wallet(&cfg).is_ok(), "its own address is fine");
+    }
+
+    /// The skey path never derives an address, so it must not need a network
+    /// it does not consult — `blockfrost_url` without `network` is a config
+    /// that loads today and worked before this change.
+    #[test]
+    fn a_skey_needs_no_resolvable_network() {
+        let key = PrivateKey::from(pallas_crypto::key::ed25519::SecretKey::from([7u8; 32]));
+        let mut cfg = cardano_cfg();
+        cfg.payment_skey_path = Some(skey_file(
+            "no-network",
+            "PaymentSigningKeyShelley_ed25519",
+            &format!("5820{}", hex::encode([7u8; 32])),
+        ));
+        cfg.wallet_address = Some(wallet_address(&key, Network::Testnet));
+        cfg.blockfrost_url = Some("http://localhost:8080/api/v1".into());
+        assert!(
+            cfg.is_mainnet().is_err(),
+            "the fixture must be unresolvable"
+        );
+        assert!(
+            resolve_wallet(&cfg).is_ok(),
+            "and the skey path must not care"
+        );
     }
 
     /// The wallet address was the last derivation taking its network tag from

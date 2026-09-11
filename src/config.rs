@@ -409,15 +409,17 @@ pub struct CardanoConfig {
     /// by name, so a stake or cold key in this slot cannot quietly sign.
     pub payment_skey_path: Option<String>,
     /// The address the wallet's funds are at. REQUIRED with
-    /// [`CardanoConfig::payment_skey_path`], meaningless with a mnemonic.
+    /// [`CardanoConfig::payment_skey_path`]; with a mnemonic it is an optional
+    /// cross-check, and must equal the address that mnemonic derives.
     ///
     /// A signing key alone does not say where the money is: an SPO's funds
     /// normally sit at a CIP-1852 BASE address built from payment.vkey AND
     /// stake.vkey, and the stake half is not in the signing key. Rather than
     /// ask for a second file, take the address the operator already knows —
-    /// then CHECK it, by requiring its payment credential to equal the hash of
-    /// the key. A mismatched pair is refused rather than left to surface much
-    /// later as an empty wallet.
+    /// then CHECK it: its payment credential must be the hash of the key, and
+    /// its network tag must agree with the configured network, since every
+    /// script address is tagged from this one. A mismatch is refused rather
+    /// than left to surface much later as an empty wallet.
     pub wallet_address: Option<String>,
     /// Path to this pool's Ed25519 COLD signing key, used by `register-spo`
     /// (and revocation) when `--cold-skey` is not given.
@@ -1310,11 +1312,6 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The three ban-schedule keys are REFUSED, not ignored. Ignoring them is
-    /// how an operator ends up believing a ban duration they typed is in force
-    /// while the node enforces the bridge's — or worse, derives a ban address no
-    /// deployment has and reads back an empty ban list.
     /// Two wallet keys is not a precedence question. Whichever one the code
     /// preferred, an operator who migrated and left the old key behind would
     /// sign from an address they were not expecting, and nothing would say so.
@@ -1342,6 +1339,11 @@ payment_skey_path = "/etc/heimdall/payment.skey"
         HeimdallConfig::from_toml_str("[cardano]\nnetwork = \"preprod\"\n")
             .expect("resolved later, not at parse");
     }
+
+    /// The three ban-schedule keys are REFUSED, not ignored. Ignoring them is
+    /// how an operator ends up believing a ban duration they typed is in force
+    /// while the node enforces the bridge's — or worse, derives a ban address no
+    /// deployment has and reads back an empty ban list.
 
     #[test]
     fn retired_ban_schedule_keys_are_refused_with_their_replacement() {
