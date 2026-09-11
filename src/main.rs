@@ -1335,10 +1335,62 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
 /// to see WHICH bridge and WHICH contracts this node resolved, not merely that it
 /// started. Nothing here spends: steps 4 and 6 — the reference script and the
 /// registration — name the command and stop.
+/// The gate, plus the one repair the node can make for itself.
+///
+/// ORDER MATTERS, and this is why the catch-up is not simply run first. The
+/// rebuild writes to the state directory using the bridge THIS CONFIG names,
+/// so everything that establishes which bridge that is — step 3 above all —
+/// has to have passed before it runs. Healing first meant a mistyped
+/// `cardano.config_address` would resolve some other bridge, report the tries
+/// as diverged against ITS roots, and overwrite this node's state with that
+/// bridge's history, self-consistently, before step 3 ever failed.
+///
+/// So: run the checks, and repair only when the tries are the single thing
+/// standing in the way. Then run them again — the second report is the one
+/// printed and the one that decides, because it is the only one that has seen
+/// the repaired state.
+fn gate_with_catch_up(cfg: &HeimdallConfig) -> (Result<(), String>, Option<String>) {
+    use heimdall::preflight::{CONFIG_STEP, Status, TRIES_STEP};
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => return (Err(e.to_string()), None),
+    };
+    let report = rt.block_on(heimdall::preflight::preflight(cfg));
+    let failed = |n: u8| {
+        report
+            .steps
+            .iter()
+            .any(|s| s.n == n && s.status == Status::Fail)
+    };
+    // Two conditions, and only two. The tries must actually be the fault —
+    // repairing what is not broken is how a bug gets a second chance — and the
+    // Config must have RESOLVED, because that is what says which bridge the
+    // rebuild reads. Deliberately not "everything else passed": a node that is
+    // configured but not yet registered fails step 6, and it should still be
+    // able to seed itself, which is exactly what a new operator meets.
+    let repairable = failed(TRIES_STEP) && !failed(CONFIG_STEP);
+    if !repairable {
+        print!("{}", report.render());
+        return (verdict(&report), None);
+    }
+
+    let rebuilt = catch_up_tries(cfg);
+    let report = rt.block_on(heimdall::preflight::preflight(cfg));
+    print!("{}", report.render());
+    (verdict(&report), rebuilt)
+}
+
+/// The checks, reported and judged, repairing nothing. What `doctor` and
+/// `run-spo --check` run.
 fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let report = rt.block_on(heimdall::preflight::preflight(cfg));
     print!("{}", report.render());
+    verdict(&report)
+}
+
+fn verdict(report: &heimdall::preflight::Report) -> Result<(), String> {
     match report.first_failure() {
         None => Ok(()),
         // Deliberately says "not yet ready", not "you misconfigured something".
@@ -1609,8 +1661,14 @@ fn main() {
             // and an operator running it to see what a start WOULD do must
             // not have it quietly change the state directory first. Under
             // `--check` the gate reports the tries as they actually stand.
-            let tries_rebuilt = if check { None } else { catch_up_tries(&cfg) };
-            if let Err(e) = run_preflight_gate(&cfg) {
+            // `--check` gets the plain gate: it is read-only, and a command
+            // run to see what a start WOULD do must not repair anything first.
+            let (gate, tries_rebuilt) = if check {
+                (run_preflight_gate(&cfg), None)
+            } else {
+                gate_with_catch_up(&cfg)
+            };
+            if let Err(e) = gate {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -2138,8 +2196,7 @@ fn main() {
             // daemon to fix itself while the other exits would be two answers to
             // one fault. NOT in `doctor`: that is read-only, and operators run it
             // against the state directory of a node that is already running.
-            catch_up_tries(&cfg);
-            if let Err(e) = run_preflight_gate(&cfg) {
+            if let Err(e) = gate_with_catch_up(&cfg).0 {
                 error!("Error: {e}");
                 std::process::exit(1);
             }

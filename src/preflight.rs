@@ -68,6 +68,21 @@ pub struct Step {
     pub fix: Option<String>,
 }
 
+/// The step number of the `local tries` check.
+///
+/// Named rather than written as `10` in two files: the daemon keys its one
+/// self-repair on "is this the ONLY thing failing", and a step renumbering
+/// that silently moved that decision onto a different check would be a bad
+/// afternoon.
+pub const TRIES_STEP: u8 = 10;
+
+/// The step number of `resolve the Config`.
+///
+/// The precondition for any self-repair: the rebuild writes state derived from
+/// the bridge this step identifies, so a node that cannot say WHICH bridge it
+/// is on must not be writing tries for one.
+pub const CONFIG_STEP: u8 = 3;
+
 /// The whole preflight, in the order the steps ran.
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -504,7 +519,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             (7, "key handoff (Update-Y)"),
             (8, "federation identity"),
             (9, "post a movement"),
-            (10, "local tries"),
+            (TRIES_STEP, "local tries"),
             (11, "wallet collateral"),
         ] {
             b.push(n, title, Status::Skipped, "needs a Cardano provider");
@@ -1547,6 +1562,29 @@ mod tests {
             !diverged.contains("EXPECTED"),
             "divergence is never expected: {diverged}"
         );
+    }
+
+    /// The daemon repairs the tries only when the Config resolved, because the
+    /// rebuild writes state derived from the bridge that step identifies.
+    /// Healing regardless meant a mistyped `cardano.config_address` resolved
+    /// SOME OTHER bridge, reported the tries as diverged against its roots,
+    /// and overwrote this node's state with that bridge's history — before
+    /// step 3 ever failed.
+    ///
+    /// Pinning the two step numbers because the decision is keyed on them: a
+    /// renumbering that moved the repair onto a different check would be very
+    /// quiet and very bad.
+    #[test]
+    fn the_repairable_step_and_its_precondition_do_not_move() {
+        assert_eq!(TRIES_STEP, 10);
+        assert_eq!(CONFIG_STEP, 3);
+        let cfg = HeimdallConfig::default();
+        let report = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(preflight(&cfg));
+        let step = |n: u8| report.steps.iter().find(|s| s.n == n).expect("step exists");
+        assert_eq!(step(TRIES_STEP).title, "local tries");
+        assert_eq!(step(CONFIG_STEP).title, "resolve the Config");
     }
 
     /// The message must cite the root of the trie that is actually missing.

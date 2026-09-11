@@ -635,8 +635,9 @@ swept — and a node cannot invent them. A new node on a bridge with history has
 that was stopped while a movement completed is behind: it never recorded that movement, so it
 never folded it.
 
-**`run-spo` fixes both itself, at startup.** Before the checks run it compares its tries against
-the bridge-state singleton and, if they are absent or behind, rebuilds them from Cardano history:
+**`run-spo` fixes both itself, at startup.** It runs the checks, and if the tries are the fault —
+and the Config resolved, so it knows which bridge to read — it rebuilds them from Cardano history
+and runs the checks again:
 
 ```
 ⚠ local tries behind the chain — never seeded (cpo, spi absent). Rebuilding both from
@@ -648,8 +649,21 @@ the bridge-state singleton and, if they are absent or behind, rebuilds them from
 ```
 
 Every movement is on chain, so nothing here needs you. The walk refuses to persist a root the
-singleton does not attest, so it cannot invent state either, and a node already in sync does
-nothing at all — one read, no rebuild.
+singleton does not attest, so it cannot invent state either, and a node already in sync does no
+rebuild at all.
+
+It repairs **only** the tries, and **only** once step 3 has resolved the Config. That ordering is
+the point: the rebuild writes state derived from whichever bridge your config names, so a mistyped
+`cardano.config_address` would otherwise overwrite this node's history with another bridge's,
+perfectly self-consistently, before the check that catches the typo ever ran. A node that is
+configured but not yet registered still seeds itself — step 6 failing does not stop the repair,
+because it has nothing to do with which bridge this is.
+
+A file that exists and cannot be parsed is a third case, and it is reported as such rather than as
+a disagreement: the fix is usually the file's owner or mode, not a consensus investigation. There
+the node keeps a copy, rebuilds, and **keeps** `pending-tm.json` — the chain may not have moved at
+all, so a movement this node posted may still be in flight and that record is the only thing that
+will fold it.
 
 **It is reported twice, because a log line scrolls away.** A node that rebuilds once is a new
 node, or one that missed a batch. A node that rebuilds at *every* start is losing its state
