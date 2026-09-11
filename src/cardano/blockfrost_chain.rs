@@ -2032,14 +2032,12 @@ impl BlockfrostCardanoChain {
         .map_err(|e| EpochError::Chain(format!("blockfrost wallet UTxO query: {e}")))?;
 
         // The oracle-update tx only needs ADA (fee + new-UTxO min-ADA + script collateral) and runs a
-        // minting script — feed coin-selection only PURE-ADA UTxOs. A token-bearing fee input drops
-        // those tokens from the change (ValueNotConservedUTxO) and a token-bearing collateral fails
-        // (CollateralContainsNonADA); the wallet's token UTxOs are irrelevant to this tx.
-        Ok(utxos
-            .iter()
-            .map(WalletUtxo::from_bf)
-            .filter(|u| u.pure_ada)
-            .collect())
+        // minting script — hand coin-selection the WHOLE wallet and let it choose. This used to
+        // filter to pure-ADA UTxOs, which hid a token-bearing UTxO from the fee selector even
+        // though its value is declared on the input and comes back in the change; the effect was
+        // that a wallet whose ADA all sat behind tokens looked empty (WI-20260910-5DRP6).
+        // Collateral still has to be ada-only, and `select_collateral` is where that is decided.
+        Ok(utxos.iter().map(WalletUtxo::from_bf).collect())
     }
 
     async fn submit_cardano_tx(&self, label: &str, signed_tx_hex: &str) -> EpochResult<String> {

@@ -38,7 +38,9 @@ use crate::cardano::blueprint::ParameterizedScript;
 use crate::cardano::publish::WalletUtxo;
 use crate::cardano::treasury_info::{TreasuryInfoDatum, update_y_redeemer, update_y_sig_msg};
 use crate::cardano::treasury_spend::{TreasuryStateUtxo, treasury_spend_leg};
-use crate::cardano::tx_common::{select_collateral, select_fee, sign_built_tx};
+use crate::cardano::tx_common::{
+    select_collateral, select_fee, sign_built_tx, wallet_input_amount,
+};
 
 #[derive(Debug)]
 pub enum UpdateYError {
@@ -248,10 +250,7 @@ pub fn build_update_y_tx(req: &UpdateYRequest) -> Result<UpdateYTx, UpdateYError
                 tx_in: TxInParameter {
                     tx_hash: fee_utxo.tx_hash.clone(),
                     tx_index: fee_utxo.output_index,
-                    amount: Some(vec![Asset::new_from_str(
-                        "lovelace",
-                        &fee_utxo.lovelace.to_string(),
-                    )]),
+                    amount: Some(wallet_input_amount(fee_utxo)),
                     address: Some(req.wallet_address.to_string()),
                 },
             }),
@@ -262,10 +261,7 @@ pub fn build_update_y_tx(req: &UpdateYRequest) -> Result<UpdateYTx, UpdateYError
             tx_in: TxInParameter {
                 tx_hash: coll_utxo.tx_hash.clone(),
                 tx_index: coll_utxo.output_index,
-                amount: Some(vec![Asset::new_from_str(
-                    "lovelace",
-                    &coll_utxo.lovelace.to_string(),
-                )]),
+                amount: Some(wallet_input_amount(coll_utxo)),
                 address: Some(req.wallet_address.to_string()),
             },
         }],

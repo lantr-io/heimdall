@@ -29,7 +29,9 @@ use crate::cardano::ban_list::fault_token_name;
 use crate::cardano::blueprint::ParameterizedScript;
 use crate::cardano::plutus::{self, array, bytes, constr, int};
 use crate::cardano::publish::WalletUtxo;
-use crate::cardano::tx_common::{sign_built_tx as common_sign_built_tx, whisky_network};
+use crate::cardano::tx_common::{
+    sign_built_tx as common_sign_built_tx, wallet_input_amount, whisky_network,
+};
 use crate::cardano::wallet::pub_key_hash_hex;
 
 const POOL_ID_LEN: usize = 28;
@@ -374,30 +376,10 @@ fn select_fee_and_collateral(
     wallet_utxos: &[WalletUtxo],
     min_fee_lovelace: u64,
 ) -> Result<(&WalletUtxo, &WalletUtxo), FaultProofMintError> {
-    let fee_utxo = wallet_utxos
-        .iter()
-        .filter(|u| u.pure_ada)
-        .max_by_key(|u| u.lovelace)
-        .ok_or_else(|| FaultProofMintError::Wallet("no clean wallet UTxOs for fees".into()))?;
-    if fee_utxo.lovelace < min_fee_lovelace {
-        return Err(FaultProofMintError::Wallet(format!(
-            "largest wallet UTxO ({} lovelace) cannot cover the proof output plus fees",
-            fee_utxo.lovelace
-        )));
-    }
-    let coll_utxo = wallet_utxos
-        .iter()
-        .find(|u| {
-            u.lovelace >= 5_000_000
-                && u.pure_ada
-                && !(u.tx_hash == fee_utxo.tx_hash && u.output_index == fee_utxo.output_index)
-        })
-        .ok_or_else(|| {
-            FaultProofMintError::Wallet(
-                "no pure-ADA wallet UTxO with >= 5 ADA for collateral, distinct from the fee input"
-                    .into(),
-            )
-        })?;
+    let fee_utxo = crate::cardano::tx_common::select_fee(wallet_utxos, min_fee_lovelace)
+        .map_err(FaultProofMintError::Wallet)?;
+    let coll_utxo = crate::cardano::tx_common::select_collateral(wallet_utxos, &[fee_utxo])
+        .map_err(FaultProofMintError::Wallet)?;
     Ok((fee_utxo, coll_utxo))
 }
 
@@ -501,10 +483,7 @@ pub fn build_fault_proof_mint_tx(
             tx_in: TxInParameter {
                 tx_hash: fee_utxo.tx_hash.clone(),
                 tx_index: fee_utxo.output_index,
-                amount: Some(vec![Asset::new_from_str(
-                    "lovelace",
-                    &fee_utxo.lovelace.to_string(),
-                )]),
+                amount: Some(wallet_input_amount(fee_utxo)),
                 address: Some(req.wallet_address.to_string()),
             },
         })],
@@ -513,10 +492,7 @@ pub fn build_fault_proof_mint_tx(
             tx_in: TxInParameter {
                 tx_hash: coll_utxo.tx_hash.clone(),
                 tx_index: coll_utxo.output_index,
-                amount: Some(vec![Asset::new_from_str(
-                    "lovelace",
-                    &coll_utxo.lovelace.to_string(),
-                )]),
+                amount: Some(wallet_input_amount(coll_utxo)),
                 address: Some(req.wallet_address.to_string()),
             },
         }],
@@ -634,13 +610,15 @@ mod tests {
                 tx_hash: "aa".repeat(32),
                 output_index: 0,
                 lovelace: 50_000_000,
-                pure_ada: true,
+                tokens: Default::default(),
+                has_ref_script: false,
             },
             WalletUtxo {
                 tx_hash: "bb".repeat(32),
                 output_index: 1,
                 lovelace: 6_000_000,
-                pure_ada: true,
+                tokens: Default::default(),
+                has_ref_script: false,
             },
         ]
     }

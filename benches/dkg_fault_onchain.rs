@@ -886,13 +886,15 @@ fn bench_wallet_utxos() -> Vec<WalletUtxo> {
             tx_hash: tx_hash_hex(0xA1),
             output_index: 0,
             lovelace: 50_000_000,
-            pure_ada: true,
+            tokens: Default::default(),
+            has_ref_script: false,
         },
         WalletUtxo {
             tx_hash: tx_hash_hex(0xA2),
             output_index: 1,
             lovelace: 6_000_000,
-            pure_ada: true,
+            tokens: Default::default(),
+            has_ref_script: false,
         },
     ]
 }

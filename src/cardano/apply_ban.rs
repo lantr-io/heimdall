@@ -55,7 +55,8 @@ use crate::cardano::plutus::{bytes, constr, int, option};
 use crate::cardano::publish::WalletUtxo;
 use crate::cardano::tx_common::{
     BootstrapError, OneShotBootstrapParams, build_oneshot_bootstrap_tx, element_lovelace,
-    select_collateral, select_fee, sign_built_tx as common_sign_built_tx, whisky_network,
+    select_collateral, select_fee, sign_built_tx as common_sign_built_tx, wallet_input_amount,
+    whisky_network,
 };
 use crate::cardano::wallet::pub_key_hash_hex;
 
@@ -674,10 +675,7 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
         tx_in: TxInParameter {
             tx_hash: fee_utxo.tx_hash.clone(),
             tx_index: fee_utxo.output_index,
-            amount: Some(vec![Asset::new_from_str(
-                "lovelace",
-                &fee_utxo.lovelace.to_string(),
-            )]),
+            amount: Some(wallet_input_amount(fee_utxo)),
             address: Some(req.wallet_address.to_string()),
         },
     });
@@ -702,10 +700,7 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
             tx_in: TxInParameter {
                 tx_hash: coll_utxo.tx_hash.clone(),
                 tx_index: coll_utxo.output_index,
-                amount: Some(vec![Asset::new_from_str(
-                    "lovelace",
-                    &coll_utxo.lovelace.to_string(),
-                )]),
+                amount: Some(wallet_input_amount(coll_utxo)),
                 address: Some(req.wallet_address.to_string()),
             },
         }],
@@ -901,13 +896,15 @@ mod tests {
                 tx_hash: "aa".repeat(32),
                 output_index: 0,
                 lovelace: 50_000_000,
-                pure_ada: true,
+                tokens: Default::default(),
+                has_ref_script: false,
             },
             WalletUtxo {
                 tx_hash: "bb".repeat(32),
                 output_index: 1,
                 lovelace: 6_000_000,
-                pure_ada: true,
+                tokens: Default::default(),
+                has_ref_script: false,
             },
         ]
     }
