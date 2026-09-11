@@ -855,7 +855,8 @@ mod tests {
         }];
 
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let wallet_addr = crate::cardano::wallet::wallet_address(&key);
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
         let wallet_utxos = vec![
             WalletUtxo {
                 tx_hash: "aa".repeat(32),

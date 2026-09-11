@@ -1,11 +1,19 @@
-//! BIP-39 mnemonic → Cardano payment key derivation (CIP-1852).
+//! The node's Cardano wallet: one signing key and the address its funds are at.
 //!
-//! Derives the external payment key at path
-//! `m/1852'/1815'/0'/0/0` and the staking key at
-//! `m/1852'/1815'/0'/2/0` using the Icarus (V2) scheme, via
-//! `pallas_wallet::hd::Bip32PrivateKey`. The resulting key is an
-//! **extended** ed25519 key (64 bytes), as used by all Cardano HD
-//! wallets.
+//! Two ways in, and exactly one must resolve — see [`resolve_wallet`].
+//!
+//! - a **BIP-39 mnemonic**, from which the external payment key
+//!   (`m/1852'/1815'/0'/0/0`) and staking key (`m/1852'/1815'/0'/2/0`) are
+//!   derived Icarus-style, and the CIP-1852 base address built from both. The
+//!   key is an **extended** ed25519 key, as every Cardano HD wallet uses.
+//! - a **cardano-cli `payment.skey`** plus the address to use it at. The
+//!   signing key is whatever the envelope holds — a plain 32-byte ed25519
+//!   secret or the extended BIP32 form — and the address is the operator's,
+//!   checked against the key rather than trusted.
+//!
+//! The network tag comes from the config, through `is_mainnet()`, and not from
+//! a constant here. Every other address this node derives already honours it;
+//! the wallet address was the one that did not, which made mainnet impossible.
 
 use pallas_addresses::{
     Address, Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
@@ -13,6 +21,198 @@ use pallas_addresses::{
 use pallas_wallet::{PrivateKey, hd::Bip32PrivateKey};
 
 use crate::cardano::hash::blake2b_224;
+use crate::config::CardanoConfig;
+
+/// The node's wallet: what signs, where the funds are, and which config key
+/// said so.
+pub struct Wallet {
+    pub key: PrivateKey,
+    /// Bech32. Every builder spends from it, pays change back to it, and every
+    /// UTxO query reads it.
+    pub address: String,
+    /// For `doctor` and step 1 — which of the two sources is live.
+    pub source: &'static str,
+}
+
+/// Redacts the key. `pallas_wallet::PrivateKey` is deliberately not `Debug`,
+/// and a wrapper that quietly restored it would put a signing key one
+/// `{:?}` away from the journal.
+impl std::fmt::Debug for Wallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Wallet")
+            .field("key", &"<redacted>")
+            .field("address", &self.address)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// Resolve the node's wallet from config, or say precisely what is missing.
+///
+/// The single funnel: `resolve_mnemonic` + `derive_payment_key` +
+/// `wallet_address_from_mnemonic` used to be repeated at every call site, and
+/// preflight answered "where is the wallet from" with a second implementation.
+/// Two answers to that question is how they drift apart.
+///
+/// The "both are set" case is refused earlier, at config load, where it is
+/// static. This is where "neither" surfaces, because `$HEIMDALL_MNEMONIC` is
+/// invisible to the TOML parser and plenty of commands need no wallet at all.
+pub fn resolve_wallet(cfg: &CardanoConfig) -> Result<Wallet, String> {
+    let network = if cfg.is_mainnet()? {
+        Network::Mainnet
+    } else {
+        Network::Testnet
+    };
+
+    if let Some(path) = cfg.payment_skey_path.as_deref() {
+        let key = payment_key_from_skey_file(path)?;
+        let address = cfg.wallet_address.clone().ok_or_else(|| {
+            "cardano.payment_skey_path is set but cardano.wallet_address is not — a \
+             signing key does not say where the funds are, and an SPO's usually sit at a \
+             base address whose stake half is not in the key"
+                .to_string()
+        })?;
+        check_address_matches_key(&address, &key)?;
+        return Ok(Wallet {
+            key,
+            address,
+            source: "cardano.payment_skey_path",
+        });
+    }
+
+    let (mnemonic, source) = mnemonic_from(cfg).ok_or_else(|| {
+        "no wallet key: set cardano.payment_skey_path (with cardano.wallet_address), \
+         or cardano.mnemonic, or $HEIMDALL_MNEMONIC"
+            .to_string()
+    })?;
+    let key = derive_payment_key(&mnemonic)?;
+    // A configured address still wins, and is still checked — an operator
+    // moving off the mnemonic can set it first and confirm the two agree.
+    let address = match cfg.wallet_address.clone() {
+        Some(addr) => {
+            check_address_matches_key(&addr, &key)?;
+            addr
+        }
+        None => wallet_address_from_mnemonic(&mnemonic, network)?,
+    };
+    Ok(Wallet {
+        key,
+        address,
+        source,
+    })
+}
+
+/// The mnemonic and which key supplied it. `cardano.mnemonic` wins over the
+/// environment, as it always has.
+#[must_use]
+pub fn mnemonic_from(cfg: &CardanoConfig) -> Option<(String, &'static str)> {
+    if let Some(m) = cfg.mnemonic.clone() {
+        return Some((m, "cardano.mnemonic"));
+    }
+    match std::env::var("HEIMDALL_MNEMONIC") {
+        Ok(v) if !v.trim().is_empty() => Some((v, "$HEIMDALL_MNEMONIC")),
+        _ => None,
+    }
+}
+
+/// Refuse an address whose payment credential is not this key's.
+///
+/// The whole reason a pasted address is safe. Without it, naming the wrong
+/// `payment.skey` — easy, they are all called `payment.skey` — gives a
+/// well-formed address for a wallet the operator cannot spend from, and the
+/// symptom is "no UTxOs" somewhere much later.
+///
+/// Checks the PAYMENT part only, so a base address and an enterprise address
+/// over the same key both pass: the delegation half says who earns the
+/// rewards, not who can spend.
+fn check_address_matches_key(address: &str, key: &PrivateKey) -> Result<(), String> {
+    let parsed = Address::from_bech32(address)
+        .map_err(|e| format!("cardano.wallet_address is not a bech32 address: {e}"))?;
+    let Address::Shelley(sh) = parsed else {
+        return Err(format!(
+            "cardano.wallet_address {address} is not a Shelley address — Byron and \
+             reward addresses cannot be spent from here"
+        ));
+    };
+    let want = pub_key_hash_hex(key);
+    match sh.payment() {
+        ShelleyPaymentPart::Key(h) => {
+            let got = hex::encode(h.as_ref());
+            if got != want {
+                return Err(format!(
+                    "cardano.wallet_address {address} has payment key hash {got}, but the key \
+                     hashes to {want} — the address and the signing key are not a pair, so \
+                     nothing at that address could be spent"
+                ));
+            }
+            Ok(())
+        }
+        ShelleyPaymentPart::Script(_) => Err(format!(
+            "cardano.wallet_address {address} is script-locked — heimdall signs with a payment \
+             key and cannot spend it"
+        )),
+    }
+}
+
+/// Load a cardano-cli text-envelope signing key.
+///
+/// Accepts the plain Shelley payment key (32-byte ed25519 secret) and its
+/// extended BIP32 form (96 bytes: 64-byte key + 32-byte chain code, of which
+/// only the key is needed to sign). Every other envelope `type` is refused BY
+/// NAME: a stake or cold key here would produce a perfectly valid signature
+/// for the wrong credential, which is worse than an error.
+pub fn payment_key_from_skey_file(path: &str) -> Result<PrivateKey, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cardano.payment_skey_path {path}: {e}"))?;
+    let env: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{path} is not a text envelope: {e}"))?;
+    let kind = env
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| format!("{path} has no \"type\" field — not a cardano-cli key file"))?;
+    let cbor_hex = env
+        .get("cborHex")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| format!("{path} has no \"cborHex\" field"))?;
+    let cbor = hex::decode(cbor_hex.trim()).map_err(|e| format!("{path} cborHex: {e}"))?;
+    let raw: Vec<u8> = pallas_codec::minicbor::decode::<pallas_codec::utils::Bytes>(&cbor)
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("{path} cborHex is not a CBOR byte string: {e}"))?;
+
+    match kind {
+        "PaymentSigningKeyShelley_ed25519" => {
+            let seed: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+                format!(
+                    "{path}: expected a 32-byte ed25519 secret, got {}",
+                    raw.len()
+                )
+            })?;
+            Ok(PrivateKey::from(
+                pallas_crypto::key::ed25519::SecretKey::from(seed),
+            ))
+        }
+        "PaymentExtendedSigningKeyShelley_ed25519_bip32" => {
+            let extended: [u8; 64] =
+                raw.get(..64)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "{path}: expected >= 64 bytes of extended key, got {}",
+                            raw.len()
+                        )
+                    })?;
+            let key = pallas_crypto::key::ed25519::SecretKeyExtended::from_bytes(extended)
+                .map_err(|e| format!("{path}: not a valid extended ed25519 key: {e:?}"))?;
+            Ok(PrivateKey::from(key))
+        }
+        other => Err(format!(
+            "{path} is a {other:?}. heimdall's wallet key must be a payment key — \
+             \"PaymentSigningKeyShelley_ed25519\" or \
+             \"PaymentExtendedSigningKeyShelley_ed25519_bip32\". A stake or cold key here \
+             would sign perfectly well for the wrong credential"
+        )),
+    }
+}
 
 /// CIP-1852 hardened offset: `n'` = `0x8000_0000 | n`.
 const HARDENED: u32 = 0x8000_0000;
@@ -37,7 +237,7 @@ pub fn derive_payment_key(mnemonic: &str) -> Result<PrivateKey, String> {
 /// payment key at `m/1852'/1815'/0'/0/0` + staking key at
 /// `m/1852'/1815'/0'/2/0`. This matches what Daedalus/Yoroi/cardano-cli
 /// show as the wallet's receive address.
-pub fn wallet_address_from_mnemonic(mnemonic: &str) -> Result<String, String> {
+pub fn wallet_address_from_mnemonic(mnemonic: &str, network: Network) -> Result<String, String> {
     let root = Bip32PrivateKey::from_bip39_mnenomic(mnemonic.to_string(), String::new())
         .map_err(|e| format!("mnemonic parse: {e:?}"))?;
 
@@ -64,7 +264,7 @@ pub fn wallet_address_from_mnemonic(mnemonic: &str) -> Result<String, String> {
     let skh = blake2b_224(&stk_pk);
 
     let shelley = ShelleyAddress::new(
-        Network::Testnet,
+        network,
         ShelleyPaymentPart::key_hash(pkh.into()),
         ShelleyDelegationPart::key_hash(skh.into()),
     );
@@ -76,11 +276,11 @@ pub fn wallet_address_from_mnemonic(mnemonic: &str) -> Result<String, String> {
 /// Testnet enterprise (no staking part) bech32 address for a payment
 /// key. Used for Blockfrost UTxO queries when only the payment key is
 /// available.
-pub fn wallet_address(key: &PrivateKey) -> String {
+pub fn wallet_address(key: &PrivateKey, network: Network) -> String {
     let pk_bytes: [u8; 32] = key.public_key().into();
     let pkh = blake2b_224(&pk_bytes);
     let shelley = ShelleyAddress::new(
-        Network::Testnet,
+        network,
         ShelleyPaymentPart::key_hash(pkh.into()),
         ShelleyDelegationPart::Null,
     );
@@ -109,21 +309,154 @@ mod tests {
     fn derive_payment_key_is_deterministic() {
         let k1 = derive_payment_key(TEST_MNEMONIC).unwrap();
         let k2 = derive_payment_key(TEST_MNEMONIC).unwrap();
-        assert_eq!(wallet_address(&k1), wallet_address(&k2));
+        assert_eq!(
+            wallet_address(&k1, Network::Testnet),
+            wallet_address(&k2, Network::Testnet)
+        );
     }
 
     #[test]
     fn wallet_address_is_testnet_enterprise() {
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
-        let addr = wallet_address(&key);
+        let addr = wallet_address(&key, pallas_addresses::Network::Testnet);
         assert!(addr.starts_with("addr_test1"), "got {addr}");
     }
 
     #[test]
     fn wallet_address_from_mnemonic_is_base_address() {
-        let addr = wallet_address_from_mnemonic(TEST_MNEMONIC).unwrap();
+        let addr = wallet_address_from_mnemonic(TEST_MNEMONIC, pallas_addresses::Network::Testnet)
+            .unwrap();
         // Base address prefix for testnet is addr_test1q
         assert!(addr.starts_with("addr_test1q"), "got {addr}");
+    }
+
+    /// A cardano-cli text envelope for a given 32-byte secret. Named per
+    /// test so a parallel run cannot have two of them collide.
+    fn skey_file(name: &str, kind: &str, cbor_hex: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("heimdall-skey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.skey"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"type":"{kind}","description":"Payment Signing Key","cborHex":"{cbor_hex}"}}"#
+            ),
+        )
+        .unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn cardano_cfg() -> crate::config::CardanoConfig {
+        crate::config::HeimdallConfig::default().cardano
+    }
+
+    /// The point of the feature: a plain cardano-cli payment key signs, and
+    /// the address the operator gave is used as-is.
+    #[test]
+    fn a_payment_skey_and_an_address_make_a_wallet() {
+        let seed = [7u8; 32];
+        let key = PrivateKey::from(pallas_crypto::key::ed25519::SecretKey::from(seed));
+        let addr = wallet_address(&key, Network::Testnet);
+
+        let mut cfg = cardano_cfg();
+        cfg.payment_skey_path = Some(skey_file(
+            "skey-and-address",
+            "PaymentSigningKeyShelley_ed25519",
+            &format!("5820{}", hex::encode(seed)),
+        ));
+        cfg.wallet_address = Some(addr.clone());
+
+        let w = resolve_wallet(&cfg).expect("resolves");
+        assert_eq!(w.address, addr);
+        assert_eq!(w.source, "cardano.payment_skey_path");
+        assert_eq!(pub_key_hash_hex(&w.key), pub_key_hash_hex(&key));
+    }
+
+    /// Naming the wrong `payment.skey` — they are all called `payment.skey` —
+    /// must not produce a wallet nothing can spend from.
+    #[test]
+    fn an_address_that_is_not_the_keys_is_refused() {
+        let other = PrivateKey::from(pallas_crypto::key::ed25519::SecretKey::from([9u8; 32]));
+
+        let mut cfg = cardano_cfg();
+        cfg.payment_skey_path = Some(skey_file(
+            "address-mismatch",
+            "PaymentSigningKeyShelley_ed25519",
+            &format!("5820{}", hex::encode([7u8; 32])),
+        ));
+        cfg.wallet_address = Some(wallet_address(&other, Network::Testnet));
+
+        let err = resolve_wallet(&cfg).expect_err("not a pair");
+        assert!(err.contains("not a pair"), "{err}");
+    }
+
+    /// A stake or cold key here would sign perfectly well for the wrong
+    /// credential, so the envelope type is refused by name.
+    #[test]
+    fn only_a_payment_key_envelope_is_accepted() {
+        let path = skey_file(
+            "stake-in-payment-slot",
+            "StakeSigningKeyShelley_ed25519",
+            &format!("5820{}", hex::encode([7u8; 32])),
+        );
+        let err = payment_key_from_skey_file(&path)
+            .err()
+            .expect("a stake key must be refused");
+        assert!(err.contains("StakeSigningKeyShelley_ed25519"), "{err}");
+        assert!(err.contains("must be a payment key"), "{err}");
+    }
+
+    #[test]
+    fn a_skey_without_an_address_says_why_one_is_needed() {
+        let mut cfg = cardano_cfg();
+        cfg.payment_skey_path = Some(skey_file(
+            "no-address",
+            "PaymentSigningKeyShelley_ed25519",
+            &format!("5820{}", hex::encode([7u8; 32])),
+        ));
+        let err = resolve_wallet(&cfg).expect_err("no address");
+        assert!(err.contains("cardano.wallet_address"), "{err}");
+    }
+
+    /// "Neither" is resolved here, not at config load: $HEIMDALL_MNEMONIC is
+    /// invisible to the TOML parser.
+    #[test]
+    fn no_key_at_all_names_both_ways_in() {
+        let err = resolve_wallet(&cardano_cfg()).expect_err("nothing configured");
+        assert!(err.contains("payment_skey_path"), "{err}");
+        assert!(err.contains("mnemonic"), "{err}");
+    }
+
+    /// The wallet address was the last derivation taking its network tag from
+    /// a constant, which is why mainnet could not work.
+    #[test]
+    fn the_network_tag_comes_from_the_config() {
+        let mut cfg = cardano_cfg();
+        cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
+        cfg.blockfrost_project_id = Some("preprod_xxx".into());
+        assert!(
+            resolve_wallet(&cfg)
+                .unwrap()
+                .address
+                .starts_with("addr_test1")
+        );
+
+        cfg.network = Some("mainnet".into());
+        let addr = resolve_wallet(&cfg).unwrap().address;
+        assert!(addr.starts_with("addr1"), "got {addr}");
+    }
+
+    /// A mnemonic-configured node is untouched by any of this.
+    #[test]
+    fn a_mnemonic_still_resolves_to_its_base_address() {
+        let mut cfg = cardano_cfg();
+        cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
+        let w = resolve_wallet(&cfg).expect("resolves");
+        assert_eq!(w.source, "cardano.mnemonic");
+        assert_eq!(
+            w.address,
+            wallet_address_from_mnemonic(TEST_MNEMONIC, Network::Testnet).unwrap()
+        );
     }
 
     #[test]

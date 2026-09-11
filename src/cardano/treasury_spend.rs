@@ -497,7 +497,8 @@ mod tests {
 
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let key = derive_payment_key(mnemonic).unwrap();
-        let wallet_addr = crate::cardano::wallet::wallet_address(&key);
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
         let fee_in = TxIn::PubKeyTxIn(PubKeyTxIn {
             tx_in: TxInParameter {
                 tx_hash: "aa".repeat(32),

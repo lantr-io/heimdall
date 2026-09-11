@@ -28,7 +28,7 @@ You need:
 |---|---|
 | A registered Cardano stake pool | With active stake. Your pool's **cold signing key** is needed once, at registration. |
 | A Blockfrost project id | For the network the bridge runs on. This is how the daemon reads Cardano. |
-| A funded Cardano wallet | A mnemonic. Pays fees and holds the registration's locked ADA. |
+| A funded Cardano wallet | A mnemonic, or your `payment.skey` plus its address (§3). Pays fees and holds the registration's locked ADA. |
 | A host reachable from the internet | On one TCP port, for the SPO-to-SPO protocol. See [step 5](#5-make-your-endpoint-reachable). |
 | The bridge's deployment notes | Roughly twenty values identifying the bridge you are joining, from whoever deployed it. |
 
@@ -357,16 +357,44 @@ and the operational parameters and batch schedule. **The daemon will not start u
 set** — the check in the next section reports a missing one as a hard failure, not a warning.
 
 
+### The wallet key: a mnemonic, or the `payment.skey` you already have
+
+Two ways, and **exactly one** must be set. Both set is refused at load; neither is refused when
+something first needs to sign.
+
+```toml
+# EITHER — a BIP-39 mnemonic. Leave the key out of the TOML and supply it as
+# $HEIMDALL_MNEMONIC; heimdall reads the variable only when cardano.mnemonic is absent.
+# mnemonic = "…"
+
+# OR — the cardano-cli key you already run the pool with.
+payment_skey_path = "/etc/heimdall/payment.skey"    # 0600, owned by the heimdall user
+wallet_address    = "addr_test1q…"                  # where the funds actually are
+```
+
+Most operators should prefer the second, and not only out of habit. A mnemonic has to live in
+the TOML or in `$HEIMDALL_MNEMONIC` — and an environment variable is readable from
+`systemctl show` and `/proc/<pid>/environ`, by anyone who can run them. A *path* is not a
+secret; the `0600` file it names is.
+
+`wallet_address` is required alongside the key, because a signing key does not say where the
+money is: your funds are almost certainly at the base address built from `payment.vkey` **and**
+`stake.vkey`, and the stake half is not in the signing key. Paste what
+`cardano-cli address build` gives you. Heimdall then checks that the address's payment
+credential is the hash of the key you supplied and refuses the pair if not — so naming the
+wrong `payment.skey`, which is easy when every one of them is called `payment.skey`, is caught
+at startup rather than surfacing later as an unexplained empty wallet.
+
+Only a payment key is accepted (`PaymentSigningKeyShelley_ed25519` or its `..._bip32` extended
+form). A stake or cold key in that slot is refused by name — it would otherwise sign perfectly
+well, for the wrong credential.
+
 **Secrets.** Two, and neither belongs in the TOML if you can avoid it:
 
 | secret | where to put it |
 |---|---|
-| wallet mnemonic | `HEIMDALL_MNEMONIC` in `/etc/default/heimdall` (Debian) or `-e HEIMDALL_MNEMONIC` (Docker) |
+| wallet key | `payment_skey_path` pointing at a `0600` file — or, for the mnemonic, `HEIMDALL_MNEMONIC` in `/etc/default/heimdall` (Debian) / `-e HEIMDALL_MNEMONIC` (Docker) |
 | bifrost identity key | the `0600` file from step 2, referenced by path |
-
-Heimdall reads `$HEIMDALL_MNEMONIC` **only when `cardano.mnemonic` is absent** from the config
-file. Leaving that key commented out is what activates the environment variable — and keeps the
-seed out of the file dpkg tracks and diffs on upgrade.
 
 The Blockfrost project id is also a credential. It lives in the TOML, which is why the package
 installs that file `0640 root:heimdall` rather than world-readable.
@@ -502,7 +530,7 @@ yourself, and running as root would leave root-owned files in the state director
 
 Give it the mnemonic. `/etc/default/heimdall` is read by the systemd unit, not by your shell, so
 run as `sudo -u heimdall env HEIMDALL_MNEMONIC="…" heimdall doctor …` or step 1 reports `no
-wallet mnemonic` and step 4 cannot look for the reference script. That is the first FAIL every
+wallet key` and step 4 cannot look for the reference script. That is the first FAIL every
 operator sees, and it is not a misconfiguration.
 
 This runs nine startup checks and prints all of them with the exact command that fixes each one,
@@ -515,7 +543,7 @@ other direction, if you would rather not type a second command name. When someth
 later, `heimdall doctor` is the first output to capture.
 
 ```
-[1/11]  local preflight           PASS  mnemonic from $HEIMDALL_MNEMONIC; bifrost identity key loaded
+[1/11]  local preflight           PASS  wallet key from cardano.payment_skey_path, address addr_test1q…; bifrost identity key loaded
 [2/11]  cardano connectivity      PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
 [3/11]  resolve the Config        PASS  2dce4027…#0 (12 fields, fee_rate 1 sat/vB); peg-in requests at addr_test1…
 [4/11]  reference script          …

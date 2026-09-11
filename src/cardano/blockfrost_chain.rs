@@ -51,7 +51,6 @@ use crate::cardano::treasury_datum::{
     ConfirmedTm, TreasuryConfig, TreasuryDatumError, UnconfirmedTm, parse_confirmed_tm_datum,
     parse_unconfirmed_tm,
 };
-use crate::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 use crate::epoch::state::{EpochError, EpochResult, Roster};
 use crate::epoch::traits::{
     BatchSnapshot, CardanoChain, EpochBoundaryEvent, PegOutRequestUtxo, TreasuryUtxo,
@@ -353,16 +352,11 @@ async fn resolve_script_ref(
         .as_deref()
         .ok_or_else(|| format!("{what} reference script is unset and there is no chain to find it on: set cardano.blockfrost_project_id, or cardano.{what}_ref"))?;
     let base_url = crate::cardano::bf_http::base_url(pid, cardano.blockfrost_url.as_deref());
-    let mnemonic = cardano
-        .mnemonic
-        .clone()
-        .or_else(|| {
-            std::env::var("HEIMDALL_MNEMONIC")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-        })
-        .ok_or_else(|| format!("{what} reference script is unset and this node has no wallet to look in: set cardano.mnemonic / $HEIMDALL_MNEMONIC, or cardano.{what}_ref"))?;
-    let wallet = crate::cardano::wallet::wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = crate::cardano::wallet::resolve_wallet(cardano)
+        .map_err(|e| {
+            format!("{what} reference script is unset and this node has no wallet to look in: {e}, or set cardano.{what}_ref")
+        })?
+        .address;
     let hash = script.hash_hex();
     let found = crate::cardano::ref_script::find_ref_script_anywhere(
         &base_url,
@@ -1935,17 +1929,14 @@ impl BlockfrostCardanoChain {
         self
     }
 
-    /// Configure publishing from a BIP-39 mnemonic. The payment key is
-    /// derived at `m/1852'/1815'/0'/0/0` (CIP-1852). The wallet base
-    /// address (payment_pkh + staking_pkh) is derived for UTxO queries.
-    pub fn with_mnemonic(mut self, mnemonic: &str) -> EpochResult<Self> {
-        let key = derive_payment_key(mnemonic)
-            .map_err(|e| EpochError::Chain(format!("derive payment key: {e}")))?;
-        let base_addr = wallet_address_from_mnemonic(mnemonic)
-            .map_err(|e| EpochError::Chain(format!("derive wallet address: {e}")))?;
-        self.payment_key = Some(key);
-        self.wallet_base_address = Some(base_addr);
-        Ok(self)
+    /// Configure publishing from the node's resolved wallet — a mnemonic's
+    /// derived key and base address, or a `payment.skey` and the address the
+    /// operator gave for it. Which of the two it was is settled in
+    /// [`crate::cardano::wallet::resolve_wallet`]; this only spends it.
+    pub fn with_wallet(mut self, wallet: crate::cardano::wallet::Wallet) -> Self {
+        self.payment_key = Some(wallet.key);
+        self.wallet_base_address = Some(wallet.address);
+        self
     }
 
     /// Read + decode the bridge Config UTxO (`cardano::config_params`).

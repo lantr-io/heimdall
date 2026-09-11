@@ -434,7 +434,8 @@ mod tests {
     fn bootstrap_accepts_operator_supplied_identity_root() {
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let key = derive_payment_key(mnemonic).unwrap();
-        let wallet_addr = crate::cardano::wallet::wallet_address(&key);
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
         let operator_root = [9u8; 32];
         let mut datum = bootstrap_datum(vec![0xAB; 32], mpf::NULL_HASH);
         datum.bifrost_identity_root = operator_root;
@@ -487,7 +488,8 @@ mod tests {
     fn build_bootstrap_tx_end_to_end() {
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let key = derive_payment_key(mnemonic).unwrap();
-        let wallet_addr = crate::cardano::wallet::wallet_address(&key);
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
         let script = test_script();
 
         let one_shot_hash = "bb".repeat(32);

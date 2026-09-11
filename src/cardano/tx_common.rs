@@ -708,7 +708,8 @@ mod tests {
     fn signer() -> (PrivateKey, String) {
         (
             derive_payment_key(TEST_MNEMONIC).unwrap(),
-            wallet_address_from_mnemonic(TEST_MNEMONIC).unwrap(),
+            wallet_address_from_mnemonic(TEST_MNEMONIC, pallas_addresses::Network::Testnet)
+                .unwrap(),
         )
     }
 

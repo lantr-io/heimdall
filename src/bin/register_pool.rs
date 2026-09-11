@@ -27,7 +27,7 @@ use heimdall::cardano::register_pool::{
     normal_key_from_seed, synthetic_vrf_key_hash,
 };
 use heimdall::cardano::tx_common::network_from_address;
-use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+use heimdall::cardano::wallet::resolve_wallet;
 use heimdall::config::HeimdallConfig;
 use tracing::{error, info};
 
@@ -132,25 +132,12 @@ fn parse_key32(arg: &str) -> Result<[u8; 32], String> {
     Ok(bytes.try_into().unwrap())
 }
 
-fn resolve_mnemonic(cfg: &HeimdallConfig) -> Result<String, String> {
-    cfg.cardano
-        .mnemonic
-        .clone()
-        .or_else(|| {
-            std::env::var("HEIMDALL_MNEMONIC")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-        })
-        .ok_or_else(|| "no mnemonic (set cardano.mnemonic or $HEIMDALL_MNEMONIC)".to_string())
-}
-
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
     let cfg = HeimdallConfig::from_file(&cli.config).map_err(|e| e.to_string())?;
 
-    let mnemonic = resolve_mnemonic(&cfg)?;
-    let payment_key = derive_payment_key(&mnemonic)?;
-    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+    let wallet = resolve_wallet(&cfg.cardano)?;
+    let (payment_key, wallet_addr) = (wallet.key, wallet.address);
     let wallet_payment_pkh = key_hash(&payment_key);
 
     let cold_seed = parse_key32(&cli.cold_skey)?;
