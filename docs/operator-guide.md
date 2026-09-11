@@ -134,7 +134,10 @@ printf 'HEIMDALL_MNEMONIC=%s\n' "$HEIMDALL_MNEMONIC" | sudo tee -a /etc/default/
 Copy the exact bytes of `config_address` and `config_nft_policy_id` – never retype them. One
 wrong character passes the TOML parser and fails at `[3/11]`.
 
-**4. Check** – [§4](#4-check-it-before-going-further). The mnemonic has to be in *this* command's
+**4. Check** – [§4](#4-check-it-before-going-further). On a bridge that already has history a new
+node reports `[10/11] local tries FAIL`; that is expected and `run-spo` clears it itself at
+startup — see [The node seeds its own state](#the-node-seeds-its-own-state). The mnemonic has to
+be in *this* command's
 environment: `/etc/default/heimdall` is read by the unit, not by your shell.
 
 ```bash
@@ -204,6 +207,37 @@ from source, is [below](#building-from-source).
 
 **<https://github.com/lantr-io/heimdall/releases>** — that page is what tells you the `<version>`
 to substitute into the commands below. `…/releases/latest` redirects to the newest one.
+
+**The current release is `v0.1-M5.5`.** Everything below is written with `<version>` left as a
+placeholder on purpose, so the commands stay correct after the next one; substitute `0.1-M5.5`
+(or whatever `…/releases/latest` shows) as you paste. What it adds over `v0.1-M5.4`:
+
+- **Two new startup checks.** `[10/11] local tries` compares this node's `cpo-trie.json` and
+  `spi-trie.json` against the bridge-state singleton, and `[11/11] wallet collateral` warns
+  before the wallet can no longer post a script transaction. Both are faults that used to be
+  silent until a movement failed — see [§4](#4-check-it-before-going-further).
+- **The node seeds and catches up its own state.** A new node, or one that was stopped while a
+  movement completed, rebuilds both tries from Cardano history at startup instead of sitting
+  inert until an operator notices. Loudly, because a node that does it at every start is losing
+  its state directory — see [The node seeds its own state](#the-node-seeds-its-own-state).
+- **`heimdall ensure-collateral`.** A wallet whose ADA all sits behind native tokens could not
+  pay a fee, offer collateral, or build the transaction that would have split itself a clean
+  UTxO. It can now; the new command does the split.
+- **A `payment.skey` may be the wallet key**, instead of a mnemonic — see
+  [§3](#the-wallet-key-a-mnemonic-or-the-paymentskey-you-already-have). Existing mnemonic
+  configs are unaffected.
+
+**This one does not have to be roster-wide.** The pre-ceremony handshake compares the build's
+MINOR SERIES (`0.1`, from the crate version — not the milestone in the tag) and the
+`blueprint_digest`. `v0.1-M5.4` and `v0.1-M5.5` agree on both, and no contract changed, so the
+two interoperate and you can upgrade one node at a time. That is not true of every release —
+see [Upgrades](#upgrades) for how to tell.
+
+**Expect a rebuild on first start.** Any node whose tries are behind — which includes every node
+that was stopped while a movement completed — rebuilds them from chain history as it comes up,
+and says so. That is a few seconds on this bridge, and it replaces a fault that used to leave a
+node co-signing nothing until somebody noticed. A node that reports it at *every* restart is
+losing its state directory, and that is worth chasing.
 
 Every release is one workflow run over one commit, and it publishes the same binary three ways:
 
@@ -533,66 +567,63 @@ run as `sudo -u heimdall env HEIMDALL_MNEMONIC="…" heimdall doctor …` or ste
 wallet key` and step 4 cannot look for the reference script. That is the first FAIL every
 operator sees, and it is not a misconfiguration.
 
-This runs nine startup checks and prints all of them with the exact command that fixes each one,
+This runs eleven startup checks and prints all of them with the exact command that fixes each one,
 then exits non-zero if any failed. It reads the chain and **posts nothing** — a missing reference
 script and an unregistered SPO are both reported, never deployed or registered for you.
 
-`heimdall doctor` runs the same checks the daemon runs when it starts, by calling the same code, so
-the two cannot disagree about what is wrong. `run-spo --check` is the same thing reached from the
-other direction, if you would rather not type a second command name. When something goes wrong
-later, `heimdall doctor` is the first output to capture.
+### The node seeds its own state
+
+The two tries are cumulative — the bridge's record of what has already been paid and already been
+swept — and a node cannot invent them. A new node on a bridge with history has neither, and one
+that was stopped while a movement completed is behind: it never recorded that movement, so it
+never folded it.
+
+**`run-spo` fixes both itself, at startup.** Before the checks run it compares its tries against
+the bridge-state singleton and, if they are absent or behind, rebuilds them from Cardano history:
 
 ```
-[1/11]  local preflight           PASS  wallet key from cardano.payment_skey_path, address addr_test1q…; bifrost identity key loaded
-[2/11]  cardano connectivity      PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
-[3/11]  resolve the Config        PASS  2dce4027…#0 (12 fields, fee_rate 1 sat/vB); peg-in requests at addr_test1…
-[4/11]  reference script          …
-[5/11]  ban list                  PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (detection only)
-[6/11]  registration status       …
-[7/11]  key handoff (Update-Y)    …
-[8/11]  federation identity       PASS  Y_fed 37b381ac…, csv 144 blocks — published in the Config datum
-[9/11]  post a movement           PASS  TM validator f691433e… on chain, 4032 bytes, verified against Config #5
-[10/11] local tries               PASS  cpo and spi match the bridge-state singleton (cpo_root c88736be…)
-[11/11] wallet collateral         PASS  2 ada-only UTxO(s) of >= 5000000 lovelace across 3 UTxO(s)
+⚠ local tries behind the chain — never seeded (cpo, spi absent). Rebuilding both from
+  Cardano history before starting; this node could neither build nor co-sign until they match
+  [cpo] reconstructed root matches the bridge state singleton's cpo_root (c88736be…)
+  [spi] reconstructed root matches the bridge state singleton's spi_root (265fdb3f…)
+⚠ tries rebuilt from chain history and now match the bridge-state singleton
+[10/11] local tries   PASS  cpo and spi match the bridge-state singleton
 ```
 
-Step 3's field count is the datum's, and **more than twelve is normal** — the Config grows by
-appending, and a reader decodes the twelve it knows and ignores the rest. Fewer than twelve is a
-bridge older than this build, and it fails.
+Every movement is on chain, so nothing here needs you. The walk refuses to persist a root the
+singleton does not attest, so it cannot invent state either, and a node already in sync does
+nothing at all — one read, no rebuild.
 
-Step 3 is the one that earns its keep: it resolves the Config UTxO, and everything the node knows
-about the bridge follows from it. Step 5 confirms your roster is ban-filtered — it fails if the
-registry is configured without a ban list, since that node could not agree with its peers on who is
-in the DKG.
-Step 6 tells you whether this node is registered; it never spends — it names the command and stops.
+**Both lines are warnings on purpose, and they reach Discord.** A node that rebuilds once is a new
+node, or one that missed a batch. A node that rebuilds at *every* start is losing its state
+directory between runs — a wiped volume, a deploy that recreates `/var/lib/heimdall` — and that is
+worth knowing about, so it is said loudly rather than healed in silence.
 
-Step 9 asks the question the rest of the report does not: **can this node actually post the
-movement it would sign?** Minting the TM NFT needs the treasury-movement validator itself, not
-just its hash, and the node fetches it from the chain by the hash the Config publishes (#5),
-refusing any bytes that do not hash back to it. Nothing here is yours to configure — that is the
-point. It used to be a CBOR string pasted into the config file, and a node missing it passed every
-other check, took a full turn in a signing ceremony, and failed at the mint, having already
-broadcast the Bitcoin transaction. That is why this one is a **FAIL** and not a warning.
+`heimdall doctor` and `run-spo --check` do **not** do this. They are read-only, and a command you
+run to see what a start *would* do must not change the state directory first — so on a new node
+they report the `FAIL` rather than clearing it:
 
-Only `FAIL` blocks startup. A `WARN` is worth reading, and steps 4 and 7 are the two you will most
-often see one on:
+```
+[10/11] local tries  FAIL  no cpo-trie.json, no spi-trie.json, and the bridge has history
+                           (cpo_root c88736be…)
+        -> EXPECTED on a node that has not run before … Run `heimdall reconstruct-tries`
+```
 
-- **Step 4 (`reference script`)** warns when the registry reference script is not deployed at your
-  wallet. That script is only needed to *register*; a running daemon reads the roster without it.
-- **Step 7 (`key handoff`)** warns when this node cannot compile the `treasury_info` script. It
-  still runs DKG and signs — but if it is elected leader for an epoch, the Update-Y that hands the
-  treasury to the new group key fails, and the handoff does not happen. Set
-  `cardano.config_nft_policy_id` to clear it — the one-shot the script compiles from is Config
-  #12, and the node reads it from there.
+That is the command to run by hand if you would rather seed before the first start, or if the
+automatic rebuild failed and you want to see why:
 
-`protocol.state_dir` is **not** in that list any more. It used to warn; it is now a step 1
-**FAIL**, because what it costs is a second payment of an already-paid peg-out rather than a
-degraded feature, and a warning is the wrong instrument for a fault whose symptom arrives an
-epoch later on a different machine.
+```bash
+sudo -u heimdall heimdall reconstruct-tries --config /etc/heimdall/heimdall.toml --dry-run
+sudo -u heimdall heimdall reconstruct-tries --config /etc/heimdall/heimdall.toml
+```
 
-Do not continue until this passes.
+A genuinely new bridge — no peg-out completed, no peg-in swept — has all-zero roots, and a node
+with no files is correct. That is also why this went unnoticed for two weeks on preprod: the check
+only has something to say once the bridge has history.
 
----
+Both walks read chain history one transaction at a time over Blockfrost — seconds on this bridge,
+longer as it grows. `cardano.kupo_url`, if you run Kupo, answers a whole address history in one
+request instead.
 
 ## 5. Make your endpoint reachable
 
@@ -975,13 +1006,14 @@ WI-058]**, which adds a periodic heartbeat and a `heimdall status` command, beca
 |---|---|
 | bifrost identity key | re-registration |
 | DKG signing share | the current epoch — the node sits out until the next boundary |
-| `cpo-trie.json`, `spi-trie.json` | a rebuild: `heimdall reconstruct-cpo-trie` / `reconstruct-spi-trie` walk chain history and refuse anything they cannot explain |
+| `cpo-trie.json`, `spi-trie.json` | a rebuild: nothing — `run-spo` rebuilds both from chain history at its next start, loudly ([The node seeds its own state](#the-node-seeds-its-own-state)) |
 | `pending-tm.json` | the fold for one posted movement, which then needs the same rebuild |
 
 Back the directory up. The two tries are **cumulative** — they are the bridge's record of what has
 already been paid and already been swept — so a node whose tries are behind the chain refuses to
-build rather than sign a root the chain does not hold. That refusal is loud and it names the
-command; it is not a state you can wait out.
+build rather than sign a root the chain does not hold. Since `v0.1-M5.5` the startup checks catch
+that before the daemon runs rather than at the first movement; either way the refusal is loud and
+names the command, and it is not a state you can wait out.
 
 `pending-tm.json` is the movement this node has posted and not yet folded. It exists because
 confirmation takes ~17 hours, and the node must be free to restart during them.
@@ -1000,10 +1032,27 @@ shipped default is offered as a merge rather than applied silently. `/etc/defaul
 diffed at all. The service restarts only if it was already running. `apt purge` deliberately leaves
 `/var/lib/heimdall` and the `heimdall` user in place.
 
-**Upgrade the roster together.** A node whose build the others will not run a ceremony with is
-excluded from every ceremony until they match – and the exclusion is reported on *both* sides as
-the other one lagging. Agree a commit and an epoch boundary with the other operators, and restart
-every node before it. Upgrading one node ahead of the roster removes it from the roster.
+**Check first whether the roster has to move together.** A node whose build the others will not
+run a ceremony with is excluded from every ceremony until they match — and the exclusion is
+reported on *both* sides as the other one lagging. But not every release forces that. The
+pre-ceremony handshake compares two things:
+
+| compared | changes when |
+|---|---|
+| the build's **minor series** — `0.1` from the crate version, NOT the `M5.x` milestone in the tag | a release bumps the crate's major or minor version |
+| `blueprint_digest` | the Aiken contracts change |
+
+Both are on `/health`, so `curl -s http://<peer>/health` against a node already on the new
+release answers it before you install anything. Same pair on both sides, and you can upgrade one
+node at a time. Either differs, and you must agree a commit and an epoch boundary with the other
+operators and restart every node before it — upgrading one node ahead of the roster removes it
+from the roster.
+
+**Run `heimdall doctor` before you install, not after.** The startup checks are a gate: a `Fail`
+stops the daemon. A new release can add a check that a node has been quietly failing for weeks —
+step 10 (`local tries`) did exactly that — so a node that ran yesterday can refuse to start
+today. Finding that out while the old binary is still serving gives you a working node to fix it
+from.
 
 ### Leaving the bridge
 

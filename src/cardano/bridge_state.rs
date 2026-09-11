@@ -393,3 +393,145 @@ mod tests {
         );
     }
 }
+
+/// How this node's persisted tries stand against the roots the bridge attests.
+///
+/// One reader for two callers that must never disagree: the startup catch-up
+/// decides whether to rebuild from it, and preflight step 10 reports from it.
+/// Two implementations of "is my state current" is how a node heals a fault the
+/// check still reports, or reports one it has already healed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriesStatus {
+    /// Both match what the singleton attests — including the case where the
+    /// bridge has no history and this node correctly has no files.
+    InSync,
+    /// Files absent where the chain has history. Every new node starts here,
+    /// and it is not a fault in the node — it has no starting point yet.
+    NeverSeeded { missing: Vec<&'static str> },
+    /// Files present and disagreeing. Different in kind: this node holds state
+    /// the chain contradicts, and it can neither build nor co-sign until it is
+    /// reconciled.
+    Diverged { detail: Vec<String> },
+}
+
+impl TriesStatus {
+    #[must_use]
+    pub fn in_sync(&self) -> bool {
+        matches!(self, Self::InSync)
+    }
+}
+
+/// Compare the tries in `state_dir` against the roots the bridge-state
+/// singleton attests.
+///
+/// A trie that cannot be READ counts as diverged rather than absent: a corrupt
+/// file is state this node cannot account for, and treating it as "never
+/// seeded" would silently overwrite it.
+#[must_use]
+pub fn local_tries_status(
+    state_dir: &std::path::Path,
+    chain_cpo_root: [u8; 32],
+    chain_spi_root: [u8; 32],
+) -> TriesStatus {
+    let cpo = crate::cardano::cpo_trie::CpoTrie::load(state_dir).map(|t| t.map(|t| t.root()));
+    let spi = crate::cardano::spi_trie::SpiTrie::load(state_dir).map(|t| t.map(|t| t.root()));
+
+    let mut missing: Vec<&'static str> = Vec::new();
+    let mut detail: Vec<String> = Vec::new();
+    for (what, local, want) in [
+        ("cpo", cpo.map_err(|e| e.to_string()), chain_cpo_root),
+        ("spi", spi.map_err(|e| e.to_string()), chain_spi_root),
+    ] {
+        match local {
+            Err(e) => detail.push(format!("{what}-trie.json cannot be read: {e}")),
+            Ok(None) if want == [0u8; 32] => {}
+            Ok(None) => missing.push(what),
+            Ok(Some(root)) if root != want => detail.push(format!(
+                "{what} root {} != the chain's {}",
+                hex::encode(root),
+                hex::encode(want)
+            )),
+            Ok(Some(_)) => {}
+        }
+    }
+    if !detail.is_empty() {
+        TriesStatus::Diverged { detail }
+    } else if !missing.is_empty() {
+        TriesStatus::NeverSeeded { missing }
+    } else {
+        TriesStatus::InSync
+    }
+}
+
+#[cfg(test)]
+mod tries_status_tests {
+    use super::*;
+    use crate::cardano::cpo_trie::CpoTrie;
+    use crate::cardano::spi_trie::SpiTrie;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("heimdall-tries-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        // Each test owns its directory; leftovers from a previous run would
+        // make "never seeded" pass for the wrong reason.
+        let _ = std::fs::remove_file(d.join("cpo-trie.json"));
+        let _ = std::fs::remove_file(d.join("spi-trie.json"));
+        d
+    }
+
+    /// A brand-new bridge has all-zero roots, and a node with no files is
+    /// correct — which is exactly why the spo4 fault stayed invisible until
+    /// the first peg-out moved the root off zero.
+    #[test]
+    fn no_files_against_a_bridge_with_no_history_is_in_sync() {
+        let d = dir("fresh-bridge");
+        assert_eq!(
+            local_tries_status(&d, [0u8; 32], [0u8; 32]),
+            TriesStatus::InSync
+        );
+    }
+
+    /// Every new node on a live bridge. Not a fault in the node — it has no
+    /// starting point — and the distinction is what the daemon keys its
+    /// self-seeding on.
+    #[test]
+    fn no_files_against_a_bridge_with_history_is_never_seeded() {
+        let d = dir("new-node");
+        let status = local_tries_status(&d, [0xc8u8; 32], [0x26u8; 32]);
+        assert_eq!(
+            status,
+            TriesStatus::NeverSeeded {
+                missing: vec!["cpo", "spi"]
+            }
+        );
+        assert!(!status.in_sync());
+    }
+
+    /// Present and disagreeing is a different kind of fault: this node holds
+    /// state the chain contradicts.
+    #[test]
+    fn files_that_disagree_with_the_chain_are_diverged() {
+        let d = dir("diverged");
+        CpoTrie::empty().save(&d).unwrap();
+        SpiTrie::empty().save(&d).unwrap();
+        let TriesStatus::Diverged { detail } = local_tries_status(&d, [0xc8u8; 32], [0x26u8; 32])
+        else {
+            panic!("empty tries against a bridge with history disagree");
+        };
+        assert_eq!(detail.len(), 2, "{detail:?}");
+        assert!(detail[0].contains("cpo root"), "{detail:?}");
+    }
+
+    #[test]
+    fn files_that_match_are_in_sync() {
+        let d = dir("in-sync");
+        CpoTrie::empty().save(&d).unwrap();
+        SpiTrie::empty().save(&d).unwrap();
+        let empty_cpo = CpoTrie::empty().root();
+        let empty_spi = SpiTrie::empty().root();
+        assert_eq!(
+            local_tries_status(&d, empty_cpo, empty_spi),
+            TriesStatus::InSync
+        );
+    }
+}

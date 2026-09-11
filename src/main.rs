@@ -935,6 +935,22 @@ enum Commands {
     /// Both run the SAME algorithm. Every step is checked against the root each
     /// Treasury Movement attested, so a garbled data-availability hint costs time,
     /// never correctness.
+    /// Seed BOTH cumulative tries from Cardano history — what a new node runs
+    /// once before its first start, and what a node whose state directory lost
+    /// them runs to get back.
+    ///
+    /// Just `reconstruct-cpo-trie` followed by `reconstruct-spi-trie`. It
+    /// exists because they are one step, not two: a node needs both to build a
+    /// movement, the startup check reports them together, and an operator
+    /// running only the first is left with a node that still will not start.
+    ReconstructTries {
+        #[arg(long)]
+        config: Option<String>,
+        /// Print both reconstructed roots and entry counts without writing
+        /// either file.
+        #[arg(long)]
+        dry_run: bool,
+    },
     ReconstructCpoTrie {
         #[arg(long)]
         config: Option<String>,
@@ -1139,6 +1155,87 @@ async fn fetch_node_state(bind: &str) -> Result<heimdall::health::NodeState, Str
 /// to see WHICH bridge and WHICH contracts this node resolved, not merely that it
 /// started. Nothing here spends: steps 4 and 6 — the reference script and the
 /// registration — name the command and stop.
+/// Bring the cumulative tries up to the chain before the startup gate looks at
+/// them, rebuilding from Cardano history when they are absent or behind.
+///
+/// Why this exists: the tries only advance through [`settle_pending_tm`], which
+/// folds a movement THIS node recorded. A node that was down while a movement
+/// completed records nothing, so there is nothing to fold and no catch-up — and
+/// a node whose tries are behind can neither build (`cross_check_bridge_roots`)
+/// nor co-sign (`verify_committed_root` refuses). It is not degraded, it is
+/// inert, and until now the only way out was an operator noticing and running
+/// `reconstruct-tries` by hand.
+///
+/// Every movement is on chain, so the node has no need of a human for this. The
+/// walk is the same one `reconstruct-tries` does, with the same discipline: it
+/// refuses to persist a root the bridge-state singleton does not attest, so it
+/// cannot invent state. A new node seeds itself here too.
+///
+/// LOUD on purpose. A node that heals this at every start is losing state
+/// between runs — a failing disk, a deploy that wipes the state dir — and
+/// silently repairing it is how spo4 went unnoticed for two weeks. The event
+/// goes to the operator's log and out to Discord.
+///
+/// Never fatal. A rebuild that fails leaves the tries as they were, and the
+/// preflight gate immediately after is what refuses to start and says why —
+/// one voice for that, not two.
+fn catch_up_tries(cfg: &HeimdallConfig) {
+    use heimdall::cardano::bridge_state::{TriesStatus, local_tries_status};
+
+    let Some(dir) = cfg.protocol.state_dir.as_deref() else {
+        return;
+    };
+    let Some(project_id) = cfg.cardano.blockfrost_project_id.clone() else {
+        return;
+    };
+    let Ok(bridge) = resolve_bridge_contracts(cfg) else {
+        return; // The gate reports an unresolvable Config far better than this could.
+    };
+    let Ok(rt) = tokio::runtime::Runtime::new() else {
+        return;
+    };
+    let history = heimdall::cardano::cpo_history::BlockfrostHistory::new(
+        &project_id,
+        cfg.cardano.blockfrost_url.as_deref(),
+    );
+    let Ok(chain) = rt.block_on(heimdall::cardano::bridge_state::fetch_bridge_state(
+        &history,
+        &bridge.bridge_state_policy_id,
+    )) else {
+        return; // Provider trouble: step 10 reports it as a Warn.
+    };
+
+    let dir = std::path::Path::new(dir);
+    let what = match local_tries_status(dir, chain.cpo_root, chain.spi_root) {
+        TriesStatus::InSync => return,
+        TriesStatus::NeverSeeded { missing } => {
+            format!("never seeded ({} absent)", missing.join(", "))
+        }
+        TriesStatus::Diverged { detail } => detail.join("; "),
+    };
+
+    warn!(
+        target: "heimdall::event",
+        "local tries behind the chain — {what}. Rebuilding both from Cardano history \
+         before starting; this node could neither build nor co-sign until they match"
+    );
+    if let Err(e) =
+        run_reconstruct_cpo_trie(cfg, false).and_then(|()| run_reconstruct_spi_trie(cfg, false))
+    {
+        warn!(
+            target: "heimdall::event",
+            "rebuilding the tries from chain history FAILED: {e}. Startup checks below \
+         decide whether this node can run"
+        );
+        return;
+    }
+    warn!(
+        target: "heimdall::event",
+        "tries rebuilt from chain history and now match the bridge-state singleton. If \
+         this happens at every start, this node is losing its state directory between runs"
+    );
+}
+
 fn run_preflight_gate(cfg: &HeimdallConfig) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let report = rt.block_on(heimdall::preflight::preflight(cfg));
@@ -1405,6 +1502,17 @@ fn main() {
             // This is the packaged daemon now, so it is the one that has to
             // refuse to start on a misconfiguration rather than join a ceremony
             // with a bridge view that disagrees with everyone else's.
+            // Before the gate, so the gate VERIFIES the result rather than
+            // refusing over something the node could have fixed itself.
+            //
+            // NOT under `--check`. That mode and `heimdall doctor` are
+            // advertised as read-only — "reads the chain and posts nothing" —
+            // and an operator running it to see what a start WOULD do must
+            // not have it quietly change the state directory first. Under
+            // `--check` the gate reports the tries as they actually stand.
+            if !check {
+                catch_up_tries(&cfg);
+            }
             if let Err(e) = run_preflight_gate(&cfg) {
                 error!("Error: {e}");
                 std::process::exit(1);
@@ -1984,6 +2092,24 @@ fn main() {
             if let Err(e) = run_show_config_params(&cfg) {
                 error!("Error: {e}");
                 std::process::exit(1);
+            }
+        }
+        Commands::ReconstructTries { config, dry_run } => {
+            let cfg = load_config(config.as_deref());
+            // Both, in order, and stop at the first failure: the second walk
+            // reads the same chain, so whatever broke the first breaks it too.
+            let both = run_reconstruct_cpo_trie(&cfg, dry_run)
+                .and_then(|()| run_reconstruct_spi_trie(&cfg, dry_run));
+            if let Err(e) = both {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+            if dry_run {
+                println!("(dry run — neither file written; re-run without --dry-run to seed)");
+            } else {
+                println!(
+                    "both tries written. `heimdall doctor` should now report `local tries  PASS`"
+                );
             }
         }
         Commands::ReconstructCpoTrie { config, dry_run } => {
