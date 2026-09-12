@@ -393,3 +393,194 @@ mod tests {
         );
     }
 }
+
+/// How this node's persisted tries stand against the roots the bridge attests.
+///
+/// One reader for two callers that must never disagree: the startup catch-up
+/// decides whether to rebuild from it, and preflight step 10 reports from it.
+/// Two implementations of "is my state current" is how a node heals a fault the
+/// check still reports, or reports one it has already healed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriesStatus {
+    /// Both match what the singleton attests — including the case where the
+    /// bridge has no history and this node correctly has no files.
+    InSync,
+    /// Files absent where the chain has history. Every new node starts here,
+    /// and it is not a fault in the node — it has no starting point yet.
+    NeverSeeded { missing: Vec<&'static str> },
+    /// At least one file present and disagreeing. Different in kind: this node
+    /// holds state the chain contradicts, and it can neither build nor co-sign
+    /// until it is reconciled.
+    ///
+    /// `missing` rides along rather than being dropped: one trie diverged and
+    /// the other absent is a real combination, and an operator diagnosing by
+    /// hand needs to hear about both files, not the louder one.
+    Diverged {
+        detail: Vec<String>,
+        missing: Vec<&'static str>,
+    },
+    /// A file exists and cannot be parsed — truncated by a crash, unreadable
+    /// after a permission change, or written by a version this build does not
+    /// understand.
+    ///
+    /// Its own case, not `Diverged`, for two reasons. The operator's fix is
+    /// different: "this node's state disagrees with the chain" sends someone
+    /// hunting a consensus fault when the answer is `chown`. And the CHAIN may
+    /// not have moved at all, so a movement this node posted can still be in
+    /// flight — which decides whether its pending record may be dropped.
+    Unreadable { detail: Vec<String> },
+}
+
+/// Compare the tries in `state_dir` against the roots the bridge-state
+/// singleton attests.
+///
+/// A trie that cannot be READ counts as diverged rather than absent: a corrupt
+/// file is state this node cannot account for, and treating it as "never
+/// seeded" would silently overwrite it.
+#[must_use]
+pub fn local_tries_status(
+    state_dir: &std::path::Path,
+    chain_cpo_root: [u8; 32],
+    chain_spi_root: [u8; 32],
+) -> TriesStatus {
+    let cpo = crate::cardano::cpo_trie::CpoTrie::load(state_dir).map(|t| t.map(|t| t.root()));
+    let spi = crate::cardano::spi_trie::SpiTrie::load(state_dir).map(|t| t.map(|t| t.root()));
+
+    let mut missing: Vec<&'static str> = Vec::new();
+    let mut detail: Vec<String> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+    for (what, local, want) in [
+        ("cpo", cpo.map_err(|e| e.to_string()), chain_cpo_root),
+        ("spi", spi.map_err(|e| e.to_string()), chain_spi_root),
+    ] {
+        match local {
+            Err(e) => unreadable.push(format!("{what}-trie.json cannot be read: {e}")),
+            Ok(None) if want == crate::cardano::cpo_trie::EMPTY_ROOT => {}
+            Ok(None) => missing.push(what),
+            Ok(Some(root)) if root != want => detail.push(format!(
+                "{what} root {} != the chain's {}",
+                hex::encode(root),
+                hex::encode(want)
+            )),
+            Ok(Some(_)) => {}
+        }
+    }
+    if !unreadable.is_empty() {
+        // Ahead of the others: an unparseable file is the fault to report, and
+        // whatever the other trie says cannot be acted on until it is fixed.
+        TriesStatus::Unreadable { detail: unreadable }
+    } else if !detail.is_empty() {
+        TriesStatus::Diverged { detail, missing }
+    } else if !missing.is_empty() {
+        TriesStatus::NeverSeeded { missing }
+    } else {
+        TriesStatus::InSync
+    }
+}
+
+#[cfg(test)]
+mod tries_status_tests {
+    use super::*;
+    use crate::cardano::cpo_trie::CpoTrie;
+    use crate::cardano::spi_trie::SpiTrie;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("heimdall-tries-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        // Each test owns its directory; leftovers from a previous run would
+        // make "never seeded" pass for the wrong reason.
+        let _ = std::fs::remove_file(d.join("cpo-trie.json"));
+        let _ = std::fs::remove_file(d.join("spi-trie.json"));
+        d
+    }
+
+    /// A brand-new bridge has all-zero roots, and a node with no files is
+    /// correct — which is exactly why the spo4 fault stayed invisible until
+    /// the first peg-out moved the root off zero.
+    #[test]
+    fn no_files_against_a_bridge_with_no_history_is_in_sync() {
+        let d = dir("fresh-bridge");
+        assert_eq!(
+            local_tries_status(&d, [0u8; 32], [0u8; 32]),
+            TriesStatus::InSync
+        );
+    }
+
+    /// Every new node on a live bridge. Not a fault in the node — it has no
+    /// starting point — and the distinction is what the daemon keys its
+    /// self-seeding on.
+    #[test]
+    fn no_files_against_a_bridge_with_history_is_never_seeded() {
+        let d = dir("new-node");
+        let status = local_tries_status(&d, [0xc8u8; 32], [0x26u8; 32]);
+        assert_eq!(
+            status,
+            TriesStatus::NeverSeeded {
+                missing: vec!["cpo", "spi"]
+            }
+        );
+    }
+
+    /// Present and disagreeing is a different kind of fault: this node holds
+    /// state the chain contradicts.
+    #[test]
+    fn files_that_disagree_with_the_chain_are_diverged() {
+        let d = dir("diverged");
+        CpoTrie::empty().save(&d).unwrap();
+        SpiTrie::empty().save(&d).unwrap();
+        let TriesStatus::Diverged { detail, .. } =
+            local_tries_status(&d, [0xc8u8; 32], [0x26u8; 32])
+        else {
+            panic!("empty tries against a bridge with history disagree");
+        };
+        assert_eq!(detail.len(), 2, "{detail:?}");
+        assert!(detail[0].contains("cpo root"), "{detail:?}");
+    }
+
+    /// The combination `Diverged.missing` exists to carry, and the one the
+    /// earlier version silently dropped: an operator diagnosing this by hand
+    /// has to hear that the second file is GONE, not only that the first
+    /// disagrees.
+    #[test]
+    fn one_trie_diverged_and_the_other_absent_reports_both() {
+        let d = dir("mixed");
+        CpoTrie::empty().save(&d).unwrap();
+        let TriesStatus::Diverged { detail, missing } =
+            local_tries_status(&d, [0xc8u8; 32], [0x26u8; 32])
+        else {
+            panic!("a stale cpo trie beside an absent spi trie is diverged");
+        };
+        assert_eq!(detail.len(), 1, "{detail:?}");
+        assert!(detail[0].starts_with("cpo root"), "{detail:?}");
+        assert_eq!(missing, vec!["spi"], "the absent file must not be dropped");
+    }
+
+    /// A file that exists and cannot be parsed is its own fault: the operator's
+    /// fix is `chown`, not a consensus investigation, and the chain may not
+    /// have moved at all — which decides whether a pending record may be
+    /// dropped.
+    #[test]
+    fn an_unparseable_file_is_not_a_disagreement() {
+        let d = dir("unreadable");
+        std::fs::write(d.join("cpo-trie.json"), b"not json").unwrap();
+        SpiTrie::empty().save(&d).unwrap();
+        let status = local_tries_status(&d, [0xc8u8; 32], SpiTrie::empty().root());
+        let TriesStatus::Unreadable { detail } = status else {
+            panic!("got {status:?}, wanted Unreadable");
+        };
+        assert!(detail[0].contains("cannot be read"), "{detail:?}");
+    }
+
+    #[test]
+    fn files_that_match_are_in_sync() {
+        let d = dir("in-sync");
+        CpoTrie::empty().save(&d).unwrap();
+        SpiTrie::empty().save(&d).unwrap();
+        let empty_cpo = CpoTrie::empty().root();
+        let empty_spi = SpiTrie::empty().root();
+        assert_eq!(
+            local_tries_status(&d, empty_cpo, empty_spi),
+            TriesStatus::InSync
+        );
+    }
+}
