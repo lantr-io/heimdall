@@ -1590,6 +1590,24 @@ fn main() {
             // is unchanged: CLI --cardano-mnemonic > cardano.mnemonic >
             // $HEIMDALL_MNEMONIC.
 
+            // `load_config` validates the TOML document. These flags can replace
+            // its values, so validate the merged configuration too: `run-spo
+            // --check` must catch the exact process settings the daemon would
+            // start with, not merely the file before overrides.
+            if let Err(e) = cfg.validate() {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+            if let Some(ix) = index {
+                if ix == 0 || ix > cfg.demo.max_signers {
+                    error!(
+                        "Error: --index must be between 1 and demo.max_signers ({})",
+                        cfg.demo.max_signers
+                    );
+                    std::process::exit(1);
+                }
+            }
+
             // WI-053's startup gate, which used to run only in `run-mover`.
             // This is the packaged daemon now, so it is the one that has to
             // refuse to start on a misconfiguration rather than join a ceremony
@@ -1638,6 +1656,10 @@ fn main() {
             if let Some(v) = federation_csv_blocks {
                 cfg.bitcoin.federation_csv_blocks = Some(u32::from(v));
             }
+            if let Err(e) = cfg.validate() {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
             if let Err(e) = print_bootstrap_treasury(&cfg) {
                 error!("Error: {e}");
                 std::process::exit(1);
@@ -1652,6 +1674,10 @@ fn main() {
             let mut cfg = load_config(config.as_deref());
             if let Some(v) = federation_csv_blocks {
                 cfg.bitcoin.federation_csv_blocks = Some(u32::from(v));
+            }
+            if let Err(e) = cfg.validate() {
+                error!("Error: {e}");
+                std::process::exit(1);
             }
             if let Err(e) =
                 print_frost_treasury(&cfg, frost_key.as_deref(), y_federation.as_deref())
@@ -2244,9 +2270,9 @@ fn main() {
 /// `cardano.tm_script_cbor` until WI-HJ1N5; nothing is typed now, and a node that
 /// cannot resolve it refuses to start rather than discovering it after a ceremony.
 ///
-/// `cardano.config_address` and `cardano.config_nft_policy_id` must still be
-/// configured together — the Config UTxO locates the bridge-state singleton the
-/// mint redeemer links against. Errors on a half-configured set.
+/// The three Config locator values must still be configured together — the
+/// Config UTxO locates the bridge-state singleton the mint redeemer links
+/// against. Errors on a half-configured set.
 async fn apply_tm_policy(
     chain: BlockfrostCardanoChain,
     cfg: &HeimdallConfig,
@@ -2257,18 +2283,17 @@ async fn apply_tm_policy(
     let chain = match (
         &cfg.cardano.config_address,
         &cfg.cardano.config_nft_policy_id,
+        &cfg.cardano.config_nft_asset_name,
     ) {
-        (Some(addr), Some(policy)) => {
-            let unit = format!(
-                "{policy}{}",
-                cfg.cardano.config_nft_asset_name.as_deref().unwrap_or("")
-            );
+        (Some(addr), Some(policy), Some(asset)) => {
+            let unit = format!("{policy}{asset}");
             chain.with_config_utxo(addr, &unit)
         }
-        (None, None) => chain,
+        (None, None, None) => chain,
         _ => {
             return Err(
-                "set both cardano.config_address and cardano.config_nft_policy_id (or neither)"
+                "set cardano.config_address, cardano.config_nft_policy_id and \
+                 cardano.config_nft_asset_name together (or leave all three unset)"
                     .into(),
             );
         }
@@ -2745,7 +2770,10 @@ async fn run_spo(
             );
             fed.to_epoch_roster(epoch)
         }
-        Err(e) => panic!("query initial roster: {e}"),
+        Err(e) => {
+            error!("Error: cannot query the initial roster: {e}");
+            return;
+        }
     };
 
     let (id, me, keypair) = match configured_keypair {
@@ -2800,21 +2828,26 @@ async fn run_spo(
                         // member either. Against a real registry roster this is
                         // fatal (not registered / banned / URL-excluded). Fall
                         // back to --index ONLY for the legacy fixture demo.
-                        let ix = index.unwrap_or_else(|| {
-                            panic!(
-                                "this node's bifrost_id_pk ({}) is in neither the eligible \
-                                 roster for epoch {epoch} (not registered / banned / \
-                                 URL-excluded) nor [federation].members, and no --index \
-                                 fallback was given – refusing to run under an unknown identity",
+                        let Some(ix) = index else {
+                            error!(
+                                "Error: this node's bifrost_id_pk ({}) is in neither the eligible \
+                                 roster for epoch {epoch} (not registered / banned / URL-excluded) \
+                                 nor [federation].members; pass --index only for the legacy fixture demo",
                                 hex::encode(bifrost_id_pk)
-                            )
-                        });
-                        let id = Identifier::try_from(ix).unwrap();
-                        let info = roster
-                            .participants
-                            .get(&id)
-                            .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
-                            .clone();
+                            );
+                            return;
+                        };
+                        let id = match Identifier::try_from(ix) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                error!("Error: invalid --index {ix}: {e}");
+                                return;
+                            }
+                        };
+                        let Some(info) = roster.participants.get(&id).cloned() else {
+                            error!("Error: --index {ix} is not an eligible roster participant");
+                            return;
+                        };
                         warn!(
                             "[demo] bifrost_id_pk not found in roster; falling back to \
                              --index {ix} (fixture/legacy demo only)"
@@ -2828,25 +2861,31 @@ async fn run_spo(
         // come from --index via the fixture's deterministic keypairs, so 3
         // processes sharing one config differ only by `--index`.
         None => {
-            let ix = index.unwrap_or_else(|| {
-                panic!(
-                    "no bifrost identity key — set [bifrost].skey_path (on-chain registry \
-                     deployments) or pass --index N for the local no-registry fixture demo"
-                )
-            });
-            let id = Identifier::try_from(ix).unwrap();
-            let info = roster
-                .participants
-                .get(&id)
-                .unwrap_or_else(|| panic!("--index {ix} is not in the roster"))
-                .clone();
-            let kp = *fixture.bifrost_keypairs.get(&id).unwrap_or_else(|| {
-                panic!(
-                    "--index {ix}: no fixture bifrost keypair — the no-registry demo derives \
-                     each node's key from the fixture; set [bifrost].skey_path for a registry \
-                     deployment"
-                )
-            });
+            let Some(ix) = index else {
+                error!(
+                    "Error: no bifrost identity key — set [bifrost].skey_path for a registry \
+                     deployment or pass --index N for the local no-registry fixture demo"
+                );
+                return;
+            };
+            let id = match Identifier::try_from(ix) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("Error: invalid --index {ix}: {e}");
+                    return;
+                }
+            };
+            let Some(info) = roster.participants.get(&id).cloned() else {
+                error!("Error: --index {ix} is not an eligible roster participant");
+                return;
+            };
+            let Some(kp) = fixture.bifrost_keypairs.get(&id).copied() else {
+                error!(
+                    "Error: --index {ix} has no fixture bifrost keypair; set \
+                     [bifrost].skey_path for a registry deployment"
+                );
+                return;
+            };
             (id, info, kp)
         }
     };
@@ -2864,7 +2903,13 @@ async fn run_spo(
             );
             p
         }
-        None => port_from_url(&me.bifrost_url).unwrap_or_else(|e| panic!("{e}")),
+        None => match port_from_url(&me.bifrost_url) {
+            Ok(port) => port,
+            Err(e) => {
+                error!("Error: {e}");
+                return;
+            }
+        },
     };
     let my_pool_id: [u8; 28] = me.pool_id.as_slice().try_into().unwrap_or_else(|_| {
         panic!(
@@ -2891,11 +2936,18 @@ async fn run_spo(
     net.shared_state().write().await.facts = cfg.cardano.node_facts();
     let app = router(net.shared_state());
     let bind_addr = &cfg.http.bind_address;
-    let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
-        .await
-        .expect("bind");
+    let bind = format!("{bind_addr}:{port}");
+    let listener = match tokio::net::TcpListener::bind(&bind).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("Error: could not bind peer listener at {bind}: {e}");
+            return;
+        }
+    };
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        if let Err(e) = axum::serve(listener, app).await {
+            error!("peer listener stopped: {e}");
+        }
     });
 
     // The OPERATOR surface (WI-058), on its own listener. Separate from the one
@@ -2943,14 +2995,20 @@ async fn run_spo(
             out
         })
         .unwrap_or([0u8; 28]);
-    let mut config = cfg.to_epoch_config(
+    let mut config = match cfg.to_epoch_config(
         SpoIdentity {
             identifier: id,
             bifrost_id_pk: own_bifrost_id_pk,
             port,
         },
         pegin_policy_id,
-    );
+    ) {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Error: {e}");
+            return;
+        }
+    };
     // The loop reports through the same handle the surface serves.
     config.health = health;
     // Runtime trie reconciliation is safe only after this exact bridge's
@@ -3408,21 +3466,20 @@ struct ConfigLocator {
 }
 
 /// The Config locator, when this node is configured to locate it
-/// (`cardano.config_address` + `cardano.config_nft_policy_id` + Blockfrost).
+/// (`cardano.config_address` + `cardano.config_nft_policy_id` +
+/// `cardano.config_nft_asset_name` + Blockfrost).
 fn config_locator(cfg: &HeimdallConfig) -> Option<ConfigLocator> {
-    let (pid, addr, policy) = (
+    let (pid, addr, policy, asset) = (
         cfg.cardano.blockfrost_project_id.as_deref()?,
         cfg.cardano.config_address.as_deref()?,
         cfg.cardano.config_nft_policy_id.as_deref()?,
+        cfg.cardano.config_nft_asset_name.as_deref()?,
     );
     Some(ConfigLocator {
         project_id: pid.to_string(),
         base_url: heimdall::cardano::bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref()),
         address: addr.to_string(),
-        nft_unit: format!(
-            "{policy}{}",
-            cfg.cardano.config_nft_asset_name.as_deref().unwrap_or("")
-        ),
+        nft_unit: format!("{policy}{asset}"),
     })
 }
 
@@ -4643,7 +4700,7 @@ fn run_federation_spend(
     let spend_info = treasury_spend_info(&secp, y51, y_fed, csv);
     let treasury_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
     let treasury_addr =
-        bitcoin::Address::p2tr_tweaked(spend_info.output_key(), cfg.bitcoin.parsed_network());
+        bitcoin::Address::p2tr_tweaked(spend_info.output_key(), cfg.bitcoin.parsed_network()?);
     // Prove the tree before anyone signs it. The tree is a function of three
     // values — Y_51, y_fed and the CSV delay — and `--y51` in particular is
     // hand-supplied here, defaulting to y_fed, which is only right for a treasury
@@ -8070,7 +8127,8 @@ fn run_show_config_params(cfg: &HeimdallConfig) -> Result<(), String> {
     use heimdall::cardano::config_params::{ParamSource, fetch_param_snapshot, resolve_tm_params};
 
     let loc = config_locator(cfg).ok_or(
-        "set cardano.config_address, cardano.config_nft_policy_id and \
+        "set cardano.config_address, cardano.config_nft_policy_id, \
+         cardano.config_nft_asset_name and \
          cardano.blockfrost_project_id to read the bridge Config UTxO",
     )?;
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
@@ -8408,7 +8466,8 @@ fn singleton_chain_tip(
 ) -> Result<ChainTip, String> {
     let loc = config_locator(cfg).ok_or(
         "chain-sourced treasury requires a Config locator (cardano.config_address + \
-         config_nft_policy_id) — or pass --treasury-outpoint and --treasury-amount-sat",
+         config_nft_policy_id + config_nft_asset_name) — or pass --treasury-outpoint and \
+         --treasury-amount-sat",
     )?;
     let mainnet = cfg.cardano.is_mainnet()?;
     let (_config, singleton) =
@@ -9152,7 +9211,7 @@ fn print_bootstrap_treasury(cfg: &HeimdallConfig) -> Result<(), String> {
     let signer = federation_signer(cfg)?;
     let y_fed = signer.public_key()?;
 
-    let network = cfg.bitcoin.parsed_network();
+    let network = cfg.bitcoin.parsed_network()?;
     let csv_blocks = csv_blocks_u16(cfg)?;
 
     // At bootstrap Y_51 = Y_fed.
@@ -9188,7 +9247,7 @@ fn print_frost_treasury(
     use heimdall::frost::dkg::run_demo_dkg;
 
     let secp = Secp256k1::new();
-    let network = cfg.bitcoin.parsed_network();
+    let network = cfg.bitcoin.parsed_network()?;
     let csv_blocks = csv_blocks_u16(cfg)?;
 
     fn xonly(flag: &str, hex_str: &str) -> Result<UntweakedPublicKey, String> {

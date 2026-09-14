@@ -306,6 +306,9 @@ fn missing_locator_keys(cfg: &HeimdallConfig) -> Vec<&'static str> {
     if c.config_nft_policy_id.is_none() {
         missing.push("cardano.config_nft_policy_id");
     }
+    if c.config_nft_asset_name.is_none() {
+        missing.push("cardano.config_nft_asset_name");
+    }
     missing
 }
 
@@ -1418,7 +1421,8 @@ mod tests {
             vec![
                 "cardano.blockfrost_project_id",
                 "cardano.config_address",
-                "cardano.config_nft_policy_id"
+                "cardano.config_nft_policy_id",
+                "cardano.config_nft_asset_name"
             ]
         );
     }
@@ -1432,7 +1436,10 @@ mod tests {
         cfg.cardano.config_address = Some("addr_test1...".into());
         assert_eq!(
             missing_locator_keys(&cfg),
-            vec!["cardano.config_nft_policy_id"]
+            vec![
+                "cardano.config_nft_policy_id",
+                "cardano.config_nft_asset_name"
+            ]
         );
     }
 
