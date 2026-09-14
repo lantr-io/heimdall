@@ -141,6 +141,12 @@ pub async fn sign_phase(
             //
             // It runs BEFORE the first nonce commitment leaves the node, because a
             // published commitment is a signing input the others can use.
+            // Deliberately do not invoke the configured tries repairer here.
+            // This is mid-ceremony, under the nonce-round deadline: a history
+            // walk would stall peers, can race an operator changing the files,
+            // and would turn an independent co-signer check into "rebuild until
+            // I agree with the proposal". Runtime repair belongs at the next
+            // CollectPegins opportunity; disagreement here remains a refusal.
             verify_cpo_root(config, me, epoch, &tm)?;
 
             // [SPI-2]: the same gate for the swept peg-ins root. Everything the

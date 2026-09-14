@@ -54,6 +54,7 @@ pub mod treasury_bootstrap;
 pub mod treasury_datum;
 pub mod treasury_info;
 pub mod treasury_spend;
+pub mod tries_repair;
 pub mod tx_common;
 pub mod update_y;
 pub mod wallet;

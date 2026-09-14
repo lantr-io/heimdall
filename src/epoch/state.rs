@@ -786,6 +786,9 @@ pub struct EpochConfig {
     /// nothing. Default is an unread handle, so a caller that wants no surface
     /// simply never serves it.
     pub health: crate::health::HealthHandle,
+    /// Chain-history repair used when the singleton proves the local cumulative
+    /// tries are behind. Set only after the bridge Config has resolved.
+    pub tries_repair: Option<std::sync::Arc<dyn crate::cardano::tries_repair::TriesRepairer>>,
     /// Depositor refund timelock (BTC blocks) baked into the peg-in
     /// Taproot's depositor refund leaf. Spec default is 4320 (~30 days);
     /// testnet4/preprod typically use a smaller value.
@@ -849,6 +852,7 @@ impl EpochConfig {
     pub fn demo_default(identity: SpoIdentity) -> Self {
         Self {
             health: crate::health::HealthHandle::new(),
+            tries_repair: None,
             dkg_round_timeout: Duration::from_secs(300),
             dkg_window: Duration::from_secs(600),
             dkg_join_wait: Duration::from_secs(300),
@@ -879,6 +883,12 @@ impl EpochConfig {
 pub enum EpochError {
     Frost(String),
     TmBuild(String),
+    /// Runtime reconstruction failed. Unlike an ordinary build error this
+    /// spends the grid opportunity: repeating a full history walk every minute
+    /// cannot produce a movement and can exhaust the chain backend.
+    TriesBehind {
+        why: String,
+    },
     /// The FROZEN BATCH cannot produce a movement, and no retry of the same batch
     /// can change that: the inputs are fixed for the opportunity, so the same
     /// computation runs over the same bytes and reaches the same refusal.
@@ -1027,6 +1037,7 @@ impl std::fmt::Display for EpochError {
         match self {
             Self::Frost(s) => write!(f, "FROST: {s}"),
             Self::TmBuild(s) => write!(f, "Bitcoin tx build failed: {s}"),
+            Self::TriesBehind { why } => write!(f, "local bridge tries are behind: {why}"),
             Self::BatchRejected(s) => write!(f, "this batch cannot produce a movement: {s}"),
             Self::PollTimeout { got, need } => {
                 write!(f, "peer poll timed out: got {got}, need {need}")

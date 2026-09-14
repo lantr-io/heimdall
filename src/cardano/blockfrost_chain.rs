@@ -2475,12 +2475,9 @@ impl CardanoChain for BlockfrostCardanoChain {
         // walk: Confirm burns the TM record and advances the singleton instead.
         let (config, singleton) = self.query_config_singleton().await?;
         let state = &singleton.state;
-        use bitcoin::hashes::Hash;
-        let txid_bytes: [u8; 32] = state.treasury_utxo_id[..32].try_into().unwrap();
-        let outpoint = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_byte_array(txid_bytes),
-            vout: u32::from_le_bytes(state.treasury_utxo_id[32..].try_into().unwrap()),
-        };
+        // The same decoding `query_bridge_roots` reports its head with, so the
+        // head check in `BuildTm` compares one value, not two spellings of it.
+        let outpoint = state.treasury_outpoint();
         let value = bitcoin::Amount::from_sat(state.treasury_amount);
 
         // Scan the Unconfirmed records at the TM address (fresh HTTP client per call — the
@@ -3257,13 +3254,17 @@ impl CardanoChain for BlockfrostCardanoChain {
                     Some(&self.bf_base_url),
                 )),
             };
-        // Both roots BY NAME, per [LIB-1]: a positional read would swap them.
+        // Both roots BY NAME, per [LIB-1]: a positional read would swap them. The
+        // head from the SAME datum: this read can run on Kupo while
+        // `query_treasury` runs on the Blockfrost-compatible API, and only the
+        // head says whether the two saw the same chain state.
         crate::cardano::bridge_state::fetch_bridge_state(source.as_ref(), policy)
             .await
             .map(|state| {
                 Some(crate::epoch::traits::BridgeRoots {
                     spi_root: state.spi_root,
                     cpo_root: state.cpo_root,
+                    head: state.treasury_outpoint(),
                 })
             })
             .map_err(|e| EpochError::Chain(format!("read the bridge state singleton: {e}")))

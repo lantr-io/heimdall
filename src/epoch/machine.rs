@@ -696,7 +696,8 @@ fn step_clears_ramp(failed_in: Option<&'static str>, stepped: &'static str) -> b
 /// catch-all for filesystem I/O and for comparisons against live chain reads,
 /// neither of which a retry reproduces.
 fn rejects_the_batch(stepped: &'static str, cause: &EpochError) -> bool {
-    stepped == "BuildTm" && matches!(cause, EpochError::BatchRejected(_))
+    (stepped == "BuildTm" && matches!(cause, EpochError::BatchRejected(_)))
+        || (stepped == "CollectPegins" && matches!(cause, EpochError::TriesBehind { .. }))
 }
 
 /// Whether a failed attempt keeps its batch opportunity instead of handing it
@@ -1029,6 +1030,98 @@ fn settle_pending_tm(
     PendingTm::clear(dir)
         .map_err(|e| EpochError::TmBuild(format!("pending treasury movement: {e}")))?;
     Ok(())
+}
+
+async fn reconcile_tries(
+    chain: &Arc<dyn CardanoChain>,
+    config: &EpochConfig,
+    treasury: &crate::epoch::traits::TreasuryUtxo,
+    epoch: u64,
+    batch: Option<u64>,
+) -> EpochResult<()> {
+    use crate::cardano::bridge_state::{TriesStatus, local_tries_status};
+    use crate::cardano::tries_repair::RepairError;
+    use crate::epoch::pending_tm::PendingTm;
+
+    let Some(dir) = config.state_dir.as_deref() else {
+        return Ok(());
+    };
+    let fold_error = settle_pending_tm(config, treasury).err();
+    let Some(roots) = chain.query_bridge_roots().await? else {
+        return fold_error.map_or(Ok(()), Err);
+    };
+    if roots.head != treasury.outpoint {
+        return Err(EpochError::Chain(format!(
+            "the bridge roots were read at treasury head {}, but CollectPegins read {}; not comparing or repairing across chain states",
+            roots.head, treasury.outpoint
+        )));
+    }
+    let status = local_tries_status(dir, roots.cpo_root, roots.spi_root);
+    if status == TriesStatus::InSync {
+        if let Some(e) = fold_error {
+            let moved = PendingTm::set_aside(dir)
+                .map_err(|x| EpochError::TmBuild(format!("{e}; set stale journal aside: {x}")))?;
+            crate::epoch_warn!(
+                config.identity.identifier,
+                epoch,
+                "pending movement could not be folded ({e}), but both tries already match the singleton; set the stale journal aside as {}",
+                moved
+                    .as_ref()
+                    .map_or_else(|| "<already absent>".into(), |p| p.display().to_string())
+            );
+        }
+        return Ok(());
+    }
+    let why = match &status {
+        TriesStatus::NeverSeeded { missing } => {
+            format!("never seeded ({} absent)", missing.join(", "))
+        }
+        TriesStatus::Diverged { detail, missing } => {
+            let mut all = detail.clone();
+            if !missing.is_empty() {
+                all.push(format!("{} absent", missing.join(", ")));
+            }
+            all.join("; ")
+        }
+        TriesStatus::Unreadable { detail } => detail.join("; "),
+        TriesStatus::InSync => unreachable!(),
+    };
+    let why = fold_error.map_or(why.clone(), |e| format!("{e}; {why}"));
+    let Some(repairer) = config.tries_repair.as_ref() else {
+        let why =
+            format!("{why}; this node cannot rebuild because no tries repairer was configured");
+        config
+            .health
+            .update(|h| h.tries_repair_failed = Some(why.clone()));
+        return Err(EpochError::TriesBehind { why });
+    };
+    match repairer.repair(dir, &status, &why, treasury.outpoint).await {
+        Ok(reason) => {
+            let position = batch.map_or_else(
+                || format!("epoch {epoch}"),
+                |i| format!("epoch {epoch} B_{i}"),
+            );
+            config.health.update(|h| {
+                h.tries_repair_failed = None;
+                h.tries_rebuilt_at_runtime
+                    .push(format!("{position}: {reason}"));
+                if h.tries_rebuilt_at_runtime.len() > 8 {
+                    h.tries_rebuilt_at_runtime.remove(0);
+                }
+            });
+            Ok(())
+        }
+        Err(RepairError::HeadMoved { walked, expected }) => Err(EpochError::Chain(format!(
+            "tries repair walked treasury head {walked}, but this batch will spend {expected}; retrying after the chain views converge"
+        ))),
+        Err(e) => {
+            let why = e.to_string();
+            config
+                .health
+                .update(|h| h.tries_repair_failed = Some(why.clone()));
+            Err(EpochError::TriesBehind { why })
+        }
+    }
 }
 
 /// Fold a CONFIRMED TM's peg-outs into this node's persisted completed-peg-outs
@@ -2803,7 +2896,7 @@ async fn collect_pegins_phase(
         // (WI-032). It runs BEFORE the gate below and before every build, so
         // `build_tm_phase`'s cross-check against the on-chain singleton never
         // sees a trie that this node already had the means to advance.
-        settle_pending_tm(config, &treasury)?;
+        reconcile_tries(chain, config, &treasury, epoch, batch.map(|b| b.index)).await?;
         // With no grid there is no opportunity to pass, so the tip wait inside
         // `build_tm_phase` stands as it did before the grid.
         let Some(b) = batch else {
@@ -3443,10 +3536,20 @@ fn load_cpo_trie(
 /// returns [`CpoTrust::Unverified`] in that case — since WI-031 the trie is the SOLE
 /// already-paid authority, so "not cross-checked" has to be a value the caller can act
 /// on, not just a log line.
+///
+/// Roots are compared only at `head`, the treasury outpoint this movement spends.
+/// That head and these roots are two separate reads of the singleton, on two
+/// different backends when `cardano.kupo_url` is set, so they can describe
+/// different chain states. Roots from an OLDER singleton match the tries of a node
+/// that missed the newest movement exactly, and without this check that node would
+/// spend the newest head on a trie that lacks the newest movement's peg-outs, and
+/// pay them again. So a head mismatch refuses before any root is compared, as a
+/// chain read the retry ramp repeats — not as a verdict on the tries.
 async fn cross_check_bridge_roots(
     chain: &Arc<dyn CardanoChain>,
     cpo_trie: &crate::cardano::cpo_trie::CpoTrie,
     spi_trie: &crate::cardano::spi_trie::SpiTrie,
+    head: bitcoin::OutPoint,
     state_dir: Option<&std::path::Path>,
     me: frost::Identifier,
     epoch: u64,
@@ -3460,6 +3563,14 @@ async fn cross_check_bridge_roots(
         )
     };
     match chain.query_bridge_roots().await? {
+        Some(roots) if roots.head != head => Err(EpochError::Chain(format!(
+            "the bridge state singleton's roots were read at treasury head {}, but this movement \
+             spends {head} — the two reads saw different chain states (a Confirm landed between \
+             them, or one backend is behind the other). Not comparing roots across them: roots \
+             from an older singleton would pass a trie that is missing the newest movement, and \
+             this movement would pay that movement's peg-outs again.",
+            roots.head,
+        ))),
         Some(roots) if roots.cpo_root != local_cpo => Err(EpochError::TmBuild(format!(
             "completed-peg-outs trie is out of sync with the chain: local root {} ({} entries) \
              != the bridge state singleton's cpo_root {}. Refusing to attest — a TM built on a \
@@ -3493,7 +3604,9 @@ async fn cross_check_bridge_roots(
             crate::epoch_log!(
                 me,
                 epoch,
-                "  local tries match the bridge state singleton (cpo_root {}, spi_root {})",
+                "  local tries match the bridge state singleton at head {} (cpo_root {}, spi_root \
+                 {})",
+                roots.head,
                 hex::encode(roots.cpo_root),
                 hex::encode(roots.spi_root),
             );
@@ -3774,6 +3887,7 @@ async fn build_tm_phase(
         chain,
         &cpo_trie,
         &spi_trie,
+        treasury.outpoint,
         config.state_dir.as_deref(),
         me,
         epoch,
@@ -7594,6 +7708,55 @@ mod tests {
         );
     }
 
+    /// The same withdrawal and the same trie as the vouched half above, but the
+    /// singleton's roots are read at a DIFFERENT head from the treasury this
+    /// movement spends. That is a node that missed the newest movement, reading a
+    /// backend that has not yet seen that movement's Confirm: its trie matches the
+    /// older singleton, and the withdrawal it would pay may be one the newest
+    /// movement already paid. `BuildTm` must refuse rather than build.
+    #[tokio::test]
+    async fn a_withdrawal_is_not_paid_on_roots_read_at_another_head() {
+        use bitcoin::hashes::Hash;
+        let (roster, keys) = group_for(0xe0, 2, 3);
+        let y = xonly_of(&keys);
+        let (_, fed) = group_for(0xe1, 2, 3);
+        let mut fixture = movable_fixture(2, 2, 19_830, 1);
+        fixture.y_51 = y;
+        fixture.y_fed = y;
+        let older = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x0d; 32]),
+            vout: 0,
+        };
+        assert_ne!(older, fixture.treasury_outpoint);
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(y)
+                .with_config_y_fed(xonly_of(&fed))
+                .with_treasury_info(MockCardanoChain::treasury_info_state(y, [0x5a; 32]))
+                .with_cpo_root(empty_cpo_root())
+                .with_roots_read_at(older),
+        );
+
+        let Err(err) = build_tm_phase(
+            &chain,
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &fast_config(*keys.key_package.identifier()),
+            9,
+            roster,
+            keys,
+            None,
+            Vec::new(),
+        )
+        .await
+        else {
+            panic!("a trie vouched for by roots at another head must not build a payment");
+        };
+        assert!(
+            matches!(err, EpochError::Chain(_)),
+            "refused as a chain read, so the ramp re-reads: {err:?}"
+        );
+    }
+
     /// WI-032, the headline: posting a movement does NOT block on its
     /// confirmation.
     ///
@@ -7918,12 +8081,19 @@ mod tests {
         assert_ne!(k1 * DKG_ATTEMPTS_PER_WINDOW, k2 * DKG_ATTEMPTS_PER_WINDOW);
     }
 
-    fn cpo_check_chain(on_chain_root: Option<[u8; 32]>) -> Arc<dyn CardanoChain> {
-        let mock = MockCardanoChain::new(demo_static_fixture(2, 2, 18_900));
-        Arc::new(match on_chain_root {
+    /// A chain reporting `on_chain_root` as the singleton's `cpo_root`, and the
+    /// treasury head it reports — the head a movement built on it would spend.
+    fn cpo_check_chain(
+        on_chain_root: Option<[u8; 32]>,
+    ) -> (Arc<dyn CardanoChain>, bitcoin::OutPoint) {
+        let fixture = demo_static_fixture(2, 2, 18_900);
+        let head = fixture.treasury_outpoint;
+        let mock = MockCardanoChain::new(fixture);
+        let chain: Arc<dyn CardanoChain> = Arc::new(match on_chain_root {
             Some(root) => mock.with_cpo_root(root),
             None => mock,
-        })
+        });
+        (chain, head)
     }
 
     /// The trie the chain agrees with is signable: the cross-check passes and
@@ -7932,11 +8102,51 @@ mod tests {
     async fn cpo_cross_check_accepts_a_matching_root() {
         let trie = crate::cardano::cpo_trie::CpoTrie::empty();
         let spi = crate::cardano::spi_trie::SpiTrie::empty();
-        let chain = cpo_check_chain(Some(trie.root()));
+        let (chain, head) = cpo_check_chain(Some(trie.root()));
         let id = Identifier::try_from(1u16).unwrap();
-        cross_check_bridge_roots(&chain, &trie, &spi, None, id, 0)
+        cross_check_bridge_roots(&chain, &trie, &spi, head, None, id, 0)
             .await
             .expect("a root the chain holds must be attestable");
+    }
+
+    /// Matching roots are not enough: they have to be the roots AT the head this
+    /// movement spends. Here the singleton read sits at an older head than the
+    /// treasury read — a Kupo behind the Blockfrost-compatible API — and a trie
+    /// missing the newest movement matches that older singleton exactly. Comparing
+    /// roots across the two reads would vouch for it.
+    ///
+    /// The refusal is a `Chain` error, not `BatchRejected`: the reads disagree, not
+    /// the batch, so the retry ramp must re-read rather than spend the opportunity.
+    #[tokio::test]
+    async fn bridge_roots_cross_check_refuses_roots_read_at_another_head() {
+        use bitcoin::hashes::Hash;
+        let trie = crate::cardano::cpo_trie::CpoTrie::empty();
+        let spi = crate::cardano::spi_trie::SpiTrie::empty();
+        let fixture = demo_static_fixture(2, 2, 18_900);
+        let spent = fixture.treasury_outpoint;
+        let older = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x0d; 32]),
+            vout: 0,
+        };
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_bridge_roots(spi.root(), trie.root())
+                .with_roots_read_at(older),
+        );
+        let id = Identifier::try_from(1u16).unwrap();
+        let err = cross_check_bridge_roots(&chain, &trie, &spi, spent, None, id, 0)
+            .await
+            .expect_err("roots read at another head must not vouch for the tries");
+        assert!(
+            matches!(err, EpochError::Chain(_)),
+            "a disagreement between two reads is a chain-read failure the ramp retries, not a \
+             verdict on the batch: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&older.to_string()) && msg.contains(&spent.to_string()),
+            "the refusal must name both heads: {msg}"
+        );
     }
 
     /// The SPI twin of the stale-root refusal: a roster-wide restored (empty)
@@ -7947,14 +8157,16 @@ mod tests {
     async fn spi_cross_check_refuses_a_stale_root() {
         let trie = crate::cardano::cpo_trie::CpoTrie::empty();
         let spi = crate::cardano::spi_trie::SpiTrie::empty();
-        let mock = MockCardanoChain::new(demo_static_fixture(2, 2, 18_900))
-            .with_bridge_roots([0x22u8; 32], trie.root());
+        let fixture = demo_static_fixture(2, 2, 18_900);
+        let head = fixture.treasury_outpoint;
+        let mock = MockCardanoChain::new(fixture).with_bridge_roots([0x22u8; 32], trie.root());
         let chain: Arc<dyn CardanoChain> = Arc::new(mock);
         let id = Identifier::try_from(1u16).unwrap();
         let err = cross_check_bridge_roots(
             &chain,
             &trie,
             &spi,
+            head,
             Some(std::path::Path::new("/var/lib/hd")),
             id,
             0,
@@ -7982,13 +8194,14 @@ mod tests {
     #[tokio::test]
     async fn cpo_cross_check_refuses_a_stale_root() {
         let trie = crate::cardano::cpo_trie::CpoTrie::empty();
-        let chain = cpo_check_chain(Some([0x11u8; 32]));
+        let (chain, head) = cpo_check_chain(Some([0x11u8; 32]));
         let id = Identifier::try_from(1u16).unwrap();
         let spi = crate::cardano::spi_trie::SpiTrie::empty();
         let err = cross_check_bridge_roots(
             &chain,
             &trie,
             &spi,
+            head,
             Some(std::path::Path::new("/var/lib/hd")),
             id,
             0,
@@ -8022,10 +8235,10 @@ mod tests {
             1_000,
         )])
         .unwrap();
-        let chain = cpo_check_chain(None);
+        let (chain, head) = cpo_check_chain(None);
         let id = Identifier::try_from(1u16).unwrap();
         let spi = crate::cardano::spi_trie::SpiTrie::empty();
-        cross_check_bridge_roots(&chain, &trie, &spi, None, id, 0)
+        cross_check_bridge_roots(&chain, &trie, &spi, head, None, id, 0)
             .await
             .expect("an unchecked root must still be attestable");
     }
@@ -9128,6 +9341,22 @@ mod tests {
             !spends_the_opportunity(false, false, gridded),
             "an ordinary transient failure hands the opportunity back, as it always has"
         );
+    }
+
+    #[test]
+    fn a_failed_runtime_repair_is_terminal_for_this_opportunity() {
+        assert!(rejects_the_batch(
+            "CollectPegins",
+            &EpochError::TriesBehind {
+                why: "history backend unavailable".into(),
+            }
+        ));
+        assert!(!rejects_the_batch(
+            "BuildTm",
+            &EpochError::TriesBehind {
+                why: "history backend unavailable".into(),
+            }
+        ));
     }
 
     /// WI-097's acceptance. Two Treasury Movements in ONE epoch, off ONE ceremony,

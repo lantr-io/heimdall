@@ -68,6 +68,21 @@ pub struct Step {
     pub fix: Option<String>,
 }
 
+/// The step number of the `local tries` check.
+///
+/// Named rather than written as `10` in two files: the daemon keys its one
+/// self-repair on "is this the ONLY thing failing", and a step renumbering
+/// that silently moved that decision onto a different check would be a bad
+/// afternoon.
+pub const TRIES_STEP: u8 = 10;
+
+/// The step number of `resolve the Config`.
+///
+/// The precondition for any self-repair: the rebuild writes state derived from
+/// the bridge this step identifies, so a node that cannot say WHICH bridge it
+/// is on must not be writing tries for one.
+pub const CONFIG_STEP: u8 = 3;
+
 /// The whole preflight, in the order the steps ran.
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -504,7 +519,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             (7, "key handoff (Update-Y)"),
             (8, "federation identity"),
             (9, "post a movement"),
-            (10, "local tries"),
+            (TRIES_STEP, "local tries"),
             (11, "wallet collateral"),
         ] {
             b.push(n, title, Status::Skipped, "needs a Cardano provider");
@@ -1115,33 +1130,33 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     ),
                 ),
                 Ok(chain) => {
-                    let cpo = crate::cardano::cpo_trie::CpoTrie::load(dir)
-                        .ok()
-                        .flatten()
-                        .map(|t| (t.root(), t.len()));
-                    let spi = crate::cardano::spi_trie::SpiTrie::load(dir)
-                        .ok()
-                        .flatten()
-                        .map(|t| (t.root(), t.len()));
-                    let mut bad: Vec<String> = Vec::new();
-                    for (what, local, want, rebuild) in [
-                        ("cpo", cpo, chain.cpo_root, "reconstruct-cpo-trie"),
-                        ("spi", spi, chain.spi_root, "reconstruct-spi-trie"),
-                    ] {
-                        match local {
-                            None if want == [0u8; 32] => {}
-                            None => bad.push(format!(
-                                "no {what}-trie.json, but the chain holds {} — run `{rebuild}`",
-                                hex::encode(want)
-                            )),
-                            Some((root, _)) if root != want => bad.push(format!(
-                                "{what} root {} != the chain's {} — run `{rebuild}`",
-                                hex::encode(root),
-                                hex::encode(want)
-                            )),
-                            Some(_) => {}
+                    // One reader with the startup catch-up, so the check can
+                    // never report a fault the daemon has already healed, nor
+                    // miss one it did not.
+                    let status = crate::cardano::bridge_state::local_tries_status(
+                        dir,
+                        chain.cpo_root,
+                        chain.spi_root,
+                    );
+                    // Three faults, three fixes — `advice` says which.
+                    let (bad, advice) = match &status {
+                        crate::cardano::bridge_state::TriesStatus::InSync => {
+                            (Vec::new(), TriesFault::NeverSeeded)
                         }
-                    }
+                        crate::cardano::bridge_state::TriesStatus::NeverSeeded { missing } => {
+                            (vec![absent_line(missing, &chain)], TriesFault::NeverSeeded)
+                        }
+                        crate::cardano::bridge_state::TriesStatus::Diverged { detail, missing } => {
+                            let mut bad = detail.clone();
+                            if !missing.is_empty() {
+                                bad.push(absent_line(missing, &chain));
+                            }
+                            (bad, TriesFault::Diverged)
+                        }
+                        crate::cardano::bridge_state::TriesStatus::Unreadable { detail } => {
+                            (detail.clone(), TriesFault::Unreadable)
+                        }
+                    };
                     if bad.is_empty() {
                         b.push(
                             10,
@@ -1158,10 +1173,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             "local tries",
                             Status::Fail,
                             bad.join("; "),
-                            "Until the tries match, this node reaches BuildTm and stops: it \
-                             signs nothing and the roster counts it absent. The rebuild reads \
-                             chain history and checks every step against the root each movement \
-                             attested, so it cannot invent state.",
+                            tries_fix_advice(advice),
                         );
                     }
                 }
@@ -1223,6 +1235,74 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     }
 
     Report { steps: b.steps }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriesFault {
+    NeverSeeded,
+    Diverged,
+    Unreadable,
+}
+
+/// What step 10 tells the operator to do, by which of the three faults it is.
+///
+/// Public to the module's tests, and the ONLY copy: a test that restates these
+/// strings passes whichever branch production takes, which is how a mirror
+/// drifts from the thing it mirrors.
+fn tries_fix_advice(fault: TriesFault) -> &'static str {
+    match fault {
+        TriesFault::Unreadable => {
+            "A trie file EXISTS and cannot be parsed — truncated by a crash, unreadable after \
+             a permission change, or written by a version this build does not understand. \
+             This is not a disagreement with the chain: check the file's owner and mode \
+             first (the daemon runs as `heimdall`). `run-spo` keeps a copy and rebuilds from \
+             chain history at startup, but a node that cannot read its own state directory \
+             will be back here on the next restart."
+        }
+        TriesFault::Diverged => {
+            "This node's state DISAGREES with the chain, which is not the same as a node that \
+         has never been seeded. Until they match it reaches BuildTm and stops: it signs \
+         nothing and the roster counts it absent. `run-spo` rebuilds both from chain history \
+         at startup; `heimdall reconstruct-tries` does it now, checking every step against \
+             the root each movement attested."
+        }
+        TriesFault::NeverSeeded => {
+            "EXPECTED on a node that has not run before: the two tries are cumulative, and a new \
+         node cannot invent what the bridge has already paid and swept. `run-spo` seeds them \
+         itself at startup, so this clears on the first real start; `heimdall \
+         reconstruct-tries` does it now if you would rather seed first. Nothing is wrong \
+             with this node yet; it just has no starting point."
+        }
+    }
+}
+
+/// "no X-trie.json, and the bridge has history (…)" — citing the root that
+/// actually shows the history, per trie.
+///
+/// Quoting `cpo_root` whatever is missing produces
+/// `no spi-trie.json, and the bridge has history (cpo_root 0000…)` on a bridge
+/// that has swept peg-ins but completed no peg-out: self-contradicting, and
+/// never showing the root that is the real evidence.
+fn absent_line(
+    missing: &[&'static str],
+    chain: &crate::cardano::bridge_state::BridgeState,
+) -> String {
+    let roots: Vec<String> = missing
+        .iter()
+        .map(|what| {
+            let root = if *what == "cpo" {
+                chain.cpo_root
+            } else {
+                chain.spi_root
+            };
+            format!("{what}_root {}", hex::encode(root))
+        })
+        .collect();
+    format!(
+        "no {}-trie.json, and the bridge has history ({})",
+        missing.join("-trie.json, no "),
+        roots.join(", ")
+    )
 }
 
 /// The wallet's UTxOs, for the collateral count in step 11. Read-only, and the
@@ -1456,6 +1536,72 @@ mod tests {
         );
         assert!(!verdict(Some(some), some), "a matching trie passes");
         assert!(verdict(Some(some), empty), "so does the mirror image");
+    }
+
+    /// A node that has never been seeded and a node whose state disagrees with
+    /// the chain both stop the daemon, and must not read the same.
+    ///
+    /// Every new node on a bridge with history is in the first case. Telling
+    /// that operator their state is corrupt sends them hunting a fault that
+    /// does not exist — and it is the reason the guide now has a seeding step
+    /// rather than only a recovery one.
+    #[test]
+    fn never_seeded_and_diverged_are_diagnosed_differently() {
+        let never_seeded = tries_fix_advice(TriesFault::NeverSeeded);
+        assert!(never_seeded.contains("EXPECTED"), "{never_seeded}");
+        assert!(never_seeded.contains("reconstruct-tries"), "{never_seeded}");
+        assert!(
+            !never_seeded.contains("DISAGREES"),
+            "a new node is not a diverged one: {never_seeded}"
+        );
+
+        let diverged = tries_fix_advice(TriesFault::Diverged);
+        assert!(diverged.contains("DISAGREES"), "{diverged}");
+        assert!(diverged.contains("reconstruct-tries"), "{diverged}");
+        assert!(
+            !diverged.contains("EXPECTED"),
+            "divergence is never expected: {diverged}"
+        );
+    }
+
+    /// The daemon repairs the tries only when the Config resolved, because the
+    /// rebuild writes state derived from the bridge that step identifies.
+    /// Healing regardless meant a mistyped `cardano.config_address` resolved
+    /// SOME OTHER bridge, reported the tries as diverged against its roots,
+    /// and overwrote this node's state with that bridge's history — before
+    /// step 3 ever failed.
+    ///
+    /// Pinning the two step numbers because the decision is keyed on them: a
+    /// renumbering that moved the repair onto a different check would be very
+    /// quiet and very bad.
+    #[test]
+    fn the_repairable_step_and_its_precondition_do_not_move() {
+        assert_eq!(TRIES_STEP, 10);
+        assert_eq!(CONFIG_STEP, 3);
+        let cfg = HeimdallConfig::default();
+        let report = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(preflight(&cfg));
+        let step = |n: u8| report.steps.iter().find(|s| s.n == n).expect("step exists");
+        assert_eq!(step(TRIES_STEP).title, "local tries");
+        assert_eq!(step(CONFIG_STEP).title, "resolve the Config");
+    }
+
+    /// The message must cite the root of the trie that is actually missing.
+    /// Quoting `cpo_root` for an absent SPI trie produced
+    /// `no spi-trie.json, and the bridge has history (cpo_root 0000…0000)` —
+    /// self-contradicting, and never showing the real evidence.
+    #[test]
+    fn the_absent_line_cites_the_root_of_the_missing_trie() {
+        let chain = crate::cardano::bridge_state::BridgeState {
+            spi_root: [0x26u8; 32],
+            cpo_root: [0u8; 32],
+            treasury_utxo_id: [0u8; 36],
+            treasury_amount: 0,
+        };
+        let line = absent_line(&["spi"], &chain);
+        assert!(line.contains("spi_root 2626"), "{line}");
+        assert!(!line.contains("cpo_root"), "the wrong evidence: {line}");
     }
 
     #[tokio::test]

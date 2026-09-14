@@ -1148,6 +1148,7 @@ impl HeimdallConfig {
     pub fn to_epoch_config(&self, identity: SpoIdentity, pegin_policy_id: [u8; 28]) -> EpochConfig {
         EpochConfig {
             health: crate::health::HealthHandle::new(),
+            tries_repair: None,
             dkg_round_timeout: Duration::from_secs(self.protocol.dkg_round_timeout_secs),
             dkg_window: Duration::from_secs(self.protocol.dkg_window_secs),
             dkg_join_wait: Duration::from_secs(self.protocol.dkg_join_wait_secs),

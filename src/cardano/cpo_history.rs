@@ -204,6 +204,32 @@ pub trait CpoHistorySource: Send + Sync {
     ) -> Result<Vec<HistoricalOutput>, String>;
 }
 
+/// The history backend this node reconstructs from: Kupo when `cardano.kupo_url`
+/// is set — one request answers a whole address history — else the
+/// Blockfrost-compatible API, a local Dolos or hosted Blockfrost, at roughly one
+/// request per transaction.
+///
+/// The one place the choice is made, so the operator's `reconstruct-*` commands
+/// and the node's own repair (`cardano::tries_repair`) always read the same index.
+pub fn history_source(
+    cardano: &crate::config::CardanoConfig,
+) -> Result<Box<dyn CpoHistorySource>, String> {
+    match cardano.kupo_url.as_deref() {
+        Some(url) => Ok(Box::new(KupoHistory::new(url))),
+        None => {
+            let project_id = cardano.blockfrost_project_id.as_deref().ok_or(
+                "set cardano.kupo_url (recommended for SPOs) or cardano.blockfrost_project_id \
+                 — reconstruction reads the datums of SPENT outputs, which needs either a Kupo \
+                 index or a Blockfrost-compatible transaction-history API",
+            )?;
+            Ok(Box::new(BlockfrostHistory::new(
+                project_id,
+                cardano.blockfrost_url.as_deref(),
+            )))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Kupo backend
 // ---------------------------------------------------------------------------
