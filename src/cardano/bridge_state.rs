@@ -44,6 +44,29 @@ pub struct BridgeState {
     pub treasury_amount: u64,
 }
 
+impl BridgeState {
+    /// Field 2 as the Bitcoin outpoint it names — the inverse of
+    /// [`crate::cardano::tm_chain::outpoint_bytes`]: txid in internal byte order,
+    /// then the output index little-endian.
+    ///
+    /// The ONE decoding of `treasury_utxo_id`. The head it yields is compared
+    /// across separate reads of this datum — the treasury a movement spends
+    /// against the singleton its roots were read from — so a second hand-rolled
+    /// decoding is a way for one head to compare unequal to itself.
+    #[must_use]
+    pub fn treasury_outpoint(&self) -> bitcoin::OutPoint {
+        use bitcoin::hashes::Hash;
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&self.treasury_utxo_id[..32]);
+        let mut vout = [0u8; 4];
+        vout.copy_from_slice(&self.treasury_utxo_id[32..]);
+        bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array(txid),
+            vout: u32::from_le_bytes(vout),
+        }
+    }
+}
+
 /// The `ByteArray` field at index `i`, required to be exactly `N` bytes.
 ///
 /// A short root or a short outpoint is a WRONG value, not a shorter one: the MPF
@@ -266,6 +289,32 @@ mod tests {
         );
         // The control: the same shape with correct lengths does decode.
         assert!(parse_bridge_state(&case(32, 32, 36, int_from_u64(1))).is_ok());
+    }
+
+    // --- treasury_outpoint -------------------------------------------------
+
+    // The head is compared across two reads of this datum, so its decoding must
+    // be the exact inverse of the encoding TM records use. Asymmetric txid bytes
+    // and an index above 255: a reversed txid or a big-endian index each change
+    // the answer.
+    #[test]
+    fn treasury_outpoint_inverts_the_tm_outpoint_encoding() {
+        use bitcoin::hashes::Hash;
+        let mut txid = [0u8; 32];
+        for (b, v) in txid.iter_mut().zip(1u8..) {
+            *b = v;
+        }
+        let op = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array(txid),
+            vout: 0x0102,
+        };
+        let state = BridgeState {
+            spi_root: [0x11; 32],
+            cpo_root: [0x22; 32],
+            treasury_utxo_id: crate::cardano::tm_chain::outpoint_bytes(&op),
+            treasury_amount: 1,
+        };
+        assert_eq!(state.treasury_outpoint(), op);
     }
 
     // --- fetch_bridge_state ------------------------------------------------

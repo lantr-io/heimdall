@@ -187,7 +187,12 @@ pub struct MockCardanoChain {
     /// object every SPO reads, and it ADVANCES: a confirmed movement's own BTMR1
     /// commitment becomes the attested pair. A mock that froze it could only ever
     /// cross-check the FIRST movement of a test.
-    bridge_roots: Option<Arc<Mutex<crate::epoch::traits::BridgeRoots>>>,
+    bridge_roots: Option<Arc<Mutex<MockBridgeRoots>>>,
+    /// A treasury head the singleton read reports INSTEAD of the one
+    /// `query_treasury` reports: the two reads at different chain states, as a
+    /// Kupo behind the Blockfrost-compatible API serves them. `None` (the default)
+    /// is a real chain, where both come from one datum.
+    roots_read_at: Option<bitcoin::OutPoint>,
     /// The TM batch opportunity the mock reports (N19). `NoGrid` (the default) is a
     /// chain with no grid, so `BuildTm` applies no membership cutoff — the behaviour
     /// of a deployment whose Config carries no `schedule`.
@@ -296,6 +301,18 @@ pub struct MockTreasuryInfo {
     pub external_post: bool,
 }
 
+/// The roots a [`MockCardanoChain`] keeps for its bridge state singleton.
+///
+/// The singleton's head is deliberately NOT kept here. On chain the head and the
+/// roots are one datum, so the mock reports the head `query_treasury` reads, and a
+/// test cannot put the two out of step by accident — only on purpose, through
+/// [`MockCardanoChain::with_roots_read_at`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MockBridgeRoots {
+    pub spi_root: [u8; 32],
+    pub cpo_root: [u8; 32],
+}
+
 impl MockCardanoChain {
     pub fn new(fixture: crate::epoch::fixture::StaticFixture) -> Self {
         Self {
@@ -315,6 +332,7 @@ impl MockCardanoChain {
             update_y_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             external_rotation: None,
             bridge_roots: None,
+            roots_read_at: None,
             datum_lag: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             config_y_fed: None,
             retired_internal_keys: Vec::new(),
@@ -402,20 +420,32 @@ impl MockCardanoChain {
     pub fn bridge_roots_state(
         spi_root: [u8; 32],
         cpo_root: [u8; 32],
-    ) -> Arc<Mutex<crate::epoch::traits::BridgeRoots>> {
-        Arc::new(Mutex::new(crate::epoch::traits::BridgeRoots {
-            spi_root,
-            cpo_root,
-        }))
+    ) -> Arc<Mutex<MockBridgeRoots>> {
+        Arc::new(Mutex::new(MockBridgeRoots { spi_root, cpo_root }))
     }
 
     /// Read (and, with a TM chain, advance) the shared singleton.
-    pub fn with_shared_bridge_roots(
-        mut self,
-        roots: Arc<Mutex<crate::epoch::traits::BridgeRoots>>,
-    ) -> Self {
+    pub fn with_shared_bridge_roots(mut self, roots: Arc<Mutex<MockBridgeRoots>>) -> Self {
         self.bridge_roots = Some(roots);
         self
+    }
+
+    /// Report the singleton's roots as read at `head`, while `query_treasury`
+    /// keeps reporting its own head — the roots backend at a different chain
+    /// state from the head backend. For the refusal to compare roots across the
+    /// two.
+    pub fn with_roots_read_at(mut self, head: bitcoin::OutPoint) -> Self {
+        self.roots_read_at = Some(head);
+        self
+    }
+
+    /// The treasury head and its value: the TM chain's when this mock models one,
+    /// else the fixture's.
+    fn treasury_head(&self) -> (bitcoin::OutPoint, bitcoin::Amount) {
+        self.tm_chain.as_ref().map_or(
+            (self.fixture.treasury_outpoint, self.fixture.treasury_value),
+            |head| *head.lock().unwrap(),
+        )
     }
 
     /// Report an open TM batch opportunity, so the batch loop has one to take and
@@ -598,10 +628,7 @@ impl CardanoChain for MockCardanoChain {
         let y_51 = maybe_key.unwrap_or(self.fixture.y_51);
         // After DKG: Y_fed = Y_51 = FROST group key (same key everywhere).
         let y_fed = maybe_key.unwrap_or(self.fixture.y_fed);
-        let (outpoint, value) = self.tm_chain.as_ref().map_or(
-            (self.fixture.treasury_outpoint, self.fixture.treasury_value),
-            |head| *head.lock().unwrap(),
-        );
+        let (outpoint, value) = self.treasury_head();
         Ok(TreasuryUtxo {
             outpoint,
             value,
@@ -684,7 +711,14 @@ impl CardanoChain for MockCardanoChain {
     }
 
     async fn query_bridge_roots(&self) -> EpochResult<Option<crate::epoch::traits::BridgeRoots>> {
-        Ok(self.bridge_roots.as_ref().map(|r| *r.lock().unwrap()))
+        Ok(self.bridge_roots.as_ref().map(|r| {
+            let roots = *r.lock().unwrap();
+            crate::epoch::traits::BridgeRoots {
+                spi_root: roots.spi_root,
+                cpo_root: roots.cpo_root,
+                head: self.roots_read_at.unwrap_or_else(|| self.treasury_head().0),
+            }
+        }))
     }
 
     async fn plan_update_y(
@@ -831,6 +865,24 @@ impl CardanoChain for MockCardanoChain {
                 .output
                 .first()
                 .ok_or_else(|| EpochError::Chain("mock: movement has no outputs".into()))?;
+            // The bridge state singleton moves with the head, because on chain it
+            // is the same transition: Confirm attests the roots the movement's own
+            // BTMR1 output committed. A mock that advanced only the head would
+            // make every movement after the first fail `cross_check_bridge_roots`
+            // — the check would be measuring the mock, not the node.
+            //
+            // Roots BEFORE the head: they are two locks here and one datum on
+            // chain. A node reading between them sees an old head with new roots,
+            // which its root comparison refuses. The other order would show a new
+            // head with old roots, and the head check cannot catch that in a mock
+            // that reports the singleton's head from this very TM chain.
+            if let Some(roots) = &self.bridge_roots {
+                let spi_root = crate::bitcoin::tm_builder::committed_spi_root(&tx)
+                    .map_err(|e| EpochError::Chain(format!("mock: movement spi_root: {e}")))?;
+                let cpo_root = crate::bitcoin::tm_builder::committed_cpo_root(&tx)
+                    .map_err(|e| EpochError::Chain(format!("mock: movement cpo_root: {e}")))?;
+                *roots.lock().unwrap() = MockBridgeRoots { spi_root, cpo_root };
+            }
             *head.lock().unwrap() = (
                 bitcoin::OutPoint {
                     txid: tx.compute_txid(),
@@ -838,18 +890,6 @@ impl CardanoChain for MockCardanoChain {
                 },
                 out.value,
             );
-            // The bridge state singleton moves with the head, because on chain it
-            // is the same transition: Confirm attests the roots the movement's own
-            // BTMR1 output committed. A mock that advanced only the head would
-            // make every movement after the first fail `cross_check_bridge_roots`
-            // — the check would be measuring the mock, not the node.
-            if let Some(roots) = &self.bridge_roots {
-                let spi_root = crate::bitcoin::tm_builder::committed_spi_root(&tx)
-                    .map_err(|e| EpochError::Chain(format!("mock: movement spi_root: {e}")))?;
-                let cpo_root = crate::bitcoin::tm_builder::committed_cpo_root(&tx)
-                    .map_err(|e| EpochError::Chain(format!("mock: movement cpo_root: {e}")))?;
-                *roots.lock().unwrap() = crate::epoch::traits::BridgeRoots { spi_root, cpo_root };
-            }
         }
         // Move the shared grid on, if this chain was built to. A real chain does
         // this by itself — a movement takes hours to sign, post and confirm, and

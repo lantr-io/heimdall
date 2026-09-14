@@ -8449,7 +8449,6 @@ fn singleton_chain_tip(
     cfg: &HeimdallConfig,
     scan: Option<&heimdall::cardano::blockfrost_chain::TmScan>,
 ) -> Result<ChainTip, String> {
-    use bitcoin::hashes::Hash;
     let loc = config_locator(cfg).ok_or(
         "chain-sourced treasury requires a Config locator (cardano.config_address + \
          config_nft_policy_id) — or pass --treasury-outpoint and --treasury-amount-sat",
@@ -8464,11 +8463,7 @@ fn singleton_chain_tip(
             mainnet,
         ))?;
     let state = &singleton.state;
-    let txid_bytes: [u8; 32] = state.treasury_utxo_id[..32].try_into().unwrap();
-    let outpoint = bitcoin::OutPoint {
-        txid: bitcoin::Txid::from_byte_array(txid_bytes),
-        vout: u32::from_le_bytes(state.treasury_utxo_id[32..].try_into().unwrap()),
-    };
+    let outpoint = state.treasury_outpoint();
     let in_flight = scan.is_some_and(|s| {
         s.in_flight_spends.contains(&outpoint) || s.opaque_unconfirmed > 0 || s.parse_failures > 0
     });

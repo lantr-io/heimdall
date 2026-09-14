@@ -512,11 +512,20 @@ impl DkgFaultEvidence {
 }
 
 /// Both attested roots read from the bridge state singleton in ONE fetch, by
-/// name per [LIB-1] (field 0 is `spi_root`, field 1 `cpo_root`).
+/// name per [LIB-1] (field 0 is `spi_root`, field 1 `cpo_root`), with the
+/// treasury head the same datum records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BridgeRoots {
     pub spi_root: [u8; 32],
     pub cpo_root: [u8; 32],
+    /// Field 2: the treasury outpoint these roots are attested AT.
+    ///
+    /// The roots mean nothing without it. The head a movement spends comes from
+    /// a different read — `query_treasury`, on a different backend when
+    /// `cardano.kupo_url` is set — so the two can describe different chain
+    /// states, and roots from an OLDER singleton match the tries of a node that
+    /// missed the newest movement. Compare this head before any root.
+    pub head: bitcoin::OutPoint,
 }
 
 #[async_trait]
@@ -594,7 +603,8 @@ pub trait CardanoChain: Send + Sync {
     /// passes because every co-signer recomputes from the SAME stale trie.
     /// `BuildTm` compares these against its local roots and refuses to attest on
     /// a mismatch: a TM built on a stale trie commits a root the chain does not
-    /// hold.
+    /// hold. It compares [`BridgeRoots::head`] first, because roots are only
+    /// comparable at the head the movement spends.
     ///
     /// `None` means "not configured / cannot be checked", never "empty tries".
     /// The empty trie has a real root (32 zero bytes), and reporting it here
