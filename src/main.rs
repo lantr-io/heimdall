@@ -1179,7 +1179,7 @@ async fn fetch_node_state(bind: &str) -> Result<heimdall::health::NodeState, Str
 /// one voice for that, not two.
 fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
     use heimdall::cardano::bridge_state::{TriesStatus, local_tries_status};
-    use heimdall::epoch::pending_tm::PendingTm;
+    use heimdall::cardano::tries_repair::{ChainTriesRepairer, TriesRepairer};
 
     // Every early return here means "I could not even look", which is NOT the
     // same as "they were in sync" — and the health gauge reads `None` as the
@@ -1187,10 +1187,6 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
     // from a healthy one. Whether any of these is fatal is the gate's to rule
     // on, not this function's.
     let dir = cfg.protocol.state_dir.as_deref()?; // no state dir: step 10 skips too
-    let Some(project_id) = cfg.cardano.blockfrost_project_id.clone() else {
-        warn!("tries catch-up skipped: no cardano.blockfrost_project_id to read the chain with");
-        return None;
-    };
     let bridge = match resolve_bridge_contracts(cfg) {
         Ok(b) => b,
         // The gate reports an unresolvable Config far better than this could.
@@ -1206,12 +1202,15 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
             return None;
         }
     };
-    let history = heimdall::cardano::cpo_history::BlockfrostHistory::new(
-        &project_id,
-        cfg.cardano.blockfrost_url.as_deref(),
-    );
+    let history = match heimdall::cardano::cpo_history::history_source(&cfg.cardano) {
+        Ok(source) => source,
+        Err(e) => {
+            warn!("tries catch-up skipped: {e}");
+            return None;
+        }
+    };
     let chain = match rt.block_on(heimdall::cardano::bridge_state::fetch_bridge_state(
-        &history,
+        history.as_ref(),
         &bridge.bridge_state_policy_id,
     )) {
         Ok(c) => c,
@@ -1229,25 +1228,14 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
 
     let dir = std::path::Path::new(dir);
     let status = local_tries_status(dir, chain.cpo_root, chain.spi_root);
-    // A file that exists is evidence, whether it disagrees or cannot be parsed:
-    // keep a copy before the rebuild overwrites it.
-    let keep_a_copy = matches!(
-        status,
-        TriesStatus::Diverged { .. } | TriesStatus::Unreadable { .. }
-    );
-    // The pending record may only be dropped once the chain has MOVED PAST this
-    // node, which a root mismatch or a never-seeded node proves and an
-    // unreadable file does not: there, a movement this node posted can still be
-    // genuinely in flight, and its record is the only thing that will fold it.
-    let chain_moved_on = !matches!(status, TriesStatus::Unreadable { .. });
-    let what = match status {
+    let what = match &status {
         TriesStatus::InSync => return None,
         TriesStatus::Unreadable { detail } => detail.join("; "),
         TriesStatus::NeverSeeded { missing } => {
             format!("never seeded ({} absent)", missing.join(", "))
         }
         TriesStatus::Diverged { detail, missing } => {
-            let mut all = detail;
+            let mut all = detail.clone();
             if !missing.is_empty() {
                 all.push(format!("{} absent", missing.join(", ")));
             }
@@ -1260,34 +1248,11 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
         "local tries behind the chain — {what}. Rebuilding both from Cardano history \
          before starting; this node could neither build nor co-sign until they match"
     );
-    // A file this node WROTE and the chain contradicts is evidence — of what it
-    // held, and so of whether it ever signed a wrong root. The rebuild
-    // overwrites in place, so take a COPY first.
-    //
-    // Copy rather than move, deliberately: moving them aside would mean a
-    // rebuild that fails leaves the node with NO tries, which breaks this
-    // function's "leaves them as they were" contract and flips the next
-    // start's diagnosis from "diverged" to the far gentler "never seeded".
-    if keep_a_copy {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        for name in ["cpo-trie.json", "spi-trie.json"] {
-            let from = dir.join(name);
-            if !from.exists() {
-                continue;
-            }
-            let to = dir.join(format!("{name}.superseded-{stamp}"));
-            match std::fs::copy(&from, &to) {
-                Ok(_) => warn!("  kept a copy of the superseded {name} as {}", to.display()),
-                Err(e) => warn!("  could not copy {name} aside before rebuilding: {e}"),
-            }
-        }
-    }
-
-    if let Err(e) = run_reconstruct_cpo_trie(cfg, false, false)
-        .and_then(|()| run_reconstruct_spi_trie(cfg, false, false))
-    {
+    let repairer = ChainTriesRepairer::new(
+        history,
+        heimdall::cardano::cpo_trie::ReconstructConfig::for_bridge(&bridge),
+    );
+    if let Err(e) = rt.block_on(repairer.repair(dir, &status, &what, chain.treasury_outpoint())) {
         warn!(
             target: "heimdall::event",
             "rebuilding the tries from chain history FAILED: {e}. Startup checks below \
@@ -1296,31 +1261,6 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
         return Some(format!("{what} — rebuild FAILED: {e}"));
     }
 
-    // The pending record MUST go with the rebuild, or the catch-up wedges the
-    // node it just healed. `settle_pending_tm` folds that record and checks the
-    // result against the root the record committed; a trie rebuilt PAST that
-    // movement reaches a different root, so the fold is refused,
-    // `PendingTm::clear` is never reached, and every later start repeats the
-    // rebuild, reports success, and jams in the same place.
-    //
-    // Safe to drop: a rebuild only happens when the chain has moved past this
-    // node. A movement still genuinely in flight leaves the head where the
-    // record expects it, so the tries match and this function returned above.
-    // Anything the record described that DID confirm is already in the rebuilt
-    // tries — they came from chain history.
-    if chain_moved_on && let Err(e) = PendingTm::clear(dir) {
-        warn!(
-            target: "heimdall::event",
-            "tries rebuilt, but the stale pending-movement record could not be removed: {e}. \
-             Delete pending-tm.json by hand, or this node will refuse to fold its next movement"
-        );
-    }
-
-    // Deliberately NOT re-checked here. `chain` is the snapshot read before the
-    // rebuild, and each walk cross-checked against its OWN read of the
-    // singleton — so comparing the new files to the old snapshot contradicts
-    // the gate, which is about to re-read it and report step 10 properly. One
-    // verdict, from the reader whose job that is.
     warn!(
         target: "heimdall::event",
         "tries rebuilt from chain history; the startup checks below confirm them. If this \
@@ -3012,6 +2952,22 @@ async fn run_spo(
     );
     // The loop reports through the same handle the surface serves.
     config.health = health;
+    // Runtime trie reconciliation is safe only after this exact bridge's
+    // contract set has resolved. It shares the operator reconstruction
+    // backend selection (Kupo when configured, otherwise Blockfrost-compatible).
+    if config.state_dir.is_some() {
+        if let Some(bridge) = contracts.as_ref() {
+            match heimdall::cardano::cpo_history::history_source(&cfg.cardano) {
+                Ok(source) => {
+                    let recon = heimdall::cardano::cpo_trie::ReconstructConfig::for_bridge(bridge);
+                    config.tries_repair = Some(Arc::new(
+                        heimdall::cardano::tries_repair::ChainTriesRepairer::new(source, recon),
+                    ));
+                }
+                Err(e) => warn!(target: "heimdall::event", "runtime tries repair unavailable: {e}"),
+            }
+        }
+    }
     // DEMO-ONLY fault injection (--inject-fault); parse-and-die on a bad kind.
     config.inject_fault = match inject_fault.as_deref() {
         None => None,

@@ -703,6 +703,20 @@ Both walks read chain history one transaction at a time over Blockfrost — seco
 longer as it grows. `cardano.kupo_url`, if you run Kupo, answers a whole address history in one
 request instead.
 
+### The node reconciles while running
+
+At every batch opportunity, before freezing requests, the node compares both cumulative trie
+roots with the bridge-state singleton at the treasury head it will spend. If it missed a confirmed
+movement while still running, it rebuilds both tries together from Cardano history and continues
+without a restart. The event log records the repair and `heimdall status` shows it under
+`tries REBUILT at runtime`.
+
+One repair means the node missed a ceremony and healed. Repairs every epoch usually mean the node
+is repeatedly being excluded; inspect `dkg` and the peer-exclusion lines in the same status report.
+A standing `RUNTIME REPAIR FAILED` means the node sat out that opportunity. Run
+`reconstruct-tries --dry-run` to see the history-backend failure; for a history that no longer fits
+the runtime budget, configure `cardano.kupo_url`.
+
 ## 5. Make your endpoint reachable
 
 **This is the one piece of networking you can get wrong silently.** Your node serves its DKG and
@@ -1225,7 +1239,7 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 | `[9/11] post a movement FAIL` | this bridge has never published its treasury-movement validator on chain, so no SPO can post — `binocular deploy-script-refs`, re-run, publishes it and skips what already exists. Not something one operator's config can fix |
 | `[11/11] wallet collateral WARN`, or `no ada-only wallet UTxO with >= 5 ADA for collateral` when a tx is built | the wallet cannot post a script transaction, which is **not** a balance problem — it can hold thousands of ADA and still fail, if every UTxO carries a native token. A script tx needs one UTxO to pay the fee and a DISTINCT ada-only one for collateral. `heimdall ensure-collateral --submit` splits clean UTxOs off whatever the wallet holds; it runs no script, so it needs no collateral itself and works even when every lovelace is behind a token |
 | a key you set is `refused` at load | it names a value the Config publishes; delete it, and `show-config-params` prints what the chain says |
-| `trie diverged` or `trie is out of sync with the chain` | this node's cumulative state is behind the bridge's — run the `reconstruct-…` command the message names; it rebuilds from chain history and refuses anything it cannot explain |
+| `trie diverged` or `trie is out of sync with the chain` | the node reconciles itself at the next batch opportunity; if `tries_repair_failed` is set, run `reconstruct-tries --dry-run` to see why |
 | `roots were read at treasury head …, but this movement spends …` | two reads of the bridge state saw different chain states, usually the Kupo at `cardano.kupo_url` lagging the Blockfrost-compatible API. This is not yet a verdict on your tries: the node retries by itself and compares them once both reads agree. If the message keeps repeating, the lagging backend is stuck: check that it is synced |
 | `the 51% mode did not sign this movement`, climbing | the roster cannot reach a signature. One member that publishes a round-1 commitment and then goes quiet — a crash does it as readily as malice — costs one attempt and is then excluded for that movement, so a count that keeps climbing means something wider. Compare `/health` across the roster; `heimdall status` reports the run of unsigned movements. If it does not clear, the treasury moves only through the federation's emergency path (below) |
 | the treasury has to move and the roster cannot sign it | `heimdall federation-spend`, run by each federation member with the same `--signers`. It needs the treasury UTxO to be `federation_csv_blocks` deep on Bitcoin, and it checks both that and the rebuilt treasury address against Bitcoin before anyone signs. **No daemon does this** — it is a spend, and heimdall's daemon never spends |

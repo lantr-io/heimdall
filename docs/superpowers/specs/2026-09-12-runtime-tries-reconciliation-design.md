@@ -304,7 +304,9 @@ Added by §A and §B:
 
 0. **Done, in #104.** The head check: `BridgeState::treasury_outpoint`, `BridgeRoots.head`, `cross_check_bridge_roots` refusing on a mismatch, and test 10. It closes a gap `main` has today.
 1. Measure (§C), in parallel with 0, and confirm or change `TRIES_REPAIR_BUDGET` before step 3.
-2. Extract the core into `tries_repair.rs` (one harvest, the attested head, both-or-neither) and point `catch_up_tries` at it. No behaviour change beyond refusing a half-saved pair and a walk at another head. Branch off `main` once #104 has merged, not stacked on it: merging a base branch with `--delete-branch` closes the PR stacked on it.
+Steps 2–4 also land in #104 (rssh, 2026-09-14): #104 is the fix for tries that disagree with the chain, and a node that drifts while running is the same fault.
+
+2. Extract the core into `tries_repair.rs` (one harvest, the attested head, both-or-neither) and point `catch_up_tries` at it. No behaviour change beyond refusing a half-saved pair and a walk at another head.
 3. `EpochConfig.tries_repair`, `TriesBehind`, `reconcile_tries`, ramp arm, health fields, tests 1–9 and 11–14.
 4. Signing comment, operator guide.
 

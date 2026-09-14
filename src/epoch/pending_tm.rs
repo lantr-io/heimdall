@@ -147,6 +147,30 @@ impl PendingTm {
             Err(e) => Err(format!("remove {}: {e}", path.display())),
         }
     }
+
+    /// Move the record out of the way, as `pending-tm.json.superseded-<unix
+    /// secs>`, when it cannot be folded but the tries already match the chain.
+    ///
+    /// Not [`Self::clear`]: a record the fold refused is either stale or
+    /// unreadable, and either way it is evidence of what this node posted. Moving
+    /// it keeps that, and stops it being read again. `Ok(None)` when there was no
+    /// record.
+    pub fn set_aside(state_dir: &Path) -> Result<Option<PathBuf>, String> {
+        let path = Self::state_path(state_dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let to = state_dir.join(format!("pending-tm.json.superseded-{stamp}"));
+        match std::fs::rename(&path, &to) {
+            Ok(()) => Ok(Some(to)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!(
+                "rename {} to {}: {e}",
+                path.display(),
+                to.display()
+            )),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +332,17 @@ mod tests {
         sample().save(dir.path()).unwrap();
         PendingTm::clear(dir.path()).unwrap();
         PendingTm::clear(dir.path()).expect("clearing twice succeeds");
+        assert_eq!(PendingTm::load(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn setting_aside_preserves_a_stale_record_and_stops_loading_it() {
+        let dir = TestDir::new("set-aside");
+        sample().save(dir.path()).unwrap();
+        let kept = PendingTm::set_aside(dir.path())
+            .unwrap()
+            .expect("record was present");
+        assert!(kept.exists(), "the stale journal remains as evidence");
         assert_eq!(PendingTm::load(dir.path()).unwrap(), None);
     }
 

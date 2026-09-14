@@ -688,6 +688,30 @@ pub struct ReconstructConfig {
     pub cpo_policy_id: String,
 }
 
+impl ReconstructConfig {
+    /// Every identifier the walk needs, from the bridge the Config names —
+    /// Config #2/#4/#5/#7 (WI-070). One authenticated read rather than typed
+    /// copies, which matters here more than anywhere: a wrong TM or peg-out
+    /// address yields a SHORT trie, indistinguishable from a bridge with less
+    /// history.
+    #[must_use]
+    pub fn for_bridge(bridge: &crate::cardano::config_params::BridgeContracts) -> Self {
+        let unit = bridge.bridged_token_unit.to_ascii_lowercase();
+        // #2 is a 28-byte policy, so the unit's first 56 hex characters are it and
+        // the rest is the asset name. Clamped rather than indexed: a short unit
+        // then names a policy nothing holds and the walk finds no requests,
+        // which the final root check reports, instead of panicking the daemon.
+        let (policy, asset_name) = unit.split_at(unit.len().min(56));
+        Self {
+            tm_address: bridge.tm_address.clone(),
+            pegout_address: bridge.pegout_script_address.clone(),
+            fbtc_policy_id: policy.to_string(),
+            fbtc_asset_name_hex: asset_name.to_string(),
+            cpo_policy_id: bridge.bridge_state_policy_id.to_ascii_lowercase(),
+        }
+    }
+}
+
 /// A peg-out request as chain history remembers it — open or long since spent.
 #[derive(Debug, Clone)]
 struct HistoricalPor {
@@ -743,8 +767,53 @@ pub async fn reconstruct(
 ) -> Result<CpoTrie, CpoTrieError> {
     let chain = harvest_confirmed_chain(source, &cfg.tm_address, &cfg.cpo_policy_id).await?;
     let history = fetch_pegout_history(source, cfg).await?;
+    cpo_from_harvest(&chain, &history)
+}
 
-    let trie = replay(&chain.ordered, &chain.hints, &history)?;
+/// Both cumulative tries, rebuilt from ONE harvest, with the singleton state
+/// that attested them. See [`reconstruct_both`].
+pub struct ReconstructedTries {
+    pub cpo: CpoTrie,
+    pub spi: crate::cardano::spi_trie::SpiTrie,
+    /// The singleton read the walk started from and both roots were checked
+    /// against — so [`BridgeState::treasury_outpoint`] of it is the head the pair
+    /// is attested AT.
+    ///
+    /// [`BridgeState::treasury_outpoint`]: crate::cardano::bridge_state::BridgeState::treasury_outpoint
+    pub state: crate::cardano::bridge_state::BridgeState,
+}
+
+/// Rebuild both tries from one harvest of the chain.
+///
+/// [`reconstruct`] and [`reconstruct_spi`] harvest separately, so each checks
+/// its root against its OWN read of the singleton, and a Confirm landing between
+/// the two reads yields a pair attested by two different states. That is harmless
+/// for an operator running the two commands; a node repairing itself needs the
+/// pair attested by one read, and needs to know which read — so it can hold the
+/// pair against the head it is about to spend. Same walk, same checks, and the
+/// TM address history is read once instead of twice.
+pub async fn reconstruct_both(
+    source: &dyn CpoHistorySource,
+    cfg: &ReconstructConfig,
+) -> Result<ReconstructedTries, CpoTrieError> {
+    let chain = harvest_confirmed_chain(source, &cfg.tm_address, &cfg.cpo_policy_id).await?;
+    let history = fetch_pegout_history(source, cfg).await?;
+    let cpo = cpo_from_harvest(&chain, &history)?;
+    let spi = spi_from_harvest(&chain)?;
+    Ok(ReconstructedTries {
+        cpo,
+        spi,
+        state: chain.state,
+    })
+}
+
+/// Steps 5–7 of [`reconstruct`] over a harvest already in hand: replay, then the
+/// final cross-check against the singleton that harvest read.
+fn cpo_from_harvest(
+    chain: &HarvestedChain,
+    history: &HashMap<[u8; 36], HistoricalPor>,
+) -> Result<CpoTrie, CpoTrieError> {
+    let trie = replay(&chain.ordered, &chain.hints, history)?;
 
     // --- the final safety net ---
     //
@@ -773,8 +842,15 @@ pub async fn reconstruct_spi(
     tm_address: &str,
     bridge_state_policy: &str,
 ) -> Result<crate::cardano::spi_trie::SpiTrie, CpoTrieError> {
-    use crate::cardano::spi_trie::{Outpoint, SpiTrie};
     let chain = harvest_confirmed_chain(source, tm_address, bridge_state_policy).await?;
+    spi_from_harvest(&chain)
+}
+
+/// The SPI replay and its singleton cross-check, over a harvest already in hand.
+fn spi_from_harvest(
+    chain: &HarvestedChain,
+) -> Result<crate::cardano::spi_trie::SpiTrie, CpoTrieError> {
+    use crate::cardano::spi_trie::{Outpoint, SpiTrie};
     let mut trie = SpiTrie::empty();
     for tm in &chain.ordered {
         let inputs: Vec<Outpoint> = tm

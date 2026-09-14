@@ -696,7 +696,8 @@ fn step_clears_ramp(failed_in: Option<&'static str>, stepped: &'static str) -> b
 /// catch-all for filesystem I/O and for comparisons against live chain reads,
 /// neither of which a retry reproduces.
 fn rejects_the_batch(stepped: &'static str, cause: &EpochError) -> bool {
-    stepped == "BuildTm" && matches!(cause, EpochError::BatchRejected(_))
+    (stepped == "BuildTm" && matches!(cause, EpochError::BatchRejected(_)))
+        || (stepped == "CollectPegins" && matches!(cause, EpochError::TriesBehind { .. }))
 }
 
 /// Whether a failed attempt keeps its batch opportunity instead of handing it
@@ -1029,6 +1030,98 @@ fn settle_pending_tm(
     PendingTm::clear(dir)
         .map_err(|e| EpochError::TmBuild(format!("pending treasury movement: {e}")))?;
     Ok(())
+}
+
+async fn reconcile_tries(
+    chain: &Arc<dyn CardanoChain>,
+    config: &EpochConfig,
+    treasury: &crate::epoch::traits::TreasuryUtxo,
+    epoch: u64,
+    batch: Option<u64>,
+) -> EpochResult<()> {
+    use crate::cardano::bridge_state::{TriesStatus, local_tries_status};
+    use crate::cardano::tries_repair::RepairError;
+    use crate::epoch::pending_tm::PendingTm;
+
+    let Some(dir) = config.state_dir.as_deref() else {
+        return Ok(());
+    };
+    let fold_error = settle_pending_tm(config, treasury).err();
+    let Some(roots) = chain.query_bridge_roots().await? else {
+        return fold_error.map_or(Ok(()), Err);
+    };
+    if roots.head != treasury.outpoint {
+        return Err(EpochError::Chain(format!(
+            "the bridge roots were read at treasury head {}, but CollectPegins read {}; not comparing or repairing across chain states",
+            roots.head, treasury.outpoint
+        )));
+    }
+    let status = local_tries_status(dir, roots.cpo_root, roots.spi_root);
+    if status == TriesStatus::InSync {
+        if let Some(e) = fold_error {
+            let moved = PendingTm::set_aside(dir)
+                .map_err(|x| EpochError::TmBuild(format!("{e}; set stale journal aside: {x}")))?;
+            crate::epoch_warn!(
+                config.identity.identifier,
+                epoch,
+                "pending movement could not be folded ({e}), but both tries already match the singleton; set the stale journal aside as {}",
+                moved
+                    .as_ref()
+                    .map_or_else(|| "<already absent>".into(), |p| p.display().to_string())
+            );
+        }
+        return Ok(());
+    }
+    let why = match &status {
+        TriesStatus::NeverSeeded { missing } => {
+            format!("never seeded ({} absent)", missing.join(", "))
+        }
+        TriesStatus::Diverged { detail, missing } => {
+            let mut all = detail.clone();
+            if !missing.is_empty() {
+                all.push(format!("{} absent", missing.join(", ")));
+            }
+            all.join("; ")
+        }
+        TriesStatus::Unreadable { detail } => detail.join("; "),
+        TriesStatus::InSync => unreachable!(),
+    };
+    let why = fold_error.map_or(why.clone(), |e| format!("{e}; {why}"));
+    let Some(repairer) = config.tries_repair.as_ref() else {
+        let why =
+            format!("{why}; this node cannot rebuild because no tries repairer was configured");
+        config
+            .health
+            .update(|h| h.tries_repair_failed = Some(why.clone()));
+        return Err(EpochError::TriesBehind { why });
+    };
+    match repairer.repair(dir, &status, &why, treasury.outpoint).await {
+        Ok(reason) => {
+            let position = batch.map_or_else(
+                || format!("epoch {epoch}"),
+                |i| format!("epoch {epoch} B_{i}"),
+            );
+            config.health.update(|h| {
+                h.tries_repair_failed = None;
+                h.tries_rebuilt_at_runtime
+                    .push(format!("{position}: {reason}"));
+                if h.tries_rebuilt_at_runtime.len() > 8 {
+                    h.tries_rebuilt_at_runtime.remove(0);
+                }
+            });
+            Ok(())
+        }
+        Err(RepairError::HeadMoved { walked, expected }) => Err(EpochError::Chain(format!(
+            "tries repair walked treasury head {walked}, but this batch will spend {expected}; retrying after the chain views converge"
+        ))),
+        Err(e) => {
+            let why = e.to_string();
+            config
+                .health
+                .update(|h| h.tries_repair_failed = Some(why.clone()));
+            Err(EpochError::TriesBehind { why })
+        }
+    }
 }
 
 /// Fold a CONFIRMED TM's peg-outs into this node's persisted completed-peg-outs
@@ -2803,7 +2896,7 @@ async fn collect_pegins_phase(
         // (WI-032). It runs BEFORE the gate below and before every build, so
         // `build_tm_phase`'s cross-check against the on-chain singleton never
         // sees a trie that this node already had the means to advance.
-        settle_pending_tm(config, &treasury)?;
+        reconcile_tries(chain, config, &treasury, epoch, batch.map(|b| b.index)).await?;
         // With no grid there is no opportunity to pass, so the tip wait inside
         // `build_tm_phase` stands as it did before the grid.
         let Some(b) = batch else {
@@ -9248,6 +9341,22 @@ mod tests {
             !spends_the_opportunity(false, false, gridded),
             "an ordinary transient failure hands the opportunity back, as it always has"
         );
+    }
+
+    #[test]
+    fn a_failed_runtime_repair_is_terminal_for_this_opportunity() {
+        assert!(rejects_the_batch(
+            "CollectPegins",
+            &EpochError::TriesBehind {
+                why: "history backend unavailable".into(),
+            }
+        ));
+        assert!(!rejects_the_batch(
+            "BuildTm",
+            &EpochError::TriesBehind {
+                why: "history backend unavailable".into(),
+            }
+        ));
     }
 
     /// WI-097's acceptance. Two Treasury Movements in ONE epoch, off ONE ceremony,
