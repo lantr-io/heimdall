@@ -1524,14 +1524,15 @@ fn ref_script_already_deployed(
 /// different port between the two invalidates both signatures, and the failure
 /// says only "signature does not verify".
 fn resolve_bifrost_url(cfg: &HeimdallConfig, arg: Option<&str>) -> Result<String, String> {
-    arg.or(cfg.bifrost.url.as_deref())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            "no Bifrost endpoint URL: pass --bifrost-url or set [bifrost].url. It is published \
+    let raw = arg.or(cfg.bifrost.url.as_deref()).ok_or_else(|| {
+        "no Bifrost endpoint URL: pass --bifrost-url or set [bifrost].url. It is published \
              on chain and peers fetch this node's DKG rounds from it, so its port is also the \
              port the daemon binds"
-                .to_string()
-        })
+            .to_string()
+    })?;
+
+    heimdall::cardano::roster::validate_bifrost_url(raw)
+        .map_err(|reason| format!("invalid Bifrost endpoint URL {raw:?}: {reason}"))
 }
 
 fn main() {
@@ -9253,8 +9254,9 @@ mod tests {
     use super::{
         MOVER_KEY_MISMATCH, cross_check_treasury, csv_depth_verdict, mover_key_mismatch_error,
         parse_cardano_outref, parse_hex_n, parse_key32, parse_treasury_override, pool_id_bech32,
-        ref_script_already_deployed, treasury_script_verdict,
+        ref_script_already_deployed, resolve_bifrost_url, treasury_script_verdict,
     };
+    use heimdall::config::HeimdallConfig;
 
     /// The packaged unit must actually START.
     ///
@@ -9337,6 +9339,37 @@ mod tests {
         assert_eq!(parse_hex_n::<2>("a1b2", "x").unwrap(), [0xa1, 0xb2]);
         assert!(parse_hex_n::<2>("a1", "x").is_err());
         assert!(parse_hex_n::<2>("zz", "x").is_err());
+    }
+
+    #[test]
+    fn registration_url_is_validated_and_canonicalized_before_signing() {
+        let cfg = HeimdallConfig::default();
+
+        assert_eq!(
+            resolve_bifrost_url(&cfg, Some("HTTP://SPO.EXAMPLE:80/")).unwrap(),
+            "http://spo.example"
+        );
+
+        let err = resolve_bifrost_url(&cfg, Some("bifrost.xstakepool.com")).unwrap_err();
+        assert!(err.contains("invalid Bifrost endpoint URL"), "{err}");
+        assert!(err.contains("relative URL without a base"), "{err}");
+    }
+
+    #[test]
+    fn registration_url_rejects_unusable_http_endpoints() {
+        let cfg = HeimdallConfig::default();
+        for url in [
+            "ftp://spo.example:18500",
+            "http:///",
+            "https://user:secret@spo.example",
+            "https://spo.example?node=1",
+            "https://spo.example#rounds",
+        ] {
+            assert!(
+                resolve_bifrost_url(&cfg, Some(url)).is_err(),
+                "accepted unusable registration URL {url:?}"
+            );
+        }
     }
 
     /// WI-092: what `sign-registration` prints must be what `register-spo`
