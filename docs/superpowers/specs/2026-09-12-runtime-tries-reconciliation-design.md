@@ -1,6 +1,6 @@
 # Reconcile the tries where the divergence is detected
 
-**Status:** Design — ready for planning
+**Status:** Design — amended 2026-09-14 (§Before implementing); implement from this document, no separate plan
 **Date:** 2026-09-12
 **Driver:** WI-20260912-8DDEA — a node whose tries fall behind the chain *while it is running* stays inert until an operator restarts it. PR #104 (`feat/tries-catch-up-at-startup`) covers only the restart.
 
@@ -14,7 +14,7 @@ A node whose cumulative tries (`cpo-trie.json`, `spi-trie.json`) go behind the b
 
 - A node with no `protocol.state_dir`. It keeps no tries at all and is warned once per movement by `record_movement_phase`; nothing here changes that.
 - The leader-proposes-TM wire format (`/sign/{epoch}/tm.json`). It does not exist; the co-sign decision below is written so it survives its arrival.
-- Changing what `reconstruct` / `reconstruct_spi` compute. The walk, its cross-checks and its refusal to persist an unattested root are reused verbatim.
+- Changing what `reconstruct` / `reconstruct_spi` compute. The walk, its cross-checks and its refusal to persist an unattested root are reused verbatim; the repairer harvests once for both tries and reads back the singleton state the walk verified against (§A).
 
 ---
 
@@ -61,6 +61,51 @@ Two properties of that code decide the shape of the runtime path:
 
 ---
 
+## Before implementing
+
+*Added 2026-09-14, after checking this document against the code at `3faf16a`. The sections below are amended to match.* No separate implementation plan: "Changes by file", "Tests" and "Rollout" are the plan. Three things had to be settled first.
+
+### A. The roots must come from the state whose head the movement spends
+
+**The gap.** The head and the roots are two fields of one singleton UTxO, read by two paths. `query_treasury` reads the head through the Blockfrost-compatible API (`query_config_singleton`). `query_bridge_roots` reads the roots, and both reconstruction walks read their history, through Kupo when `cardano.kupo_url` is set. Each walk checks itself only against its own read of the singleton (`harvest_confirmed_chain`). No comparison looks at the head. So "the tries match the chain" means "the tries match the state the roots backend is serving", which can be older than the head the batch spends. Hosted Blockfrost's load-balanced replicas can do the same without Kupo.
+
+**On `main` today.** A node that missed movement M has no journal entry for it. It passes `cross_check_bridge_roots` whenever its roots backend has not yet seen M's Confirm and its head backend has. `build_tm_phase` then spends M's output with a cpo trie that lacks M's peg-outs. Since WI-031 that trie is the only already-paid record, and M's requests stay open on Cardano until their owners complete them, so the batch pays them again. Only nodes that missed M are exposed. They build a movement their up-to-date peers do not, so the usual cost is their round — unless enough of them to reach the threshold share the stale view.
+
+**What this item would add.** `reconcile_tries` is a second writer of the tries, and it follows the roots backend. With that backend behind a Confirm, it would rewind a node that signed M and folded it correctly, which makes a threshold of stale nodes far easier to reach.
+
+**Decision.** Enforce the invariant wherever the tries are compared or written:
+
+- `BridgeRoots` gains `head: bitcoin::OutPoint`, decoded from the same `fetch_bridge_state` read as the roots. One `BridgeState::treasury_outpoint()` does the decoding, and `query_treasury` switches to it, so the two sides cannot disagree about byte order.
+- `cross_check_bridge_roots` takes the head `build_tm_phase` just read and refuses when `roots.head` differs.
+- `reconcile_tries` compares heads before roots, and on a mismatch compares and writes nothing.
+- The repairer takes the head the caller will spend and saves nothing unless its walk attests that head. Both tries come from ONE `harvest_confirmed_chain`, so one singleton read attests the pair, and the TM address history is walked once, not twice. `reconstruct` / `reconstruct_spi` keep their CLI signatures.
+
+A head mismatch is chain-read skew, not a verdict on the tries. It returns `EpochError::Chain`, goes to the ramp like any failed read and retries within the window. It is never `TriesBehind`. Lag heals in seconds. A stuck indexer produces one warning per `retry_backoff_max` naming both heads, the same cadence a folded node gets from `cross_check_bridge_roots` today.
+
+It ships first, in #104 itself (Rollout 0). #104 exists because a node's tries and the chain disagreed, and this is the deeper half of that fault, found while fixing it.
+
+### B. Any fold error goes to the singleton, not only a root mismatch
+
+`settle_pending_tm` returns `EpochError::TmBuild(String)` for all of these alike: an unreadable journal, an unreadable trie, a `Conflict`, a root mismatch, a failed write. "The divergence error" cannot be picked out without parsing strings.
+
+**Decision: no typed refusal.** The fold becomes the fast path, and the gate is the singleton comparison: the tries must equal the roots attested at the head this batch spends (A). That is what `cross_check_bridge_roots` already enforces, so proceeding past a fold error is no weaker than today. The fold's error is kept as the reason, and step 2 decides:
+
+| After a fold error, the tries are | Then |
+|---|---|
+| `InSync` | The journal describes nothing still owed, because the tries already match the chain at the head being spent. Move `pending-tm.json` aside as `pending-tm.json.superseded-<stamp>`, kept as evidence like the trie copies. Log once, continue, no walk. |
+| `Diverged` / `NeverSeeded` / `Unreadable` | Repair, with #104's record-clearing rule unchanged. |
+| not comparable: `query_bridge_roots` is `None`, which only mocks and the demo reach, since `run_spo` always configures the singleton | The fold error propagates exactly as today. |
+
+The rejected alternative, a typed refusal, heals only the root mismatch. A corrupt `pending-tm.json` or trie file would stay on the 60 s loop this item exists to end.
+
+### C. Measure the repair over the backends nodes run, before fixing its budget
+
+The only number we have is the operator guide's "seconds on this bridge" (§4), which says nothing about growth. Time `reconstruct-tries --dry-run` on the shared preprod bridge over Dolos, hosted Blockfrost and Kupo. That settles `TRIES_REPAIR_BUDGET` and the Blockfrost-refusal question before Rollout 3.
+
+Dolos matters most. It is the backend SPOs are meant to run (WI-064), and it now serves the walk's endpoints (rssh, 2026-09-14).
+
+---
+
 ## Design
 
 ### One reconciliation point, not three
@@ -70,20 +115,23 @@ The WI lists three sites. Two of them share one cause and one detection: the loc
 So:
 
 - **`CollectPegins`** gets `reconcile_tries`, replacing the bare `settle_pending_tm` call. It heals both the refused FOLD and the would-be refused BUILD.
-- **`BuildTm`**'s `cross_check_bridge_roots` is unchanged. It is now expected never to fire; when it does, refusing is correct.
+- **`BuildTm`**'s `cross_check_bridge_roots` keeps its refusal and gains the head check (§A). It is now expected never to fire; when it does, refusing is correct.
 - **`Sign`**'s `verify_cpo_root` / `verify_spi_root` are unchanged, by decision (below).
 
 ### `reconcile_tries` — the runtime site
 
 Called inside the opportunity loop of `collect_pegins_phase`, exactly where `settle_pending_tm(config, &treasury)?` is today:
 
-1. `settle_pending_tm(config, &treasury)`. On `Ok`, continue to 2. On the divergence error, keep the error text (it *is* the diagnosis) and go to 3 with it as the reason.
-2. `chain.query_bridge_roots().await?`. `None` means no `cardano.cpo_policy_id`: nothing to compare against, return `Ok` and let `BuildTm` report `CpoTrust::Unverified` as it does now. `Some(roots)`: `local_tries_status(state_dir, roots.cpo_root, roots.spi_root)`. `InSync` → return `Ok`. Anything else → 3.
-3. Repair, once, under a budget (below). On success, log at event level, record it on `/health`, return `Ok` — the phase continues into the peg-in scan on tries that now match the chain. On failure, return `EpochError::TriesBehind { why }`.
+1. `settle_pending_tm(config, &treasury)`, the fast path. On any error, keep the error text (it *is* the diagnosis) and continue to 2 (§B).
+2. `chain.query_bridge_roots().await?`.
+   - `None`: no singleton is configured, which only mocks and the demo reach. Nothing to compare against, so a fold error from 1 propagates as today. Otherwise return `Ok` and let `BuildTm` report `CpoTrust::Unverified` as it does now.
+   - `Some(roots)` with `roots.head != treasury.outpoint`: the two reads describe different singleton states. Return a retriable `EpochError::Chain` naming both heads, and compare and write nothing (§A).
+   - Otherwise `local_tries_status(state_dir, roots.cpo_root, roots.spi_root)`. `InSync` → move aside a journal the fold refused (§B) and return `Ok`. Anything else → 3.
+3. Repair, once, under a budget (below), for the head `treasury.outpoint`. On success, log at event level, record it on `/health` and return `Ok`; the phase continues into the peg-in scan on tries that now match the chain. On `RepairError::HeadMoved`, return the same retriable error as step 2. On any other failure, return `EpochError::TriesBehind { why }`.
 
 The record-clearing rule is #104's, unchanged: cleared on `Diverged` and `NeverSeeded` (the chain has moved past this node), kept on `Unreadable` (a movement may still be in flight and the record is the only thing that will fold it). It must clear on the refused-FOLD path too, or the node wedges exactly as the comment in `catch_up_tries` describes.
 
-`query_treasury` and `query_bridge_roots` are two reads and a Confirm can land between them. Either order is safe: a fold that succeeds and then a roots read that matches is the normal case; a fold that finds no movement and a roots read that disagrees repairs and clears the record, and the repair is idempotent.
+`query_treasury` and `query_bridge_roots` are two reads, on two backends when `kupo_url` is set, so they can describe different singleton states. On roots alone neither order is safe. The head comparison in step 2 makes it safe: a Confirm landing between the reads, or one indexer behind the other, becomes a retry instead of a repair (§A).
 
 Cost in the steady state: one `query_bridge_roots` and two small file loads per opportunity, every ~6 h. Nothing new is read on the retry loop.
 
@@ -96,10 +144,23 @@ New module `crate::cardano::tries_repair`:
 pub trait TriesRepairer: Send + Sync + std::fmt::Debug {
     /// Rebuild both tries from chain history into `state_dir`, replacing what is
     /// there. `status` is what the caller found; it decides keep-a-copy and
-    /// whether pending-tm.json may be dropped. Returns the one-line reason for
-    /// the health surface.
-    async fn repair(&self, state_dir: &Path, status: &TriesStatus, why: &str)
-        -> Result<String, String>;
+    /// whether pending-tm.json may be dropped. `head` is the treasury head the
+    /// caller will spend: nothing is saved unless the walk attests exactly that
+    /// head (§A). Returns the one-line reason for the health surface.
+    async fn repair(
+        &self,
+        state_dir: &Path,
+        status: &TriesStatus,
+        why: &str,
+        head: bitcoin::OutPoint,
+    ) -> Result<String, RepairError>;
+}
+
+pub enum RepairError {
+    /// The walk's singleton read is at another head: chain-read skew, retriable.
+    HeadMoved { walked: bitcoin::OutPoint, expected: bitcoin::OutPoint },
+    /// The walk failed, ran out of budget, or could not save. Spends the opportunity.
+    Failed(String),
 }
 
 pub struct ChainTriesRepairer {
@@ -109,7 +170,15 @@ pub struct ChainTriesRepairer {
 }
 ```
 
-`ChainTriesRepairer::repair` does, in order: keep a copy on `Diverged`/`Unreadable`; `tokio::time::timeout(budget, async { reconstruct(..).await?; reconstruct_spi(..).await })` — **both walks in memory first**, then save both files, so a failed spi walk leaves the cpo file untouched; then `PendingTm::clear` per the rule above. It logs through `tracing`, never `println!`.
+`ChainTriesRepairer::repair` does, in order:
+
+1. Keep a copy on `Diverged`/`Unreadable`.
+2. Under `tokio::time::timeout(budget, ..)`, run **one** `harvest_confirmed_chain` and both replays from it, in memory.
+3. Return `HeadMoved` unless the harvested singleton's head is `head`.
+4. Save both files, so a failed replay leaves both untouched.
+5. `PendingTm::clear` per the rule above.
+
+It logs through `tracing`, never `println!`.
 
 Three callers, one core:
 
@@ -131,6 +200,8 @@ A failed repair returns `EpochError::TriesBehind`. Two changes make it terminal 
 - The `deterministic` arm's warning says "failed on the frozen batch"; `TriesBehind` gets its own wording, because at `CollectPegins` nothing is frozen.
 
 The node therefore attempts one repair per opportunity, logs one warning per attempt, and waits for the next grid line. That is honest: a node whose tries are behind can neither build nor co-sign at this opportunity, so sitting it out costs nothing the loop could have recovered. If a within-window retry is wanted later, the alternative is a memo keyed on `(epoch, batch index)` that re-raises the last error without walking the chain; it is more state for a benefit that only shows on a transient failure in the first minutes of a window.
+
+A head mismatch, whether from step 2 or `RepairError::HeadMoved`, is not a failed repair and gets none of this. It is chain-read skew, and the ramp retries it within the window (§A).
 
 Log on change, gauge in health, as for `stranded_pegins`: a repeat failure with the same reason logs at debug; the standing condition lives on `/health`.
 
@@ -161,10 +232,19 @@ pub tries_repair_failed: Option<String>,
 ## Changes by file
 
 ### `src/cardano/tries_repair.rs` (new)
-`TriesRepairer`, `ChainTriesRepairer`, `TRIES_REPAIR_BUDGET`. Keep-a-copy, both-walks-then-both-saves, record-clearing rule, `tracing` output.
+`TriesRepairer`, `RepairError`, `ChainTriesRepairer`, `TRIES_REPAIR_BUDGET`. Keep-a-copy, one harvest for both tries, the attested-head check, both-or-neither saves, record-clearing rule, `tracing` output.
+
+### `src/cardano/bridge_state.rs`
+- `BridgeState::treasury_outpoint()`, the one decoding of field 2. `query_treasury` and `main.rs`'s other hand-rolled copy switch to it.
+
+### `src/cardano/cpo_trie.rs`
+- Harvest once and replay both tries from it, returning the attested `BridgeState` with them. `reconstruct` / `reconstruct_spi` stay as the CLI's wrappers.
+
+### `src/epoch/traits.rs`, `src/cardano/blockfrost_chain.rs`, `src/epoch/mocks.rs`
+- `BridgeRoots.head: bitcoin::OutPoint`, filled from the same `fetch_bridge_state` read as the roots. The mock stores only the roots (`MockBridgeRoots`) and reports the head `query_treasury` reads, so a test can put them out of step only on purpose, through `with_roots_read_at` (tests 10 and 11).
 
 ### `src/main.rs`
-- `catch_up_tries`: build `ChainTriesRepairer` from `cfg` + `resolve_bridge_contracts`, call `repair`. Delete the copy/clear logic it duplicates.
+- `catch_up_tries`: build `ChainTriesRepairer` from `cfg` + `resolve_bridge_contracts`, and call `repair` with the head from the singleton read it already makes. Delete the copy/clear logic it duplicates.
 - `run_spo`: construct the repairer after the Config resolves, when `state_dir` is set, and put it on the `EpochConfig`.
 - `run_reconstruct_cpo_trie` / `run_reconstruct_spi_trie`: unchanged in behaviour; share the backend-selection helper with the repairer.
 
@@ -173,7 +253,8 @@ pub tries_repair_failed: Option<String>,
 - `EpochError::TriesBehind { why: String }`.
 
 ### `src/epoch/machine.rs`
-- `reconcile_tries` (new), called from `collect_pegins_phase` in place of the bare `settle_pending_tm` call.
+- `reconcile_tries` (new), called from `collect_pegins_phase` in place of the bare `settle_pending_tm` call: fold, head check, status, then move a refused journal aside or repair (§A, §B).
+- `cross_check_bridge_roots`: takes the head `build_tm_phase` read and refuses when `roots.head` differs (§A, Rollout 0).
 - `rejects_the_batch`: the `CollectPegins` + `TriesBehind` arm.
 - `drive_to_movement`: `TriesBehind` wording in the deterministic arm; health update on success and failure.
 - `advance_cpo_trie` / `advance_spi_trie`: message no longer tells the operator to run `reconstruct-cpo-trie`; it says the node will reconcile at this opportunity.
@@ -201,11 +282,19 @@ pub tries_repair_failed: Option<String>,
 5. **Repairer returns `Err`** → `TriesBehind`; through `drive_to_movement` with the fast config the opportunity is spent (`built` still marked), the repairer was called exactly once, `tries_repair_failed` is set; the next opportunity calls it again and a success clears the field.
 6. **Repairer exceeds the budget** (fake sleeps past a test-sized budget) → same as 5, message names the budget.
 7. **`tries_repair: None`, roots differ** → `TriesBehind` with "this node cannot rebuild"; opportunity spent.
-8. **No `cpo_policy_id`** (`query_bridge_roots` → `None`) → repairer not called; `BuildTm` reports `Unverified` as today.
+8. **No `cpo_policy_id`** (`query_bridge_roots` → `None`) → repairer not called; `BuildTm` reports `Unverified` as today. With a refused fold, the fold's error propagates unchanged (§B).
 
 `tries_repair.rs`:
 
-9. **spi walk fails after cpo walk succeeds** → neither file changed, journal kept.
+9. **spi replay fails after the cpo replay succeeds** → neither file changed, journal kept.
+
+Added by §A and §B:
+
+10. **Head skew at `BuildTm`**: the tries equal the roots, but `roots.head` differs from the treasury head → `cross_check_bridge_roots` refuses with a `Chain` error naming both heads (`bridge_roots_cross_check_refuses_roots_read_at_another_head`), and `build_tm_phase` with a withdrawal waiting builds nothing (`a_withdrawal_is_not_paid_on_roots_read_at_another_head`). This is the regression test for the gap on `main`, and it shipped in Rollout 0.
+11. **Head skew at `CollectPegins`**: `roots.head` differs and the tries differ → the repairer is not called, nothing is written, the journal is kept; through `drive_to_movement` the opportunity is handed back, not spent.
+12. **Refused fold, tries already `InSync`** → the repairer is not called, `pending-tm.json` is moved aside, and the phase continues.
+13. **Unreadable `pending-tm.json`, tries `InSync`** → the same as 12, instead of today's 60 s loop.
+14. (`tries_repair.rs`) **The harvested singleton is at another head** → `HeadMoved`, neither file written, journal kept.
 
 `signing.rs`: existing `verify_committed_root_refuses_*` tests unchanged, plus one asserting `verify_cpo_root` refuses with a repairer configured — the gate must not become reachable to the repairer by accident.
 
@@ -213,13 +302,14 @@ pub tries_repair_failed: Option<String>,
 
 ## Rollout
 
-1. Extract the core into `tries_repair.rs`; point `catch_up_tries` at it; fix both-or-neither. No behaviour change beyond that fix. Own PR, reviewable against #104.
-2. `EpochConfig.tries_repair`, `TriesBehind`, `reconcile_tries`, ramp arm, health fields, tests 1–9.
-3. Signing comment, operator guide.
-4. Measure `reconstruct-tries` over Blockfrost on preprod and confirm or change `TRIES_REPAIR_BUDGET`.
+0. **Done, in #104.** The head check: `BridgeState::treasury_outpoint`, `BridgeRoots.head`, `cross_check_bridge_roots` refusing on a mismatch, and test 10. It closes a gap `main` has today.
+1. Measure (§C), in parallel with 0, and confirm or change `TRIES_REPAIR_BUDGET` before step 3.
+2. Extract the core into `tries_repair.rs` (one harvest, the attested head, both-or-neither) and point `catch_up_tries` at it. No behaviour change beyond refusing a half-saved pair and a walk at another head. Branch off `main` once #104 has merged, not stacked on it: merging a base branch with `--delete-branch` closes the PR stacked on it.
+3. `EpochConfig.tries_repair`, `TriesBehind`, `reconcile_tries`, ramp arm, health fields, tests 1–9 and 11–14.
+4. Signing comment, operator guide.
 
 ## Open questions
 
-- **Budget value.** 10 min is a proposal, not a measurement. Step 4 settles it.
-- **Blockfrost quota.** A Blockfrost rebuild is ~1 request per transaction in the TM and peg-out address histories and grows with the bridge's age. Kupo is the production answer and already the documented recommendation; the runtime path inherits the CLI's backend selection, so a Kupo node pays one request. Whether to *refuse* runtime repair over Blockfrost above some history size, rather than let the budget catch it, is a call for after the measurement.
+- **Budget value.** 10 min is a proposal, not a measurement. Step 1 settles it.
+- **Blockfrost quota.** A Blockfrost rebuild is ~1 request per transaction in the TM and peg-out address histories and grows with the bridge's age. Kupo is the production answer and already the documented recommendation; the runtime path inherits the CLI's backend selection, so a Kupo node pays one request. The intended SPO shape, though, is Dolos (WI-064), which now serves the walk (§C). Whether to *refuse* runtime repair over Blockfrost above some history size, rather than let the budget catch it, is a call for after the measurement.
 - **Same-window retry.** Spending the opportunity is proposed for its simplicity. If a transient failure early in a window turns out to be common on preprod, the memo alternative above restores in-window retries without restoring chain walks.
