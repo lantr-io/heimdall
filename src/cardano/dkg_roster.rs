@@ -203,6 +203,81 @@ pub struct DkgContext {
     /// of its own the mismatch would read as "reconciled" on a ceremony that cannot
     /// converge.
     pub live_stake: bool,
+    /// What this context was READ as, before anything narrowed it — the value
+    /// the pre-ceremony handshake compares between nodes (WI-067).
+    ///
+    /// Set where the context is derived (the chain fetch re-hashes it once, as
+    /// the only place that knows the weighting) and carried unchanged by
+    /// [`Self::without`], [`Self::narrowed_to`] and [`Self::reduced_to`], so
+    /// publishing any context of this ceremony publishes the same read. That is
+    /// the point: a node that advertised its NARROWED candidate set looked like a
+    /// disagreement to every peer whose handshake was still running.
+    pub read: RosterRead,
+}
+
+/// The candidate set and threshold one node read for a ceremony, in the form the
+/// pre-ceremony handshake compares (WI-067).
+///
+/// Covers what every node of one ceremony must agree on: each participant's
+/// FROST identifier, `pool_id`, `bifrost_id_pk` and `bifrost_url` in ceremony
+/// order, the derived `t`, and — when the roster is weighted by the epoch
+/// snapshot — each stake. The identifier is hashed rather than implied by the
+/// order because the static-roster fallback takes identifiers from
+/// configuration. The URL is in it because two nodes that read a URL update at
+/// different moments reach different endpoints and split at Round 1; the stakes
+/// are in it because narrowing and `quorum_ok` re-derive from them.
+///
+/// **Under `live_stake` weighting the stakes are left out**, because they drift
+/// between two reads moments apart and hashing them would exclude peers on every
+/// delegation. What that leaves open is the TEST-RUN residual the flag already
+/// carries: two nodes on the same read that both narrow can re-derive different
+/// thresholds from drifted stakes and lose that attempt at Round 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RosterRead {
+    /// First 8 bytes of a domain-tagged `blake2b_256` over the above — an
+    /// equality check between peers, short enough to compare by eye in two log
+    /// lines.
+    pub digest: [u8; 8],
+    /// Eligible participant count.
+    pub n: u16,
+    /// The FROST `t` derived over this read.
+    pub threshold: u16,
+}
+
+impl RosterRead {
+    const DIGEST_TAG: &'static [u8] = b"heimdall/dkg-roster-read/v1";
+
+    /// `with_stakes` is false exactly when the roster is weighted by
+    /// `live_stake` — see the type doc.
+    #[must_use]
+    pub fn of(participants: &[DkgParticipant], threshold: u16, with_stakes: bool) -> Self {
+        let mut buf = Vec::with_capacity(Self::DIGEST_TAG.len() + participants.len() * 160 + 3);
+        buf.extend_from_slice(Self::DIGEST_TAG);
+        buf.push(u8::from(with_stakes));
+        buf.extend_from_slice(&threshold.to_be_bytes());
+        // Length-prefixed, so no two different participant lists can serialize
+        // to the same bytes.
+        let mut field = |bytes: &[u8]| {
+            buf.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_be_bytes());
+            buf.extend_from_slice(bytes);
+        };
+        for p in participants {
+            field(&p.identifier.serialize());
+            field(&p.pool_id);
+            field(&p.bifrost_id_pk);
+            field(p.bifrost_url.as_bytes());
+            if with_stakes {
+                field(&p.active_stake.to_be_bytes());
+            }
+        }
+        let mut digest = [0u8; 8];
+        digest.copy_from_slice(&crate::cardano::hash::blake2b_256(&buf)[..8]);
+        Self {
+            digest,
+            n: u16::try_from(participants.len()).unwrap_or(u16::MAX),
+            threshold,
+        }
+    }
 }
 
 /// A node's view of the on-chain candidate set. Published UNSIGNED alongside
@@ -436,7 +511,7 @@ pub fn derive_dkg_context(
 
     // Order by bifrost_id_pk and assign identifiers 1..=n.
     eligible.sort_by(|a, b| a.bifrost_id_pk.cmp(&b.bifrost_id_pk));
-    let participants = eligible
+    let participants: Vec<DkgParticipant> = eligible
         .into_iter()
         .enumerate()
         .map(|(i, e)| {
@@ -452,11 +527,13 @@ pub fn derive_dkg_context(
         })
         .collect();
 
+    let threshold = threshold.min(n);
     Ok(DkgContext {
         epoch,
         attempt,
-        threshold: threshold.min(n),
+        threshold,
         total_stake: total,
+        read: RosterRead::of(&participants, threshold, true),
         participants,
         excluded,
         // The schedule anchor is supplied by `fetch_dkg_context` (it already
@@ -602,6 +679,7 @@ impl DkgContext {
             excluded: self.excluded.clone(),
             schedule_anchor_ms: self.schedule_anchor_ms,
             read_time_ms: self.read_time_ms,
+            read: self.read,
         })
     }
 
@@ -661,6 +739,8 @@ impl DkgContext {
             // Same anchor → same anchored schedule for the rerun.
             schedule_anchor_ms: self.schedule_anchor_ms,
             read_time_ms: self.read_time_ms,
+            // Same read: only what this node runs with changed.
+            read: self.read,
         })
     }
 
@@ -697,6 +777,7 @@ impl DkgContext {
             attempt,
             threshold: roster.min_signers,
             total_stake,
+            read: RosterRead::of(&participants, roster.min_signers, true),
             // No chain stake is read on this path, so there is no snapshot to be
             // ahead of and nothing for the flag to change.
             live_stake: false,
@@ -910,6 +991,9 @@ pub async fn fetch_dkg_context(
     // #6), so every node freezes L1/Q at the same chain-time instant.
     ctx.schedule_anchor_ms = Some(epoch_start_ms);
     ctx.live_stake = live_stake;
+    // The pure derivation cannot know the weighting, so it hashed the stakes;
+    // under `live_stake` they drift between reads and must not be in the digest.
+    ctx.read = RosterRead::of(&ctx.participants, ctx.threshold, !live_stake);
     // Freshness stamp for the published ChainView: the chain time this view was
     // read at. A node that read the chain later saw more of it, so on a
     // candidate-set disagreement the OLDER read_time_ms marks the stale node.
@@ -1058,18 +1142,68 @@ mod tests {
                     active_stake: s,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
         DkgContext {
             epoch: 1,
             attempt: 0,
             threshold,
             total_stake: total,
+            read: RosterRead::of(&participants, threshold, true),
             live_stake: false,
             participants,
             excluded: vec![],
             schedule_anchor_ms: None,
             read_time_ms: 0,
         }
+    }
+
+    /// The digest moves with everything two nodes must agree on to run one
+    /// ceremony — identifier, identity, endpoint, `t`, and snapshot stake — and
+    /// ignores a `live_stake` drift, which would otherwise exclude on every
+    /// delegation. Every narrowing carries the read unchanged.
+    #[test]
+    fn the_roster_read_covers_what_a_ceremony_depends_on() {
+        let base = ctx_with(&[10, 20, 30], 2);
+        let of =
+            |c: &DkgContext, with_stakes| RosterRead::of(&c.participants, c.threshold, with_stakes);
+        let d = |c: &DkgContext| of(c, true).digest;
+        assert_eq!(
+            base.read,
+            of(&base, true),
+            "the helper builds the same read"
+        );
+
+        let mut renumbered = base.clone();
+        renumbered.participants[0].identifier = Identifier::try_from(9u16).unwrap();
+        let mut moved = base.clone();
+        moved.participants[1].bifrost_url = "http://elsewhere.example:18500".into();
+        let mut rekeyed = base.clone();
+        rekeyed.participants[2].bifrost_id_pk = vec![0xee; 32];
+        let mut reweighted = base.clone();
+        reweighted.participants[2].active_stake += 1;
+        for (what, c) in [
+            ("identifier", &renumbered),
+            ("url", &moved),
+            ("key", &rekeyed),
+            ("stake", &reweighted),
+        ] {
+            assert_ne!(d(c), d(&base), "{what} must change the digest");
+        }
+        assert_ne!(
+            of(&base, true).digest,
+            RosterRead::of(&base.participants, 3, true).digest,
+            "t"
+        );
+        assert_eq!(
+            of(&reweighted, false).digest,
+            of(&base, false).digest,
+            "under live_stake a stake drift must not"
+        );
+
+        let dropped = base.without(&qset(&[1])).expect("two remain");
+        assert_eq!(dropped.read, base.read, "without() keeps the read");
+        let reduced = base.reduced_to(&qset(&[1, 2])).expect("two remain");
+        assert_eq!(reduced.read, base.read, "reduced_to() keeps the read");
     }
 
     fn qset(ids: &[u16]) -> BTreeSet<Identifier> {

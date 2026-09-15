@@ -601,6 +601,8 @@ impl CardanoConfig {
             exclude_unstaked: Some(self.demo_exclude_unstaked),
             epoch: None,
             threshold: None,
+            roster_digest: None,
+            roster_size: None,
         }
     }
 }

@@ -972,6 +972,10 @@ pub struct MockPeerHub {
     /// build is unknown, which is what an un-configured mock peer reports and
     /// what a real peer predating the check reports.
     builds: Mutex<BTreeMap<Identifier, crate::http::compat::PeerBuild>>,
+    /// What each node last published through `set_node_facts`, served on that
+    /// node's `/health` like the HTTP server does — so a test can run two nodes'
+    /// handshakes against each other.
+    facts: Mutex<BTreeMap<Identifier, crate::http::compat::NodeFacts>>,
 }
 
 impl MockPeerHub {
@@ -1188,11 +1192,41 @@ impl PeerNetwork for MockPeerNetwork {
         let published_dkg = with_slot(&self.hub, peer.identifier, |s| {
             s.dkg1.as_ref().map(|(ns, _)| (ns.epoch, ns.attempt))
         });
+        // What the node published fills what the test did not pin with
+        // `set_build` — so a deliberately drifted value survives the node's own
+        // publish. The version stays whatever the test set (none by default),
+        // which is what keeps the gate out of every test that never asked for it.
+        let mut build = self.hub.build_of(peer.identifier);
+        if let Some(facts) = self.hub.facts.lock().unwrap().get(&peer.identifier) {
+            let served = crate::http::compat::PeerBuild::own(*facts);
+            build.virtual_epoch_slots = build.virtual_epoch_slots.or(served.virtual_epoch_slots);
+            build.live_stake = build.live_stake.or(served.live_stake);
+            build.stake_source = build.stake_source.or(served.stake_source);
+            build.exclude_unstaked = build.exclude_unstaked.or(served.exclude_unstaked);
+            // The read travels as ONE unit: a test that pinned any part of it (say
+            // a drifted `threshold`) keeps exactly what it pinned, rather than
+            // gaining the node's real digest — which is compared first and would
+            // quietly overrule the drift.
+            let read_pinned = build.dkg_threshold_epoch.is_some()
+                || build.threshold.is_some()
+                || build.roster_digest.is_some()
+                || build.roster_size.is_some();
+            if !read_pinned {
+                build.dkg_threshold_epoch = served.dkg_threshold_epoch;
+                build.threshold = served.threshold;
+                build.roster_digest = served.roster_digest;
+                build.roster_size = served.roster_size;
+            }
+        }
         crate::epoch::traits::PeerHealth {
             reachable: true,
-            build: self.hub.build_of(peer.identifier),
+            build,
             published_dkg,
         }
+    }
+
+    async fn set_node_facts(&self, facts: crate::http::compat::NodeFacts) {
+        self.hub.facts.lock().unwrap().insert(self.me, facts);
     }
 
     async fn publish_dkg_round1(

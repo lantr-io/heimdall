@@ -753,7 +753,7 @@ impl PeerHealth {
     ///
     /// `own` is a parameter rather than read from a global because the
     /// deployment half of it ([`crate::http::compat::NodeFacts`]) includes the
-    /// `t` this node just derived, which is live ceremony state — the caller has
+    /// roster this node just read, which is live ceremony state — the caller has
     /// it, and nothing here should go looking for it.
     #[must_use]
     pub fn compatibility(
@@ -818,7 +818,9 @@ pub trait PeerNetwork: Send + Sync {
     /// decide the namespace itself, so they must travel somewhere un-namespaced
     /// and be readable before anything is published — see
     /// [`crate::http::compat`]. Called at each ceremony entry, before the health
-    /// gate. Default no-op for a transport with no health surface (the mock).
+    /// gate, with the roster READ — never a narrowed candidate set, which a peer
+    /// still in its own gate would take for a disagreement. Default no-op for a
+    /// transport with no health surface.
     async fn set_node_facts(&self, _facts: crate::http::compat::NodeFacts) {}
 
     /// Whether, during the ceremony since the last [`Self::set_chain_view`], this

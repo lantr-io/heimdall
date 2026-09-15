@@ -325,12 +325,14 @@ mod tests {
             bifrost_url: format!("http://spo{n}.example:1850{n}"),
             active_stake: 20_000_000,
         };
+        let participants = vec![participant(1, 0x11), participant(2, 0x22)];
         let mut ctx = DkgContext {
             epoch: 1543,
             attempt: 0,
             threshold: 2,
             total_stake: 40_000_000,
-            participants: vec![participant(1, 0x11), participant(2, 0x22)],
+            read: crate::cardano::dkg_roster::RosterRead::of(&participants, 2, true),
+            participants,
             excluded: Vec::new(),
             schedule_anchor_ms: None,
             read_time_ms: 0,

@@ -49,10 +49,12 @@
 //!
 //! ## The deployment's own values, and why they are here rather than in the payload
 //!
-//! [`NodeFacts`] carries three values that are not build identity at all: the
-//! two TEST-RUN settings (`cardano.demo_virtual_epoch_slots`,
-//! `cardano.demo_live_stake`) and the FROST `t` this node actually derived. They
-//! live in this gate for three reasons the DKG payload cannot match.
+//! [`NodeFacts`] carries values that are not build identity at all: the
+//! deployment settings (`cardano.demo_virtual_epoch_slots`,
+//! `cardano.demo_live_stake`, `stake_source`, `demo_exclude_unstaked`) and the
+//! roster this node READ for the ceremony — its candidate-set digest and `t`,
+//! before the gate narrowed anything. They live in this gate for three reasons
+//! the DKG payload cannot match.
 //!
 //! **It is the only channel that survives a namespace split.** The DKG namespace
 //! is `(epoch, threshold, attempt)`, so two nodes on different epoch schemes
@@ -74,11 +76,14 @@
 //! The verdict carries a [`Mismatch`] kind, because the three causes want
 //! different things from the operator. A version or blueprint mismatch is
 //! PERMANENT for the epoch and one side must upgrade; a settings mismatch needs
-//! the setting matched; a derived-`t` difference is two roster reads that saw
-//! different chain state — a pool registering mid-epoch, or `live_stake` drift —
-//! and clears once both re-derive, at the latest at the next epoch. The exclusion
-//! itself is the same for all three, but an operator must never be told to
-//! upgrade when the answer is "your read of the registry differs".
+//! the setting matched; a roster-read difference is two reads that saw different
+//! chain state — a pool registering mid-epoch, or `live_stake` drift — and clears
+//! once both re-derive, at the latest at the next epoch. A peer too old to report
+//! a roster digest is compared on `t` alone, and a difference there is its own
+//! kind, because that build advertises a narrowed `t` and upgrading it is the
+//! fix. The exclusion itself is the same for all of them, but an operator must
+//! never be told to upgrade when the answer is "your read of the registry
+//! differs".
 
 use serde::{Deserialize, Serialize};
 
@@ -142,14 +147,31 @@ pub struct NodeFacts {
     /// peer that agrees with it — on a production bridge, with no test flag
     /// anywhere near it.
     pub epoch: Option<u64>,
-    /// The FROST `t` this node derived for the ceremony it is about to enter —
-    /// the length its Round-1 commitment vector will have.
+    /// The FROST `t` this node derived from its roster read for [`Self::epoch`],
+    /// BEFORE the handshake dropped any incompatible peer
+    /// ([`crate::cardano::dkg_roster::RosterRead::threshold`]).
+    ///
+    /// Not necessarily the length its Round-1 commitment vector will have: when
+    /// the gate narrows the candidate set, `t` is re-derived over the survivors
+    /// and that value is kept local. What peers compare is whether two nodes read
+    /// the same roster, and advertising the narrowed value made a node whose gate
+    /// finished first look like a disagreement to every peer still polling — see
+    /// `narrow_at_handshake` in the epoch machine. Still published beside
+    /// [`Self::roster_digest`] because a build that predates the digest compares
+    /// only this.
     ///
     /// Live state, not configuration: `None` until this node has read a roster,
     /// exactly as `dkg_epoch`/`dkg_attempt` are absent until it has published a
     /// Round 1. A peer that has not yet entered a ceremony is therefore a
     /// reporting gap, not a disagreement.
     pub threshold: Option<u16>,
+    /// [`crate::cardano::dkg_roster::RosterRead::digest`] of the same read: the
+    /// candidate set in ceremony order, and `t`. Two reads with an equal `t` over
+    /// different candidates differ here, which `t` alone cannot show.
+    pub roster_digest: Option<[u8; 8]>,
+    /// [`crate::cardano::dkg_roster::RosterRead::n`] — the read's candidate count,
+    /// so a digest mismatch can be described in words.
+    pub roster_size: Option<u16>,
 }
 
 /// What `/health` reports about the software behind it, plus the deployment
@@ -189,6 +211,14 @@ pub struct PeerBuild {
     /// [`NodeFacts::threshold`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<u16>,
+    /// [`NodeFacts::roster_digest`], as 16 hex chars. Absent from a build that
+    /// predates it — such a peer is compared on [`Self::threshold`] alone, so a
+    /// roster that is mid-upgrade still runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_digest: Option<String>,
+    /// [`NodeFacts::roster_size`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_size: Option<u16>,
 }
 
 impl PeerBuild {
@@ -206,6 +236,8 @@ impl PeerBuild {
             exclude_unstaked: facts.exclude_unstaked,
             dkg_threshold_epoch: facts.epoch,
             threshold: facts.threshold,
+            roster_digest: facts.roster_digest.map(hex::encode),
+            roster_size: facts.roster_size,
         }
     }
 }
@@ -238,9 +270,15 @@ pub enum Mismatch {
     /// A consensus setting of the deployment: one side must match the other's
     /// configuration. Same build, so an upgrade would change nothing.
     Settings,
-    /// Only the derived FROST `t` for the same epoch — two roster reads that saw
-    /// different chain state. Nothing to upgrade or configure.
-    Threshold,
+    /// The roster read for the same epoch differs — candidate set or `t` — while
+    /// both nodes report its digest: two reads that saw different chain state.
+    /// Nothing to upgrade or configure.
+    Roster,
+    /// Only the advertised `t` differs, against a peer too old to report a roster
+    /// digest. Such a build advertises its `t` AFTER dropping incompatible peers,
+    /// so the difference may be that peer having narrowed rather than a different
+    /// read — which upgrading it removes.
+    LegacyThreshold,
 }
 
 /// One clause per kind present, each with its count and its own instruction —
@@ -264,11 +302,17 @@ pub fn exclusion_causes(kinds: impl IntoIterator<Item = Mismatch>) -> String {
                 "{n} with different consensus settings — match the setting the ⚠ EXCLUDING \
                  lines name; no upgrade is needed"
             ),
-            Mismatch::Threshold => format!(
-                "{n} derived a different FROST threshold for this epoch — NOT a build or \
-                 settings problem and no upgrade is needed: the nodes read the registry or \
-                 stake at different moments, as when a pool registers mid-epoch, and it \
-                 clears once they re-derive, at the latest at the next epoch"
+            Mismatch::Roster => format!(
+                "{n} read a different roster for this epoch — NOT a build or settings problem \
+                 and no upgrade is needed: the nodes read the registry or stake at different \
+                 moments, as when a pool registers mid-epoch, and it clears once they re-derive, \
+                 at the latest at the next epoch"
+            ),
+            Mismatch::LegacyThreshold => format!(
+                "{n} advertise a different FROST threshold from an older build that reports no \
+                 roster digest — upgrade those nodes: that build advertises its threshold after \
+                 dropping peers, which reads as a disagreement even when the rosters agree. If \
+                 it persists once they run this release, the reads really differ"
             ),
         })
         .collect::<Vec<_>>()
@@ -379,10 +423,11 @@ impl Compatibility {
             return Self::Incompatible {
                 kind: settings,
                 reason: format!(
-                    "the peer reads per-pool stake from {t} and we from {o} — the same registry \
+                    "the peer reads per-pool stake from {} and we from {o} — the same registry \
                      weighs differently on the two backends, so we derive different FROST \
                      thresholds. Set cardano.stake_source identically on every node of the \
-                     roster"
+                     roster",
+                    shown(t)
                 ),
             };
         }
@@ -406,7 +451,7 @@ impl Compatibility {
         if minor_series(theirs) != minor_series(ours) {
             return Self::Incompatible {
                 kind: Mismatch::Build,
-                reason: format!("version {theirs} against our {ours}"),
+                reason: format!("version {} against our {ours}", shown(theirs)),
             };
         }
         // Only compared when BOTH report one: a peer new enough to send a
@@ -420,8 +465,10 @@ impl Compatibility {
             return Self::Incompatible {
                 kind: Mismatch::Build,
                 reason: format!(
-                    "same version {theirs}, but blueprint {t} against our {o} — \
-                     different contracts, so a different bridge"
+                    "same version {}, but blueprint {} against our {o} — \
+                     different contracts, so a different bridge",
+                    shown(theirs),
+                    shown(t)
                 ),
             };
         }
@@ -436,38 +483,90 @@ impl Compatibility {
             return Self::Incompatible {
                 kind: Mismatch::Build,
                 reason: format!(
-                    "same version {theirs}, but the security threshold is {t}% against our {o}% \
+                    "same version {}, but the security threshold is {t}% against our {o}% \
                      — we would derive different FROST thresholds from the same registry, commit \
-                     to polynomials of different degree, and produce no key at all"
+                     to polynomials of different degree, and produce no key at all",
+                    shown(theirs)
                 ),
             };
         }
-        // THE DERIVED `t` itself — the value all of the above exist to protect,
+        // THE ROSTER READ itself — the value all of the above exist to protect,
         // compared directly so a cause nobody anticipated is still caught.
         //
-        // Compared only when both report one AND both report it FOR THE SAME
-        // CEREMONY EPOCH. A node publishes its `t` at each ceremony entry and
-        // goes on serving it until the next, so at an epoch boundary the node
-        // that crosses first would otherwise compare this epoch's `t` against a
-        // peer's previous one and exclude a peer that agrees with it. Absent
-        // here means "has not read a roster yet", which is not a disagreement.
-        if let (Some(t), Some(o), Some(pe), Some(oe)) = (
-            peer.threshold,
-            own.threshold,
-            peer.dkg_threshold_epoch,
-            own.dkg_threshold_epoch,
-        ) && pe == oe
-            && t != o
+        // Compared only FOR THE SAME CEREMONY EPOCH. A node publishes its read at
+        // each ceremony entry and goes on serving it until the next, so at an
+        // epoch boundary the node that crosses first would otherwise compare this
+        // epoch's read against a peer's previous one and exclude a peer that
+        // agrees with it. Absent means "has not read a roster yet", which is not a
+        // disagreement.
+        let (Some(pe), Some(oe)) = (peer.dkg_threshold_epoch, own.dkg_threshold_epoch) else {
+            return Self::Compatible;
+        };
+        if pe != oe {
+            return Self::Compatible;
+        }
+        // A digest this build cannot read is a format difference, i.e. another
+        // release — never "the same read, differently" — and it is peer-supplied
+        // text, so only a bounded, escaped form of it reaches a log line.
+        if let Some(pd) = peer.roster_digest.as_deref()
+            && !is_roster_digest(pd)
         {
             return Self::Incompatible {
-                kind: Mismatch::Threshold,
+                kind: Mismatch::Build,
                 reason: format!(
-                    "for epoch {pe} the peer derived FROST threshold t={t} and we t={o} — \
-                     commitment vectors of different length, which cannot combine. Every \
-                     setting we compare agrees, so this is NOT a build problem and needs no \
+                    "the peer reports roster digest {} in a format this build does not read — \
+                     it runs a different release",
+                    shown(pd)
+                ),
+            };
+        }
+        // Both report a digest: compare the whole read. The candidate set is in
+        // it, so two reads with an equal `t` over different pools are caught.
+        if let (Some(pd), Some(od)) = (peer.roster_digest.as_deref(), own.roster_digest.as_deref())
+        {
+            if pd == od {
+                return Self::Compatible;
+            }
+            let describe = |n: Option<u16>, t: Option<u16>, d: &str| {
+                let n = n.map_or_else(|| "?".to_string(), |n| n.to_string());
+                let t = t.map_or_else(|| "?".to_string(), |t| t.to_string());
+                format!("{n} candidates with t={t} (roster {d})")
+            };
+            return Self::Incompatible {
+                kind: Mismatch::Roster,
+                reason: format!(
+                    "for epoch {pe} the peer read {} and we read {} — different indices, \
+                     endpoints, weights or thresholds, so the two ceremonies cannot combine. \
+                     Every setting we compare agrees, so this is NOT a build problem and needs no \
                      upgrade: the two nodes read the registry or stake at different moments (a \
-                     pool that registered mid-epoch, or live_stake drift), and it clears once \
-                     both re-derive — at the latest at the next epoch"
+                     pool that registered or changed its URL mid-epoch, or live_stake drift), and \
+                     it clears once both re-derive — at the latest at the next epoch",
+                    describe(peer.roster_size, peer.threshold, pd),
+                    describe(own.roster_size, own.threshold, od),
+                ),
+            };
+        }
+        // One side reports no digest — in production always the PEER, since every
+        // read this build publishes carries one. Compare `t`, so a roster mid-upgrade
+        // keeps running. What an older build advertises is its NARROWED `t`, so a
+        // difference here may be that and not a different read; the kind says so,
+        // and says to upgrade.
+        if let (Some(t), Some(o)) = (peer.threshold, own.threshold)
+            && t != o
+        {
+            let older = if peer.roster_digest.is_none() {
+                "the peer reports no roster digest, so it runs an older build"
+            } else {
+                "this node reports no roster digest, so it runs an older build"
+            };
+            return Self::Incompatible {
+                kind: Mismatch::LegacyThreshold,
+                reason: format!(
+                    "for epoch {pe} the peer advertises FROST threshold t={t} and we t={o}; \
+                     {older} — one that advertises its threshold AFTER dropping incompatible \
+                     peers, so this may be that node having narrowed rather than a different \
+                     read. Upgrading it removes that case; if it persists afterwards, the two \
+                     nodes read the registry or stake at different moments"
                 ),
             };
         }
@@ -478,6 +577,24 @@ impl Compatibility {
     pub fn is_incompatible(&self) -> bool {
         matches!(self, Self::Incompatible { .. })
     }
+}
+
+/// Whether `d` is a roster digest as this build publishes one: 16 lowercase hex.
+fn is_roster_digest(d: &str) -> bool {
+    d.len() == 16
+        && d.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A peer-supplied string as it may appear in a log line or on `/health`:
+/// escaped, so it cannot forge lines, and bounded, so it cannot fill them.
+fn shown(s: &str) -> String {
+    const MAX: usize = 40;
+    let mut out: String = s.chars().take(MAX).flat_map(char::escape_debug).collect();
+    if s.chars().count() > MAX {
+        out.push('…');
+    }
+    format!("\"{out}\"")
 }
 
 /// `major.minor` of a semver string, as text.
@@ -647,17 +764,46 @@ mod tests {
 
         peer.threshold = Some(2);
         peer.dkg_threshold_epoch = Some(7);
-        let Compatibility::Incompatible { reason, .. } =
+        let Compatibility::Incompatible { kind, reason } =
             Compatibility::between(&peer, &build_with(mine))
         else {
             panic!("two derived thresholds that differ cannot combine");
         };
         assert!(reason.contains("t=2"), "{reason}");
         assert!(reason.contains("t=3"), "{reason}");
-        // The wording must NOT send an operator to upgrade a node that is fine:
-        // with every setting matching, the cause is drift and it resolves itself.
-        assert!(reason.contains("needs no upgrade"), "{reason}");
-        assert!(!reason.contains("Upgrade"), "{reason}");
+        // Without a digest on the peer only `t` can be compared, and that is an
+        // older build's signal — the "needs no upgrade" wording belongs to a
+        // digest comparison (`an_equal_threshold_over_a_different_roster_is_caught`).
+        assert_eq!(kind, Mismatch::LegacyThreshold, "{reason}");
+    }
+
+    /// A digest this build cannot read is another release, and the peer's text
+    /// reaches the reason only escaped and bounded.
+    #[test]
+    fn a_malformed_roster_digest_is_a_build_mismatch_and_is_not_echoed_raw() {
+        let hostile = PeerBuild {
+            roster_digest: Some(format!("ZZ\nforged log line{}", "x".repeat(4_000))),
+            ..read(1548, 5, 5, "unused")
+        };
+        let Compatibility::Incompatible { kind, reason } =
+            Compatibility::between(&hostile, &read(1548, 5, 5, "1111111111111111"))
+        else {
+            panic!("a digest in an unknown format must not pass");
+        };
+        assert_eq!(kind, Mismatch::Build);
+        assert!(!reason.contains('\n'), "{reason}");
+        assert!(reason.len() < 300, "bounded: {} bytes", reason.len());
+        let upper = PeerBuild {
+            roster_digest: Some("1111111111111111".to_uppercase().replace('1', "A")),
+            ..read(1548, 5, 5, "unused")
+        };
+        assert_eq!(
+            kind_of(Compatibility::between(
+                &upper,
+                &read(1548, 5, 5, "1111111111111111")
+            )),
+            Mismatch::Build
+        );
     }
 
     /// A `t` from a DIFFERENT ceremony epoch is not a disagreement, and treating
@@ -904,15 +1050,125 @@ mod tests {
             kind_of(Compatibility::between(&PeerBuild::default(), &ancient)),
             Mismatch::Build
         );
-        let at = |t| PeerBuild {
+        let at = |t, digest: Option<&str>| PeerBuild {
             dkg_threshold_epoch: Some(1548),
             threshold: Some(t),
+            roster_digest: digest.map(str::to_string),
             ..base.clone()
         };
         assert_eq!(
-            kind_of(Compatibility::between(&at(2), &at(5))),
-            Mismatch::Threshold
+            kind_of(Compatibility::between(
+                &at(2, Some("aaaaaaaaaaaaaaaa")),
+                &at(5, Some("bbbbbbbbbbbbbbbb"))
+            )),
+            Mismatch::Roster
         );
+        assert_eq!(
+            kind_of(Compatibility::between(
+                &at(2, None),
+                &at(5, Some("bbbbbbbbbbbbbbbb"))
+            )),
+            Mismatch::LegacyThreshold
+        );
+    }
+
+    fn read(epoch: u64, n: u16, t: u16, digest: &str) -> PeerBuild {
+        PeerBuild {
+            dkg_threshold_epoch: Some(epoch),
+            roster_size: Some(n),
+            threshold: Some(t),
+            roster_digest: Some(digest.into()),
+            ..build("0.1.0", "aa")
+        }
+    }
+
+    /// Two reads with the SAME `t` over different candidates are a disagreement
+    /// — the case `t` alone passed as compatible — and the reason names both
+    /// reads in words.
+    #[test]
+    fn an_equal_threshold_over_a_different_roster_is_caught() {
+        let v = Compatibility::between(
+            &read(1548, 5, 3, "1111111111111111"),
+            &read(1548, 4, 3, "2222222222222222"),
+        );
+        let Compatibility::Incompatible { kind, reason } = v else {
+            panic!("different rosters must not pass: {v:?}");
+        };
+        assert_eq!(kind, Mismatch::Roster);
+        assert!(reason.contains("5 candidates with t=3"), "{reason}");
+        assert!(reason.contains("4 candidates with t=3"), "{reason}");
+        assert!(reason.contains("NOT a build problem"), "{reason}");
+    }
+
+    /// The same read is compatible, and a read from another epoch is not
+    /// compared at all — the boundary rule the threshold already had.
+    #[test]
+    fn the_roster_read_is_compared_only_within_one_epoch() {
+        assert_eq!(
+            Compatibility::between(
+                &read(1548, 5, 5, "1111111111111111"),
+                &read(1548, 5, 5, "1111111111111111")
+            ),
+            Compatibility::Compatible
+        );
+        assert_eq!(
+            Compatibility::between(
+                &read(1547, 4, 2, "2222222222222222"),
+                &read(1548, 5, 5, "1111111111111111")
+            ),
+            Compatibility::Compatible
+        );
+    }
+
+    /// A roster mid-upgrade keeps running. A peer from before the digest is
+    /// compared on `t` alone — admitted when it agrees, and when it does not,
+    /// reported as an older build to upgrade rather than as "nothing to do".
+    #[test]
+    fn a_peer_without_a_digest_is_compared_on_its_threshold() {
+        let mine = read(1548, 5, 5, "1111111111111111");
+        let legacy = |t| PeerBuild {
+            roster_digest: None,
+            roster_size: None,
+            ..read(1548, 5, t, "unused")
+        };
+        assert_eq!(
+            Compatibility::between(&legacy(5), &mine),
+            Compatibility::Compatible
+        );
+        let Compatibility::Incompatible { kind, reason } =
+            Compatibility::between(&legacy(4), &mine)
+        else {
+            panic!("a different t from an older build is still a mismatch");
+        };
+        assert_eq!(kind, Mismatch::LegacyThreshold);
+        assert!(reason.contains("older build"), "{reason}");
+        let s = exclusion_summary([kind], 3);
+        assert!(s.contains("upgrade those nodes"), "{s}");
+    }
+
+    /// Both `/health` formats parse: an old body (no digest) reads as absent
+    /// fields, and a new body carries the digest an old build simply ignores.
+    #[test]
+    fn both_health_formats_parse() {
+        let old: PeerBuild = serde_json::from_str(
+            r#"{"version":"0.1.0","blueprint_digest":"e8987f35bc2e577f","threshold_percent":20,
+                "dkg_threshold_epoch":1548,"threshold":2,"status":"ok"}"#,
+        )
+        .expect("an old /health body parses");
+        assert_eq!(old.threshold, Some(2));
+        assert_eq!(old.roster_digest, None);
+
+        let facts = NodeFacts {
+            epoch: Some(1548),
+            threshold: Some(5),
+            roster_digest: Some([0xab; 8]),
+            roster_size: Some(5),
+            ..NodeFacts::default()
+        };
+        let body = serde_json::to_value(PeerBuild::own(facts)).unwrap();
+        assert_eq!(body["roster_digest"], "abababababababab");
+        assert_eq!(body["roster_size"], 5);
+        assert_eq!(body["threshold"], 5, "still published for an older peer");
     }
 
     /// The reported abort: a node that registered mid-epoch derives a different
@@ -920,10 +1176,10 @@ mod tests {
     /// peers, and must not be told its build is at fault.
     #[test]
     fn a_threshold_only_abort_does_not_blame_the_build() {
-        let s = exclusion_summary([Mismatch::Threshold; 4], 5);
+        let s = exclusion_summary([Mismatch::Roster; 4], 5);
         assert!(s.starts_with("4 of 5 candidates excluded"), "{s}");
         assert!(s.contains("THIS node that differs"), "{s}");
-        assert!(s.contains("FROST threshold"), "{s}");
+        assert!(s.contains("read a different roster"), "{s}");
         assert!(s.contains("no upgrade is needed"), "{s}");
         assert!(!s.contains("incompatible build"), "{s}");
         assert!(!s.contains("must upgrade"), "{s}");
@@ -935,9 +1191,9 @@ mod tests {
     fn a_mixed_abort_names_every_kind_with_its_count() {
         let s = exclusion_summary(
             [
-                Mismatch::Threshold,
+                Mismatch::Roster,
                 Mismatch::Build,
-                Mismatch::Threshold,
+                Mismatch::Roster,
                 Mismatch::Settings,
             ],
             6,
@@ -949,6 +1205,6 @@ mod tests {
         );
         assert!(s.contains("1 on an incompatible build"), "{s}");
         assert!(s.contains("1 with different consensus settings"), "{s}");
-        assert!(s.contains("2 derived a different FROST threshold"), "{s}");
+        assert!(s.contains("2 read a different roster"), "{s}");
     }
 }
