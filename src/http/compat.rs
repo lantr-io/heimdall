@@ -71,12 +71,14 @@
 //! **It works for a peer that publishes no view at all**, which the chain-view
 //! comparison counts as agreeing.
 //!
-//! One distinction is kept in the wording rather than in the verdict. A version
-//! or blueprint mismatch is PERMANENT for the epoch and the operator must
-//! upgrade; a derived-`t` difference may be transient drift between two
-//! `live_stake` reads that resolves at the next entry. Same verdict — excluded,
-//! re-checked on the next ceremony entry — but an operator must never be told to
-//! upgrade when the answer is "your stake read drifted".
+//! The verdict carries a [`Mismatch`] kind, because the three causes want
+//! different things from the operator. A version or blueprint mismatch is
+//! PERMANENT for the epoch and one side must upgrade; a settings mismatch needs
+//! the setting matched; a derived-`t` difference is two roster reads that saw
+//! different chain state — a pool registering mid-epoch, or `live_stake` drift —
+//! and clears once both re-derive, at the latest at the next epoch. The exclusion
+//! itself is the same for all three, but an operator must never be told to
+//! upgrade when the answer is "your read of the registry differs".
 
 use serde::{Deserialize, Serialize};
 
@@ -229,8 +231,9 @@ pub enum Compatibility {
 /// one sentence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Mismatch {
-    /// Version series, blueprint or security percentage: one side must move to
-    /// the other's release.
+    /// Version series, blueprint or security percentage — or a settings
+    /// difference against a peer too old to report a version, which cannot set
+    /// the value at all. One side must move to the other's release.
     Build,
     /// A consensus setting of the deployment: one side must match the other's
     /// configuration. Same build, so an upgrade would change nothing.
@@ -240,19 +243,17 @@ pub enum Mismatch {
     Threshold,
 }
 
-/// The cause clause of a DKG abort after the gate excluded peers, one clause per
-/// kind present. Each kind carries its own instruction, because the three want
-/// opposite things from the operator: telling a node whose only difference is a
-/// threshold read to upgrade sends it chasing a build problem it does not have.
+/// One clause per kind present, each with its count and its own instruction —
+/// the three want opposite things from the operator: telling a node whose only
+/// difference is a threshold read to upgrade sends it chasing a build problem it
+/// does not have.
 #[must_use]
-pub fn exclusion_summary(kinds: impl IntoIterator<Item = Mismatch>, candidates: usize) -> String {
+pub fn exclusion_causes(kinds: impl IntoIterator<Item = Mismatch>) -> String {
     let mut counts = std::collections::BTreeMap::new();
-    let mut excluded = 0usize;
     for kind in kinds {
         *counts.entry(kind).or_insert(0usize) += 1;
-        excluded += 1;
     }
-    let clauses: Vec<String> = counts
+    counts
         .into_iter()
         .map(|(kind, n)| match kind {
             Mismatch::Build => format!(
@@ -270,11 +271,30 @@ pub fn exclusion_summary(kinds: impl IntoIterator<Item = Mismatch>, candidates: 
                  clears once they re-derive, at the latest at the next epoch"
             ),
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The reason of a DKG abort after the gate excluded peers and what is left
+/// cannot run a ceremony. `candidates` counts this node too.
+///
+/// When EVERY peer was excluded it says so: the comparison is symmetric, so a
+/// node that disagrees with all of its peers is the odd one out itself, and
+/// that is the one fact its operator most needs.
+#[must_use]
+pub fn exclusion_summary(kinds: impl IntoIterator<Item = Mismatch>, candidates: usize) -> String {
+    let kinds: Vec<Mismatch> = kinds.into_iter().collect();
+    let excluded = kinds.len();
+    let outlier = if excluded > 0 && excluded + 1 == candidates {
+        " — every peer was excluded, so it is THIS node that differs from the roster; \
+         compare its /health against any peer's"
+    } else {
+        ""
+    };
     format!(
-        "{excluded} of {candidates} candidates excluded at the pre-ceremony handshake, leaving \
-         too few to run a ceremony: {}",
-        clauses.join("; ")
+        "{excluded} of {candidates} candidates excluded at the pre-ceremony handshake and the \
+         rest cannot run a ceremony{outlier}: {}",
+        exclusion_causes(kinds)
     )
 }
 
@@ -304,13 +324,21 @@ impl Compatibility {
         // `(epoch, threshold, attempt)`, so they publish into namespaces that
         // never fetch each other. Nothing errors on either side; the ceremony
         // simply never has a second participant.
+        // A peer too old to report a version cannot set these values at all, so a
+        // difference against it is a build problem: "match the setting" would
+        // send its operator looking for a key that build does not have.
+        let settings = if peer.version.is_none() {
+            Mismatch::Build
+        } else {
+            Mismatch::Settings
+        };
         if peer.virtual_epoch_slots != own.virtual_epoch_slots {
             let describe = |v: Option<u64>| match v {
                 Some(s) => format!("a {s}-slot virtual epoch (TEST RUN)"),
                 None => "real Cardano epochs".to_string(),
             };
             return Self::Incompatible {
-                kind: Mismatch::Settings,
+                kind: settings,
                 reason: format!(
                     "the peer runs on {} and we run on {} — we would number epochs \
                      differently, publish into DKG namespaces that never fetch each other, \
@@ -334,7 +362,7 @@ impl Compatibility {
                 }
             };
             return Self::Incompatible {
-                kind: Mismatch::Settings,
+                kind: settings,
                 reason: format!(
                     "the peer weights the roster by {} and we by {} — the candidate set would \
                      AGREE while the derived thresholds differ, so nothing we exchange can \
@@ -349,7 +377,7 @@ impl Compatibility {
             && t != o
         {
             return Self::Incompatible {
-                kind: Mismatch::Settings,
+                kind: settings,
                 reason: format!(
                     "the peer reads per-pool stake from {t} and we from {o} — the same registry \
                      weighs differently on the two backends, so we derive different FROST \
@@ -360,7 +388,7 @@ impl Compatibility {
         }
         if peer.exclude_unstaked.unwrap_or(false) != own.exclude_unstaked.unwrap_or(false) {
             return Self::Incompatible {
-                kind: Mismatch::Settings,
+                kind: settings,
                 reason: format!(
                     "cardano.demo_exclude_unstaked is {} on the peer and {} here — a pool whose \
                      stake will not resolve is dropped from one node's candidate set and fatal \
@@ -833,6 +861,49 @@ mod tests {
             kind_of(Compatibility::between(&live, &base)),
             Mismatch::Settings
         );
+        let settings = [
+            PeerBuild {
+                virtual_epoch_slots: Some(86_400),
+                ..base.clone()
+            },
+            PeerBuild {
+                stake_source: Some("koios".into()),
+                ..base.clone()
+            },
+            PeerBuild {
+                exclude_unstaked: Some(true),
+                ..base.clone()
+            },
+        ];
+        let own_source = PeerBuild {
+            stake_source: Some("blockfrost".into()),
+            ..base.clone()
+        };
+        for peer in settings {
+            assert_eq!(
+                kind_of(Compatibility::between(&peer, &own_source)),
+                Mismatch::Settings,
+                "{peer:?}"
+            );
+        }
+        let percent = PeerBuild {
+            threshold_percent: Some(33),
+            ..base.clone()
+        };
+        assert_eq!(
+            kind_of(Compatibility::between(&percent, &base)),
+            Mismatch::Build
+        );
+        // A peer too old to report a version cannot set the value, so matching
+        // the setting is not an option its operator has.
+        let ancient = PeerBuild {
+            virtual_epoch_slots: Some(86_400),
+            ..PeerBuild::default()
+        };
+        assert_eq!(
+            kind_of(Compatibility::between(&PeerBuild::default(), &ancient)),
+            Mismatch::Build
+        );
         let at = |t| PeerBuild {
             dkg_threshold_epoch: Some(1548),
             threshold: Some(t),
@@ -851,6 +922,7 @@ mod tests {
     fn a_threshold_only_abort_does_not_blame_the_build() {
         let s = exclusion_summary([Mismatch::Threshold; 4], 5);
         assert!(s.starts_with("4 of 5 candidates excluded"), "{s}");
+        assert!(s.contains("THIS node that differs"), "{s}");
         assert!(s.contains("FROST threshold"), "{s}");
         assert!(s.contains("no upgrade is needed"), "{s}");
         assert!(!s.contains("incompatible build"), "{s}");
@@ -871,6 +943,10 @@ mod tests {
             6,
         );
         assert!(s.starts_with("4 of 6 candidates excluded"), "{s}");
+        assert!(
+            !s.contains("THIS node"),
+            "a peer survived, so this node is not the outlier: {s}"
+        );
         assert!(s.contains("1 on an incompatible build"), "{s}");
         assert!(s.contains("1 with different consensus settings"), "{s}");
         assert!(s.contains("2 derived a different FROST threshold"), "{s}");
