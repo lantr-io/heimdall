@@ -203,6 +203,60 @@ pub struct DkgContext {
     /// of its own the mismatch would read as "reconciled" on a ceremony that cannot
     /// converge.
     pub live_stake: bool,
+    /// What this context was READ as, before anything narrowed it — the value
+    /// the pre-ceremony handshake compares between nodes (WI-067).
+    ///
+    /// Set once where the context is derived and carried unchanged by
+    /// [`Self::without`], [`Self::narrowed_to`] and [`Self::reduced_to`], so
+    /// publishing any context of this ceremony publishes the same read. That is
+    /// the point: a node that advertised its NARROWED candidate set looked like a
+    /// disagreement to every peer whose handshake was still running.
+    pub read: RosterRead,
+}
+
+/// The candidate set and threshold one node read for a ceremony, in the form the
+/// pre-ceremony handshake compares (WI-067).
+///
+/// Covers exactly what fixes a ceremony's shape: the eligible participants'
+/// `pool_id` and `bifrost_id_pk` in ceremony order (which assigns every FROST
+/// index) and the derived `t`. Stakes are deliberately NOT in it: they reach the
+/// ceremony only through `t`, and under `live_stake` weighting they drift between
+/// two reads moments apart — hashing them would exclude a peer that agrees on
+/// every value the ceremony depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RosterRead {
+    /// First 8 bytes of `blake2b_256` over the participants and `t` — an equality
+    /// check between peers, short enough to compare by eye in two log lines.
+    pub digest: [u8; 8],
+    /// Eligible participant count.
+    pub n: u16,
+    /// The FROST `t` derived over this read.
+    pub threshold: u16,
+}
+
+impl RosterRead {
+    #[must_use]
+    pub fn of(participants: &[DkgParticipant], threshold: u16) -> Self {
+        let mut buf = Vec::with_capacity(participants.len() * 64 + 2);
+        for p in participants {
+            // Length-prefixed, so no two different participant lists can
+            // serialize to the same bytes.
+            for field in [&p.pool_id, &p.bifrost_id_pk] {
+                buf.extend_from_slice(
+                    &u32::try_from(field.len()).unwrap_or(u32::MAX).to_be_bytes(),
+                );
+                buf.extend_from_slice(field);
+            }
+        }
+        buf.extend_from_slice(&threshold.to_be_bytes());
+        let mut digest = [0u8; 8];
+        digest.copy_from_slice(&crate::cardano::hash::blake2b_256(&buf)[..8]);
+        Self {
+            digest,
+            n: u16::try_from(participants.len()).unwrap_or(u16::MAX),
+            threshold,
+        }
+    }
 }
 
 /// A node's view of the on-chain candidate set. Published UNSIGNED alongside
@@ -436,7 +490,7 @@ pub fn derive_dkg_context(
 
     // Order by bifrost_id_pk and assign identifiers 1..=n.
     eligible.sort_by(|a, b| a.bifrost_id_pk.cmp(&b.bifrost_id_pk));
-    let participants = eligible
+    let participants: Vec<DkgParticipant> = eligible
         .into_iter()
         .enumerate()
         .map(|(i, e)| {
@@ -452,11 +506,13 @@ pub fn derive_dkg_context(
         })
         .collect();
 
+    let threshold = threshold.min(n);
     Ok(DkgContext {
         epoch,
         attempt,
-        threshold: threshold.min(n),
+        threshold,
         total_stake: total,
+        read: RosterRead::of(&participants, threshold),
         participants,
         excluded,
         // The schedule anchor is supplied by `fetch_dkg_context` (it already
@@ -602,6 +658,7 @@ impl DkgContext {
             excluded: self.excluded.clone(),
             schedule_anchor_ms: self.schedule_anchor_ms,
             read_time_ms: self.read_time_ms,
+            read: self.read,
         })
     }
 
@@ -661,6 +718,8 @@ impl DkgContext {
             // Same anchor → same anchored schedule for the rerun.
             schedule_anchor_ms: self.schedule_anchor_ms,
             read_time_ms: self.read_time_ms,
+            // Same read: only what this node runs with changed.
+            read: self.read,
         })
     }
 
@@ -697,6 +756,7 @@ impl DkgContext {
             attempt,
             threshold: roster.min_signers,
             total_stake,
+            read: RosterRead::of(&participants, roster.min_signers),
             // No chain stake is read on this path, so there is no snapshot to be
             // ahead of and nothing for the flag to change.
             live_stake: false,
@@ -1058,12 +1118,13 @@ mod tests {
                     active_stake: s,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
         DkgContext {
             epoch: 1,
             attempt: 0,
             threshold,
             total_stake: total,
+            read: RosterRead::of(&participants, threshold),
             live_stake: false,
             participants,
             excluded: vec![],

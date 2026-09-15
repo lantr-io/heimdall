@@ -2040,14 +2040,14 @@ async fn epoch_start_phase(
         }
     };
 
-    // Publish what this node is about to run with, BEFORE the resume shortcut
-    // below and before the gate. `/health` is un-namespaced, which is what lets
+    // Publish the configured settings and the roster this node READ, BEFORE the
+    // resume shortcut below and before the gate. `/health` is un-namespaced, which is what lets
     // this reach a peer whose epoch scheme differs — the one mismatch no DKG
     // payload can ever carry, because the two nodes address namespaces that
     // never meet. It sits above the resume because a node that restarts
     // mid-epoch and resumes a persisted ceremony would otherwise never publish
-    // the `t` it is holding, and every peer entering a later attempt would read
-    // a gap where the value should be.
+    // its read, and every peer entering a later attempt would read a gap where
+    // the value should be.
     peers.set_node_facts(own_node_facts(config, &ctx)).await;
 
     // Restart recovery (WI-014 #5): if this epoch's DKG already ran and was
@@ -2146,9 +2146,14 @@ fn own_node_facts(
     config: &EpochConfig,
     ctx: &crate::cardano::dkg_roster::DkgContext,
 ) -> crate::http::compat::NodeFacts {
+    // `ctx.read`, never `ctx.participants`/`ctx.threshold`: the read is carried
+    // unchanged through every narrowing, so this publishes the same facts whichever
+    // context of the ceremony it is handed.
     crate::http::compat::NodeFacts {
         epoch: Some(ctx.epoch),
-        threshold: Some(ctx.threshold),
+        threshold: Some(ctx.read.threshold),
+        roster_digest: Some(ctx.read.digest),
+        roster_size: Some(ctx.read.n),
         ..config.node_facts
     }
 }
@@ -2169,20 +2174,24 @@ fn own_node_facts(
 /// fail to run) separately rather than corrupting one ceremony. An error means
 /// what is left cannot run at all — loud, and correct.
 ///
-/// **The narrowed `t` is deliberately NOT republished.** What a peer's gate
-/// compares is the `t` each node derived from its ROSTER READ, and that is what
-/// this node keeps advertising. Republishing the narrowed value made the gate
-/// exclude healthy peers: a node whose gate finished first advertised `t'` over
-/// the survivors while a peer still polling — one other peer down is enough to
-/// keep it polling — held `t` over the full read, saw `t' != t` for the same
-/// epoch, and dropped a node that agreed with it on every input — so one real
-/// mismatch could cascade into exclusions until too few remained for a ceremony.
+/// **What peers compare is the ROSTER READ, never the narrowed set.** Each node
+/// advertises [`crate::cardano::dkg_roster::RosterRead`] — the candidate set in
+/// ceremony order and `t`, as read from the chain — and the narrowed context
+/// carries that same read, so nothing published after this function can leak
+/// the narrowed set. Advertising the narrowed `t` used to make the gate exclude
+/// healthy peers: a node whose gate finished first advertised `t'` over the
+/// survivors while a peer still polling — one other peer down is enough to keep
+/// it polling — held `t` over the full read, saw `t' != t` for the same epoch,
+/// and dropped a node that agreed with it on every input, so one real mismatch
+/// could cascade until too few remained for a ceremony. Comparing only `t` also
+/// passed two reads with an equal `t` over different candidates.
 ///
-/// The republish could not do what it was for either: a `t` cannot say WHICH
-/// survivors a peer kept, two different survivor sets can share one, and a peer
-/// whose gate had already returned never read it. It was also already
-/// inconsistent with a resumed ceremony, which publishes the `t` of the fresh
-/// read.
+/// What this does NOT settle, and the narrowed `t` never did either: two nodes on
+/// the same read can still narrow differently when a peer answers one of them
+/// and not the other before its join wait expires. They then run different
+/// candidate sets in the same namespace and lose the attempt at Round 1, exactly
+/// as a reachability split always has. Agreeing on the narrowed set would need
+/// an agreement round this gate deliberately does not have.
 async fn narrow_at_handshake(
     peers: &Arc<dyn PeerNetwork>,
     ctx: crate::cardano::dkg_roster::DkgContext,
@@ -2209,12 +2218,13 @@ async fn narrow_at_handshake(
         me,
         ctx.epoch,
         "  candidate set reduced to {} of {} at the pre-ceremony handshake ({}); t is now {} \
-         (this node keeps advertising t={} from its roster read, which is what peers compare)",
+         (this node keeps advertising its roster read, n={} t={}, which is what peers compare)",
         narrowed.participants.len(),
         ctx.participants.len(),
         crate::http::compat::exclusion_causes(incompatible.values().copied()),
         narrowed.threshold,
-        ctx.threshold,
+        ctx.read.n,
+        ctx.read.threshold,
     );
     Ok(narrowed)
 }
@@ -2300,9 +2310,10 @@ async fn wait_for_roster_health(
                  reachable — this is a disagreement, not an outage. Both sides log this, \
                  so that operator sees the same line from its own node. The reason says \
                  what to change: a version or blueprint difference needs an upgrade, a \
-                 settings difference needs the setting matched, and a bare threshold \
-                 difference needs nothing — it clears once both nodes re-derive, at the \
-                 latest at the next epoch.",
+                 settings difference needs the setting matched, a different roster read \
+                 needs nothing — it clears once both nodes re-derive, at the latest at the \
+                 next epoch — and a threshold difference against an older build that \
+                 reports no roster digest needs that node upgraded.",
                 crate::epoch::log::id_short(info.identifier),
             );
             incompatible.insert(info.identifier, (kind, reason));
@@ -7418,18 +7429,31 @@ mod tests {
     async fn the_gate_reports_the_kind_of_each_exclusion() {
         use crate::http::compat::Mismatch;
 
-        let fixture = movable_fixture(2, 3, 19_990, 1);
+        let fixture = movable_fixture(2, 4, 19_990, 1);
         let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
         let ctx = chain.query_dkg_context(0, 0).await.expect("ctx");
         let hub = crate::epoch::mocks::MockPeerHub::new();
         let id = |i: u16| Identifier::try_from(i).unwrap();
+        let current = build_of(crate::http::compat::own_version());
         hub.set_build(id(2), build_of("9.9.9"));
+        // An upgraded peer that read another roster.
         hub.set_build(
             id(3),
             crate::http::compat::PeerBuild {
                 dkg_threshold_epoch: Some(ctx.epoch),
-                threshold: Some(ctx.threshold + 1),
-                ..build_of(crate::http::compat::own_version())
+                threshold: Some(ctx.read.threshold),
+                roster_digest: Some("0123456789abcdef".into()),
+                roster_size: Some(ctx.read.n + 1),
+                ..current.clone()
+            },
+        );
+        // A peer from before the digest, advertising another `t`.
+        hub.set_build(
+            id(4),
+            crate::http::compat::PeerBuild {
+                dkg_threshold_epoch: Some(ctx.epoch),
+                threshold: Some(ctx.read.threshold + 1),
+                ..current
             },
         );
         let me = id(1);
@@ -7440,11 +7464,16 @@ mod tests {
         let out = wait_for_roster_health(&peers, &ctx, &config, me).await;
         assert_eq!(
             out,
-            BTreeMap::from([(id(2), Mismatch::Build), (id(3), Mismatch::Threshold)])
+            BTreeMap::from([
+                (id(2), Mismatch::Build),
+                (id(3), Mismatch::Roster),
+                (id(4), Mismatch::LegacyThreshold),
+            ])
         );
-        let s = crate::http::compat::exclusion_summary(out.values().copied(), 3);
+        let s = crate::http::compat::exclusion_summary(out.values().copied(), 4);
         assert!(s.contains("1 on an incompatible build"), "{s}");
-        assert!(s.contains("1 derived a different FROST threshold"), "{s}");
+        assert!(s.contains("1 read a different roster"), "{s}");
+        assert!(s.contains("1 advertise a different FROST threshold"), "{s}");
     }
 
     /// A peer that disagrees on one poll and agrees on the next is not excluded:
@@ -7510,16 +7539,19 @@ mod tests {
         );
     }
 
-    /// The narrowing race. Nodes 1 and 2 agree on every input and share one real
-    /// mismatch: peer 3 runs another minor. Node 2's handshake finishes first and
-    /// narrows to {1, 2}, which moves `t`; node 1 runs its handshake afterwards and
-    /// must drop only peer 3 — not node 2 for serving a `t` over the survivors
-    /// while node 1 still holds the `t` of the full read. When node 2 republished
-    /// its narrowed `t`, node 1 excluded it too and was left alone: an abort over
-    /// a roster whose only disagreement was one build.
+    /// The narrowing race, run as it happens. Nodes 1 and 2 agree on every input
+    /// and share one real mismatch: peer 3 runs another minor. Peer 4 is down,
+    /// which keeps node 1's handshake polling while node 2's — on a short join
+    /// wait — narrows to {1, 2, 4} and returns. Node 2 then publishes its facts
+    /// again from the NARROWED context, as any later publish in the ceremony
+    /// would. Node 1 reads that while still polling and must drop only peer 3.
+    ///
+    /// When the published facts followed the narrowed context, node 1 saw a
+    /// different read from node 2, excluded it, and ran a different ceremony
+    /// from the node it agreed with on every input.
     #[tokio::test]
     async fn a_peer_that_narrowed_first_is_not_excluded_for_it() {
-        let fixture = movable_fixture(3, 3, 19_990, 1);
+        let fixture = movable_fixture(2, 4, 19_990, 1);
         let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture));
         let ctx = chain.query_dkg_context(0, 0).await.expect("ctx");
         let id = |i: u16| Identifier::try_from(i).unwrap();
@@ -7528,30 +7560,59 @@ mod tests {
         hub.set_build(id(1), current.clone());
         hub.set_build(id(2), current);
         hub.set_build(id(3), build_of("9.9.9"));
-
-        let mut narrowed = Vec::new();
-        for i in [2u16, 1] {
-            let me = id(i);
-            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub.clone()));
-            let mut config = fast_config(me);
-            config.dkg_join_wait = Duration::from_millis(50);
-            // What `epoch_start_phase` publishes at entry, before the handshake.
-            peers.set_node_facts(own_node_facts(&config, &ctx)).await;
-            let out = narrow_at_handshake(&peers, ctx.clone(), &config, me)
-                .await
-                .unwrap_or_else(|e| panic!("node {i} must still run a ceremony: {e}"));
-            narrowed.push(out);
+        for i in 1..=3 {
+            hub.set_online(id(i));
         }
+
+        let handshake = |i: u16, join_wait_ms: u64| {
+            let hub = hub.clone();
+            let ctx = ctx.clone();
+            async move {
+                let me = id(i);
+                let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub));
+                let mut config = fast_config(me);
+                config.dkg_join_wait = Duration::from_millis(join_wait_ms);
+                // What `epoch_start_phase` publishes at entry.
+                peers.set_node_facts(own_node_facts(&config, &ctx)).await;
+                let narrowed = narrow_at_handshake(&peers, ctx.clone(), &config, me)
+                    .await
+                    .unwrap_or_else(|e| panic!("node {i} must still run a ceremony: {e}"));
+                // Any later publish, from the context the node now runs with.
+                peers
+                    .set_node_facts(own_node_facts(&config, &narrowed))
+                    .await;
+                narrowed
+            }
+        };
+        let node1 = tokio::spawn(handshake(1, 1_500));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let node2 = handshake(2, 100).await;
+        assert!(
+            !node1.is_finished(),
+            "precondition: node 1 must still be polling after node 2 narrowed"
+        );
+        let node1 = node1.await.unwrap();
 
         assert_ne!(
-            narrowed[0].threshold, ctx.threshold,
-            "precondition: narrowing must move t, or there is no race to lose"
+            node2.participants.len(),
+            ctx.participants.len(),
+            "precondition: node 2 must actually have narrowed"
         );
-        for out in &narrowed {
+        for out in [&node1, &node2] {
             let ids: Vec<Identifier> = out.participants.iter().map(|p| p.identifier).collect();
-            assert_eq!(ids, vec![id(1), id(2)], "only the real mismatch is dropped");
-            assert_eq!(out.threshold, narrowed[0].threshold);
+            assert_eq!(
+                ids,
+                vec![id(1), id(2), id(4)],
+                "only the real mismatch is dropped"
+            );
+            assert_eq!(out.threshold, node2.threshold);
         }
+        let config = fast_config(id(2));
+        assert_eq!(
+            own_node_facts(&config, &node2),
+            own_node_facts(&config, &ctx),
+            "a narrowed context publishes the read it was narrowed from"
+        );
     }
 
     fn test_budget() -> crate::epoch::batch::TmBudget {
