@@ -245,6 +245,26 @@ pub fn test_stake_weighting(live_stake: bool) -> Option<String> {
 /// other; a cycle mismatch means they address DKG namespaces that never meet, so
 /// nothing is ever fetched and nothing anywhere errors.
 #[must_use]
+/// The one-line summary of step 1's advisories, naming each kind present.
+fn advisory_summary(test_run_settings: usize, retired_keys: usize) -> String {
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts = Vec::new();
+    if test_run_settings > 0 {
+        parts.push(format!(
+            "{} in force",
+            plural(test_run_settings, "TEST-RUN setting", "TEST-RUN settings")
+        ));
+    }
+    if retired_keys > 0 {
+        parts.push(format!(
+            "{} to delete",
+            plural(retired_keys, "retired config key", "retired config keys")
+        ));
+    }
+    parts.join("; ")
+}
+
 pub fn test_virtual_epoch(slots: Option<u64>) -> Option<String> {
     slots.map(|s| {
         format!(
@@ -452,6 +472,10 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         let mut advisories: Vec<String> = Vec::new();
         advisories.extend(test_stake_weighting(cfg.cardano.demo_live_stake));
         advisories.extend(test_virtual_epoch(cfg.cardano.demo_virtual_epoch_slots));
+        let test_run_settings = advisories.len();
+        // A retired key kept loadable for an upgrade is an advisory too: the node
+        // runs, and `doctor` still names the line to delete.
+        advisories.extend(cfg.tolerated_retired_keys.iter().cloned());
 
         // Unset state_dir is a REFUSAL, not a warning: the completed-peg-outs trie
         // lives there, and rebuilding it empty makes a node pay an already-paid
@@ -471,11 +495,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     1,
                     "local preflight",
                     Status::Warn,
-                    format!(
-                        "{} TEST-RUN setting{} in force",
-                        advisories.len(),
-                        if advisories.len() == 1 { "" } else { "s" }
-                    ),
+                    advisory_summary(test_run_settings, advisories.len() - test_run_settings),
                     advisories.join("\n"),
                 );
             }
