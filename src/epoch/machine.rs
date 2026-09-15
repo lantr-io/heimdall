@@ -70,7 +70,7 @@ use crate::epoch::state::{
 use crate::epoch::traits::PeginKeyOrigin;
 use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use crate::frost::xonly::group_xonly;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Run the epoch state machine for one full cycle and return the
 /// witnessed `TreasuryMovement` once the cycle reaches `RecordMovement`.
@@ -1987,7 +1987,7 @@ async fn epoch_start_phase(
     let mut ctx = if incompatible.is_empty() {
         ctx
     } else {
-        match ctx.without(&incompatible) {
+        match ctx.without(&incompatible.keys().copied().collect()) {
             Some(narrowed) => {
                 crate::epoch_warn!(
                     me,
@@ -2012,11 +2012,9 @@ async fn epoch_start_phase(
                     attempt: ctx.attempt,
                     eligible: ctx.participants.len(),
                     qualified: ctx.participants.len().saturating_sub(incompatible.len()),
-                    reason: format!(
-                        "{} of {} candidates run an incompatible build, leaving too few to run \
-                         a ceremony — upgrade the lagging nodes",
-                        incompatible.len(),
-                        ctx.participants.len()
+                    reason: crate::http::compat::exclusion_summary(
+                        incompatible.values().copied(),
+                        ctx.participants.len(),
                     ),
                 });
             }
@@ -2115,8 +2113,8 @@ fn own_node_facts(
 }
 
 /// Poll every roster peer's `/health` until all answer or `dkg_join_wait`
-/// elapses (N21), and return the peers whose BUILD is incompatible with ours
-/// (WI-067).
+/// elapses (N21), and return the peers that are incompatible with ours (WI-067),
+/// each with the kind of mismatch that excluded it.
 ///
 /// Never fails on reachability: proceeding without a peer is always legal — the
 /// ceremony's quorum gate decides viability, and this gate only makes the happy
@@ -2139,7 +2137,7 @@ async fn wait_for_roster_health(
     ctx: &crate::cardano::dkg_roster::DkgContext,
     config: &EpochConfig,
     me: frost::Identifier,
-) -> BTreeSet<frost::Identifier> {
+) -> BTreeMap<frost::Identifier, crate::http::compat::Mismatch> {
     use crate::http::compat::Compatibility;
 
     let own = own_node_facts(config, ctx);
@@ -2148,7 +2146,7 @@ async fn wait_for_roster_health(
     let poll = config
         .poll_interval
         .max(std::time::Duration::from_millis(200));
-    let mut incompatible: BTreeSet<frost::Identifier> = BTreeSet::new();
+    let mut incompatible = BTreeMap::new();
     loop {
         let mut down = Vec::new();
         for info in roster.participants.values() {
@@ -2162,8 +2160,8 @@ async fn wait_for_roster_health(
             }
             // Logged ONCE per peer per gate, not per poll: the loop can turn
             // every 200 ms and this is the line an operator has to find.
-            if let Compatibility::Incompatible { reason } = health.compatibility(own)
-                && incompatible.insert(info.identifier)
+            if let Compatibility::Incompatible { kind, reason } = health.compatibility(own)
+                && incompatible.insert(info.identifier, kind).is_none()
             {
                 crate::epoch_warn!(
                     me,
@@ -7143,7 +7141,7 @@ mod tests {
         let mut config = fast_config(me);
         config.dkg_join_wait = Duration::from_millis(50);
         let out = wait_for_roster_health(&peers, &ctx, &config, me).await;
-        out.iter()
+        out.keys()
             .map(|id| {
                 ctx.participants
                     .iter()
@@ -7245,7 +7243,7 @@ mod tests {
                     == Some(2)
             })
             .map(|p| p.identifier)
-            .collect::<BTreeSet<_>>();
+            .collect::<std::collections::BTreeSet<_>>();
         let narrowed = ctx
             .without(&out)
             .expect("two of three still run a ceremony");

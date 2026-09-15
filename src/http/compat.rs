@@ -221,7 +221,61 @@ pub enum Compatibility {
     Unknown,
     /// A definite mismatch, with both sides named so either log line is enough
     /// to diagnose it.
-    Incompatible { reason: String },
+    Incompatible { kind: Mismatch, reason: String },
+}
+
+/// Which kind of disagreement excluded a peer — it decides what the operator
+/// must do, so a summary over several peers must never collapse the kinds into
+/// one sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Mismatch {
+    /// Version series, blueprint or security percentage: one side must move to
+    /// the other's release.
+    Build,
+    /// A consensus setting of the deployment: one side must match the other's
+    /// configuration. Same build, so an upgrade would change nothing.
+    Settings,
+    /// Only the derived FROST `t` for the same epoch — two roster reads that saw
+    /// different chain state. Nothing to upgrade or configure.
+    Threshold,
+}
+
+/// The cause clause of a DKG abort after the gate excluded peers, one clause per
+/// kind present. Each kind carries its own instruction, because the three want
+/// opposite things from the operator: telling a node whose only difference is a
+/// threshold read to upgrade sends it chasing a build problem it does not have.
+#[must_use]
+pub fn exclusion_summary(kinds: impl IntoIterator<Item = Mismatch>, candidates: usize) -> String {
+    let mut counts = std::collections::BTreeMap::new();
+    let mut excluded = 0usize;
+    for kind in kinds {
+        *counts.entry(kind).or_insert(0usize) += 1;
+        excluded += 1;
+    }
+    let clauses: Vec<String> = counts
+        .into_iter()
+        .map(|(kind, n)| match kind {
+            Mismatch::Build => format!(
+                "{n} on an incompatible build — whichever side runs the other release must \
+                 upgrade (the ⚠ EXCLUDING lines name both versions)"
+            ),
+            Mismatch::Settings => format!(
+                "{n} with different consensus settings — match the setting the ⚠ EXCLUDING \
+                 lines name; no upgrade is needed"
+            ),
+            Mismatch::Threshold => format!(
+                "{n} derived a different FROST threshold for this epoch — NOT a build or \
+                 settings problem and no upgrade is needed: the nodes read the registry or \
+                 stake at different moments, as when a pool registers mid-epoch, and it \
+                 clears once they re-derive, at the latest at the next epoch"
+            ),
+        })
+        .collect();
+    format!(
+        "{excluded} of {candidates} candidates excluded at the pre-ceremony handshake, leaving \
+         too few to run a ceremony: {}",
+        clauses.join("; ")
+    )
 }
 
 impl Compatibility {
@@ -256,6 +310,7 @@ impl Compatibility {
                 None => "real Cardano epochs".to_string(),
             };
             return Self::Incompatible {
+                kind: Mismatch::Settings,
                 reason: format!(
                     "the peer runs on {} and we run on {} — we would number epochs \
                      differently, publish into DKG namespaces that never fetch each other, \
@@ -279,6 +334,7 @@ impl Compatibility {
                 }
             };
             return Self::Incompatible {
+                kind: Mismatch::Settings,
                 reason: format!(
                     "the peer weights the roster by {} and we by {} — the candidate set would \
                      AGREE while the derived thresholds differ, so nothing we exchange can \
@@ -293,6 +349,7 @@ impl Compatibility {
             && t != o
         {
             return Self::Incompatible {
+                kind: Mismatch::Settings,
                 reason: format!(
                     "the peer reads per-pool stake from {t} and we from {o} — the same registry \
                      weighs differently on the two backends, so we derive different FROST \
@@ -303,6 +360,7 @@ impl Compatibility {
         }
         if peer.exclude_unstaked.unwrap_or(false) != own.exclude_unstaked.unwrap_or(false) {
             return Self::Incompatible {
+                kind: Mismatch::Settings,
                 reason: format!(
                     "cardano.demo_exclude_unstaked is {} on the peer and {} here — a pool whose \
                      stake will not resolve is dropped from one node's candidate set and fatal \
@@ -319,6 +377,7 @@ impl Compatibility {
         let ours = own.version.as_deref().unwrap_or_default();
         if minor_series(theirs) != minor_series(ours) {
             return Self::Incompatible {
+                kind: Mismatch::Build,
                 reason: format!("version {theirs} against our {ours}"),
             };
         }
@@ -331,6 +390,7 @@ impl Compatibility {
         ) && t != o
         {
             return Self::Incompatible {
+                kind: Mismatch::Build,
                 reason: format!(
                     "same version {theirs}, but blueprint {t} against our {o} — \
                      different contracts, so a different bridge"
@@ -346,6 +406,7 @@ impl Compatibility {
             && t != o
         {
             return Self::Incompatible {
+                kind: Mismatch::Build,
                 reason: format!(
                     "same version {theirs}, but the security threshold is {t}% against our {o}% \
                      — we would derive different FROST thresholds from the same registry, commit \
@@ -371,12 +432,14 @@ impl Compatibility {
             && t != o
         {
             return Self::Incompatible {
+                kind: Mismatch::Threshold,
                 reason: format!(
                     "for epoch {pe} the peer derived FROST threshold t={t} and we t={o} — \
                      commitment vectors of different length, which cannot combine. Every \
                      setting we compare agrees, so this is NOT a build problem and needs no \
-                     upgrade: under live_stake weighting it is two reads moments apart, and it \
-                     resolves at the next ceremony entry"
+                     upgrade: the two nodes read the registry or stake at different moments (a \
+                     pool that registered mid-epoch, or live_stake drift), and it clears once \
+                     both re-derive — at the latest at the next epoch"
                 ),
             };
         }
@@ -448,7 +511,7 @@ mod tests {
     /// own side, so it learns why it was dropped rather than seeing silence.
     #[test]
     fn a_mismatch_names_both_versions() {
-        let Compatibility::Incompatible { reason } =
+        let Compatibility::Incompatible { reason, .. } =
             Compatibility::between(&build("0.2.5", "aa"), &build("0.1.0", "aa"))
         else {
             panic!("expected a mismatch");
@@ -463,7 +526,7 @@ mod tests {
     fn the_same_version_over_a_different_blueprint_is_incompatible() {
         let v = Compatibility::between(&build("0.1.0", "aaaa"), &build("0.1.0", "bbbb"));
         assert!(v.is_incompatible(), "{v:?}");
-        let Compatibility::Incompatible { reason } = v else {
+        let Compatibility::Incompatible { reason, .. } = v else {
             unreachable!()
         };
         assert!(reason.contains("different bridge"), "{reason}");
@@ -478,7 +541,7 @@ mod tests {
         peer.threshold_percent = Some(20);
         let v = Compatibility::between(&peer, &build("0.1.0", "aa"));
         assert!(v.is_incompatible(), "{v:?}");
-        let Compatibility::Incompatible { reason } = v else {
+        let Compatibility::Incompatible { reason, .. } = v else {
             unreachable!()
         };
         assert!(reason.contains("20%"), "{reason}");
@@ -494,7 +557,7 @@ mod tests {
     fn a_virtual_epoch_difference_is_incompatible_in_both_directions() {
         let mut peer = build("0.1.0", "aa");
         peer.virtual_epoch_slots = Some(86_400);
-        let Compatibility::Incompatible { reason } =
+        let Compatibility::Incompatible { reason, .. } =
             Compatibility::between(&peer, &build_with(NodeFacts::default()))
         else {
             panic!("a virtual epoch against real epochs must be incompatible");
@@ -528,7 +591,7 @@ mod tests {
             live_stake: Some(true),
             ..NodeFacts::default()
         };
-        let Compatibility::Incompatible { reason } =
+        let Compatibility::Incompatible { reason, .. } =
             Compatibility::between(&peer, &build_with(mine))
         else {
             panic!("live_stake against the epoch snapshot must be incompatible");
@@ -556,7 +619,7 @@ mod tests {
 
         peer.threshold = Some(2);
         peer.dkg_threshold_epoch = Some(7);
-        let Compatibility::Incompatible { reason } =
+        let Compatibility::Incompatible { reason, .. } =
             Compatibility::between(&peer, &build_with(mine))
         else {
             panic!("two derived thresholds that differ cannot combine");
@@ -610,7 +673,7 @@ mod tests {
         };
         let mut peer = build_with(own);
         peer.stake_source = Some("yaci_store".into());
-        let Compatibility::Incompatible { reason } =
+        let Compatibility::Incompatible { reason, .. } =
             Compatibility::between(&peer, &build_with(own))
         else {
             panic!("two stake backends cannot derive one threshold");
@@ -619,7 +682,7 @@ mod tests {
 
         let mut peer = build_with(own);
         peer.exclude_unstaked = Some(true);
-        let Compatibility::Incompatible { reason } =
+        let Compatibility::Incompatible { reason, .. } =
             Compatibility::between(&peer, &build_with(own))
         else {
             panic!("differing exclusion rules are different rosters");
@@ -641,7 +704,7 @@ mod tests {
             ..NodeFacts::default()
         };
         let v = Compatibility::between(&PeerBuild::default(), &build_with(mine));
-        let Compatibility::Incompatible { reason } = v else {
+        let Compatibility::Incompatible { reason, .. } = v else {
             panic!("an unknown build on real epochs must not be admitted: {v:?}");
         };
         assert!(reason.contains("86400"), "{reason}");
@@ -740,5 +803,76 @@ mod tests {
     fn the_digest_changes_with_the_blueprint() {
         assert_ne!(blueprint_digest("{}"), blueprint_digest("{ }"));
         assert_eq!(blueprint_digest("{}"), blueprint_digest("{}"));
+    }
+
+    fn kind_of(v: Compatibility) -> Mismatch {
+        let Compatibility::Incompatible { kind, .. } = v else {
+            panic!("expected a mismatch, got {v:?}");
+        };
+        kind
+    }
+
+    /// Each verdict carries the kind that decides what the operator does, so a
+    /// summary over several peers can keep them apart.
+    #[test]
+    fn every_mismatch_carries_its_kind() {
+        let base = build("0.1.0", "aa");
+        assert_eq!(
+            kind_of(Compatibility::between(&build("0.2.0", "aa"), &base)),
+            Mismatch::Build
+        );
+        assert_eq!(
+            kind_of(Compatibility::between(&build("0.1.0", "bb"), &base)),
+            Mismatch::Build
+        );
+        let live = PeerBuild {
+            live_stake: Some(true),
+            ..base.clone()
+        };
+        assert_eq!(
+            kind_of(Compatibility::between(&live, &base)),
+            Mismatch::Settings
+        );
+        let at = |t| PeerBuild {
+            dkg_threshold_epoch: Some(1548),
+            threshold: Some(t),
+            ..base.clone()
+        };
+        assert_eq!(
+            kind_of(Compatibility::between(&at(2), &at(5))),
+            Mismatch::Threshold
+        );
+    }
+
+    /// The reported abort: a node that registered mid-epoch derives a different
+    /// `t` than the roster that already read the registry, excludes all four
+    /// peers, and must not be told its build is at fault.
+    #[test]
+    fn a_threshold_only_abort_does_not_blame_the_build() {
+        let s = exclusion_summary([Mismatch::Threshold; 4], 5);
+        assert!(s.starts_with("4 of 5 candidates excluded"), "{s}");
+        assert!(s.contains("FROST threshold"), "{s}");
+        assert!(s.contains("no upgrade is needed"), "{s}");
+        assert!(!s.contains("incompatible build"), "{s}");
+        assert!(!s.contains("must upgrade"), "{s}");
+    }
+
+    /// Mixed causes are each named with their own count and instruction, not
+    /// collapsed into whichever came first.
+    #[test]
+    fn a_mixed_abort_names_every_kind_with_its_count() {
+        let s = exclusion_summary(
+            [
+                Mismatch::Threshold,
+                Mismatch::Build,
+                Mismatch::Threshold,
+                Mismatch::Settings,
+            ],
+            6,
+        );
+        assert!(s.starts_with("4 of 6 candidates excluded"), "{s}");
+        assert!(s.contains("1 on an incompatible build"), "{s}");
+        assert!(s.contains("1 with different consensus settings"), "{s}");
+        assert!(s.contains("2 derived a different FROST threshold"), "{s}");
     }
 }

@@ -916,8 +916,9 @@ both:
   operator on the other end sees the same line, and **the line says which of three things it is**:
   a different version or blueprint (upgrade the lagging node); a different `demo_live_stake` or
   `demo_virtual_epoch_slots` (match the setting across the roster); or only a different derived
-  threshold, which is `live_stake` drifting between two reads and needs nothing done — it clears at
-  the next ceremony entry. Do not upgrade a node for the third one.
+  threshold, which is two nodes reading the registry or stake at different moments — a pool that
+  registered mid-epoch, or `live_stake` drift — and needs nothing done: it clears once both
+  re-derive, at the latest at the next epoch. Do not upgrade a node for the third one.
 
 ### Reading the log
 
@@ -1094,7 +1095,7 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 | `[3/11] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
 | `[6/11] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
 | `no reference script for the registry` right after `deploy-registry-ref` succeeded | the provider's address listing has not shown the script yet – pass the outpoint the deploy printed, `--registry-ref <tx_hash>:0` (step 6) |
-| `N of M candidates run an incompatible build` at every epoch start | this node and its peers disagree on version, blueprint, threshold or a test-bridge setting; both sides report the other as lagging. Compare `/health` across the roster and change the odd one out, together – see *Upgrades* |
+| `N of M candidates excluded at the pre-ceremony handshake` at every epoch start | the rest of the line names each cause with its count. *Incompatible build* (version, blueprint, security threshold): both sides report the other, so compare `/health` across the roster and upgrade the odd one out – see *Upgrades*. *Different consensus settings*: match the setting the `⚠ EXCLUDING` lines name. *Different FROST threshold* only: nothing to change – typically this node registered after the roster read the registry for this epoch, and it clears at the next epoch |
 | `[9/11] post a movement FAIL` | this bridge has never published its treasury-movement validator on chain, so no SPO can post — `binocular deploy-script-refs`, re-run, publishes it and skips what already exists. Not something one operator's config can fix |
 | `[11/11] wallet collateral WARN`, or `no ada-only wallet UTxO with >= 5 ADA for collateral` when a tx is built | the wallet cannot post a script transaction, which is **not** a balance problem — it can hold thousands of ADA and still fail, if every UTxO carries a native token. A script tx needs one UTxO to pay the fee and a DISTINCT ada-only one for collateral. `heimdall ensure-collateral --submit` splits clean UTxOs off whatever the wallet holds; it runs no script, so it needs no collateral itself and works even when every lovelace is behind a token |
 | a key you set is `refused` at load | it names a value the Config publishes; delete it, and `show-config-params` prints what the chain says |
