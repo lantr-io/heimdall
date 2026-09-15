@@ -972,6 +972,11 @@ pub struct MockPeerHub {
     /// build is unknown, which is what an un-configured mock peer reports and
     /// what a real peer predating the check reports.
     builds: Mutex<BTreeMap<Identifier, crate::http::compat::PeerBuild>>,
+    /// What each node last published through `set_node_facts`. Its live half
+    /// (the derived `t` and its epoch) is served on that node's `/health`,
+    /// mirroring the HTTP server, so a test can run two nodes' gates against
+    /// each other.
+    facts: Mutex<BTreeMap<Identifier, crate::http::compat::NodeFacts>>,
 }
 
 impl MockPeerHub {
@@ -1188,11 +1193,20 @@ impl PeerNetwork for MockPeerNetwork {
         let published_dkg = with_slot(&self.hub, peer.identifier, |s| {
             s.dkg1.as_ref().map(|(ns, _)| (ns.epoch, ns.attempt))
         });
+        let mut build = self.hub.build_of(peer.identifier);
+        if let Some(facts) = self.hub.facts.lock().unwrap().get(&peer.identifier) {
+            build.dkg_threshold_epoch = facts.epoch;
+            build.threshold = facts.threshold;
+        }
         crate::epoch::traits::PeerHealth {
             reachable: true,
-            build: self.hub.build_of(peer.identifier),
+            build,
             published_dkg,
         }
+    }
+
+    async fn set_node_facts(&self, facts: crate::http::compat::NodeFacts) {
+        self.hub.facts.lock().unwrap().insert(self.me, facts);
     }
 
     async fn publish_dkg_round1(

@@ -2059,62 +2059,7 @@ async fn epoch_start_phase(
         return Ok(resumed);
     }
 
-    // N21 health gate: bring the roster up before the ceremony. A staggered
-    // process start otherwise freezes divergent live subsets — the early
-    // nodes complete a reduced key without the late one, which then loops
-    // forever against their stale round-1 packages. Time-bounded: a peer
-    // that stays down is excluded by the normal quorum-gated reduction.
-    let incompatible = wait_for_roster_health(peers, &ctx, config, me).await;
-    // WI-067: drop the reachable-but-incompatible peers from the candidate set
-    // before anything is published. Nothing has been generated yet, so this is
-    // simply a smaller candidate set — `t` is re-derived over it and `attempt`
-    // does not move.
-    //
-    // It converges without any agreement protocol because the comparison is
-    // symmetric: every node compares each peer against ITSELF, so a node on a
-    // different minor is dropped by all of its peers and drops all of them, and
-    // the two groups run (or fail to run) separately rather than corrupting one
-    // ceremony. `None` means what is left cannot run at all, which is the
-    // existing abort — loud, and correct: the roster really has gone below what
-    // a DKG needs.
-    let mut ctx = if incompatible.is_empty() {
-        ctx
-    } else {
-        match ctx.without(&incompatible.keys().copied().collect()) {
-            Some(narrowed) => {
-                crate::epoch_warn!(
-                    me,
-                    epoch,
-                    "  candidate set reduced to {} of {} at the pre-ceremony handshake ({}); \
-                     t is now {}",
-                    narrowed.participants.len(),
-                    ctx.participants.len(),
-                    crate::http::compat::exclusion_causes(incompatible.values().copied()),
-                    narrowed.threshold,
-                );
-                // The gate changed `t`. Republish it, or this node advertises the
-                // pre-narrowing value and reports agreement with a peer that
-                // narrowed to a different survivor set — at the exact moment the
-                // two diverged.
-                peers
-                    .set_node_facts(own_node_facts(config, &narrowed))
-                    .await;
-                narrowed
-            }
-            None => {
-                return Err(EpochError::DkgAborted {
-                    epoch,
-                    attempt: ctx.attempt,
-                    eligible: ctx.participants.len(),
-                    qualified: ctx.participants.len().saturating_sub(incompatible.len()),
-                    reason: crate::http::compat::exclusion_summary(
-                        incompatible.values().copied(),
-                        ctx.participants.len(),
-                    ),
-                });
-            }
-        }
-    };
+    let mut ctx = narrow_at_handshake(peers, ctx, config, me).await?;
 
     // N21 ceremony window grid: with a chain-time anchor, join at the next
     // grid line so every node — however late it started, or re-entering
@@ -2192,8 +2137,9 @@ fn next_window(boundary_ms: i64, window: std::time::Duration, now_ms: i64) -> (u
 /// compares their answers to.
 ///
 /// The configured half is already in `config.node_facts` and has been published
-/// since the server came up; this adds the live half — the `t` just derived, and
-/// the ceremony epoch it belongs to. The epoch travels with it because a `t`
+/// since the server came up; this adds the live half — the `t` derived from the
+/// roster read (never the narrowed one, see [`narrow_at_handshake`]), and the
+/// ceremony epoch it belongs to. The epoch travels with it because a `t`
 /// without one is compared against a peer's PREVIOUS epoch's `t` at every
 /// boundary where the roster's threshold moves.
 fn own_node_facts(
@@ -2205,6 +2151,72 @@ fn own_node_facts(
         threshold: Some(ctx.threshold),
         ..config.node_facts
     }
+}
+
+/// The pre-ceremony handshake: wait for the roster (N21), then drop the
+/// reachable-but-incompatible peers from the candidate set (WI-067).
+///
+/// A staggered process start otherwise freezes divergent live subsets — the
+/// early nodes complete a reduced key without the late one, which then loops
+/// forever against their stale round-1 packages. Time-bounded: a peer that stays
+/// down is excluded by the normal quorum-gated reduction.
+///
+/// Nothing has been generated yet, so an exclusion is simply a smaller candidate
+/// set — `t` is re-derived over it and `attempt` does not move. It converges
+/// without any agreement protocol because the comparison is symmetric: every
+/// node compares each peer against ITSELF, so a node on a different minor is
+/// dropped by all of its peers and drops all of them, and the two groups run (or
+/// fail to run) separately rather than corrupting one ceremony. An error means
+/// what is left cannot run at all — loud, and correct.
+///
+/// **The narrowed `t` is deliberately NOT republished.** What a peer's gate
+/// compares is the `t` each node derived from its ROSTER READ, and that is what
+/// this node keeps advertising. Republishing the narrowed value made the gate
+/// exclude healthy peers: a node whose gate finished first advertised `t'` over
+/// the survivors while a peer still polling — one other peer down is enough to
+/// keep it polling — held `t` over the full read, saw `t' != t` for the same
+/// epoch, and dropped a node that agreed with it on every input — so one real
+/// mismatch could cascade into exclusions until too few remained for a ceremony.
+///
+/// The republish could not do what it was for either: a `t` cannot say WHICH
+/// survivors a peer kept, two different survivor sets can share one, and a peer
+/// whose gate had already returned never read it. It was also already
+/// inconsistent with a resumed ceremony, which publishes the `t` of the fresh
+/// read.
+async fn narrow_at_handshake(
+    peers: &Arc<dyn PeerNetwork>,
+    ctx: crate::cardano::dkg_roster::DkgContext,
+    config: &EpochConfig,
+    me: frost::Identifier,
+) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
+    let incompatible = wait_for_roster_health(peers, &ctx, config, me).await;
+    if incompatible.is_empty() {
+        return Ok(ctx);
+    }
+    let Some(narrowed) = ctx.without(&incompatible.keys().copied().collect()) else {
+        return Err(EpochError::DkgAborted {
+            epoch: ctx.epoch,
+            attempt: ctx.attempt,
+            eligible: ctx.participants.len(),
+            qualified: ctx.participants.len().saturating_sub(incompatible.len()),
+            reason: crate::http::compat::exclusion_summary(
+                incompatible.values().copied(),
+                ctx.participants.len(),
+            ),
+        });
+    };
+    crate::epoch_warn!(
+        me,
+        ctx.epoch,
+        "  candidate set reduced to {} of {} at the pre-ceremony handshake ({}); t is now {} \
+         (this node keeps advertising t={} from its roster read, which is what peers compare)",
+        narrowed.participants.len(),
+        ctx.participants.len(),
+        crate::http::compat::exclusion_causes(incompatible.values().copied()),
+        narrowed.threshold,
+        ctx.threshold,
+    );
+    Ok(narrowed)
 }
 
 /// Poll every roster peer's `/health` until all answer or `dkg_join_wait`
@@ -7496,6 +7508,50 @@ mod tests {
             config.health.snapshot().excluded_peers.is_empty(),
             "and /health no longer lists it"
         );
+    }
+
+    /// The narrowing race. Nodes 1 and 2 agree on every input and share one real
+    /// mismatch: peer 3 runs another minor. Node 2's handshake finishes first and
+    /// narrows to {1, 2}, which moves `t`; node 1 runs its handshake afterwards and
+    /// must drop only peer 3 — not node 2 for serving a `t` over the survivors
+    /// while node 1 still holds the `t` of the full read. When node 2 republished
+    /// its narrowed `t`, node 1 excluded it too and was left alone: an abort over
+    /// a roster whose only disagreement was one build.
+    #[tokio::test]
+    async fn a_peer_that_narrowed_first_is_not_excluded_for_it() {
+        let fixture = movable_fixture(3, 3, 19_990, 1);
+        let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture));
+        let ctx = chain.query_dkg_context(0, 0).await.expect("ctx");
+        let id = |i: u16| Identifier::try_from(i).unwrap();
+        let hub = crate::epoch::mocks::MockPeerHub::new();
+        let current = build_of(crate::http::compat::own_version());
+        hub.set_build(id(1), current.clone());
+        hub.set_build(id(2), current);
+        hub.set_build(id(3), build_of("9.9.9"));
+
+        let mut narrowed = Vec::new();
+        for i in [2u16, 1] {
+            let me = id(i);
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub.clone()));
+            let mut config = fast_config(me);
+            config.dkg_join_wait = Duration::from_millis(50);
+            // What `epoch_start_phase` publishes at entry, before the handshake.
+            peers.set_node_facts(own_node_facts(&config, &ctx)).await;
+            let out = narrow_at_handshake(&peers, ctx.clone(), &config, me)
+                .await
+                .unwrap_or_else(|e| panic!("node {i} must still run a ceremony: {e}"));
+            narrowed.push(out);
+        }
+
+        assert_ne!(
+            narrowed[0].threshold, ctx.threshold,
+            "precondition: narrowing must move t, or there is no race to lose"
+        );
+        for out in &narrowed {
+            let ids: Vec<Identifier> = out.participants.iter().map(|p| p.identifier).collect();
+            assert_eq!(ids, vec![id(1), id(2)], "only the real mismatch is dropped");
+            assert_eq!(out.threshold, narrowed[0].threshold);
+        }
     }
 
     fn test_budget() -> crate::epoch::batch::TmBudget {

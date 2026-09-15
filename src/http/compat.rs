@@ -142,8 +142,15 @@ pub struct NodeFacts {
     /// peer that agrees with it — on a production bridge, with no test flag
     /// anywhere near it.
     pub epoch: Option<u64>,
-    /// The FROST `t` this node derived for the ceremony it is about to enter —
-    /// the length its Round-1 commitment vector will have.
+    /// The FROST `t` this node derived from its roster read for [`Self::epoch`],
+    /// BEFORE the handshake dropped any incompatible peer.
+    ///
+    /// Not necessarily the length its Round-1 commitment vector will have: when
+    /// the gate narrows the candidate set, `t` is re-derived over the survivors
+    /// and that value is kept local. What peers compare is whether two nodes read
+    /// the same roster, and advertising the narrowed value made a node whose gate
+    /// finished first look like a disagreement to every peer still polling — see
+    /// `narrow_at_handshake` in the epoch machine.
     ///
     /// Live state, not configuration: `None` until this node has read a roster,
     /// exactly as `dkg_epoch`/`dkg_attempt` are absent until it has published a
