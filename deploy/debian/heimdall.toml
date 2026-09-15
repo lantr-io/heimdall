@@ -181,7 +181,6 @@ poll_interval_ms = 5000
 # is how a movement reaches the watchtowers. 0 = post as Unconfirmed (a watchtower
 # marks it Confirmed later, after Bitcoin confirmations and oracle aging).
 submit_oracle = true
-oracle_constructor = 0
 
 # How this node learns each pool's active stake for the stake-weighted DKG.
 stake_source = "blockfrost"

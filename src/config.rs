@@ -13,7 +13,7 @@ use crate::epoch::state::{EpochConfig, SpoIdentity};
 // ── Root ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HeimdallConfig {
     pub protocol: ProtocolConfig,
     pub bitcoin: BitcoinConfig,
@@ -45,7 +45,7 @@ impl Default for HeimdallConfig {
 // ── [log] ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LogConfig {
     /// A bare level (`error`/`warn`/`info`/`debug`/`trace`), which is scoped to
     /// heimdall's own modules, or a full `RUST_LOG` directive such as
@@ -70,7 +70,7 @@ impl Default for LogConfig {
 // ── [bifrost] ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BifrostConfig {
     /// Path to a `0600` file holding this SPO's 32-byte bifrost identity
     /// secret key, hex-encoded. This is the long-lived secp256k1 key bound
@@ -118,7 +118,7 @@ impl Default for BifrostConfig {
 /// rule the epoch DKG uses, so every node derives the identical numbering from
 /// the same set.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FederationConfig {
     /// FROST threshold `t` of the federation key — how many members it takes to
     /// sign a recovery spend.
@@ -155,6 +155,7 @@ impl Default for FederationConfig {
 /// address is derived from `bifrost_id_pk` instead (see
 /// [`crate::federation::roster`]), so the typed list stays the whole input.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FederationMemberConfig {
     /// The member's 32-byte x-only secp256k1 identity key, hex.
     pub bifrost_id_pk: String,
@@ -183,7 +184,7 @@ const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const BATCH_POLL_CEILING: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProtocolConfig {
     pub dkg_round_timeout_secs: u64,
     /// Ceremony-window grid pitch (N21): a node entering DKG sleeps to the
@@ -240,7 +241,7 @@ impl Default for ProtocolConfig {
 // ── [bitcoin] ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BitcoinConfig {
     /// `"regtest"`, `"testnet4"`, `"signet"`, `"mainnet"`.
     pub network: String,
@@ -344,13 +345,15 @@ impl Default for BitcoinConfig {
 }
 
 impl BitcoinConfig {
-    pub fn parsed_network(&self) -> bitcoin::Network {
+    pub fn parsed_network(&self) -> Result<bitcoin::Network, String> {
         match self.network.as_str() {
-            "mainnet" | "bitcoin" => bitcoin::Network::Bitcoin,
-            "testnet4" => bitcoin::Network::Testnet4,
-            "signet" => bitcoin::Network::Signet,
-            "regtest" => bitcoin::Network::Regtest,
-            other => panic!("unknown bitcoin.network: {other:?}"),
+            "mainnet" | "bitcoin" => Ok(bitcoin::Network::Bitcoin),
+            "testnet4" => Ok(bitcoin::Network::Testnet4),
+            "signet" => Ok(bitcoin::Network::Signet),
+            "regtest" => Ok(bitcoin::Network::Regtest),
+            other => Err(format!(
+                "unknown bitcoin.network {other:?} — expected \"mainnet\", \"testnet4\", \"signet\" or \"regtest\""
+            )),
         }
     }
 }
@@ -358,7 +361,7 @@ impl BitcoinConfig {
 // ── [cardano] ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CardanoConfig {
     pub blockfrost_project_id: Option<String>,
     /// Custom Blockfrost-compatible API base URL — a local Dolos or a
@@ -763,7 +766,7 @@ impl CardanoConfig {
 /// participation, grid position — and defaults to loopback so it is reachable by
 /// the machine's own monitoring and nobody else.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HealthConfig {
     /// `address:port` for the operator surface. Loopback by default; point it at
     /// a LAN address only if you mean to, since nothing here authenticates.
@@ -783,7 +786,7 @@ impl Default for HealthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
     /// Local interface to bind. Defaults to `0.0.0.0`, because the peer endpoint
     /// is public by construction — its URL is on chain and every other SPO has to
@@ -814,7 +817,7 @@ impl Default for HttpConfig {
 // ── [demo] ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DemoConfig {
     pub min_signers: u16,
     pub max_signers: u16,
@@ -1020,6 +1023,303 @@ fn retired_keys_in(doc: &toml::Value) -> Vec<RetiredKey> {
         .collect()
 }
 
+const DKG_RETRY_ALLOWANCE_SECS: u64 = 2;
+
+fn invalid(key: &str, why: impl std::fmt::Display) -> ConfigError {
+    ConfigError::Invalid(format!("{key}: {why}"))
+}
+
+fn validate_protocol(protocol: &ProtocolConfig) -> Result<(), ConfigError> {
+    for (key, value) in [
+        (
+            "protocol.dkg_round_timeout_secs",
+            protocol.dkg_round_timeout_secs,
+        ),
+        ("protocol.dkg_window_secs", protocol.dkg_window_secs),
+        (
+            "protocol.dkg_round1_offset_secs",
+            protocol.dkg_round1_offset_secs,
+        ),
+        (
+            "protocol.dkg_round2_offset_secs",
+            protocol.dkg_round2_offset_secs,
+        ),
+        (
+            "protocol.dkg_reconcile_backoff_secs",
+            protocol.dkg_reconcile_backoff_secs,
+        ),
+    ] {
+        if value == 0 {
+            return Err(invalid(key, "must be greater than zero"));
+        }
+    }
+    if protocol.poll_interval_ms == 0 {
+        return Err(invalid(
+            "protocol.poll_interval_ms",
+            "must be greater than zero; zero would busy-loop",
+        ));
+    }
+    if protocol.dkg_round2_offset_secs <= protocol.dkg_round1_offset_secs {
+        return Err(invalid(
+            "protocol.dkg_round2_offset_secs",
+            format!(
+                "must be after protocol.dkg_round1_offset_secs ({})",
+                protocol.dkg_round1_offset_secs
+            ),
+        ));
+    }
+    let minimum_window = protocol
+        .dkg_round2_offset_secs
+        .saturating_add(DKG_RETRY_ALLOWANCE_SECS);
+    if protocol.dkg_window_secs <= minimum_window {
+        return Err(invalid(
+            "protocol.dkg_window_secs",
+            format!(
+                "must exceed protocol.dkg_round2_offset_secs + retry allowance ({minimum_window}s)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_demo(demo: &DemoConfig) -> Result<(), ConfigError> {
+    if demo.min_signers < 2 {
+        return Err(invalid("demo.min_signers", "must be at least 2"));
+    }
+    if demo.max_signers == 0 {
+        return Err(invalid("demo.max_signers", "must be greater than zero"));
+    }
+    if demo.min_signers > demo.max_signers {
+        return Err(invalid(
+            "demo.min_signers",
+            format!("must not exceed demo.max_signers ({})", demo.max_signers),
+        ));
+    }
+    let last_port = u32::from(demo.base_port) + u32::from(demo.max_signers) - 1;
+    if last_port > u32::from(u16::MAX) {
+        return Err(invalid(
+            "demo.base_port",
+            format!(
+                "with demo.max_signers = {}, the final fixture port {last_port} exceeds 65535",
+                demo.max_signers
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_http(http: &HttpConfig) -> Result<(), ConfigError> {
+    http.bind_address
+        .parse::<std::net::IpAddr>()
+        .map_err(|e| invalid("http.bind_address", format!("must be an IP address: {e}")))?;
+    if http.listen_port == Some(0) {
+        return Err(invalid(
+            "http.listen_port",
+            "must be between 1 and 65535; port 0 is ephemeral and cannot be advertised",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_health(health: &HealthConfig) -> Result<(), ConfigError> {
+    let addr = health.bind.parse::<std::net::SocketAddr>().map_err(|e| {
+        invalid(
+            "health.bind",
+            format!("must be an address:port socket address: {e}"),
+        )
+    })?;
+    if addr.port() == 0 {
+        return Err(invalid(
+            "health.bind",
+            "must use a fixed port, not ephemeral port 0",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_backend_url(key: &str, raw: Option<&str>) -> Result<(), ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let url = url::Url::parse(raw)
+        .map_err(|e| invalid(key, format!("must be an absolute HTTP(S) URL: {e}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(invalid(key, "scheme must be http or https"));
+    }
+    if url.host_str().is_none() {
+        return Err(invalid(key, "must include a host"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid(key, "must not contain a query or fragment"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid(
+            key,
+            "must not contain credentials; use bitcoin.rpc_user and bitcoin.rpc_pass for RPC authentication",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_config_locator(cardano: &CardanoConfig) -> Result<(), ConfigError> {
+    let locator = [
+        ("cardano.config_address", cardano.config_address.as_deref()),
+        (
+            "cardano.config_nft_policy_id",
+            cardano.config_nft_policy_id.as_deref(),
+        ),
+        (
+            "cardano.config_nft_asset_name",
+            cardano.config_nft_asset_name.as_deref(),
+        ),
+    ];
+    let configured = locator.iter().filter(|(_, value)| value.is_some()).count();
+    if configured != 0 && configured != locator.len() {
+        let missing: Vec<&str> = locator
+            .iter()
+            .filter_map(|(key, value)| value.is_none().then_some(*key))
+            .collect();
+        return Err(invalid(
+            "cardano Config locator",
+            format!(
+                "set all three fields or none; missing {}",
+                missing.join(", ")
+            ),
+        ));
+    }
+    if configured == 0 {
+        return Ok(());
+    }
+
+    let address = cardano
+        .config_address
+        .as_deref()
+        .expect("all locator fields set");
+    let parsed = pallas_addresses::Address::from_bech32(address).map_err(|e| {
+        invalid(
+            "cardano.config_address",
+            format!("is not a bech32 address: {e}"),
+        )
+    })?;
+    let pallas_addresses::Address::Shelley(shelley) = parsed else {
+        return Err(invalid(
+            "cardano.config_address",
+            "must be a Shelley address",
+        ));
+    };
+    let address_mainnet = matches!(shelley.network(), pallas_addresses::Network::Mainnet);
+    let configured_mainnet = cardano.is_mainnet().map_err(ConfigError::Invalid)?;
+    if address_mainnet != configured_mainnet {
+        return Err(invalid(
+            "cardano.config_address",
+            format!(
+                "is {}, but cardano.network selects {}",
+                if address_mainnet {
+                    "mainnet"
+                } else {
+                    "a testnet"
+                },
+                if configured_mainnet {
+                    "mainnet"
+                } else {
+                    "a testnet"
+                }
+            ),
+        ));
+    }
+
+    let policy = hex::decode(
+        cardano
+            .config_nft_policy_id
+            .as_deref()
+            .expect("all locator fields set"),
+    )
+    .map_err(|e| invalid("cardano.config_nft_policy_id", format!("must be hex: {e}")))?;
+    if policy.len() != 28 {
+        return Err(invalid(
+            "cardano.config_nft_policy_id",
+            format!(
+                "must be exactly 28 bytes (56 hex characters), got {} bytes",
+                policy.len()
+            ),
+        ));
+    }
+
+    let asset_name = hex::decode(
+        cardano
+            .config_nft_asset_name
+            .as_deref()
+            .expect("all locator fields set"),
+    )
+    .map_err(|e| invalid("cardano.config_nft_asset_name", format!("must be hex: {e}")))?;
+    if asset_name != crate::cardano::config_params::CONFIG_NFT_ASSET_NAME {
+        return Err(invalid(
+            "cardano.config_nft_asset_name",
+            format!(
+                "must be the protocol Config NFT name {} (hex {})",
+                String::from_utf8_lossy(crate::cardano::config_params::CONFIG_NFT_ASSET_NAME),
+                hex::encode(crate::cardano::config_params::CONFIG_NFT_ASSET_NAME)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bifrost(bifrost: &BifrostConfig) -> Result<(), ConfigError> {
+    if let Some(url) = bifrost.url.as_deref() {
+        crate::cardano::roster::validate_bifrost_url(url).map_err(|e| invalid("bifrost.url", e))?;
+    }
+    Ok(())
+}
+
+fn validate_federation(federation: &FederationConfig) -> Result<(), ConfigError> {
+    if federation.min_signers.is_some() || !federation.members.is_empty() {
+        crate::federation::roster::FederationRoster::from_config(federation)
+            .map_err(|e| invalid("federation", e))?;
+    }
+    Ok(())
+}
+
+fn validate_bitcoin_inputs(bitcoin: &BitcoinConfig) -> Result<(), ConfigError> {
+    if bitcoin.fee_rate_sat_per_vb == 0 {
+        return Err(invalid(
+            "bitcoin.fee_rate_sat_per_vb",
+            "must be greater than zero",
+        ));
+    }
+    if bitcoin.federation_csv_blocks == Some(0) {
+        return Err(invalid(
+            "bitcoin.federation_csv_blocks",
+            "must be greater than zero",
+        ));
+    }
+    if bitcoin.pegin_refund_timeout_blocks == Some(0) {
+        return Err(invalid(
+            "bitcoin.pegin_refund_timeout_blocks",
+            "must be greater than zero",
+        ));
+    }
+    if let (Some(refund), Some(csv)) = (
+        bitcoin.pegin_refund_timeout_blocks,
+        bitcoin.federation_csv_blocks,
+    ) && u32::from(refund) <= csv
+    {
+        return Err(invalid(
+            "bitcoin.pegin_refund_timeout_blocks",
+            format!(
+                "must exceed bitcoin.federation_csv_blocks ({csv}) so the federation can sweep first"
+            ),
+        ));
+    }
+    if let Some(seed) = bitcoin.y_fed_seed_hex.as_deref().map(str::trim)
+        && !seed.is_empty()
+    {
+        crate::cardano::federation::keypair_from_seed_hex(seed)
+            .map_err(|e| invalid("bitcoin.y_fed_seed_hex", e))?;
+    }
+    Ok(())
+}
+
 // ── Loading ─────────────────────────────────────────────────────────
 
 impl HeimdallConfig {
@@ -1045,9 +1345,42 @@ impl HeimdallConfig {
         let cfg: Self = doc
             .try_into()
             .map_err(|e| ConfigError::Parse(String::new(), e))?;
+        cfg.validate()?;
         cfg.refuse_test_flags_on_mainnet()?;
         cfg.refuse_ambiguous_wallet_key()?;
         Ok(cfg)
+    }
+
+    /// Validate values whose shape is independent of which command reads them.
+    ///
+    /// Deliberately does not require optional command-specific inputs such as a
+    /// wallet, a signing key or a provider credential: `show-roster` and the
+    /// air-gapped commands are valid without them.  It does reject a value that
+    /// is present but can never mean what its key promises.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.bitcoin
+            .parsed_network()
+            .map_err(ConfigError::Invalid)?;
+        self.cardano.is_mainnet().map_err(ConfigError::Invalid)?;
+        validate_protocol(&self.protocol)?;
+        validate_demo(&self.demo)?;
+        validate_http(&self.http)?;
+        validate_health(&self.health)?;
+        validate_backend_url(
+            "cardano.blockfrost_url",
+            self.cardano.blockfrost_url.as_deref(),
+        )?;
+        validate_backend_url("cardano.kupo_url", self.cardano.kupo_url.as_deref())?;
+        validate_backend_url("bitcoin.rpc_url", self.bitcoin.rpc_url.as_deref())?;
+        validate_config_locator(&self.cardano)?;
+        validate_bifrost(&self.bifrost)?;
+        validate_federation(&self.federation)?;
+        validate_bitcoin_inputs(&self.bitcoin)?;
+        if let Some(source) = self.cardano.stake_source.as_deref() {
+            crate::cardano::stake::StakeSource::from_config(Some(source))
+                .map_err(|e| invalid("cardano.stake_source", e))?;
+        }
+        Ok(())
     }
 
     /// Refuse a config that names BOTH a mnemonic and a payment key.
@@ -1145,8 +1478,12 @@ impl HeimdallConfig {
     /// it is Config #6, so the caller — which has already read the Config to get
     /// here — supplies it. `[0u8; 28]` is the mock/fixture value, where there is
     /// no bridge and nothing to scan for.
-    pub fn to_epoch_config(&self, identity: SpoIdentity, pegin_policy_id: [u8; 28]) -> EpochConfig {
-        EpochConfig {
+    pub fn to_epoch_config(
+        &self,
+        identity: SpoIdentity,
+        pegin_policy_id: [u8; 28],
+    ) -> Result<EpochConfig, String> {
+        Ok(EpochConfig {
             health: crate::health::HealthHandle::new(),
             tries_repair: None,
             dkg_round_timeout: Duration::from_secs(self.protocol.dkg_round_timeout_secs),
@@ -1157,7 +1494,7 @@ impl HeimdallConfig {
             dkg_reconcile_backoff: Duration::from_secs(self.protocol.dkg_reconcile_backoff_secs),
             poll_interval: Duration::from_millis(self.protocol.poll_interval_ms),
             retry_backoff_max: RETRY_BACKOFF_MAX,
-            bitcoin_network: self.bitcoin.parsed_network(),
+            bitcoin_network: self.bitcoin.parsed_network()?,
             identity,
             pegin_policy_id,
             // Carried so the machine can PUBLISH them in the handshake; the chain
@@ -1189,7 +1526,7 @@ impl HeimdallConfig {
             phase1_signer: None,
             // Demo-only; the harness/CLI sets this after building the config.
             inject_fault: None,
-        }
+        })
     }
 }
 
@@ -1266,6 +1603,8 @@ pub enum ConfigError {
     AmbiguousWalletKey(String),
     /// The document sets keys the bridge Config now publishes.
     RetiredKeys(Vec<RetiredKey>),
+    /// A configured value has a shape or relationship no command can use safely.
+    Invalid(String),
 }
 
 impl ConfigError {
@@ -1321,6 +1660,7 @@ impl std::fmt::Display for ConfigError {
                      `heimdall show-config-params` prints what this node resolves from the chain"
                 )
             }
+            Self::Invalid(why) => write!(f, "invalid configuration: {why}"),
         }
     }
 }
@@ -1450,9 +1790,12 @@ payment_skey_path = "/etc/heimdall/payment.skey"
             rendered.contains("PEG_OUT_FRESHNESS_MARGIN_MS"),
             "{rendered}"
         );
-        // The same key name under another section is NOT this key.
-        HeimdallConfig::from_toml_str("[cardano]\npegout_freshness_margin_ms = 1\n")
-            .expect("a stray key in another section is not the retired one");
+        // The same key name under another section is not a retired key, but it
+        // is still rejected: an unknown key must never be silently ignored.
+        let stray = HeimdallConfig::from_toml_str("[cardano]\npegout_freshness_margin_ms = 1\n")
+            .expect_err("unknown keys must be rejected")
+            .to_string();
+        assert!(stray.contains("pegout_freshness_margin_ms"), "{stray}");
     }
 
     /// A test-run flag must not be expressible on a bridge holding real funds, and
@@ -1488,7 +1831,7 @@ demo_live_stake = true
         // bypassable, and the failure is silent on a real-funds bridge.
         let err = HeimdallConfig::from_toml_str(&toml("Mainnet"))
             .expect_err("an unresolvable network must not open the gate");
-        assert!(err.to_string().contains("demo_live_stake"), "{err}");
+        assert!(err.to_string().contains("cardano.network"), "{err}");
     }
 
     /// The virtual epoch is refused on mainnet by the same rule, and for a
@@ -1523,10 +1866,7 @@ demo_virtual_epoch_slots = 86400
         // mainnet, never waved through.
         let err = HeimdallConfig::from_toml_str(&toml("Mainnet"))
             .expect_err("an unresolvable network must not open the gate");
-        assert!(
-            err.to_string().contains("demo_virtual_epoch_slots"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("cardano.network"), "{err}");
     }
 
     /// A cycle length nothing can run is refused at LOAD, not at the first
@@ -1551,6 +1891,86 @@ demo_virtual_epoch_slots = 86400
     fn a_config_without_the_retired_keys_loads() {
         let cfg = HeimdallConfig::from_toml_str("[cardano]\nnetwork = \"preprod\"\n").unwrap();
         assert_eq!(cfg.cardano.network.as_deref(), Some("preprod"));
+    }
+
+    #[test]
+    fn operator_input_errors_are_refused_at_config_load() {
+        for (name, toml, key) in [
+            (
+                "unknown key",
+                "[bifrost]\nur1 = \"https://spo.example\"\n",
+                "ur1",
+            ),
+            (
+                "unknown section",
+                "[bitcion]\nnetwork = \"mainnet\"\n",
+                "bitcion",
+            ),
+            (
+                "bitcoin network",
+                "[bitcoin]\nnetwork = \"mainett\"\n",
+                "bitcoin.network",
+            ),
+            (
+                "busy poll",
+                "[protocol]\npoll_interval_ms = 0\n",
+                "protocol.poll_interval_ms",
+            ),
+            (
+                "listener",
+                "[http]\nbind_address = \"not an address\"\n",
+                "http.bind_address",
+            ),
+            (
+                "backend URL",
+                "[cardano]\nblockfrost_url = \"blockfrost.example\"\nnetwork = \"preprod\"\n",
+                "cardano.blockfrost_url",
+            ),
+            (
+                "bifrost URL",
+                "[bifrost]\nurl = \"spo.example\"\n",
+                "bifrost.url",
+            ),
+            (
+                "stake source",
+                "[cardano]\nstake_source = \"somewhere\"\n",
+                "cardano.stake_source",
+            ),
+            (
+                "partial Config locator",
+                "[cardano]\nconfig_nft_policy_id = \"11\"\n",
+                "cardano Config locator",
+            ),
+            (
+                "demo threshold",
+                "[demo]\nmin_signers = 1\n",
+                "demo.min_signers",
+            ),
+            (
+                "federation seed",
+                "[bitcoin]\ny_fed_seed_hex = \"not hex\"\n",
+                "bitcoin.y_fed_seed_hex",
+            ),
+        ] {
+            let err = HeimdallConfig::from_toml_str(toml)
+                .expect_err(name)
+                .to_string();
+            assert!(err.contains(key), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn complete_current_config_locator_is_accepted() {
+        HeimdallConfig::from_toml_str(
+            r#"
+[cardano]
+network = "preprod"
+config_address = "addr_test1wrvvq6mstvqgnwx6xts6za2shsxn5nl20xv4pr37j4nf6yqgpyh9f"
+config_nft_policy_id = "d8c06b705b0089b8da32e1a17550bc0d3a4fea7999508e3e95669d10"
+config_nft_asset_name = "424946434647"
+"#,
+        )
+        .expect("the operator-guide Config locator is structurally valid");
     }
 
     /// Every config file COMMITTED to this repo must still load.
@@ -1599,16 +2019,18 @@ demo_virtual_epoch_slots = 86400
 
     /// …and the field that replaced them cannot be set from TOML at all: it is
     /// `#[serde(skip)]`, filled only from an authenticated Config datum. A file
-    /// that names it is ignored rather than honoured, so there is no back door
-    /// to the value every federation script hash derives from.
+    /// that names it is rejected, so there is no back door — or silent typo —
+    /// for the value every federation script hash derives from.
     #[test]
     fn the_federation_one_shot_cannot_come_from_a_file() {
         let toml = format!(
             "[cardano]\nfederation_one_shot = \"{}:7\"\n",
             "ab".repeat(32)
         );
-        let cfg = HeimdallConfig::from_toml_str(&toml).expect("an unknown key is not fatal");
-        assert_eq!(cfg.cardano.federation_one_shot, None);
+        let err = HeimdallConfig::from_toml_str(&toml)
+            .expect_err("the Config-published value cannot come from TOML")
+            .to_string();
+        assert!(err.contains("federation_one_shot"), "{err}");
     }
 
     #[test]
@@ -1726,14 +2148,17 @@ fee_rate_sat_per_vb = 5
     #[test]
     fn bitcoin_network_parsing() {
         let cfg = BitcoinConfig::default();
-        assert_eq!(cfg.parsed_network(), bitcoin::Network::Regtest);
+        assert_eq!(cfg.parsed_network(), Ok(bitcoin::Network::Regtest));
 
         let mut cfg2 = BitcoinConfig::default();
         cfg2.network = "mainnet".to_string();
-        assert_eq!(cfg2.parsed_network(), bitcoin::Network::Bitcoin);
+        assert_eq!(cfg2.parsed_network(), Ok(bitcoin::Network::Bitcoin));
 
         cfg2.network = "testnet4".to_string();
-        assert_eq!(cfg2.parsed_network(), bitcoin::Network::Testnet4);
+        assert_eq!(cfg2.parsed_network(), Ok(bitcoin::Network::Testnet4));
+
+        cfg2.network = "mainett".to_string();
+        assert!(cfg2.parsed_network().is_err());
     }
 
     #[test]
@@ -1745,7 +2170,7 @@ fee_rate_sat_per_vb = 5
             bifrost_id_pk: Vec::new(),
             port: 18500,
         };
-        let epoch = cfg.to_epoch_config(identity.clone(), [0u8; 28]);
+        let epoch = cfg.to_epoch_config(identity.clone(), [0u8; 28]).unwrap();
         let demo = EpochConfig::demo_default(identity);
 
         assert_eq!(epoch.dkg_round_timeout, demo.dkg_round_timeout);

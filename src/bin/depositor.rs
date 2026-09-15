@@ -176,7 +176,7 @@ fn run() -> Result<(), String> {
     let cli = Cli::parse();
 
     let cfg = HeimdallConfig::from_file(&cli.config).map_err(|e| e.to_string())?;
-    let network = cfg.bitcoin.parsed_network();
+    let network = cfg.bitcoin.parsed_network()?;
     let secp = Secp256k1::new();
     // Created here rather than at the first broadcast: resolving the deposit tree
     // from the chain is itself async, and that happens before anything is built.
