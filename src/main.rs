@@ -3164,20 +3164,38 @@ fn mock_chain_with_rpc(
 }
 
 /// The local HTTP bind port, from this node's OWN registered bifrost_url.
-/// Parses the URL properly (a naive `rsplit(':')` mishandles paths, IPv6
-/// hosts, and userinfo that the roster's URL validation accepts) and
-/// requires an explicit `:<port>` — peers fetching FROM a URL can rely on
-/// scheme defaults, but the node cannot guess which local port to serve on.
+///
+/// Parses the URL properly (a naive `rsplit(':')` mishandles paths, IPv6 hosts,
+/// and userinfo that the roster's URL validation accepts), and takes the
+/// SCHEME DEFAULT when the URL carries no `:<port>` — 443 for https, 80 for
+/// http. That is the port peers will fetch from, because a URL without one is
+/// exactly a URL on its scheme's default port; refusing it made `https://spo.example`
+/// — the clean address the guide tells an operator to register in front of nginx —
+/// a node that would not start, and the canonical form ELIDES `:443` and `:80`, so
+/// an operator who did type the port got the same refusal.
+///
+/// A privileged port cannot be bound by the unprivileged service user, so that
+/// case says what to do rather than failing at `bind` with `EACCES`.
 fn port_from_url(url: &str) -> Result<u16, String> {
-    url::Url::parse(url)
+    let port = url::Url::parse(url)
         .ok()
-        .and_then(|u| u.port())
+        .and_then(|u| u.port_or_known_default())
         .ok_or_else(|| {
             format!(
-                "this node's bifrost_url {url:?} has no explicit ':<port>' — the demo binds its \
-                 local HTTP server to that port, so register a URL ending in ':<port>'"
+                "this node's bifrost_url {url:?} names no port and its scheme has no default — \
+                 register an http(s) URL (with an explicit ':<port>' unless 80 or 443 is what \
+                 peers should use), or set [http] listen_port"
             )
-        })
+        })?;
+    if port < 1024 {
+        warn!(
+            "binding the privileged port {port} from bifrost_url {url:?}: the service user needs \
+             CAP_NET_BIND_SERVICE (systemd: AmbientCapabilities=CAP_NET_BIND_SERVICE) or this \
+             will fail. Behind a reverse proxy, set [http] listen_port instead and leave the \
+             registered URL as it is"
+        );
+    }
+    Ok(port)
 }
 
 /// Derive the bootstrap federation keypair from `bitcoin.y_fed_seed_hex`.
@@ -9313,7 +9331,7 @@ mod tests {
     use super::{
         MOVER_KEY_MISMATCH, cross_check_treasury, csv_depth_verdict, mover_key_mismatch_error,
         parse_cardano_outref, parse_hex_n, parse_key32, parse_treasury_override, pool_id_bech32,
-        ref_script_already_deployed, resolve_bifrost_url, treasury_script_verdict,
+        port_from_url, ref_script_already_deployed, resolve_bifrost_url, treasury_script_verdict,
     };
     use heimdall::config::HeimdallConfig;
 
@@ -9398,6 +9416,26 @@ mod tests {
         assert_eq!(parse_hex_n::<2>("a1b2", "x").unwrap(), [0xa1, 0xb2]);
         assert!(parse_hex_n::<2>("a1", "x").is_err());
         assert!(parse_hex_n::<2>("zz", "x").is_err());
+    }
+
+    /// A registered URL without `:<port>` is a URL on its scheme's default port,
+    /// and that is where peers will fetch — so the node serves there instead of
+    /// refusing to start. The canonical form elides `:443`/`:80`, so this is also
+    /// what an operator who DID type the port ends up registering.
+    #[test]
+    fn the_listen_port_falls_back_to_the_scheme_default() {
+        for (url, expected) in [
+            ("http://spo.example:18500", 18500),
+            ("https://spo.example:18500", 18500),
+            ("https://spo.example", 443),
+            ("http://spo.example", 80),
+            ("https://spo.example/heimdall", 443),
+            ("http://[2001:db8::1]:18500", 18500),
+        ] {
+            assert_eq!(port_from_url(url), Ok(expected), "{url}");
+        }
+        let err = port_from_url("not a url").expect_err("an unparseable URL has no port");
+        assert!(err.contains("listen_port"), "{err}");
     }
 
     #[test]
