@@ -115,8 +115,12 @@ pub struct NodeState {
     /// for each: a version or blueprint difference wants an upgrade, a settings
     /// difference (`demo_live_stake`, `demo_virtual_epoch_slots`) wants the
     /// setting matched across the roster, and a bare derived-threshold
-    /// difference wants nothing done — it is `live_stake` drift and clears at
-    /// the next ceremony entry.
+    /// difference wants nothing done — two nodes read the registry or stake at
+    /// different moments (a pool registering mid-epoch, or `live_stake` drift),
+    /// and it clears once both re-derive, at the latest at the next epoch.
+    ///
+    /// Holds the latest pre-ceremony gate's exclusions only: it is reset at each
+    /// ceremony entry, so an entry here is current, not history.
     ///
     /// Here because it is the one problem that is INVISIBLE from the excluded
     /// node's chain state: it is registered, unbanned, reachable, and simply not

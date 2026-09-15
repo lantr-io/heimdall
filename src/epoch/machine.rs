@@ -70,7 +70,7 @@ use crate::epoch::state::{
 use crate::epoch::traits::PeginKeyOrigin;
 use crate::epoch::traits::{CardanoChain, Clock, PeerNetwork, RngSource};
 use crate::frost::xonly::group_xonly;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Run the epoch state machine for one full cycle and return the
 /// witnessed `TreasuryMovement` once the cycle reaches `RecordMovement`.
@@ -2080,14 +2080,16 @@ async fn epoch_start_phase(
     let mut ctx = if incompatible.is_empty() {
         ctx
     } else {
-        match ctx.without(&incompatible) {
+        match ctx.without(&incompatible.keys().copied().collect()) {
             Some(narrowed) => {
                 crate::epoch_warn!(
                     me,
                     epoch,
-                    "  candidate set reduced to {} of {} by software mismatch; t is now {}",
+                    "  candidate set reduced to {} of {} at the pre-ceremony handshake ({}); \
+                     t is now {}",
                     narrowed.participants.len(),
                     ctx.participants.len(),
+                    crate::http::compat::exclusion_causes(incompatible.values().copied()),
                     narrowed.threshold,
                 );
                 // The gate changed `t`. Republish it, or this node advertises the
@@ -2105,11 +2107,9 @@ async fn epoch_start_phase(
                     attempt: ctx.attempt,
                     eligible: ctx.participants.len(),
                     qualified: ctx.participants.len().saturating_sub(incompatible.len()),
-                    reason: format!(
-                        "{} of {} candidates run an incompatible build, leaving too few to run \
-                         a ceremony — upgrade the lagging nodes",
-                        incompatible.len(),
-                        ctx.participants.len()
+                    reason: crate::http::compat::exclusion_summary(
+                        incompatible.values().copied(),
+                        ctx.participants.len(),
                     ),
                 });
             }
@@ -2208,8 +2208,8 @@ fn own_node_facts(
 }
 
 /// Poll every roster peer's `/health` until all answer or `dkg_join_wait`
-/// elapses (N21), and return the peers whose BUILD is incompatible with ours
-/// (WI-067).
+/// elapses (N21), and return the peers that are incompatible with ours (WI-067),
+/// each with the kind of mismatch that excluded it.
 ///
 /// Never fails on reachability: proceeding without a peer is always legal — the
 /// ceremony's quorum gate decides viability, and this gate only makes the happy
@@ -2232,7 +2232,7 @@ async fn wait_for_roster_health(
     ctx: &crate::cardano::dkg_roster::DkgContext,
     config: &EpochConfig,
     me: frost::Identifier,
-) -> BTreeSet<frost::Identifier> {
+) -> BTreeMap<frost::Identifier, crate::http::compat::Mismatch> {
     use crate::http::compat::Compatibility;
 
     let own = own_node_facts(config, ctx);
@@ -2241,47 +2241,76 @@ async fn wait_for_roster_health(
     let poll = config
         .poll_interval
         .max(std::time::Duration::from_millis(200));
-    let mut incompatible: BTreeSet<frost::Identifier> = BTreeSet::new();
+    // The LATEST verdict per peer, not the first: the loop keeps polling while
+    // any peer is down, and a peer that disagreed on one poll (a threshold read
+    // a moment before ours) and agrees on the next is not excluded for it.
+    let mut incompatible: BTreeMap<frost::Identifier, (crate::http::compat::Mismatch, String)> =
+        BTreeMap::new();
+    // `/health` lists THIS gate's exclusions only. Without the reset it keeps
+    // every exclusion since the process started — including threshold ones that
+    // cleared epochs ago — and an operator cannot tell a live one from history.
+    config.health.update(|h| h.excluded_peers.clear());
+    let verdicts = |incompatible: &BTreeMap<_, (crate::http::compat::Mismatch, String)>| {
+        incompatible
+            .iter()
+            .map(|(id, (kind, _))| (*id, *kind))
+            .collect::<BTreeMap<_, _>>()
+    };
     loop {
         let mut down = Vec::new();
+        let mut changed = false;
         for info in roster.participants.values() {
             if info.identifier == me {
                 continue;
             }
             let health = peers.check_health(info).await;
             if !health.reachable {
+                // No new answer, so the last verdict on it stands.
                 down.push(crate::epoch::log::id_short(info.identifier));
                 continue;
             }
-            // Logged ONCE per peer per gate, not per poll: the loop can turn
-            // every 200 ms and this is the line an operator has to find.
-            if let Compatibility::Incompatible { reason } = health.compatibility(own)
-                && incompatible.insert(info.identifier)
+            let Compatibility::Incompatible { kind, reason } = health.compatibility(own) else {
+                changed |= incompatible.remove(&info.identifier).is_some();
+                continue;
+            };
+            // Logged once per peer per distinct reason, not per poll: the loop
+            // can turn every 200 ms and this is the line an operator has to find.
+            if incompatible
+                .get(&info.identifier)
+                .is_some_and(|(_, logged)| *logged == reason)
             {
-                crate::epoch_warn!(
-                    me,
-                    ctx.epoch,
-                    "  ⚠ EXCLUDING spo={} from the ceremony: {reason}. It is running and \
-                     reachable — this is a disagreement, not an outage. Both sides log this, \
-                     so that operator sees the same line from its own node. The reason says \
-                     what to change: a version or blueprint difference needs an upgrade, a \
-                     settings difference needs the setting matched, and a bare threshold \
-                     difference resolves at the next ceremony entry.",
-                    crate::epoch::log::id_short(info.identifier),
-                );
-                // Also on the operator surface: this is the one failure invisible
-                // from the excluded node's chain state — registered, unbanned,
-                // reachable, and simply not being talked to.
-                let line = format!(
-                    "spo={}: {reason}",
-                    crate::epoch::log::id_short(info.identifier)
-                );
-                config.health.update(|h| h.excluded_peers.push(line));
+                continue;
             }
+            crate::epoch_warn!(
+                me,
+                ctx.epoch,
+                "  ⚠ EXCLUDING spo={} from the ceremony: {reason}. It is running and \
+                 reachable — this is a disagreement, not an outage. Both sides log this, \
+                 so that operator sees the same line from its own node. The reason says \
+                 what to change: a version or blueprint difference needs an upgrade, a \
+                 settings difference needs the setting matched, and a bare threshold \
+                 difference needs nothing — it clears once both nodes re-derive, at the \
+                 latest at the next epoch.",
+                crate::epoch::log::id_short(info.identifier),
+            );
+            incompatible.insert(info.identifier, (kind, reason));
+            changed = true;
+        }
+        if changed {
+            // Also on the operator surface: this is the one failure invisible
+            // from the excluded node's chain state — registered, unbanned,
+            // reachable, and simply not being talked to.
+            let lines: Vec<String> = incompatible
+                .iter()
+                .map(|(id, (_, reason))| {
+                    format!("spo={}: {reason}", crate::epoch::log::id_short(*id))
+                })
+                .collect();
+            config.health.update(|h| h.excluded_peers = lines);
         }
         if down.is_empty() {
             crate::epoch_log!(me, ctx.epoch, "health gate: full roster reachable");
-            return incompatible;
+            return verdicts(&incompatible);
         }
         if tokio::time::Instant::now() >= deadline {
             crate::epoch_warn!(
@@ -2291,7 +2320,7 @@ async fn wait_for_roster_health(
                 down,
                 config.dkg_join_wait
             );
-            return incompatible;
+            return verdicts(&incompatible);
         }
         // Per-poll, and `poll` can be 200ms — at info this drowns the join. Both
         // ways out of the loop log (reachable → info, deadline → warn), so the
@@ -7257,7 +7286,7 @@ mod tests {
         let mut config = fast_config(me);
         config.dkg_join_wait = Duration::from_millis(50);
         let out = wait_for_roster_health(&peers, &ctx, &config, me).await;
-        out.iter()
+        out.keys()
             .map(|id| {
                 ctx.participants
                     .iter()
@@ -7359,7 +7388,7 @@ mod tests {
                     == Some(2)
             })
             .map(|p| p.identifier)
-            .collect::<BTreeSet<_>>();
+            .collect::<std::collections::BTreeSet<_>>();
         let narrowed = ctx
             .without(&out)
             .expect("two of three still run a ceremony");
@@ -7367,6 +7396,105 @@ mod tests {
         assert_eq!(
             narrowed.attempt, ctx.attempt,
             "an exclusion before publishing must not spend an attempt"
+        );
+    }
+
+    /// The gate hands each excluded peer's KIND to the caller, which is what the
+    /// abort's cause clause is built from — a threshold-only exclusion must reach
+    /// it as `Threshold`, or the operator is told to upgrade again.
+    #[tokio::test]
+    async fn the_gate_reports_the_kind_of_each_exclusion() {
+        use crate::http::compat::Mismatch;
+
+        let fixture = movable_fixture(2, 3, 19_990, 1);
+        let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+        let ctx = chain.query_dkg_context(0, 0).await.expect("ctx");
+        let hub = crate::epoch::mocks::MockPeerHub::new();
+        let id = |i: u16| Identifier::try_from(i).unwrap();
+        hub.set_build(id(2), build_of("9.9.9"));
+        hub.set_build(
+            id(3),
+            crate::http::compat::PeerBuild {
+                dkg_threshold_epoch: Some(ctx.epoch),
+                threshold: Some(ctx.threshold + 1),
+                ..build_of(crate::http::compat::own_version())
+            },
+        );
+        let me = id(1);
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub));
+        let mut config = fast_config(me);
+        config.dkg_join_wait = Duration::from_millis(50);
+
+        let out = wait_for_roster_health(&peers, &ctx, &config, me).await;
+        assert_eq!(
+            out,
+            BTreeMap::from([(id(2), Mismatch::Build), (id(3), Mismatch::Threshold)])
+        );
+        let s = crate::http::compat::exclusion_summary(out.values().copied(), 3);
+        assert!(s.contains("1 on an incompatible build"), "{s}");
+        assert!(s.contains("1 derived a different FROST threshold"), "{s}");
+    }
+
+    /// A peer that disagrees on one poll and agrees on the next is not excluded:
+    /// the gate keeps polling while any peer is down, and the verdict it acts on
+    /// is the latest. `/health` lists only what is still excluded, and nothing
+    /// from before this gate.
+    #[tokio::test]
+    async fn the_gate_acts_on_the_latest_verdict_and_resets_the_health_list() {
+        let fixture = movable_fixture(2, 3, 19_990, 1);
+        let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture.clone()));
+        let ctx = chain.query_dkg_context(0, 0).await.expect("ctx");
+        let hub = crate::epoch::mocks::MockPeerHub::new();
+        let id = |i: u16| Identifier::try_from(i).unwrap();
+        let agreeing = build_of(crate::http::compat::own_version());
+        hub.set_build(
+            id(2),
+            crate::http::compat::PeerBuild {
+                dkg_threshold_epoch: Some(ctx.epoch),
+                threshold: Some(ctx.threshold + 1),
+                ..agreeing.clone()
+            },
+        );
+        // Peer 3 stays down, so the gate polls until its deadline.
+        hub.set_online(id(1));
+        hub.set_online(id(2));
+        let me = id(1);
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(me, hub.clone()));
+        let mut config = fast_config(me);
+        config.dkg_join_wait = Duration::from_millis(1_500);
+        config.health.update(|h| {
+            h.excluded_peers
+                .push("spo=old: from an earlier epoch".into())
+        });
+
+        let flip = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                hub.set_build(id(2), agreeing);
+            })
+        };
+        let seen_mid_gate = {
+            let health = config.health.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                health.snapshot().excluded_peers
+            })
+        };
+        let out = wait_for_roster_health(&peers, &ctx, &config, me).await;
+        flip.await.unwrap();
+
+        let mid = seen_mid_gate.await.unwrap();
+        assert_eq!(
+            mid.len(),
+            1,
+            "while it disagrees it is listed, alone: {mid:?}"
+        );
+        assert!(!mid[0].contains("earlier epoch"), "{mid:?}");
+        assert!(out.is_empty(), "it agreed by the end of the gate: {out:?}");
+        assert!(
+            config.health.snapshot().excluded_peers.is_empty(),
+            "and /health no longer lists it"
         );
     }
 

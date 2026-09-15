@@ -1124,7 +1124,7 @@ mod tests {
 
         // Symmetric: each excludes the other, so the two never enter one ceremony.
         for (health, own) in [(&h2, facts1), (&h1, facts2)] {
-            let Compatibility::Incompatible { reason } = health.compatibility(own) else {
+            let Compatibility::Incompatible { reason, .. } = health.compatibility(own) else {
                 panic!("a live_stake mismatch must be incompatible");
             };
             assert!(reason.contains("demo_live_stake"), "{reason}");
@@ -1160,7 +1160,7 @@ mod tests {
 
         let peer2 = peer_info(2, &pool2, &url2, &pk2);
         let health = net1.check_health(&peer2).await;
-        let Compatibility::Incompatible { reason } = health.compatibility(mine) else {
+        let Compatibility::Incompatible { reason, .. } = health.compatibility(mine) else {
             panic!("a virtual-epoch mismatch must be incompatible");
         };
         assert!(reason.contains("86400"), "{reason}");
