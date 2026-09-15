@@ -24,6 +24,11 @@ pub struct HeimdallConfig {
     pub bifrost: BifrostConfig,
     pub federation: FederationConfig,
     pub log: LogConfig,
+    /// Retired keys this file still sets with the one value that means what
+    /// heimdall does anyway — accepted, and reported as a line to delete. Filled
+    /// by [`HeimdallConfig::from_toml_str`], never from TOML.
+    #[serde(skip)]
+    pub tolerated_retired_keys: Vec<String>,
 }
 
 impl Default for HeimdallConfig {
@@ -38,6 +43,7 @@ impl Default for HeimdallConfig {
             bifrost: BifrostConfig::default(),
             federation: FederationConfig::default(),
             log: LogConfig::default(),
+            tolerated_retired_keys: Vec::new(),
         }
     }
 }
@@ -1010,7 +1016,49 @@ const RETIRED_KEYS: &[RetiredKey] = &[
          bridge publishes, and every SPO must step through the roster together. A per-operator \
          timeout would have each node decide on its own when its turn began (WI-104)",
     ),
+    (
+        "cardano",
+        "oracle_constructor",
+        "nothing — a treasury movement is always posted as an UnconfirmedTm record \
+         (constructor 0) and a watchtower confirms it; no other value was ever honoured",
+    ),
 ];
+
+/// Retired keys ACCEPTED when set to the single value that matches what heimdall
+/// does anyway, as `(section, key, value, note)`. Any other value falls through
+/// to [`RETIRED_KEYS`] and is refused.
+///
+/// This exists for upgrades, not for convenience. `deploy/debian/heimdall.toml`
+/// is a dpkg conffile, and every packaged release up to `v0.1-M5.5` shipped it
+/// with `oracle_constructor = 0` — a key the code had already dropped, harmless
+/// while unknown keys were ignored. Once they are refused, an operator who edited
+/// that file (all of them: it holds their Config locator) keeps their copy
+/// through a package upgrade, and the node would not start. The value is the
+/// one that is in force, so accepting it does not leave anyone believing a
+/// setting they typed is honoured — which is the reason retired keys are refused.
+const TOLERATED_RETIRED_KEYS: &[(&str, &str, i64, &str)] = &[(
+    "cardano",
+    "oracle_constructor",
+    0,
+    "[cardano].oracle_constructor = 0 is a retired key: a treasury movement is always posted \
+     as an UnconfirmedTm record (constructor 0), so it changes nothing. Delete the line — a \
+     later release may refuse it, and any other value is refused already",
+)];
+
+/// Remove the tolerated retired keys from `doc`, returning the note for each.
+fn take_tolerated_retired_keys(doc: &mut toml::Value) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (section, key, value, note) in TOLERATED_RETIRED_KEYS {
+        let Some(table) = doc.get_mut(*section).and_then(toml::Value::as_table_mut) else {
+            continue;
+        };
+        if table.get(*key).and_then(toml::Value::as_integer) == Some(*value) {
+            table.remove(*key);
+            notes.push((*note).to_string());
+        }
+    }
+    notes
+}
 
 /// The retired keys this document still sets, in the order listed above.
 fn retired_keys_in(doc: &toml::Value) -> Vec<RetiredKey> {
@@ -1338,15 +1386,17 @@ impl HeimdallConfig {
     /// that silently does nothing leaves the operator believing a value they
     /// typed is in force, which is the same failure in a quieter form.
     pub fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
-        let doc: toml::Value =
+        let mut doc: toml::Value =
             toml::from_str(contents).map_err(|e| ConfigError::Parse(String::new(), e))?;
+        let tolerated = take_tolerated_retired_keys(&mut doc);
         let retired = retired_keys_in(&doc);
         if !retired.is_empty() {
             return Err(ConfigError::RetiredKeys(retired));
         }
-        let cfg: Self = doc
+        let mut cfg: Self = doc
             .try_into()
             .map_err(|e| ConfigError::Parse(String::new(), e))?;
+        cfg.tolerated_retired_keys = tolerated;
         cfg.validate()?;
         cfg.refuse_test_flags_on_mainnet()?;
         cfg.refuse_ambiguous_wallet_key()?;
@@ -1990,12 +2040,43 @@ config_nft_asset_name = "424946434647"
             "heimdall.localdkg.toml",
             "heimdall.testnet4.toml",
             "deploy/debian/heimdall.toml",
+            // What an operator who installed the last packaged release still has
+            // on disk: dpkg keeps an edited conffile across the upgrade.
+            "tests/fixtures/config/debian-heimdall-v0.1-M5.5.toml",
         ] {
             let path = root.join(rel);
             let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel}: {e}"));
             HeimdallConfig::from_toml_str(&text)
                 .unwrap_or_else(|e| panic!("{rel} does not load:\n{e}"));
         }
+    }
+
+    /// The packaged template's `oracle_constructor = 0` loads, and says to delete
+    /// it; any other value is refused, because it would mean a posting mode
+    /// heimdall does not have.
+    #[test]
+    fn the_packaged_oracle_constructor_is_tolerated_only_at_zero() {
+        let cfg = HeimdallConfig::from_toml_str("[cardano]\noracle_constructor = 0\n")
+            .expect("the value every packaged release shipped must still load");
+        assert_eq!(cfg.tolerated_retired_keys.len(), 1);
+        assert!(
+            cfg.tolerated_retired_keys[0].contains("Delete the line"),
+            "{:?}",
+            cfg.tolerated_retired_keys
+        );
+
+        let err = HeimdallConfig::from_toml_str("[cardano]\noracle_constructor = 1\n")
+            .expect_err("a value that was never honoured must be refused")
+            .to_string();
+        assert!(err.contains("oracle_constructor"), "{err}");
+        assert!(err.contains("UnconfirmedTm"), "{err}");
+
+        assert!(
+            HeimdallConfig::from_toml_str("[cardano]\n")
+                .unwrap()
+                .tolerated_retired_keys
+                .is_empty()
+        );
     }
 
     /// WI-090: all three bootstrap outrefs are refused, each naming Config #12.

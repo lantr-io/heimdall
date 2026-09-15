@@ -1,0 +1,389 @@
+# /etc/heimdall/heimdall.toml — heimdall SPO daemon configuration.
+#
+# Installed 0640 root:heimdall and tracked by dpkg as a conffile: your edits
+# survive package upgrades, and a changed shipped default is offered as a merge
+# rather than applied silently.
+#
+# Everything that identifies THIS BRIDGE is commented out below, because there is
+# no sane default for it — the values come from whoever deployed the bridge you
+# are joining. The daemon exits with a message naming the missing key rather than
+# guessing, so uncomment as you go.
+#
+# SECRETS: the wallet key never belongs in this file. Point
+# cardano.payment_skey_path at a 0600 key file, or keep a mnemonic in
+# /etc/default/heimdall as $HEIMDALL_MNEMONIC (see the wallet section below).
+#
+# After editing:  heimdall run-spo --config /etc/heimdall/heimdall.toml --check
+# to run every startup check and exit, then `systemctl enable --now heimdall`.
+
+
+[protocol]
+# REQUIRED, and enforced: the daemon REFUSES TO START without it. Holds the
+# per-epoch DKG signing share (0600) so it survives a restart, and the
+# completed-peg-outs trie (cpo-trie.json). Left unset the trie is rebuilt EMPTY
+# on every start, so a bridge that has already paid a peg-out would read it as
+# unpaid and pay it again — which is why this is a refusal and not a warning.
+# The package creates this directory 0700.
+state_dir = "/var/lib/heimdall"
+
+# Poll cadence for the chain-watching loops (ms).
+poll_interval_ms = 5000
+
+# There is no peg-out freshness margin to set here any more (WI-071). It decided
+# which requests enter a batch, so it decided the TM bytes — two operators on
+# different values freeze different peg-out sets and their FROST round never
+# converges, with neither log able to say why. "MUST be identical on every SPO"
+# was a warning label where a constant belonged; it is now compiled in, and a
+# config still setting it is refused at load.
+
+
+[bitcoin]
+# The Bitcoin network this bridge settles on: "mainnet", "testnet4", "signet",
+# "regtest". Must match the bridge you are joining.
+#network = "testnet4"
+
+# Federation identity — LEAVE BOTH UNSET on a bridge with an on-chain registry.
+#
+# They feed the treasury address every SPO must derive identically, so they used
+# to be copied from the bridge's deployment notes into every operator's config,
+# with a wrong value producing no error at all — just a well-formed address nobody
+# else uses. They are published in the bridge's treasury_info datum, which
+# heimdall finds from the Config NFT alone, and startup check 9 prints which
+# source it used.
+#
+# Set them ONLY for a deployment with no readable treasury_info (the fixture-roster
+# demo). There they are mandatory: heimdall refuses to start without them, because
+# an input to the treasury address has no safe default.
+#
+# y_fed_seed_hex is a SPENDING SECRET, not an identifier: it signs the treasury's
+# federation recovery path, which is why the chain carries only the derived public
+# key. It is the SINGLE-KEY federation — one seed, one holder, who can sweep the
+# whole treasury alone once the CSV delay passes. A federation formed by the
+# ceremony ([federation] below) leaves it unset: each member holds a SHARE of
+# federation_setup_Y, under protocol.state_dir, and no member can spend alone.
+#
+# Setting both is refused. They are different keys locking different treasuries,
+# so nothing can tell which one is this bridge's.
+#
+# Leaving these commented out is the normal case. Setting either to "" counts as
+# unset, not as an empty value.
+#y_fed_seed_hex = ""
+#federation_csv_blocks = 144
+
+# NO BITCOIN NODE IS REQUIRED, and heimdall cannot use one. It posts Treasury
+# Movements to Cardano; the watchtowers relay them to Bitcoin, which is what the
+# UnconfirmedTm record carries the signed transaction FOR. There is no setting
+# that changes this — `bitcoin.submit` was removed and is now REFUSED, because a
+# second broadcaster was never redundancy, only a way to move BTC that Cardano has
+# no record of.
+#
+# The keys below are read by the `depositor` tool alone, which needs to READ the
+# UTxO set to choose funding inputs. An SPO leaves them unset.
+#rpc_url = "http://127.0.0.1:8332"
+#rpc_user = ""
+#rpc_pass = ""
+
+
+# [federation] — ONLY for the people STANDING A BRIDGE UP. An SPO joining an
+# existing bridge leaves this out entirely: the federation key is already formed
+# and published at Config #11, and joining does not make you a member of it.
+#
+# This is the one participant list heimdall does not read from a chain, and it
+# cannot be: the key it produces (federation_setup_Y) is an input to genesis — the
+# treasury address the genesis anchor is funded at derives from it — so it exists
+# before the bridge does. There is no registry to enumerate, no ban list to filter
+# by, no stake to weight. Genesis publishes the key as Config #11, and from then
+# on it is y_federation and every node reads it from the chain; the setup name
+# marks the one window in which a local copy is the source.
+#
+# Every member's config carries the IDENTICAL block: the same members (order is
+# irrelevant — they are numbered by key) and the same min_signers. `heimdall
+# bifrost-id` prints the numbering and a digest to compare with the others, and a
+# member running a different threshold is named during the ceremony rather than
+# stalling it. Then every member runs `heimdall federation-dkg`, which waits for
+# all of them.
+#
+# min_signers has NO DEFAULT on purpose: it is baked into the key at generation, so
+# changing it later means a new key, a new treasury address and moving the funds.
+# Use n-1 unless you have a reason not to — one dark member must not brick the path
+# that exists because members go dark. A value at or below n/2 is accepted but
+# warned about: a minority could then move the whole treasury after the CSV delay.
+#
+# See docs/operator-guide.md, "Forming the initial federation".
+#[federation]
+#min_signers = 4
+#members = [
+#  { bifrost_id_pk = "<64 hex>", bifrost_url = "https://spo1.example.com" },
+#  { bifrost_id_pk = "<64 hex>", bifrost_url = "https://spo2.example.com" },
+#]
+
+
+[cardano]
+# ── Operator identity — these are about YOU, not the bridge ──────────────────
+
+# Blockfrost project id for the network above. Required: it is how the daemon
+# reads Cardano.
+#blockfrost_project_id = ""
+
+# Self-hosted Blockfrost-compatible endpoint — a Dolos in front of your own
+# cardano-node, which is the shape an SPO should prefer: heimdall -> Dolos ->
+# your node, with no third party between you and the chain. Covers reads and
+# transaction submission alike. Leave unset for hosted Blockfrost.
+#blockfrost_url = "http://localhost:3000/api/v0"
+
+# Which Cardano network this node is on: mainnet | preprod | preview | testnet.
+#
+# REQUIRED once blockfrost_url is set, and the daemon refuses to start without
+# it. Hosted Blockfrost encodes the network in the project id, so it can be
+# inferred there; a local backend has no such prefix, and guessing "testnet" on
+# a mainnet machine would derive every script address with the wrong bech32
+# prefix and let the fault-proof safety gate fail open.
+#network = "mainnet"
+
+# The wallet that pays fees and holds this SPO's registration deposit. TWO ways
+# to give heimdall its key, and EXACTLY ONE must be set — both is refused at
+# startup, because choosing by precedence would mean signing from an address
+# you were not expecting.
+#
+# (a) PREFERRED — the cardano-cli key you already run the pool with. The path
+#     is not a secret; the file is, so heimdall refuses it unless it is 0600.
+#     The address is required alongside it: a signing key does not say where
+#     the funds are, and yours are almost certainly at the base address built
+#     from payment.vkey AND stake.vkey. heimdall checks the two are a pair.
+#payment_skey_path = "/etc/heimdall/payment.skey"
+#wallet_address = "addr_test1q..."
+#
+# (b) A BIP-39 mnemonic. Leave this key commented and put the seed in
+#     /etc/default/heimdall as $HEIMDALL_MNEMONIC: heimdall falls back to the
+#     environment only when this key is absent, so uncommenting it here
+#     DISABLES the variable. Left commented, the seed never enters a
+#     dpkg-tracked file.
+#mnemonic = ""
+
+# Path to this pool's Ed25519 COLD signing key, used by `register-spo` (and
+# revocation) when --cold-skey is not given. A Cardano TextEnvelope file
+# (pool-cold.skey) is accepted as-is; so is raw 32-byte hex.
+#
+# NO DEFAULT, deliberately. Unset does not mean "look in the usual place" — it
+# means the cold key is not on this machine, which is the state a careful
+# operator is in. The cold key signs registration and revocation and nothing
+# else, and the daemon never reads it under any flag.
+#cold_skey_path = "/etc/heimdall/pool-cold.skey"
+
+# Path to the pool cold VERIFICATION key (cold.vkey) — the public half, and the
+# one a node keeps in the air-gapped flow: the signature comes from the machine
+# holding cold.skey, and this is only used to derive the pool id and check what
+# was handed over. Not a secret, so setting it here costs nothing.
+#cold_vkey_path = "/etc/heimdall/pool-cold.vkey"
+
+
+# Where the treasury movement is posted. Keep true: posting to the Cardano oracle
+# is how a movement reaches the watchtowers. 0 = post as Unconfirmed (a watchtower
+# marks it Confirmed later, after Bitcoin confirmations and oracle aging).
+submit_oracle = true
+oracle_constructor = 0
+
+# How this node learns each pool's active stake for the stake-weighted DKG.
+stake_source = "blockfrost"
+
+# ── The bridge: THREE values, and they are the only ones ─────────────────────
+#
+# The Config UTxO is the discovery root and, since WI-070, the whole of it. The
+# daemon derives the config address from the policy id, finds the single UTxO
+# holding that token, and reads EVERYTHING else from its datum: the peg-in and
+# peg-out script addresses, the bridged-token unit, the TM validator address and
+# its state token, the bridge-state singleton policy, the registry and ban
+# identities, and the operational parameters (fee rate, batch schedule,
+# selection floors).
+#
+# The identifiers used to be typed here as well, and checked against the chain at
+# startup. That is worse than it sounds: a stale copy does not fail, it scans an
+# address that holds nothing — which reads exactly like a bridge with no pending
+# work, on a node that keeps signing. There is now no second copy to disagree, so
+# a key naming any of them is REFUSED at load rather than ignored.
+#
+# `heimdall show-config-params` prints what this node resolved.
+#config_address = ""
+#config_nft_policy_id = ""
+#config_nft_asset_name = ""
+
+# The treasury movement validator is NOT a key. Posting a TM needs the compiled
+# script and the Config publishes only its hash — so the node fetches the script
+# from the chain by that hash (#5) and refuses bytes that do not hash back to it.
+# A `tm_script_cbor` key is refused at load: an unset one used to let a node pass
+# every check, sign a whole movement, and only then fail to post it.
+
+# On-chain SPO registry. LEAVE ALL THREE UNSET on any bridge whose Config
+# publishes the registry identity (#9-#10) — the node reads the registry
+# policy, the treasury_info policy and its state-NFT name from there, and there
+# is nothing here to get wrong. `heimdall show-config-params` prints what it
+# resolved; startup step 4 names the source.
+#
+# Set them ONLY for a bridge deployed before those fields existed (or for the
+# demo fixture roster, which sets none of them).
+#
+# The contract blueprint is COMPILED INTO the binary (WI-066) and is not a key.
+# It is a build artifact of a contracts release, identical for every operator of
+# a given heimdall version — the opposite of a per-bridge value — and a stale
+# copy derived a policy id no deployment had, so the node read an empty registry
+# and said nothing. --blueprint overrides it for development, or for a bridge
+# built from a contracts release this heimdall predates.
+#
+# The one-shot outpoint that REBUILDS those scripts is not a key either: it is
+# Config #12 (WI-090). It used to be three — registry_bootstrap,
+# treasury_bootstrap and ban_bootstrap — which were the same outpoint under
+# three names on every bridge deploy-bridge stood up, so the only thing three
+# keys could add was a disagreement between them. Setting any of the three now
+# refuses startup and names the field that replaced it.
+
+# Ban list. LEAVE THIS UNSET on any bridge whose Config publishes the ban policy
+# (#8) — the node reads it from there and there is nothing here to get
+# wrong. `heimdall show-config-params` prints the ban address it resolved.
+#
+# It is not an operator preference either way: the eligible roster is the
+# registry MINUS active bans, so a node that does not read the list enumerates a
+# different set of DKG participants, assigns different indices, and cannot
+# converge with the others. Nothing in either node's log would say so — which is
+# why the ban list is not optional. Since WI-090 it cannot be half-configured
+# either: one Config-published one-shot parameterizes the registry AND the ban
+# list, so a node that can derive one can always derive the other.
+#
+# fault_proof_policies is DERIVED (WI-066) — each id is hash(verifier code ++
+# registry policy), and heimdall has both. Leave it unset. Setting it still
+# overrides, for a bridge whose verifiers came from other contracts, but the
+# list is checked against what this build derives and a stale copy is refused
+# rather than used.
+#fault_proof_policies = ["<28-byte hex>", "<28-byte hex>", "<28-byte hex>"]
+
+# The ban SCHEDULE is no longer settable here. base_ban_duration_ms,
+# max_faults_before_permanent and max_validity_window_ms come from the bridge
+# Config (params[4..6]) and heimdall REFUSES to start if this file still sets
+# them — a key that silently did nothing left the operator believing a ban
+# duration they typed was in force. Delete them if you are carrying them over.
+# At genesis, where no Config exists yet, `bootstrap-ban-list` takes the same
+# three values as explicit flags.
+
+# Fault enforcement — publishing a fault proof on chain so misbehaviour costs
+# something. Entirely OPTIONAL and off by default: faults are detected and the
+# offender excluded from the ceremony either way, with or without these.
+#
+# In practice that means ONE key: fault_proof_srs_path. Setting it turns the
+# path on, and everything else is derived or discovered.
+#
+# The four *_ref keys below are reference-script LOCATIONS, and since WI-091 they
+# are found rather than typed: heimdall looks at this wallet, then at the wallet
+# the bridge was deployed from — which the Config's one-shot (#12) identifies,
+# and where `binocular deploy-script-refs` publishes them for the whole bridge.
+# Leave them unset. Set one only to pin a copy held somewhere else; a value here
+# WINS and is not cross-checked, because a deliberate override is a legitimate
+# reason to disagree with what discovery would find.
+#
+# Do not enable on mainnet yet — the deployed round1/round2 verifiers are
+# generated from a test setup and heimdall will refuse to start. See
+# docs/fault-proof-srs.md in the heimdall repository.
+#spo_bans_ref = "<tx_hash>:<index>"
+#fault_verifier_round1_ref = "<tx_hash>:<index>"
+#fault_verifier_round2_ref = "<tx_hash>:<index>"
+#fault_verifier_equivocation_ref = "<tx_hash>:<index>"
+#fault_proof_srs_path = "/var/lib/heimdall/kzg_params_22"
+
+
+[http]
+# THE SPO-TO-SPO PROTOCOL SURFACE, and the one piece of networking that must be
+# right. Peers FETCH this node's DKG and signing rounds from the `bifrost_url` it
+# registered on-chain. A peer that cannot reach it cannot get this node's round-1
+# payload, so the node drops out of the qualified set and contributes nothing to
+# the epoch — silently, from this node's point of view.
+#
+# bind_address is the LOCAL INTERFACE to bind. 0.0.0.0 (every interface) is the
+# default because this endpoint has to be reachable; narrow it to a specific NIC,
+# or to 127.0.0.1 when a reverse proxy in front is the only thing that should
+# reach it. Do NOT use loopback on a directly-exposed node — inside a container
+# it is unreachable even with -p.
+#
+# THE ADVERTISED ADDRESS IS NOT SET HERE — it is the bifrost_url you registered
+# on-chain, and peers fetch from that. Left alone, this node also LISTENS on the
+# port inside that URL, which is right when it is exposed directly.
+#
+# Set listen_port when the local port must differ from the public one — a reverse
+# proxy owning :443, a container port mapping, anything in front. The advertised
+# URL stays whatever you registered; only where this process listens changes. It
+# also lifts the explicit-:<port> requirement on the URL, so you can register a
+# clean https://spo.example.com and terminate TLS at nginx.
+bind_address = "0.0.0.0"
+#listen_port = 18500
+
+
+[health]
+# THE OPERATOR SURFACE, and deliberately NOT the one above. That one is the
+# SPO-to-SPO protocol: its address is on chain, every other SPO fetches from it,
+# and anyone can reach it. This one reports what YOU need to know about your own
+# node — whether it qualified in this epoch's ceremony, where it stands on the
+# batch grid, which peers it excluded for running incompatible software — so it
+# binds separately and to loopback, and nothing on it authenticates.
+#
+# `heimdall status` reads it. Point your monitoring at http://127.0.0.1:18580/
+# and alert on `last_progress_ms` failing to advance: that is the field that
+# separates a node doing its job from one that is up and wedged, which systemd
+# cannot tell you (see below).
+#
+# Move `bind` off loopback only if you mean to expose operator state to whatever
+# can reach that address.
+bind = "127.0.0.1:18580"
+#enabled = false
+
+# ON THE SYSTEMD WATCHDOG, since the question comes up: this unit deliberately
+# sets no WatchdogSec/sd_notify. A watchdog proves the process is scheduling and
+# calling home; it cannot tell a node that is co-signing movements from one stuck
+# in a loop, because the same code answers either way. Adding one would turn
+# `active (running)` into a green light meaning no more than it does now — and a
+# false signal gets trusted where a missing one does not. Alert on the health
+# surface instead.
+
+
+[bifrost]
+# This SPO's long-lived secp256k1 bifrost identity secret key: a 0600 file holding
+# 32 bytes as hex. It is bound on-chain at registration, and the daemon signs every
+# published DKG and signing payload with it — losing it means re-registering,
+# leaking it means someone else can sign as you. Keep it inside state_dir, owned
+# by the heimdall user, and back it up somewhere the daemon cannot reach.
+#skey_path = "/var/lib/heimdall/bifrost.skey"
+
+# This node's own endpoint, where peers fetch its DKG and signing rounds. It is
+# an INPUT to registration, not a copy of a chain value: register-spo publishes
+# it and sign-registration signs over it, and after that the URL on chain is what
+# peers use and what the daemon's listen port comes from. Nothing reads this key
+# afterwards.
+#
+# Set it here rather than passing --bifrost-url twice. The registration message
+# commits to these EXACT bytes, so a trailing slash or a different port between
+# the two commands invalidates both signatures, and the only symptom is
+# "signature does not verify".
+#url = "http://spo1.example.com:18500"
+
+
+[log]
+# Verbosity. A bare level — error / warn / info / debug / trace — applies to
+# heimdall's own modules and leaves its dependencies at "warn", so `debug` shows
+# you the daemon rather than reqwest's TLS handshakes. Anything containing "=" or
+# "," is used verbatim as a RUST_LOG directive, e.g.
+# "warn,heimdall::cardano::blockfrost_chain=debug" to follow one subsystem.
+#
+# You rarely need to edit this file to change it: RUST_LOG in
+# /etc/default/heimdall overrides it and survives package upgrades.
+#
+# Whatever the level, the operator-facing event lines (target "heimdall::event":
+# a DKG round and its participants, the new key and treasury address, a movement
+# built / posted / confirmed) stay at info — they are one line each and are what
+# tools/heimdall-discord relays to a channel. Only a full directive that names
+# heimdall ("warn,heimdall=warn") turns them off.
+level = "info"
+
+# auto | plain | journal | json. LEAVE THIS ALONE under systemd.
+#
+# "auto" detects that journald is capturing stdout and switches to "journal",
+# which prefixes each line with the syslog priority systemd strips. That is what
+# makes `journalctl -u heimdall -p err` show errors and nothing else — without
+# it systemd files EVERY line at priority 6 (info), including the errors, and a
+# broken node looks silent. Set "json" only if a log shipper is reading this.
+format = "auto"

@@ -1084,6 +1084,10 @@ fn load_config(path: Option<&str>) -> HeimdallConfig {
         None => HeimdallConfig::default(),
     };
     heimdall::logging::init(&cfg.log);
+    // Only now is there a subscriber to say it through.
+    for note in &cfg.tolerated_retired_keys {
+        tracing::warn!("{}: {note}", path.unwrap_or("config"));
+    }
     cfg
 }
 
