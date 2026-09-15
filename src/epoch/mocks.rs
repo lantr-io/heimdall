@@ -1192,7 +1192,7 @@ impl PeerNetwork for MockPeerNetwork {
         let published_dkg = with_slot(&self.hub, peer.identifier, |s| {
             s.dkg1.as_ref().map(|(ns, _)| (ns.epoch, ns.attempt))
         });
-        // What the node published fills every field the test did not pin with
+        // What the node published fills what the test did not pin with
         // `set_build` — so a deliberately drifted value survives the node's own
         // publish. The version stays whatever the test set (none by default),
         // which is what keeps the gate out of every test that never asked for it.
@@ -1203,10 +1203,20 @@ impl PeerNetwork for MockPeerNetwork {
             build.live_stake = build.live_stake.or(served.live_stake);
             build.stake_source = build.stake_source.or(served.stake_source);
             build.exclude_unstaked = build.exclude_unstaked.or(served.exclude_unstaked);
-            build.dkg_threshold_epoch = build.dkg_threshold_epoch.or(served.dkg_threshold_epoch);
-            build.threshold = build.threshold.or(served.threshold);
-            build.roster_digest = build.roster_digest.or(served.roster_digest);
-            build.roster_size = build.roster_size.or(served.roster_size);
+            // The read travels as ONE unit: a test that pinned any part of it (say
+            // a drifted `threshold`) keeps exactly what it pinned, rather than
+            // gaining the node's real digest — which is compared first and would
+            // quietly overrule the drift.
+            let read_pinned = build.dkg_threshold_epoch.is_some()
+                || build.threshold.is_some()
+                || build.roster_digest.is_some()
+                || build.roster_size.is_some();
+            if !read_pinned {
+                build.dkg_threshold_epoch = served.dkg_threshold_epoch;
+                build.threshold = served.threshold;
+                build.roster_digest = served.roster_digest;
+                build.roster_size = served.roster_size;
+            }
         }
         crate::epoch::traits::PeerHealth {
             reachable: true,

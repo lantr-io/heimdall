@@ -7378,11 +7378,15 @@ mod tests {
         let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture));
         let ctx = chain.query_dkg_context(0, 0).await.expect("ctx");
 
-        // A peer reporting a `t` one away from ours FOR THE SAME EPOCH — the
-        // shape a `live_stake` drift takes, with every setting identical.
+        // A same-build peer that read another roster FOR THE SAME EPOCH — the
+        // shape a mid-epoch registration or a `live_stake` drift takes, with
+        // every setting identical. (The older-build path, `t` alone, is
+        // `the_gate_reports_the_kind_of_each_exclusion`.)
         let drifted = crate::http::compat::PeerBuild {
             dkg_threshold_epoch: Some(ctx.epoch),
-            threshold: Some(ctx.threshold + 1),
+            threshold: Some(ctx.read.threshold + 1),
+            roster_digest: Some("0123456789abcdef".into()),
+            roster_size: Some(ctx.read.n),
             ..build_of(crate::http::compat::own_version())
         };
         let excluded = gate_over(&[(3, drifted.clone())]).await;
@@ -7424,7 +7428,7 @@ mod tests {
 
     /// The gate hands each excluded peer's KIND to the caller, which is what the
     /// abort's cause clause is built from — a threshold-only exclusion must reach
-    /// it as `Threshold`, or the operator is told to upgrade again.
+    /// it as `Roster`, or the operator is told to upgrade again.
     #[tokio::test]
     async fn the_gate_reports_the_kind_of_each_exclusion() {
         use crate::http::compat::Mismatch;
@@ -7487,12 +7491,20 @@ mod tests {
         let ctx = chain.query_dkg_context(0, 0).await.expect("ctx");
         let hub = crate::epoch::mocks::MockPeerHub::new();
         let id = |i: u16| Identifier::try_from(i).unwrap();
-        let agreeing = build_of(crate::http::compat::own_version());
+        // A same-build peer on another roster read, which then re-reads and
+        // agrees — the SAME read as ours, not merely a gap.
+        let agreeing = crate::http::compat::PeerBuild {
+            dkg_threshold_epoch: Some(ctx.epoch),
+            threshold: Some(ctx.read.threshold),
+            roster_digest: Some(hex::encode(ctx.read.digest)),
+            roster_size: Some(ctx.read.n),
+            ..build_of(crate::http::compat::own_version())
+        };
         hub.set_build(
             id(2),
             crate::http::compat::PeerBuild {
-                dkg_threshold_epoch: Some(ctx.epoch),
-                threshold: Some(ctx.threshold + 1),
+                roster_digest: Some("0123456789abcdef".into()),
+                roster_size: Some(ctx.read.n + 1),
                 ..agreeing.clone()
             },
         );

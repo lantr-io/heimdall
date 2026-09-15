@@ -331,7 +331,7 @@ mod tests {
             attempt: 0,
             threshold: 2,
             total_stake: 40_000_000,
-            read: crate::cardano::dkg_roster::RosterRead::of(&participants, 2),
+            read: crate::cardano::dkg_roster::RosterRead::of(&participants, 2, true),
             participants,
             excluded: Vec::new(),
             schedule_anchor_ms: None,
