@@ -226,6 +226,12 @@ placeholder on purpose, so the commands stay correct after the next one; substit
   candidates run an incompatible build — upgrade the lagging nodes" whatever the cause, which sent
   operators chasing a build problem they did not have. It now names each cause with its count, and
   says when *this* node is the one that differs from the roster.
+- **A node registered on a standard port starts.** The local port comes from your registered
+  `bifrost_url`, and a URL with no `:<port>` — `https://spo.example.com`, or the `:443` that the
+  canonical form drops — used to refuse to start. It now means that scheme's default port, 443 or
+  80, which is where peers fetch from anyway. Binding those needs `CAP_NET_BIND_SERVICE` on the
+  service user, and the daemon says so instead of failing at `bind`; behind a reverse proxy set
+  `http.listen_port` — see [§5](#5-make-your-endpoint-reachable).
 - **The handshake compares the roster each node read, not just its threshold.** `/health` carries
   `roster_digest` and `roster_size` beside `threshold`. Two nodes that read different candidates
   but derive the same `t` used to pass the check and then fail mid-ceremony with nothing in the
