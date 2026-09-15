@@ -733,11 +733,13 @@ Two settings, and they are not what the names suggest:
 - **The advertised address is the `bifrost_url` you register**, not a config setting. Peers fetch
   from it, so it must be reachable and it must be right.
 - **Where the process listens is separate.** By default it listens on the port inside that URL,
-  which is what you want when the node is exposed directly. Behind a reverse proxy or a container
-  port map, set **`http.listen_port`**: the advertised URL stays as registered, only the local port
-  changes. That also lets you register a clean `https://spo.example.com` and terminate TLS at
-  nginx — without `listen_port` the URL must carry an explicit `:<port>`, because it is the only
-  place the daemon can learn one.
+  which is what you want when the node is exposed directly. A URL with no `:<port>` means its
+  scheme's default — `443` for `https`, `80` for `http` — and the daemon listens there, so a
+  registered `https://spo.example.com` starts. Binding 80 or 443 needs `CAP_NET_BIND_SERVICE` on
+  the service user (systemd: `AmbientCapabilities=CAP_NET_BIND_SERVICE`), so behind a reverse
+  proxy or a container port map set **`http.listen_port`** instead: the advertised URL stays as
+  registered, only the local port changes. That is the usual pairing with a clean
+  `https://spo.example.com` and TLS terminated at nginx.
 
 ```toml
 # nginx owns :443 in front; heimdall listens privately.
@@ -747,9 +749,10 @@ listen_port  = 18500
 # and you registered --bifrost-url https://spo.example.com
 ```
 
-So the URL you register in step 6 is the single source of truth for your port. Register a URL with
-an explicit `:<port>` — the daemon refuses to start without one, because it cannot guess which
-local port to serve on — open that port, and make sure the hostname resolves publicly.
+So the URL you register in step 6 is the single source of truth for your port: register the port
+peers should use — an explicit `:<port>`, or none when that port is `443`/`80` — open it, and make
+sure the hostname resolves publicly. (Registering `:443` or `:80` is the same thing: the canonical
+form drops a scheme-default port, on chain and in every comparison.)
 
 ```bash
 # from another machine, once the daemon is running:
