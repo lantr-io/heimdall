@@ -208,36 +208,45 @@ from source, is [below](#building-from-source).
 **<https://github.com/lantr-io/heimdall/releases>** — that page is what tells you the `<version>`
 to substitute into the commands below. `…/releases/latest` redirects to the newest one.
 
-**The current release is `v0.1-M5.5`.** Everything below is written with `<version>` left as a
-placeholder on purpose, so the commands stay correct after the next one; substitute `0.1-M5.5`
-(or whatever `…/releases/latest` shows) as you paste. What it adds over `v0.1-M5.4`:
+**The current release is `v0.1-M5.6`.** Everything below is written with `<version>` left as a
+placeholder on purpose, so the commands stay correct after the next one; substitute `0.1-M5.6`
+(or whatever `…/releases/latest` shows) as you paste. What it adds over `v0.1-M5.5`:
 
-- **Two new startup checks.** `[10/11] local tries` compares this node's `cpo-trie.json` and
-  `spi-trie.json` against the bridge-state singleton, and `[11/11] wallet collateral` warns
-  before the wallet can no longer post a script transaction. Both are faults that used to be
-  silent until a movement failed — see [§4](#4-check-it-before-going-further).
-- **The node seeds and catches up its own state.** A new node, or one that was stopped while a
-  movement completed, rebuilds both tries from Cardano history at startup instead of sitting
-  inert until an operator notices. Loudly, because a node that does it at every start is losing
-  its state directory — see [The node seeds its own state](#the-node-seeds-its-own-state).
-- **`heimdall ensure-collateral`.** A wallet whose ADA all sits behind native tokens could not
-  pay a fee, offer collateral, or build the transaction that would have split itself a clean
-  UTxO. It can now; the new command does the split.
-- **A `payment.skey` may be the wallet key**, instead of a mnemonic — see
-  [§3](#the-wallet-key-a-mnemonic-or-the-paymentskey-you-already-have). Existing mnemonic
-  configs are unaffected.
+- **Your config is checked when it loads.** A key heimdall does not know, or a value it cannot
+  use — a port of 0, a bind address that is not an IP, a DKG round-2 offset before round 1 — is
+  now refused by name at startup instead of being ignored or panicking later. **If your
+  `heimdall.toml` came from the packaged template it contains `oracle_constructor = 0`**: that
+  line is accepted and reported as a retired key to delete (any other value is refused), so the
+  upgrade does not stop your node, but delete it when you next edit the file.
+- **`register-spo` validates your endpoint before it spends anything.** A URL that is not
+  absolute HTTP(S), has no host, or carries credentials, a query or a fragment is refused before
+  the transaction is built — the same check the air-gapped `sign-registration` route runs, so the
+  signed and the registered bytes stay identical.
+- **A ceremony that aborts says why each peer was excluded.** The abort used to read "N of M
+  candidates run an incompatible build — upgrade the lagging nodes" whatever the cause, which sent
+  operators chasing a build problem they did not have. It now names each cause with its count, and
+  says when *this* node is the one that differs from the roster.
+- **The handshake compares the roster each node read, not just its threshold.** `/health` carries
+  `roster_digest` and `roster_size` beside `threshold`. Two nodes that read different candidates
+  but derive the same `t` used to pass the check and then fail mid-ceremony with nothing in the
+  log; they are now named at the handshake. It also fixes a race in which a node that had already
+  dropped an incompatible peer looked like a disagreement to every peer still waiting, and could
+  take the ceremony below a quorum over one real mismatch.
 
-**This one does not have to be roster-wide.** The pre-ceremony handshake compares the build's
-MINOR SERIES (`0.1`, from the crate version — not the milestone in the tag) and the
-`blueprint_digest`. `v0.1-M5.4` and `v0.1-M5.5` agree on both, and no contract changed, so the
-two interoperate and you can upgrade one node at a time. That is not true of every release —
-see [Upgrades](#upgrades) for how to tell.
+**This one does not have to be roster-wide, but do it together if you can.** The pre-ceremony
+handshake compares the build's MINOR SERIES (`0.1`, from the crate version — not the milestone in
+the tag) and the `blueprint_digest`. `v0.1-M5.5` and `v0.1-M5.6` agree on both, and no contract
+changed, so the two interoperate and you may upgrade one node at a time. The reason to prefer one
+window: a node still on `v0.1-M5.5` advertises the threshold it derived *after* dropping peers, so
+whenever anything is excluded it can read as a disagreement to an upgraded peer and be left out of
+that ceremony. An upgraded node says so in as many words — the exclusion names an older build and
+tells you to upgrade it, and `curl -s http://<peer>/health` shows which peers report
+`roster_digest` at all.
 
-**Expect a rebuild on first start.** Any node whose tries are behind — which includes every node
-that was stopped while a movement completed — rebuilds them from chain history as it comes up,
-and says so. That is a few seconds on this bridge, and it replaces a fault that used to leave a
-node co-signing nothing until somebody noticed. A node that reports it at *every* restart is
-losing its state directory, and that is worth chasing.
+**Coming from `v0.1-M5.4` or earlier, expect a rebuild on first start.** Any node whose tries are
+behind — which includes every node that was stopped while a movement completed — rebuilds them
+from chain history as it comes up, and says so. That is a few seconds on this bridge. A node that
+reports it at *every* restart is losing its state directory, and that is worth chasing.
 
 Every release is one workflow run over one commit, and it publishes the same binary three ways:
 
@@ -1146,6 +1155,11 @@ release answers it before you install anything. Same pair on both sides, and you
 node at a time. Either differs, and you must agree a commit and an epoch boundary with the other
 operators and restart every node before it — upgrading one node ahead of the roster removes it
 from the roster.
+
+`/health` also carries the roster each node READ for the current ceremony — `roster_digest`,
+`roster_size` and `threshold`, tagged with `dkg_threshold_epoch`. Those must match across the
+roster for one epoch; when they do not, the `⚠ EXCLUDING` lines say whether it is a read that will
+settle by the next epoch (nothing to do) or a peer too old to report a digest (upgrade it).
 
 **Run `heimdall doctor` before you install, not after.** The startup checks are a gate: a `Fail`
 stops the daemon. A new release can add a check that a node has been quietly failing for weeks —
