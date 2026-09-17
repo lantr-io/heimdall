@@ -227,46 +227,43 @@ from source, is [below](#building-from-source).
 **<https://github.com/lantr-io/heimdall/releases>** — that page is what tells you the `<version>`
 to substitute into the commands below. `…/releases/latest` redirects to the newest one.
 
-**The current release is `v0.1-M5.6`.** Everything below is written with `<version>` left as a
-placeholder on purpose, so the commands stay correct after the next one; substitute `0.1-M5.6`
-(or whatever `…/releases/latest` shows) as you paste. What it adds over `v0.1-M5.5`:
+**The current release is `v0.1-M5.7`.** Everything below is written with `<version>` left as a
+placeholder on purpose, so the commands stay correct after the next one; substitute `0.1-M5.7`
+(or whatever `…/releases/latest` shows) as you paste. What it adds over `v0.1-M5.6`:
 
-- **Your config is checked when it loads.** A key heimdall does not know, or a value it cannot
-  use — a port of 0, a bind address that is not an IP, a DKG round-2 offset before round 1 — is
-  now refused by name at startup instead of being ignored or panicking later. **If your
-  `heimdall.toml` came from the packaged template it contains `oracle_constructor = 0`**: that
-  line is accepted and reported as a retired key to delete (any other value is refused), so the
-  upgrade does not stop your node, but delete it when you next edit the file.
-- **`register-spo` validates your endpoint before it spends anything.** A URL that is not
-  absolute HTTP(S), has no host, or carries credentials, a query or a fragment is refused before
-  the transaction is built — and the air-gapped route carries that same URL across in its request
-  file, so the signed and the registered bytes stay identical.
-- **A ceremony that aborts says why each peer was excluded.** The abort used to read "N of M
-  candidates run an incompatible build — upgrade the lagging nodes" whatever the cause, which sent
-  operators chasing a build problem they did not have. It now names each cause with its count, and
-  says when *this* node is the one that differs from the roster.
-- **A node registered on a standard port starts.** The local port comes from your registered
-  `bifrost_url`, and a URL with no `:<port>` — `https://spo.example.com`, or the `:443` that the
-  canonical form drops — used to refuse to start. It now means that scheme's default port, 443 or
-  80, which is where peers fetch from anyway. Binding those needs `CAP_NET_BIND_SERVICE` on the
-  service user, and the daemon says so instead of failing at `bind`; behind a reverse proxy set
-  `http.listen_port` — see [§5](#5-make-your-endpoint-reachable).
-- **The handshake compares the roster each node read, not just its threshold.** `/health` carries
-  `roster_digest` and `roster_size` beside `threshold`. Two nodes that read different candidates
-  but derive the same `t` used to pass the check and then fail mid-ceremony with nothing in the
-  log; they are now named at the handshake. It also fixes a race in which a node that had already
-  dropped an incompatible peer looked like a disagreement to every peer still waiting, and could
-  take the ceremony below a quorum over one real mismatch.
+- **Registering and leaving with the cold key where it belongs is three commands and one trip.**
+  `register-spo` and `deregister-spo` write a request file when the pool cold key is not on the
+  node — after running every check they already ran, so the trip is worth making — the new
+  `heimdall sign-with-pool-key` answers it beside `cold.skey`, and `--signed` finishes the
+  transaction. Nothing is copied by hand, and the confirmation screen on the air-gapped machine
+  names the pool, the bridge and the endpoint before the key is used. See [§6](#6-register).
+- **Your Bifrost key no longer has to reach the air-gapped machine.** `sign-registration` required
+  it there, which contradicted what this guide promised about that key. The cold half now signs
+  first and returns its verification key, so the node derives the pool ID and signs the Bifrost
+  half itself.
+- **`sign-registration` and `sign-revocation` are removed** — this is the one breaking change. If
+  a runbook calls either, it wants the three steps in [§6](#6-register) instead. The
+  `--cold-vkey` / `--cold-sig` flags still work, for an operator who signs with their own Ed25519
+  tool: the request carries the exact `message` bytes to sign.
+- **`cardano.cold_vkey_path` is optional and now earns its keep.** The public half is safe on a
+  node, and with it `register-spo` prints your pool ID and runs the min-stake gate *before* you
+  make the trip rather than after. Leaving needs it even less: a leaving pool is already in the
+  registry, so the node finds its own pool ID there by the Bifrost key it runs on, and reports any
+  ban record before writing the request.
+- **The file that authorises an exit is treated as the bearer instrument it is.** Its signature
+  commits to your pool ID and nothing else, so it never expires and anyone holding it can post
+  your exit and collect the freed deposit. It is written `0600`, and `deregister-spo --signed`
+  deletes it after a successful submit unless you pass `--keep`. A durable fix — binding the
+  signature to a deadline and to one wallet — needs an on-chain change and waits for the next
+  contract revision.
+- **A key path that is not there says so.** `--cold-skey`, `cold_vkey_path` and the rest used to
+  fall back to reading the argument as inline hex, so a missing file reported "expected 32 bytes
+  of hex" and sent you looking inside a file the command never opened.
 
-**This one does not have to be roster-wide, but do it together if you can.** The pre-ceremony
-handshake compares the build's MINOR SERIES (`0.1`, from the crate version — not the milestone in
-the tag) and the `blueprint_digest`. `v0.1-M5.5` and `v0.1-M5.6` agree on both, and no contract
-changed, so the two interoperate and you may upgrade one node at a time. The reason to prefer one
-window: a node still on `v0.1-M5.5` advertises the threshold it derived *after* dropping peers, so
-whenever anything is excluded it can read as a disagreement to an upgraded peer and be left out of
-that ceremony. An upgraded node says so in as many words — the exclusion names an older build and
-tells you to upgrade it, and `curl -s http://<peer>/health` shows which peers report
-`roster_digest` at all.
+**This one is per-node, and nothing about it is roster-wide.** No contract changed, the minor
+series (`0.1`) and the `blueprint_digest` are the same as `v0.1-M5.6`, and nothing here touches the
+DKG, signing or the pre-ceremony handshake — only registration and exit, which happen outside a
+ceremony. A roster may run a mix of `v0.1-M5.6` and `v0.1-M5.7` indefinitely.
 
 **Coming from `v0.1-M5.4` or earlier, expect a rebuild on first start.** Any node whose tries are
 behind — which includes every node that was stopped while a movement completed — rebuilds them
