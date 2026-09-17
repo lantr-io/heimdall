@@ -724,11 +724,11 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     Status::Warn,
                     format!("registry script {hash} is not deployed at this wallet"),
                     "only needed to REGISTER — the daemon reads the roster without it, and \
-                     step 7 below says whether this node is already registered. To deploy it \
-                     you need the compiled script, so this one command still takes the \
-                     blueprint and the bootstrap outref:\n\
-                     heimdall deploy-registry-ref --config <file> --blueprint <plutus.json> \
-                     --registry-bootstrap <txid:ix> --submit\n\
+                     step 7 below says whether this node is already registered. Try registering \
+                     first: it looks for this script at this wallet AND at the one the bridge \
+                     was deployed from, and finding it there means there is nothing to deploy. \
+                     If it reports neither:\n\
+                     heimdall deploy-registry-ref --config <file> --submit\n\
                      (~55 ADA, reclaimable — the daemon will not spend this for you)",
                 ),
             }
@@ -1755,6 +1755,32 @@ mod tests {
             assert!(
                 line.starts_with("         ->"),
                 "unindented fix line: {line:?}"
+            );
+        }
+    }
+
+    /// Nothing this file prints may ask an operator to type a value the bridge
+    /// itself publishes.
+    ///
+    /// These all have a Config fallback — `resolve_one_shot` reads the one-shot
+    /// from Config #12, and the blueprint is embedded — so a command line
+    /// carrying them sends the operator hunting for a value the command would
+    /// have found. An SPO did exactly that: derived the outref by hand from the
+    /// reg-root asset's mint transaction, because a printed line asked for it.
+    /// What `doctor` prints is what gets pasted, so it is the copy that has to
+    /// be right, not just the guide's.
+    ///
+    /// The needles are assembled at runtime so this test does not match itself.
+    #[test]
+    fn doctor_never_asks_for_a_value_the_bridge_publishes() {
+        let src = include_str!("preflight.rs");
+        for name in ["registry-bootstrap", "blueprint", "treasury-nft-name"] {
+            let flag = format!("--{name}");
+            assert!(
+                !src.contains(&flag),
+                "preflight mentions {flag}, which the bridge Config supplies. \
+                 An operator who pastes that line goes looking for a value the \
+                 command resolves on its own."
             );
         }
     }

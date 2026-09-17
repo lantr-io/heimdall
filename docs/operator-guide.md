@@ -256,6 +256,11 @@ placeholder on purpose, so the commands stay correct after the next one; substit
   deletes it after a successful submit unless you pass `--keep`. A durable fix — binding the
   signature to a deadline and to one wallet — needs an on-chain change and waits for the next
   contract revision.
+- **`doctor` no longer prints flags you do not need.** Its unregistered-node and
+  reference-script advice used to include `--registry-bootstrap <txid:ix>` and a `--blueprint`
+  path, which sent operators hunting for an outref the command reads from Config #12 by itself.
+  One SPO derived it by hand from the reg-root asset's mint transaction before finding that out.
+  What `doctor` prints is now what the guide says: `--config <file> --submit`, nothing else.
 - **A key path that is not there says so.** `--cold-skey`, `cold_vkey_path` and the rest used to
   fall back to reading the argument as inline hex, so a missing file reported "expected 32 bytes
   of hex" and sent you looking inside a file the command never opened.
