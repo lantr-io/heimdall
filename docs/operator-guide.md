@@ -115,7 +115,9 @@ config_address = "$BRIDGE_CONFIG_ADDRESS"
 config_nft_policy_id = "$BRIDGE_CONFIG_POLICY"
 config_nft_asset_name = "424946434647"   # "BIFCFG"
 min_stake_lovelace = 1000000000          # your own registration gate, in lovelace
-cold_skey_path = "/etc/heimdall/pool-cold.skey"   # or cold_vkey_path, for the air-gapped flow
+# cold_vkey_path = "/etc/heimdall/pool-cold.vkey"  # optional, see step 6: copy your pool's
+                                                   # PUBLIC cold.vkey here and step 6 can check
+                                                   # your pool id and stake before you sign
 
 # CONSENSUS INPUTS — the shared preprod test bridge above runs both, and every
 # node of its roster must carry the SAME values or the peers exclude each other
@@ -151,16 +153,33 @@ is correct before step 6. A `WARN` on `[4/11] reference script` is normal.
 **5. Open the port** – [§5](#5-make-your-endpoint-reachable). The port inside `$MY_URL` is the
 one the daemon binds. Open it in your firewall now; the test is in step 7, from another machine.
 
-**6. Register** – [§6](#6-register). Spends real ADA. Put the pool cold key at the path from step 3
-(`0600`, owned by `heimdall`), or use the air-gapped flow in §6. Dry run first:
+**6. Register** – [§6](#6-register). Spends real ADA, and needs your pool cold key, which belongs
+on your air-gapped machine. Three commands, one trip:
+
+```bash
+# on the node — runs its checks, then writes the request instead of a transaction
+sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+    heimdall register-spo --config /etc/heimdall/heimdall.toml --out /media/usb/request.json
+# beside cold.skey, on a machine with no network
+heimdall sign-with-pool-key /media/usb/request.json \
+    --cold-skey cold.skey --out /media/usb/signed.json
+# back on the node
+sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+    heimdall register-spo --config /etc/heimdall/heimdall.toml \
+    --signed /media/usb/signed.json --submit
+```
+
+Expect, from the first command: `min-stake gate: … → PASS` and a `registry ref:` line. From the
+second: a `pool id:` **equal to your pool's real id** — check it before you answer the prompt.
+
+If the cold key is already on this machine — a test bridge, or a risk you have decided to take —
+set `cardano.cold_skey_path` to it (`0600`, owned by `heimdall`) and it is one command instead.
+Dry run first, then add `--submit`:
 
 ```bash
 sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
     heimdall register-spo --config /etc/heimdall/heimdall.toml
 ```
-
-Expect: `pool id:  <hex> (pool1…)` **equal to your pool's real id**, `min-stake gate: … → PASS`,
-and a `registry ref:` line. Then add `--submit`.
 
 If it stops with `no reference script for the registry` instead, deploy one, then register with
 the outpoint it prints:
@@ -220,8 +239,8 @@ placeholder on purpose, so the commands stay correct after the next one; substit
   upgrade does not stop your node, but delete it when you next edit the file.
 - **`register-spo` validates your endpoint before it spends anything.** A URL that is not
   absolute HTTP(S), has no host, or carries credentials, a query or a fragment is refused before
-  the transaction is built — the same check the air-gapped `sign-registration` route runs, so the
-  signed and the registered bytes stay identical.
+  the transaction is built — and the air-gapped route carries that same URL across in its request
+  file, so the signed and the registered bytes stay identical.
 - **A ceremony that aborts says why each peer was excluded.** The abort used to read "N of M
   candidates run an incompatible build — upgrade the lagging nodes" whatever the cause, which sent
   operators chasing a build problem they did not have. It now names each cause with its count, and
@@ -492,12 +511,15 @@ demo_virtual_epoch_slots = 86400    # TEST BRIDGES ONLY — a 24-hour cycle
 # Your own minimum-stake gate for registration, in lovelace.
 min_stake_lovelace = 1000000000
 
-# Registration only, and only one of these. The cold key is your existing Cardano
-# stake-pool key: `cold_skey_path` signs here, `cold_vkey_path` is the public half
-# for the flow where the signature is made on the machine that holds the secret.
-# Neither has a default location — unset means "not on this machine".
-#cold_skey_path = "/etc/heimdall/pool-cold.skey"
+# Registration and exit only. The cold key is your existing Cardano stake-pool
+# key, and it should NOT be on this machine: `sign-with-pool-key` signs beside it
+# and the node never sees it. Set `cold_vkey_path` — the public half is safe here
+# — and register-spo can print your pool id and run the min-stake gate before you
+# make the trip. `cold_skey_path` is the on-machine route, for a test bridge or a
+# risk you have decided to take. Neither has a default location: unset means "not
+# on this machine", which for the secret half is the normal state.
 #cold_vkey_path = "/etc/heimdall/pool-cold.vkey"
+#cold_skey_path = "/etc/heimdall/pool-cold.skey"
 
 [http]
 # 0.0.0.0 is the default; set listen_port only if the port peers connect to
@@ -801,7 +823,7 @@ Every command below prints the transaction and stops unless you add `--submit`. 
 referenced. Both commands below compile that script from the outpoint the bridge publishes at Config
 #12, so there is nothing about it to type.
 
-Try step 2 first. `register-spo` looks for the script at your wallet and then at the wallet the
+Try step 2a first. `register-spo` looks for the script at your wallet and then at the wallet the
 bridge was deployed from — whoever ran `binocular deploy-script-refs` published it there for the
 whole bridge, and finding it means you deploy nothing and lock no ADA. It prints which one it used.
 Run this command only if it reports finding neither.
@@ -848,7 +870,82 @@ nothing is trusted that was not checked.
   operation after this uses it, and it stays on this machine.
 
 Registration is the cold key signing *"this pool authorizes this Bifrost identity"*. That is the
-whole purpose of the step, and the only time the cold key is used.
+whole purpose of the step, and the cold key does nothing else here or afterwards — apart from
+authorising an exit, if you ever leave.
+
+**Your cold key should not be on this machine.** It signs registration and revocation and nothing
+else, so it has no business on a networked block producer — and the pool-registration page linked
+above says the same. The flow below assumes it is where it belongs: three commands, one trip, and
+nothing copied by hand.
+
+**2a. On the node — write the request.** With no cold key here, `register-spo` runs every check it
+would run anyway (wallet, registry reference script, the min-stake gate) and then, instead of a
+transaction, writes the request the other machine answers:
+
+```bash
+sudo -u heimdall heimdall register-spo --config /etc/heimdall/heimdall.toml \
+    --out /media/usb/request.json
+```
+
+The checks come first on purpose: the trip is worth making only once everything else is green.
+Read what it prints before you carry the file; those lines are described after the two routes. Leave `--out` off and the same JSON goes to stdout, if you would rather paste it than carry
+a stick.
+
+**2b. Beside `cold.skey` — sign it.** No config file, no network, no state directory. It wants the
+pool cold key and nothing else, which is what its name says:
+
+```bash
+heimdall sign-with-pool-key /media/usb/request.json \
+    --cold-skey cold.skey --out /media/usb/signed.json
+```
+
+It prints what it is about to authorize and waits for you:
+
+```
+JOIN the bifrost bridge on preprod
+  pool id:      5ae193ab… (pool1ttse82lxjjnqw5c7yru9mq6c4h56ga9y73dvfc27jck6zh5z39s)
+  bifrost url:  http://spo.example:8080
+  bifrost pk:   9f3c…
+  registry:     7d21…
+
+Sign with the pool cold key? [y/N]
+```
+
+**Check that pool ID against your pool** — `cardano-cli stake-pool id
+--cold-verification-key-file cold.vkey --output-format hex`, or your pool's page. It is derived
+from the key in front of you, so a mismatch means that is not your pool's cold key. The command
+also refuses outright if the request names a pool this key does not produce, and it verifies its
+own signature before writing — the same check the on-chain validator performs — so a mistake fails
+here rather than after a fee is spent.
+
+`cold.skey` may be the file as `cardano-cli` wrote it (a TextEnvelope), a path to one, or raw
+32-byte hex. `--yes` skips the prompt, for scripting only: the prompt is where you compare the pool
+id, which is the one check nothing downstream can make for you. Without a terminal to answer it
+the command stops rather than assuming you said yes.
+
+**2c. Back on the node — submit.**
+
+```bash
+sudo -u heimdall heimdall register-spo --config /etc/heimdall/heimdall.toml \
+    --signed /media/usb/signed.json --submit
+```
+
+Your **Bifrost** key never makes this trip. It stays on the node and signs its half of the
+registration here, after the cold key's answer comes back with the verification key that completes
+the message. Nothing else is needed from the air-gapped machine.
+
+**Set `cardano.cold_vkey_path` and step 2a can tell you more.** The public half of the cold key is
+safe on a node, and with it the node knows your pool ID before the trip — so it prints it, and the
+min-stake gate runs. Without it, step 2a reports
+
+```
+min-stake gate:    SKIPPED — pool id is not known on this machine.
+```
+
+and the gate runs at step 2c instead. Submission is never ungated; only the early warning is lost.
+
+**If the cold key is already on this machine** — a test bridge, or a decision you have made
+deliberately — point `cardano.cold_skey_path` at it and the whole thing is one command:
 
 ```bash
 sudo -u heimdall heimdall register-spo \
@@ -856,42 +953,27 @@ sudo -u heimdall heimdall register-spo \
     --submit
 ```
 
-Everything it needs is in the config file:
+**What `register-spo` prints, and what to check.** The same lines on either route.
 
-| key | what |
-|---|---|
-| `bifrost.url` | your endpoint, published on chain |
-| `bifrost.skey_path` | your Bifrost identity key — the same one the daemon runs on |
-| `cardano.cold_skey_path` | your pool cold key, for the on-machine flow |
-| `cardano.cold_vkey_path` | the public half, for the air-gapped flow |
-
-Each has a `--flag` that overrides it. `bifrost.url` matters most: the registration message commits
-to those exact bytes, so a trailing slash or a different port between this command and
-`sign-registration` invalidates both signatures — one value, read by both, cannot drift.
-
-The cold-key paths take the `cold.skey` / `cold.vkey` files as cardano-cli wrote them — TextEnvelopes
-— or raw 32-byte hex. `cold_skey_path` has no default location, and unset does not mean "look in the
-usual place": it means the cold key is not on this machine.
-
-**Check the pool ID it prints before you submit.** The command derives your pool ID from the cold
-key you gave it and prints it:
+**The pool ID.** Derived from whichever cold key was used — yours on this machine, or the one that
+answered the request:
 
 ```
 pool id:           <hex> (pool1...)
 ```
 
-That must equal your pool's real ID — `cardano-cli stake-pool id --cold-verification-key-file
-cold.vkey --output-format hex`, or the ID on your pool's page. If it does not, you pointed at the wrong file, and what
-you are about to register is a Bifrost identity for a pool that is not yours. Nothing later catches
-this: the transaction is well formed, it just speaks for someone else.
+That must equal your pool's real ID. If it does not, what you are about to register is a Bifrost
+identity for a pool that is not yours. Nothing later catches this: the transaction is well formed,
+it just speaks for someone else. On a node with no `cardano.cold_vkey_path`, step 2a cannot print
+this at all and step 2c is where you check it — which is before `--submit` either way.
 
-It also prints which reference script it picked, so you can see it found the one step 1 made:
+**The reference script it picked**, so you can see it found the one step 1 made:
 
 ```
 registry ref:      <tx_hash>#0 (discovered at this wallet)
 ```
 
-If no reference script exists anywhere it can see, this command stops before building anything and
+If no reference script exists anywhere it can see, the command stops before building anything and
 prints the `deploy-registry-ref` line to run — it does not build a transaction that would be too
 large to submit.
 
@@ -900,44 +982,33 @@ sits at their wallet and is deliberately kept spendable, so they can reclaim it.
 retroactively — your registration is already on chain — but a later `register-spo` or `apply-ban`
 would have to fall back to deploying your own.
 
-`--bifrost-url` is what step 5 was about: it is published on chain, peers fetch from it, and its
-port is the port your daemon will bind.
+**The min-stake gate.** Submission is gated on a minimum-stake check against your pool's
+epoch-snapshot active stake. If it fails, the command prints the dry-run transaction and refuses —
+it will not submit.
 
-Submission is gated on a minimum-stake check against your pool's epoch-snapshot active stake. If it
-fails, the command prints the dry-run transaction and refuses — it will not submit.
+**Everything it needs is in the config file:**
 
-Your cold key is used only here, and by revocation. The daemon never reads it.
+| key | what |
+|---|---|
+| `bifrost.url` | your endpoint, published on chain |
+| `bifrost.skey_path` | your Bifrost identity key — the same one the daemon runs on |
+| `cardano.cold_vkey_path` | the public half of the cold key. Optional; buys you the checks above before the trip |
+| `cardano.cold_skey_path` | your pool cold key — only for the on-machine route. No default location: unset means the key is not here, which is the normal state |
 
-**Keeping the cold key off this machine.** Preferred, and the reason the key type exists: the cold
-key signs registration and revocation and nothing else, so it has no business on a networked block
-producer. Sign beside the key instead, and carry four public values across.
+Each has a `--flag` that overrides it. `bifrost.url` is [step 5](#5-make-your-endpoint-reachable):
+it is published on chain, peers fetch from it, and its port is the port your daemon will bind. It
+is signed over, but you no longer have to keep it byte-identical across two machines by hand — the
+request file carries it, and a change between writing the request and submitting is reported as
+that change rather than as a signature that does not verify.
 
-On the machine that holds `cold.skey`:
+Your cold key is used only here and by [leaving](#leaving-the-bridge). The daemon never reads it.
 
-```bash
-heimdall sign-registration --config /path/to/heimdall.toml
-```
-
-It touches no chain and no network. It prints the pool ID it derived — check that against your pool
-before going further — and then the four flags to copy:
-
-```
-    --bifrost-url http://<your-host>:<your-port> \
-    --cold-vkey <64 hex> \
-    --cold-sig <128 hex> \
-    --bifrost-id-pk <64 hex> \
-    --bifrost-sig <128 hex>
-```
-
-Pass those to `register-spo` on the node in place of `--cold-skey` and `--bifrost-skey`. The
-`--bifrost-url` must be **byte-identical** in both commands: it is signed over, so a trailing slash
-or a different port silently invalidates both signatures. `sign-registration` verifies them before
-printing — the same check the on-chain validator performs — so a mistake fails beside your cold key
-rather than after a fee is spent.
-
-Do not try to produce these signatures with a general-purpose signing tool. The cold half is a raw
-Ed25519 signature over exact bytes, and the usual community signer's CIP-8 mode signs a *wrapped*
-payload — different bytes, so the result verifies nowhere and nothing tells you why.
+**If you would rather use your own signing tool**, the request carries a `message` field — the
+exact bytes to sign — whenever the pool ID is known. Ed25519-sign those bytes and pass the result
+to `register-spo --cold-vkey … --cold-sig …`. Do **not** reach for a general-purpose Cardano
+signer: the cold half is a raw Ed25519 signature over exact bytes, `cardano-cli` has no raw-sign
+command at all, and the usual community signer's CIP-8 mode signs a *wrapped* payload — different
+bytes, so the result verifies nowhere and nothing tells you why.
 
 
 **3. Confirm you are in the roster.**
@@ -1182,26 +1253,41 @@ running to the epoch boundary, stop after it.** Doing those in the other order i
 the on-chain list and removes your Bifrost identity from the treasury's identity root — freeing
 that identity, so the same key can register again later.
 
+Your **cold** key authorises the exit, alone — nothing signs with the Bifrost identity, so losing
+that key does not trap you in the registry, and there is no minimum-stake check on the way out.
+With the key where it belongs, off this machine, it is the same three steps as registering:
+
 ```bash
-sudo -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml
-# prints what it is about to do; add --submit to actually post it
+# on the node — reports the ban record, then writes the request
+sudo -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml \
+    --out /media/usb/request.json
+# beside cold.skey
+heimdall sign-with-pool-key /media/usb/request.json \
+    --cold-skey cold.skey --out /media/usb/signed.json
+# back on the node
+sudo -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml \
+    --signed /media/usb/signed.json --submit
 ```
+
+With `cardano.cold_skey_path` set, it is one command — `deregister-spo --config … --submit`, and
+without `--submit` first, which prints what it is about to do and stops.
 
 Like registering, this needs the registry reference script on chain — it finds the same one your
 registration used. If that was the bridge deployer's and they have since reclaimed it, the command
-says so, and `deploy-registry-ref` puts a new one up (~55 ADA, itself reclaimable). It also reports
-whether this pool has a ban record, and what leaving means for one; read that output before adding
-`--submit`.
+says so, and `deploy-registry-ref` puts a new one up (~55 ADA, itself reclaimable). **Read the ban
+record it prints before you go any further**: it reports whether this pool has one and what leaving
+means for it, and the first command above prints it before writing the request, which is the point
+— that decision belongs before the trip, not after.
 
-Your **cold** key authorises the exit, alone — nothing signs with the Bifrost identity, so losing
-that key does not trap you in the registry, and there is no minimum-stake check on the way out. If
-the cold key lives on another machine, which is where it should live, sign there and submit here:
+You do **not** need `cardano.cold_vkey_path` for this one: a leaving pool is already in the
+registry, so the node finds your pool ID there by the Bifrost key it runs on.
 
-```bash
-# on the machine holding the cold key:
-heimdall sign-revocation --cold-skey /path/to/cold.skey
-# prints --cold-vkey / --cold-sig; pass both to deregister-spo on the node
-```
+**Guard that `signed.json` like the cold key itself, and delete it after.** The exit signature
+commits to your pool ID and nothing else: it never expires, and anyone who picks the file up can
+post your exit from *their* wallet and collect the freed deposit (see "the deposit comes back to
+whoever pays", below). `sign-with-pool-key` writes it `0600` and says so; `deregister-spo --signed`
+deletes it after a successful submit unless you pass `--keep`. Between those two moments it is a
+bearer instrument.
 
 **2. Keep the node running until the next epoch boundary.** The roster for the current epoch was
 frozen before your exit and this transaction does not reach back into it: you still owe that
@@ -1250,6 +1336,11 @@ public peer endpoint).
 
 Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimdall`.
 
+Your pool cold key belongs on a machine none of this runs on — see [§6](#6-register). Nothing here
+reads it, and the one file that carries its signature, the `signed.json` of an exit, is a standing
+authorization to leave that anyone holding it can post: `sign-with-pool-key` writes it `0600` and
+`deregister-spo --signed` deletes it once the exit is on chain.
+
 ---
 
 ## When something is wrong
@@ -1260,7 +1351,7 @@ Do not expose your Blockfrost credentials, your config file, or `/var/lib/heimda
 | starts, then nothing happens for days | expected; see *Quiet is normal* |
 | peers seem not to see you | first step 5 — is the registered port open and reachable *from outside*? If it is, compare `demo_live_stake` and `demo_virtual_epoch_slots` against the rest of the roster (§3): they are consensus inputs, so a node that differs is registered, reachable, and deliberately never talked to. Both sides log `⚠ EXCLUDING`, so the roster sees it too |
 | `[3/11] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
-| `[6/11] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
+| `[6/11] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command, including the `--signed` form for a cold key that is not on this machine. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
 | `no reference script for the registry` right after `deploy-registry-ref` succeeded | the provider's address listing has not shown the script yet – pass the outpoint the deploy printed, `--registry-ref <tx_hash>:0` (step 6) |
 | `N of M candidates excluded at the pre-ceremony handshake` at every epoch start | the rest of the line names each cause with its count. *Incompatible build* (version, blueprint, security threshold): both sides report the other, so compare `/health` across the roster and upgrade the odd one out – see *Upgrades*. *Different consensus settings*: match the setting the `⚠ EXCLUDING` lines name. *Different roster read*: nothing to change – typically this node registered after the roster read the registry for this epoch, and it clears at the next epoch; if it is still there after an epoch boundary it is not that, so compare `roster_digest`, `roster_size`, `threshold` and `dkg_threshold_epoch` in `/health` across the roster. *Different FROST threshold from an older build*: upgrade the nodes whose `/health` has no `roster_digest`. `/health` shows the roster each node READ; the threshold it actually runs with after exclusions is in its `candidate set reduced` log line. When the line says *every peer was excluded*, the node that differs is this one |
 | `[9/11] post a movement FAIL` | this bridge has never published its treasury-movement validator on chain, so no SPO can post — `binocular deploy-script-refs`, re-run, publishes it and skips what already exists. Not something one operator's config can fix |
