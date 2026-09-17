@@ -594,6 +594,10 @@ enum Commands {
         blueprint: Option<String>,
         /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
         /// that parameterizes the registry policy (and through it treasury_info).
+        /// OPTIONAL, and normally left off: the bridge publishes it at Config #12
+        /// and this command reads it from there. Pass it only to build against a
+        /// bridge whose Config this node is not reading. An operator who goes
+        /// looking for this value has been sent somewhere they did not need to go.
         #[arg(long)]
         registry_bootstrap: Option<String>,
         /// Pool cold signing key: 32-byte hex, or a path to a file holding that
@@ -665,6 +669,10 @@ enum Commands {
         blueprint: Option<String>,
         /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
         /// that parameterizes the registry policy (and through it treasury_info).
+        /// OPTIONAL, and normally left off: the bridge publishes it at Config #12
+        /// and this command reads it from there. Pass it only to build against a
+        /// bridge whose Config this node is not reading. An operator who goes
+        /// looking for this value has been sent somewhere they did not need to go.
         #[arg(long)]
         registry_bootstrap: Option<String>,
         /// Pool cold signing key: 32-byte hex, or a path to a file holding that
