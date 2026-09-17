@@ -1688,9 +1688,10 @@ fn ref_script_already_deployed(
 /// This node's Bifrost endpoint URL: the flag, else `[bifrost].url`.
 ///
 /// One resolver, because the registration message commits to these EXACT bytes:
-/// a trailing slash or a different port between writing the air-gapped request
-/// and submitting the answer invalidates both signatures. `SignedResponse::check`
-/// reports that as the field that moved; this keeps it from happening at all.
+/// a different port between writing the air-gapped request and submitting the
+/// answer invalidates both signatures. `SignedResponse::check` reports that as
+/// the field that moved; this keeps it from happening at all. (A trailing slash
+/// no longer can: `validate_bifrost_url` strips it from both sides.)
 fn resolve_bifrost_url(cfg: &HeimdallConfig, arg: Option<&str>) -> Result<String, String> {
     let raw = arg.or(cfg.bifrost.url.as_deref()).ok_or_else(|| {
         "no Bifrost endpoint URL: pass --bifrost-url or set [bifrost].url. It is published \
