@@ -175,13 +175,13 @@ const NOT_REGISTERED_FIX: &str = "Expected on a node that has not been registere
      contribute nothing, so startup stops here rather than running an idle process that looks \
      healthy.\n\
      \n\
-     heimdall register-spo --config <file> --blueprint <plutus.json> \
-     --registry-bootstrap <txid:ix> --treasury-nft-name <hex> --cold-skey <pool-cold.skey> \
-     --bifrost-skey <bifrost.skey> --bifrost-url http://<host>:<port> --submit\n\
+     heimdall register-spo --config <file> --submit\n\
      \n\
-     Run it without --submit first — it prints the transaction and stops. The registry reference \
-     script it needs is found automatically once deploy-registry-ref has put one at this wallet; \
-     see step 5.\n\
+     Run it without --submit first — it prints the transaction and stops. If the cold key is not \
+     on this machine, which is where it should not be, the same command without --submit writes \
+     a request instead: sign it beside the key with `heimdall sign-with-pool-key`, then re-run \
+     with --signed <file> --submit. The registry reference script it needs is found \
+     automatically once deploy-registry-ref has put one at this wallet; see step 5.\n\
      \n\
      If you HAVE already registered this pool, then [bifrost].skey_path points at a different key \
      than the one you registered with — fix the path rather than registering again, which would \

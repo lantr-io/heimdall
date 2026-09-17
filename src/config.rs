@@ -85,17 +85,18 @@ pub struct BifrostConfig {
     /// `None` is fine for read-only / air-gapped-registration commands.
     pub skey_path: Option<String>,
     /// This node's own Bifrost endpoint URL — where peers fetch its DKG and
-    /// signing rounds from. Used by `register-spo`, which publishes it on chain,
-    /// and by `sign-registration`, which signs over it.
+    /// signing rounds from. Used by `register-spo`, which publishes it on chain
+    /// and signs over it.
     ///
     /// It is an INPUT to registration, not a second copy of a chain value: once
     /// registered, the URL on chain is what peers use and what this node's
     /// listen port comes from. Nothing reads this afterwards.
     ///
-    /// Having it here is what makes the two commands agree. The registration
-    /// message commits to these exact bytes, so a trailing slash or a different
-    /// port between `sign-registration` and `register-spo` silently invalidates
-    /// both signatures — one value typed once removes that entirely.
+    /// The registration message commits to these exact bytes. The air-gapped
+    /// request file carries the URL across, so a change between writing the
+    /// request and submitting is reported as that change rather than as a
+    /// signature that does not verify — but one value typed once is still what
+    /// keeps the question from arising.
     pub url: Option<String>,
 }
 

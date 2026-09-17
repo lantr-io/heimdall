@@ -9,6 +9,7 @@
 //! through the `CardanoPegInSource` trait, so swapping mock ↔ real is
 //! a one-line change at the demo entry point.
 
+pub mod airgap;
 pub mod always_ok;
 pub mod apply_ban;
 pub mod ban_list;

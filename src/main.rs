@@ -176,39 +176,37 @@ enum Commands {
         #[arg(long)]
         amount_sat: u64,
     },
-    /// Produce the four air-gapped registration values, on a machine that
-    /// touches no chain and no network (WI-092).
+    /// Sign a registration or an exit with the pool COLD key, on the machine
+    /// that holds it. Never the Bifrost key: that one stays on the node.
     ///
-    /// `register-spo` accepts the cold and Bifrost signatures in place of the two
-    /// key files, so a pool's cold key never has to reach a networked block
-    /// producer — the key type exists for exactly that. Nothing could produce the
-    /// cold half, though: it is a RAW Ed25519 signature over the registration
-    /// message, `cardano-cli` has no raw-sign command, and the usual community
-    /// signer's CIP-8 mode signs a WRAPPED payload, so a signature made the
-    /// obvious way verifies nowhere and says nothing about why. This command is
-    /// the signer.
+    /// Reads the `request.json` that `register-spo` or `deregister-spo` wrote,
+    /// prints what it is about to authorize, and writes a `signed.json` for the
+    /// node to finish with. It touches no chain, opens no socket and needs no
+    /// config file.
     ///
-    /// Run it beside your cold key, copy the four printed flags to the node, and
-    /// pass them to `register-spo`. Both signatures are verified here before
-    /// printing, so a mistyped URL fails on the air-gapped machine rather than
-    /// after a fee is spent.
-    SignRegistration {
-        #[arg(long)]
-        config: Option<String>,
+    /// The signature it makes is a RAW Ed25519 signature over an exact message.
+    /// `cardano-cli` has no raw-sign command, and the usual community signer's
+    /// CIP-8 mode signs a WRAPPED payload, so a signature made the obvious way
+    /// verifies nowhere and says nothing about why — which is why this command
+    /// exists. To use your own Ed25519 tool instead, sign the `message` field of
+    /// the request and pass the result to `--cold-sig`.
+    SignWithPoolKey {
+        /// The `request.json` written by `register-spo` / `deregister-spo`.
+        /// `-` reads it from stdin.
+        request: String,
         /// Pool cold SIGNING key: a `cold.skey` TextEnvelope, a path to one, or
-        /// raw 32-byte hex. Falls back to `cardano.cold_skey_path`.
+        /// raw 32-byte hex. Falls back to `cardano.cold_skey_path`, which needs
+        /// a --config; without one, this flag is the only source.
         #[arg(long)]
         cold_skey: Option<String>,
-        /// Bifrost identity secret key: 32-byte hex or a path. Falls back to
-        /// `[bifrost].skey_path`.
+        /// Where to write the signed file. Omit to print it to stdout.
         #[arg(long)]
-        bifrost_skey: Option<String>,
-        /// This SPO's Bifrost endpoint URL. MUST be byte-identical to the one
-        /// `register-spo` uses: it is signed over, so any difference — a
-        /// trailing slash, a different port — invalidates both signatures. Set
-        /// `[bifrost].url` instead and neither command can get it wrong.
+        out: Option<String>,
+        /// Skip the confirmation prompt. Required when stdin is not a terminal.
         #[arg(long)]
-        bifrost_url: Option<String>,
+        yes: bool,
+        #[arg(long)]
+        config: Option<String>,
     },
     /// Print this node's Bifrost identity — the public half of
     /// `[bifrost].skey_path`. Read-only; touches no chain and no secret beyond
@@ -621,10 +619,18 @@ enum Commands {
         /// sha2_256(registration message).
         #[arg(long)]
         bifrost_sig: Option<String>,
+        /// Air-gapped step 1: write the request for `sign-with-pool-key` here
+        /// instead of stdout. Used when no cold key is on this machine.
+        #[arg(long)]
+        out: Option<String>,
+        /// Air-gapped step 3: the `signed.json` that came back from the machine
+        /// holding the cold key. `-` reads it from stdin.
+        #[arg(long)]
+        signed: Option<String>,
         /// This SPO's Bifrost endpoint URL (where DKG data is published).
         /// Falls back to `[bifrost].url`, which is the better place for it: the
         /// registration message commits to these exact bytes, so one value read
-        /// by both this and `sign-registration` cannot drift between them.
+        /// by both this and the air-gapped request cannot drift between them.
         #[arg(long)]
         bifrost_url: Option<String>,
         /// Override the registry reference-script UTxO (<tx_hash>:<index>).
@@ -663,7 +669,7 @@ enum Commands {
         registry_bootstrap: Option<String>,
         /// Pool cold signing key: 32-byte hex, or a path to a file holding that
         /// hex or a cardano-cli TextEnvelope. Omit for the air-gapped flow
-        /// (--cold-vkey + --cold-sig, produced by `sign-revocation`).
+        /// (--cold-vkey + --cold-sig, or the --signed file).
         #[arg(long)]
         cold_skey: Option<String>,
         /// Air-gapped: 32-byte cold verification key, hex (or the .vkey file).
@@ -673,6 +679,22 @@ enum Commands {
         /// message. Run without it first to print the exact message to sign.
         #[arg(long)]
         cold_sig: Option<String>,
+        /// Air-gapped step 1: write the request for `sign-with-pool-key` here
+        /// instead of stdout.
+        #[arg(long)]
+        out: Option<String>,
+        /// Air-gapped step 3: the `signed.json` that came back from the machine
+        /// holding the cold key. `-` reads it from stdin.
+        ///
+        /// It is deleted after a successful submit: the signature it holds
+        /// commits to the pool id and nothing else, so it never expires and
+        /// whoever has it can post this exit and collect the freed deposit.
+        #[arg(long)]
+        signed: Option<String>,
+        /// Keep the --signed file after a successful submit. Know what you are
+        /// keeping: see above.
+        #[arg(long)]
+        keep: bool,
         /// Override the registry reference-script UTxO (<tx_hash>:<index>).
         /// Discovered automatically otherwise, as for register-spo.
         #[arg(long)]
@@ -680,22 +702,6 @@ enum Commands {
         /// Actually submit via Blockfrost (default: print the tx only).
         #[arg(long)]
         submit: bool,
-    },
-    /// Sign a deregistration with the pool COLD key, on the machine that holds
-    /// it — the exit counterpart of `sign-registration`. Prints the
-    /// --cold-vkey/--cold-sig pair for `deregister-spo`, which can then run on
-    /// a node that has never seen the cold key.
-    ///
-    /// The signature commits to nothing but the pool id, so it stays valid for
-    /// the life of the pool key: it is a standing authorization to leave, and
-    /// wants the same care as the key itself.
-    SignRevocation {
-        #[arg(long)]
-        config: Option<String>,
-        /// Pool cold SIGNING key: a `cold.skey` TextEnvelope, a path to one, or
-        /// raw 32-byte hex. Falls back to `cardano.cold_skey_path`.
-        #[arg(long)]
-        cold_skey: Option<String>,
     },
     /// Update-Y: rotate `current_spos_frost_key` in the treasury_info state UTxO
     /// to the incoming roster's Y_51' (the DKG key handoff — §Update-Y). The
@@ -1401,93 +1407,251 @@ fn resolve_one_shot(cfg: &HeimdallConfig, arg: Option<&str>) -> Result<String, S
     Ok(view.params.federation_one_shot)
 }
 
-/// WI-092: the air-gapped half of `register-spo`, as a command that runs where
-/// the cold key lives.
+/// `sign-with-pool-key`: the air-gapped half of `register-spo` and
+/// `deregister-spo`, as one command that runs where the cold key lives.
 ///
-/// Prints the four flags `register-spo` needs and nothing else, so the operator
-/// copies values rather than reproducing a signing scheme. Both signatures are
-/// verified here — the same check `spos_registry.ak` performs — so a wrong URL or
-/// a wrong key file fails on this machine, before a fee is spent on the other.
-fn run_sign_registration(
+/// It reads a request, prints what it is about to authorize, and writes the
+/// signed file. It reads no chain, opens no socket and needs no config: the
+/// only thing it wants is the pool cold key, and saying so is what the command
+/// is named for.
+fn run_sign_with_pool_key(
     cfg: &HeimdallConfig,
+    request_path: &str,
     cold_skey: Option<&str>,
-    bifrost_skey: Option<&str>,
-    bifrost_url: Option<&str>,
+    out: Option<&str>,
+    yes: bool,
 ) -> Result<(), String> {
-    use bitcoin::key::Secp256k1;
-    use bitcoin::secp256k1::Keypair;
-    use heimdall::cardano::register_spo::{sign_registration, verify_registration};
+    use heimdall::cardano::airgap::{Action, SigningRequest, sign};
     use pallas_crypto::key::ed25519;
 
-    let bifrost_url = &resolve_bifrost_url(cfg, bifrost_url)?;
+    let req: SigningRequest = read_json(request_path, "request")?;
     let cold_src = cold_skey
         .or(cfg.cardano.cold_skey_path.as_deref())
-        .ok_or("no cold key: pass --cold-skey or set cardano.cold_skey_path")?;
+        .ok_or("no cold key: pass --cold-skey (or set cardano.cold_skey_path and --config)")?;
     let cold = ed25519::SecretKey::from(parse_key32(cold_src, "--cold-skey")?);
 
-    let secp = Secp256k1::new();
-    let bifrost = match bifrost_skey {
-        Some(arg) => Keypair::from_seckey_slice(&secp, &parse_key32(arg, "--bifrost-skey")?)
-            .map_err(|e| format!("--bifrost-skey: {e}"))?,
-        None => cfg
-            .load_bifrost_keypair(&secp)
-            .map_err(|e| format!("no --bifrost-skey and [bifrost].skey_path: {e}"))?,
-    };
-
-    let sigs = sign_registration(&cold, &bifrost, bifrost_url.as_bytes());
-    let bifrost_id_pk = bifrost.x_only_public_key().0.serialize();
-    // The same verification spos_registry.ak runs. It cannot fail for keys this
-    // command just signed with, which is the point: if it ever does, the message
-    // construction here and there have diverged, and that must not reach a chain.
-    let pool_id = verify_registration(&sigs, &bifrost_id_pk, bifrost_url.as_bytes())
-        .map_err(|e| format!("self-check failed, refusing to print: {e}"))?;
-
-    println!("pool id:  {}", hex::encode(pool_id));
+    // Everything the operator needs to recognise a wrong file, before the key is
+    // used: which bridge, which pool, and — for a registration — the two values
+    // being bound to it.
+    let pool_id = heimdall::cardano::register_spo::pool_id_from_cold_vkey(&<[u8; 32]>::from(
+        cold.public_key(),
+    ));
     println!();
-    println!("Pass these to `register-spo` on the node, with the SAME --bifrost-url:");
-    println!();
-    println!("    --bifrost-url {bifrost_url} \\");
-    println!("    --cold-vkey {} \\", hex::encode(sigs.cold_vkey));
-    println!("    --cold-sig {} \\", hex::encode(sigs.cold_sig));
-    println!("    --bifrost-id-pk {} \\", hex::encode(bifrost_id_pk));
-    println!("    --bifrost-sig {}", hex::encode(sigs.bifrost_sig));
-    Ok(())
-}
-
-/// Sign a deregistration off the node: Ed25519 over `"bifrost-revoke" || pool_id`
-/// with the pool cold key. The exit counterpart of [`run_sign_registration`],
-/// and it needs strictly less — no bifrost key, no URL, because the contract
-/// asks the operational key for nothing when its owner leaves.
-fn run_sign_revocation(cfg: &HeimdallConfig, cold_skey: Option<&str>) -> Result<(), String> {
-    use heimdall::cardano::deregister_spo::{sign_revocation, verify_revocation};
-    use pallas_crypto::key::ed25519;
-
-    let cold_src = cold_skey
-        .or(cfg.cardano.cold_skey_path.as_deref())
-        .ok_or("no cold key: pass --cold-skey or set cardano.cold_skey_path")?;
-    let cold = ed25519::SecretKey::from(parse_key32(cold_src, "--cold-skey")?);
-
-    let sig = sign_revocation(&cold);
-    // The same verification spos-registry.ak runs. It cannot fail for a key this
-    // command just signed with, which is the point: if it ever does, the message
-    // construction here and there have diverged, and that must not reach a chain.
-    let pool_id = verify_revocation(&sig)
-        .map_err(|e| format!("self-check failed, refusing to print: {e}"))?;
-
+    match req.action {
+        Action::Register => println!("JOIN the bifrost bridge on {}", req.network),
+        Action::Deregister => println!("LEAVE the bifrost bridge on {}", req.network),
+    }
     println!(
-        "pool id:  {} ({})",
+        "  pool id:      {} ({})",
         hex::encode(pool_id),
         pool_id_bech32(&pool_id)
     );
+    if let Some(url) = &req.bifrost_url {
+        println!("  bifrost url:  {url}");
+    }
+    if let Some(pk) = &req.bifrost_id_pk {
+        println!("  bifrost pk:   {pk}");
+    }
+    println!("  registry:     {}", req.registry_policy);
+    if req.action == Action::Deregister {
+        println!();
+        println!("  This authorization commits to the pool id and NOTHING ELSE: it never");
+        println!("  expires, and whoever holds the file can post this exit from their own");
+        println!("  wallet and collect the freed deposit. Treat it like the cold key.");
+    }
     println!();
-    println!("Pass these to `deregister-spo` on the node:");
-    println!();
-    println!("    --cold-vkey {} \\", hex::encode(sig.cold_vkey));
-    println!("    --cold-sig {}", hex::encode(sig.cold_sig));
-    println!();
-    println!("This signature commits to the pool id and nothing else, so it stays valid until the");
-    println!("cold key changes. Keep it as private as the key that made it.");
+    confirm("Sign with the pool cold key?", yes)?;
+
+    let signed = sign(&req, &cold)?;
+    let secret = req.action == Action::Deregister;
+    write_json(&signed, out, secret)?;
+    if secret && out.is_some() {
+        println!("Delete this file once the exit is on chain. `deregister-spo --signed` does");
+        println!("it for you unless you pass --keep.");
+    }
     Ok(())
+}
+
+/// Read a request or a response. `-` is stdin, so an operator with a shell on
+/// both machines can pipe instead of carrying a stick.
+fn read_json<T: serde::de::DeserializeOwned>(path: &str, what: &str) -> Result<T, String> {
+    let text = if path == "-" {
+        std::io::read_to_string(std::io::stdin()).map_err(|e| format!("read {what}: {e}"))?
+    } else {
+        std::fs::read_to_string(path).map_err(|e| format!("read {what} {path}: {e}"))?
+    };
+    serde_json::from_str(&text).map_err(|e| format!("{what} {path}: {e}"))
+}
+
+/// Write a request or a response: to `out` if given, else to stdout. `secret`
+/// files are created `0600` — see the warning in `run_sign_with_pool_key`.
+fn write_json<T: serde::Serialize>(
+    value: &T,
+    out: Option<&str>,
+    secret: bool,
+) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(value).map_err(|e| format!("encode: {e}"))?;
+    let Some(path) = out else {
+        println!("{text}");
+        return Ok(());
+    };
+    std::fs::write(path, format!("{text}\n")).map_err(|e| format!("write {path}: {e}"))?;
+    if secret {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("chmod 0600 {path}: {e}"))?;
+        }
+    }
+    println!("written: {path}");
+    Ok(())
+}
+
+/// What to call this bridge's network on the air-gapped confirmation screen.
+///
+/// `cardano.network` is optional on hosted blockfrost.io, where the project-id
+/// prefix carries it — and that is exactly the deployment where "JOIN the
+/// bifrost bridge on unknown" would be the first line the operator reads beside
+/// their cold key.
+fn network_label(cfg: &HeimdallConfig) -> String {
+    if let Some(name) = cfg.cardano.network.as_deref() {
+        return name.to_string();
+    }
+    match cfg.cardano.is_mainnet() {
+        Ok(true) => "mainnet".to_string(),
+        Ok(false) => "a testnet".to_string(),
+        Err(_) => "an unnamed network".to_string(),
+    }
+}
+
+/// This node's own pool id, read out of the registry by the bifrost key it runs
+/// on — the lookup `doctor` step 6 makes.
+///
+/// It is what lets an exit be prepared with no cold key and no
+/// `cardano.cold_vkey_path`: a leaving pool is by definition already registered,
+/// so the chain knows its pool id even when this machine does not.
+fn find_own_pool_id(
+    cfg: &HeimdallConfig,
+    registry_policy_hex: &str,
+    registry_utxos: &[heimdall::cardano::bf_http::BfUtxo],
+    treasury_policy_hex: &str,
+    treasury_utxos: &[heimdall::cardano::bf_http::BfUtxo],
+) -> Result<[u8; 28], String> {
+    use bitcoin::key::Secp256k1;
+
+    let secp = Secp256k1::new();
+    let keypair = cfg.load_bifrost_keypair(&secp).map_err(|e| {
+        format!(
+            "no cold key here and no [bifrost].skey_path to find this pool's registry entry \
+             with: {e}"
+        )
+    })?;
+    let our_pk = keypair.x_only_public_key().0.serialize();
+
+    let snapshot = heimdall::cardano::roster::registry_snapshot(
+        registry_utxos,
+        registry_policy_hex,
+        treasury_utxos,
+        treasury_policy_hex,
+        &hex::encode(heimdall::cardano::config_params::TREASURY_INFO_ASSET_NAME),
+    )
+    .map_err(|e| format!("read the registry: {e}"))?;
+
+    let mine = snapshot
+        .spos
+        .iter()
+        .find(|s| s.bifrost_id_pk == our_pk)
+        .ok_or_else(|| {
+            format!(
+                "no registry entry for this node's bifrost key ({}). There is nothing to \
+                 leave — either this pool never registered, or [bifrost].skey_path points at \
+                 a different key than the one it registered with",
+                hex::encode(our_pk)
+            )
+        })?;
+    mine.pool_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| "registry entry with a malformed pool id".to_string())
+}
+
+/// What an exit costs the ROSTER, which is not visible in the transaction.
+///
+/// `spo_bans.ak` requires a LIVE registration node for the accused pool as a
+/// reference input — `validate_registered_pool_ref`, in both the first-ban and
+/// the re-ban branch. The exit burns that node's NFT, so once it confirms no
+/// ApplyBan naming this pool can be built again, ever: an outstanding fault
+/// proof becomes unenforceable and an existing ban can no longer escalate.
+///
+/// Only half of it CAN be checked. An unspent FaultProof token sits at its
+/// minter's own wallet with no datum, under a name that is
+/// blake2b_256(pool_id || evidence_hash) — so "is someone about to ban me" has
+/// no off-chain query. The ban list does. Reported before the request is
+/// written, because this is the output that decides whether to make the trip.
+fn report_ban_record(
+    rt: &tokio::runtime::Runtime,
+    base_url: &str,
+    project_id: &str,
+    ban_addr: &str,
+    ban_policy_hex: &str,
+    pool_id: &[u8; 28],
+) {
+    use heimdall::cardano::bf_http;
+
+    println!();
+    match rt.block_on(bf_http::fetch_address_utxos(base_url, project_id, ban_addr)) {
+        Ok(ban_utxos) => {
+            match heimdall::cardano::ban_list::ban_snapshot(&ban_utxos, ban_policy_hex) {
+                Ok(list) => match list.get(pool_id) {
+                    Some(node) => println!(
+                        "ban record:        THIS POOL IS IN THE BAN LIST (ban_counter={}, \
+                     until={}{}). Leaving now makes that ban unescalatable: a re-ban needs \
+                     this registration node as a reference input.",
+                        node.ban_counter,
+                        node.ban_until_time,
+                        if node.permanent { ", PERMANENT" } else { "" }
+                    ),
+                    None => println!("ban record:        none for this pool"),
+                },
+                Err(e) => println!("ban record:        unreadable ({e}) — cannot say"),
+            }
+        }
+        Err(e) => println!("ban record:        unreadable ({e}) — cannot say"),
+    }
+    println!(
+        "                   NOTE: this exit burns the registry node that `apply-ban` needs as \
+         a reference input, so no ban for this pool can be applied after it confirms."
+    );
+    println!();
+}
+
+/// Ask before using the cold key. Refuses to assume consent when there is
+/// nobody at the terminal to give it.
+fn confirm(question: &str, yes: bool) -> Result<(), String> {
+    use std::io::IsTerminal as _;
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(
+            "nothing is attached to this terminal to answer the confirmation. Pass --yes if \
+             you meant to run unattended"
+                .into(),
+        );
+    }
+    print!("{question} [y/N] ");
+    use std::io::Write as _;
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    if matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
+        Ok(())
+    } else {
+        Err("not signed".into())
+    }
 }
 
 /// Whether this wallet already holds a reference script for `script_hash_hex`.
@@ -1523,10 +1687,10 @@ fn ref_script_already_deployed(
 
 /// This node's Bifrost endpoint URL: the flag, else `[bifrost].url`.
 ///
-/// One resolver for both `register-spo` and `sign-registration` because the
-/// registration message commits to these EXACT bytes — a trailing slash or a
-/// different port between the two invalidates both signatures, and the failure
-/// says only "signature does not verify".
+/// One resolver, because the registration message commits to these EXACT bytes:
+/// a trailing slash or a different port between writing the air-gapped request
+/// and submitting the answer invalidates both signatures. `SignedResponse::check`
+/// reports that as the field that moved; this keeps it from happening at all.
 fn resolve_bifrost_url(cfg: &HeimdallConfig, arg: Option<&str>) -> Result<String, String> {
     let raw = arg.or(cfg.bifrost.url.as_deref()).ok_or_else(|| {
         "no Bifrost endpoint URL: pass --bifrost-url or set [bifrost].url. It is published \
@@ -1701,19 +1865,17 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::SignRegistration {
-            config,
+        Commands::SignWithPoolKey {
+            request,
             cold_skey,
-            bifrost_skey,
-            bifrost_url,
+            out,
+            yes,
+            config,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) = run_sign_registration(
-                &cfg,
-                cold_skey.as_deref(),
-                bifrost_skey.as_deref(),
-                bifrost_url.as_deref(),
-            ) {
+            if let Err(e) =
+                run_sign_with_pool_key(&cfg, &request, cold_skey.as_deref(), out.as_deref(), yes)
+            {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1935,6 +2097,8 @@ fn main() {
             bifrost_id_pk,
             bifrost_sig,
             bifrost_url,
+            out,
+            signed,
             registry_ref,
             submit,
         } => {
@@ -1949,6 +2113,8 @@ fn main() {
                 bifrost_id_pk,
                 bifrost_sig,
                 bifrost_url,
+                out,
+                signed,
                 registry_ref,
                 submit,
             };
@@ -1964,6 +2130,9 @@ fn main() {
             cold_skey,
             cold_vkey,
             cold_sig,
+            out,
+            signed,
+            keep,
             registry_ref,
             submit,
         } => {
@@ -1974,17 +2143,13 @@ fn main() {
                 cold_skey,
                 cold_vkey,
                 cold_sig,
+                out,
+                signed,
+                keep,
                 registry_ref,
                 submit,
             };
             if let Err(e) = run_deregister_spo(&cfg, &args) {
-                error!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Commands::SignRevocation { config, cold_skey } => {
-            let cfg = load_config(config.as_deref());
-            if let Err(e) = run_sign_revocation(&cfg, cold_skey.as_deref()) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -5948,6 +6113,8 @@ struct RegisterSpoArgs {
     bifrost_id_pk: Option<String>,
     bifrost_sig: Option<String>,
     bifrost_url: Option<String>,
+    out: Option<String>,
+    signed: Option<String>,
     registry_ref: Option<String>,
     submit: bool,
 }
@@ -5959,6 +6126,9 @@ struct DeregisterSpoArgs {
     cold_skey: Option<String>,
     cold_vkey: Option<String>,
     cold_sig: Option<String>,
+    out: Option<String>,
+    signed: Option<String>,
+    keep: bool,
     registry_ref: Option<String>,
     submit: bool,
 }
@@ -5985,8 +6155,19 @@ struct FaultProofMintArgs {
 /// Parse a 32-byte secret-key argument: inline hex, a file containing hex, or
 /// a cardano-cli TextEnvelope file (`cborHex` = `"5820" || 32 bytes`).
 fn parse_key32(arg: &str, what: &str) -> Result<[u8; 32], String> {
-    let content = if std::path::Path::new(arg).is_file() {
+    let path = std::path::Path::new(arg);
+    let content = if path.is_file() {
         std::fs::read_to_string(arg).map_err(|e| format!("{what}: read {arg}: {e}"))?
+    } else if arg.contains('/')
+        || matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("skey" | "vkey")
+        )
+    {
+        // It is a path, and it is not there. Falling through would parse the
+        // PATH as hex and report "expected 32 bytes of hex", which sends the
+        // operator to look inside a file this never opened.
+        return Err(format!("{what}: no such file: {arg}"));
     } else {
         arg.to_string()
     };
@@ -6339,6 +6520,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     use bitcoin::hashes::{Hash as _, sha256};
     use bitcoin::key::Secp256k1;
     use bitcoin::secp256k1::{Keypair, Message};
+    use heimdall::cardano::airgap::{SignedResponse, SigningRequest};
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
     use heimdall::cardano::publish::WalletUtxo;
@@ -6396,27 +6578,38 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         .cold_vkey
         .as_deref()
         .or(cfg.cardano.cold_vkey_path.as_deref());
-    let cold_vkey: [u8; 32] = match (&cold_skey, cold_vkey_src) {
-        (Some(sk), None) => sk.public_key().into(),
+    let cold_vkey_local: Option<[u8; 32]> = match (&cold_skey, cold_vkey_src) {
+        (Some(sk), None) => Some(sk.public_key().into()),
         // parse_key32, not raw hex: pool-cold.vkey is a Cardano TextEnvelope, so
         // requiring hex here made the operator slice `cborHex` past its 5820
         // prefix by hand — while --cold-skey accepted the file directly. A wrong
         // slice yields a wrong pool_id, i.e. a well-formed registration for a
         // pool that is not theirs.
-        (None, Some(vk)) => parse_key32(vk, "--cold-vkey")?,
+        (None, Some(vk)) => Some(parse_key32(vk, "--cold-vkey")?),
         (Some(sk), Some(vk)) => {
             let derived: [u8; 32] = sk.public_key().into();
             if parse_key32(vk, "--cold-vkey")? != derived {
                 return Err("--cold-vkey does not match --cold-skey".into());
             }
-            derived
+            Some(derived)
         }
-        (None, None) => {
-            return Err(
-                "provide --cold-skey, or --cold-vkey (+ --cold-sig) for the air-gapped flow".into(),
-            );
-        }
+        (None, None) => None,
     };
+    // Whether this run can produce the cold half at all. It cannot when the key
+    // is on the other machine, which is not a mistake: the command then runs its
+    // read-only checks and writes the request that machine answers. Keyed on the
+    // SIGNATURE sources, not on `cold_vkey_local` — `cardano.cold_vkey_path` is
+    // public material and may be set on a node that holds no cold key.
+    let request_mode = cold_skey.is_none() && args.cold_sig.is_none() && args.signed.is_none();
+    if request_mode && args.submit {
+        return Err(
+            "--submit needs the cold signature, and this machine has no cold key. \
+                    Run this without --submit to write the request, sign it beside the key \
+                    with `heimdall sign-with-pool-key`, then re-run with --signed <file> \
+                    --submit."
+                .into(),
+        );
+    }
 
     let secp = Secp256k1::new();
     // `[bifrost].skey_path` is the same key the daemon runs on, so a node that
@@ -6452,53 +6645,41 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         }
     };
 
-    let pool_id = pool_id_from_cold_vkey(&cold_vkey);
     let bifrost_url = resolve_bifrost_url(cfg, args.bifrost_url.as_deref())?;
-    let message = registration_message(&pool_id, &bifrost_id_pk, bifrost_url.as_bytes());
-    let digest = sha256::Hash::hash(&message).to_byte_array();
 
-    let cold_sig: [u8; 64] = match (&cold_skey, args.cold_sig.as_deref()) {
-        (Some(sk), _) => sk
-            .sign(&message)
-            .as_ref()
-            .try_into()
-            .expect("ed25519 signature is 64 bytes"),
-        (None, Some(sig)) => parse_hex_n(sig, "--cold-sig")?,
-        (None, None) => {
-            return Err(format!(
-                "no --cold-skey/--cold-sig. Air-gapped: Ed25519-sign this message with the \
-                 pool cold key and re-run with --cold-sig:\n  message (hex): {}",
-                hex::encode(&message)
-            ));
-        }
-    };
-    let bifrost_sig: [u8; 64] = match (&bifrost_keypair, args.bifrost_sig.as_deref()) {
-        (Some(kp), _) => secp
-            .sign_schnorr_no_aux_rand(&Message::from_digest(digest), kp)
-            .serialize(),
-        (None, Some(sig)) => parse_hex_n(sig, "--bifrost-sig")?,
-        (None, None) => {
-            return Err(format!(
-                "no --bifrost-skey/--bifrost-sig. Air-gapped: BIP340-sign this 32-byte digest \
-                 with the bifrost identity key and re-run with --bifrost-sig:\n  \
-                 sha2_256(message): {}",
-                hex::encode(digest)
-            ));
-        }
-    };
-    let sigs = RegistrationSignatures {
-        cold_vkey,
-        cold_sig,
-        bifrost_sig,
-    };
-    verify_registration(&sigs, &bifrost_id_pk, bifrost_url.as_bytes())
-        .map_err(|e| format!("registration signatures: {e}"))?;
-
-    println!(
-        "pool id:           {} ({})",
-        hex::encode(pool_id),
-        pool_id_bech32(&pool_id)
+    // What this node is asking the cold key to authorize, and what a returning
+    // file is checked against. It carries a pool id only when this machine can
+    // derive one: a registering pool is in no registry, so `cold_vkey_path` is
+    // the only source, and without it the message is completed on the other side.
+    let request = SigningRequest::register(
+        &network_label(cfg),
+        &registry.hash_hex(),
+        &bifrost_url,
+        &bifrost_id_pk,
+        cold_vkey_local.map(|vk| pool_id_from_cold_vkey(&vk)),
     );
+    // Air-gapped step 3. The checks are in `SignedResponse::check`, and they name
+    // what moved — a URL that changed between the two machines is reported as
+    // that, not as a signature that does not verify.
+    let from_file: Option<([u8; 32], [u8; 64])> = args
+        .signed
+        .as_deref()
+        .map(|p| -> Result<_, String> {
+            read_json::<SignedResponse>(p, "--signed")?.check(&request, cold_vkey_local)
+        })
+        .transpose()?;
+
+    let cold_vkey: Option<[u8; 32]> = from_file.map(|(vk, _)| vk).or(cold_vkey_local);
+    let pool_id: Option<[u8; 28]> = cold_vkey.as_ref().map(pool_id_from_cold_vkey);
+
+    match &pool_id {
+        Some(id) => println!(
+            "pool id:           {} ({})",
+            hex::encode(id),
+            pool_id_bech32(id)
+        ),
+        None => println!("pool id:           not known on this machine (no cold key here)"),
+    }
     println!("bifrost_id_pk:     {}", hex::encode(bifrost_id_pk));
     println!("bifrost_url:       {bifrost_url}");
     println!("registry policy:   {}", registry.hash_hex());
@@ -6521,7 +6702,17 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let stake_source = StakeSource::from_config(cfg.cardano.stake_source.as_deref())?;
     let min_stake = cfg.cardano.min_stake_lovelace;
     match min_stake {
+        // The gate is keyed on the pool id, so it cannot run before the cold
+        // machine has answered. Saying so is the point: an operator who sets
+        // `cardano.cold_vkey_path` — public material, safe on a node — learns
+        // about a FAIL here, before making the trip, instead of after it.
+        Some(_) if pool_id.is_none() => {
+            println!("min-stake gate:    SKIPPED — pool id is not known on this machine.");
+            println!("                   Set cardano.cold_vkey_path (the PUBLIC half) to");
+            println!("                   check it before the trip. It runs on --signed.");
+        }
         Some(threshold) => {
+            let pool_id = pool_id.expect("checked by the arm above");
             // yaci-store reads stake per-epoch; Blockfrost ignores the epoch.
             let epoch = match stake_source {
                 StakeSource::YaciStore => rt
@@ -6671,6 +6862,68 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         }
     };
 
+    // ── air-gapped step 1: everything above was read-only, so the trip to the
+    // safe is only worth making now that it passed ──
+    if request_mode {
+        println!();
+        println!("The pool cold key is not on this machine, so nothing can be built yet.");
+        println!("Take this request to the machine that holds cold.skey:");
+        println!();
+        println!(
+            "    heimdall sign-with-pool-key <request> --cold-skey cold.skey --out signed.json"
+        );
+        println!();
+        println!("then come back and run this again with --signed signed.json --submit.");
+        println!();
+        write_json(&request, args.out.as_deref(), false)?;
+        return Ok(());
+    }
+
+    // ── the two signatures ──
+    //
+    // The cold half is local, or arrived in the signed file; the bifrost half is
+    // always made here, because that key never leaves this machine.
+    // Not `expect`: `--cold-sig` alone reaches here with no verification key,
+    // and the message it signed cannot be rebuilt without one.
+    let cold_vkey = cold_vkey.ok_or(
+        "--cold-sig needs --cold-vkey (or cardano.cold_vkey_path) to say which pool it \
+                is for. `--signed` carries both and needs neither",
+    )?;
+    let pool_id = pool_id_from_cold_vkey(&cold_vkey);
+    let message = registration_message(&pool_id, &bifrost_id_pk, bifrost_url.as_bytes());
+    let digest = sha256::Hash::hash(&message).to_byte_array();
+    let cold_sig: [u8; 64] = match (&cold_skey, from_file, args.cold_sig.as_deref()) {
+        (Some(sk), _, _) => sk
+            .sign(&message)
+            .as_ref()
+            .try_into()
+            .expect("ed25519 signature is 64 bytes"),
+        (None, Some((_, sig)), _) => sig,
+        (None, None, Some(sig)) => parse_hex_n(sig, "--cold-sig")?,
+        (None, None, None) => unreachable!("request_mode covers this"),
+    };
+    let bifrost_sig: [u8; 64] = match (&bifrost_keypair, args.bifrost_sig.as_deref()) {
+        (Some(kp), _) => secp
+            .sign_schnorr_no_aux_rand(&Message::from_digest(digest), kp)
+            .serialize(),
+        (None, Some(sig)) => parse_hex_n(sig, "--bifrost-sig")?,
+        (None, None) => {
+            return Err(format!(
+                "no --bifrost-skey/--bifrost-sig. Air-gapped: BIP340-sign this 32-byte digest \
+                 with the bifrost identity key and re-run with --bifrost-sig:\n  \
+                 sha2_256(message): {}",
+                hex::encode(digest)
+            ));
+        }
+    };
+    let sigs = RegistrationSignatures {
+        cold_vkey,
+        cold_sig,
+        bifrost_sig,
+    };
+    verify_registration(&sigs, &bifrost_id_pk, bifrost_url.as_bytes())
+        .map_err(|e| format!("registration signatures: {e}"))?;
+
     // Rev 5.5: treasury.ak's RegistryUpdate branch reads the registry policy from
     // the Config datum ([TSY-12]), so the tx must reference the Config UTxO.
     let config_view = rt
@@ -6732,6 +6985,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
 /// min-stake gate (that is a registration policy), and no epoch validity window
 /// (the spec leaves the interval unconstrained — an exit binds to no snapshot).
 fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<(), String> {
+    use heimdall::cardano::airgap::{SignedResponse, SigningRequest};
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
     use heimdall::cardano::deregister_spo::{
@@ -6783,54 +7037,42 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         .cold_vkey
         .as_deref()
         .or(cfg.cardano.cold_vkey_path.as_deref());
-    let cold_vkey: [u8; 32] = match (&cold_skey, cold_vkey_src) {
-        (Some(sk), None) => sk.public_key().into(),
-        (None, Some(vk)) => parse_key32(vk, "--cold-vkey")?,
+    let cold_vkey_local: Option<[u8; 32]> = match (&cold_skey, cold_vkey_src) {
+        (Some(sk), None) => Some(sk.public_key().into()),
+        (None, Some(vk)) => Some(parse_key32(vk, "--cold-vkey")?),
         (Some(sk), Some(vk)) => {
             let derived: [u8; 32] = sk.public_key().into();
             if parse_key32(vk, "--cold-vkey")? != derived {
                 return Err("--cold-vkey does not match --cold-skey".into());
             }
-            derived
+            Some(derived)
         }
-        (None, None) => {
-            return Err(
-                "provide --cold-skey, or --cold-vkey (+ --cold-sig) for the air-gapped flow. \
-                 `heimdall sign-revocation` produces both on the machine that holds the cold key"
-                    .into(),
+        (None, None) => None,
+    };
+    // As in run_register_spo: keyed on the SIGNATURE sources, because a node may
+    // legitimately know the public half of a cold key it does not hold.
+    let request_mode = cold_skey.is_none() && args.cold_sig.is_none() && args.signed.is_none();
+    if request_mode && args.submit {
+        return Err(
+            "--submit needs the cold signature, and this machine has no cold key. \
+                    Run this without --submit to write the request, sign it beside the key \
+                    with `heimdall sign-with-pool-key`, then re-run with --signed <file> \
+                    --submit."
+                .into(),
+        );
+    }
+
+    match &cold_vkey_local {
+        Some(vk) => {
+            let id = pool_id_from_cold_vkey(vk);
+            println!(
+                "pool id:           {} ({})",
+                hex::encode(id),
+                pool_id_bech32(&id)
             );
         }
-    };
-
-    let pool_id = pool_id_from_cold_vkey(&cold_vkey);
-    let message = revocation_message(&pool_id);
-    let cold_sig: [u8; 64] = match (&cold_skey, args.cold_sig.as_deref()) {
-        (Some(sk), _) => sk
-            .sign(&message)
-            .as_ref()
-            .try_into()
-            .expect("ed25519 signature is 64 bytes"),
-        (None, Some(sig)) => parse_hex_n(sig, "--cold-sig")?,
-        (None, None) => {
-            return Err(format!(
-                "no --cold-skey/--cold-sig. Air-gapped: Ed25519-sign this message with the \
-                 pool cold key (or run `heimdall sign-revocation` there) and re-run with \
-                 --cold-sig:\n  message (hex): {}",
-                hex::encode(&message)
-            ));
-        }
-    };
-    let sig = RevocationSignature {
-        cold_vkey,
-        cold_sig,
-    };
-    verify_revocation(&sig).map_err(|e| format!("revocation signature: {e}"))?;
-
-    println!(
-        "pool id:           {} ({})",
-        hex::encode(pool_id),
-        pool_id_bech32(&pool_id)
-    );
+        None => println!("pool id:           looked up in the registry below"),
+    }
     println!("registry policy:   {}", registry.hash_hex());
     println!("treasury policy:   {}", treasury.hash_hex());
 
@@ -6916,6 +7158,80 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         .block_on(config_view_async(cfg))?
         .ok_or("deregister-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
 
+    // A leaving pool is already in the registry, so its id can always be found
+    // here — by the bifrost key this node runs on, the same lookup `doctor`
+    // step 6 makes. `cold_vkey_path` is not needed for an exit.
+    let pool_id = match cold_vkey_local {
+        Some(vk) => pool_id_from_cold_vkey(&vk),
+        None => find_own_pool_id(
+            cfg,
+            &registry.hash_hex(),
+            &registry_utxos,
+            &treasury.hash_hex(),
+            &treasury_utxos,
+        )?,
+    };
+    let ban_policy = config_view.params.bans.spo_bans_policy_id;
+    let ban_addr = heimdall::cardano::blueprint::script_enterprise_address(&ban_policy, network);
+    report_ban_record(
+        &rt,
+        &base_url,
+        pid,
+        &ban_addr,
+        &hex::encode(ban_policy),
+        &pool_id,
+    );
+
+    // ── air-gapped step 1 ──
+    if request_mode {
+        println!();
+        println!("The pool cold key is not on this machine, so nothing can be built yet.");
+        println!("Read the ban record above before you make the trip, then:");
+        println!();
+        println!(
+            "    heimdall sign-with-pool-key <request> --cold-skey cold.skey --out signed.json"
+        );
+        println!();
+        println!("and run this again with --signed signed.json --submit.");
+        println!();
+        let request =
+            SigningRequest::deregister(&network_label(cfg), &registry.hash_hex(), &pool_id);
+        write_json(&request, args.out.as_deref(), false)?;
+        return Ok(());
+    }
+
+    // ── the cold signature: local, or the one that came back in the file ──
+    let now = SigningRequest::deregister(&network_label(cfg), &registry.hash_hex(), &pool_id);
+    let from_file: Option<([u8; 32], [u8; 64])> = args
+        .signed
+        .as_deref()
+        .map(|p| -> Result<_, String> {
+            read_json::<SignedResponse>(p, "--signed")?.check(&now, cold_vkey_local)
+        })
+        .transpose()?;
+    let message = revocation_message(&pool_id);
+    let sig = match (&cold_skey, from_file, args.cold_sig.as_deref()) {
+        (Some(sk), _, _) => RevocationSignature {
+            cold_vkey: sk.public_key().into(),
+            cold_sig: sk
+                .sign(&message)
+                .as_ref()
+                .try_into()
+                .expect("ed25519 signature is 64 bytes"),
+        },
+        (None, Some((cold_vkey, cold_sig)), _) => RevocationSignature {
+            cold_vkey,
+            cold_sig,
+        },
+        (None, None, Some(s)) => RevocationSignature {
+            cold_vkey: cold_vkey_local
+                .ok_or("--cold-sig needs --cold-vkey (or cardano.cold_vkey_path)")?,
+            cold_sig: parse_hex_n(s, "--cold-sig")?,
+        },
+        (None, None, None) => unreachable!("request_mode covers this"),
+    };
+    verify_revocation(&sig).map_err(|e| format!("revocation signature: {e}"))?;
+
     let req = DeregisterSpoRequest {
         registry_script: &registry,
         treasury_script: &treasury,
@@ -6951,34 +7267,6 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
     // its minter's own wallet with no datum, under a name that is
     // blake2b_256(pool_id || evidence_hash) — so "is someone about to ban me"
     // has no off-chain query. The ban list does.
-    println!();
-    let ban_policy = config_view.params.bans.spo_bans_policy_id;
-    let ban_addr = heimdall::cardano::blueprint::script_enterprise_address(&ban_policy, network);
-    match rt.block_on(bf_http::fetch_address_utxos(&base_url, pid, &ban_addr)) {
-        Ok(ban_utxos) => {
-            match heimdall::cardano::ban_list::ban_snapshot(&ban_utxos, &hex::encode(ban_policy)) {
-                Ok(list) => match list.get(&pool_id) {
-                    Some(node) => println!(
-                        "ban record:        THIS POOL IS IN THE BAN LIST (ban_counter={}, \
-                         until={}{}). Leaving now makes that ban unescalatable: a re-ban needs \
-                         this registration node as a reference input.",
-                        node.ban_counter,
-                        node.ban_until_time,
-                        if node.permanent { ", PERMANENT" } else { "" }
-                    ),
-                    None => println!("ban record:        none for this pool"),
-                },
-                Err(e) => println!("ban record:        unreadable ({e}) — cannot say"),
-            }
-        }
-        Err(e) => println!("ban record:        unreadable ({e}) — cannot say"),
-    }
-    println!(
-        "                   NOTE: this exit burns the registry node that `apply-ban` needs as \
-         a reference input, so no ban for this pool can be applied after it confirms."
-    );
-    println!();
-
     let anchor = if built.anchor_asset_name == REGISTRATION_ROOT_KEY {
         "reg-root (registry root)".to_string()
     } else {
@@ -7006,6 +7294,22 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
 
     let out = finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex);
     if out.is_ok() && args.submit {
+        // The exit authorization commits to the pool id and nothing else, so it
+        // never expires: whoever holds the file can post this exit from their own
+        // wallet and collect the freed deposit. It has now done its one job.
+        // (The durable fix is a deadline in the signed message and belongs to the
+        // next spos-registry revision — see the air-gapped design doc.)
+        if let (Some(path), false) = (args.signed.as_deref(), args.keep)
+            && path != "-"
+        {
+            match std::fs::remove_file(path) {
+                Ok(()) => println!("removed {path} — it was a standing authorization to leave."),
+                Err(e) => println!(
+                    "could not remove {path} ({e}) — delete it yourself: it stays a valid \
+                     authorization to leave, for anyone who has it."
+                ),
+            }
+        }
         // The one thing an exiting operator can still get wrong, and it is not
         // in the transaction: the roster for the CURRENT epoch was frozen at its
         // boundary and this removal does not reach back into it.
@@ -9336,8 +9640,37 @@ mod tests {
         MOVER_KEY_MISMATCH, cross_check_treasury, csv_depth_verdict, mover_key_mismatch_error,
         parse_cardano_outref, parse_hex_n, parse_key32, parse_treasury_override, pool_id_bech32,
         port_from_url, ref_script_already_deployed, resolve_bifrost_url, treasury_script_verdict,
+        write_json,
     };
     use heimdall::config::HeimdallConfig;
+
+    /// An exit authorization is a bearer instrument until it is submitted: it
+    /// commits to the pool id and nothing else, so anyone holding the file can
+    /// post the exit and take the freed deposit. It must not land world-readable
+    /// on a shared machine or a stick.
+    #[test]
+    #[cfg(unix)]
+    fn a_secret_file_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("heimdall-airgap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("signed.json");
+        let public = dir.join("request.json");
+
+        write_json(&"x", Some(secret.to_str().unwrap()), true).unwrap();
+        write_json(&"x", Some(public.to_str().unwrap()), false).unwrap();
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&secret),
+            0o600,
+            "exit authorization must be owner-only"
+        );
+        assert_ne!(mode(&public), 0o600, "a request is not a secret");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The packaged unit must actually START.
     ///
@@ -9473,7 +9806,7 @@ mod tests {
         }
     }
 
-    /// WI-092: what `sign-registration` prints must be what `register-spo`
+    /// WI-092: what the air-gapped signer produces must be what `register-spo`
     /// accepts, and the binding must be to THIS url. The self-check inside the
     /// command cannot catch a divergence between the two sides on its own — it
     /// signs and verifies with one message builder — so this pins the property
@@ -9672,6 +10005,18 @@ mod tests {
             false
         ));
         assert!(!ref_script_already_deployed(&[], &hash, "registry", false));
+    }
+
+    /// A path that is not there must say so. It used to fall through to "expected
+    /// 32 bytes of hex" — the path was parsed AS hex — which sends an operator
+    /// looking at the contents of a file the command never opened, or at a config
+    /// key that is correct apart from pointing somewhere empty.
+    #[test]
+    fn parse_key32_names_a_missing_file_rather_than_parsing_its_path_as_hex() {
+        let err = parse_key32("/no/such/dir/pool-cold.vkey", "--cold-vkey").unwrap_err();
+
+        assert!(err.contains("/no/such/dir/pool-cold.vkey"), "{err}");
+        assert!(!err.contains("expected 32 bytes of hex"), "{err}");
     }
 
     #[test]
