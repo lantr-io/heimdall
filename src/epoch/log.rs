@@ -9,14 +9,18 @@
 //! becoming a tracing field: it is what makes the three-terminal view scannable,
 //! and fields render *after* the message.
 //!
-//! The four variants exist so severity survives the trip to journald — see
+//! The four level variants exist so severity survives the trip to journald — see
 //! [`crate::logging`]. Use `epoch_log!` for protocol progress, `epoch_debug!`
 //! for per-peer and per-packet detail, `epoch_warn!` when the node degrades or
 //! drops something, `epoch_error!` when it gives up.
 //!
-//! `epoch_event!` is the fifth: `info`, but under [`crate::logging::EVENT_TARGET`]
-//! so the handful of lines an operator wants pushed to them can be selected on
-//! their own — see there for what qualifies.
+//! Two more carry the operator-facing events, under
+//! [`crate::logging::EVENT_TARGET`], so the handful of lines an operator wants
+//! pushed to them can be selected on their own — see there for what qualifies.
+//! `epoch_event!` is the `info` one; `epoch_event_warn!` is the same channel at
+//! `warn`, for an event that reports a FAILURE. Reach for the second whenever
+//! the event is the unhappy outcome of one the first already reports, so a relay
+//! keeping only failures does not end up keeping only the successes.
 
 use std::collections::BTreeMap;
 
@@ -78,6 +82,86 @@ macro_rules! epoch_event {
             format_args!($($arg)*)
         );
     }};
+}
+
+/// An operator-facing protocol event that is also a FAILURE: same
+/// [`crate::logging::EVENT_TARGET`] as [`crate::epoch_event!`], at `warn`.
+///
+/// The severity and the channel are two different questions and this answers
+/// both. A posted movement is an event; a movement that could NOT be posted is
+/// the same event's other outcome, and an operator who is told the first and not
+/// the second reads silence as success. Emitting it as an ordinary `epoch_warn!`
+/// would reach the relay's level filter but not its event filter, so a relay run
+/// with `--min-level error` — "keep only failures" — would drop the failure, and
+/// one run with `--min-level off` would show the posts and none of the misses.
+///
+/// `warn` passes the `heimdall::event=info` directive a bare `--log-level` pins,
+/// so these survive a quiet node exactly as the `info` events do.
+#[macro_export]
+macro_rules! epoch_event_warn {
+    ($me:expr, $epoch:expr, $($arg:tt)*) => {{
+        ::tracing::warn!(
+            target: $crate::logging::EVENT_TARGET,
+            "[spo={} epoch={}] {}",
+            $crate::epoch::log::id_short($me),
+            $epoch,
+            format_args!($($arg)*)
+        );
+    }};
+}
+
+/// Collapse a multi-line error into one line, for an event that must stay one
+/// line.
+///
+/// The formatter repeats the `<N>target:` prefix on every line of a multi-line
+/// message, so nothing is LOST to the relay — but the continuation lines lose
+/// the `[spo=N epoch=E]` prefix and arrive as free-standing fragments. A
+/// Blockfrost rejection is exactly that shape (`Status code: 400` / `Error: …` /
+/// `Message: <the ledger error>`), so the one line naming the actual cause would
+/// reach the channel with nothing tying it to the movement it is about, and
+/// would be split off entirely if it fell outside the relay's coalesce window.
+///
+/// Whitespace-collapsing rather than newline-replacing: the SDK pretty-prints an
+/// unparseable JSON error body, which is indented, and the indentation is not
+/// worth carrying into a chat line.
+pub fn one_line(e: &impl std::fmt::Display) -> String {
+    /// Room for ONE interpolated cause on a line, with the event's own text
+    /// around it. An event that interpolates two must divide the line between
+    /// them with [`one_line_within`] — two of these do not fit together.
+    const DEFAULT: usize = 900;
+    one_line_within(e, DEFAULT)
+}
+
+/// [`one_line`] with the byte budget stated, for an event that interpolates more
+/// than one value.
+///
+/// The budget is in BYTES because that is what the relay measures:
+/// `heimdall-discord` cuts anything past `2000 - fences` bytes into pieces that
+/// carry no `[spo=N epoch=E]` prefix — the very fragmentation this exists to
+/// prevent — so a cap in characters would leave a multi-byte error body splitting
+/// anyway.
+pub fn one_line_within(e: &impl std::fmt::Display, max_bytes: usize) -> String {
+    let joined = e
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if joined.len() <= max_bytes {
+        return joined;
+    }
+    // Truncating rather than splitting, and saying so: a cause that does not fit
+    // is still worth its first `max_bytes`. The note says only that the text was
+    // cut and where the whole of it is — deliberately not a length, which would be
+    // the length AFTER collapsing and so would not match the multi-line, indented
+    // original an operator finds in the log.
+    let mut end = max_bytes;
+    while !joined.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}… [truncated; full error in this node's log]",
+        &joined[..end]
+    )
 }
 
 /// Per-peer, per-packet and per-input detail. Off by default.
@@ -265,6 +349,137 @@ mod tests {
 
     fn ident(n: u16) -> Identifier {
         Identifier::try_from(n).unwrap()
+    }
+
+    /// The shape a Blockfrost submit rejection actually has — three lines, with
+    /// the ledger's reason on the last one. All of it has to end up on the ONE
+    /// line of the event, because the reason is the whole point of relaying the
+    /// failure.
+    #[test]
+    fn a_multi_line_chain_error_collapses_to_one_line() {
+        let e = "Response error for URL https://cardano-preprod.blockfrost.io/api/v0/tx/submit: \
+                 Status code: 400\nError: Bad Request\nMessage: transaction submit error \
+                 ShelleyTxValidationError (ApplyTxError [UtxowFailure (UtxoFailure \
+                 (ValueNotConservedUTxO))])";
+        let collapsed = one_line(&e);
+        assert!(!collapsed.contains('\n'), "{collapsed}");
+        assert!(
+            collapsed.contains("Message: transaction submit error"),
+            "{collapsed}"
+        );
+        assert!(collapsed.contains("ValueNotConservedUTxO"), "{collapsed}");
+        assert!(
+            collapsed.ends_with("(ValueNotConservedUTxO))])"),
+            "{collapsed}"
+        );
+
+        // Indented JSON, which is what the SDK produces from an error body it
+        // could not parse: collapsed to single spaces, not carried through.
+        assert_eq!(one_line(&"{\n    \"a\": 1\n}"), "{ \"a\": 1 }");
+        // A single-line error is untouched.
+        assert_eq!(one_line(&"plain failure"), "plain failure");
+    }
+
+    /// A tripwire on the event inventory, not a proof of pairing.
+    ///
+    /// The failure mode it exists for is someone adding an `epoch_event!` and
+    /// stopping there, leaving the channel showing a bridge that only ever
+    /// succeeds — a roster that stopped rotating then looks exactly like one that
+    /// was not due to. It cannot verify that a given success event has a matching
+    /// failure event, only that the totals are what the last person to think
+    /// about it left behind, so if it fires the question to answer is which half
+    /// of which pair changed. Update the numbers WITH that answer, not to make it
+    /// pass.
+    ///
+    /// Counts every source file, so an event added in a module this test has
+    /// never heard of still trips it.
+    #[test]
+    fn the_operator_event_inventory_is_what_we_last_agreed() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("source tree is readable") {
+                let path = entry.expect("readable entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(std::fs::read_to_string(&path).expect("source is readable"));
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        // The success needle ends in a bang, so it cannot also match the _warn
+        // spelling. Neither needle may appear literally anywhere in this file, or
+        // the scan counts its own source.
+        let count =
+            |needle: &str| -> usize { sources.iter().map(|s| s.matches(needle).count()).sum() };
+        // Assembled rather than written out, because this file is inside the tree
+        // being scanned and a literal needle would count itself.
+        // Both spellings: these are `#[macro_export]`, so a call site may write
+        // the bare name. Assembled rather than written out, because this file is
+        // inside the tree being scanned and a literal needle would count itself.
+        let success = format!("epoch_{}!(", "event");
+        let failure = format!("epoch_{}!(", "event_warn");
+
+        // dkg: round1/round2/part3/complete. machine: TM confirmed, federation
+        // handoff, registry, new treasury address, Update-Y posted, TM built,
+        // TM posted.
+        assert_eq!(
+            count(&success),
+            11,
+            "the set of SUCCESS events changed — does each one still have a failure counterpart?"
+        );
+        // DKG aborted, fault ban failed, Update-Y failed, Update-Y did not take,
+        // TM not signed, TM post failed.
+        assert_eq!(
+            count(&failure),
+            6,
+            "the set of FAILURE events changed — does each success event still have one?"
+        );
+    }
+
+    /// The budget is per CALL, so an event interpolating two values can divide one
+    /// line between them. `DKG ABORTED` does, and two default budgets plus its own
+    /// text would overflow the relay's 1992-byte body.
+    #[test]
+    fn a_stated_budget_is_honoured_in_bytes_and_two_of_them_still_fit() {
+        let note = "… [truncated; full error in this node's log]";
+        for (budget, body) in [(300usize, "x"), (600, "は")] {
+            let capped = one_line_within(&body.repeat(4_000), budget);
+            assert!(capped.len() <= budget + note.len(), "{}", capped.len());
+            assert!(capped.ends_with(note), "{capped}");
+        }
+        // What `DKG ABORTED` actually spends: two budgets, their truncation notes
+        // and the fixed text, against what the relay will carry on one line.
+        const RELAY_BODY_BUDGET: usize = 2000 - 8;
+        assert!(
+            300 + 600 + 2 * note.len() + 400 < RELAY_BODY_BUDGET,
+            "the abort event no longer fits on one relayed line"
+        );
+    }
+
+    /// An unparseable error body is pretty-printed JSON and runs to kilobytes.
+    /// Collapsing it without a cap only moves the fragmentation downstream: the
+    /// relay splits anything past ~2000 characters into pieces that carry no
+    /// `[spo=N epoch=E]`, which is what `one_line` exists to prevent.
+    #[test]
+    fn an_enormous_error_is_truncated_rather_than_left_for_the_relay_to_split() {
+        let huge = format!("Message: {}", "x".repeat(5_000));
+        let collapsed = one_line(&huge);
+        assert!(collapsed.len() < 1_000, "{}", collapsed.len());
+        assert!(collapsed.starts_with("Message: xxx"), "{collapsed}");
+        assert!(collapsed.contains("[truncated;"), "{collapsed}");
+        assert!(!collapsed.contains('\n'));
+
+        // The cap is in BYTES and must not split a character. A body of
+        // three-byte characters is a third of the length in chars, so a
+        // char-counted cap would sail past the relay's byte budget.
+        let multibyte = one_line(&"は".repeat(2_000));
+        assert!(multibyte.len() < 1_000, "{}", multibyte.len());
+        assert!(multibyte.starts_with("はは"), "{multibyte}");
+        assert!(multibyte.contains("[truncated;"));
     }
 
     #[test]

@@ -20,7 +20,11 @@ where `ps` would show it.
 
 ## What gets relayed
 
-The `heimdall::event` lines, at `info` — one line each, self-contained:
+The `heimdall::event` lines — one line each, self-contained. Nearly all are `info`;
+the failure counterpart of an event is `warn` on the same target. Being an EVENT is
+what keeps it wherever its successful twin is kept — otherwise `--min-level error`
+shows every `TM posted` and none of the misses. Being `warn` earns it the ⚠️ and
+keeps it under `--no-events --min-level warn`:
 
 | event | when |
 |---|---|
@@ -28,12 +32,49 @@ The `heimdall::event` lines, at `info` — one line each, self-contained:
 | `DKG round2 (attempt N) started: round1 packages in from 3 of 4: #1 http://…, …` | who made it into round 2, named |
 | `DKG part3 (attempt N) started: round2 shares in from 3 of 4: #1 http://…, …` | whose shares arrived |
 | `DKG complete (attempt N): Y_51=…, 3 share-holder(s), threshold 2. Final roster: #1 http://…, …` | the group key, and who holds a share of it |
+| `⚠️ DKG ABORTED (attempt N): 2 of 4 eligible qualified — …. Excluded: …` | this ceremony produced no key, naming who was excluded; a later attempt this epoch still may succeed |
 | `registry: 5 registered, 4 eligible: #1 http://…, … — NOT eligible: pool1… (no stake at this epoch's snapshot …)` | only when it CHANGES: someone joined, left, was banned, or their stake activated |
+| `⚠️ FAULT BAN FAILED: <kind> by pool … could not be published (…)` | a misbehaving SPO stays in the roster and enters the next ceremony |
 | `New treasury address tb1p… (Y_51=…)` | where this epoch's handoff pays the treasury |
 | `Update-Y posted: cardano tx … — treasury key … -> …` | the rotation is on Cardano (also the federation-handoff form) |
+| `⚠️ Update-Y FAILED: the key handoff has failed N retries running this epoch — parking until the next boundary` | this node has stopped expecting a rotation; the epoch's whole batch grid goes with it |
+| `⚠️ Update-Y DID NOT TAKE: the rotation to … was accepted … but treasury_info still does not name it` | posted and accepted, but the datum never caught up |
 | `TM built: txid … — 3 input(s) (2 deposit(s) swept), 2 output(s), 1 peg-out(s) paid; signing starts` | a treasury movement is assembled |
+| `⚠️ TM NOT SIGNED: the 51% mode did not sign this movement (…) — N consecutive now` | the roster could not sign what it built; no daemon resolves this |
 | `TM posted: txid … — Post-TM submitted (… bytes; …); awaiting Bitcoin confirmation` | the movement is posted |
+| `⚠️ TM post FAILED: txid … — this node could not complete the Post-TM (…)` | a signed movement did not go out; the Cardano submit may still have been accepted, so the movement may yet confirm |
 | `TM confirmed: txid … — treasury head is now …` | the chain shows it as the head |
+
+Four steps appear both ways, so the channel cannot show only the good half of
+them: the DKG, the rotation, the signing and the post. `registry`, `New treasury
+address` and `TM confirmed` report what the chain now says rather than an action
+this node took, so there is no outcome for them to fail at.
+
+`TM built` has no ⚠️ counterpart, and deliberately so. The two ways a movement
+does not get built are both already `warn`s, which the default `--min-level warn`
+forwards:
+
+- the opportunity is never taken, because a movement is still in flight against
+  the tip — `batch B_i passes UNUSED: a treasury movement is still in flight …`;
+- the build is entered and refuses, over roots or trie state — the phase driver's
+  `BuildTm failed on the frozen batch (…)`.
+
+The first of those fires on a HEALTHY bridge: with a ~6 h grid pitch and ~17 h to
+confirm a movement, up to three opportunities in a row pass while the last one
+confirms, and that is the schedule working rather than a stall. So read a run of
+them, not a single one — and note that an in-flight movement is always released
+by `tm_recovery_window`, while a TM record this node cannot READ has no deadline
+and holds the gate until someone looks.
+
+**A rejected Update-Y is deliberately NOT an event.** `submit_update_y` returns on
+Cardano acceptance while the plan is read from the confirmed datum, so a cascade
+follower — and every federation member, which has no cascade at all — can be
+rejected as a conflicting spend for a rotation that is landing. A rejection means
+nothing on its own, so `Update-Y FAILED` is raised where the node has stopped
+expecting a rotation at all: once per epoch, after the handoff retries are spent.
+`Update-Y DID NOT TAKE` likewise comes only from the node whose own rotation it
+was; on the federation path every member watches the same one and logs it at
+`warn` instead.
 
 plus every line at `--min-level` or above (`warn` by default), whatever it
 says: a peer dropped from a round, a provider rate-limiting the node, a
