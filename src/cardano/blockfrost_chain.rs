@@ -2674,20 +2674,32 @@ impl CardanoChain for BlockfrostCardanoChain {
         // that never confirms is the only one that never recovers: its peers time
         // the record out and take the next opportunity, while it holds itself
         // blocked for ever on its own bookkeeping.
-        let own_pending = match *self.last_submitted_txid.lock().unwrap() {
-            None => false,
-            Some((t, _)) if outpoint.txid == t => false,
-            Some((t, at)) => match recovery_window {
-                Some(w) if at.elapsed().as_secs() > w => {
-                    warn!(
-                        "[blockfrost] our submitted movement {t} has not become the head in {}s \
-                         (> tm_recovery_window {w}s) — no longer treating it as in flight",
-                        at.elapsed().as_secs()
-                    );
+        let own_pending = {
+            let mut last = self.last_submitted_txid.lock().unwrap();
+            match own_movement_verdict(
+                last.map(|(t, at)| (t, at.elapsed())),
+                outpoint.txid,
+                recovery_window,
+            ) {
+                OwnMovement::Discharged => {
+                    // Drop it: either there was nothing, or our movement reached
+                    // the head and the obligation is met. Keeping it would put us
+                    // back in `Blocking` the moment a child movement takes over.
+                    *last = None;
                     false
                 }
-                _ => true,
-            },
+                OwnMovement::Blocking => true,
+                OwnMovement::Abandoned { txid, elapsed } => {
+                    warn!(
+                        "[blockfrost] our submitted movement {txid} has not become the head in \
+                         {}s (> tm_recovery_window {}s) — no longer treating it as in flight",
+                        elapsed.as_secs(),
+                        recovery_window.unwrap_or_default(),
+                    );
+                    *last = None;
+                    false
+                }
+            }
         };
         // The other two terms have NO deadline and are not meant to: they mean
         // "there is a movement at the TM address we could not read", so a node
@@ -3677,14 +3689,115 @@ fn viable_in_flight_spends(
     in_flight_spends
 }
 
+/// What to do about the movement THIS node last submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnMovement {
+    /// Nothing outstanding: no record, or it reached the head. The record has
+    /// done its job and is dropped.
+    Discharged,
+    /// Posted but not yet the head — do not build the next movement on top.
+    Blocking,
+    /// Past `tm_recovery_window`. Report it ONCE, then drop the record.
+    Abandoned {
+        txid: bitcoin::Txid,
+        elapsed: std::time::Duration,
+    },
+}
+
+/// Decide from the record alone (DEC-022), so the rule is testable without a chain.
+///
+/// `last` is `(txid, how long ago we submitted it)`. Both non-blocking outcomes
+/// drop the record, and that is the point: the previous version cleared it only
+/// while the head EQUALLED our txid, so a movement that confirmed and was
+/// superseded between two polls stayed "outstanding" for the life of the
+/// process, re-warning on every chain query.
+fn own_movement_verdict(
+    last: Option<(bitcoin::Txid, std::time::Duration)>,
+    head: bitcoin::Txid,
+    recovery_window: Option<u64>,
+) -> OwnMovement {
+    match last {
+        None => OwnMovement::Discharged,
+        Some((t, _)) if t == head => OwnMovement::Discharged,
+        Some((txid, elapsed)) => match recovery_window {
+            Some(w) if elapsed.as_secs() > w => OwnMovement::Abandoned { txid, elapsed },
+            _ => OwnMovement::Blocking,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BlockfrostCardanoChain, DkgFaultBanFlow, viable_in_flight_spends};
+    use super::{
+        BlockfrostCardanoChain, DkgFaultBanFlow, OwnMovement, own_movement_verdict,
+        viable_in_flight_spends,
+    };
     use crate::cardano::treasury_datum::UnconfirmedTm;
     use crate::epoch::state::Roster;
     use bitcoin::hashes::Hash as _;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
     use std::collections::HashSet;
+    use std::time::Duration;
+
+    fn txid(byte: u8) -> Txid {
+        Txid::from_byte_array([byte; 32])
+    }
+
+    /// The record exists to make THIS node wait until the movement it posted is
+    /// the head. Once it is, the obligation is discharged — and the record must
+    /// go, or the next poll (by which time a child movement is the head) starts
+    /// treating a finished movement as outstanding again.
+    #[test]
+    fn a_movement_that_reached_the_head_stops_being_tracked() {
+        let v = own_movement_verdict(Some((txid(1), Duration::from_secs(5))), txid(1), Some(3600));
+        assert_eq!(v, OwnMovement::Discharged);
+    }
+
+    /// A movement that is confirmed but not yet the head is exactly what the
+    /// guard is for: do not build the next one on top of it.
+    #[test]
+    fn a_recent_movement_that_is_not_the_head_still_blocks() {
+        let v = own_movement_verdict(Some((txid(1), Duration::from_secs(5))), txid(2), Some(3600));
+        assert_eq!(v, OwnMovement::Blocking);
+    }
+
+    /// Past the recovery window the node gives up on its own bookkeeping. It must
+    /// say so ONCE: this fires from a chain query that runs every few seconds, and
+    /// a warning that repeats for days is how the next real fault goes unread.
+    ///
+    /// The case is not hypothetical. Movement ed2fc57a confirmed on Bitcoin and
+    /// the treasury advanced past it between two polls, so the head never equalled
+    /// it again and the record stuck for the life of the process — 2.25 days of
+    /// one warning per query on the preprod bridge.
+    #[test]
+    fn a_superseded_movement_is_reported_once_and_forgotten() {
+        let elapsed = Duration::from_secs(200_000);
+        let v = own_movement_verdict(Some((txid(1), elapsed)), txid(2), Some(129_600));
+        assert_eq!(
+            v,
+            OwnMovement::Abandoned {
+                txid: txid(1),
+                elapsed
+            }
+        );
+
+        // What the caller does next: having reported it, it drops the record.
+        assert_eq!(
+            own_movement_verdict(None, txid(2), Some(129_600)),
+            OwnMovement::Discharged
+        );
+    }
+
+    /// No window configured means no deadline — the guard is meant to hold.
+    #[test]
+    fn without_a_recovery_window_the_guard_never_times_out() {
+        let v = own_movement_verdict(
+            Some((txid(1), Duration::from_secs(10_000_000))),
+            txid(2),
+            None,
+        );
+        assert_eq!(v, OwnMovement::Blocking);
+    }
 
     /// One dealer-generated FROST group, standing in for a ceremony output. What
     /// is under test is which group KEYS a persisted ceremony contributes, so how
