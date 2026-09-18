@@ -215,6 +215,32 @@ in flight, so a later opportunity may rebuild the same frozen batch at a higher 
 pending record simply replaces the original's, and whichever of the two confirms folds
 identically.
 
+The window is the fallback, not the usual release. The question a node asks about a
+movement it submitted itself is the one the fold already asks: **is the head still the
+outpoint that movement spends?** While it is, nothing has landed on top and the movement
+may yet confirm. When it is not, either it confirmed or something else took its input,
+and either way there is nothing left to wait for. The window covers only the state that
+question cannot reach: the head stays ours and the movement simply never confirms.
+
+Only the window DROPS the record (the code calls the head's two answers
+`Discharged`, meaning the obligation is met — not that the record is gone). The head's two answers are recomputed on every
+poll, so dropping the record on one buys nothing, and would make a single stale or
+rolled-back read permanent — it would disarm the guard for a movement that is still
+live. Keeping it makes that mistake self-correcting instead. The window is not an
+observation but the node deciding to stop waiting, which it may do once, and dropping
+there is also what stops its warning repeating on every chain query.
+
+Recognising instead "the head IS my txid" is not a weaker form of that question but a
+different one, and it fails on this very recovery path: A is rebuilt as A′ against the
+same head, the original A then confirms, and the head becomes something that is neither
+A′ nor what A′ spends. A′ can never confirm, yet a node asking only about its own txid
+goes on blocking until a second window elapses — while its fold, asking the right
+question of the same chain read, has already folded A.
+
+That comparison rests on a single head observation, so a stale or rolled-back read
+releases early. The fold accepts that exposure to authorise a durable write; the guard
+holds itself to the same standard, so the two cannot disagree about the same movement.
+
 ### 4.4 Signing Cascade
 
 ```
