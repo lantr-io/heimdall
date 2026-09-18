@@ -315,13 +315,19 @@ async fn drive_to_movement(
             // next failure falls through to `Idle` and the node waits for a
             // boundary that re-derives everything from chain.
             EpochPhase::PublishKeys { epoch, .. } => {
-                crate::epoch_warn!(
+                // The counterpart to `Update-Y posted`, and the only place that
+                // can honestly raise one. A rejected submission means nothing on
+                // its own — peers are posting the same rotation and all but one
+                // are rejected by design — so the event belongs where the node has
+                // stopped expecting a rotation at all, which happens once per
+                // epoch rather than once per attempt.
+                crate::epoch_event_warn!(
                     me,
                     *epoch,
-                    "the key handoff has failed {HANDOFF_RETRIES} retries running this epoch — \
-                     treating it as non-transient and parking until the next boundary. The \
-                     treasury stays under the OUTGOING key until a rotation completes, so this \
-                     node signs no movement for this epoch."
+                    "Update-Y FAILED: the key handoff has failed {HANDOFF_RETRIES} retries \
+                     running this epoch — treating it as non-transient and parking until the \
+                     next boundary. The treasury stays under the OUTGOING key, so this node \
+                     signs no movement for this epoch"
                 );
                 resume = None;
             }
@@ -507,14 +513,27 @@ async fn drive_to_movement(
                     unsigned_movements += 1;
                     let n = unsigned_movements;
                     config.health.update(|h| h.unsigned_movements = n);
-                    crate::epoch_warn!(
+                    // The counterpart to `TM built`, which has already gone out
+                    // for this movement: without it the channel announced every
+                    // movement the node assembled and never that the roster could
+                    // not sign one. An unsigned movement is also the one condition
+                    // no daemon resolves — the answer is a federation spend, run by
+                    // hand — so the count being visible is the only thing standing
+                    // between a stuck treasury and someone reaching for it.
+                    crate::epoch_event_warn!(
                         me,
-                        current_epoch(&EpochPhase::Idle),
-                        "the 51% mode did not sign this movement ({e}) — {n} consecutive now. If \
-                         this does not clear, the treasury moves only through the federation's \
-                         emergency path: `heimdall federation-spend`, which needs the treasury \
-                         UTxO to be federation_csv_blocks deep on Bitcoin and every federation \
-                         member to run it with the same --signers. No daemon does this."
+                        // NOT `current_epoch(&Idle)`, which is the constant 0 the
+                        // surrounding retry warnings are content with. An event is
+                        // read on its own, so it has to name the epoch its
+                        // `TM built` twin named or there is nothing to join on.
+                        resume.as_ref().map_or(0, current_epoch),
+                        "TM NOT SIGNED: the 51% mode did not sign this movement ({}) — {n} \
+                         consecutive now. If this does not clear the treasury moves only \
+                         through the federation's emergency path, `heimdall federation-spend`, \
+                         which needs the treasury UTxO to be federation_csv_blocks deep on \
+                         Bitcoin and every federation member to run it with the same \
+                         --signers. No daemon does this",
+                        crate::epoch::log::one_line(&e)
                     );
                 }
                 let round_spent = e.round_is_spent();
@@ -1636,7 +1655,16 @@ async fn phase1_fallback(
         // node has just replaced. The movement would then pay its change to the
         // federation — a self-send that burns a fee and leaves the window exactly
         // as wide as it was.
-        if !await_datum_rotation(chain, config, epoch, posted, log_id).await {
+        if !await_datum_rotation(
+            chain,
+            config,
+            epoch,
+            posted,
+            log_id,
+            RotationWatch::Federation,
+        )
+        .await
+        {
             // Idle, NOT EpochStart. Re-entering EpochStart looks like a re-read
             // and is a re-run: `epoch_start_phase` fails for a federation node
             // exactly as before, `phase1_fallback` runs again, and
@@ -1678,12 +1706,28 @@ async fn phase1_fallback(
 ///
 /// A read error is not a "no" — it is retried, because a provider hiccup says
 /// nothing about whether the rotation landed.
+/// Whose rotation `await_datum_rotation` is watching, which decides whether a
+/// stall reaches the operator channel.
+///
+/// `Roster` is this node's own rotation, which it posted moments earlier and is
+/// alone in watching — a stall there is its to report. `Federation` is the shared
+/// Phase-1 handoff: every member holding the seed watches the SAME rotation, so
+/// an event would arrive once per member for one stall. Those members log it at
+/// `warn`, which the relay forwards by default anyway; what they must not do is
+/// each announce it as an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RotationWatch {
+    Roster,
+    Federation,
+}
+
 async fn await_datum_rotation(
     chain: &Arc<dyn CardanoChain>,
     config: &EpochConfig,
     epoch: u64,
     posted: bitcoin::key::UntweakedPublicKey,
     log_id: frost::Identifier,
+    watch: RotationWatch,
 ) -> bool {
     // The CHAIN cadence, not the peer one. `wait_for_published_namespace` polls
     // SPO endpoints over local HTTP and can afford `poll_interval`; this polls
@@ -1711,13 +1755,33 @@ async fn await_datum_rotation(
         // interval, and the nap is clamped to what is left of it.
         let now = std::time::Instant::now();
         if now >= deadline {
-            crate::epoch_warn!(
-                log_id,
-                epoch,
-                "  handoff: the Update-Y for {} was posted but treasury_info still does not name \
-                 it — refusing to build a movement against a datum that has not caught up",
-                hex::encode(posted.serialize())
-            );
+            // `Update-Y posted` has already gone out for this rotation, so the
+            // channel would otherwise show the handoff succeeding and never show
+            // that it did not take. The node is about to stand down for the epoch.
+            // An event only for the node whose rotation this WAS. On the
+            // federation path every member holding the seed watches the same
+            // rotation, so raising it there would put N copies of one stall in the
+            // channel — the same reason `Update-Y FAILED` is gated on the
+            // authority.
+            if watch == RotationWatch::Roster {
+                crate::epoch_event_warn!(
+                    log_id,
+                    epoch,
+                    "Update-Y DID NOT TAKE: the rotation to {} was accepted by Cardano but \
+                     treasury_info still does not name it — this node refuses to build against \
+                     a datum that has not caught up, and stands down for this epoch",
+                    hex::encode(posted.serialize())
+                );
+            } else {
+                crate::epoch_warn!(
+                    log_id,
+                    epoch,
+                    "  handoff: the Update-Y for {} was posted but treasury_info still does not \
+                     name it — refusing to build a movement against a datum that has not \
+                     caught up",
+                    hex::encode(posted.serialize())
+                );
+            }
             return false;
         }
         tokio::time::sleep(nap.min(deadline.saturating_duration_since(now))).await;
@@ -2636,7 +2700,29 @@ async fn publish_keys_phase(
                     });
                 }
             }
-            let tx_id = chain.submit_update_y(&plan, &signature).await?;
+            let tx_id = match chain.submit_update_y(&plan, &signature).await {
+                Ok(t) => t,
+                Err(e) => {
+                    // NOT an operator event, however tempting. `submit_update_y`
+                    // returns on Cardano ACCEPTANCE while `plan_update_y` reads
+                    // the CONFIRMED datum, so a cascade follower that wakes before
+                    // the leader's transaction is in a block still sees a plan to
+                    // post, submits, and is rejected as a conflicting spend of the
+                    // treasury_info state — for a rotation that is landing. The
+                    // federation path has no cascade at all and every member does
+                    // this. A rejection here simply does not mean the rotation
+                    // failed, and the node that CONCLUDES it did raises the event
+                    // instead, after HANDOFF_RETRIES (see `drive_to_movement`).
+                    crate::epoch_warn!(
+                        me,
+                        epoch,
+                        "  Update-Y: this node's submission was not accepted ({}) — a peer's \
+                         may have been, so the rotation is still expected",
+                        crate::epoch::log::one_line(&e)
+                    );
+                    return Err(e);
+                }
+            };
             crate::epoch_log!(me, epoch, "  Update-Y submitted: cardano tx {tx_id}");
             crate::epoch_event!(
                 me,
@@ -2657,7 +2743,7 @@ async fn publish_keys_phase(
             // The node that CANNOT post is already covered — `NotOursToAuthorize`
             // routes it to `AwaitRotation`, which polls for the same thing. This is
             // the mirror of that for the node that can.
-            if !await_datum_rotation(chain, config, epoch, y_51, me).await {
+            if !await_datum_rotation(chain, config, epoch, y_51, me, RotationWatch::Roster).await {
                 return Ok(EpochPhase::Idle);
             }
         }
@@ -4617,7 +4703,47 @@ async fn submit_phase(
         }
     }
     let hint: Vec<[u8; 36]> = tm.fulfilled.iter().map(|f| f.outpoint).collect();
-    chain.submit_signed_tm(&tx_bytes, &hint).await?;
+    if let Err(e) = chain.submit_signed_tm(&tx_bytes, &hint).await {
+        // The other outcome of the event below, and it has to BE an event rather
+        // than lean on the driver's retry line. That line — `Submit failed (…);
+        // backing off …` — is relayed, but it names the phase and the error and
+        // not the TXID, and it arrives in the same shape as every transient 502
+        // the node shrugs off. This one is not that: a movement the roster has
+        // already SIGNED failed to go out.
+        //
+        // Returning Err here skips `RecordMovement`, which is the ONLY writer of
+        // `pending-tm.json` — so a post that was accepted and then failed while
+        // waiting for confirmation leaves a movement that will confirm on Bitcoin
+        // and a node with no record to fold when it does. `settle_pending_tm`
+        // finds nothing, the tries stay behind the singleton, and every later
+        // `BuildTm` is refused by the root cross-check until they are repaired.
+        // That is recoverable but not automatic, so the event says it rather than
+        // leaving an operator to discover it from a refusal days later.
+        //
+        // What the line does NOT say is as considered as what it does. It makes no
+        // claim about whether BTC moved, because `submit_signed_tm` can fail on
+        // either side of the Cardano submit — `wait_for_cardano_confirmation`
+        // returns Err for a tx Blockfrost has already accepted — and an operator
+        // told "nothing went out" may hand-post a movement that is already on
+        // chain. It makes no claim about how long this node stays blocked either:
+        // the guard is armed only from the submit onwards, so a failure before it
+        // blocks nothing, and one after it clears when the movement confirms or
+        // the window runs out. Both were asserted here and both were wrong.
+        crate::epoch_event_warn!(
+            me,
+            epoch,
+            "TM post FAILED: txid {} — this node could not complete the Post-TM ({e}). The \
+             Cardano submit may already have been ACCEPTED before the failure, so do not \
+             assume nothing went out: if it landed, the watchtower relays the movement and \
+             Bitcoin confirms it. This node recorded no pending movement for it either way, \
+             so if it DOES confirm, this node's tries never fold it and every later build is \
+             refused until they are repaired. Check the chain for this movement before \
+             posting or broadcasting anything by hand",
+            tm.txid,
+            e = crate::epoch::log::one_line(&e),
+        );
+        return Err(e);
+    }
     crate::epoch_event!(
         me,
         epoch,
@@ -5575,11 +5701,27 @@ mod tests {
 
         // Visible already: proceed at once.
         assert!(
-            await_datum_rotation(&lagging(0, 19350, y_roster), &config, 9, y_roster, log_id).await
+            await_datum_rotation(
+                &lagging(0, 19350, y_roster),
+                &config,
+                9,
+                y_roster,
+                log_id,
+                RotationWatch::Roster
+            )
+            .await
         );
         // Two stale reads, then it appears — the ordinary case.
         assert!(
-            await_datum_rotation(&lagging(2, 19360, y_roster), &config, 9, y_roster, log_id).await
+            await_datum_rotation(
+                &lagging(2, 19360, y_roster),
+                &config,
+                9,
+                y_roster,
+                log_id,
+                RotationWatch::Roster
+            )
+            .await
         );
         // Never appears: decline rather than build against a datum that has not
         // caught up. The budget is 120 poll intervals, milliseconds under a test
@@ -5590,7 +5732,8 @@ mod tests {
                 &config,
                 9,
                 y_roster,
-                log_id
+                log_id,
+                RotationWatch::Roster
             )
             .await
         );
@@ -5599,7 +5742,15 @@ mod tests {
         // and re-open the window. A predicate of "the datum has left y_federation"
         // returns true on the first read of exactly this chain.
         assert!(
-            !await_datum_rotation(&lagging(0, 19380, y_third), &config, 9, y_roster, log_id).await,
+            !await_datum_rotation(
+                &lagging(0, 19380, y_third),
+                &config,
+                9,
+                y_roster,
+                log_id,
+                RotationWatch::Roster
+            )
+            .await,
             "a rotation to a different key is not the rotation we posted"
         );
     }
@@ -9155,6 +9306,75 @@ mod tests {
         // spo 3 published nothing and cannot complete; it is the absentee, not a
         // participant.
         spo3_handle.abort();
+    }
+
+    /// A Post-TM that cannot be completed must not produce a movement.
+    ///
+    /// The failure branch is operator-facing — it emits the `TM post FAILED`
+    /// event and returns the error rather than falling through to
+    /// `RecordMovement` — and until the mock could fail a submit, nothing
+    /// exercised it: a refactor that swallowed the error, dropped the event, or
+    /// reordered the return would have passed CI with the behaviour asserted only
+    /// in prose.
+    ///
+    /// The loop RETRIES a submit failure, which is correct (it is usually a
+    /// transient chain error), so this bounds the run rather than waiting for it
+    /// to finish: what is asserted is that the movement never completes while the
+    /// post keeps failing, and that the node did get as far as handing the signed
+    /// bytes over. The deadline IS the success path, so it is wall clock this
+    /// suite pays on every run — kept as short as reaching `submit` under
+    /// `fast_config` allows, and the second assertion fails loudly rather than
+    /// passing vacuously if it is ever too short.
+    #[tokio::test]
+    async fn a_post_that_cannot_complete_never_yields_a_movement() {
+        let fixture = movable_fixture(2, 2, 19_961, 1);
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        let mut submitted = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let mock = MockCardanoChain::new(fixture.clone())
+                .with_cpo_root(empty_cpo_root())
+                .failing_tm_submit("blockfrost tx submit: 400 ValueNotConservedUTxO");
+            submitted.push(mock.submitted_txs());
+            let chain: Arc<dyn CardanoChain> = Arc::new(mock);
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let config = fast_config(id);
+            let hub = hub.clone();
+            handles.push(tokio::spawn(async move {
+                hub.set_online(id);
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+
+        // One shared deadline, not one per handle: the nodes run concurrently, so
+        // waiting on each in turn would charge the suite the full timeout twice.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        for mut h in handles {
+            // Matched rather than `.is_err()`-ed: a panic and an error that
+            // escaped the retry ramp are both `Err` here, and reporting either as
+            // "a movement completed" would send the next reader looking for a
+            // movement that was never built.
+            match tokio::time::timeout_at(deadline, &mut h).await {
+                // The expected outcome: still retrying when the deadline came.
+                Err(_elapsed) => h.abort(),
+                Ok(Ok(Ok(tm))) => panic!(
+                    "a movement completed ({}) although every Post-TM failed",
+                    tm.txid
+                ),
+                Ok(Ok(Err(e))) => {
+                    panic!("the loop gave up rather than retrying the failed post: {e}")
+                }
+                Ok(Err(join)) => panic!("a node panicked: {join}"),
+            }
+        }
+        assert!(
+            submitted.iter().any(|s| !s.lock().unwrap().is_empty()),
+            "no node reached the submit at all, so the failure branch was never taken"
+        );
     }
 
     fn snapshot_at(slot: u64) -> crate::epoch::traits::BatchSnapshot {

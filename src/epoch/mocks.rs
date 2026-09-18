@@ -167,6 +167,11 @@ pub struct MockCardanoChain {
     fixture: crate::epoch::fixture::StaticFixture,
     boundary_fired: Mutex<bool>,
     submitted_txs: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// When set, `submit_signed_tm` records the bytes and then FAILS with this
+    /// message. The Post-TM can fail on either side of the Cardano submit and the
+    /// node's response to that is operator-facing, so it needs to be reachable
+    /// from a test rather than only from a real outage.
+    submit_tm_error: Option<String>,
     /// After DKG, `publish_group_key` stores the FROST group key here.
     /// `query_treasury` returns this as Y_51 so the FROST group can
     /// sign the treasury input.
@@ -319,6 +324,7 @@ impl MockCardanoChain {
             fixture,
             boundary_fired: Mutex::new(false),
             submitted_txs: Arc::new(Mutex::new(Vec::new())),
+            submit_tm_error: None,
             treasury_y_51: Mutex::new(None),
             btc_rpc: None,
             dkg_faults: Arc::new(Mutex::new(Vec::new())),
@@ -571,6 +577,27 @@ impl MockCardanoChain {
             max_signers,
             base_port,
         ))
+    }
+
+    /// Make the next and every later `submit_signed_tm` fail after recording the
+    /// bytes, as a Post-TM that Cardano refused (or that failed while waiting for
+    /// the submitted transaction to be indexed) does.
+    pub fn failing_tm_submit(mut self, message: &str) -> Self {
+        self.submit_tm_error = Some(message.to_string());
+        self
+    }
+
+    /// Move the shared grid on, if this chain was built to. A real chain does
+    /// this by itself — a movement takes hours to sign, post and confirm, and the
+    /// grid keeps ticking — so a mock that stood still would leave every node's
+    /// batch loop waiting out the opportunity it just used.
+    fn advance_batch_grid(&self) {
+        if self.advance_batch_on_submit {
+            let mut w = self.batch.lock().unwrap();
+            if let crate::epoch::batch::BatchWindow::Open { batch, .. } = *w {
+                *w = open_at(following(batch));
+            }
+        }
     }
 
     pub fn submitted_txs(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
@@ -856,6 +883,21 @@ impl CardanoChain for MockCardanoChain {
         _fulfilled_por_outpoints: &[[u8; 36]],
     ) -> EpochResult<()> {
         self.submitted_txs.lock().unwrap().push(tx_bytes.to_vec());
+        // A REJECTED post: the grid still ticks, the treasury head does not move.
+        // Those are the two halves a real adapter has — Cardano's slots advance
+        // whether or not this node's transaction was accepted, and a transaction
+        // that was not accepted moves nothing — so the injection sits between
+        // them rather than at either end of the function. Advancing the head here
+        // would let a test assert the node's behaviour against a chain no adapter
+        // produces; skipping the grid would make it re-enter the same opportunity
+        // for ever, which is the comment below's point.
+        if self.submit_tm_error.is_some() {
+            self.advance_batch_grid();
+        }
+        if let Some(e) = &self.submit_tm_error {
+            return Err(EpochError::Chain(e.clone()));
+        }
+
         // Advance the TM chain: output 0 of a movement is the treasury change, so
         // it becomes the head the NEXT movement spends.
         if let Some(head) = &self.tm_chain {
@@ -895,15 +937,11 @@ impl CardanoChain for MockCardanoChain {
         // this by itself — a movement takes hours to sign, post and confirm, and
         // the grid keeps ticking — so a mock that stood still would leave every
         // node's batch loop waiting out the opportunity it just used.
-        if self.advance_batch_on_submit {
-            let mut w = self.batch.lock().unwrap();
-            if let crate::epoch::batch::BatchWindow::Open { batch, .. } = *w {
-                *w = open_at(following(batch));
-            }
-        }
+        self.advance_batch_grid();
         if let Some(rpc) = &self.btc_rpc {
             broadcast_btc_tx(rpc, tx_bytes).await?;
         }
+
         Ok(())
     }
 

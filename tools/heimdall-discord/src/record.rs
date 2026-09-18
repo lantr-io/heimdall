@@ -328,6 +328,43 @@ mod tests {
         assert_eq!(parse_line(TRACING_JSON), Some(event(Level::Info, None)));
     }
 
+    /// The failure counterpart of an event: on the event target AND at `warn`,
+    /// so every selector an operator can configure keeps it. `--min-level error`
+    /// is the one that matters — it means "only failures", and a post that never
+    /// reached Cardano is exactly that, so it must arrive on the EVENT filter
+    /// rather than on a level floor it sits below.
+    #[test]
+    fn a_warn_level_event_is_selected_by_either_filter() {
+        let record = parse_line("<4>heimdall::event: [spo=1 epoch=307] TM post FAILED: txid ab")
+            .expect("parses");
+        assert_eq!(record.level, Level::Warn);
+        assert!(record.is_event());
+
+        let events_only = Selector {
+            events: true,
+            min_level: None,
+        };
+        let failures_only = Selector {
+            events: false,
+            min_level: Some(Level::Error),
+        };
+        let levels_only = Selector {
+            events: false,
+            min_level: Some(Level::Warn),
+        };
+        assert!(events_only.wants(&record));
+        assert!(levels_only.wants(&record));
+        // The gap this level closes: with `--no-events --min-level error` the
+        // line is genuinely out of scope, and that is the operator's choice.
+        assert!(!failures_only.wants(&record));
+
+        // An event line renders without its target, and a warn one still marks.
+        assert_eq!(
+            render(&record, None),
+            "\u{26a0}\u{fe0f} [spo=1 epoch=307] TM post FAILED: txid ab"
+        );
+    }
+
     #[test]
     fn journal_json_carries_unit_and_priority() {
         let line = r#"{"__REALTIME_TIMESTAMP":"1757066400000000","PRIORITY":"4","_SYSTEMD_UNIT":"heimdall@spo1.service","SYSLOG_IDENTIFIER":"heimdall","MESSAGE":"heimdall::epoch::dkg: [spo=1 epoch=307] dropping round1 from 2"}"#;

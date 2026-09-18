@@ -739,16 +739,41 @@ fn rerun_or_abort(
     why: &str,
 ) -> EpochResult<EpochPhase> {
     let evidence = DkgExclusionEvidence::from_round(ctx, round, survivors);
+    // Once: it allocates a `hex::encode` per excluded member, and both the warn
+    // below and the abort event want the same text.
+    let summary = evidence.summary();
     crate::epoch_warn!(
         me,
         ctx.epoch,
-        "  DKG exclusions (attempt {}, {:?}): excluded [{}]",
+        "  DKG exclusions (attempt {}, {:?}): excluded [{summary}]",
         ctx.attempt,
-        round,
-        evidence.summary()
+        round
     );
     let eligible = ctx.participants.len();
+    // The counterpart to `DKG complete`. Without it the event channel carried
+    // every ceremony that produced a key and none of the ceremonies that did not,
+    // so a roster that stopped rotating looked, to anyone reading the channel,
+    // exactly like a roster that was not due to.
     let abort = |reason: String| {
+        crate::epoch_event_warn!(
+            me,
+            ctx.epoch,
+            "DKG ABORTED (attempt {}): {} of {} eligible qualified — {}. Excluded: {}. This \
+             ceremony produced no Y_51; the treasury stays under the OUTGOING key until one \
+             completes, which a later attempt this epoch still may",
+            ctx.attempt,
+            survivors.len(),
+            eligible,
+            // TWO interpolated values on one line, so they share the budget rather
+            // than each taking a whole one — two default caps plus the fixed text
+            // would overflow the relay's split budget and arrive as fragments
+            // carrying no `[spo=N epoch=E]`. The excluded list is inline at all
+            // because it is the first thing an operator asks for and otherwise
+            // exists only in the `epoch_warn!` above, which a relay run with
+            // `--min-level off` never forwards.
+            crate::epoch::log::one_line_within(&reason, 300),
+            crate::epoch::log::one_line_within(&summary, 600)
+        );
         Err(EpochError::DkgAborted {
             epoch: ctx.epoch,
             attempt: ctx.attempt,
@@ -898,15 +923,30 @@ async fn publish_detected_fault(
     peer: SpoInfo,
     fault: DkgFaultEvidence,
 ) -> EpochResult<()> {
+    let kind = fault.kind_label();
+    let accused = hex::encode(fault.accused_pool_id());
     crate::epoch_warn!(
         me,
         epoch,
-        "  -> publishing DKG fault: kind={} accused={} spo={}",
-        fault.kind_label(),
-        hex::encode(fault.accused_pool_id()),
+        "  -> publishing DKG fault: kind={kind} accused={accused} spo={}",
         id_short(peer.identifier)
     );
-    chain.publish_dkg_fault_and_apply_ban(fault).await
+    if let Err(e) = chain.publish_dkg_fault_and_apply_ban(fault).await {
+        // An event because of what the failure MEANS, not because posting to
+        // Cardano failed: the proof is the only thing that removes a misbehaving
+        // SPO, so while it does not land the accused stays in the roster and is a
+        // candidate for the next ceremony — which is the ceremony its misbehaviour
+        // just cost the bridge.
+        crate::epoch_event_warn!(
+            me,
+            epoch,
+            "FAULT BAN FAILED: {kind} by pool {accused} could not be published ({}) — the \
+             accused stays in the roster and enters the next ceremony",
+            crate::epoch::log::one_line(&e)
+        );
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Assert dkg_part3's two outputs are internally coherent: the [`KeyPackage`]

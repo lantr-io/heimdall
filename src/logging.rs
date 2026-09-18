@@ -22,8 +22,10 @@
 //! **A channel for the few lines that matter.** The protocol events an operator
 //! wants pushed rather than read — a DKG round opening with its participant
 //! list, the group key and treasury address it produced, a treasury movement
-//! built, posted or confirmed — are emitted at `info` under the dedicated target
-//! [`EVENT_TARGET`] (`heimdall::event`) by [`crate::epoch_event!`]. A bare level
+//! built, posted or confirmed — are emitted under the dedicated target
+//! [`EVENT_TARGET`] (`heimdall::event`) by [`crate::epoch_event!`] at `info`, or
+//! by [`crate::epoch_event_warn!`] at `warn` when the event reports a FAILURE
+//! rather than a step that succeeded. A bare level
 //! keeps that target at `info` however quiet the rest is, so `warn` reads as
 //! "warnings, plus what the node did". heimdall itself sends them nowhere: the
 //! relay that posts them to a Discord channel is a separate program
@@ -568,6 +570,30 @@ mod tests {
         assert!(out.contains("<6>heimdall::event: moved"), "{out}");
         assert!(out.contains("<4>heimdall::logging::tests: loud"), "{out}");
         assert!(!out.contains("quiet"), "{out}");
+    }
+
+    /// A FAILING event is `warn` on the event target, and both halves of that
+    /// have to survive the formatter: the `<4>` so the relay marks it, and the
+    /// `heimdall::event` so `--min-level error` — "keep only failures" — does
+    /// not drop the one line in this pair that reports a failure.
+    #[test]
+    fn a_warn_level_event_keeps_both_the_target_and_the_severity() {
+        let text = render(true, || {
+            tracing::warn!(target: "heimdall::event", "[spo=1 epoch=307] TM post FAILED: txid ab");
+        });
+        assert_eq!(
+            text,
+            "<4>heimdall::event: [spo=1 epoch=307] TM post FAILED: txid ab\n"
+        );
+
+        let plain = render(false, || {
+            tracing::warn!(target: "heimdall::event", "[spo=1 epoch=307] TM post FAILED: txid ab");
+        });
+        assert_eq!(
+            &plain[20..],
+            "  WARN heimdall::event: [spo=1 epoch=307] TM post FAILED: txid ab\n",
+            "{plain}"
+        );
     }
 
     /// The shapes `tools/heimdall-discord` parses, pinned here so a change to
