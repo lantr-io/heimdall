@@ -1,11 +1,11 @@
 # NixOS module: the Phase-1 federation SPO daemons (`run-spo`).
 #
-# THIS IS NOT THE MOVER. `heimdall-mover.nix` runs `run-mover`, which builds and
-# signs in a single process from a key reproduced off a constant seed, and can only
-# spend a treasury deployed with that key. These units run `run-spo`: the epoch loop
-# that co-signs Treasury Movements with the rest of the roster over the authenticated
-# HTTP peer transport. The two modules can be enabled on one host - they share
-# nothing but the service user, and deliberately not the binary or the state dir.
+# These units run `run-spo`: the epoch loop that co-signs Treasury Movements with
+# the rest of the roster over the authenticated HTTP peer transport. They do NOT
+# run `run-mover`, which builds and signs in a single process from a key reproduced
+# off a constant seed and can only spend a treasury deployed with that key. (The
+# `heimdall-mover.nix` module that packaged `run-mover` was removed on 2026-09-19;
+# the command survives for hand-run devnets.)
 #
 # WHY SEVERAL UNITS. A federation is t-of-n, and the signing rounds poll EVERY peer
 # rather than the first t to answer, so all n must be up to produce a movement. Each
@@ -123,8 +123,9 @@ in
         Directory holding the shared binary and secrets file. Each member's own state
         dir is this path with its index appended (`/var/lib/heimdall-fed1`).
 
-        Deliberately NOT `/var/lib/heimdall`: that belongs to `heimdall-mover.nix`,
-        whose binary is a different build and whose config is a different bridge.
+        Deliberately NOT `/var/lib/heimdall`: that is the Debian package's `state_dir`
+        and the conventional home for a single-node heimdall, whose binary is a
+        different build and whose config is a different bridge.
       '';
     };
 
@@ -144,9 +145,9 @@ in
       type = lib.types.str;
       default = "heimdall";
       description = ''
-        Service user. Defaults to the one `heimdall-mover.nix` also declares, so the
-        two modules coexist on one host; see the `home` note where the user is
-        defined for how the overlap is resolved.
+        Service user. Defaults to the conventional `heimdall`, which another heimdall
+        unit on the same host is likely to declare too; see the `home` note where the
+        user is defined for how that overlap is resolved.
       '';
     };
 
@@ -192,12 +193,12 @@ in
     users.users.${cfg.user} = {
       isSystemUser = true;
       group = cfg.user;
-      # mkDefault because heimdall-mover.nix declares this same user with its OWN
-      # home (/var/lib/heimdall), and two plain definitions of one option are a
-      # conflict the evaluator refuses rather than merges. The mover's value wins
-      # when both modules are enabled; this one applies when the federation runs
-      # alone. `home` is not load-bearing for either - each unit is given its
-      # working state through StateDirectory - so yielding costs nothing.
+      # mkDefault because another heimdall unit on the same host declares this same
+      # user with its OWN home (conventionally /var/lib/heimdall), and two plain
+      # definitions of one option are a conflict the evaluator refuses rather than
+      # merges. Theirs wins when both are enabled; this one applies when the
+      # federation runs alone. `home` is not load-bearing for either - each unit is
+      # given its working state through StateDirectory - so yielding costs nothing.
       home = lib.mkDefault cfg.stateDir;
     };
     users.groups.${cfg.user} = { };

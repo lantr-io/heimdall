@@ -68,9 +68,9 @@ delete both branches.
 | `heimdall.deb.sha256` | GitHub release assets |
 | `ghcr.io/lantr-io/heimdall:<version>` | GHCR (plus `:latest`, **only** if not a prerelease) |
 
-Two checksum files, not one, because `deploy/deploy.sh` downloads only the bare binary and runs
-`shasum -c heimdall.sha256` on it. A second line naming the `.deb` would make that verification fail
-on a file it never fetched.
+Two checksum files, not one, so each can be verified against the file it names. `shasum -c
+heimdall.sha256` runs on a bare binary downloaded on its own; a second line naming the `.deb`
+would make that verification fail on a file the operator never fetched.
 
 ### Where it is *not* published
 

@@ -60,9 +60,9 @@ jobs:
         run: |
           apk add --no-cache dpkg
           sh deploy/debian/build-deb.sh
-          # A separate checksum file: deploy.sh runs `shasum -c heimdall.sha256`
-          # having downloaded only the bare binary, so an extra line in there
-          # would make that verification fail on a missing file.
+          # A separate checksum file: `shasum -c heimdall.sha256` is run by whoever
+          # downloaded only the bare binary, so an extra line in there would make
+          # that verification fail on a file they never fetched.
           cd dist && sha256sum ./*.deb > heimdall.deb.sha256 && cat heimdall.deb.sha256
 
       - name: Create GitHub release

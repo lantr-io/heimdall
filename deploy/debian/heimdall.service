@@ -58,10 +58,11 @@ ExecStart=/usr/bin/heimdall run-spo --config /etc/heimdall/heimdall.toml $HEIMDA
 Restart=on-failure
 RestartSec=10
 
-# Hardening — mirrors deploy/nixos/heimdall-mover.nix rather than inventing a
-# second shape. (That module deploys the auto-MOVER, which is a different job
-# from this unit's; only the sandboxing is shared.) ProtectSystem=strict makes the whole filesystem read-only except
-# ReadWritePaths, so the state directory is the only thing the daemon can write.
+# Hardening — the same shape deploy/nixos/heimdall-federation.nix uses, rather
+# than inventing a second one. That module runs a different arrangement of the
+# daemon; only the sandboxing is shared. ProtectSystem=strict makes the whole
+# filesystem read-only except ReadWritePaths, so the state directory is the only
+# thing the daemon can write.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

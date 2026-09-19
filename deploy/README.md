@@ -1,25 +1,22 @@
 # Deploying Heimdall
 
-Two shapes off the same static musl binary. They run DIFFERENT commands, because they are
-different jobs: the Debian package runs the SPO daemon (`heimdall run-spo`), which joins the DKG
-and co-signs Treasury Movements with the rest of the roster; the NixOS module runs the WI-028
-auto-mover (`heimdall run-mover`), a single-process devnet/demo tool that cannot sign a real
-bridge's treasury.
+Two shapes off the same static musl binary, both running the SPO daemon (`heimdall run-spo`),
+which joins the DKG and co-signs Treasury Movements with the rest of the roster.
 
 - **[Debian package](#debian-package)** — `heimdall.service`, config in `/etc/heimdall`. The
   general-purpose route, published on each release.
-- **[NixOS module](#deploying-the-heimdall-auto-mover-to-a-nixos-box)** — `heimdall-mover.service`,
-  binary and config in `/var/lib/heimdall`. What `dev.lantr.io` runs.
 - **[Docker image](#docker-image)** — `ghcr.io/lantr-io/heimdall`, config bind-mounted into
   `/etc/heimdall`. Same binary, no systemd; published on each release.
+
+A third shape, the `heimdall-mover` NixOS module, was removed on 2026-09-19. It ran `run-mover`,
+a single-process devnet tool that could not sign a real bridge's treasury, and `dev.lantr.io`
+had moved to the SPO daemon long before: the mover spent its last three weeks skipping every
+tick against a treasury head the bridge had already orphaned. The `run-mover` command itself is
+untouched — run it by hand where you want it. Git history has the module and its `deploy.sh`.
 
 New to heimdall? Read the [operator guide](../docs/operator-guide.md) first — it walks the whole
 path from a clean machine to a registered, running node, and links back here for the details. This
 page is the per-route reference.
-
-They are separate deployments with different unit names and different config paths; do not mix
-their instructions. Running both against one bridge is a mistake — see *One instance per bridge*
-below.
 
 ---
 
@@ -167,64 +164,6 @@ sh deploy/docker/build-image.sh        # wraps it as heimdall:<version>
 
 ---
 
-## Deploying the Heimdall auto-mover to a NixOS box
-
-Runs the WI-028 treasury auto-mover (`heimdall run-mover`) as a systemd service
-(`heimdall-mover`) against the preprod BIP-322 bridge. The static binary and config live in
-`/var/lib/heimdall` (out of the Nix store); only the service definition is declarative.
-
-The mover chain-sources the treasury from Cardano and reads every bridge identifier from the
-config's `[cardano]` section, so it needs only `--config heimdall-bip322.toml`. It talks to
-Blockfrost (preprod) and the box's local `bitcoind` (RPC `127.0.0.1:48332`, provided by the
-existing `bitcoind-watchtower` service). BTC broadcast stays off (`bitcoin.submit = false`) —
-binocular's relay broadcasts the Bitcoin side; Cardano posting is gated by
-`cardano.submit_oracle = true`.
-
-## One-time setup on the box
-
-1. Add the module to your host's NixOS configuration (e.g. copy it into `/etc/nixos/`):
-
-   ```nix
-   imports = [ ./heimdall-mover.nix ];
-   services.heimdall-mover.enable = true;
-   ```
-
-   Then `nixos-rebuild switch`. This creates the `heimdall` user, `/var/lib/heimdall`, and the
-   `heimdall-mover` service. The service will fail to start until the binary + config are present —
-   that's expected.
-
-2. First deploy (binary + config):
-
-   ```bash
-   deploy/deploy.sh root@dev.lantr.io --with-config
-   ```
-
-## Routine deploys (new binary only)
-
-```bash
-deploy/deploy.sh root@dev.lantr.io
-```
-
-Builds the static musl binary (`deploy/build-linux.sh`), copies it to
-`/var/lib/heimdall/heimdall`, and restarts the service. No `nixos-rebuild` needed — that's only
-for changes to the service definition.
-
-## Deploying a published release (no local build)
-
-Cut a release from the **Release** GitHub Action — see
-[CONTRIBUTING.md](../CONTRIBUTING.md#cutting-a-release) for what it produces and the one-time GHCR
-step. It publishes the same static musl binary this page builds locally, so you can ship that exact
-artifact to the box:
-
-```bash
-deploy/deploy.sh root@dev.lantr.io --release v0.2.0
-```
-
-This downloads the release asset with `gh release download`, verifies the checksum, and installs +
-restarts as usual (no local Docker build). Requires the `gh` CLI authenticated to `lantr-io/heimdall`.
-Confirm what's running with `ssh root@dev.lantr.io '/var/lib/heimdall/heimdall --version'` — it
-prints the embedded version + commit, e.g. `heimdall 0.2.0 (abc1234 2026-07-09)`.
-
 ## Building only
 
 ```bash
@@ -239,18 +178,19 @@ reqwest → native-tls) is linked statically, so the binary has no runtime deps.
 ## Watching logs
 
 ```bash
-ssh root@dev.lantr.io 'journalctl -fu heimdall-mover -o cat'
+journalctl -fu heimdall -o cat
 ```
 
-Each tick prints a `═══ auto-mover tick #N ═══` banner and the treasury scan / peg-in / peg-out
-collection results. Ticks that find nothing pending (or a movement already in flight) skip.
+Each batch opportunity prints a `═══ batch B_i @ slot N ═══` banner and what it froze. A batch
+with nothing eligible, or one whose previous movement is still unconfirmed on Bitcoin, passes
+unused and says so.
 
 Everything the daemon says carries a level, and journald files it at the matching syslog
 priority — so the two questions worth asking have direct answers:
 
 ```bash
-journalctl -u heimdall-mover -p err      # did anything fail?
-journalctl -u heimdall-mover -p warning  # ...and what degraded before it did?
+journalctl -u heimdall -p err      # did anything fail?
+journalctl -u heimdall -p warning  # ...and what degraded before it did?
 ```
 
 That works because heimdall prefixes each line with `<N>` when systemd is capturing its stdout
@@ -260,8 +200,8 @@ priority 6, and `-p err` finds nothing on a broken node. Nothing in the unit con
 To turn up the detail on a running node, without a rebuild and without editing the config:
 
 ```bash
-systemctl edit heimdall-mover     # [Service] Environment=RUST_LOG=debug
-systemctl restart heimdall-mover
+systemctl edit heimdall     # [Service] Environment=RUST_LOG=debug
+systemctl restart heimdall
 ```
 
 A bare level is scoped to heimdall and leaves reqwest/hyper at `warn`; pass a full directive
@@ -304,9 +244,10 @@ heimdall-discord --file spo1=/var/log/heimdall/spo1.log --dry-run  # a file; pri
 
 ## Notes
 
-- **Config is secret.** `heimdall-bip322.toml` holds the Blockfrost project id and the wallet
-  mnemonic; `deploy.sh` installs it mode 600 owned by `heimdall`. It is not in the Nix store.
-- **Dry-run first.** To watch ticks without posting, set `services.heimdall-mover.broadcast = false`
-  and rebuild, or run `heimdall run-mover --config … --once` by hand as the `heimdall` user.
-- **One instance per bridge.** The mover runs on the current contracts with no leader election —
-  do not run a second instance against the same bridge.
+- **Config is secret.** It holds the Blockfrost project id and the wallet mnemonic. Install it
+  `0640 root:heimdall` at most, and keep the mnemonic in `/etc/default/heimdall` instead where
+  the route allows it.
+- **Look before joining.** `run-spo --check` resolves the config, the roster and the key material
+  and then exits, joining no DKG and posting nothing.
+- **One node per registered identity.** Each member is a distinct registration with its own key,
+  port and state dir; do not run two processes as the same registered SPO.
