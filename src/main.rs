@@ -323,6 +323,15 @@ enum Commands {
         /// y_fed (as `bootstrap-treasury` prints it).
         #[arg(long)]
         y51: Option<String>,
+        /// Pay the treasury to this address instead of back to itself. Omit for
+        /// the self-send this command defaults to.
+        ///
+        /// For retiring a treasury the bridge has moved on from: the funds leave
+        /// the federation's custody, so there is no going back once the
+        /// transaction confirms. The address must be on `bitcoin.network`; one
+        /// from another network is refused rather than paid.
+        #[arg(long)]
+        to: Option<String>,
         /// Which federation members will sign, as roster indices
         /// (`--signers 1,3,4`; `federation-dkg` prints the numbering). Every
         /// participant MUST pass the same list: FROST binds each share to the
@@ -1928,6 +1937,7 @@ fn main() {
             outpoint,
             amount_sat,
             y51,
+            to,
             signers,
             timeout_secs,
             serve_after_secs,
@@ -1938,6 +1948,7 @@ fn main() {
                 outpoint.as_deref(),
                 amount_sat,
                 y51.as_deref(),
+                to.as_deref(),
                 &signers,
                 timeout_secs,
                 serve_after_secs,
@@ -4844,6 +4855,7 @@ fn run_federation_spend(
     outpoint: Option<&str>,
     amount_sat: Option<u64>,
     y51_hex: Option<&str>,
+    to: Option<&str>,
     signers: &[u16],
     timeout_secs: Option<u64>,
     serve_after_secs: u64,
@@ -4852,6 +4864,7 @@ fn run_federation_spend(
     use bitcoin::{Amount, ScriptBuf};
     use heimdall::bitcoin::taproot::treasury_spend_info;
     use heimdall::bitcoin::tm_builder::{TreasuryInput, build_tm, federation_leaf_spend};
+    use std::str::FromStr;
 
     let secp = Secp256k1::new();
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
@@ -4907,7 +4920,26 @@ fn run_federation_spend(
     // which is the only witness that settles it.
     check_treasury_script(&rt, cfg, &outpoint, &treasury_spk, &treasury_addr)?;
 
-    // Treasury-only, no peg-ins/peg-outs => single output[0] = treasury.
+    // Where the value lands. Default: back to the treasury (the self-send this
+    // command was written for). `--to` is the retirement case — a treasury the
+    // bridge has moved on from, whose funds should leave federation custody
+    // rather than return to an address nothing will spend again. Network-checked
+    // against `bitcoin.network`, because a testnet address on mainnet (or the
+    // reverse) is a burn dressed up as a payment.
+    let destination = match to {
+        Some(a) => {
+            let network = cfg.bitcoin.parsed_network()?;
+            let addr = bitcoin::Address::from_str(a.trim())
+                .map_err(|e| format!("--to is not a Bitcoin address: {e}"))?
+                .require_network(network)
+                .map_err(|e| format!("--to is not a {network} address: {e}"))?;
+            println!("  destination: {addr} — NOT the treasury, this moves the funds OUT");
+            addr.script_pubkey()
+        }
+        None => treasury_spk.clone(),
+    };
+
+    // Treasury-only, no peg-ins/peg-outs => single output[0] = the destination.
     let unsigned = build_tm(
         TreasuryInput {
             outpoint,
@@ -4916,7 +4948,7 @@ fn run_federation_spend(
         },
         vec![],
         vec![],
-        treasury_spk,
+        destination,
         &dev_tm_params_from_cfg(cfg),
         &heimdall::bitcoin::tm_builder::Freshness::inert(),
         &cpo_trie_from_cfg(cfg)?,
