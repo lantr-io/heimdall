@@ -665,8 +665,13 @@ enum Commands {
         /// The wallet UTxO (<tx_hash>#<index>) this signature is bound to
         /// ([REG-10], [DRG-6]). Normally left off: the command reserves a fresh
         /// 2 ADA UTxO and records it, so fee selection leaves it alone while the
-        /// file is at the cold key. Pass it to name your own — for instance when
-        /// signing the printed `message` with your own Ed25519 tool.
+        /// file is at the cold key.
+        ///
+        /// Two reasons to pass it. You are signing the printed `message` with
+        /// your own Ed25519 tool and want to choose which UTxO to tie up. Or the
+        /// state dir lost the reservation while a signed file was away — name
+        /// the outpoint the file's `nonce_outpoint` field carries, and the
+        /// signature is usable again as long as that UTxO is still unspent.
         #[arg(long)]
         nonce_utxo: Option<String>,
         /// Do not submit the nonce reservation transaction; print it instead.
@@ -741,8 +746,13 @@ enum Commands {
         /// The wallet UTxO (<tx_hash>#<index>) this signature is bound to
         /// ([REG-10], [DRG-6]). Normally left off: the command reserves a fresh
         /// 2 ADA UTxO and records it, so fee selection leaves it alone while the
-        /// file is at the cold key. Pass it to name your own — for instance when
-        /// signing the printed `message` with your own Ed25519 tool.
+        /// file is at the cold key.
+        ///
+        /// Two reasons to pass it. You are signing the printed `message` with
+        /// your own Ed25519 tool and want to choose which UTxO to tie up. Or the
+        /// state dir lost the reservation while a signed file was away — name
+        /// the outpoint the file's `nonce_outpoint` field carries, and the
+        /// signature is usable again as long as that UTxO is still unspent.
         #[arg(long)]
         nonce_utxo: Option<String>,
         /// Do not submit the nonce reservation transaction; print it instead.

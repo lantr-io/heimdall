@@ -1334,6 +1334,11 @@ If `doctor` reports the reserved UTxO as spent, the file at the cold key is dead
 command again to reserve a fresh one, and take the NEW request. Nothing else recovers it — being
 single-use is the point.
 
+If instead the *state directory* lost the reservation while the file was away — a rebuilt machine,
+a restored backup — the signature is fine. Open the signed file, read its `nonce_outpoint`, and
+pass it as `--nonce-utxo <txid>#<index>`. The signature still verifies as long as that UTxO is
+unspent, which it will be unless something else on this wallet took it.
+
 **2. Keep the node running until the next epoch boundary.** The roster for the current epoch was
 frozen before your exit and this transaction does not reach back into it: you still owe that
 epoch's DKG rounds and your signature on its Treasury Movements. A node that stops here looks
