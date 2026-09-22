@@ -46,7 +46,7 @@ pub const EMBEDDED_BLUEPRINT: &str = include_str!("../../assets/plutus.json");
 /// The upstream commit `EMBEDDED_BLUEPRINT` was taken from, for `--version` and
 /// for the startup report — so a node can say which contracts it speaks without
 /// anyone diffing a 400 kB file.
-pub const EMBEDDED_BLUEPRINT_COMMIT: &str = "4d5516e149d76893280d06d184250f57d3c43175";
+pub const EMBEDDED_BLUEPRINT_COMMIT: &str = "9508705476f9a7d7ccccdd813864779377212e89";
 
 /// The blueprint to derive scripts from: the operator's file when one is named,
 /// the embedded copy otherwise.
@@ -275,11 +275,17 @@ pub fn apply_params(
 /// and the dependency a cycle. [PRE-4] broke that by reading the registry policy
 /// from the Config datum instead, so the build order is now a chain — Config
 /// identity, then treasury, then registry.
+///
+/// Rev 5.6 appends `config_policy_id` ([PRE-3]): the `Migrate` branch reads
+/// Config #13 to learn which policy a registration is being carried across
+/// FROM, and the Config NFT policy id is the one identity safe to bake in,
+/// since it depends only on its own one-shot outpoint.
 pub fn spos_registry_script(
     blueprint_json: &str,
     bootstrap_tx_id: &[u8; 32],
     bootstrap_output_index: u64,
     treasury_policy_id: &[u8; 28],
+    config_policy_id: &[u8; 28],
 ) -> Result<ParameterizedScript, BlueprintError> {
     let code = validator_compiled_code(blueprint_json, SPOS_REGISTRY_TITLE)?;
     apply_params(
@@ -288,6 +294,7 @@ pub fn spos_registry_script(
             bytes(bootstrap_tx_id),
             int_from_u64(bootstrap_output_index),
             bytes(treasury_policy_id),
+            bytes(config_policy_id),
         ],
     )
 }
@@ -347,6 +354,7 @@ pub fn registry_policy_from_bootstraps(
         registry_bootstrap.0,
         registry_bootstrap.1,
         &treasury.hash,
+        config_policy_id,
     )
 }
 
@@ -420,8 +428,11 @@ pub fn fault_verifier_equivocation_script(
 /// `spo_bans` parameterized by its full upstream parameter list (7 params, in
 /// the order the compiled validator declares them):
 ///
-/// 1. `registration_script_hash` — the registry policy id (the registered-pool
-///    reference input is checked against it).
+/// 1. `config_policy_id` — the Config NFT policy id. REPLACED
+///    `registration_script_hash` in rev 5.6 ([PRE-5]): the validator now reads
+///    the registry policy from Config #9 at run time, so a registry revision no
+///    longer makes a new ban policy, a fresh `ban-root` and a Config #8 move.
+///    Config #8 pays for that swap once, with the rev-5.6 deployment.
 /// 2. `fault_proof_policy_ids` — the authorized fault-verifier policies. The
 ///    contract's `ban_config_ok` requires **exactly 3, all distinct**, and the
 ///    hash is order-sensitive, so pass them in the exact deployment order.
@@ -439,7 +450,7 @@ pub fn fault_verifier_equivocation_script(
 #[allow(clippy::too_many_arguments)]
 pub fn spo_bans_script(
     blueprint_json: &str,
-    registration_script_hash: &[u8; 28],
+    config_policy_id: &[u8; 28],
     fault_proof_policy_ids: &[[u8; 28]],
     base_ban_duration_ms: i64,
     max_faults_before_permanent: i64,
@@ -451,7 +462,7 @@ pub fn spo_bans_script(
     apply_params(
         &code,
         &[
-            bytes(registration_script_hash),
+            bytes(config_policy_id),
             array(fault_proof_policy_ids.iter().map(|p| bytes(p)).collect()),
             int(base_ban_duration_ms),
             int(max_faults_before_permanent),
@@ -505,7 +516,20 @@ mod tests {
 
     // `bitcoin/spo_bans.spo_bans` unapplied compiledCode + the hash
     // `aiken blueprint apply` (v1.1.21) produces for the 7-param application in
-    // the test below. This pins the new bit — the `List<PolicyId>` param — which
+    // the test below.
+    //
+    // FROZEN on purpose, and NOT refreshed when `assets/plutus.json` is: what it
+    // pins is that `apply_params` reproduces `aiken blueprint apply` byte for
+    // byte, and a vector is only ground truth while both halves stay the ones
+    // aiken actually produced together. Refreshing the code without re-running
+    // aiken for the hash turns the assertion into "our encoder agrees with
+    // itself". The CURRENT blueprint's derived ids are pinned separately, by
+    // `the_embedded_blueprint_derives_pinned_policy_ids`.
+    //
+    // Rev 5.6 renamed this script's first parameter from
+    // `registration_script_hash` to `config_policy_id` ([PRE-5]). Both are
+    // 28-byte hashes, so the applied bytes — and therefore this vector — are
+    // unaffected; only what the value MEANS changed. This pins the new bit — the `List<PolicyId>` param — which
     // must be encoded as a canonical INDEFINITE-length CBOR array (`9f..ff`, what
     // `plutus::array` emits and what the on-chain ban datum already uses). aiken
     // is NOT length-form agnostic: a definite array (`83..`) hashes differently,
@@ -520,7 +544,7 @@ mod tests {
         );
         let script = spo_bans_script(
             &blueprint,
-            &[0x11; 28],                           // registration_script_hash
+            &[0x11; 28],                           // config_policy_id (rev 5.6)
             &[[0x21; 28], [0x22; 28], [0x23; 28]], // fault_proof_policy_ids (3 distinct)
             86_400_000,                            // base_ban_duration_ms
             3,                                     // max_faults_before_permanent
@@ -664,7 +688,8 @@ mod tests {
         let path = std::env::var("BIFROST_PLUTUS_JSON")
             .expect("set BIFROST_PLUTUS_JSON to the upstream plutus.json");
         let blueprint = std::fs::read_to_string(path).unwrap();
-        let registry = spos_registry_script(&blueprint, &[0xaa; 32], 1, &[0x77; 28]).unwrap();
+        let registry =
+            spos_registry_script(&blueprint, &[0xaa; 32], 1, &[0x77; 28], &[0x88; 28]).unwrap();
         // N10b: spos_registry references TreasuryDatum, whose shape changed (federation
         // fields + last_reset_tm_txid), so its compiled code — and this hash — moved.
         assert_eq!(
@@ -709,7 +734,8 @@ mod embedded_blueprint_tests {
     fn the_embedded_blueprint_derives_pinned_policy_ids() {
         let bp = EMBEDDED_BLUEPRINT;
         let treasury = treasury_info_script(bp, &BOOTSTRAP_TX, 0, &CONFIG_POLICY).unwrap();
-        let registry = spos_registry_script(bp, &BOOTSTRAP_TX, 0, &treasury.hash).unwrap();
+        let registry =
+            spos_registry_script(bp, &BOOTSTRAP_TX, 0, &treasury.hash, &CONFIG_POLICY).unwrap();
         let r1 = fault_verifier_round1_script(bp, &registry.hash).unwrap();
         let r2 = fault_verifier_round2_script(bp, &registry.hash).unwrap();
         let eq = fault_verifier_equivocation_script(bp, &registry.hash).unwrap();
@@ -721,22 +747,22 @@ mod embedded_blueprint_tests {
         );
         assert_eq!(
             registry.hash_hex(),
-            "739da7b8bb0974fd54ec353f126018e7830f18bbc0516c5c3b2f0f3b",
+            "c5e156090a31a6758b2e8dd278f40a603f6f926b05b441040307c417",
             "spos_registry"
         );
         assert_eq!(
             r1.hash_hex(),
-            "c8d0bbd6f6c06bcf03afd953c63af4cd3a01e4c41a7a04fa8a96867b",
+            "8aa81c055814b3ae4696c0c4dff18f4b1ca2ae5418a7e45b27172c14",
             "fault_verifier round1"
         );
         assert_eq!(
             r2.hash_hex(),
-            "6e20809f597c883e9c59752964f51efa320db278f69f91284ec7a929",
+            "0ffa58bf03d123946e99eaacef5c0e089e78f54c128fa7a0d20e5998",
             "fault_verifier round2"
         );
         assert_eq!(
             eq.hash_hex(),
-            "66cc08531fa362a08ced184141dae0f2f8b58bfad5adc218de72b6b9",
+            "eb64db58374361c59009046d2da97722f9c3a1cb6636c8d1e63d705f",
             "fault_verifier equivocation"
         );
     }

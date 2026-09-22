@@ -544,6 +544,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             (9, "post a movement"),
             (TRIES_STEP, "local tries"),
             (11, "wallet collateral"),
+            (12, "nonce reservation"),
         ] {
             b.push(n, title, Status::Skipped, "needs a Cardano provider");
         }
@@ -1204,6 +1205,11 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         }
     }
 
+    // The set step 11 fetches, kept for step 12: one wallet read serves both,
+    // and a reservation check that fetched again could disagree with the
+    // collateral figures printed above it.
+    let mut wallet_utxos_for_nonce: Option<Vec<crate::cardano::publish::WalletUtxo>> = None;
+
     // 11. The wallet can still post a script transaction.
     //
     // Two ada-only UTxOs, because a UTxO cannot be both the fee input and the
@@ -1222,6 +1228,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             format!("could not read the wallet's UTxOs to count collateral ({e})"),
         ),
         Ok(utxos) => {
+            wallet_utxos_for_nonce = Some(utxos.clone());
             let candidates = crate::cardano::tx_common::collateral_candidates(&utxos).len();
             let with_tokens = utxos.iter().filter(|u| !u.tokens.is_empty()).count();
             if candidates >= crate::cardano::tx_common::COLLATERAL_UTXOS_WANTED {
@@ -1255,6 +1262,67 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 );
             }
         }
+    }
+
+    // ── 12. the nonce a pending registration or exit signature is bound to ──
+    //
+    // spec [REG-10], [DRG-6]. The reservation exists so that nothing else in
+    // this wallet spends that UTxO while the signature is at an air-gapped
+    // machine. If it has been spent anyway, the file waiting at the cold key is
+    // dead, and the operator needs to hear that HERE rather than when they come
+    // back and the build fails — the trip has to be made again either way, and
+    // this is the surface that runs before it.
+    match crate::cardano::nonce_reservation::NonceReservation::load_or_none(
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    ) {
+        Err(e) => b.push(
+            12,
+            "nonce reservation",
+            Status::Warn,
+            format!("could not read the nonce reservation ({e})"),
+        ),
+        Ok(None) => b.push(
+            12,
+            "nonce reservation",
+            Status::Pass,
+            "none — no registration or exit signature is in flight".to_string(),
+        ),
+        Ok(Some(rec)) => match (rec.nonce(), wallet_utxos_for_nonce.as_ref()) {
+            (Err(e), _) => b.push(12, "nonce reservation", Status::Warn, e),
+            (Ok(_), None) => b.push(
+                12,
+                "nonce reservation",
+                Status::Warn,
+                format!(
+                    "{} reserved for a pending {}, but the wallet's UTxOs could not be read to                      check it is still unspent",
+                    rec.outpoint, rec.action
+                ),
+            ),
+            (Ok(nonce), Some(utxos)) => {
+                if crate::cardano::nonce_reservation::still_unspent(utxos, nonce) {
+                    b.push(
+                        12,
+                        "nonce reservation",
+                        Status::Pass,
+                        format!(
+                            "{} reserved for a pending {} and still unspent — fee and                              collateral selection skip it",
+                            rec.outpoint, rec.action
+                        ),
+                    );
+                } else {
+                    b.push_fix(
+                        12,
+                        "nonce reservation",
+                        Status::Warn,
+                        format!(
+                            "{} is reserved for a pending {} but is no longer an unspent UTxO                              of this wallet. Any signature made against it is used up: the                              outpoint is what makes it single-use ([REG-10], [DRG-6]), and the                              transaction that would carry it can no longer be built",
+                            rec.outpoint, rec.action
+                        ),
+                        "Delete `nonce-reservation.json` from the state dir and run                          `heimdall register-spo` (or `deregister-spo`) again: it reserves a                          fresh UTxO and writes a new request. The file already at the cold key                          cannot be used — take the new one.",
+                    );
+                }
+            }
+        },
     }
 
     Report { steps: b.steps }
@@ -1640,10 +1708,10 @@ mod tests {
         );
         let report = preflight(&cfg).await;
         let numbers: Vec<u8> = report.steps.iter().map(|s| s.n).collect();
-        assert_eq!(numbers, (1..=11).collect::<Vec<u8>>(), "{numbers:?}");
+        assert_eq!(numbers, (1..=12).collect::<Vec<u8>>(), "{numbers:?}");
         // Every rendered line's step number is within the total it prints.
         let total = report.steps.len();
-        assert_eq!(total, 11);
+        assert_eq!(total, 12);
         for s in &report.steps {
             assert!(usize::from(s.n) <= total, "step {} of {total}", s.n);
         }

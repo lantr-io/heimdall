@@ -175,7 +175,12 @@ impl std::error::Error for RegisterPoolError {}
 /// Native tokens ride along into the change output; only reference-script
 /// UTxOs are skipped, for the unpriced Conway per-byte fee.
 fn select_inputs(wallet_utxos: &[WalletUtxo], needed: u64) -> Result<Vec<&WalletUtxo>, String> {
-    let mut pure: Vec<&WalletUtxo> = wallet_utxos.iter().filter(|u| !u.has_ref_script).collect();
+    // Skips a reserved nonce UTxO for the same reason it skips a reference
+    // script: it is spoken for ([REG-10], [DRG-6]).
+    let mut pure: Vec<&WalletUtxo> = wallet_utxos
+        .iter()
+        .filter(|u| !u.has_ref_script && !u.reserved)
+        .collect();
     pure.sort_by_key(|u| std::cmp::Reverse(u.lovelace));
     let mut picked = Vec::new();
     let mut sum = 0u64;
@@ -321,6 +326,7 @@ mod tests {
             lovelace,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         }
     }
 

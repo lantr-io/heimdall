@@ -220,6 +220,53 @@ pub fn registry_snapshot(
     treasury_policy_hex: &str,
     treasury_asset_name_hex: &str,
 ) -> Result<RegistrySnapshot, RosterError> {
+    registry_snapshot_during_migration(
+        registry_utxos,
+        registry_policy_hex,
+        treasury_utxos,
+        treasury_policy_hex,
+        treasury_asset_name_hex,
+        None,
+    )
+}
+
+/// The previous registry's list, while a migration is in progress ([CFG-10]).
+pub struct PreviousRegistry<'a> {
+    pub policy_hex: &'a str,
+    pub utxos: &'a [BfUtxo],
+}
+
+/// [`registry_snapshot`], told about a registry migration in progress.
+///
+/// The identity-root check needs this, and would otherwise fail on every node
+/// for the length of the window. `Migrate` deliberately does NOT move
+/// `bifrost_identity_root` ([MIG-3], [MIG-6]) — the binding is already the
+/// treasury's truth — so while pools are crossing, the root commits to the OLD
+/// list's bindings while Config #9 names the new one. Rebuilt from the new list
+/// alone, the root simply does not match, and a node that treated that as
+/// corruption would refuse to read a roster for the whole rollout.
+///
+/// So the trie is rebuilt from the UNION of the two lists, keyed by
+/// `bifrost_id_pk`. That is exactly what the root commits to, with one
+/// exception: a pool that migrated and then exited under the new registry is
+/// gone from the trie but still sits in the old list, inert, because the old
+/// list froze when Config #9 moved. The union then over-counts by that pool and
+/// the roots differ.
+///
+/// That case is REPORTED rather than fatal, and only inside a declared window.
+/// The roster itself is taken from the new list either way — the list Config #9
+/// names, which is what the boundary snapshot and every on-chain rule use — so
+/// what is lost is a consistency check, not a safety property: the validators,
+/// not this function, are what stop a registry node the treasury does not know
+/// about. Outside a window the check is exactly as strict as it always was.
+pub fn registry_snapshot_during_migration(
+    registry_utxos: &[BfUtxo],
+    registry_policy_hex: &str,
+    treasury_utxos: &[BfUtxo],
+    treasury_policy_hex: &str,
+    treasury_asset_name_hex: &str,
+    previous: Option<PreviousRegistry<'_>>,
+) -> Result<RegistrySnapshot, RosterError> {
     let elements = find_registry_utxos(registry_utxos, registry_policy_hex)?;
     let list = RegistryList::from_elements(
         elements
@@ -236,13 +283,42 @@ pub fn registry_snapshot(
             return Err(RosterError::DuplicateIdPk(pk.clone()));
         }
     }
-    let trie = mpf::Trie::from_pairs(pairs).map_err(RosterError::Mpf)?;
+    // The union, when a migration is in progress: entries the new list does not
+    // carry yet are still the treasury's, because nothing removed them.
+    let mut trie_pairs = pairs.clone();
+    if let Some(prev) = &previous {
+        let prev_elements = find_registry_utxos(prev.utxos, prev.policy_hex)?;
+        let prev_list = RegistryList::from_elements(
+            prev_elements
+                .iter()
+                .map(|u| (u.asset_name.clone(), u.element.clone())),
+        )?;
+        for (pk, pool_id) in prev_list.identity_pairs() {
+            if seen.insert(pk.clone()) {
+                trie_pairs.push((pk, pool_id));
+            }
+        }
+    }
+    let trie = mpf::Trie::from_pairs(trie_pairs).map_err(RosterError::Mpf)?;
     let computed = trie.root_hash();
     if computed != treasury_state.datum.bifrost_identity_root {
-        return Err(RosterError::RootMismatch {
-            datum: treasury_state.datum.bifrost_identity_root,
-            computed,
-        });
+        if previous.is_none() {
+            return Err(RosterError::RootMismatch {
+                datum: treasury_state.datum.bifrost_identity_root,
+                computed,
+            });
+        }
+        // Inside a declared migration window. The one shape that produces this
+        // is a pool that migrated and then exited, leaving its frozen old-list
+        // node behind; say so rather than halt.
+        tracing::warn!(
+            datum = %hex::encode(treasury_state.datum.bifrost_identity_root),
+            computed = %hex::encode(computed),
+            "identity root does not match the union of the old and new registry lists. \
+             A registry migration is in progress (Config #13), and a pool that migrated and \
+             then exited leaves its old-list node behind, which is the expected cause. The \
+             roster is taken from the list Config #9 names, as always."
+        );
     }
 
     let spos = list
@@ -263,8 +339,11 @@ pub fn registry_snapshot(
         .collect();
 
     Ok(RegistrySnapshot {
+        // The TREASURY's root, not the recomputed one. Outside a migration
+        // window the two are equal by the check above; inside one the treasury's
+        // is the value every builder must prove against.
+        identity_root: treasury_state.datum.bifrost_identity_root,
         spos,
-        identity_root: computed,
         treasury_state,
     })
 }
@@ -510,6 +589,7 @@ impl RegistryRosterSource {
             &reg_tx_id,
             u64::from(reg_index),
             &treasury.hash,
+            config_policy_id,
         )
         .map_err(|e| err("spos_registry", e))?;
         let network = if mainnet {
@@ -1191,6 +1271,7 @@ mod tests {
         c.registry = RegistryParams {
             spos_registry_policy_id: [0xc1; 28],
             treasury_info_policy_id: [0xc2; 28],
+            previous_spos_registry_policy_id: None,
         };
         // #12 is what the local derivations in these tests compile against since
         // WI-090: `resolve` takes the one-shot from the Config, not from

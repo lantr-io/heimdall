@@ -21,6 +21,77 @@ use crate::cardano::blueprint::ParameterizedScript;
 use crate::cardano::publish::WalletUtxo;
 use crate::cardano::wallet::pub_key_hash_hex;
 
+/// The 36 bytes an outpoint contributes to a signed message: the 32-byte
+/// transaction id followed by the output index as 4-byte little-endian.
+///
+/// ONE encoding, matching `utils.serialise_output_reference` in the Aiken tree.
+/// Two messages commit to an outpoint this way — `treasury.ak`'s Update-Y
+/// rotation preimage and, since rev 5.6, `spos-registry.ak`'s registration and
+/// revocation nonces ([REG-10], [DRG-6]) — and a signer that matched one
+/// endianness and not the other would produce signatures the chain rejects with
+/// nothing to point at.
+#[must_use]
+pub fn serialise_outpoint(tx_hash: &[u8; 32], index: u32) -> [u8; 36] {
+    let mut out = [0u8; 36];
+    out[..32].copy_from_slice(tx_hash);
+    out[32..].copy_from_slice(&index.to_le_bytes());
+    out
+}
+
+/// The UTxO a registration or revocation signature is bound to ([REG-10],
+/// [DRG-6]).
+///
+/// An ordinary outpoint under the registrant's own payment key, which the
+/// transaction carrying the signatures must spend. An outpoint is spendable
+/// once, so the signatures fit exactly one transaction; spending it needs the
+/// registrant's payment witness, so a signature file that leaks is useless from
+/// any other wallet; and a failed attempt spends nothing, so a retry reuses the
+/// same signatures with no second trip to the air-gapped cold key.
+///
+/// Rendered as `<txid hex>#<index>`, the form `cardano-cli` prints and the form
+/// the air-gapped request file carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonceOutpoint {
+    pub tx_hash: [u8; 32],
+    pub index: u32,
+}
+
+impl NonceOutpoint {
+    #[must_use]
+    pub fn new(tx_hash: [u8; 32], index: u32) -> Self {
+        Self { tx_hash, index }
+    }
+
+    /// The 36 bytes the signed message ends with.
+    #[must_use]
+    pub fn to_message_bytes(&self) -> [u8; 36] {
+        serialise_outpoint(&self.tx_hash, self.index)
+    }
+
+    /// Parse `<txid hex>#<index>`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (tx, idx) = s
+            .trim()
+            .rsplit_once('#')
+            .ok_or_else(|| format!("outpoint must be <txid hex>#<index>, got {s:?}"))?;
+        let tx_hash: [u8; 32] = hex::decode(tx.trim())
+            .map_err(|e| format!("outpoint tx id is not hex: {e}"))?
+            .try_into()
+            .map_err(|_| "outpoint tx id is not 32 bytes".to_string())?;
+        let index: u32 = idx
+            .trim()
+            .parse()
+            .map_err(|_| format!("outpoint index is not a number: {idx:?}"))?;
+        Ok(Self { tx_hash, index })
+    }
+}
+
+impl std::fmt::Display for NonceOutpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{}", hex::encode(self.tx_hash), self.index)
+    }
+}
+
 /// What a collateral UTxO must hold. Generous next to the ledger's floor (150%
 /// of the fee, so a few hundred thousand lovelace), and deliberately so: it is
 /// what a phase-2 failure would forfeit, and it is the size `ensure-collateral`
@@ -56,7 +127,7 @@ pub fn token_change_floor(tokens: usize) -> u64 {
 pub fn collateral_candidates(wallet_utxos: &[WalletUtxo]) -> Vec<&WalletUtxo> {
     wallet_utxos
         .iter()
-        .filter(|u| u.pure_ada() && u.lovelace >= COLLATERAL_LOVELACE)
+        .filter(|u| u.pure_ada() && !u.reserved && u.lovelace >= COLLATERAL_LOVELACE)
         .collect()
 }
 
@@ -210,6 +281,108 @@ pub fn build_collateral_top_up(
     }))
 }
 
+/// The lovelace a reserved nonce UTxO carries. Big enough to clear the
+/// ada-only min-UTxO with room to spare, small enough that tying it up for a
+/// round trip to a safe costs an operator nothing worth thinking about.
+pub const NONCE_RESERVATION_LOVELACE: u64 = 2_000_000;
+
+/// A nonce UTxO, created and ready to submit.
+#[derive(Debug, Clone)]
+pub struct NonceReservationTx {
+    pub signed_tx_hex: String,
+    /// The outpoint the reserved output WILL have. Known before the transaction
+    /// is submitted, because an output's index is chosen here and the tx id is
+    /// the hash of the body that is now fixed.
+    pub outpoint: NonceOutpoint,
+}
+
+/// Build a self-payment whose first output is a dedicated UTxO for a
+/// registration or exit signature to be bound to ([REG-10], [DRG-6]).
+///
+/// One ordinary transaction, no scripts, so it needs no collateral — the same
+/// shape as `ensure-collateral`'s top-up.
+///
+/// Why create one rather than reserve a UTxO the wallet already holds: the
+/// wallet's existing ada-only UTxOs are its COLLATERAL, and a wallet typically
+/// has exactly the two it needs. Reserving one of those for a round trip to an
+/// air-gapped machine would stop the daemon posting movements for the duration,
+/// which is the opposite of what the reservation is for. A fresh 2 ADA output
+/// costs a fee and takes nothing away.
+///
+/// The returned outpoint is usable immediately: the request file can name it
+/// before the transaction confirms, because the registration that spends it is
+/// hours away in the air-gapped flow, and in the one-machine flow the caller
+/// uses the fee input directly instead of coming here.
+pub fn build_nonce_reservation_tx(
+    wallet_address: &str,
+    wallet_utxos: &[WalletUtxo],
+    key: &PrivateKey,
+    cost_models: &Option<Vec<Vec<i64>>>,
+) -> Result<NonceReservationTx, String> {
+    // A plain fee selection: this spends one UTxO and hands most of it back as
+    // change, so the margin only has to cover the new output plus the fee.
+    let funder = select_fee(wallet_utxos, NONCE_RESERVATION_LOVELACE + 1_000_000)?;
+
+    let body = TxBuilderBody {
+        inputs: vec![TxIn::PubKeyTxIn(PubKeyTxIn {
+            tx_in: TxInParameter {
+                tx_hash: funder.tx_hash.clone(),
+                tx_index: funder.output_index,
+                amount: Some(wallet_input_amount(funder)),
+                address: Some(wallet_address.to_string()),
+            },
+        })],
+        // Index 0, and nothing else before it: the change output whisky appends
+        // comes after, so the reserved outpoint's index is fixed at 0.
+        outputs: vec![Output {
+            address: wallet_address.to_string(),
+            amount: vec![Asset::new_from_str(
+                "lovelace",
+                &NONCE_RESERVATION_LOVELACE.to_string(),
+            )],
+            datum: None,
+            reference_script: None,
+        }],
+        collaterals: vec![],
+        required_signatures: vec![pub_key_hash_hex(key)],
+        change_address: wallet_address.to_string(),
+        signing_key: vec![],
+        network: Some(whisky_network(cost_models)),
+        reference_inputs: vec![],
+        withdrawals: vec![],
+        mints: vec![],
+        certificates: vec![],
+        votes: vec![],
+        fee: None,
+        change_datum: None,
+        metadata: vec![],
+        validity_range: ValidityRange {
+            invalid_before: None,
+            invalid_hereafter: None,
+        },
+        total_collateral: None,
+        collateral_return_address: None,
+    };
+
+    let mut pallas = WhiskyPallas::new(None);
+    pallas.tx_builder_body = body;
+    let unsigned_hex = pallas
+        .serialize_tx_body()
+        .map_err(|e| format!("whisky tx build: {e:?}"))?;
+    let signed_tx_hex = sign_built_tx(&unsigned_hex, key)?;
+
+    // The id of the transaction that will create the output: the hash of the
+    // body, computed from the SIGNED bytes so it is the id the node will report.
+    let bytes = hex::decode(&signed_tx_hex).map_err(|e| format!("signed tx hex decode: {e}"))?;
+    let tx: Tx = minicbor::decode(&bytes).map_err(|e| format!("signed tx minicbor decode: {e}"))?;
+    let tx_hash: [u8; 32] = *tx.transaction_body.compute_hash();
+
+    Ok(NonceReservationTx {
+        signed_tx_hex,
+        outpoint: NonceOutpoint { tx_hash, index: 0 },
+    })
+}
+
 /// Whether a bech32 address is a testnet address (`addr_test…` HRP).
 #[must_use]
 pub fn is_testnet_address(wallet_address: &str) -> bool {
@@ -294,9 +467,12 @@ pub fn select_fee(
     wallet_utxos: &[WalletUtxo],
     min_fee_lovelace: u64,
 ) -> Result<&WalletUtxo, String> {
+    // `reserved` is skipped for the same reason `has_ref_script` is: spending
+    // this UTxO for anything else destroys something the wallet still needs —
+    // here, the nonce a cold signature is already bound to ([REG-10], [DRG-6]).
     let fee = wallet_utxos
         .iter()
-        .filter(|u| !u.has_ref_script)
+        .filter(|u| !u.has_ref_script && !u.reserved)
         .max_by_key(|u| u.lovelace)
         .ok_or_else(|| "no wallet UTxO available for the fee input".to_string())?;
     // A token-bearing fee input means the change output carries those tokens,
@@ -357,6 +533,7 @@ pub fn select_collateral<'a>(
         .find(|u| {
             u.lovelace >= COLLATERAL_LOVELACE
                 && u.pure_ada()
+                && !u.reserved
                 && !spent_inputs
                     .iter()
                     .any(|s| s.tx_hash == u.tx_hash && s.output_index == u.output_index)
@@ -645,6 +822,7 @@ mod tests {
                 .map(|(u, q)| ((*u).to_string(), (*q).to_string()))
                 .collect::<BTreeMap<_, _>>(),
             has_ref_script: false,
+            reserved: false,
         }
     }
 

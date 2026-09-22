@@ -214,7 +214,10 @@ impl DkgFaultBanFlow {
         }
         let spo_bans = crate::cardano::blueprint::spo_bans_script(
             &blueprint_json,
-            &registry.hash,
+            // spec [PRE-5]: the Config NFT policy, NOT the registry hash. The
+            // validator reads the registry policy from Config #9 at run time,
+            // so this parameter no longer moves when the registry is revised.
+            &config_policy_id,
             &ban_params.fault_proof_policies,
             ban_params.base_ban_duration_ms,
             ban_params.max_faults_before_permanent,
@@ -2334,6 +2337,33 @@ impl BlockfrostCardanoChain {
             .iter()
             .map(WalletUtxo::from_bf)
             .collect();
+        // spec [PRE-5]: `spo-bans.ak` reads the registry policy from Config #9
+        // at run time now, so the ban transaction must reference the Config
+        // UTxO. Read fresh rather than from the cache: the redeemer names an
+        // index into THIS transaction's reference set, so it has to be the UTxO
+        // that exists as this transaction is built.
+        let config_ref = {
+            let (Some(addr), Some(unit)) = (
+                self.config_address.as_deref(),
+                self.config_nft_unit.as_deref(),
+            ) else {
+                return Err(EpochError::Chain(
+                    "applying a ban needs the bridge Config UTxO (spo-bans.ak reads the \
+                     registry policy from field #9 since rev 5.6); set cardano.config_address \
+                     and cardano.config_nft_policy_id"
+                        .to_string(),
+                ));
+            };
+            crate::cardano::config_params::fetch_config(
+                &self.bf_base_url,
+                &self.bf_project_id,
+                addr,
+                unit,
+            )
+            .await
+            .map_err(|e| EpochError::Chain(format!("bridge Config for the ban: {e}")))?
+            .utxo
+        };
         let apply = crate::cardano::apply_ban::build_apply_ban_tx(
             &crate::cardano::apply_ban::ApplyBanRequest {
                 spo_bans_script: &flow.spo_bans,
@@ -2345,6 +2375,7 @@ impl BlockfrostCardanoChain {
                 ban_utxos: &ban_raw,
                 fault_utxo: &fault_utxo,
                 registration_ref: (reg_node.tx_hash.clone(), reg_node.output_index),
+                config_ref: (config_ref.tx_hash.clone(), config_ref.index),
                 spo_bans_ref: (
                     flow.spo_bans_ref.tx_hash.clone(),
                     flow.spo_bans_ref.output_index,

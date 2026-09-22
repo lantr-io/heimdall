@@ -102,6 +102,23 @@ pub struct WalletUtxo {
     /// that generic fee estimation cannot see (`FeeTooSmallUTxO`), and consumes
     /// a deployed reference script.
     pub has_ref_script: bool,
+    /// The UTxO is the nonce a pending registration or exit signature is bound
+    /// to ([REG-10], [DRG-6]). Coin selection skips it for the same reason it
+    /// skips a reference script: spending it for anything else destroys
+    /// something the wallet still needs.
+    ///
+    /// The window this protects is real and unattended. An exit signature goes
+    /// to an air-gapped machine and comes back hours or days later, and the
+    /// daemon keeps posting treasury movements and bans from this same wallet
+    /// the whole time. Without the flag one of those picks the nonce UTxO as a
+    /// fee input, and the signature the operator carried to the safe is dead —
+    /// reported by the chain as nothing more informative than an invalid
+    /// signature.
+    ///
+    /// Set by [`mark_reserved`](crate::cardano::nonce_reservation::mark_reserved)
+    /// from the record in the state dir; false everywhere the reservation is
+    /// not in play.
+    pub reserved: bool,
 }
 
 impl WalletUtxo {
@@ -128,6 +145,7 @@ impl WalletUtxo {
             lovelace,
             tokens,
             has_ref_script: u.reference_script_hash.is_some(),
+            reserved: false,
         }
     }
 
@@ -143,6 +161,16 @@ impl WalletUtxo {
     #[must_use]
     pub fn pure_ada(&self) -> bool {
         self.tokens.is_empty() && !self.has_ref_script
+    }
+
+    /// This UTxO's outpoint, for comparison against a reservation.
+    #[must_use]
+    pub fn outpoint(&self) -> Option<crate::cardano::tx_common::NonceOutpoint> {
+        let tx_hash: [u8; 32] = hex::decode(&self.tx_hash).ok()?.try_into().ok()?;
+        Some(crate::cardano::tx_common::NonceOutpoint {
+            tx_hash,
+            index: self.output_index,
+        })
     }
 }
 

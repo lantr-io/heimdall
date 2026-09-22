@@ -78,6 +78,15 @@ pub struct NodeState {
     /// pool joining, leaving, being banned or having its stake activate is one
     /// line. Empty until the first ceremony entry.
     pub registry: String,
+    /// A registry migration this node is part of, for `heimdall status` and
+    /// `/health` (spec [MIG-1], §SPO Registration section 8).
+    ///
+    /// `migrating <old> -> <new>` while this node is carrying its own
+    /// registration across, `migrated` once it is in the list Config #9 names.
+    /// `None` when Config #13 is unset, which is the normal state and says
+    /// nothing rather than "not migrating" — a line that would appear on every
+    /// node forever.
+    pub registry_migration: Option<String>,
     /// Why this node had to rebuild its cumulative tries when it started, or
     /// `None` when they were already current — the normal case.
     ///
@@ -228,6 +237,9 @@ pub fn render(state: &NodeState) -> String {
     }
     if !state.registry.is_empty() {
         out.push_str(&format!("registry        {}\n", state.registry));
+    }
+    if let Some(migration) = &state.registry_migration {
+        out.push_str(&format!("registry        {migration}\n"));
     }
     if let Some(why) = &state.tries_rebuilt_at_startup {
         out.push_str(&format!("tries           REBUILT at startup — {why}\n"));
@@ -484,6 +496,7 @@ mod tests {
             // at all.
             stranded_pegins: BTreeSet::from(["abc123:0".to_string()]),
             registry: "4 registered, all eligible: #1 http://a.example:18500".to_string(),
+            registry_migration: Some("migrating aabb -> ccdd".to_string()),
             // Non-empty for the same reason: an operator whose monitoring
             // scrapes this must see it over the wire, not only in the log the
             // daemon wrote at startup.

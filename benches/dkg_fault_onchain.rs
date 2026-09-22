@@ -554,7 +554,8 @@ struct BifrostFaultScripts {
 
 fn bifrost_fault_scripts(kind: FaultVerifierKind) -> BifrostFaultScripts {
     let blueprint_json = fetch_bifrost_plutus_json();
-    let registry = blueprint::spos_registry_script(&blueprint_json, &[0xC0; 32], 0, &[0x77; 28])
+    let registry =
+        blueprint::spos_registry_script(&blueprint_json, &[0xC0; 32], 0, &[0x77; 28], &[0x88; 28])
         .expect("parameterize benchmark spos_registry");
     let round1_fault = blueprint::fault_verifier_script(
         &blueprint_json,
@@ -587,7 +588,8 @@ fn bifrost_fault_scripts(kind: FaultVerifierKind) -> BifrostFaultScripts {
     };
     let spo_bans = blueprint::spo_bans_script(
         &blueprint_json,
-        &registry.hash,
+        // spec [PRE-5]: the Config NFT policy, not the registry hash.
+        &[0x88; 28],
         &policy_ids,
         ban_params.base_ban_duration_ms,
         ban_params.max_faults_before_permanent,
@@ -692,6 +694,7 @@ fn run_apply_ban_full_tx_benchmark(
         ban_utxos: &[ban_root_bf],
         fault_utxo: &fault_utxo,
         registration_ref: (registration_tx_hash.to_string(), registration_output_index),
+        config_ref: ("ce".repeat(32), 0),
         spo_bans_ref: (spo_bans_ref_tx_hash, spo_bans_ref_output_index),
         mainnet: false,
         start_time_ms,
@@ -888,6 +891,7 @@ fn bench_wallet_utxos() -> Vec<WalletUtxo> {
             lovelace: 50_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         },
         WalletUtxo {
             tx_hash: tx_hash_hex(0xA2),
@@ -895,6 +899,7 @@ fn bench_wallet_utxos() -> Vec<WalletUtxo> {
             lovelace: 6_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         },
     ]
 }

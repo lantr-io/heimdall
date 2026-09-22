@@ -66,9 +66,9 @@ use crate::cardano::treasury_info::{
 };
 use crate::cardano::treasury_spend::{TreasurySpendError, find_treasury_state, treasury_spend_leg};
 use crate::cardano::tx_common::{
-    BootstrapError, OneShotBootstrapParams, build_oneshot_bootstrap_tx, element_lovelace,
-    network_from_address, select_collateral, select_fee, sign_built_tx as common_sign_built_tx,
-    wallet_input_amount, whisky_network,
+    BootstrapError, NonceOutpoint, OneShotBootstrapParams, build_oneshot_bootstrap_tx,
+    element_lovelace, network_from_address, select_collateral, select_fee,
+    sign_built_tx as common_sign_built_tx, wallet_input_amount, whisky_network,
 };
 use crate::cardano::wallet::pub_key_hash_hex;
 
@@ -159,23 +159,50 @@ pub fn pool_id_from_cold_vkey(cold_vkey: &[u8; 32]) -> [u8; 28] {
 }
 
 /// `registration_message` in `spos_registry.ak`:
-/// `"bifrost-spo" || pool_id || bifrost_id_pk || bifrost_url`.
+/// `"bifrost-spo" || pool_id || bifrost_id_pk || bifrost_url || nonce_outpoint`.
+///
+/// The trailing 36-byte nonce is what makes the signatures single-use ([REG-10],
+/// rev 5.6). Everything before it is the same for every registration of a pool
+/// — the domain separator, a pool id derived from a cold key that does not
+/// change, and the identity the operator declares — and both signatures travel
+/// in the redeemer, so they are public from the first transaction that carries
+/// them. Before the nonce, a published registration signature could put a pool
+/// that had left back into the registry with its old key and URL, where the
+/// roster faults it and the ban list records that against the real pool.
+///
+/// Its fixed length also keeps the message unambiguous: it follows a
+/// variable-length URL, and a suffix of known length is the only thing that
+/// stops the two being re-split.
 #[must_use]
-pub fn registration_message(pool_id: &[u8], bifrost_id_pk: &[u8], bifrost_url: &[u8]) -> Vec<u8> {
+pub fn registration_message(
+    pool_id: &[u8],
+    bifrost_id_pk: &[u8],
+    bifrost_url: &[u8],
+    nonce: &NonceOutpoint,
+) -> Vec<u8> {
+    let nonce_bytes = nonce.to_message_bytes();
     let mut m = Vec::with_capacity(
         REGISTRATION_DOMAIN_SEPARATOR.len()
             + pool_id.len()
             + bifrost_id_pk.len()
-            + bifrost_url.len(),
+            + bifrost_url.len()
+            + nonce_bytes.len(),
     );
     m.extend_from_slice(REGISTRATION_DOMAIN_SEPARATOR);
     m.extend_from_slice(pool_id);
     m.extend_from_slice(bifrost_id_pk);
     m.extend_from_slice(bifrost_url);
+    m.extend_from_slice(&nonce_bytes);
     m
 }
 
-/// The two registration signatures plus the cold verification key they bind.
+/// The two registration signatures, the cold verification key they bind, and
+/// the outpoint they are bound TO.
+///
+/// The nonce travels with the signatures because it is part of what they mean:
+/// a pair of signatures without it names no transaction, and a builder that
+/// paired them with a different outpoint would produce a transaction the chain
+/// rejects with nothing but "signature invalid" to go on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistrationSignatures {
     pub cold_vkey: [u8; 32],
@@ -183,6 +210,9 @@ pub struct RegistrationSignatures {
     pub cold_sig: [u8; 64],
     /// BIP340 Schnorr over `sha2_256(registration message)`.
     pub bifrost_sig: [u8; 64],
+    /// spec [REG-10]: the UTxO the transaction must spend for these signatures
+    /// to verify. Chosen among the registrant's own UTxOs.
+    pub nonce: NonceOutpoint,
 }
 
 /// Produce both registration signatures locally (non-air-gapped flow).
@@ -192,11 +222,12 @@ pub fn sign_registration(
     cold_skey: &ed25519::SecretKey,
     bifrost_keypair: &Keypair,
     bifrost_url: &[u8],
+    nonce: NonceOutpoint,
 ) -> RegistrationSignatures {
     let cold_vkey: [u8; 32] = cold_skey.public_key().into();
     let pool_id = pool_id_from_cold_vkey(&cold_vkey);
     let bifrost_id_pk = bifrost_keypair.x_only_public_key().0.serialize();
-    let message = registration_message(&pool_id, &bifrost_id_pk, bifrost_url);
+    let message = registration_message(&pool_id, &bifrost_id_pk, bifrost_url, &nonce);
 
     let cold_sig: [u8; 64] = cold_skey
         .sign(&message)
@@ -216,6 +247,7 @@ pub fn sign_registration(
         cold_vkey,
         cold_sig,
         bifrost_sig,
+        nonce,
     }
 }
 
@@ -232,7 +264,7 @@ pub fn verify_registration(
         .map_err(|e| RegisterSpoError::BadBifrostKey(e.to_string()))?;
 
     let pool_id = pool_id_from_cold_vkey(&sigs.cold_vkey);
-    let message = registration_message(&pool_id, bifrost_id_pk, bifrost_url);
+    let message = registration_message(&pool_id, bifrost_id_pk, bifrost_url, &sigs.nonce);
 
     let vkey = ed25519::PublicKey::from(sigs.cold_vkey);
     if !vkey.verify(&message, &ed25519::Signature::from(sigs.cold_sig)) {
@@ -255,12 +287,19 @@ pub fn verify_registration(
 
 /// `SposRegistryMintRedeemer::Register` — constructor 1, field order pinned by
 /// `bifrost/types/spos_registry.ak`:
-/// `{cold_vkey, cold_sig, bifrost_sig, registration_anchor_input_index,
-/// registration_anchor_output_index, treasury_input_index,
-/// treasury_output_index, bifrost_identity_absence_proof}`.
+/// `{cold_vkey, cold_sig, bifrost_sig, nonce_input_index,
+/// registration_anchor_input_index, registration_anchor_output_index,
+/// treasury_input_index, treasury_output_index, bifrost_identity_absence_proof}`.
+///
+/// `nonce_input_index` sits directly after the signatures it makes single-use
+/// (rev 5.6, [REG-10]); every index after it keeps the position it had. There is
+/// no schema between this function and the Aiken constructor — the fields are
+/// positional on both sides — so the order here is a contract, not a
+/// convenience.
 #[must_use]
 pub fn register_mint_redeemer(
     sigs: &RegistrationSignatures,
+    nonce_input_index: i64,
     anchor_input_index: i64,
     anchor_output_index: i64,
     treasury_input_index: i64,
@@ -273,6 +312,7 @@ pub fn register_mint_redeemer(
             bytes(&sigs.cold_vkey),
             bytes(&sigs.cold_sig),
             bytes(&sigs.bifrost_sig),
+            int(nonce_input_index),
             int(anchor_input_index),
             int(anchor_output_index),
             int(treasury_input_index),
@@ -416,7 +456,9 @@ fn select_fee_and_collateral(
     min_fee_lovelace: u64,
 ) -> Result<(&WalletUtxo, &WalletUtxo), RegisterSpoError> {
     let fee_utxo = select_fee(wallet_utxos, min_fee_lovelace).map_err(RegisterSpoError::Wallet)?;
-    // Collateral must be ada-only and DISTINCT from the fee input.
+    // Collateral must be ada-only and DISTINCT from the fee input. Both calls
+    // also skip a `reserved` UTxO, which is how the nonce a cold signature is
+    // bound to survives the round trip to the cold key ([REG-10], [DRG-6]).
     let coll_utxo =
         select_collateral(wallet_utxos, &[fee_utxo]).map_err(RegisterSpoError::Wallet)?;
     Ok((fee_utxo, coll_utxo))
@@ -511,23 +553,57 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
     let new_node_datum_cbor = plan.new_node.to_cbor();
     let node_lovelace = element_lovelace(new_node_datum_cbor.len());
 
+    // spec [REG-10]: the transaction MUST spend the UTxO the signatures name, or
+    // the message the validator rebuilds is not the message that was signed.
+    // Locate it in the wallet first: gone from the set means already spent, and
+    // saying so here is worth more than the chain's "signature invalid".
+    let nonce = req.sigs.nonce;
+    let nonce_utxo = req
+        .wallet_utxos
+        .iter()
+        .find(|u| u.outpoint() == Some(nonce))
+        .ok_or_else(|| {
+            RegisterSpoError::Build(format!(
+                "the nonce UTxO {nonce} these signatures are bound to is not in the wallet. \
+                 Either it has been spent — in which case the signatures are used up and the \
+                 cold key must sign again — or this is the wrong wallet",
+            ))
+        })?;
+
     let (fee_utxo, coll_utxo) =
         select_fee_and_collateral(req.wallet_utxos, node_lovelace + 1_000_000)?;
 
     // The ledger orders tx inputs lexicographically by (tx_id, index); the
     // redeemer indices must point into that order.
     let fee_ref = (tx_id_bytes(&fee_utxo.tx_hash)?, fee_utxo.output_index);
+    let nonce_ref = (nonce.tx_hash, nonce.index);
     let anchor_ref = (tx_id_bytes(&anchor.tx_hash)?, anchor.output_index);
     let treasury_ref = (tx_id_bytes(&state.tx_hash)?, state.output_index);
-    if fee_ref == anchor_ref || fee_ref == treasury_ref || anchor_ref == treasury_ref {
+    // The nonce MAY be the fee input — that is the one-machine flow, where the
+    // request and the submission happen in the same command and nothing can
+    // spend it in between. Everywhere else it is its own input, reserved in the
+    // state dir so fee selection skips it.
+    let nonce_is_fee = nonce_ref == fee_ref;
+    let mut sorted = vec![fee_ref, anchor_ref, treasury_ref];
+    if !nonce_is_fee {
+        sorted.push(nonce_ref);
+    }
+    let distinct = {
+        let mut d = sorted.clone();
+        d.sort();
+        d.dedup();
+        d.len()
+    };
+    if distinct != sorted.len() {
         return Err(RegisterSpoError::Build(
-            "fee/anchor/treasury inputs must be distinct outpoints".into(),
+            "fee/nonce/anchor/treasury inputs must be distinct outpoints".into(),
         ));
     }
-    let mut sorted = [fee_ref, anchor_ref, treasury_ref];
     sorted.sort();
-    let anchor_input_index = sorted.iter().position(|r| *r == anchor_ref).unwrap() as i64;
-    let treasury_input_index = sorted.iter().position(|r| *r == treasury_ref).unwrap() as i64;
+    let index_of = |r: &([u8; 32], u32)| sorted.iter().position(|s| s == r).unwrap() as i64;
+    let anchor_input_index = index_of(&anchor_ref);
+    let treasury_input_index = index_of(&treasury_ref);
+    let nonce_input_index = index_of(&nonce_ref);
     // Outputs are ours to order: [0] continued anchor, [1] new node,
     // [2] continued treasury (whisky appends the change output after).
     let (anchor_output_index, treasury_output_index) = (0i64, 2i64);
@@ -610,6 +686,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
 
     let mint_redeemer = register_mint_redeemer(
         req.sigs,
+        nonce_input_index,
         anchor_input_index,
         anchor_output_index,
         treasury_input_index,
@@ -619,19 +696,29 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
     let mint_redeemer_hex =
         hex::encode(minicbor::to_vec(&mint_redeemer).expect("redeemer CBOR encode"));
 
+    let mut inputs = vec![TxIn::PubKeyTxIn(PubKeyTxIn {
+        tx_in: TxInParameter {
+            tx_hash: fee_utxo.tx_hash.clone(),
+            tx_index: fee_utxo.output_index,
+            amount: Some(wallet_input_amount(fee_utxo)),
+            address: Some(req.wallet_address.to_string()),
+        },
+    })];
+    if !nonce_is_fee {
+        inputs.push(TxIn::PubKeyTxIn(PubKeyTxIn {
+            tx_in: TxInParameter {
+                tx_hash: nonce_utxo.tx_hash.clone(),
+                tx_index: nonce_utxo.output_index,
+                amount: Some(wallet_input_amount(nonce_utxo)),
+                address: Some(req.wallet_address.to_string()),
+            },
+        }));
+    }
+    inputs.push(anchor_in);
+    inputs.push(treasury_in);
+
     let body = TxBuilderBody {
-        inputs: vec![
-            TxIn::PubKeyTxIn(PubKeyTxIn {
-                tx_in: TxInParameter {
-                    tx_hash: fee_utxo.tx_hash.clone(),
-                    tx_index: fee_utxo.output_index,
-                    amount: Some(wallet_input_amount(fee_utxo)),
-                    address: Some(req.wallet_address.to_string()),
-                },
-            }),
-            anchor_in,
-            treasury_in,
-        ],
+        inputs,
         outputs: vec![continued_anchor_out, new_node_out, treasury_out],
         collaterals: vec![PubKeyTxIn {
             tx_in: TxInParameter {
@@ -717,6 +804,9 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
             };
             at(anchor_input_index, &anchor_ref, "anchor")?;
             at(treasury_input_index, &treasury_ref, "treasury")?;
+            // spec [REG-10]. The one index whose drift the chain reports as
+            // nothing but a bad signature, so it is worth naming here.
+            at(nonce_input_index, &nonce_ref, "nonce")?;
         }
 
         hex::encode(
@@ -929,8 +1019,18 @@ mod tests {
 
     const URL: &[u8] = b"https://spo.example:18500";
 
+    /// The nonce the fixture signatures are bound to ([REG-10]).
+    fn test_nonce() -> NonceOutpoint {
+        NonceOutpoint::new([0x7a; 32], 3)
+    }
+
+    /// A different one, for the replay negatives.
+    fn other_nonce() -> NonceOutpoint {
+        NonceOutpoint::new([0x5c; 32], 1)
+    }
+
     fn test_sigs() -> RegistrationSignatures {
-        sign_registration(&cold_skey(), &bifrost_keypair(), URL)
+        sign_registration(&cold_skey(), &bifrost_keypair(), URL, test_nonce())
     }
 
     fn test_pool_id() -> [u8; 28] {
@@ -939,8 +1039,79 @@ mod tests {
 
     #[test]
     fn message_is_domain_separated_concatenation() {
-        let m = registration_message(b"POOL", b"PK", b"URL");
-        assert_eq!(m, b"bifrost-spoPOOLPKURL");
+        let m = registration_message(b"POOL", b"PK", b"URL", &test_nonce());
+        let mut want = b"bifrost-spoPOOLPKURL".to_vec();
+        want.extend_from_slice(&[0x7a; 32]);
+        want.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(m, want);
+    }
+
+    /// The golden bytes, pinned against the SAME fixture the Aiken suite uses
+    /// (`register_happy` in `spos-registry.ak`): cold seed [42; 32], bifrost
+    /// seckey [7; 32], this URL, this outpoint. Two suites, one message format —
+    /// a change to either concatenation breaks both, which is the point.
+    #[test]
+    fn the_registration_message_matches_the_on_chain_golden_bytes() {
+        let cold: [u8; 32] = cold_skey().public_key().into();
+        let pool_id = pool_id_from_cold_vkey(&cold);
+        let m = registration_message(
+            &pool_id,
+            &bifrost_pk(),
+            b"https://spo.example/bifrost",
+            &test_nonce(),
+        );
+        assert_eq!(
+            hex::encode(&m),
+            "626966726f73742d73706f1dfb74a8cbcda254c65b5dd5d95df89f60b28b11de4da2ded3bc1f9b989c0b\
+             76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f68747470733a2f2f73706f2e65\
+             78616d706c652f626966726f73747a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a\
+             7a7a7a7a03000000"
+                .replace(['\n', ' '], "")
+        );
+        // The outpoint is the LAST 36 bytes, after the variable-length URL, and
+        // that fixed width is what keeps the message unambiguous.
+        assert_eq!(&m[m.len() - 36..][..32], &[0x7a; 32]);
+        assert_eq!(&m[m.len() - 4..], &3u32.to_le_bytes());
+    }
+
+    /// Every field is covered, INCLUDING the nonce: change any one of them and
+    /// the signatures the cold key made stop verifying.
+    #[test]
+    fn verification_rejects_a_tamper_in_any_field() {
+        let sigs = test_sigs();
+        assert!(verify_registration(&sigs, &bifrost_pk(), URL).is_ok());
+
+        let mut moved_nonce = sigs.clone();
+        moved_nonce.nonce = other_nonce();
+        assert!(
+            verify_registration(&moved_nonce, &bifrost_pk(), URL).is_err(),
+            "a different nonce outpoint must invalidate both signatures ([REG-10])"
+        );
+
+        assert!(
+            verify_registration(&sigs, &bifrost_pk(), b"https://attacker.example").is_err(),
+            "a different URL must invalidate the signatures"
+        );
+
+        let mut other_key = sigs.clone();
+        other_key.cold_vkey = ed25519::SecretKey::from([43u8; 32]).public_key().into();
+        assert!(
+            verify_registration(&other_key, &bifrost_pk(), URL).is_err(),
+            "a different cold key must invalidate the signatures"
+        );
+
+        let mut flipped = sigs.clone();
+        flipped.cold_sig[0] ^= 0xff;
+        assert!(verify_registration(&flipped, &bifrost_pk(), URL).is_err());
+    }
+
+    /// Sign / verify round trip, which is what the one-machine flow does.
+    #[test]
+    fn signing_and_verifying_round_trip() {
+        let sigs = test_sigs();
+        let pool_id = verify_registration(&sigs, &bifrost_pk(), URL).expect("verify");
+        assert_eq!(pool_id, test_pool_id());
+        assert_eq!(sigs.nonce, test_nonce());
     }
 
     // Pinned externally (python hashlib.blake2b(b'\x11'*32, digest_size=28)):
@@ -1002,7 +1173,7 @@ mod tests {
     fn bifrost_sig_is_bip340_over_sha256_of_message() {
         let sigs = test_sigs();
         let pool_id = pool_id_from_cold_vkey(&sigs.cold_vkey);
-        let message = registration_message(&pool_id, &bifrost_pk(), URL);
+        let message = registration_message(&pool_id, &bifrost_pk(), URL, &sigs.nonce);
         let digest = sha256::Hash::hash(&message).to_byte_array();
         let secp = Secp256k1::verification_only();
         secp.verify_schnorr(
@@ -1029,7 +1200,10 @@ mod tests {
         // canonically (indefinite-length) encoded.
         let sigs = test_sigs();
         let proof: mpf::Proof = vec![];
-        let r = register_mint_redeemer(&sigs, 1, 0, 2, 2, &proof);
+        // nonce_input_index goes FIRST of the indices, directly after the
+        // signatures it makes single-use — the position the Aiken constructor
+        // pins ([REG-10]).
+        let r = register_mint_redeemer(&sigs, 0, 2, 0, 3, 2, &proof);
         let cbor = minicbor::to_vec(&r).unwrap();
         let hex_str = hex::encode(&cbor);
         assert!(hex_str.starts_with("d87a9f"), "{hex_str}");
@@ -1040,11 +1214,13 @@ mod tests {
         };
         assert_eq!(c.tag, 122);
         let fields: Vec<_> = c.fields.iter().collect();
-        assert_eq!(fields.len(), 8);
+        assert_eq!(fields.len(), 9);
         assert!(matches!(fields[0], PlutusData::BoundedBytes(b) if **b == sigs.cold_vkey));
         assert!(matches!(fields[1], PlutusData::BoundedBytes(b) if **b == sigs.cold_sig));
         assert!(matches!(fields[2], PlutusData::BoundedBytes(b) if **b == sigs.bifrost_sig));
-        assert!(matches!(fields[7], PlutusData::Array(_)));
+        // The nonce index, then the four it used to be followed by.
+        assert!(matches!(fields[3], PlutusData::BigInt(_)));
+        assert!(matches!(fields[8], PlutusData::Array(_)));
     }
 
     // ---- fixtures for the snapshot/build tests --------------------------
@@ -1188,6 +1364,7 @@ mod tests {
                 lovelace: 50_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
             // Distinct pure-ADA collateral — the fee input can't double as collateral.
             WalletUtxo {
@@ -1196,6 +1373,18 @@ mod tests {
                 lovelace: 6_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
+            },
+            // The reserved nonce UTxO the signatures are bound to ([REG-10]).
+            // Flagged `reserved`, so fee and collateral selection leave it to
+            // the one input that is allowed to spend it.
+            WalletUtxo {
+                tx_hash: "7a".repeat(32),
+                output_index: 3,
+                lovelace: 2_000_000,
+                tokens: Default::default(),
+                has_ref_script: false,
+                reserved: true,
             },
         ];
 
@@ -1223,7 +1412,9 @@ mod tests {
         (built, tx, registry, treasury)
     }
 
-    fn decoded_register_redeemer(tx: &Tx) -> (i64, i64, i64, i64) {
+    /// `(nonce_in, anchor_in, anchor_out, treasury_in, treasury_out)` from the
+    /// built transaction's mint redeemer.
+    fn decoded_register_redeemer(tx: &Tx) -> (i64, i64, i64, i64, i64) {
         let redeemers = tx.transaction_witness_set.redeemer.as_ref().unwrap();
         let all: Vec<pallas_primitives::conway::Redeemer> = match redeemers {
             pallas_primitives::conway::Redeemers::List(rs) => rs.iter().cloned().collect(),
@@ -1246,14 +1437,20 @@ mod tests {
         };
         assert_eq!(c.tag, 122, "Register is constructor 1");
         let f: Vec<_> = c.fields.iter().collect();
-        assert_eq!(f.len(), 8);
+        assert_eq!(f.len(), 9);
         let as_int = |pd: &PlutusData| -> i64 {
             let PlutusData::BigInt(pallas_primitives::BigInt::Int(i)) = pd else {
                 panic!("expected int field");
             };
             i128::from(*i) as i64
         };
-        (as_int(f[3]), as_int(f[4]), as_int(f[5]), as_int(f[6]))
+        (
+            as_int(f[3]),
+            as_int(f[4]),
+            as_int(f[5]),
+            as_int(f[6]),
+            as_int(f[7]),
+        )
     }
 
     /// End-to-end against an EMPTY list: the anchor is the root, the identity
@@ -1276,11 +1473,21 @@ mod tests {
         assert_eq!(built.pool_id, pool_id);
         assert_eq!(built.anchor_asset_name, REGISTRATION_ROOT_KEY);
 
-        // Inputs are sorted (fee aa…:0, anchor 11…:0, treasury dd…:0 →
-        // 11 < aa < dd) and the redeemer indices point at the right ones.
+        // Inputs are sorted (anchor 11…:0, fee aa…:0, nonce 7a…:3, treasury
+        // dd…:0 → 11 < 7a < aa < dd) and the redeemer indices point at the
+        // right ones. Four inputs since rev 5.6: the nonce UTxO the signatures
+        // are bound to is spent here, which is what makes them single-use
+        // ([REG-10]).
         let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
-        assert_eq!(inputs.len(), 3);
-        let (anchor_in, anchor_out, treasury_in, treasury_out) = decoded_register_redeemer(&tx);
+        assert_eq!(inputs.len(), 4);
+        let (nonce_in, anchor_in, anchor_out, treasury_in, treasury_out) =
+            decoded_register_redeemer(&tx);
+        assert_eq!(
+            inputs[nonce_in as usize].transaction_id.as_slice(),
+            [0x7a; 32],
+            "the redeemer's nonce_input_index must name the signed outpoint"
+        );
+        assert_eq!(inputs[nonce_in as usize].index, 3);
         assert_eq!(
             inputs[anchor_in as usize].transaction_id.as_slice(),
             [0x11; 32]
@@ -1405,8 +1612,13 @@ mod tests {
 
         // The anchor is the low node, not the root.
         assert_eq!(built.anchor_asset_name, lo);
-        let (anchor_in, _, treasury_in, _) = decoded_register_redeemer(&tx);
+        let (nonce_in, anchor_in, _, treasury_in, _) = decoded_register_redeemer(&tx);
         let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
+        assert_eq!(
+            inputs[nonce_in as usize].transaction_id.as_slice(),
+            [0x7a; 32],
+            "the nonce index holds through a node anchor too"
+        );
         assert_eq!(
             (
                 inputs[anchor_in as usize].transaction_id.as_slice(),
@@ -1458,6 +1670,7 @@ mod tests {
                 lovelace: 50_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
             // Distinct pure-ADA collateral — the fee input can't double as collateral.
             WalletUtxo {
@@ -1466,6 +1679,18 @@ mod tests {
                 lovelace: 6_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
+            },
+            // The reserved nonce UTxO the signatures are bound to ([REG-10]).
+            // Flagged `reserved`, so fee and collateral selection leave it to
+            // the one input that is allowed to spend it.
+            WalletUtxo {
+                tx_hash: "7a".repeat(32),
+                output_index: 3,
+                lovelace: 2_000_000,
+                tokens: Default::default(),
+                has_ref_script: false,
+                reserved: true,
             },
         ];
         let sigs = test_sigs();
@@ -1585,6 +1810,7 @@ mod tests {
             lovelace: 50_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         };
         // A distinct pure-ADA UTxO for collateral — collateral cannot reuse the
         // one-shot (a UTxO can't be both a spent input and collateral).
@@ -1594,6 +1820,7 @@ mod tests {
             lovelace: 6_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         };
         let utxos = vec![one_shot, collateral_utxo];
 
@@ -1677,6 +1904,7 @@ mod tests {
             lovelace: 50_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         }];
         let err = build_registry_bootstrap_tx(
             &registry,

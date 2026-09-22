@@ -14,10 +14,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::cardano::deregister_spo::{RevocationSignature, revocation_message, verify_revocation};
 use crate::cardano::register_spo::{pool_id_from_cold_vkey, registration_message};
+use crate::cardano::tx_common::NonceOutpoint;
 
 /// The file format version. Bumped when a field changes meaning, not when one
-/// is added: the queued revocation-message fix is what `2` is reserved for.
-pub const VERSION: u32 = 1;
+/// is added.
+///
+/// `2` is the rev-5.6 nonce: both signed messages gained a trailing outpoint
+/// ([REG-10], [DRG-6]), so a `v: 1` file's signature covers a preimage the
+/// chain no longer builds. Such a file is refused by name rather than accepted
+/// and left to fail as an invalid signature after a fee is spent — there is
+/// nothing it could still authorize.
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,6 +59,17 @@ pub struct SigningRequest {
     /// the registry), only with `cardano.cold_vkey_path` for a registration.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pool_id: Option<String>,
+    /// spec [REG-10], [DRG-6]: the UTxO this signature will be bound to, as
+    /// `<txid hex>#<index>`. Chosen by the node among the wallet's own UTxOs and
+    /// reserved until the transaction lands, so nothing else spends it meanwhile.
+    ///
+    /// Not optional in practice — every `v: 2` request carries it, and
+    /// [`message_of`] fails without it rather than signing a shorter preimage
+    /// that would look like a valid rev-5.5 message. It is `Option` only so the
+    /// field's absence in a hand-written file is reported as the missing nonce
+    /// rather than as malformed JSON.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub nonce_outpoint: Option<String>,
     /// The exact preimage the cold key signs, when `pool_id` is known. For an
     /// operator who would rather sign with their own Ed25519 tool and pass the
     /// result to `--cold-sig`.
@@ -84,9 +102,10 @@ impl SigningRequest {
         bifrost_url: &str,
         bifrost_id_pk: &[u8; 32],
         pool_id: Option<[u8; 28]>,
+        nonce: NonceOutpoint,
     ) -> Self {
         let message = pool_id
-            .map(|id| registration_message(&id, bifrost_id_pk, bifrost_url.as_bytes()))
+            .map(|id| registration_message(&id, bifrost_id_pk, bifrost_url.as_bytes(), &nonce))
             .map(hex::encode);
         Self {
             v: VERSION,
@@ -97,6 +116,7 @@ impl SigningRequest {
             bifrost_url: Some(bifrost_url.to_string()),
             bifrost_id_pk: Some(hex::encode(bifrost_id_pk)),
             pool_id: pool_id.map(hex::encode),
+            nonce_outpoint: Some(nonce.to_string()),
             message,
         }
     }
@@ -104,7 +124,12 @@ impl SigningRequest {
     /// An exit request. The pool is already in the registry, so its id is always
     /// known here and the message is always complete.
     #[must_use]
-    pub fn deregister(network: &str, registry_policy: &str, pool_id: &[u8; 28]) -> Self {
+    pub fn deregister(
+        network: &str,
+        registry_policy: &str,
+        pool_id: &[u8; 28],
+        nonce: NonceOutpoint,
+    ) -> Self {
         Self {
             v: VERSION,
             heimdall: version(),
@@ -114,8 +139,19 @@ impl SigningRequest {
             bifrost_url: None,
             bifrost_id_pk: None,
             pool_id: Some(hex::encode(pool_id)),
-            message: Some(hex::encode(revocation_message(pool_id))),
+            nonce_outpoint: Some(nonce.to_string()),
+            message: Some(hex::encode(revocation_message(pool_id, &nonce))),
         }
+    }
+
+    /// The nonce outpoint this request is bound to.
+    pub fn nonce(&self) -> Result<NonceOutpoint, String> {
+        let raw = self.nonce_outpoint.as_deref().ok_or(
+            "this request carries no nonce_outpoint. Every registration and exit signature is \
+             bound to one UTxO since rev 5.6 ([REG-10], [DRG-6]); a request without it names no \
+             transaction and cannot be signed",
+        )?;
+        NonceOutpoint::parse(raw)
     }
 }
 
@@ -142,6 +178,15 @@ impl SignedResponse {
             "bifrost_id_pk",
             &self.request.bifrost_id_pk,
             &now.bifrost_id_pk,
+        )?;
+        // spec [REG-10], [DRG-6]. The one field whose drift is not the
+        // operator's doing: the node picks the nonce, so a mismatch here means
+        // the reservation was lost and a DIFFERENT UTxO would be spent — which
+        // the chain would report only as an invalid signature.
+        differ(
+            "nonce_outpoint",
+            &self.request.nonce_outpoint,
+            &now.nonce_outpoint,
         )?;
 
         let cold_vkey: [u8; 32] = parse_hex(&self.cold_vkey, "cold_vkey")?;
@@ -188,6 +233,22 @@ impl SignedResponse {
 fn check_version(v: u32, written_by: &str) -> Result<(), String> {
     if v == VERSION {
         return Ok(());
+    }
+    // A v1 file is refused by NAME, not silently retried: its signature covers
+    // the rev-5.5 preimage, which ends at the URL (registration) or the pool id
+    // (exit), and the chain now rebuilds a message with a 36-byte nonce after
+    // that. There is no transaction the old signature still authorizes, so
+    // accepting the file would only move the failure to after a fee is spent.
+    if v == 1 {
+        return Err(format!(
+            "sign again: the message format changed. This file is format version 1, written by \
+             heimdall {written_by}; this one is {} and speaks version {VERSION}. Since spec rev \
+             5.6 both signed messages end with the outpoint of a UTxO the transaction spends \
+             ([REG-10], [DRG-6]), which makes the signature single-use — so a version 1 signature \
+             can no longer verify on chain against any transaction. Re-run the request command and \
+             take the new file to the cold key.",
+            version(),
+        ));
     }
     Err(format!(
         "this file is format version {v} and this heimdall speaks version {VERSION}. \
@@ -263,8 +324,9 @@ pub fn sign(req: &SigningRequest, cold: &ed25519::SecretKey) -> Result<SignedRes
 
 /// The exact bytes the cold key signs for this request.
 fn message_of(req: &SigningRequest, pool_id: &[u8; 28]) -> Result<Vec<u8>, String> {
+    let nonce = req.nonce()?;
     match req.action {
-        Action::Deregister => Ok(revocation_message(pool_id)),
+        Action::Deregister => Ok(revocation_message(pool_id, &nonce)),
         Action::Register => {
             let url = req
                 .bifrost_url
@@ -276,7 +338,7 @@ fn message_of(req: &SigningRequest, pool_id: &[u8; 28]) -> Result<Vec<u8>, Strin
                     .ok_or("a register request with no bifrost_id_pk")?,
                 "bifrost_id_pk",
             )?;
-            Ok(registration_message(pool_id, &pk, url.as_bytes()))
+            Ok(registration_message(pool_id, &pk, url.as_bytes(), &nonce))
         }
     }
 }
@@ -291,6 +353,7 @@ fn verify(
         Action::Deregister => verify_revocation(&RevocationSignature {
             cold_vkey: *cold_vkey,
             cold_sig: *cold_sig,
+            nonce: req.nonce()?,
         })
         .is_ok(),
         // The registration half the validator checks against the cold key. The
@@ -324,9 +387,18 @@ mod tests {
         ed25519::SecretKey::from([seed; 32])
     }
 
+    /// The nonce every fixture request is bound to ([REG-10], [DRG-6]).
+    fn nonce() -> NonceOutpoint {
+        NonceOutpoint::new([0x7a; 32], 3)
+    }
+
+    fn other_nonce() -> NonceOutpoint {
+        NonceOutpoint::new([0x5c; 32], 1)
+    }
+
     #[test]
     fn signing_refuses_a_request_for_a_pool_this_key_is_not() {
-        let req = SigningRequest::deregister("preprod", "7d21", &[0xab; 28]);
+        let req = SigningRequest::deregister("preprod", "7d21", &[0xab; 28], nonce());
 
         let err = sign(&req, &cold_key(7)).expect_err("must refuse");
 
@@ -336,7 +408,7 @@ mod tests {
 
     #[test]
     fn signing_refuses_a_request_from_a_newer_format() {
-        let mut req = SigningRequest::deregister("preprod", "7d21", &[0xab; 28]);
+        let mut req = SigningRequest::deregister("preprod", "7d21", &[0xab; 28], nonce());
         req.v = VERSION + 1;
 
         let err = sign(&req, &cold_key(7)).expect_err("must refuse");
@@ -349,12 +421,19 @@ mod tests {
         let cold = cold_key(7);
         let pool_id = pool_id_from_cold_vkey(&cold.public_key().into());
         let signed = sign(
-            &SigningRequest::deregister("preprod", "7d21", &pool_id),
+            &SigningRequest::deregister("preprod", "7d21", &pool_id, nonce()),
             &cold,
         )
         .expect("signing");
 
-        let now = SigningRequest::register("preprod", "7d21", "http://spo:8080", &[9u8; 32], None);
+        let now = SigningRequest::register(
+            "preprod",
+            "7d21",
+            "http://spo:8080",
+            &[9u8; 32],
+            None,
+            nonce(),
+        );
         let err = signed.check(&now, None).expect_err("must refuse");
 
         assert!(err.contains("deregister"), "{err}");
@@ -366,14 +445,14 @@ mod tests {
         let cold = cold_key(7);
         let pool_id = pool_id_from_cold_vkey(&cold.public_key().into());
         let signed = sign(
-            &SigningRequest::deregister("preprod", "7d21", &pool_id),
+            &SigningRequest::deregister("preprod", "7d21", &pool_id, nonce()),
             &cold,
         )
         .expect("signing");
 
         // What the node looked up for ITSELF in the registry, which is not the
         // pool this file speaks for.
-        let now = SigningRequest::deregister("preprod", "7d21", &[0xab; 28]);
+        let now = SigningRequest::deregister("preprod", "7d21", &[0xab; 28], nonce());
         let err = signed.check(&now, None).expect_err("must refuse");
 
         assert!(err.contains(&hex::encode([0xab; 28])), "{err}");
@@ -383,7 +462,14 @@ mod tests {
     #[test]
     fn a_response_for_another_pool_is_refused_by_a_node_that_knows_its_own() {
         let cold = cold_key(7);
-        let req = SigningRequest::register("preprod", "7d21", "http://spo:8080", &[9u8; 32], None);
+        let req = SigningRequest::register(
+            "preprod",
+            "7d21",
+            "http://spo:8080",
+            &[9u8; 32],
+            None,
+            nonce(),
+        );
         let signed = sign(&req, &cold).expect("signing");
 
         let err = signed
@@ -396,7 +482,14 @@ mod tests {
     #[test]
     fn a_tampered_signature_is_refused_before_any_chain_read() {
         let cold = cold_key(7);
-        let req = SigningRequest::register("preprod", "7d21", "http://spo:8080", &[9u8; 32], None);
+        let req = SigningRequest::register(
+            "preprod",
+            "7d21",
+            "http://spo:8080",
+            &[9u8; 32],
+            None,
+            nonce(),
+        );
         let mut signed = sign(&req, &cold).expect("signing");
         signed.cold_sig.replace_range(0..2, "ff");
 
@@ -408,7 +501,14 @@ mod tests {
     #[test]
     fn a_response_survives_the_trip_as_json() {
         let cold = cold_key(7);
-        let req = SigningRequest::register("preprod", "7d21", "http://spo:8080", &[9u8; 32], None);
+        let req = SigningRequest::register(
+            "preprod",
+            "7d21",
+            "http://spo:8080",
+            &[9u8; 32],
+            None,
+            nonce(),
+        );
         let signed = sign(&req, &cold).expect("signing");
 
         let text = serde_json::to_string_pretty(&signed).expect("encode");
@@ -420,11 +520,11 @@ mod tests {
 
     #[test]
     fn an_exit_request_always_carries_the_message_to_sign() {
-        let req = SigningRequest::deregister("preprod", "7d21", &[0xab; 28]);
+        let req = SigningRequest::deregister("preprod", "7d21", &[0xab; 28], nonce());
 
         assert_eq!(
             req.message.as_deref(),
-            Some(hex::encode(revocation_message(&[0xab; 28])).as_str())
+            Some(hex::encode(revocation_message(&[0xab; 28], &nonce())).as_str())
         );
     }
 
@@ -432,13 +532,19 @@ mod tests {
     fn a_checked_register_response_carries_the_signature_the_node_would_have_made() {
         let cold = cold_key(3);
         let pk = [4u8; 32];
-        let req = SigningRequest::register("preprod", "7d21", "http://spo:8080", &pk, None);
+        let req =
+            SigningRequest::register("preprod", "7d21", "http://spo:8080", &pk, None, nonce());
 
         let signed = sign(&req, &cold).expect("signing");
         let (cold_vkey, cold_sig) = signed.check(&req, None).expect("check");
 
         let pool_id = pool_id_from_cold_vkey(&cold.public_key().into());
-        let expected = cold.sign(registration_message(&pool_id, &pk, b"http://spo:8080"));
+        let expected = cold.sign(registration_message(
+            &pool_id,
+            &pk,
+            b"http://spo:8080",
+            &nonce(),
+        ));
         assert_eq!(cold_vkey, <[u8; 32]>::from(cold.public_key()));
         assert_eq!(cold_sig.as_slice(), expected.as_ref());
     }
@@ -448,12 +554,13 @@ mod tests {
         let cold = cold_key(7);
         let pk = [9u8; 32];
         let signed = sign(
-            &SigningRequest::register("preprod", "7d21", "http://spo:8080", &pk, None),
+            &SigningRequest::register("preprod", "7d21", "http://spo:8080", &pk, None, nonce()),
             &cold,
         )
         .expect("signing");
 
-        let now = SigningRequest::register("preprod", "7d21", "http://spo:8080/", &pk, None);
+        let now =
+            SigningRequest::register("preprod", "7d21", "http://spo:8080/", &pk, None, nonce());
         let err = signed.check(&now, None).expect_err("must refuse");
 
         assert!(err.contains("http://spo:8080/"), "{err}");
@@ -464,14 +571,132 @@ mod tests {
     fn a_signed_exit_verifies_as_the_validator_would() {
         let cold = cold_key(7);
         let pool_id = pool_id_from_cold_vkey(&cold.public_key().into());
-        let req = SigningRequest::deregister("preprod", "7d21", &pool_id);
+        let req = SigningRequest::deregister("preprod", "7d21", &pool_id, nonce());
 
         let signed = sign(&req, &cold).expect("signing");
 
         let sig = RevocationSignature {
             cold_vkey: parse_hex(&signed.cold_vkey, "cold_vkey").unwrap(),
             cold_sig: parse_hex(&signed.cold_sig, "cold_sig").unwrap(),
+            nonce: nonce(),
         };
         assert_eq!(verify_revocation(&sig).unwrap(), pool_id);
+    }
+
+    // ---- rev 5.6: the nonce ([REG-10], [DRG-6]) ---------------------------
+
+    /// The replay the nonce exists to stop, on the file format's own terms: the
+    /// node reserved a different UTxO than the one the signature covers, so the
+    /// transaction it would build is not the one that was signed. Reported as
+    /// the moved field, not as a signature that does not verify — which is the
+    /// whole reason the response carries its request.
+    #[test]
+    fn a_nonce_that_moved_after_signing_is_named() {
+        let cold = cold_key(7);
+        let pk = [9u8; 32];
+        let signed = sign(
+            &SigningRequest::register("preprod", "7d21", "http://spo:8080", &pk, None, nonce()),
+            &cold,
+        )
+        .expect("signing");
+
+        let now = SigningRequest::register(
+            "preprod",
+            "7d21",
+            "http://spo:8080",
+            &pk,
+            None,
+            other_nonce(),
+        );
+        let err = signed.check(&now, None).expect_err("must refuse");
+
+        assert!(err.contains("nonce_outpoint"), "{err}");
+        assert!(err.contains(&other_nonce().to_string()), "{err}");
+    }
+
+    /// The same exit signature against a different nonce does not verify. This
+    /// is the on-chain rejection, reproduced on the operator's own desk: before
+    /// rev 5.6 an exit signature was valid against every later registration of
+    /// the pool, from any wallet.
+    #[test]
+    fn an_exit_signature_does_not_verify_against_another_nonce() {
+        let cold = cold_key(7);
+        let pool_id = pool_id_from_cold_vkey(&cold.public_key().into());
+        let signed = sign(
+            &SigningRequest::deregister("preprod", "7d21", &pool_id, nonce()),
+            &cold,
+        )
+        .expect("signing");
+
+        let replayed = RevocationSignature {
+            cold_vkey: parse_hex(&signed.cold_vkey, "cold_vkey").unwrap(),
+            cold_sig: parse_hex(&signed.cold_sig, "cold_sig").unwrap(),
+            nonce: other_nonce(),
+        };
+        assert!(
+            verify_revocation(&replayed).is_err(),
+            "a revocation signature must not verify against an outpoint it does not name"
+        );
+    }
+
+    /// A v1 file is refused BY NAME. Its signature covers the rev-5.5 preimage,
+    /// which the chain no longer builds, so there is no transaction it could
+    /// still authorize — accepting it would only move the failure to after a fee
+    /// is spent.
+    #[test]
+    fn a_version_one_file_is_refused_with_the_reason() {
+        let cold = cold_key(7);
+        let pool_id = pool_id_from_cold_vkey(&cold.public_key().into());
+        let mut req = SigningRequest::deregister("preprod", "7d21", &pool_id, nonce());
+        req.v = 1;
+
+        let err = sign(&req, &cold).expect_err("must refuse");
+
+        assert!(err.contains("sign again"), "{err}");
+        assert!(err.contains("message format changed"), "{err}");
+    }
+
+    /// And a v1 RESPONSE is refused the same way, so an operator who kept a file
+    /// from before the upgrade hears why rather than seeing a bad signature.
+    #[test]
+    fn a_version_one_response_is_refused_with_the_reason() {
+        let cold = cold_key(7);
+        let pool_id = pool_id_from_cold_vkey(&cold.public_key().into());
+        let req = SigningRequest::deregister("preprod", "7d21", &pool_id, nonce());
+        let mut signed = sign(&req, &cold).expect("signing");
+        signed.v = 1;
+
+        let err = signed.check(&req, None).expect_err("must refuse");
+
+        assert!(err.contains("sign again"), "{err}");
+    }
+
+    /// A request with the field missing cannot be signed at all: a shorter
+    /// preimage is a rev-5.5 message, and signing one would produce a signature
+    /// nothing on chain accepts.
+    #[test]
+    fn a_request_without_a_nonce_cannot_be_signed() {
+        let cold = cold_key(7);
+        let pool_id = pool_id_from_cold_vkey(&cold.public_key().into());
+        let mut req = SigningRequest::deregister("preprod", "7d21", &pool_id, nonce());
+        req.nonce_outpoint = None;
+
+        let err = sign(&req, &cold).expect_err("must refuse");
+
+        assert!(err.contains("nonce_outpoint"), "{err}");
+    }
+
+    /// The nonce survives the JSON round trip in the form the CLI prints.
+    #[test]
+    fn the_nonce_round_trips_as_txid_hash_index() {
+        let req = SigningRequest::deregister("preprod", "7d21", &[0xab; 28], nonce());
+        let back: SigningRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(
+            back.nonce_outpoint.as_deref(),
+            Some(nonce().to_string().as_str())
+        );
+        assert_eq!(back.nonce().unwrap(), nonce());
+        assert_eq!(nonce().to_string(), format!("{}#3", "7a".repeat(32)));
     }
 }

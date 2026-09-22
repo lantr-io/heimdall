@@ -445,6 +445,7 @@ mod tests {
             lovelace: 50_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         }];
         let built = build_treasury_bootstrap_tx(
             &test_script(),
@@ -500,6 +501,7 @@ mod tests {
                 lovelace: 8_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
             WalletUtxo {
                 tx_hash: one_shot_hash.clone(),
@@ -507,6 +509,7 @@ mod tests {
                 lovelace: 50_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
         ];
         let datum = bootstrap_datum(vec![0xAB; 32], mpf::NULL_HASH);

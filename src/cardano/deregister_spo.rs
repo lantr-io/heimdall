@@ -65,8 +65,8 @@ use crate::cardano::treasury_info::{
 };
 use crate::cardano::treasury_spend::{TreasurySpendError, find_treasury_state, treasury_spend_leg};
 use crate::cardano::tx_common::{
-    network_from_address, select_collateral, select_fee, sign_built_tx as common_sign_built_tx,
-    wallet_input_amount, whisky_network,
+    NonceOutpoint, network_from_address, select_collateral, select_fee,
+    sign_built_tx as common_sign_built_tx, wallet_input_amount, whisky_network,
 };
 use crate::cardano::wallet::pub_key_hash_hex;
 
@@ -132,42 +132,58 @@ impl From<RegisterSpoError> for DeregisterSpoError {
 // Revocation message + signature
 // ---------------------------------------------------------------------------
 
-/// `revocation_message` in `spos-registry.ak`: `"bifrost-revoke" || pool_id`.
+/// `revocation_message` in `spos-registry.ak`:
+/// `"bifrost-revoke" || pool_id || nonce_outpoint`.
 ///
-/// Note what it does NOT commit to: no epoch, no outpoint, no nonce. A
-/// revocation signature is therefore replayable for the life of the pool key —
-/// but the only thing it can be replayed against is a registration of that
-/// same `pool_id`, i.e. re-exiting an SPO that re-registered. Treat it as a
-/// standing authorization to leave, and keep it as private as the cold key.
+/// The nonce is what stops an exit signature outliving its one use ([DRG-6],
+/// rev 5.6). The signature is public from the moment the exit lands, and
+/// `pool_id` is the same for every registration of the same cold key, so
+/// before rev 5.6 a published exit signature authorized the exit of every
+/// LATER registration of the pool — postable by anyone, from any wallet, with
+/// the freed node lovelace landing in the poster's change. The file really was
+/// a bearer instrument, and the operator guide used to say so.
+///
+/// With the nonce it authorizes one transaction, and only the wallet holding
+/// that UTxO can build it.
 #[must_use]
-pub fn revocation_message(pool_id: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(REVOCATION_DOMAIN_SEPARATOR.len() + pool_id.len());
+pub fn revocation_message(pool_id: &[u8], nonce: &NonceOutpoint) -> Vec<u8> {
+    let nonce_bytes = nonce.to_message_bytes();
+    let mut m =
+        Vec::with_capacity(REVOCATION_DOMAIN_SEPARATOR.len() + pool_id.len() + nonce_bytes.len());
     m.extend_from_slice(REVOCATION_DOMAIN_SEPARATOR);
     m.extend_from_slice(pool_id);
+    m.extend_from_slice(&nonce_bytes);
     m
 }
 
-/// The revocation signature plus the cold verification key it binds.
+/// The revocation signature, the cold verification key it binds, and the
+/// outpoint it is bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevocationSignature {
     pub cold_vkey: [u8; 32],
     /// Ed25519 over the raw revocation message.
     pub cold_sig: [u8; 64],
+    /// spec [DRG-6]: the UTxO the exit transaction must spend.
+    pub nonce: NonceOutpoint,
 }
 
 /// Produce the revocation signature locally (non-air-gapped flow).
 #[must_use]
-pub fn sign_revocation(cold_skey: &ed25519::SecretKey) -> RevocationSignature {
+pub fn sign_revocation(
+    cold_skey: &ed25519::SecretKey,
+    nonce: NonceOutpoint,
+) -> RevocationSignature {
     let cold_vkey: [u8; 32] = cold_skey.public_key().into();
     let pool_id = pool_id_from_cold_vkey(&cold_vkey);
     let cold_sig: [u8; 64] = cold_skey
-        .sign(revocation_message(&pool_id))
+        .sign(revocation_message(&pool_id, &nonce))
         .as_ref()
         .try_into()
         .expect("ed25519 signature is 64 bytes");
     RevocationSignature {
         cold_vkey,
         cold_sig,
+        nonce,
     }
 }
 
@@ -178,7 +194,7 @@ pub fn verify_revocation(sig: &RevocationSignature) -> Result<[u8; 28], Deregist
     let pool_id = pool_id_from_cold_vkey(&sig.cold_vkey);
     let vkey = ed25519::PublicKey::from(sig.cold_vkey);
     if !vkey.verify(
-        revocation_message(&pool_id),
+        revocation_message(&pool_id, &sig.nonce),
         &ed25519::Signature::from(sig.cold_sig),
     ) {
         return Err(DeregisterSpoError::ColdSignatureInvalid);
@@ -192,14 +208,18 @@ pub fn verify_revocation(sig: &RevocationSignature) -> Result<[u8; 28], Deregist
 
 /// `SposRegistryMintRedeemer::Deregister` — constructor 2, field order pinned
 /// by `bifrost/types/spos-registry.ak`:
-/// `{cold_vkey, cold_sig, registration_input_index,
+/// `{cold_vkey, cold_sig, nonce_input_index, registration_input_index,
 /// registration_anchor_input_index, registration_anchor_output_index,
 /// treasury_input_index, treasury_output_index,
 /// bifrost_identity_removal_proof}`.
+///
+/// `nonce_input_index` sits directly after the signature it makes single-use
+/// (rev 5.6, [DRG-6]); every index after it keeps the position it had.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn deregister_mint_redeemer(
     sig: &RevocationSignature,
+    nonce_input_index: i64,
     registration_input_index: i64,
     anchor_input_index: i64,
     anchor_output_index: i64,
@@ -212,6 +232,7 @@ pub fn deregister_mint_redeemer(
         vec![
             bytes(&sig.cold_vkey),
             bytes(&sig.cold_sig),
+            int(nonce_input_index),
             int(registration_input_index),
             int(anchor_input_index),
             int(anchor_output_index),
@@ -383,6 +404,25 @@ pub fn build_deregister_spo_tx(
     // than one because this transaction runs three scripts (two spends and the
     // burn), and a floor under what they cost is cheaper than a balancing
     // failure the operator has to interpret.
+    // spec [DRG-6]: the transaction MUST spend the UTxO the signature names.
+    // A missing one is the interesting case here: an exit signature spends
+    // hours on an air-gapped machine, so "gone from the wallet" usually means
+    // something else took it for a fee while the operator was away — which is
+    // exactly what the state-dir reservation exists to prevent.
+    let nonce = req.sig.nonce;
+    let nonce_utxo = req
+        .wallet_utxos
+        .iter()
+        .find(|u| u.outpoint() == Some(nonce))
+        .ok_or_else(|| {
+            DeregisterSpoError::Build(format!(
+                "the nonce UTxO {nonce} this revocation signature is bound to is not in the \
+                 wallet. It was spent while the signature was away, so the signature is used up: \
+                 run `heimdall deregister-spo` again to reserve a fresh one and take the new \
+                 request to the cold key",
+            ))
+        })?;
+
     let (fee_utxo, coll_utxo) = {
         let fee = select_fee(req.wallet_utxos, 2_000_000).map_err(DeregisterSpoError::Wallet)?;
         let coll =
@@ -393,10 +433,17 @@ pub fn build_deregister_spo_tx(
     // The ledger orders tx inputs lexicographically by (tx_id, index); the
     // redeemer indices must point into that order.
     let fee_ref = (tx_id_bytes(&fee_utxo.tx_hash)?, fee_utxo.output_index);
+    let nonce_ref = (nonce.tx_hash, nonce.index);
     let anchor_ref = (tx_id_bytes(&anchor.tx_hash)?, anchor.output_index);
     let node_ref = (tx_id_bytes(&node.tx_hash)?, node.output_index);
     let treasury_ref = (tx_id_bytes(&state.tx_hash)?, state.output_index);
+    // As in register_spo: the nonce may be the fee input in the one-machine
+    // flow, where nothing can spend it between signing and submitting.
+    let nonce_is_fee = nonce_ref == fee_ref;
     let mut sorted = vec![fee_ref, anchor_ref, node_ref, treasury_ref];
+    if !nonce_is_fee {
+        sorted.push(nonce_ref);
+    }
     sorted.sort();
     let distinct = {
         let mut d = sorted.clone();
@@ -405,13 +452,14 @@ pub fn build_deregister_spo_tx(
     };
     if distinct != sorted.len() {
         return Err(DeregisterSpoError::Build(
-            "fee/anchor/node/treasury inputs must be distinct outpoints".into(),
+            "fee/nonce/anchor/node/treasury inputs must be distinct outpoints".into(),
         ));
     }
     let index_of = |r: &([u8; 32], u32)| sorted.iter().position(|s| s == r).unwrap() as i64;
     let anchor_input_index = index_of(&anchor_ref);
     let node_input_index = index_of(&node_ref);
     let treasury_input_index = index_of(&treasury_ref);
+    let nonce_input_index = index_of(&nonce_ref);
     // Outputs are ours to order: [0] continued anchor, [1] continued treasury
     // (whisky appends the change output after). There is no node output — that
     // element is what this transaction destroys.
@@ -489,6 +537,7 @@ pub fn build_deregister_spo_tx(
 
     let mint_redeemer = deregister_mint_redeemer(
         req.sig,
+        nonce_input_index,
         node_input_index,
         anchor_input_index,
         anchor_output_index,
@@ -499,20 +548,30 @@ pub fn build_deregister_spo_tx(
     let mint_redeemer_hex =
         hex::encode(minicbor::to_vec(&mint_redeemer).expect("redeemer CBOR encode"));
 
+    let mut inputs = vec![TxIn::PubKeyTxIn(PubKeyTxIn {
+        tx_in: TxInParameter {
+            tx_hash: fee_utxo.tx_hash.clone(),
+            tx_index: fee_utxo.output_index,
+            amount: Some(wallet_input_amount(fee_utxo)),
+            address: Some(req.wallet_address.to_string()),
+        },
+    })];
+    if !nonce_is_fee {
+        inputs.push(TxIn::PubKeyTxIn(PubKeyTxIn {
+            tx_in: TxInParameter {
+                tx_hash: nonce_utxo.tx_hash.clone(),
+                tx_index: nonce_utxo.output_index,
+                amount: Some(wallet_input_amount(nonce_utxo)),
+                address: Some(req.wallet_address.to_string()),
+            },
+        }));
+    }
+    inputs.push(anchor_in);
+    inputs.push(node_in);
+    inputs.push(treasury_in);
+
     let body = TxBuilderBody {
-        inputs: vec![
-            TxIn::PubKeyTxIn(PubKeyTxIn {
-                tx_in: TxInParameter {
-                    tx_hash: fee_utxo.tx_hash.clone(),
-                    tx_index: fee_utxo.output_index,
-                    amount: Some(wallet_input_amount(fee_utxo)),
-                    address: Some(req.wallet_address.to_string()),
-                },
-            }),
-            anchor_in,
-            node_in,
-            treasury_in,
-        ],
+        inputs,
         outputs: vec![continued_anchor_out, treasury_out],
         collaterals: vec![PubKeyTxIn {
             tx_in: TxInParameter {
@@ -601,6 +660,9 @@ pub fn build_deregister_spo_tx(
             at(anchor_input_index, &anchor_ref, "anchor")?;
             at(node_input_index, &node_ref, "registration node")?;
             at(treasury_input_index, &treasury_ref, "treasury")?;
+            // spec [DRG-6]. Checked here because the chain will not tell you:
+            // a nonce at the wrong index fails as "signature invalid".
+            at(nonce_input_index, &nonce_ref, "nonce")?;
         }
 
         hex::encode(
@@ -657,8 +719,17 @@ mod tests {
         ed25519::SecretKey::from([42u8; 32])
     }
 
+    /// The nonce the fixture signature is bound to ([DRG-6]).
+    fn test_nonce() -> NonceOutpoint {
+        NonceOutpoint::new([0x7a; 32], 3)
+    }
+
+    fn other_nonce() -> NonceOutpoint {
+        NonceOutpoint::new([0x5c; 32], 1)
+    }
+
     fn test_sig() -> RevocationSignature {
-        sign_revocation(&cold_skey())
+        sign_revocation(&cold_skey(), test_nonce())
     }
 
     fn test_pool_id() -> [u8; 28] {
@@ -710,7 +781,44 @@ mod tests {
 
     #[test]
     fn revocation_message_is_domain_separated_concatenation() {
-        assert_eq!(revocation_message(b"POOL"), b"bifrost-revokePOOL");
+        let mut want = b"bifrost-revokePOOL".to_vec();
+        want.extend_from_slice(&[0x7a; 32]);
+        want.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(revocation_message(b"POOL", &test_nonce()), want);
+    }
+
+    /// The golden bytes, pinned against the same fixture the Aiken suite uses
+    /// (`deregister_happy` in `spos-registry.ak`): cold seed [42; 32], this
+    /// outpoint. One message format, checked from both sides.
+    #[test]
+    fn the_revocation_message_matches_the_on_chain_golden_bytes() {
+        let pool_id = test_pool_id();
+        assert_eq!(
+            hex::encode(revocation_message(&pool_id, &test_nonce())),
+            "626966726f73742d7265766f6b651dfb74a8cbcda254c65b5dd5d95df89f60b28b11de4da2ded3bc1f9b\
+             7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a03000000"
+                .replace(['\n', ' '], "")
+        );
+    }
+
+    /// The replay rev 5.6 closes. `"bifrost-revoke" || pool_id` is the same for
+    /// every registration of the same cold key, so before the nonce this exact
+    /// signature authorized every later exit of the pool, from any wallet. With
+    /// it, a signature bound to one outpoint verifies against that outpoint and
+    /// nothing else.
+    #[test]
+    fn a_revocation_signature_does_not_verify_against_another_nonce() {
+        let sig = test_sig();
+        assert_eq!(verify_revocation(&sig).unwrap(), test_pool_id());
+
+        let replayed = RevocationSignature {
+            nonce: other_nonce(),
+            ..sig
+        };
+        assert!(matches!(
+            verify_revocation(&replayed),
+            Err(DeregisterSpoError::ColdSignatureInvalid)
+        ));
     }
 
     // The local verification mirrors the on-chain check: Ed25519 by the cold
@@ -747,7 +855,9 @@ mod tests {
     fn redeemer_shape_and_canonical_encoding() {
         let sig = test_sig();
         let proof: mpf::Proof = vec![];
-        let r = deregister_mint_redeemer(&sig, 1, 0, 0, 3, 1, &proof);
+        // nonce_input_index first among the indices, directly after the
+        // signature it makes single-use ([DRG-6]).
+        let r = deregister_mint_redeemer(&sig, 0, 2, 1, 0, 4, 1, &proof);
         let cbor = minicbor::to_vec(&r).unwrap();
         let hex_str = hex::encode(&cbor);
         // Constr 2 → tag 123 (0xd87b), indefinite-length fields.
@@ -760,10 +870,11 @@ mod tests {
         };
         assert_eq!(c.tag, 123, "Deregister is constructor 2");
         let fields: Vec<_> = c.fields.iter().collect();
-        assert_eq!(fields.len(), 8);
+        assert_eq!(fields.len(), 9);
         assert!(matches!(fields[0], PlutusData::BoundedBytes(b) if **b == sig.cold_vkey));
         assert!(matches!(fields[1], PlutusData::BoundedBytes(b) if **b == sig.cold_sig));
-        assert!(matches!(fields[7], PlutusData::Array(_)));
+        assert!(matches!(fields[2], PlutusData::BigInt(_)));
+        assert!(matches!(fields[8], PlutusData::Array(_)));
     }
 
     /// `(list elements, identity pairs)` for a three-node registry whose
@@ -864,6 +975,7 @@ mod tests {
                 lovelace: 50_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
             WalletUtxo {
                 tx_hash: "bb".repeat(32),
@@ -871,6 +983,18 @@ mod tests {
                 lovelace: 6_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
+            },
+            // The reserved nonce UTxO this exit signature is bound to
+            // ([DRG-6]). Reserved, so the daemon's own transactions leave it
+            // alone for the length of the round trip to the cold key.
+            WalletUtxo {
+                tx_hash: "7a".repeat(32),
+                output_index: 3,
+                lovelace: 2_000_000,
+                tokens: Default::default(),
+                has_ref_script: false,
+                reserved: true,
             },
         ];
 
@@ -898,7 +1022,8 @@ mod tests {
     /// The eight redeemer fields that matter for placement:
     /// `(registration_input, anchor_input, anchor_output, treasury_input,
     /// treasury_output)`.
-    fn decoded_deregister_redeemer(tx: &Tx) -> (i64, i64, i64, i64, i64) {
+    /// `(nonce_in, node_in, anchor_in, anchor_out, treasury_in, treasury_out)`.
+    fn decoded_deregister_redeemer(tx: &Tx) -> (i64, i64, i64, i64, i64, i64) {
         let redeemers = tx.transaction_witness_set.redeemer.as_ref().unwrap();
         let all: Vec<pallas_primitives::conway::Redeemer> = match redeemers {
             pallas_primitives::conway::Redeemers::List(rs) => rs.iter().cloned().collect(),
@@ -921,7 +1046,7 @@ mod tests {
         };
         assert_eq!(c.tag, 123, "Deregister is constructor 2");
         let f: Vec<_> = c.fields.iter().collect();
-        assert_eq!(f.len(), 8);
+        assert_eq!(f.len(), 9);
         let as_int = |pd: &PlutusData| -> i64 {
             let PlutusData::BigInt(pallas_primitives::BigInt::Int(i)) = pd else {
                 panic!("expected int field");
@@ -934,6 +1059,7 @@ mod tests {
             as_int(f[4]),
             as_int(f[5]),
             as_int(f[6]),
+            as_int(f[7]),
         )
     }
 
@@ -975,8 +1101,17 @@ mod tests {
         node_txid: [u8; 32],
     ) -> (i64, i64) {
         let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
-        let (node_in, anchor_in, anchor_out, treasury_in, treasury_out) =
+        let (nonce_in, node_in, anchor_in, anchor_out, treasury_in, treasury_out) =
             decoded_deregister_redeemer(tx);
+        // spec [DRG-6]: the transaction spends the outpoint the signature
+        // names, and the redeemer points at it. Checked in every list shape,
+        // because the index moves with the sort.
+        assert_eq!(
+            inputs[nonce_in as usize].transaction_id.as_slice(),
+            [0x7a; 32],
+            "nonce is not at nonce_input_index"
+        );
+        assert_eq!(inputs[nonce_in as usize].index, 3);
         assert_eq!(
             inputs[anchor_in as usize].transaction_id.as_slice(),
             anchor_txid,
@@ -1029,7 +1164,10 @@ mod tests {
 
         // Here the node (0x22) sorts BEFORE its anchor (0x33) — the permutation
         // in which registration_input_index < registration_anchor_input_index.
-        assert_eq!(tx.transaction_body.inputs.len(), 4);
+        // Five inputs since rev 5.6: fee, nonce, anchor, node, treasury. The
+        // nonce is spent here, which is what makes the exit signature fit this
+        // transaction and no later one ([DRG-6]).
+        assert_eq!(tx.transaction_body.inputs.len(), 5);
         let (anchor_out, treasury_out) =
             assert_redeemer_points_at_inputs(&tx, [0x33; 32], [0x22; 32]);
         assert_eq!((anchor_out, treasury_out), (0, 1));
@@ -1144,7 +1282,7 @@ mod tests {
         let registry = registry_script();
         let policy = registry.hash_hex();
         let (elements, pairs, _) = chain(&policy, true, true);
-        let stranger = sign_revocation(&ed25519::SecretKey::from([44u8; 32]));
+        let stranger = sign_revocation(&ed25519::SecretKey::from([44u8; 32]), test_nonce());
         assert!(matches!(
             build_against(elements, &pairs, &stranger),
             Err(DeregisterSpoError::Registry(RegistryError::NotRegistered))

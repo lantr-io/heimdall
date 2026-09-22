@@ -612,6 +612,7 @@ mod tests {
                 lovelace: 50_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
             WalletUtxo {
                 tx_hash: "bb".repeat(32),
@@ -619,6 +620,7 @@ mod tests {
                 lovelace: 6_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
         ]
     }
