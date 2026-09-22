@@ -217,22 +217,25 @@ pub fn wallet_set(
     mark_from_state_dir(raw.iter().map(WalletUtxo::from_bf).collect(), state_dir)
 }
 
-/// [`wallet_set`] for the DAEMON, where an unreadable record must not become a
-/// liveness failure.
+/// [`wallet_set`] for the two callers where an unreadable record must NOT be
+/// fatal.
 ///
-/// The difference is which failure is worse where. On a command the operator is
-/// running, refusing is right: they are about to make an air-gapped round trip
-/// and the state dir cannot tell them what is reserved. Inside `run-spo` the
-/// same refusal would stop the node posting treasury movements, bans and the
-/// key handoff — for a file that belongs to a registration flow — and it would
-/// surface as a chain error attached to an epoch operation that has nothing to
-/// do with a registration.
+/// The daemon, because refusing would stop `run-spo` posting treasury
+/// movements, bans and the key handoff — over a file that belongs to a
+/// registration flow, and surfacing as a chain error attached to an epoch
+/// operation that has nothing to do with one. The node has already passed a
+/// startup gate that reads this file (preflight step 12), so an unreadable one
+/// here is a file that CHANGED under a running daemon.
 ///
-/// The node has already passed a startup gate that reads this file (preflight
-/// step 12), so an unreadable one here is a file that CHANGED under a running
-/// daemon. Say so loudly, once per read, and carry on with nothing marked:
-/// there is no outpoint to protect if the record cannot be parsed.
-pub fn wallet_set_for_daemon(
+/// And the `--nonce-utxo` override, because that flag IS the documented way out
+/// of an unreadable record: the operator read the outpoint out of the signed
+/// file and is naming it by hand. A strict read there would make the remedy
+/// unreachable — the command would abort on the very file the operator is
+/// working around.
+///
+/// Both say so loudly, once per read, and carry on with nothing marked: there
+/// is no outpoint to protect if the record cannot be parsed.
+pub fn wallet_set_lenient(
     raw: &[crate::cardano::bf_http::BfUtxo],
     state_dir: Option<&Path>,
 ) -> Vec<WalletUtxo> {
@@ -390,7 +393,7 @@ mod tests {
     /// failure: `run-spo` posts treasury movements, bans and the key handoff
     /// through it, and none of them has anything to do with a registration.
     #[test]
-    fn the_daemon_variant_survives_an_unreadable_record() {
+    fn the_lenient_variant_survives_an_unreadable_record() {
         let dir = std::env::temp_dir().join(format!("heimdall-nonce-d-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -399,7 +402,7 @@ mod tests {
         // about to make a trip to a safe.
         assert!(mark_from_state_dir(vec![utxo(1, 0)], Some(&dir)).is_err());
         // The daemon carries on with nothing marked.
-        let set = wallet_set_for_daemon(&[], Some(&dir));
+        let set = wallet_set_lenient(&[], Some(&dir));
         assert!(set.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

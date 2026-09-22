@@ -2120,7 +2120,7 @@ impl BlockfrostCardanoChain {
         // signature may be at a cold key right now, and the daemon posting
         // movements and bans from the same wallet must not spend the outpoint it
         // names ([REG-10], [DRG-6]).
-        Ok(crate::cardano::nonce_reservation::wallet_set_for_daemon(
+        Ok(crate::cardano::nonce_reservation::wallet_set_lenient(
             &utxos,
             self.state_dir.as_deref(),
         ))
@@ -2358,7 +2358,7 @@ impl BlockfrostCardanoChain {
         // Marked, like every other spending path: this posts a ban from the
         // same wallet an operator's registration or exit signature may be bound
         // to right now ([REG-10], [DRG-6]).
-        let wallet_utxos_after_mint = crate::cardano::nonce_reservation::wallet_set_for_daemon(
+        let wallet_utxos_after_mint = crate::cardano::nonce_reservation::wallet_set_lenient(
             &wallet_raw_after_mint,
             self.state_dir.as_deref(),
         );
@@ -3026,7 +3026,7 @@ impl CardanoChain for BlockfrostCardanoChain {
         .map_err(|e| EpochError::Chain(format!("wallet UTxO query: {e}")))?;
         // The Update-Y key handoff, from the same wallet, with the same reason
         // to leave a reserved nonce alone.
-        let wallet_utxos = crate::cardano::nonce_reservation::wallet_set_for_daemon(
+        let wallet_utxos = crate::cardano::nonce_reservation::wallet_set_lenient(
             &wallet_raw,
             self.state_dir.as_deref(),
         );

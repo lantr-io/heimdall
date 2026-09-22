@@ -63,6 +63,15 @@ pub enum MembershipState {
     /// telling an operator who never registered to wait for a migration is as
     /// wrong as telling a migrating one to register again with a cold key.
     NotRegistered,
+    /// Absent from the current list and present in the previous one, like
+    /// `Migratable` — but the binding is gone from the identity trie, so this
+    /// pool MIGRATED AND THEN LEFT.
+    ///
+    /// Worth telling apart rather than reporting as `Migratable`: otherwise a
+    /// pool that deliberately exited is told at every restart that it is on its
+    /// way across, and `run-spo` logs a warning and a failed build each time,
+    /// until somebody clears Config #13.
+    AlreadyLeft,
 }
 
 /// Classify one Bifrost identity key against the two lists.
@@ -75,6 +84,28 @@ pub fn classify(
     current: &RegistryList,
     previous: Option<&RegistryList>,
 ) -> MembershipState {
+    classify_against_root(bifrost_id_pk, current, previous, None)
+}
+
+/// [`classify`], given the union of the two lists' bindings and the Treasury
+/// state's identity root — which is what tells a pool waiting to migrate apart
+/// from one that migrated and then left.
+///
+/// The lists alone cannot: `Migrate` leaves the old node behind, and an exit
+/// under the new registry removes only the new one, so both shapes read as
+/// "absent from current, present in previous". The root can, because an exit
+/// deletes the binding from it.
+///
+/// Without the root, `Migratable` is the safe guess — a migration that should
+/// not happen is refused by the builder, where a missed one leaves a pool out
+/// of the roster.
+#[must_use]
+pub fn classify_against_root(
+    bifrost_id_pk: &[u8],
+    current: &RegistryList,
+    previous: Option<&RegistryList>,
+    identity_root: Option<(&[crate::cardano::register_spo::IdentityPair], mpf::Hash)>,
+) -> MembershipState {
     let find = |list: &RegistryList| -> Option<Vec<u8>> {
         list.iter()
             .find(|(_, data)| data.bifrost_id_pk == bifrost_id_pk)
@@ -83,10 +114,23 @@ pub fn classify(
     if find(current).is_some() {
         return MembershipState::Current;
     }
-    match previous.and_then(find) {
-        Some(pool_id) => MembershipState::Migratable { pool_id },
-        None => MembershipState::NotRegistered,
+    let Some(pool_id) = previous.and_then(find) else {
+        return MembershipState::NotRegistered;
+    };
+    // Does dropping this pool's binding make the union rebuild the treasury's
+    // root? If so the treasury no longer holds it, which only happens after an
+    // exit under the new registry.
+    if let Some((union, root)) = identity_root {
+        let without: Vec<(Vec<u8>, Vec<u8>)> = union
+            .iter()
+            .filter(|(pk, _)| pk.as_slice() != bifrost_id_pk)
+            .cloned()
+            .collect();
+        if mpf::Trie::from_pairs(without).is_ok_and(|t| t.root_hash() == root) {
+            return MembershipState::AlreadyLeft;
+        }
     }
+    MembershipState::Migratable { pool_id }
 }
 
 /// `SposRegistryMintRedeemer::Migrate` — constructor 3, field order pinned by
@@ -670,6 +714,62 @@ mod tests {
         assert_eq!(
             classify(PK_A, &current, None),
             MembershipState::NotRegistered
+        );
+    }
+
+    /// The shape the lists alone cannot distinguish: a pool that migrated and
+    /// then LEFT looks exactly like one waiting to migrate — absent from the
+    /// current list, present in the previous one — because `Migrate` leaves the
+    /// old node behind and the exit removes only the new one.
+    ///
+    /// The identity root tells them apart, because an exit deletes the binding
+    /// from it. Without that test an operator who deliberately left is told at
+    /// every restart that they are on their way across.
+    #[test]
+    fn a_pool_that_migrated_and_then_left_is_not_migratable() {
+        let current = list(&[(POOL_B, PK_B)]);
+        let previous = list(&[(POOL_A, PK_A), (POOL_B, PK_B)]);
+        let union = crate::cardano::register_spo::union_identity_pairs(&current, None).unwrap();
+        let both: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (PK_A.to_vec(), POOL_A.to_vec()),
+            (PK_B.to_vec(), POOL_B.to_vec()),
+        ];
+
+        // A has NOT left: the treasury root still holds both bindings, so the
+        // union rebuilds it and dropping A does not.
+        let root_with_both = mpf::Trie::from_pairs(both.clone()).unwrap().root_hash();
+        assert_eq!(
+            classify_against_root(
+                PK_A,
+                &current,
+                Some(&previous),
+                Some((&both, root_with_both))
+            ),
+            MembershipState::Migratable {
+                pool_id: POOL_A.to_vec()
+            }
+        );
+
+        // A HAS left: the treasury root is the union MINUS A.
+        let root_without_a = mpf::Trie::from_pairs(union.clone()).unwrap().root_hash();
+        assert_eq!(
+            classify_against_root(
+                PK_A,
+                &current,
+                Some(&previous),
+                Some((&both, root_without_a))
+            ),
+            MembershipState::AlreadyLeft
+        );
+
+        // With no root the answer is the safe guess, unchanged: a migration
+        // that should not happen is refused by the builder, where a missed one
+        // leaves a pool out of the roster.
+        assert_eq!(
+            classify(PK_A, &current, Some(&previous)),
+            MembershipState::Migratable {
+                pool_id: POOL_A.to_vec()
+            }
         );
     }
 

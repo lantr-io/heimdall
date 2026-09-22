@@ -693,7 +693,11 @@ pub fn build_oneshot_bootstrap_tx(
             .filter(|u| {
                 let is_one_shot =
                     u.tx_hash == one_shot.tx_hash && u.output_index == one_shot.output_index;
-                !(u.has_ref_script || is_one_shot)
+                // `!u.reserved` for the reason every other selector has it: the
+                // nonce a cold signature is bound to is spoken for. Genesis-only,
+                // so it has never mattered — but it was the last selector in the
+                // tree that took a marked set and then ignored the mark.
+                !(u.has_ref_script || u.reserved || is_one_shot)
             })
             .max_by_key(|u| u.lovelace)
             .filter(|u| one_shot.lovelace + u.lovelace >= root_lovelace + 1_000_000)

@@ -881,38 +881,44 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     // Looking in the previous list turns that into a Warn: the node is about to
     // fix this by itself, and nothing an operator does would make it happen
     // sooner.
-    let migratable_pool_id: Option<Vec<u8>> = match (&registry, &snapshot, bifrost_pk) {
-        (Ok(Some(src)), Some(Ok(snap)), Some(pk))
-            if !snap.spos.iter().any(|s| s.bifrost_id_pk == pk) =>
-        {
-            match &src.previous_registry {
-                None => None,
-                Some((address, policy_hex)) => {
-                    match bf_http::fetch_address_utxos(&base_url, &project_id, address).await {
-                        Err(_) => None,
-                        Ok(utxos) => {
-                            crate::cardano::register_spo::find_registry_utxos(&utxos, policy_hex)
-                                .ok()
-                                .and_then(|elements| {
-                                    crate::cardano::registry::RegistryList::from_elements(
-                                        elements
-                                            .iter()
-                                            .map(|u| (u.asset_name.clone(), u.element.clone())),
-                                    )
-                                    .ok()
-                                })
-                                .and_then(|list| {
-                                    list.iter()
-                                        .find(|(_, data)| data.bifrost_id_pk == pk)
-                                        .map(|(pool_id, _)| pool_id.to_vec())
-                                })
+    // `Ok(None)` is "checked, and this pool is not in the previous list".
+    // `Err` is "could not check" — and the two must not be conflated, because
+    // falling through to the NOT-REGISTERED Fail exits the daemon. One 429 from
+    // the provider would then stop an un-migrated node at the gate with the
+    // exact advice this whole change exists to stop giving.
+    let migratable_pool_id: Result<Option<Vec<u8>>, String> =
+        match (&registry, &snapshot, bifrost_pk) {
+            (Ok(Some(src)), Some(Ok(snap)), Some(pk))
+                if !snap.spos.iter().any(|s| s.bifrost_id_pk == pk) =>
+            {
+                match &src.previous_registry {
+                    None => Ok(None),
+                    Some((address, policy_hex)) => {
+                        match bf_http::fetch_address_utxos(&base_url, &project_id, address).await {
+                            Err(e) => Err(format!("previous registry UTxO query: {e}")),
+                            Ok(utxos) => crate::cardano::register_spo::find_registry_utxos(
+                                &utxos, policy_hex,
+                            )
+                            .map_err(|e| format!("previous registry list: {e}"))
+                            .and_then(|elements| {
+                                crate::cardano::registry::RegistryList::from_elements(
+                                    elements
+                                        .iter()
+                                        .map(|u| (u.asset_name.clone(), u.element.clone())),
+                                )
+                                .map_err(|e| format!("previous registry list: {e}"))
+                            })
+                            .map(|list| {
+                                list.iter()
+                                    .find(|(_, data)| data.bifrost_id_pk == pk)
+                                    .map(|(pool_id, _)| pool_id.to_vec())
+                            }),
                         }
                     }
                 }
             }
-        }
-        _ => None,
-    };
+            _ => Ok(None),
+        };
 
     match (&snapshot, bifrost_pk) {
         (None, _) => b.push(
@@ -948,7 +954,23 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             snapshot.spos.len()
                         ),
                     );
-                } else if let Some(pool_id) = &migratable_pool_id {
+                } else if let Err(e) = &migratable_pool_id {
+                    // Could not tell whether this pool is merely on the wrong
+                    // side of a migration. Warn, not Fail: a provider blip must
+                    // not stop a node that may be perfectly registered, and the
+                    // main registry read is retried where this one is not.
+                    b.push(
+                        6,
+                        "registration status",
+                        Status::Warn,
+                        format!(
+                            "not in the current registry, and the PREVIOUS one could not be \
+                             read to tell whether a migration is in progress ({e}). If this \
+                             pool has never registered, run `register-spo`; if a registry \
+                             migration is under way, starting the node carries it across"
+                        ),
+                    );
+                } else if let Ok(Some(pool_id)) = &migratable_pool_id {
                     // Registered, under the previous registry, and on its way
                     // across. Warn rather than Fail so the daemon starts and
                     // does it: this is the one state in which starting is the
