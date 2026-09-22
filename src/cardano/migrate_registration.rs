@@ -224,23 +224,46 @@ pub fn build_migrate_registration_tx(
         .find(|u| u.asset_name == plan.anchor_asset_name)
         .expect("plan_insert anchors on an element from this snapshot");
 
-    // ── [MIG-3]: the membership proof, against the trie the treasury root
-    // still commits to. That trie is the OLD list's: `Migrate` does not move
-    // the root, so every binding it carries is still exactly what was written
-    // under the previous registry.
+    // ── [MIG-3]: the membership proof, against the trie the Treasury state's
+    // root commits to — which during a migration window is the UNION of the two
+    // lists, not the previous one alone.
+    //
+    // `Migrate` does not move the root ([MIG-6]), so every binding written under
+    // the previous registry is still in it. But the new registry is live the
+    // moment Config #9 moves: a pool that has never been in the old list can
+    // register under it, and that insertion DOES move the root. Rebuilding from
+    // the previous list alone would then miss that entry, produce a different
+    // root, and yield a proof the validator rejects — after the fee.
+    //
+    // Keyed by `bifrost_id_pk`, so a pool present in both lists (migrated
+    // already) contributes once; the trie holds one entry per identity key,
+    // which is the uniqueness [REG-5] exists to enforce.
     let state = find_treasury_state(
         req.treasury_utxos,
         req.treasury_policy_hex,
         req.treasury_asset_name_hex,
     )?;
-    let identity_trie = mpf::Trie::from_pairs(prev_list.identity_pairs())
+    let mut seen: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut identity_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for (pk, pool) in list
+        .identity_pairs()
+        .into_iter()
+        .chain(prev_list.identity_pairs())
+    {
+        if seen.insert(pk.clone()) {
+            identity_pairs.push((pk, pool));
+        }
+    }
+    let identity_trie = mpf::Trie::from_pairs(identity_pairs)
         .map_err(crate::cardano::treasury_info::TreasuryInfoError::Mpf)?;
     if identity_trie.root_hash() != state.datum.bifrost_identity_root {
         return Err(RegisterSpoError::Build(format!(
-            "the previous registry's bindings do not rebuild the Treasury state's identity root \
-             ({} from the list, {} in the datum). A pool that migrated and then exited leaves its \
-             old-list node behind and produces exactly this; the membership proof below would be \
-             rejected on chain, so refuse here instead of spending a fee to find out",
+            "the two registry lists do not rebuild the Treasury state's identity root ({} from \
+             the lists, {} in the datum), so a membership proof built here would be rejected on \
+             chain. The shape that causes it: a pool that migrated and then exited under the new \
+             registry is gone from the trie but still sits in the frozen old list, so the union \
+             over-counts by that pool. Refusing here costs nothing; spending a fee to find out \
+             costs a fee",
             hex::encode(identity_trie.root_hash()),
             hex::encode(state.datum.bifrost_identity_root),
         )));
