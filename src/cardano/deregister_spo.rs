@@ -266,6 +266,10 @@ pub struct DeregisterSpoRequest<'a> {
     /// and leaving the bridge would be impossible for the length of the
     /// migration.
     pub previous_registry: Option<(&'a str, &'a [BfUtxo])>,
+    /// Leave anyway, during a migration window, knowing it stops every other
+    /// pool's registry change until Config #13 is cleared. See the refusal in
+    /// the builder for what it costs.
+    pub allow_during_migration: bool,
     pub wallet_address: &'a str,
     pub wallet_utxos: &'a [WalletUtxo],
     /// Wallet payment key (fees/collateral) — NOT the cold key.
@@ -356,6 +360,47 @@ pub fn build_deregister_spo_tx(
     // Treasury leg: rebuild the identity trie from the (pre-removal) list and
     // derive the post-deregistration datum + removal proof.
     //
+    // spec [CFG-10]: an exit BY A MIGRATED POOL, mid-window, strands every other
+    // pool's registry change.
+    //
+    // This transaction removes the pool's binding from the Treasury state's
+    // identity root, but its node in the previous list is frozen and stays.
+    // From then on the union of the two lists over-counts by exactly this pool,
+    // so no register, exit or migrate can rebuild the root — every one of them
+    // refuses until Config #13 is cleared. The roster still reads (that check
+    // only warns), so the bridge runs; what stops is membership changing.
+    //
+    // The operator cannot see this coming, and the cost falls on everyone else,
+    // so the builder refuses rather than warns. `allow_during_migration` is the
+    // deliberate override, and its name is the consequence.
+    if !req.allow_during_migration
+        && let Some((policy_hex, utxos)) = req.previous_registry
+    {
+        let in_previous = find_registry_utxos(utxos, policy_hex)
+            .ok()
+            .and_then(|elements| {
+                RegistryList::from_elements(
+                    elements
+                        .iter()
+                        .map(|u| (u.asset_name.clone(), u.element.clone())),
+                )
+                .ok()
+            })
+            .is_some_and(|prev| prev.get(&pool_id).is_some());
+        if in_previous {
+            return Err(DeregisterSpoError::Build(format!(
+                "pool {} migrated from the previous registry, and a migration is still in \
+                 progress (Config #13 names {policy_hex}). Leaving now removes this pool's \
+                 identity from the Treasury state while its node stays in the frozen previous \
+                 list, so the two lists no longer rebuild the identity root — and every other \
+                 pool's registration, exit and migration refuses until #13 is cleared. Wait \
+                 for the window to close, then exit. If the roster has agreed to bear that, \
+                 pass --allow-during-migration",
+                hex::encode(pool_id),
+            )));
+        }
+    }
+
     // From BOTH lists while a registry migration is in progress — see the note
     // on `previous_registry`, and `register_spo::union_identity_pairs`, which
     // is the one copy of this rule.
@@ -982,6 +1027,17 @@ mod tests {
         identity_pairs: &[(Vec<u8>, Vec<u8>)],
         sig: &RevocationSignature,
     ) -> Result<(DeregisterSpoTx, Tx, ParameterizedScript, mpf::Hash), DeregisterSpoError> {
+        build_against_migration(registry_elements, identity_pairs, sig, None, false)
+    }
+
+    /// As [`build_against`], during a migration window.
+    fn build_against_migration(
+        registry_elements: Vec<BfUtxo>,
+        identity_pairs: &[(Vec<u8>, Vec<u8>)],
+        sig: &RevocationSignature,
+        previous: Option<(&str, &[BfUtxo])>,
+        allow_during_migration: bool,
+    ) -> Result<(DeregisterSpoTx, Tx, ParameterizedScript, mpf::Hash), DeregisterSpoError> {
         let registry = registry_script();
         let treasury = treasury_script(&registry.hash);
 
@@ -1047,7 +1103,8 @@ mod tests {
             treasury_asset_name_hex: &nft_name,
             registry_utxos: &registry_elements,
             treasury_utxos: &treasury_utxos,
-            previous_registry: None,
+            previous_registry: previous,
+            allow_during_migration,
             wallet_address: &wallet_addr,
             wallet_utxos: &wallet_utxos,
             key: &key,
@@ -1317,6 +1374,74 @@ mod tests {
             decode_treasury_output(&tx, treasury_out as usize).bifrost_identity_root,
             built.new_bifrost_identity_root
         );
+    }
+
+    /// An exit by a MIGRATED pool, mid-window, is refused — and the refusal is
+    /// not paternalism, it is the only place the cost is visible.
+    ///
+    /// The transaction removes this pool's binding from the Treasury state's
+    /// identity root while its node stays in the frozen previous list. The two
+    /// lists then over-count by exactly this pool, so no register, exit or
+    /// migrate on the whole bridge can rebuild the root until Config #13 is
+    /// cleared. The operator cannot see that coming and does not pay for it.
+    #[test]
+    fn an_exit_by_a_migrated_pool_is_refused_during_a_window() {
+        let registry = registry_script();
+        let policy = registry.hash_hex();
+        let previous_policy = "b2".repeat(28);
+        let (elements, pairs, _) = chain(&policy, true, true);
+        // The same pool, still present in the previous list: it migrated.
+        let previous = vec![
+            element_utxo(
+                &previous_policy,
+                &"77".repeat(32),
+                0,
+                2_600_000,
+                REGISTRATION_ROOT_KEY,
+                &root_element(Some(&test_pool_id())),
+            ),
+            element_utxo(
+                &previous_policy,
+                &"88".repeat(32),
+                0,
+                2_800_000,
+                &test_pool_id(),
+                &node_element(&SELF_PK, None),
+            ),
+        ];
+
+        let err = build_against_migration(
+            elements.clone(),
+            &pairs,
+            &test_sig(),
+            Some((previous_policy.as_str(), previous.as_slice())),
+            false,
+        )
+        .expect_err("must refuse");
+        let msg = format!("{err}");
+        assert!(msg.contains("migration is still in progress"), "{msg}");
+        assert!(msg.contains("--allow-during-migration"), "{msg}");
+
+        // A pool that is NOT in the previous list registered fresh under the
+        // current registry during the window. Its exit removes its binding from
+        // both the root and the current list, so the union still matches and
+        // nobody else is affected — it must not be refused.
+        let previous_without_us = vec![element_utxo(
+            &previous_policy,
+            &"77".repeat(32),
+            0,
+            2_600_000,
+            REGISTRATION_ROOT_KEY,
+            &root_element(None),
+        )];
+        build_against_migration(
+            elements,
+            &pairs,
+            &test_sig(),
+            Some((previous_policy.as_str(), previous_without_us.as_slice())),
+            false,
+        )
+        .expect("a pool that never migrated may leave during a window");
     }
 
     /// A cold key that never registered has nothing to remove — and the error

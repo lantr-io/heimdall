@@ -739,6 +739,15 @@ enum Commands {
         /// keeping: see above.
         #[arg(long)]
         keep: bool,
+        /// Leave during a registry migration anyway.
+        ///
+        /// Refused by default, and not to protect you. This pool migrated, so
+        /// leaving now removes its identity from the Treasury state while its
+        /// node stays in the frozen previous list — after which no pool on the
+        /// bridge can register, exit or migrate until Config #13 is cleared.
+        /// Only with the roster's agreement.
+        #[arg(long)]
+        allow_during_migration: bool,
         /// Override the registry reference-script UTxO (<tx_hash>:<index>).
         /// Discovered automatically otherwise, as for register-spo.
         #[arg(long)]
@@ -2295,6 +2304,7 @@ fn main() {
             out,
             signed,
             keep,
+            allow_during_migration,
             registry_ref,
             nonce_utxo,
             no_submit_reservation,
@@ -2310,6 +2320,7 @@ fn main() {
                 out,
                 signed,
                 keep,
+                allow_during_migration,
                 registry_ref,
                 nonce_utxo,
                 no_submit_reservation,
@@ -3337,26 +3348,74 @@ async fn run_spo(
         // "migrated" state the operator guide describes is never reached.
         if let (Some(pool_id), Some(watch)) = (migration.pending, migration.watch) {
             let watch_health = health.clone();
+            let watch_cfg = cfg.clone();
             let settled = migration.settled;
             tokio::spawn(async move {
-                // Half an hour of five-second polls, each ONE address query.
-                // Deliberately not a `migration_context` rebuild: that is 7-9
-                // provider calls, and it also returns `None` the moment Config
-                // #13 is cleared — which is the NORMAL end of a rollout and can
-                // easily fall inside this window. A watcher that gave up there
-                // would leave `/health` saying "migrating" for the life of the
-                // process, which is the symptom it exists to remove.
-                for _ in 0..360u32 {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    if watch.landed(&pool_id).await {
-                        info!(
-                            pool_id = %hex::encode(&pool_id),
-                            "registry migration confirmed; this node is in the current registry"
-                        );
-                        watch_health.update(|h| h.registry_migration = Some(settled.clone()));
-                        return;
+                // Watch, and RETRY. One attempt was not enough: an anchor race
+                // is the expected failure when several nodes restart together
+                // after the same governance Update, and a transaction that
+                // Blockfrost accepted can still lose that race and be dropped.
+                // Either way the node is outside the roster, and the previous
+                // behaviour left it there until a human ran the command.
+                //
+                // Six attempts over roughly half an hour. Each poll is ONE
+                // address query, deliberately not a `migration_context`
+                // rebuild — that is 7-9 provider calls, and it returns `None`
+                // the moment Config #13 is cleared, which is the normal end of
+                // a rollout and would make the landing unobservable.
+                const ATTEMPTS: u32 = 6;
+                const POLLS_PER_ATTEMPT: u32 = 60;
+                for attempt in 1..=ATTEMPTS {
+                    for _ in 0..POLLS_PER_ATTEMPT {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        if watch.landed(&pool_id).await {
+                            info!(
+                                pool_id = %hex::encode(&pool_id),
+                                "registry migration confirmed; this node is in the current \
+                                 registry"
+                            );
+                            watch_health.update(|h| h.registry_migration = Some(settled.clone()));
+                            return;
+                        }
+                    }
+                    if attempt == ATTEMPTS {
+                        break;
+                    }
+                    // Not there after five minutes. Build a fresh context — the
+                    // anchor has moved if somebody else's migration landed — and
+                    // try again.
+                    warn!(
+                        pool_id = %hex::encode(&pool_id),
+                        "registry migration has not landed after attempt {attempt} of \
+                         {ATTEMPTS}; retrying"
+                    );
+                    match migration_context(&watch_cfg).await {
+                        // Config #13 cleared under us. Whether this pool made it
+                        // across is now answered by the list alone, and the poll
+                        // above is what answers it — keep polling, stop retrying.
+                        Ok(None) => continue,
+                        Ok(Some(ctx)) => {
+                            if let Err(e) = ctx.migrate_async(&watch_cfg, &pool_id).await {
+                                warn!(
+                                    pool_id = %hex::encode(&pool_id),
+                                    "registry migration retry {attempt} did not submit ({e})"
+                                );
+                            }
+                        }
+                        Err(e) => warn!("registry migration retry {attempt}: {e}"),
                     }
                 }
+                warn!(
+                    pool_id = %hex::encode(&pool_id),
+                    "registry migration still has not landed after {ATTEMPTS} attempts. This \
+                     node is outside the roster until it does — run `heimdall \
+                     migrate-registration`, or wait for the federation's --all pass; anyone \
+                     may run it for anyone"
+                );
+                watch_health.update(|h| {
+                    h.registry_migration =
+                        Some("migration not landed after 6 attempts — see the log".to_string());
+                });
             });
         }
     }
@@ -6542,6 +6601,7 @@ struct DeregisterSpoArgs {
     out: Option<String>,
     signed: Option<String>,
     keep: bool,
+    allow_during_migration: bool,
     registry_ref: Option<String>,
     nonce_utxo: Option<String>,
     no_submit_reservation: bool,
@@ -7624,17 +7684,22 @@ async fn auto_migrate_registration(
         }
         Err(e) => {
             // An anchor race is the expected failure when several pools migrate
-            // at once, including the federation's `--all` pass. Nothing is lost:
-            // whoever wins put a node in the list, and the next attempt — or
-            // somebody else's — carries the rest.
+            // at once, including the federation's `--all` pass — so this is a
+            // retry, not an end state. Handing the watcher the same `pending`
+            // is what makes the node try again instead of sitting outside the
+            // roster until a human notices.
             warn!(
                 pool_id = %hex::encode(&pool_id),
-                "registry migration did not land ({e}). This node is outside the roster until \
-                 it does; `heimdall migrate-registration` retries, and anyone may run it"
+                "registry migration did not submit ({e}) — retrying in the background. Until \
+                 it lands this node is outside the roster; `heimdall migrate-registration` \
+                 does it by hand, and anyone may run it"
             );
-            Some(MigrationHealth::settled(format!(
-                "migratable {from} -> {to} (last attempt failed)"
-            )))
+            Some(MigrationHealth {
+                state: format!("migrating {from} -> {to} (first attempt failed, retrying)"),
+                pending: Some(pool_id.clone()),
+                settled: format!("migrated {from} -> {to}"),
+                watch: ctx.watch(cfg).ok(),
+            })
         }
     }
 }
@@ -8443,11 +8508,84 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
 
     let out = finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex);
     if out.is_ok() && args.submit {
-        // This transaction spends the nonce, so the reservation is spent with it
-        // ([REG-10]).
-        clear_nonce_reservation(cfg);
+        // Cleared on CONFIRMATION, not on acceptance. Until the transaction
+        // lands, the nonce UTxO is still unspent and still the only thing these
+        // signatures name — so if this one loses the anchor or the Treasury
+        // state, the reservation is what lets it be retried ([REG-10]).
+        println!();
+        println!("waiting for the registration to confirm before releasing the nonce…");
+        if rt.block_on(await_registry_change(
+            &base_url,
+            pid,
+            &registry.enterprise_address(network),
+            &registry.hash_hex(),
+            &built.pool_id,
+            true,
+        )) {
+            println!("confirmed — this pool is in the registry.");
+            clear_nonce_reservation(cfg);
+        } else {
+            println!(
+                "not confirmed yet. The nonce reservation is KEPT, so the same signatures can \
+                 be retried by re-running this command; `heimdall doctor` step 12 reports it."
+            );
+        }
     }
     out
+}
+
+/// Wait for a registration or exit to CONFIRM, by watching the one thing that
+/// changes: whether this pool has a node in the registry list.
+///
+/// `want_present` is true after a registration, false after an exit.
+///
+/// Why a wait at all. Blockfrost accepting a transaction is not the chain
+/// taking it: the anchor or the Treasury state can be spent out from under it,
+/// and the transaction is then dropped. Until that is settled the nonce UTxO is
+/// still unspent and still the only thing the cold signature names, so the
+/// reservation has to hold and, on an exit, the signed file has to stay on
+/// disk. Clearing either on acceptance is clearing it on a maybe.
+///
+/// `Ok(false)` is a timeout, not a failure: the transaction may still land. The
+/// caller keeps everything and says so.
+async fn await_registry_change(
+    base_url: &str,
+    project_id: &str,
+    registry_address: &str,
+    registry_policy_hex: &str,
+    pool_id: &[u8],
+    want_present: bool,
+) -> bool {
+    use heimdall::cardano::register_spo::find_registry_utxos;
+    use heimdall::cardano::registry::RegistryList;
+    // Five minutes at five seconds. Preprod blocks are ~20 s, so this is many
+    // blocks; past it an operator is better served by being told to check than
+    // by a command that hangs.
+    const TRIES: usize = 60;
+    for _ in 0..TRIES {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let Ok(utxos) =
+            heimdall::cardano::bf_http::fetch_address_utxos(base_url, project_id, registry_address)
+                .await
+        else {
+            continue;
+        };
+        let present = find_registry_utxos(&utxos, registry_policy_hex)
+            .ok()
+            .and_then(|elements| {
+                RegistryList::from_elements(
+                    elements
+                        .iter()
+                        .map(|u| (u.asset_name.clone(), u.element.clone())),
+                )
+                .ok()
+            })
+            .map(|list| list.get(pool_id).is_some());
+        if present == Some(want_present) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Drop the nonce reservation, best-effort.
@@ -8782,6 +8920,7 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         previous_registry: previous_registry
             .as_ref()
             .map(|(p, u)| (p.as_str(), u.as_slice())),
+        allow_during_migration: args.allow_during_migration,
         wallet_address: &wallet_addr,
         wallet_utxos: &wallet_utxos,
         key: &key,
@@ -8834,26 +8973,47 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
 
     let out = finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex);
     if out.is_ok() && args.submit {
-        // The reservation has done its job: this transaction spends the nonce,
-        // so nothing else should be held back from it ([DRG-6]). Clearing is
-        // best-effort — a failure here must not turn a submitted exit into an
-        // error, and a stale record only costs the 2 ADA it names until
-        // `doctor` points at it.
-        clear_nonce_reservation(cfg);
-        // Since rev 5.6 the signature is bound to a nonce outpoint this
-        // transaction just spent, so the file is used up rather than a standing
-        // authorization anyone could post. Removing it is now tidiness, not
-        // damage control.
-        if let (Some(path), false) = (args.signed.as_deref(), args.keep)
-            && path != "-"
-        {
-            match std::fs::remove_file(path) {
-                Ok(()) => println!("removed {path} — its nonce UTxO is spent, so it is used up."),
-                Err(e) => println!(
-                    "could not remove {path} ({e}) — it is spent and no longer authorizes \
-                     anything, but delete it anyway."
-                ),
+        // Both the reservation and the signed file are released on CONFIRMATION,
+        // not on acceptance. An exit that is accepted and then dropped — the
+        // anchor or the Treasury state spent under it — leaves the nonce unspent
+        // and the signature still good; deleting the file at that moment would
+        // throw away the only copy of an authorization that still works, and
+        // buy the operator another trip to the safe ([DRG-6]).
+        println!();
+        println!("waiting for the exit to confirm before releasing the nonce and the file…");
+        let confirmed = rt.block_on(await_registry_change(
+            &base_url,
+            pid,
+            &registry.enterprise_address(network),
+            &registry.hash_hex(),
+            &built.pool_id,
+            false,
+        ));
+        if confirmed {
+            println!("confirmed — this pool is out of the registry.");
+            clear_nonce_reservation(cfg);
+            // The signature is bound to a nonce outpoint this transaction spent,
+            // so the file is used up rather than a standing authorization anyone
+            // could post. Removing it is now tidiness, not damage control.
+            if let (Some(path), false) = (args.signed.as_deref(), args.keep)
+                && path != "-"
+            {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {
+                        println!("removed {path} — its nonce UTxO is spent, so it is used up.");
+                    }
+                    Err(e) => println!(
+                        "could not remove {path} ({e}) — it is spent and no longer authorizes \
+                         anything, but delete it anyway."
+                    ),
+                }
             }
+        } else {
+            println!(
+                "not confirmed yet. The nonce reservation and the signed file are both KEPT, \
+                 so this exit can be retried by re-running with --signed; `heimdall doctor` \
+                 step 12 reports the reservation."
+            );
         }
         // The one thing an exiting operator can still get wrong, and it is not
         // in the transaction: the roster for the CURRENT epoch was frozen at its

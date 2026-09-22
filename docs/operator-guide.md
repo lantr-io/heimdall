@@ -1346,6 +1346,14 @@ Two things worth knowing rather than doing:
 - Joining and leaving both keep working during a migration, and `doctor` step 6 reports an
   un-migrated node as a Warn rather than a Fail so the daemon starts and fixes it. If you try to
   leave before crossing, the command says to migrate first.
+- **Do not leave during a migration**, and `deregister-spo` will not let you if you crossed: the
+  exit removes your identity from the treasury while your old node stays in the frozen previous
+  list, and after that no pool on the bridge can register, exit or migrate until Config #13 is
+  cleared. Wait for the window to close. `--allow-during-migration` overrides it, and the name is
+  the consequence — only with the roster's agreement.
+- If the node's own migration does not land it keeps trying, six times over about half an hour.
+  An anchor race is the expected failure when several operators restart at once, so one attempt
+  was never enough.
 - Your old registration node stays in the old list with its min-ADA in it. Recovering that would
   need the old cold signature, and the old registry cannot accept one any more. Treat it as spent.
 
@@ -1400,6 +1408,12 @@ successful submit unless you pass `--keep`. Keep treating it as private — it n
 your intent — but it is no longer the bearer instrument it was before this release, when the
 signature committed to your pool ID alone and anyone holding the file could post your exit from
 their own wallet.
+
+`deregister-spo --submit` now waits for the exit to confirm before it releases either. Blockfrost
+accepting a transaction is not the chain taking it — the anchor or the treasury state can be spent
+out from under it — and until that settles the nonce is still unspent and the signature is still
+good. If it does not confirm inside five minutes the command says so and keeps both, so you can
+re-run with the same file.
 
 If `doctor` reports the reserved UTxO as spent, the file at the cold key is dead: run the request
 command again to reserve a fresh one, and take the NEW request. Nothing else recovers it — being
