@@ -1328,6 +1328,16 @@ mod tests {
         registry_elements: Vec<BfUtxo>,
         identity_pairs: &[(Vec<u8>, Vec<u8>)],
     ) -> (RegisterSpoTx, Tx, ParameterizedScript, ParameterizedScript) {
+        build_against_treasury_at(registry_elements, identity_pairs, "dd")
+    }
+
+    /// As [`build_against`], with the Treasury state UTxO at a caller-chosen
+    /// outpoint — for the lost-race test below.
+    fn build_against_treasury_at(
+        registry_elements: Vec<BfUtxo>,
+        identity_pairs: &[(Vec<u8>, Vec<u8>)],
+        treasury_tx_byte: &str,
+    ) -> (RegisterSpoTx, Tx, ParameterizedScript, ParameterizedScript) {
         let registry = registry_script();
         let treasury = treasury_script(&registry.hash);
 
@@ -1338,7 +1348,7 @@ mod tests {
         };
         let nft_name = "ee".repeat(32);
         let treasury_utxos = vec![BfUtxo {
-            tx_hash: "dd".repeat(32),
+            tx_hash: treasury_tx_byte.repeat(32),
             output_index: 0,
             amount: vec![
                 BfAmount {
@@ -1451,6 +1461,59 @@ mod tests {
             as_int(f[6]),
             as_int(f[7]),
         )
+    }
+
+    /// The retry the nonce is designed to survive ([REG-10]).
+    ///
+    /// The Treasury state UTxO is spent by every pool's registration, exit and
+    /// key rotation, so a registration racing for it loses routinely. The nonce
+    /// is deliberately NOT that outpoint: it is one under the registrant's own
+    /// key, which nobody else can consume. So the same signatures, made once on
+    /// an air-gapped machine, build a valid transaction against a Treasury state
+    /// that has since moved — no second trip to the cold key.
+    ///
+    /// Binding to the Treasury state instead, as Update-Y does, would have made
+    /// this case fatal: the roster re-signs Update-Y online, seconds before
+    /// submitting, and a cold key on an air-gapped machine cannot.
+    #[test]
+    fn the_same_signatures_still_build_after_the_treasury_state_moves() {
+        let registry = registry_script();
+        let policy = registry.hash_hex();
+        let elements = || {
+            vec![element_utxo(
+                &policy,
+                &"11".repeat(32),
+                0,
+                2_600_000,
+                REGISTRATION_ROOT_KEY,
+                &root_element(None),
+            )]
+        };
+
+        // The first attempt loses the race for the Treasury state at dd…#0.
+        let (first, _, _, _) = build_against_treasury_at(elements(), &[], "dd");
+        // It is now at cc…#0. The signatures are unchanged — the same
+        // `test_sigs()` both times — and the transaction still builds.
+        let (retry, tx, _, _) = build_against_treasury_at(elements(), &[], "cc");
+
+        assert_eq!(first.pool_id, retry.pool_id);
+        assert_ne!(
+            first.signed_tx_hex, retry.signed_tx_hex,
+            "a different treasury outpoint is a different transaction"
+        );
+        let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
+        assert!(
+            inputs
+                .iter()
+                .any(|i| i.transaction_id.as_slice() == [0xcc; 32]),
+            "the retry spends the treasury state where it now is"
+        );
+        let (nonce_in, ..) = decoded_register_redeemer(&tx);
+        assert_eq!(
+            inputs[nonce_in as usize].transaction_id.as_slice(),
+            [0x7a; 32],
+            "and the nonce it is bound to has not moved"
+        );
     }
 
     /// End-to-end against an EMPTY list: the anchor is the root, the identity

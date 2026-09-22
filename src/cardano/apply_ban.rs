@@ -795,16 +795,24 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
                 .as_ref()
                 .map(|s| s.iter().collect())
                 .unwrap_or_default();
-            let got = refs
-                .get(registration_ref_input_index as usize)
-                .ok_or_else(|| {
-                    ApplyBanError::Build("registration ref input index out of range".into())
-                })?;
-            if got.transaction_id.as_slice() != reg_ref.0 || got.index != u64::from(reg_ref.1) {
-                return Err(ApplyBanError::Build(
-                    "registry node not at redeemer ref index — ref ordering changed".into(),
-                ));
-            }
+            let at_ref =
+                |i: i64, want: &([u8; 32], u32), what: &str| -> Result<(), ApplyBanError> {
+                    let got = refs.get(i as usize).ok_or_else(|| {
+                        ApplyBanError::Build(format!("{what} ref input index {i} out of range"))
+                    })?;
+                    if got.transaction_id.as_slice() != want.0 || got.index != u64::from(want.1) {
+                        return Err(ApplyBanError::Build(format!(
+                            "{what} not at redeemer ref index {i} — ref ordering changed"
+                        )));
+                    }
+                    Ok(())
+                };
+            at_ref(registration_ref_input_index, &reg_ref, "registry node")?;
+            // spec [PRE-5]: checked for the same reason the registry node is.
+            // whisky appends a reference input per script use and the fixup
+            // above re-sorts the set, so an index computed before the build is a
+            // prediction until it is compared against what was built.
+            at_ref(config_ref_input_index, &cfg_ref, "Config")?;
         }
         hex::encode(
             minicbor::to_vec(&tx).map_err(|e| ApplyBanError::Build(format!("re-encode: {e}")))?,
