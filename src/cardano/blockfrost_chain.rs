@@ -1155,11 +1155,24 @@ impl BlockfrostCardanoChain {
         .await
         .map_err(eligible_roster_error(epoch, attempt))?;
         if let Some(anchor_ms) = self.ceremony_anchor_ms(epoch).await? {
-            info!(
-                "[virtual-epoch] ceremony epoch {epoch} (Cardano epoch {chain_epoch}) anchored \
-                 at {anchor_ms} ms — the roster, its stake and the ban cutoff are read under \
-                 the Cardano epoch; only the ceremony's own schedule is virtual"
-            );
+            // Spec [ST-1] line 2, said where the mapping is actually known.
+            //
+            // Once per mapping, not once per read: `query_dkg_context` runs twice
+            // at startup and again at every ceremony entry, and this line was
+            // printed every time. The mapping changes once per bridge epoch, so
+            // repeating it is 20 lines of startup noise reporting one fact.
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static SAID: AtomicU64 = AtomicU64::new(u64::MAX);
+                if SAID.swap(epoch, Ordering::Relaxed) != epoch {
+                    info!(
+                        "bridge epoch {epoch} = Cardano epoch {chain_epoch}, which began at {}. \
+                         The roster, its stake and the ban cutoff are read under the Cardano \
+                         epoch; only the ceremony's own schedule is virtual",
+                        crate::epoch::log::utc_hms(anchor_ms),
+                    );
+                }
+            }
             ctx.epoch = epoch;
             ctx.schedule_anchor_ms = Some(anchor_ms);
         }
@@ -2761,7 +2774,11 @@ impl CardanoChain for BlockfrostCardanoChain {
             && !in_flight_spends.contains(&outpoint)
             && opaque_unconfirmed == 0
             && parse_failures == 0;
-        info!(
+        // DEBUG, not INFO (spec [IN-21]). Two `key=value` booleans and the word
+        // "singleton", twice per batch. The facts an operator needs off this read
+        // — what the treasury holds, and whether a movement is in flight — are on
+        // the `chain query` line of [IN-5] in a sentence.
+        debug!(
             "[blockfrost] treasury head {}:{} = {} sat (singleton, in_flight={}, btc_confirmed={})",
             outpoint.txid,
             outpoint.vout,

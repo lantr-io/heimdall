@@ -281,13 +281,30 @@ where
         ctx.field_format()
             .format_fields(Writer::new(&mut body), event)?;
 
-        // A module path (`heimdall::cardano::blockfrost_chain`) says which
-        // subsystem spoke and is what `RUST_LOG` aims at, so it earns its space.
-        // The bare crate root does not: journald already tags every record with
-        // the syslog identifier `heimdall`, and printing it again would render
-        // as `heimdall[123]: heimdall: …`.
+        // The bare crate root is never printed: journald already tags every
+        // record with the syslog identifier `heimdall`, and printing it again
+        // would render as `heimdall[123]: heimdall: …`.
+        //
+        // A module path (`heimdall::cardano::blockfrost_chain`) is printed only
+        // where it earns the space. At INFO and WARN the line is the operator's
+        // narrative and the module path is Rust internals in front of an English
+        // sentence; `RUST_LOG` still aims at it, because `EnvFilter` matches on
+        // metadata before any of this runs — filtering never needed it printed.
+        // At ERROR and below-INFO it stays: those are read while diagnosing, and
+        // which subsystem spoke is the first thing you want.
+        //
+        // EVENT_TARGET is always printed. It is not decoration but the wire
+        // format: the Discord relay classifies a line by parsing this target out
+        // of the text, journald carries no structured fields to put it in, and
+        // events are INFO while the relay's floor is WARN — so dropping it here
+        // would silently stop every success event reaching the channel.
         let target = match meta.target() {
             env!("CARGO_CRATE_NAME") => "",
+            EVENT_TARGET => EVENT_TARGET,
+            t if matches!(*meta.level(), Level::INFO | Level::WARN) => {
+                let _ = t;
+                ""
+            }
             t => t,
         };
 
@@ -483,7 +500,13 @@ mod tests {
         let line = out.lines().next().unwrap();
         assert!(!line.starts_with('<'), "{line}");
         assert!(line.contains(" WARN "), "{line}");
-        assert!(line.contains("heimdall::logging::tests: careful"), "{line}");
+        // The module path is NOT printed at WARN: the line is the operator's
+        // narrative, and `RUST_LOG` matches on metadata, not on what was written.
+        assert!(line.ends_with("careful"), "{line}");
+        assert!(!line.contains("heimdall::logging::tests"), "{line}");
+        // It IS printed at ERROR, which is read while diagnosing.
+        let err = render(false, || tracing::error!("broken"));
+        assert!(err.contains("heimdall::logging::tests: broken"), "{err}");
         // `YYYY-MM-DDTHH:MM:SSZ` leads the line.
         let stamp = &line[..20];
         assert!(stamp.ends_with('Z') && stamp.contains('T'), "{stamp}");
@@ -567,8 +590,11 @@ mod tests {
             tracing::warn!("loud");
         });
         let out = buf.contents();
+        // The event target survives because the relay parses it out of the text;
+        // the module path on the ordinary warn does not.
         assert!(out.contains("<6>heimdall::event: moved"), "{out}");
-        assert!(out.contains("<4>heimdall::logging::tests: loud"), "{out}");
+        assert!(out.contains("<4>loud"), "{out}");
+        assert!(!out.contains("<4>heimdall::logging::tests"), "{out}");
         assert!(!out.contains("quiet"), "{out}");
     }
 
@@ -579,19 +605,19 @@ mod tests {
     #[test]
     fn a_warn_level_event_keeps_both_the_target_and_the_severity() {
         let text = render(true, || {
-            tracing::warn!(target: "heimdall::event", "[spo=1 epoch=307] TM post FAILED: txid ab");
+            tracing::warn!(target: "heimdall::event", "[pool1zk3ns…q7wd epoch=307] treasury movement post FAILED: txid ab");
         });
         assert_eq!(
             text,
-            "<4>heimdall::event: [spo=1 epoch=307] TM post FAILED: txid ab\n"
+            "<4>heimdall::event: [pool1zk3ns…q7wd epoch=307] treasury movement post FAILED: txid ab\n"
         );
 
         let plain = render(false, || {
-            tracing::warn!(target: "heimdall::event", "[spo=1 epoch=307] TM post FAILED: txid ab");
+            tracing::warn!(target: "heimdall::event", "[pool1zk3ns…q7wd epoch=307] treasury movement post FAILED: txid ab");
         });
         assert_eq!(
             &plain[20..],
-            "  WARN heimdall::event: [spo=1 epoch=307] TM post FAILED: txid ab\n",
+            "  WARN heimdall::event: [pool1zk3ns…q7wd epoch=307] treasury movement post FAILED: txid ab\n",
             "{plain}"
         );
     }
@@ -602,16 +628,19 @@ mod tests {
     #[test]
     fn event_lines_keep_the_shape_the_relay_parses() {
         let text = render(true, || {
-            tracing::info!(target: "heimdall::event", "[spo=1 epoch=307] DKG complete");
+            tracing::info!(target: "heimdall::event", "[pool1zk3ns…q7wd epoch=307] key generation complete");
         });
-        assert_eq!(text, "<6>heimdall::event: [spo=1 epoch=307] DKG complete\n");
+        assert_eq!(
+            text,
+            "<6>heimdall::event: [pool1zk3ns…q7wd epoch=307] key generation complete\n"
+        );
 
         let plain = render(false, || {
-            tracing::info!(target: "heimdall::event", "[spo=1 epoch=307] DKG complete");
+            tracing::info!(target: "heimdall::event", "[pool1zk3ns…q7wd epoch=307] key generation complete");
         });
         assert_eq!(
             &plain[20..],
-            "  INFO heimdall::event: [spo=1 epoch=307] DKG complete\n",
+            "  INFO heimdall::event: [pool1zk3ns…q7wd epoch=307] key generation complete\n",
             "{plain}"
         );
 
@@ -624,12 +653,15 @@ mod tests {
             .with_max_level(Level::TRACE)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(target: "heimdall::event", "[spo=1 epoch=307] DKG complete");
+            tracing::info!(target: "heimdall::event", "[pool1zk3ns…q7wd epoch=307] key generation complete");
         });
         let json: serde_json::Value = serde_json::from_str(buf.contents().trim()).unwrap();
         assert_eq!(json["level"], "INFO");
         assert_eq!(json["target"], "heimdall::event");
-        assert_eq!(json["fields"]["message"], "[spo=1 epoch=307] DKG complete");
+        assert_eq!(
+            json["fields"]["message"],
+            "[pool1zk3ns…q7wd epoch=307] key generation complete"
+        );
         assert!(json["timestamp"].is_string(), "{json}");
     }
 

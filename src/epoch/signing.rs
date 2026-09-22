@@ -168,9 +168,10 @@ pub async fn sign_phase(
                 crate::epoch_warn!(
                     me,
                     epoch,
-                    "Sign attempt {attempt}: {eligible} of {} members remain after excluding {} \
-                     round-2 non-publisher(s), below the {} required — the 51% mode is over for \
-                     this movement.",
+                    "signing attempt {}: {eligible} of {} members remain after excluding \
+                     {} that committed and then withheld, below the {} required — the SPO roster \
+                     cannot sign this movement.",
+                    attempt + 1,
                     roster.participants.len(),
                     excluded.len(),
                     roster.min_signers,
@@ -184,8 +185,9 @@ pub async fn sign_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "Sign round1 (attempt {attempt}): generating nonce commitments for {} input(s)",
-                num_inputs
+                "signing round 1 (attempt {}): publishing nonce commitments for {}",
+                attempt + 1,
+                crate::epoch::log::plural(num_inputs, "input", "inputs")
             );
             // Generate and publish this SPO's nonce commitments for every input.
             let mut published_any = false;
@@ -220,7 +222,7 @@ pub async fn sign_phase(
                     .await
                     .map_err(mark)?;
                 published_any = true;
-                crate::epoch_debug!(me, epoch, "  -> published commitments for input {i}");
+                crate::epoch_debug!(me, epoch, "-> published commitments for input {i}");
             }
 
             // Poll peers for round 1 commitments on every input — every peer the
@@ -247,8 +249,12 @@ pub async fn sign_phase(
                 crate::epoch_log!(
                     me,
                     epoch,
-                    "  waiting for round1 commitments on input {i} from {} peer(s)...",
-                    peer_infos.len()
+                    "signing round 1 for input {i}: waiting up to {} for {}",
+                    crate::epoch::log::remaining(
+                        window.close_of(SigningRound::Round1, attempt),
+                        clock.now()
+                    ),
+                    crate::epoch::log::plural(peer_infos.len(), "peer", "peers"),
                 );
                 let ns = input_namespace(epoch, tm_sequence, attempt, &tm, i);
                 let map = collected.round1.entry(i).or_default();
@@ -278,7 +284,7 @@ pub async fn sign_phase(
                 crate::epoch_log!(
                     me,
                     epoch,
-                    "  <- have all round1 commitments, advancing to round2"
+                    "signing round 1 complete: every signer committed"
                 );
             } else {
                 // Logged and NOT carried into `excluded`, deliberately. Round 1
@@ -305,9 +311,9 @@ pub async fn sign_phase(
                 crate::epoch_warn!(
                     me,
                     epoch,
-                    "  <- round1 closed on a threshold subset: {} peer(s) missed inputs [{}]; \
-                     advancing to round2",
-                    absent_signers.len(),
+                    "signing round 1 closed on a threshold subset: {} missed inputs — {}. \
+                     Advancing to round 2",
+                    crate::epoch::log::plural(absent_signers.len(), "peer", "peers"),
                     listed.join(", ")
                 );
             }
@@ -332,9 +338,9 @@ pub async fn sign_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "Sign round2 (attempt {attempt}): computing tweaked signature shares for {} \
-                 input(s)",
-                num_inputs
+                "signing round 2 (attempt {}): computing signature shares for {}",
+                attempt + 1,
+                crate::epoch::log::plural(num_inputs, "input", "inputs")
             );
             // For each input: build SigningPackage, compute this SPO's
             // tweaked share, publish, poll peers, then aggregate into a
@@ -373,7 +379,7 @@ pub async fn sign_phase(
                     crate::epoch_debug!(
                         me,
                         epoch,
-                        "  input {i}: sighash={} merkle_root={}",
+                        "input {i}: sighash={} merkle_root={}",
                         hex::encode(sighash),
                         merkle_ref
                             .map(hex::encode)
@@ -388,13 +394,13 @@ pub async fn sign_phase(
                         merkle_ref,
                     )
                     .map_err(|e| EpochError::Frost(format!("sign_round2_with_tweak: {e}")))?;
-                    crate::epoch_debug!(me, epoch, "    -> built tweaked signature share");
+                    crate::epoch_debug!(me, epoch, "-> built tweaked signature share");
 
                     collected.round2.entry(i).or_default().insert(me, share);
 
                     let ns = input_namespace(epoch, tm_sequence, attempt, &tm, i);
                     peers.publish_sign_round2(ns, me, share).await?;
-                    crate::epoch_debug!(me, epoch, "    -> published share for input {i}");
+                    crate::epoch_debug!(me, epoch, "-> published share for input {i}");
 
                     // Poll EXACTLY the round-1 subset, and require all of it. The
                     // signing package above was built from those commitments and
@@ -415,8 +421,13 @@ pub async fn sign_phase(
                     crate::epoch_log!(
                         me,
                         epoch,
-                        "    waiting for round2 shares on input {i} from {} signer(s) of S1...",
-                        s1.len()
+                        "signing round 2 for input {i}: waiting up to {} for {} of the \
+                         signer set",
+                        crate::epoch::log::remaining(
+                            window.close_of(SigningRound::Round2, attempt),
+                            clock.now()
+                        ),
+                        crate::epoch::log::plural(s1.len(), "peer", "peers"),
                     );
                     let shares = collected.round2.entry(i).or_default();
                     let polled = poll_sign_round(
@@ -565,9 +576,10 @@ fn open_next_attempt(
         crate::epoch_warn!(
             me,
             epoch,
-            "Sign round2 (attempt {attempt}): no round-2 share from [{}] and the opportunity has \
-             room for {} attempt(s) — this movement is not signed. The next batch opportunity \
-             starts again from the full roster.",
+            "signing round 2 (attempt {}): no share from {} and this opportunity has \
+             room for {} more — the movement is not signed. The next batch starts again from \
+             the full roster.",
+            attempt + 1,
             named(&missing),
             window.max_attempts(),
         );
@@ -578,11 +590,13 @@ fn open_next_attempt(
     crate::epoch_warn!(
         me,
         epoch,
-        "Sign round2 (attempt {attempt}): no round-2 share from [{}] after they committed in \
-         round 1 — this attempt cannot aggregate (the package is S1's commitments, and a partial \
-         sum does not verify). Opening attempt {next} over the remaining {eligible} member(s) \
-         with fresh commitments.",
+        "signing round 2 (attempt {}): no share from {} after they committed in round 1 \
+         — this attempt cannot aggregate, because the package is the signer set's commitments \
+         and a partial sum does not verify. Opening attempt {} over the remaining {eligible} \
+         members with fresh commitments.",
+        attempt + 1,
         named(&missing),
+        next + 1,
     );
     Ok(EpochPhase::Sign {
         epoch,
@@ -659,7 +673,7 @@ fn verify_cpo_root(
     crate::epoch_log!(
         me,
         epoch,
-        "  completed-peg-outs root {} verified against the local trie ({} fulfilled peg-out(s)) \
+        "completed peg-outs root {} verified against the local ledger ({} fulfilled) \
          — safe to sign",
         hex::encode(root),
         tm.fulfilled.len(),
@@ -726,7 +740,7 @@ fn verify_spi_root(
     crate::epoch_log!(
         me,
         epoch,
-        "  swept peg-ins root {} verified against the local trie ({} swept input(s)) \
+        "swept peg-ins root {} verified against the local ledger ({} swept) \
          – safe to sign",
         hex::encode(root),
         inputs.len().saturating_sub(1),
@@ -915,7 +929,7 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
         crate::epoch_warn!(
             me,
             ns.epoch,
-            "     round{} for {} has a {}ms window but polls every {}ms — it will be sampled \
+            "signing round {} for {} has a {}ms window but polls every {}ms — it will be sampled \
              ONCE, so a peer that answers a moment late is excluded and the round fails as \
              though it were absent. Lower [protocol].poll_interval_ms, or the bridge's \
              sign_r{}_window is too short to co-sign under.",
@@ -951,15 +965,20 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
             // read still means what it means.
             match T::fetch(peers, ns, peer).await {
                 Ok(Some(value)) => {
-                    crate::epoch_debug!(
+                    // INFO, not DEBUG (spec [PR-8]). A signing round waits up to
+                    // thirty minutes and used to say nothing at all until it
+                    // closed — so a healthy round and a dead one looked identical
+                    // for the whole window. One line per peer per round turns the
+                    // wait into a countdown of who is in.
+                    crate::epoch_log!(
                         me,
                         ns.epoch,
-                        "     received round{} for {} from spo={} ({}/{})",
+                        "signing round {} for {}: {} of {} in — {} just answered",
                         T::ROUND,
                         ns.session_label(),
-                        id_short(peer.identifier),
                         out.len() + 1,
-                        need
+                        need,
+                        crate::epoch::log::describe_peer(peer),
                     );
                     out.insert(peer.identifier, value);
                     unreachable.answered(peer.identifier);
@@ -975,17 +994,17 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
                     // Once per peer per round, not once per poll: at a 10 ms
                     // interval against a 30-minute window the second form is tens
                     // of thousands of identical lines.
-                    if unreachable.record(peer.identifier, &e) {
+                    if unreachable.record(peer, &e) {
                         crate::epoch_warn!(
                             me,
                             ns.epoch,
-                            "     round{} for {}: spo={} is UNREACHABLE ({e}) — counting it \
+                            "signing round {} for {}: {} is up but erroring ({e}) — counting it \
                              absent for this round and continuing. A peer that answers with an \
                              error is not the same fault as one that stays silent; it is up and \
                              unhealthy",
                             T::ROUND,
                             ns.session_label(),
-                            id_short(peer.identifier),
+                            crate::epoch::log::describe_peer(peer),
                         );
                     }
                 }
@@ -1008,19 +1027,26 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
             // round is simply unavailable; at or above it, proceed with exactly
             // who answered and name who did not.
             if out.len() < min {
-                // Say WHY before failing. Since a fetch error no longer aborts the
-                // round, an all-peers-erroring outage would otherwise surface as a
-                // bare "got 1, need 2" with nothing pointing at the cause.
+                // Say WHY, and say WHO, before failing (spec [PR-10]).
+                //
+                // This branch used to close with a bare "4/6, below the 6
+                // required" — the count and nothing else — while the branch below
+                // it, the one where the round SUCCEEDS, named every absentee. So
+                // the outcome an operator has to act on was the one that told
+                // them least: thirty minutes of silence, then a number, and no
+                // way to tell which two peers to go and check. Both branches name
+                // the same set now, from the session's own `peer_infos` ([LG-4a]).
                 crate::epoch_warn!(
                     me,
                     ns.epoch,
-                    "     round{} for {} closed at the deadline with {}/{}, below the {min} \
-                     required — the round is unavailable.{}",
+                    "signing round {} for {} closed at the deadline with {} of {}, below the {min} \
+                     required — the round is unavailable. Missing: {}. Up but erroring: {}.",
                     T::ROUND,
                     ns.session_label(),
                     out.len(),
                     need,
-                    unreachable.note(),
+                    crate::epoch::log::describe_absent(peer_infos, out),
+                    unreachable.erroring(),
                 );
                 return Err(EpochError::PollTimeout {
                     got: out.len(),
@@ -1035,18 +1061,14 @@ pub(crate) async fn poll_sign_round<T: SignRoundPayload>(
             crate::epoch_warn!(
                 me,
                 ns.epoch,
-                "     round{} for {} closed at the deadline with {}/{} — proceeding on the \
-                 threshold ({min} required). Absent: {}.{}",
+                "signing round {} for {} closed at the deadline with {} of {} — proceeding on the \
+                 threshold ({min} required). Missing: {}. Up but erroring: {}.",
                 T::ROUND,
                 ns.session_label(),
                 out.len(),
                 need,
-                absent
-                    .iter()
-                    .map(|id| id_short(*id).to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                unreachable.note(),
+                crate::epoch::log::describe_absent(peer_infos, out),
+                unreachable.erroring(),
             );
             return Ok(absent);
         }

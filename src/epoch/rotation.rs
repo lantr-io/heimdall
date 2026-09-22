@@ -154,8 +154,8 @@ pub async fn authorize_update_y(
         crate::epoch_log!(
             me,
             plan.epoch,
-            "Update-Y: outgoing key is the FEDERATION key and this node holds a share of it — \
-             convening the federation ({} member(s), {}-of-n) to authorize the handoff",
+            "key handoff: the outgoing key is the FEDERATION key and this node holds a share of it — \
+             convening the federation ({} members, {}-of-n) to authorize the handoff",
             roster.participants.len(),
             roster.min_signers
         );
@@ -172,8 +172,8 @@ pub async fn authorize_update_y(
         crate::epoch_log!(
             me,
             plan.epoch,
-            "Update-Y: outgoing key is the epoch-{} FROST group key — running a rotation \
-             signing ceremony with that roster ({} participant(s))",
+            "key handoff: the outgoing key is the bridge epoch {} group key — running a rotation \
+             signing ceremony with that roster ({} participants)",
             outgoing.epoch,
             outgoing.roster.participants.len()
         );
@@ -525,7 +525,7 @@ async fn frost_sign_message(
     crate::epoch_log!(
         me,
         epoch,
-        "Update-Y round1: published commitments, waiting for up to {} outgoing peer(s) \
+        "key handoff round 1: published commitments, waiting for up to {} outgoing peers \
          ({} required)",
         peer_infos.len(),
         roster.min_signers
@@ -553,7 +553,7 @@ async fn frost_sign_message(
         crate::epoch_warn!(
             me,
             epoch,
-            "Update-Y: signing the succession without {} outgoing member(s) — the rotation still \
+            "key handoff: signing the succession without {} outgoing members — the rotation still \
              hands the treasury to the incoming key, and any absentee that is also out of the \
              incoming roster loses its share of the treasury, as intended",
             absent.len()
@@ -581,7 +581,7 @@ async fn frost_sign_message(
     crate::epoch_log!(
         me,
         epoch,
-        "Update-Y round2: published share, waiting for the {} other signer(s) of S1",
+        "key handoff round 2: published share, waiting for the {} other members of the signer set",
         s1.len()
     );
     // Exactly S1, all of it: `aggregate` needs a share from every signer in the

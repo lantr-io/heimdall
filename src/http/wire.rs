@@ -852,17 +852,21 @@ impl SignNamespace {
     /// How this session is named in trace output.
     #[must_use]
     pub fn session_label(&self) -> String {
+        // "the key handoff", not "update-y": the glossary fixes one spelling for
+        // this and it is the one an operator reads everywhere else in the log.
+        // Display only — the namespace keys off `self.session`, the number.
         let what = if self.session == UPDATE_Y_SESSION {
-            "update-y".to_string()
+            "the key handoff".to_string()
         } else {
             format!("input {}", self.session)
         };
         // Named only once it is not the first go, so the ordinary line stays the
-        // line operators already know, and a retry is visible at a glance.
+        // line operators already know, and a retry is visible at a glance. The
+        // attempt reads as an ordinal, not the 0-based index it is on the wire.
         if self.attempt == 0 {
             what
         } else {
-            format!("{what} attempt {}", self.attempt)
+            format!("{what}, attempt {}", self.attempt + 1)
         }
     }
 }

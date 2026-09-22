@@ -637,37 +637,60 @@ pub enum EpochPhase {
 }
 
 impl EpochPhase {
-    /// Short human-readable phase name for tracing.
+    /// The two names `epoch::machine` matches on to decide whether a failure is a
+    /// verdict on the frozen batch.
+    ///
+    /// Named constants because that decision keys on the string [`Self::name`]
+    /// returns, and a rewording of a log line must never silently change which
+    /// failures are treated as deterministic — the liveness bug that would cause
+    /// is documented at `rejects_the_batch`.
+    pub const COLLECT_PEGINS: &'static str = "collecting peg-ins";
+    pub const BUILD_TM: &'static str = "building the treasury movement";
+    /// What both signing rounds' names begin with. `epoch::machine` counts a
+    /// failure here as a movement the roster could not sign, which is the
+    /// condition no daemon resolves — so it must not turn on a spelling.
+    pub const SIGNING: &'static str = "signing round";
+
+    /// What this phase is DOING, in the words the log uses (spec [LG-21]).
+    ///
+    /// Plain English, not the variant name. These strings reach an operator on
+    /// every phase transition and on every failure, and `Sign(Round1)` is Rust
+    /// syntax telling a stake pool operator that this log was not written for
+    /// them. The variants keep their names; only the rendering changed.
+    ///
+    /// NOT an identifier: `rejects_the_batch` and `step_clears_ramp` in
+    /// `epoch::machine` compare these, so they are matched there against the
+    /// same constants below rather than against spellings copied by hand.
     pub fn name(&self) -> &'static str {
         match self {
-            EpochPhase::Idle => "Idle",
-            EpochPhase::EpochStart { .. } => "EpochStart",
+            EpochPhase::Idle => "idle",
+            EpochPhase::EpochStart { .. } => "epoch start",
             EpochPhase::Dkg {
                 round: DkgRound::Round1,
                 ..
-            } => "Dkg(Round1)",
+            } => "key generation round 1",
             EpochPhase::Dkg {
                 round: DkgRound::Round2,
                 ..
-            } => "Dkg(Round2)",
+            } => "key generation round 2",
             EpochPhase::Dkg {
                 round: DkgRound::Part3,
                 ..
-            } => "Dkg(Part3)",
-            EpochPhase::PublishKeys { .. } => "PublishKeys",
-            EpochPhase::AwaitRotation { .. } => "AwaitRotation",
-            EpochPhase::CollectPegins { .. } => "CollectPegins",
-            EpochPhase::BuildTm { .. } => "BuildTm",
+            } => "key generation round 3",
+            EpochPhase::PublishKeys { .. } => "publishing the group key",
+            EpochPhase::AwaitRotation { .. } => "waiting for the key handoff",
+            EpochPhase::CollectPegins { .. } => Self::COLLECT_PEGINS,
+            EpochPhase::BuildTm { .. } => Self::BUILD_TM,
             EpochPhase::Sign {
                 round: SigningRound::Round1,
                 ..
-            } => "Sign(Round1)",
+            } => "signing round 1",
             EpochPhase::Sign {
                 round: SigningRound::Round2,
                 ..
-            } => "Sign(Round2)",
-            EpochPhase::Submit { .. } => "Submit",
-            EpochPhase::RecordMovement { .. } => "RecordMovement",
+            } => "signing round 2",
+            EpochPhase::Submit { .. } => "posting the treasury movement",
+            EpochPhase::RecordMovement { .. } => "recording the treasury movement",
         }
     }
 }
@@ -1050,8 +1073,9 @@ impl std::fmt::Display for EpochError {
                 reason,
             } => write!(
                 f,
-                "DKG aborted at epoch {epoch} attempt {attempt}: {qualified}/{eligible} qualified \
-                 ({reason})"
+                "key generation aborted at epoch {epoch}, attempt {}: {qualified} of \
+                 {eligible} qualified ({reason})",
+                attempt + 1
             ),
             Self::NotInEligibleSet {
                 epoch,

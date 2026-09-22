@@ -11,7 +11,7 @@
 //!   heimdall wrote is already stripped by journald.
 //! - heimdall's `--log-format json`:
 //!   `{"level":"INFO","target":"heimdall::event","fields":{"message":"…"}}`
-//! - plain: `2026-09-05T10:00:00Z  INFO heimdall::event: [spo=1 epoch=307] …`
+//! - plain: `2026-09-05T10:00:00Z  INFO heimdall::event: [pool1zk3ns…q7wd epoch=307] …`
 //! - journal text as heimdall writes it to a pipe or a file: `<6>heimdall::event: …`
 //!
 //! A line that matches none of these is still a record — `info`, no target,
@@ -307,16 +307,16 @@ mod tests {
 
     // The literals heimdall's own `logging` tests pin
     // (`event_lines_keep_the_shape_the_relay_parses`).
-    const JOURNAL_TEXT: &str = "<6>heimdall::event: [spo=1 epoch=307] DKG complete";
+    const JOURNAL_TEXT: &str = "<6>heimdall::event: [pool1zk3ns…q7wd epoch=307] key generation complete";
     const PLAIN: &str =
-        "2026-09-05T10:00:00Z  INFO heimdall::event: [spo=1 epoch=307] DKG complete";
-    const TRACING_JSON: &str = r#"{"timestamp":"2026-09-05T10:00:00Z","level":"INFO","fields":{"message":"[spo=1 epoch=307] DKG complete"},"target":"heimdall::event"}"#;
+        "2026-09-05T10:00:00Z  INFO heimdall::event: [pool1zk3ns…q7wd epoch=307] key generation complete";
+    const TRACING_JSON: &str = r#"{"timestamp":"2026-09-05T10:00:00Z","level":"INFO","fields":{"message":"[pool1zk3ns…q7wd epoch=307] key generation complete"},"target":"heimdall::event"}"#;
 
     fn event(level: Level, unit: Option<&str>) -> Record {
         Record {
             level,
             target: Some(EVENT_TARGET.to_string()),
-            message: "[spo=1 epoch=307] DKG complete".to_string(),
+            message: "[pool1zk3ns…q7wd epoch=307] key generation complete".to_string(),
             unit: unit.map(str::to_string),
         }
     }
@@ -335,7 +335,7 @@ mod tests {
     /// rather than on a level floor it sits below.
     #[test]
     fn a_warn_level_event_is_selected_by_either_filter() {
-        let record = parse_line("<4>heimdall::event: [spo=1 epoch=307] TM post FAILED: txid ab")
+        let record = parse_line("<4>heimdall::event: [pool1zk3ns…q7wd epoch=307] treasury movement post FAILED: txid ab")
             .expect("parses");
         assert_eq!(record.level, Level::Warn);
         assert!(record.is_event());
@@ -361,18 +361,18 @@ mod tests {
         // An event line renders without its target, and a warn one still marks.
         assert_eq!(
             render(&record, None),
-            "\u{26a0}\u{fe0f} [spo=1 epoch=307] TM post FAILED: txid ab"
+            "\u{26a0}\u{fe0f} [pool1zk3ns…q7wd epoch=307] treasury movement post FAILED: txid ab"
         );
     }
 
     #[test]
     fn journal_json_carries_unit_and_priority() {
-        let line = r#"{"__REALTIME_TIMESTAMP":"1757066400000000","PRIORITY":"4","_SYSTEMD_UNIT":"heimdall@spo1.service","SYSLOG_IDENTIFIER":"heimdall","MESSAGE":"heimdall::epoch::dkg: [spo=1 epoch=307] dropping round1 from 2"}"#;
+        let line = r#"{"__REALTIME_TIMESTAMP":"1757066400000000","PRIORITY":"4","_SYSTEMD_UNIT":"heimdall@spo1.service","SYSLOG_IDENTIFIER":"heimdall","MESSAGE":"heimdall::epoch::dkg: [pool1zk3ns…q7wd epoch=307] key generation round 1: dropping the package from member #2"}"#;
         let record = parse_line(line).unwrap();
         assert_eq!(record.level, Level::Warn);
         assert_eq!(record.unit.as_deref(), Some("heimdall@spo1"));
         assert_eq!(record.target.as_deref(), Some("heimdall::epoch::dkg"));
-        assert_eq!(record.message, "[spo=1 epoch=307] dropping round1 from 2");
+        assert_eq!(record.message, "[pool1zk3ns…q7wd epoch=307] key generation round 1: dropping the package from member #2");
         assert!(!record.is_event());
     }
 
@@ -489,16 +489,16 @@ mod tests {
     fn render_marks_severity_and_source_and_keeps_non_event_targets() {
         assert_eq!(
             render(&event(Level::Info, Some("heimdall@spo1")), None),
-            "[heimdall@spo1] [spo=1 epoch=307] DKG complete"
+            "[heimdall@spo1] [pool1zk3ns…q7wd epoch=307] key generation complete"
         );
         // A file label stands in when the record has no unit; a unit wins over it.
         assert_eq!(
             render(&event(Level::Info, None), Some("spo2")),
-            "[spo2] [spo=1 epoch=307] DKG complete"
+            "[spo2] [pool1zk3ns…q7wd epoch=307] key generation complete"
         );
         assert_eq!(
             render(&event(Level::Info, Some("heimdall")), Some("ignored")),
-            "[heimdall] [spo=1 epoch=307] DKG complete"
+            "[heimdall] [pool1zk3ns…q7wd epoch=307] key generation complete"
         );
         let warn =
             parse_line("<4>heimdall::cardano::blockfrost_chain: 429 from Blockfrost").unwrap();

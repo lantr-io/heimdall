@@ -23,41 +23,42 @@ where `ps` would show it.
 The `heimdall::event` lines — one line each, self-contained. Nearly all are `info`;
 the failure counterpart of an event is `warn` on the same target. Being an EVENT is
 what keeps it wherever its successful twin is kept — otherwise `--min-level error`
-shows every `TM posted` and none of the misses. Being `warn` earns it the ⚠️ and
+shows every `treasury movement posted` and none of the misses. Being `warn` earns it the ⚠️ and
 keeps it under `--no-events --min-level warn`:
 
 | event | when |
 |---|---|
-| `DKG round1 (attempt N) started: n=… t=…, participants: #1 http://…, #2 http://…, …` | the ceremony opens; the participant list is the roster, in index order |
-| `DKG round2 (attempt N) started: round1 packages in from 3 of 4: #1 http://…, …` | who made it into round 2, named |
-| `DKG part3 (attempt N) started: round2 shares in from 3 of 4: #1 http://…, …` | whose shares arrived |
-| `DKG complete (attempt N): Y_51=…, 3 share-holder(s), threshold 2. Final roster: #1 http://…, …` | the group key, and who holds a share of it |
-| `⚠️ DKG ABORTED (attempt N): 2 of 4 eligible qualified — …. Excluded: …` | this ceremony produced no key, naming who was excluded; a later attempt this epoch still may succeed |
-| `registry: 5 registered, 4 eligible: #1 http://…, … — NOT eligible: pool1… (no stake at this epoch's snapshot …)` | only when it CHANGES: someone joined, left, was banned, or their stake activated |
-| `⚠️ FAULT BAN FAILED: <kind> by pool … could not be published (…)` | a misbehaving SPO stays in the roster and enters the next ceremony |
-| `New treasury address tb1p… (Y_51=…)` | where this epoch's handoff pays the treasury |
-| `Update-Y posted: cardano tx … — treasury key … -> …` | the rotation is on Cardano (also the federation-handoff form) |
+| `key generation round 1 opened (attempt N): 4 members, threshold 2. Participants: pool1… (http://…), …` | the ceremony opens; the participant list is the roster |
+| `key generation round 2 opened (attempt N): round 1 packages in from 3 of 4 — pool1… (http://…), …` | who made it into round 2, named |
+| `key generation round 3 opened (attempt N): round 2 shares in from 3 of 4 — pool1… (http://…), …` | whose shares arrived |
+| `key generation complete (attempt N): group key … — 3 share holders, threshold 2. Final roster: pool1… (http://…), …` | the group key, and who holds a share of it |
+| `⚠️ key generation ABORTED (attempt N): 2 of 4 eligible qualified — …. Excluded: …` | this ceremony produced no key, naming who was excluded; a later attempt this epoch still may succeed |
+| `registry: 5 registered, 4 eligible: pool1… (http://…), … — NOT eligible: pool1… (no stake at this epoch's snapshot …)` | only when it CHANGES: someone joined, left, was banned, or their stake activated |
+| `⚠️ FAULT BAN FAILED: a <kind> by pool … could not be published (…)` | a misbehaving SPO stays in the roster and enters the next ceremony |
+| `group key for bridge epoch E: …; the treasury address it produces is tb1p…` | where this epoch's handoff pays the treasury |
+| `key handoff posted: Cardano tx … — the treasury key becomes …, was …` | the rotation is on Cardano (also the federation-handoff form) |
 | `⚠️ Update-Y FAILED: the key handoff has failed N retries running this epoch — parking until the next boundary` | this node has stopped expecting a rotation; the epoch's whole batch grid goes with it |
-| `⚠️ Update-Y DID NOT TAKE: the rotation to … was accepted … but treasury_info still does not name it` | posted and accepted, but the datum never caught up |
-| `TM built: txid … — 3 input(s) (2 deposit(s) swept), 2 output(s), 1 peg-out(s) paid; signing starts` | a treasury movement is assembled |
-| `⚠️ TM NOT SIGNED: the 51% mode did not sign this movement (…) — N consecutive now` | the roster could not sign what it built; no daemon resolves this |
-| `TM posted: txid … — Post-TM submitted (… bytes; …); awaiting Bitcoin confirmation` | the movement is posted |
-| `⚠️ TM post FAILED: txid … — this node could not complete the Post-TM (…)` | a signed movement did not go out; the Cardano submit may still have been accepted, so the movement may yet confirm |
-| `TM confirmed: txid … — treasury head is now …` | the chain shows it as the head |
+| `⚠️ Update-Y DID NOT TAKE: the rotation to … was accepted by Cardano but …` | posted and accepted, but the datum never caught up |
+| `treasury movement built: txid …; sweeps 2 deposits, pays 1 peg-out, 2 outputs. Signing starts` | a treasury movement is assembled |
+| `⚠️ treasury movement NOT SIGNED: the SPO roster could not sign it (…) — N in a row` | the roster could not sign what it built; no daemon resolves this |
+| `treasury movement posted: txid … (… bytes); pays …, sweeps …. Waiting for Bitcoin …` | the movement is posted |
+| `⚠️ treasury movement post FAILED: txid … — this node could not finish posting it` | a signed movement did not go out; the Cardano submit may still have been accepted, so the movement may yet confirm |
+| `treasury movement confirmed: txid …; the treasury is now … — N completed, N swept` | the chain shows it as the head |
 
 Four steps appear both ways, so the channel cannot show only the good half of
-them: the DKG, the rotation, the signing and the post. `registry`, `New treasury
-address` and `TM confirmed` report what the chain now says rather than an action
-this node took, so there is no outcome for them to fail at.
+them: the key generation, the rotation, the signing and the post. `registry`,
+`group key for bridge epoch` and `treasury movement confirmed` report what the
+chain now says rather than an action this node took, so there is no outcome for
+them to fail at.
 
-`TM built` has no ⚠️ counterpart, and deliberately so. The two ways a movement
-does not get built are both already `warn`s, which the default `--min-level warn`
-forwards:
+`treasury movement built` has no ⚠️ counterpart, and deliberately so. The two
+ways a movement does not get built are both already `warn`s, which the default
+`--min-level warn` forwards:
 
 - the opportunity is never taken, because a movement is still in flight against
-  the tip — `batch B_i passes UNUSED: a treasury movement is still in flight …`;
+  the tip — `batch B_i skipped: treasury movement <txid> is still waiting for Bitcoin confirmation …`;
 - the build is entered and refuses, over roots or trie state — the phase driver's
-  `BuildTm failed on the frozen batch (…)`.
+  `building the treasury movement failed on the frozen batch (…)`.
 
 The first of those fires on a HEALTHY bridge: with a ~6 h grid pitch and ~17 h to
 confirm a movement, up to three opportunities in a row pass while the last one

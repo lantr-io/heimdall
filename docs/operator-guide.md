@@ -1149,8 +1149,68 @@ journalctl -u heimdall -p warning  # what degraded first
 docker logs -f heimdall            # the container equivalent
 ```
 
-The lines worth reading without reading everything — a DKG round opening and who is in it, the
-group key and treasury address it produced, an Update-Y posted, a treasury movement built, posted
+**Every line begins the same way**: `[epoch=<bridge epoch>] <what happened>`. The epoch is the
+**bridge** epoch, which the ceremony, the batch grid and this node's saved state are all keyed by;
+on a test run it is the virtual epoch, and one line at startup maps it to Cardano's.
+
+Your pool is not repeated on every line — `journalctl -u <unit>` has already picked the node, and
+the startup block states its full pool id once. A short pool id (`pool1zk3ns…q7wd`, the first ten
+characters and the last four) appears wherever a line names a *peer*, and in the prefix too if one
+process ever logs under more than one identity.
+
+Lines do not carry a Rust module path either, except at `error`, where which subsystem failed is
+the first thing you want. `RUST_LOG` still selects on it — filtering never needed it printed.
+
+Times are UTC, with how long to wait beside them, so nothing has to be converted from a slot number:
+
+```
+[epoch=1554] waiting for batch B_3 at 09:00:00 UTC (in 2h30m), slot 134298000
+```
+
+A peer is always named by pool id **and** by the URL you would open to check it, because the line
+that says a peer is missing is read by someone about to go and look:
+
+```
+[epoch=1554] signing round 1 closed with 4 of 7, below the 6 required —
+the round is unavailable. Missing: pool1xstk3…2qdn (https://bifrost.xstakepool.com). Up but
+erroring: none.
+```
+
+**What the log calls things.** The code and the specification use shorter names; the log does not.
+
+| In the log | Elsewhere |
+|---|---|
+| bridge epoch | the ceremony epoch; the virtual epoch on a test run |
+| group key | `Y_51`, the FROST group verifying key |
+| key handoff | Update-Y, the rotation of the treasury record |
+| treasury record | the `treasury_info` datum |
+| treasury movement | TM, Post-TM |
+| bridge state record | the bridge-state singleton |
+| completed peg-outs ledger | the CPO trie |
+| swept peg-ins ledger | the SPI trie |
+| SPO roster | the 51% mode |
+| signer set | S1 |
+| key generation round N | DKG round N |
+| posting order | the leader cascade |
+
+**Finding one thing.** Each line begins with a fixed phrase, so one pattern returns one subject's
+whole history:
+
+| `grep` for | Returns |
+|---|---|
+| `batch B_` | every batch: waiting, opened, skipped |
+| `signing round` | every signing round: opened, who arrived, how it closed |
+| `key generation` | the same for every ceremony |
+| `treasury movement` | built, posted, confirmed, not signed, post failed |
+| `key handoff` | every rotation of the treasury record |
+| `roster for bridge epoch` | one roster table per epoch, with the stake behind it |
+| `threshold` | how `t of n` follows from that stake |
+| `peg-in request` | every skipped request, said once per epoch |
+| `this node:` | the pool and URL this process runs for |
+| `Missing:` | every round that closed short, and who was absent |
+
+The lines worth reading without reading everything — a ceremony round opening and who is in it, the
+group key and treasury address it produced, a key handoff posted, a treasury movement built, posted
 or confirmed — carry the target `heimdall::event`, one line each, and stay at `info` under any
 bare level:
 
@@ -1181,10 +1241,17 @@ the bridge's, not the node's.
 The **ceremony** is the slower of the two clocks: the DKG and its Update-Y run once per Cardano
 epoch (5+ days), and every batch inside that epoch is signed by the roster it produced.
 
-A healthy idle node therefore says very little. Long silences are correct behaviour. What tells you
-it is alive is `systemctl status` and the absence of `-p err` output — **[will be improved —
-WI-058]**, which adds a periodic heartbeat and a `heimdall status` command, because "silent" and
-"wedged" currently look the same.
+A healthy idle node therefore says very little, and that is correct behaviour. It is not silent,
+though: while it waits for a batch it prints one line an hour saying which batch, at what time, and
+how long from now.
+
+```
+[epoch=1554] still waiting for batch B_3 at 09:00:00 UTC (in 1h30m)
+```
+
+That is how "idle" and "wedged" are told apart. A wedged node either stops printing the line or
+prints it with a countdown that does not shrink. `heimdall status` and `/health` answer the same
+question on demand.
 
 ### State
 
@@ -1238,7 +1305,7 @@ from the roster.
 
 `/health` also carries the roster each node READ for the current ceremony — `roster_digest`,
 `roster_size` and `threshold`, tagged with `dkg_threshold_epoch`. Those must match across the
-roster for one epoch; when they do not, the `⚠ EXCLUDING` lines say whether it is a read that will
+roster for one epoch; when they do not, the `EXCLUDING` lines say whether it is a read that will
 settle by the next epoch (nothing to do) or a peer too old to report a digest (upgrade it).
 
 **Run `heimdall doctor` before you install, not after.** The startup checks are a gate: a `Fail`
@@ -1352,11 +1419,11 @@ authorization to leave that anyone holding it can post: `sign-with-pool-key` wri
 |---|---|
 | the service will not start | `journalctl -u heimdall -p err`, then re-run the step-4 check — it names the failing check and what to fix |
 | starts, then nothing happens for days | expected; see *Quiet is normal* |
-| peers seem not to see you | first step 5 — is the registered port open and reachable *from outside*? If it is, compare `demo_live_stake` and `demo_virtual_epoch_slots` against the rest of the roster (§3): they are consensus inputs, so a node that differs is registered, reachable, and deliberately never talked to. Both sides log `⚠ EXCLUDING`, so the roster sees it too |
+| peers seem not to see you | first step 5 — is the registered port open and reachable *from outside*? If it is, compare `demo_live_stake` and `demo_virtual_epoch_slots` against the rest of the roster (§3): they are consensus inputs, so a node that differs is registered, reachable, and deliberately never talked to. Both sides log `EXCLUDING`, so the roster sees it too |
 | `[3/11] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
 | `[6/11] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command, including the `--signed` form for a cold key that is not on this machine. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
 | `no reference script for the registry` right after `deploy-registry-ref` succeeded | the provider's address listing has not shown the script yet – pass the outpoint the deploy printed, `--registry-ref <tx_hash>:0` (step 6) |
-| `N of M candidates excluded at the pre-ceremony handshake` at every epoch start | the rest of the line names each cause with its count. *Incompatible build* (version, blueprint, security threshold): both sides report the other, so compare `/health` across the roster and upgrade the odd one out – see *Upgrades*. *Different consensus settings*: match the setting the `⚠ EXCLUDING` lines name. *Different roster read*: nothing to change – typically this node registered after the roster read the registry for this epoch, and it clears at the next epoch; if it is still there after an epoch boundary it is not that, so compare `roster_digest`, `roster_size`, `threshold` and `dkg_threshold_epoch` in `/health` across the roster. *Different FROST threshold from an older build*: upgrade the nodes whose `/health` has no `roster_digest`. `/health` shows the roster each node READ; the threshold it actually runs with after exclusions is in its `candidate set reduced` log line. When the line says *every peer was excluded*, the node that differs is this one |
+| `N of M candidates excluded at the pre-ceremony handshake` at every epoch start | the rest of the line names each cause with its count. *Incompatible build* (version, blueprint, security threshold): both sides report the other, so compare `/health` across the roster and upgrade the odd one out – see *Upgrades*. *Different consensus settings*: match the setting the `EXCLUDING` lines name. *Different roster read*: nothing to change – typically this node registered after the roster read the registry for this epoch, and it clears at the next epoch; if it is still there after an epoch boundary it is not that, so compare `roster_digest`, `roster_size`, `threshold` and `dkg_threshold_epoch` in `/health` across the roster. *Different FROST threshold from an older build*: upgrade the nodes whose `/health` has no `roster_digest`. `/health` shows the roster each node READ; the threshold it actually runs with after exclusions is in its `candidate set reduced` log line. When the line says *every peer was excluded*, the node that differs is this one |
 | `[9/11] post a movement FAIL` | this bridge has never published its treasury-movement validator on chain, so no SPO can post — `binocular deploy-script-refs`, re-run, publishes it and skips what already exists. Not something one operator's config can fix |
 | `[11/11] wallet collateral WARN`, or `no ada-only wallet UTxO with >= 5 ADA for collateral` when a tx is built | the wallet cannot post a script transaction, which is **not** a balance problem — it can hold thousands of ADA and still fail, if every UTxO carries a native token. A script tx needs one UTxO to pay the fee and a DISTINCT ada-only one for collateral. `heimdall ensure-collateral --submit` splits clean UTxOs off whatever the wallet holds; it runs no script, so it needs no collateral itself and works even when every lovelace is behind a token |
 | a key you set is `refused` at load | it names a value the Config publishes; delete it, and `show-config-params` prints what the chain says |
@@ -1729,11 +1796,12 @@ silent on both sides.
 1. **At startup**, every node logs a `TEST RUN` warning naming the slot count:
 
    ```
-   [epoch] TEST RUN: the bridge cycle is a 86400-slot VIRTUAL epoch
-   (cardano.demo_virtual_epoch_slots), not Cardano's five-day one, and the ceremony
-   deadlines are rescaled to fit it. EVERY node of this roster must set the same value —
-   a mismatch splits the DKG namespace. It is refused on mainnet
+   TEST RUN: demo_virtual_epoch_slots=86400 — every node of this roster must match, and
+   these are refused on mainnet
    ```
+
+   Preflight check 1 prints the whole consequence above it; this line is the one-glance
+   reminder for anyone who scrolled past it.
 
    A node missing this line is on real epochs, whatever its config file says — a misspelled key
    parses as unset.

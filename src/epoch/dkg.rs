@@ -93,6 +93,9 @@ pub async fn dkg_phase(
     };
     let epoch = ctx.epoch;
     let attempt = ctx.attempt;
+    // The log counts attempts from 1; the wire and the namespace keep the
+    // 0-based index this is derived from.
+    let attempt_no = attempt + 1;
     let schedule_anchor_ms = ctx.schedule_anchor_ms;
     // Every payload (and its replay binding) is namespaced by the attempt, so a
     // stale previous-attempt package can never be replayed into a rerun.
@@ -105,24 +108,24 @@ pub async fn dkg_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "DKG round1 (attempt {attempt}): generating secret polynomial and commitments \
-                 (n={}, t={})",
+                "key generation round 1 (attempt {attempt_no}): generating this node's secret \
+                 polynomial and commitments; {} members, threshold {}",
                 roster.max_signers,
                 roster.min_signers
             );
             crate::epoch_event!(
                 me,
                 epoch,
-                "DKG round1 (attempt {attempt}) started: n={} t={}, participants: {}",
+                "key generation round 1 opened (attempt {attempt_no}): {} members, threshold {}. \
+                 Participants: {}",
                 roster.max_signers,
                 roster.min_signers,
-                // URLs only, like every other round line. This used to carry the
-                // pool id too, on the reasoning that Round 1 publishes the full
-                // identity once and the later rounds can then just cite an
-                // index. Those rounds carry URLs now, so nothing depends on this
-                // line establishing an index -> pool mapping — and it was the
-                // longest message the relay sends: 405 characters for four SPOs,
-                // 56% of it bech32. `show-roster` prints pool ids on demand.
+                // Short pool label and URL, like every other round line. The
+                // label is 15 characters rather than the full 56, which is what
+                // makes carrying both affordable on the longest message the
+                // relay sends. An index alone would not do: it comes from
+                // `bifrost_id_pk` order, so one pool joining shifts every index
+                // above it. `show-roster` prints the full pool ids on demand.
                 crate::epoch::log::describe_selected(
                     roster.participants.keys(),
                     &roster.participants
@@ -149,13 +152,13 @@ pub async fn dkg_phase(
             crate::epoch_debug!(
                 me,
                 epoch,
-                "  -> round1 package built ({} bytes): {}",
+                "-> round1 package built ({} bytes): {}",
                 pkg_bytes.len(),
                 short_hex(&pkg_bytes, 16)
             );
 
             peers.publish_dkg_round1(ns, me, &package).await?;
-            crate::epoch_debug!(me, epoch, "  -> round1 package published to local server");
+            crate::epoch_debug!(me, epoch, "-> round1 package published to local server");
 
             collected.round1_mine = Some(secret);
             collected.round1_peers.insert(me, package);
@@ -203,8 +206,9 @@ pub async fn dkg_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "  waiting for round1 packages from {} peer(s) until deadline (anchored={})...",
-                peer_infos.len(),
+                "key generation round 1: waiting up to {} for {} (published schedule: {})",
+                crate::epoch::log::remaining(deadline, clock.now()),
+                crate::epoch::log::plural(peer_infos.len(), "peer", "peers"),
                 schedule_anchor_ms.is_some()
             );
             poll_dkg_round1(
@@ -246,7 +250,8 @@ pub async fn dkg_phase(
                         crate::epoch_warn!(
                             me,
                             ctx.epoch,
-                            "  dropping round1 from {}: commitment will not serialize ({e})",
+                            "key generation round 1: dropping the package from member #{} — its commitment \
+                             will not serialize ({e})",
                             id_short(*id)
                         );
                         return false;
@@ -257,8 +262,9 @@ pub async fn dkg_phase(
                     crate::epoch_warn!(
                         me,
                         ctx.epoch,
-                        "  dropping round1 from {}: {got} commitments, we expect {expected_commitments} \
-                         (peer is on a different candidate set — treating as absent, not faulty)",
+                        "key generation round 1: dropping the package from member #{} — it carries {got} \
+                         commitments and this node expects {expected_commitments}, so that peer \
+                         is running a different candidate set. Treated as absent, not faulty",
                         id_short(*id)
                     );
                 }
@@ -273,7 +279,7 @@ pub async fn dkg_phase(
                 crate::epoch_log!(
                     me,
                     epoch,
-                    "  <- all {} round1 packages in, advancing to round2",
+                    "key generation round 1 complete: all {} packages in",
                     l1.len()
                 );
                 Ok(EpochPhase::Dkg {
@@ -282,14 +288,17 @@ pub async fn dkg_phase(
                     collected,
                 })
             } else {
-                let absent: Vec<_> = eligible.difference(&l1).map(|id| id_short(*id)).collect();
+                let absent = crate::epoch::log::describe_selected(
+                    eligible.difference(&l1),
+                    &roster.participants,
+                );
                 crate::epoch_warn!(
                     me,
                     epoch,
-                    "  round1 incomplete at deadline: {}/{} published; missing/faulty: {:?}",
+                    "key generation round 1 closed short: {} of {} published. Missing or \
+                     faulty: {absent}",
                     l1.len(),
-                    eligible.len(),
-                    absent
+                    eligible.len()
                 );
                 report_round1_faults(chain, peers, ns, me, &ctx, &l1).await?;
 
@@ -330,7 +339,7 @@ pub async fn dkg_phase(
                     crate::epoch_warn!(
                         me,
                         epoch,
-                        "  no schedule anchor, so the round1 deadline is this node's own timer \
+                        "no published schedule to anchor to, so the round 1 deadline is this node's own timer \
                          and peers may have closed a different L1 — rerunning rather than \
                          narrowing, which would derive a different key on each of them"
                     );
@@ -351,7 +360,7 @@ pub async fn dkg_phase(
                     crate::epoch_log!(
                         me,
                         epoch,
-                        "  narrowing attempt {attempt} in place to the {} node(s) that published \
+                        "narrowing attempt {attempt_no} in place to the {} nodes that published \
                          round1 (t={} unchanged, no rerun) — advancing to round2",
                         l1.len(),
                         ctx.threshold,
@@ -373,8 +382,7 @@ pub async fn dkg_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "DKG round2 (attempt {attempt}): computing per-peer secret shares from round1 \
-                 packages"
+                "key generation round 2 (attempt {attempt_no}): computing one secret share per peer"
             );
             {
                 // Who made it into this round: the peers whose round-1 package
@@ -386,7 +394,8 @@ pub async fn dkg_phase(
                 crate::epoch_event!(
                     me,
                     epoch,
-                    "DKG round2 (attempt {attempt}) started: round1 packages in from {} of {}: {}",
+                    "key generation round 2 opened (attempt {attempt_no}): round 1 packages in from {} \
+                     of {} — {}",
                     published.len(),
                     roster.max_signers,
                     crate::epoch::log::describe_selected(&published, &roster.participants)
@@ -413,16 +422,11 @@ pub async fn dkg_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "  -> built {} encrypted shares (one per peer)",
+                "built {} encrypted shares, one per peer",
                 round2_packages.len()
             );
             for peer_id in round2_packages.keys() {
-                crate::epoch_debug!(
-                    me,
-                    epoch,
-                    "     - share addressed to spo={}",
-                    id_short(*peer_id)
-                );
+                crate::epoch_debug!(me, epoch, "- share addressed to spo={}", id_short(*peer_id));
             }
 
             // Pair each share with its recipient's SpoInfo so the transport can
@@ -452,7 +456,7 @@ pub async fn dkg_phase(
             peers
                 .publish_dkg_round2(ns, me, &my_commitments, &recipients)
                 .await?;
-            crate::epoch_debug!(me, epoch, "  -> round2 packages published");
+            crate::epoch_debug!(me, epoch, "-> round2 packages published");
 
             collected.round2_mine = Some(round2_secret);
 
@@ -466,9 +470,10 @@ pub async fn dkg_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "  waiting for round2 shares addressed to me from {} peer(s) until deadline \
-                 (anchored={})...",
-                peer_infos.len(),
+                "key generation round 2: waiting up to {} for the shares addressed to this \
+                 node from {} (published schedule: {})",
+                crate::epoch::log::remaining(deadline, clock.now()),
+                crate::epoch::log::plural(peer_infos.len(), "peer", "peers"),
                 schedule_anchor_ms.is_some()
             );
             poll_dkg_round2(
@@ -492,7 +497,7 @@ pub async fn dkg_phase(
                 crate::epoch_log!(
                     me,
                     epoch,
-                    "  <- all {} round2 shares in, advancing to part3",
+                    "key generation round 2 complete: all {} shares in",
                     collected.round2_peers.len()
                 );
                 Ok(EpochPhase::Dkg {
@@ -501,14 +506,17 @@ pub async fn dkg_phase(
                     collected,
                 })
             } else {
-                let absent: Vec<_> = eligible.difference(&q).map(|id| id_short(*id)).collect();
+                let absent = crate::epoch::log::describe_selected(
+                    eligible.difference(&q),
+                    &roster.participants,
+                );
                 crate::epoch_warn!(
                     me,
                     epoch,
-                    "  round2 incomplete at deadline: {}/{} qualified; missing/faulty: {:?}",
+                    "key generation round 2 closed short: {} of {} qualified. Missing or \
+                     faulty: {absent}",
                     q.len(),
-                    eligible.len(),
-                    absent
+                    eligible.len()
                 );
                 report_round2_faults(chain, peers, ns, me, &ctx, &q, &collected.round1_peers)
                     .await?;
@@ -538,12 +546,14 @@ pub async fn dkg_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "DKG part3 (attempt {attempt}): combining shares into final KeyPackage + group key"
+                "key generation round 3 (attempt {attempt_no}): combining the shares into this \
+                 node's signing share and the group key"
             );
             crate::epoch_event!(
                 me,
                 epoch,
-                "DKG part3 (attempt {attempt}) started: round2 shares in from {} of {}: {}",
+                "key generation round 3 opened (attempt {attempt_no}): round 2 shares in from {} \
+                 of {} — {}",
                 collected.round2_peers.len() + 1,
                 roster.max_signers,
                 {
@@ -599,24 +609,19 @@ pub async fn dkg_phase(
                 .verifying_key()
                 .serialize()
                 .map_err(|e| EpochError::Frost(format!("verifying_key serialize: {e}")))?;
+            crate::epoch_log!(me, epoch, "group key = {}", hex::encode(&vk_bytes));
             crate::epoch_log!(
                 me,
                 epoch,
-                "  -> group verifying key (Y_51) = {}",
-                hex::encode(&vk_bytes)
-            );
-            crate::epoch_log!(
-                me,
-                epoch,
-                "  -> my signing share is bound to spo={}, threshold {}",
+                "this node's signing share is bound to member #{}, threshold {}",
                 id_short(*key_package.identifier()),
                 key_package.min_signers()
             );
             crate::epoch_event!(
                 me,
                 epoch,
-                "DKG complete (attempt {attempt}): Y_51={} — {} share-holder(s), threshold {}. \
-                 Final roster: {}",
+                "key generation complete (attempt {attempt_no}): group key {} — {} share holders, \
+                 threshold {}. Final roster: {}",
                 hex::encode(&vk_bytes),
                 roster.max_signers,
                 key_package.min_signers(),
@@ -656,13 +661,13 @@ pub async fn dkg_phase(
                     Ok(()) => crate::epoch_debug!(
                         me,
                         epoch,
-                        "  -> DKG state persisted to {}",
+                        "key generation state persisted to {}",
                         crate::epoch::persist::dkg_state_path(dir, epoch).display()
                     ),
                     Err(e) => crate::epoch_warn!(
                         me,
                         epoch,
-                        "  could not persist DKG state ({e}); share is in memory only \
+                        "could not persist DKG state ({e}); share is in memory only \
                          and will not survive a restart this epoch"
                     ),
                 }
@@ -745,9 +750,13 @@ fn rerun_or_abort(
     crate::epoch_warn!(
         me,
         ctx.epoch,
-        "  DKG exclusions (attempt {}, {:?}): excluded [{summary}]",
-        ctx.attempt,
-        round
+        "key generation exclusions (attempt {}, round {}): {summary}",
+        ctx.attempt + 1,
+        match round {
+            DkgRound::Round1 => 1,
+            DkgRound::Round2 => 2,
+            DkgRound::Part3 => 3,
+        }
     );
     let eligible = ctx.participants.len();
     // The counterpart to `DKG complete`. Without it the event channel carried
@@ -758,16 +767,16 @@ fn rerun_or_abort(
         crate::epoch_event_warn!(
             me,
             ctx.epoch,
-            "DKG ABORTED (attempt {}): {} of {} eligible qualified — {}. Excluded: {}. This \
-             ceremony produced no Y_51; the treasury stays under the OUTGOING key until one \
-             completes, which a later attempt this epoch still may",
-            ctx.attempt,
+            "key generation ABORTED (attempt {}): {} of {} eligible qualified — {}. Excluded: \
+             {}. This ceremony produced no group key; the treasury stays under the outgoing \
+             one until a ceremony completes, which a later attempt this epoch still may",
+            ctx.attempt + 1,
             survivors.len(),
             eligible,
             // TWO interpolated values on one line, so they share the budget rather
             // than each taking a whole one — two default caps plus the fixed text
             // would overflow the relay's split budget and arrive as fragments
-            // carrying no `[spo=N epoch=E]`. The excluded list is inline at all
+            // carrying no `[<pool label> epoch=E]`. The excluded list is inline at all
             // because it is the first thing an operator asks for and otherwise
             // exists only in the `epoch_warn!` above, which a relay run with
             // `--min-level off` never forwards.
@@ -928,7 +937,8 @@ async fn publish_detected_fault(
     crate::epoch_warn!(
         me,
         epoch,
-        "  -> publishing DKG fault: kind={kind} accused={accused} spo={}",
+        "publishing a key generation fault: {kind}, accusing pool {accused}, reported by \
+         member #{}",
         id_short(peer.identifier)
     );
     if let Err(e) = chain.publish_dkg_fault_and_apply_ban(fault).await {
@@ -940,7 +950,7 @@ async fn publish_detected_fault(
         crate::epoch_event_warn!(
             me,
             epoch,
-            "FAULT BAN FAILED: {kind} by pool {accused} could not be published ({}) — the \
+            "FAULT BAN FAILED: a {kind} by pool {accused} could not be published ({}) — the \
              accused stays in the roster and enters the next ceremony",
             crate::epoch::log::one_line(&e)
         );
@@ -1069,7 +1079,7 @@ async fn poll_dkg_round1(
                     crate::epoch_debug!(
                         me,
                         ns.epoch,
-                        "     received round1 package from spo={} ({}/{})",
+                        "received round1 package from spo={} ({}/{})",
                         id_short(peer.identifier),
                         out.len() + 1,
                         need
@@ -1079,13 +1089,13 @@ async fn poll_dkg_round1(
                 }
                 Ok(None) => unreachable.answered(peer.identifier),
                 Err(e) => {
-                    if unreachable.record(peer.identifier, &e) {
+                    if unreachable.record(peer, &e) {
                         crate::epoch_warn!(
                             me,
                             ns.epoch,
-                            "     DKG round1: spo={} is UNREACHABLE ({e}) — excluding it from \
-                             this attempt's qualified subset and continuing",
-                            id_short(peer.identifier),
+                            "key generation round 1: {} is up but erroring ({e}) — \
+                             excluding it from this attempt's qualified subset and continuing",
+                            crate::epoch::log::describe_peer(peer),
                         );
                     }
                 }
@@ -1096,7 +1106,7 @@ async fn poll_dkg_round1(
                 crate::epoch_warn!(
                     me,
                     ns.epoch,
-                    "     DKG round1 closed with {}/{}.{}",
+                    "key generation round 1 closed with {} of {}.{}",
                     out.len(),
                     need,
                     unreachable.note()
@@ -1164,7 +1174,7 @@ async fn poll_dkg_round2(
                     crate::epoch_debug!(
                         me,
                         ns.epoch,
-                        "     received round2 share from spo={} ({}/{})",
+                        "received round2 share from spo={} ({}/{})",
                         id_short(peer.identifier),
                         out.len() + 1,
                         need
@@ -1176,13 +1186,13 @@ async fn poll_dkg_round2(
                 // Same rule as round 1 (WI-108): the peer drops out of the
                 // qualified subset, the ceremony does not.
                 Err(e) => {
-                    if unreachable.record(peer.identifier, &e) {
+                    if unreachable.record(peer, &e) {
                         crate::epoch_warn!(
                             me,
                             ns.epoch,
-                            "     DKG round2: spo={} is UNREACHABLE ({e}) — excluding it from \
-                             the qualified subset and continuing",
-                            id_short(peer.identifier),
+                            "key generation round 2: {} is up but erroring ({e}) — \
+                             excluding it from the qualified subset and continuing",
+                            crate::epoch::log::describe_peer(peer),
                         );
                     }
                 }
@@ -1193,7 +1203,7 @@ async fn poll_dkg_round2(
                 crate::epoch_warn!(
                     me,
                     ns.epoch,
-                    "     DKG round2 closed with {}/{}.{}",
+                    "key generation round 2 closed with {} of {}.{}",
                     out.len(),
                     need,
                     unreachable.note()

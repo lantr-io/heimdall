@@ -111,7 +111,7 @@ impl std::fmt::Display for SuccessionError {
         match self {
             Self::Incomplete { missing, of } => write!(
                 f,
-                "{} of {of} roster member(s) published no round-1 commitment: {}",
+                "{} of {of} roster members published no round-1 commitment: {}",
                 missing.len(),
                 missing.join(", ")
             ),
@@ -124,7 +124,7 @@ impl std::fmt::Display for SuccessionError {
             Self::Malformed(m) => write!(f, "malformed round-1 commitment: {m}"),
             Self::Round2Incomplete { missing, of } => write!(
                 f,
-                "{} of {of} roster member(s) published round 1 but no signed round 2, so this \
+                "{} of {of} roster members published round 1 but no signed round 2, so this \
                  ceremony is not known to have completed: {}",
                 missing.len(),
                 missing.join(", ")
