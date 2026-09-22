@@ -2107,11 +2107,10 @@ impl BlockfrostCardanoChain {
         // signature may be at a cold key right now, and the daemon posting
         // movements and bans from the same wallet must not spend the outpoint it
         // names ([REG-10], [DRG-6]).
-        crate::cardano::nonce_reservation::mark_from_state_dir(
-            utxos.iter().map(WalletUtxo::from_bf).collect(),
+        Ok(crate::cardano::nonce_reservation::wallet_set_for_daemon(
+            &utxos,
             self.state_dir.as_deref(),
-        )
-        .map_err(EpochError::Chain)
+        ))
     }
 
     async fn submit_cardano_tx(&self, label: &str, signed_tx_hex: &str) -> EpochResult<String> {
@@ -2343,10 +2342,13 @@ impl BlockfrostCardanoChain {
         let invalid_before = window.current_slot;
         let invalid_hereafter = window.current_slot + w;
         let start_time_ms = window.block_time_ms + (w as i64) * 1000 - 1;
-        let wallet_utxos_after_mint: Vec<WalletUtxo> = wallet_raw_after_mint
-            .iter()
-            .map(WalletUtxo::from_bf)
-            .collect();
+        // Marked, like every other spending path: this posts a ban from the
+        // same wallet an operator's registration or exit signature may be bound
+        // to right now ([REG-10], [DRG-6]).
+        let wallet_utxos_after_mint = crate::cardano::nonce_reservation::wallet_set_for_daemon(
+            &wallet_raw_after_mint,
+            self.state_dir.as_deref(),
+        );
         // spec [PRE-5]: `spo-bans.ak` reads the registry policy from Config #9
         // at run time now, so the ban transaction must reference the Config
         // UTxO. Read fresh rather than from the cache: the redeemer names an
@@ -3005,7 +3007,12 @@ impl CardanoChain for BlockfrostCardanoChain {
         )
         .await
         .map_err(|e| EpochError::Chain(format!("wallet UTxO query: {e}")))?;
-        let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+        // The Update-Y key handoff, from the same wallet, with the same reason
+        // to leave a reserved nonce alone.
+        let wallet_utxos = crate::cardano::nonce_reservation::wallet_set_for_daemon(
+            &wallet_raw,
+            self.state_dir.as_deref(),
+        );
         let cost_models =
             crate::cardano::bf_http::fetch_cost_models(&self.bf_base_url, &self.bf_project_id)
                 .await

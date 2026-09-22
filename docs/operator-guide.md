@@ -1274,7 +1274,11 @@ Two things worth knowing rather than doing:
 
 - `heimdall migrate-registration` runs it by hand, and `--no-auto-migrate` on `run-spo` turns the
   automatic version off. Neither is needed in the normal case. Until a migration lands the node is
-  outside the roster, and `/health` says so.
+  outside the roster, and `/health` says so — `migration migrating <old> -> <new>` while it is in
+  flight, `migration migrated <old> -> <new>` once it confirms.
+- Joining and leaving both keep working during a migration, and `doctor` step 6 reports an
+  un-migrated node as a Warn rather than a Fail so the daemon starts and fixes it. If you try to
+  leave before crossing, the command says to migrate first.
 - Your old registration node stays in the old list with its min-ADA in it. Recovering that would
   need the old cold signature, and the old registry cannot accept one any more. Treat it as spent.
 
@@ -1402,6 +1406,10 @@ authorization to leave that anyone holding it can post: `sign-with-pool-key` wri
 | peers seem not to see you | first step 5 — is the registered port open and reachable *from outside*? If it is, compare `demo_live_stake` and `demo_virtual_epoch_slots` against the rest of the roster (§3): they are consensus inputs, so a node that differs is registered, reachable, and deliberately never talked to. Both sides log `⚠ EXCLUDING`, so the roster sees it too |
 | `[3/12] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
 | `[12/12] nonce reservation WARN` naming a spent UTxO | the UTxO a pending registration or exit signature is bound to has been spent, so the file waiting at the cold key can no longer be used. Delete `nonce-reservation.json` from the state dir, run the request command again, and take the NEW request to the safe. |
+| `[12/12] nonce reservation WARN … has not confirmed yet` | nothing is wrong. A UTxO query reports confirmed outputs only, so a reservation made in the last few minutes is simply not visible yet. Wait for a block. **Do not delete it** — the signature is bound to that outpoint and is fine. |
+| `[12/12] nonce reservation WARN … does not exist yet` | you passed `--no-submit-reservation` and never broadcast the transaction it printed. Submit it. Nothing needs re-signing. |
+| `[12/12] nonce reservation FAIL` | the record exists but this build cannot read it, and `run-spo` will not start on it. If no signature is in flight, delete the file. If one is, read its `nonce_outpoint` out of the signed file and pass it as `--nonce-utxo` instead. |
+| `[6/12] registration status WARN … under the PREVIOUS registry` | a registry migration is in progress and this node has not crossed yet. Starting the node is the fix: it carries itself across. `heimdall migrate-registration` does it by hand. |
 | `[6/12] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command, including the `--signed` form for a cold key that is not on this machine. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
 | `no reference script for the registry` right after `deploy-registry-ref` succeeded | the provider's address listing has not shown the script yet – pass the outpoint the deploy printed, `--registry-ref <tx_hash>:0` (step 6) |
 | `N of M candidates excluded at the pre-ceremony handshake` at every epoch start | the rest of the line names each cause with its count. *Incompatible build* (version, blueprint, security threshold): both sides report the other, so compare `/health` across the roster and upgrade the odd one out – see *Upgrades*. *Different consensus settings*: match the setting the `⚠ EXCLUDING` lines name. *Different roster read*: nothing to change – typically this node registered after the roster read the registry for this epoch, and it clears at the next epoch; if it is still there after an epoch boundary it is not that, so compare `roster_digest`, `roster_size`, `threshold` and `dkg_threshold_epoch` in `/health` across the roster. *Different FROST threshold from an older build*: upgrade the nodes whose `/health` has no `roster_digest`. `/health` shows the roster each node READ; the threshold it actually runs with after exclusions is in its `candidate set reduced` log line. When the line says *every peer was excluded*, the node that differs is this one |

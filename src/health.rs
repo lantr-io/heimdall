@@ -239,7 +239,9 @@ pub fn render(state: &NodeState) -> String {
         out.push_str(&format!("registry        {}\n", state.registry));
     }
     if let Some(migration) = &state.registry_migration {
-        out.push_str(&format!("registry        {migration}\n"));
+        // Its own key. `registry` above is the roster summary, and a scraper
+        // that keys on the first column would collapse the two into one.
+        out.push_str(&format!("migration       {migration}\n"));
     }
     if let Some(why) = &state.tries_rebuilt_at_startup {
         out.push_str(&format!("tries           REBUILT at startup — {why}\n"));

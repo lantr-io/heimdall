@@ -1642,6 +1642,7 @@ fn find_own_pool_id(
     registry_utxos: &[heimdall::cardano::bf_http::BfUtxo],
     treasury_policy_hex: &str,
     treasury_utxos: &[heimdall::cardano::bf_http::BfUtxo],
+    previous_registry: Option<(&str, &[heimdall::cardano::bf_http::BfUtxo])>,
 ) -> Result<[u8; 28], String> {
     use bitcoin::key::Secp256k1;
 
@@ -1654,12 +1655,19 @@ fn find_own_pool_id(
     })?;
     let our_pk = keypair.x_only_public_key().0.serialize();
 
-    let snapshot = heimdall::cardano::roster::registry_snapshot(
+    // Migration-aware, and it has to be. The identity root commits to both
+    // lists while pools are crossing ([MIG-3]), so the strict read fails — and
+    // it would fail HERE, before the previous list the caller already fetched
+    // is ever used, making an exit impossible for the whole window.
+    let snapshot = heimdall::cardano::roster::registry_snapshot_during_migration(
         registry_utxos,
         registry_policy_hex,
         treasury_utxos,
         treasury_policy_hex,
         &hex::encode(heimdall::cardano::config_params::TREASURY_INFO_ASSET_NAME),
+        previous_registry.map(
+            |(policy_hex, utxos)| heimdall::cardano::roster::PreviousRegistry { policy_hex, utxos },
+        ),
     )
     .map_err(|e| format!("read the registry: {e}"))?;
 
@@ -1668,12 +1676,38 @@ fn find_own_pool_id(
         .iter()
         .find(|s| s.bifrost_id_pk == our_pk)
         .ok_or_else(|| {
-            format!(
-                "no registry entry for this node's bifrost key ({}). There is nothing to \
-                 leave — either this pool never registered, or [bifrost].skey_path points at \
-                 a different key than the one it registered with",
-                hex::encode(our_pk)
-            )
+            // Absent from the CURRENT list. During a migration window that has
+            // a second meaning, and the difference decides what the operator
+            // should do next, so say which one it is.
+            let unmigrated = previous_registry.is_some_and(|(policy_hex, utxos)| {
+                heimdall::cardano::register_spo::find_registry_utxos(utxos, policy_hex)
+                    .ok()
+                    .and_then(|elements| {
+                        heimdall::cardano::registry::RegistryList::from_elements(
+                            elements
+                                .iter()
+                                .map(|u| (u.asset_name.clone(), u.element.clone())),
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|list| list.iter().any(|(_, data)| data.bifrost_id_pk == our_pk))
+            });
+            if unmigrated {
+                format!(
+                    "this pool is registered under the PREVIOUS registry and has not been \
+                     carried across yet, so there is no entry in the current one to leave \
+                     from. Run `heimdall migrate-registration` (it needs no cold key, and \
+                     anyone may run it), then exit. bifrost key {}",
+                    hex::encode(our_pk)
+                )
+            } else {
+                format!(
+                    "no registry entry for this node's bifrost key ({}). There is nothing to \
+                     leave — either this pool never registered, or [bifrost].skey_path points \
+                     at a different key than the one it registered with",
+                    hex::encode(our_pk)
+                )
+            }
         })?;
     mine.pool_id
         .as_slice()
@@ -3274,8 +3308,39 @@ async fn run_spo(
     if let Some(why) = tries_rebuilt {
         health.update(|h| h.tries_rebuilt_at_startup = Some(why));
     }
-    if let Some(state) = registry_migration {
-        health.update(|h| h.registry_migration = Some(state));
+    if let Some(migration) = registry_migration {
+        health.update(|h| h.registry_migration = Some(migration.state.clone()));
+        // A migration in flight is reported provisionally, so something has to
+        // finish the sentence. Without this the line reads "migrating" for the
+        // life of the process — including long after it landed — and the
+        // "migrated" state the operator guide describes is never reached.
+        if let Some(pool_id) = migration.pending {
+            let watch_cfg = cfg.clone();
+            let watch_health = health.clone();
+            let settled = migration.settled;
+            tokio::spawn(async move {
+                // Half an hour of five-second polls. A migration that has not
+                // confirmed by then is not going to, and the line keeps saying
+                // "migrating" — which is then the truth.
+                for _ in 0..360u32 {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let Ok(Some(ctx)) = migration_context(&watch_cfg).await else {
+                        continue;
+                    };
+                    let Ok((current, _)) = ctx.lists() else {
+                        continue;
+                    };
+                    if current.get(&pool_id).is_some() {
+                        info!(
+                            pool_id = %hex::encode(&pool_id),
+                            "registry migration confirmed; this node is in the current registry"
+                        );
+                        watch_health.update(|h| h.registry_migration = Some(settled.clone()));
+                        return;
+                    }
+                }
+            });
+        }
     }
     if cfg.health.enabled {
         tokio::spawn(heimdall::health::serve(
@@ -5340,11 +5405,13 @@ fn run_bootstrap_treasury_info(
     // spend path requires a registry-policy mint — the state UTxO created here
     // would be frozen at bootstrap forever.
     let reg_tx_hash_hex = hex::encode(reg_tx_id);
-    let wallet_utxos: Vec<WalletUtxo> = raw
-        .iter()
-        .map(WalletUtxo::from_bf)
-        .filter(|u| !(u.tx_hash == reg_tx_hash_hex && u.output_index == reg_index))
-        .collect();
+    let wallet_utxos: Vec<WalletUtxo> = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?
+    .into_iter()
+    .filter(|u| !(u.tx_hash == reg_tx_hash_hex && u.output_index == reg_index))
+    .collect();
     if wallet_utxos.is_empty() {
         return Err(format!(
             "wallet has no spendable UTxOs besides the registry bootstrap outref — \
@@ -5479,8 +5546,7 @@ fn run_bootstrap_registry(
     submit: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::spos_registry_script;
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::register_spo::build_registry_bootstrap_tx;
 
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
@@ -5513,7 +5579,10 @@ fn run_bootstrap_registry(
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
@@ -5570,7 +5639,6 @@ fn run_bootstrap_ban_list(
     use heimdall::cardano::ban_list::BanPolicyParams;
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::spo_bans_script;
-    use heimdall::cardano::publish::WalletUtxo;
 
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
@@ -5689,7 +5757,10 @@ fn run_bootstrap_ban_list(
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
@@ -5732,7 +5803,7 @@ fn run_bootstrap_ban_list(
 /// stuck, if every UTxO carries a native token. See WI-20260910-5DRP6.
 fn run_ensure_collateral(cfg: &HeimdallConfig, submit: bool) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::tx_common::{
         COLLATERAL_LOVELACE, COLLATERAL_UTXOS_WANTED, build_collateral_top_up,
         collateral_candidates,
@@ -5754,8 +5825,8 @@ fn run_ensure_collateral(cfg: &HeimdallConfig, submit: bool) -> Result<(), Strin
     // Flag the reserved nonce, if any. This command consolidates SMALL UTxOs,
     // so without it a 2 ADA reservation is the first thing it would spend —
     // killing a cold signature already on its way to a safe ([REG-10]).
-    let wallet_utxos = heimdall::cardano::nonce_reservation::mark_from_state_dir(
-        raw.iter().map(WalletUtxo::from_bf).collect(),
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
         cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
     )?;
 
@@ -5804,8 +5875,7 @@ fn run_deploy_registry_ref(
     force: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::spos_registry_script;
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
 
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
@@ -5838,7 +5908,10 @@ fn run_deploy_registry_ref(
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     if ref_script_already_deployed(&raw, &registry.hash_hex(), "registry", force) {
         return Ok(());
     }
@@ -5894,9 +5967,9 @@ fn run_deploy_fault_ref(
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{
         fault_verifier_equivocation_script, fault_verifier_round1_script,
-        fault_verifier_round2_script, spos_registry_script,
+        fault_verifier_round2_script,
     };
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
@@ -5949,7 +6022,10 @@ fn run_deploy_fault_ref(
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     if ref_script_already_deployed(&raw, &verifier.hash_hex(), "fault_verifier", force) {
         return Ok(());
     }
@@ -5992,9 +6068,9 @@ fn run_deploy_spo_bans_ref(
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{
         fault_verifier_equivocation_script, fault_verifier_round1_script,
-        fault_verifier_round2_script, spo_bans_script, spos_registry_script,
+        fault_verifier_round2_script, spo_bans_script,
     };
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
@@ -6064,7 +6140,10 @@ fn run_deploy_spo_bans_ref(
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     if ref_script_already_deployed(&raw, &spo_bans.hash_hex(), "spo_bans", force) {
         return Ok(());
     }
@@ -6108,13 +6187,12 @@ fn run_init_scripts(
     use heimdall::cardano::bf_http::{self, RegistrationState};
     use heimdall::cardano::blueprint::{
         fault_verifier_equivocation_script, fault_verifier_round1_script,
-        fault_verifier_round2_script, spo_bans_script, spos_registry_script,
+        fault_verifier_round2_script, spo_bans_script,
     };
     use heimdall::cardano::init_scripts::{
         WithdrawScript, build_init_scripts_tx, is_already_registered_error,
     };
     use heimdall::cardano::publish::WalletUtxo;
-    use heimdall::cardano::tx_common::is_testnet_address;
 
     // Derive spo_bans exactly as deploy-spo-bans-ref and
     // DkgFaultBanFlow::from_config do — recomputing the fault-verifier policy
@@ -6237,14 +6315,16 @@ fn run_init_scripts(
     // registry outref for the same reason.
     let reg_outref = (hex::encode(reg_tx_id), reg_index);
     let ban_outref = (hex::encode(ban_tx_id), ban_index);
-    let wallet_utxos: Vec<WalletUtxo> = raw
-        .iter()
-        .map(WalletUtxo::from_bf)
-        .filter(|u| {
-            let this = (u.tx_hash.clone(), u.output_index);
-            this != reg_outref && this != ban_outref
-        })
-        .collect();
+    let wallet_utxos: Vec<WalletUtxo> = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?
+    .into_iter()
+    .filter(|u| {
+        let this = (u.tx_hash.clone(), u.output_index);
+        this != reg_outref && this != ban_outref
+    })
+    .collect();
     if wallet_utxos.is_empty() {
         return Err(format!(
             "wallet has no spendable UTxOs besides the bootstrap one-shot outrefs — \
@@ -6742,7 +6822,7 @@ struct MigrationContext {
 async fn migration_context(cfg: &HeimdallConfig) -> Result<Option<MigrationContext>, String> {
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{script_enterprise_address, spos_registry_script};
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::ref_script::find_ref_script_anywhere;
 
     let view = config_view_async(cfg)
@@ -6824,7 +6904,10 @@ async fn migration_context(cfg: &HeimdallConfig) -> Result<Option<MigrationConte
     let wallet_raw = bf_http::fetch_address_utxos(&base_url, &project_id, &wallet_address)
         .await
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &wallet_raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     // A pending registration or exit signature is bound to one of these; a
     // migration must not spend it out from under the operator ([REG-10]).
     let reserved = heimdall::cardano::nonce_reservation::NonceReservation::load_or_none(
@@ -6964,6 +7047,53 @@ impl MigrationContext {
     }
 }
 
+/// The current registry's policy id, derived the way `migration_context` does.
+/// Split out so the confirmation poll can ask its one question without
+/// rebuilding the whole context.
+fn ctx_registry_hash(cfg: &HeimdallConfig) -> Result<[u8; 28], String> {
+    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(None)?;
+    let registry_bootstrap = cfg
+        .cardano
+        .federation_one_shot
+        .clone()
+        .ok_or("the federation one-shot (Config #12) has not been resolved")?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(&registry_bootstrap),
+        )?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    let treasury = heimdall::cardano::blueprint::treasury_info_script(
+        &blueprint_json,
+        &tsy_tx_id,
+        u64::from(tsy_index),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+    Ok(heimdall::cardano::blueprint::spos_registry_script(
+        &blueprint_json,
+        &reg_tx_id,
+        u64::from(reg_index),
+        &treasury.hash,
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize spos_registry: {e}"))?
+    .hash)
+}
+
+/// `(base_url, project_id)` for the Blockfrost reads a migration makes.
+fn migration_endpoints(cfg: &HeimdallConfig) -> Result<(String, String), String> {
+    let project_id = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?
+        .to_string();
+    let base_url =
+        heimdall::cardano::bf_http::base_url(&project_id, cfg.cardano.blockfrost_url.as_deref());
+    Ok((base_url, project_id))
+}
+
 /// Wait for `pool_id`'s migration to confirm, then re-read the chain.
 ///
 /// The next pool's insert is planned against the anchor this one just rewrote,
@@ -6984,14 +7114,51 @@ async fn await_migration(
     // noticed rather than waited out.
     const TRIES: usize = 60;
     const DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // Poll the ONE address that answers the question — the current registry —
+    // rather than rebuilding the whole context each time. A context rebuild is
+    // four address queries, a cost-model fetch, a reference-script search and
+    // two parses of the embedded blueprint; sixty of those per pool, for twenty
+    // pools, is minutes of avoidable work and a great deal of Blockfrost quota.
+    // The full re-read happens ONCE, after the answer is yes.
+    use heimdall::cardano::register_spo::find_registry_utxos;
+    use heimdall::cardano::registry::RegistryList;
+    let registry_hash = ctx_registry_hash(cfg)?;
+    let policy_hex = hex::encode(registry_hash);
+    let network = if cfg.cardano.is_mainnet()? {
+        pallas_addresses::Network::Mainnet
+    } else {
+        pallas_addresses::Network::Testnet
+    };
+    let registry_address =
+        heimdall::cardano::blueprint::script_enterprise_address(&registry_hash, network);
+    let (base_url, project_id) = migration_endpoints(cfg)?;
+
     for attempt in 0..TRIES {
         tokio::time::sleep(DELAY).await;
-        let Some(fresh) = migration_context(cfg).await? else {
-            return Ok(None);
+        let landed = match heimdall::cardano::bf_http::fetch_address_utxos(
+            &base_url,
+            &project_id,
+            &registry_address,
+        )
+        .await
+        {
+            // A transient read failure is not an answer; try again.
+            Err(_) => false,
+            Ok(utxos) => find_registry_utxos(&utxos, &policy_hex)
+                .ok()
+                .and_then(|elements| {
+                    RegistryList::from_elements(
+                        elements
+                            .iter()
+                            .map(|u| (u.asset_name.clone(), u.element.clone())),
+                    )
+                    .ok()
+                })
+                .is_some_and(|list| list.get(pool_id).is_some()),
         };
-        let (current, _) = fresh.lists()?;
-        if current.get(pool_id).is_some() {
-            return Ok(Some(fresh));
+        if landed {
+            return migration_context(cfg).await;
         }
         if attempt == TRIES / 2 {
             println!("  (still waiting for {} to confirm)", hex::encode(pool_id));
@@ -7078,14 +7245,17 @@ fn run_migrate_registration(cfg: &HeimdallConfig, all: bool, submit: bool) -> Re
     let mut failures = 0usize;
     let mut done = 0usize;
     for pool_id in &targets {
+        let mut submitted = false;
         match ctx.migrate(&rt, cfg, pool_id, submit) {
             Ok(MigrationOutcome::Migrated { tx_hash }) => {
                 println!("  {} → submitted {tx_hash}", hex::encode(pool_id));
                 done += 1;
+                submitted = true;
             }
             Ok(MigrationOutcome::Built) => {
                 println!(
-                    "  {} → built (dry run — pass --submit)",
+                    "  {} → built (dry run — pass --submit; every pool here is planned \
+                     against the SAME anchor, so only one of them could land)",
                     hex::encode(pool_id)
                 );
                 done += 1;
@@ -7095,9 +7265,12 @@ fn run_migrate_registration(cfg: &HeimdallConfig, all: bool, submit: bool) -> Re
                 println!("  {} → FAILED: {e}", hex::encode(pool_id));
             }
         }
-        // Nothing to wait for after the last one, and nothing to wait for at
-        // all in a dry run — no transaction was sent.
-        if !submit || done + failures >= targets.len() {
+        // Wait only for a transaction that was actually SENT. A build that
+        // failed sent nothing, so waiting would poll five minutes for a
+        // confirmation that can never arrive and then abandon every pool after
+        // it — and an anchor race is the expected failure here, not a rare one.
+        // Nothing to wait for after the last target either.
+        if !submitted || done + failures >= targets.len() {
             continue;
         }
         match rt.block_on(await_migration(cfg, pool_id)) {
@@ -7126,6 +7299,30 @@ fn run_migrate_registration(cfg: &HeimdallConfig, all: bool, submit: bool) -> Re
     Ok(())
 }
 
+/// What `run-spo` should report about a registry migration, and whether that
+/// report is final.
+struct MigrationHealth {
+    /// What `/health` and `heimdall status` say now.
+    state: String,
+    /// The pool whose migration is in flight, if one is. While this is `Some`,
+    /// `state` is provisional and a watcher replaces it with `settled` once the
+    /// transaction confirms.
+    pending: Option<Vec<u8>>,
+    /// What to say once it lands.
+    settled: String,
+}
+
+impl MigrationHealth {
+    /// A report that will not change without a restart.
+    fn settled(state: String) -> Self {
+        Self {
+            settled: state.clone(),
+            state,
+            pending: None,
+        }
+    }
+}
+
 /// The auto-migration `run-spo` performs at startup ([MIG-1], §SPO Registration
 /// section 8).
 ///
@@ -7138,7 +7335,10 @@ fn run_migrate_registration(cfg: &HeimdallConfig, all: bool, submit: bool) -> Re
 /// roster until somebody migrates it, which is exactly the state it was already
 /// in; killing the daemon over it would take away the `/health` surface that
 /// says so.
-async fn auto_migrate_registration(cfg: &HeimdallConfig, disabled: bool) -> Option<String> {
+async fn auto_migrate_registration(
+    cfg: &HeimdallConfig,
+    disabled: bool,
+) -> Option<MigrationHealth> {
     use heimdall::cardano::migrate_registration::{MembershipState, classify};
 
     let ctx = match migration_context(cfg).await {
@@ -7146,19 +7346,35 @@ async fn auto_migrate_registration(cfg: &HeimdallConfig, disabled: bool) -> Opti
         Ok(Some(ctx)) => ctx,
         Err(e) => {
             warn!("registry migration check: {e}");
-            return None;
+            // NOT None: None is what "no migration in progress" looks like, and
+            // a node that could not tell must not be reported as a node with
+            // nothing to do. The rationale for never being fatal here is that
+            // /health keeps saying so — which only works if it says something.
+            return Some(MigrationHealth::settled(format!(
+                "unknown — the migration check failed ({e})"
+            )));
         }
     };
     let (current, previous) = match ctx.lists() {
         Ok(v) => v,
         Err(e) => {
             warn!("registry migration check: {e}");
-            return None;
+            return Some(MigrationHealth::settled(format!(
+                "unknown — the registry lists could not be read ({e})"
+            )));
         }
     };
     let secp = bitcoin::key::Secp256k1::new();
-    let Ok(keypair) = cfg.load_bifrost_keypair(&secp) else {
-        return None;
+    let keypair = match cfg.load_bifrost_keypair(&secp) {
+        Ok(kp) => kp,
+        Err(e) => {
+            // Silence here would be indistinguishable from "no migration in
+            // progress", and the two want opposite responses.
+            warn!("registry migration check: no bifrost identity key ({e})");
+            return Some(MigrationHealth::settled(
+                "unknown — no bifrost identity key to classify this node".to_string(),
+            ));
+        }
     };
     let pk = keypair.x_only_public_key().0.serialize();
     let pool_id = match classify(&pk, &current, Some(&previous)) {
@@ -7175,7 +7391,9 @@ async fn auto_migrate_registration(cfg: &HeimdallConfig, disabled: bool) -> Opti
              --no-auto-migrate is set. Run `heimdall migrate-registration` to carry it across; \
              until then this node is outside the roster"
         );
-        return Some(format!("migratable {from} -> {to} (auto-migrate off)"));
+        return Some(MigrationHealth::settled(format!(
+            "migratable {from} -> {to} (auto-migrate off)"
+        )));
     }
     warn!(
         pool_id = %hex::encode(&pool_id),
@@ -7189,7 +7407,14 @@ async fn auto_migrate_registration(cfg: &HeimdallConfig, disabled: bool) -> Opti
                 "registry migration submitted: {tx_hash}. It takes effect for the roster at the \
                  next epoch boundary snapshot"
             );
-            Some(format!("migrating {from} -> {to}"))
+            // Watched: the line must not still say "migrating" an hour after
+            // it landed, and the "migrated" state this reports is otherwise one
+            // no code path ever produces.
+            Some(MigrationHealth {
+                state: format!("migrating {from} -> {to}"),
+                pending: Some(pool_id.clone()),
+                settled: format!("migrated {from} -> {to}"),
+            })
         }
         Err(e) => {
             // An anchor race is the expected failure when several pools migrate
@@ -7201,7 +7426,9 @@ async fn auto_migrate_registration(cfg: &HeimdallConfig, disabled: bool) -> Opti
                 "registry migration did not land ({e}). This node is outside the roster until \
                  it does; `heimdall migrate-registration` retries, and anyone may run it"
             );
-            Some(format!("migratable {from} -> {to} (last attempt failed)"))
+            Some(MigrationHealth::settled(format!(
+                "migratable {from} -> {to} (last attempt failed)"
+            )))
         }
     }
 }
@@ -7286,38 +7513,107 @@ fn resolve_nonce(
 
     let state_dir = cfg.protocol.state_dir.as_deref().map(std::path::Path::new);
 
+    let existing = NonceReservation::load_or_none(state_dir)?;
+    let record_path = || {
+        state_dir
+            .map(|d| {
+                heimdall::cardano::nonce_reservation::state_path(d)
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "the reservation record".to_string())
+    };
+
     if let Some(raw) = override_utxo {
         let nonce = NonceOutpoint::parse(raw).map_err(|e| format!("--nonce-utxo: {e}"))?;
-        if !still_unspent(wallet_utxos, nonce) {
-            return Err(format!(
-                "--nonce-utxo {nonce} is not an unspent UTxO of this wallet ({wallet_address}). \
-                 The transaction must spend it for the signature to verify ([REG-10], [DRG-6])"
-            ));
+        // Refusing to clobber is the promise this function's doc makes, and it
+        // has to be checked BEFORE the override is honoured: a signature may
+        // already be in flight against the recorded outpoint, and replacing the
+        // record un-reserves it — the daemon spends it, and a completed trip to
+        // a safe is wasted.
+        if let Some(rec) = &existing {
+            let held = rec.nonce()?;
+            if held != nonce {
+                return Err(format!(
+                    "--nonce-utxo names {nonce}, but {} already reserves {held} for a pending \
+                     {}. Replacing it would stop {held} being held back, so a signature already \
+                     made against it would die when something else spends it. If that \
+                     reservation is finished, delete {}; if you are recovering a signed file, \
+                     pass the outpoint the FILE names",
+                    record_path(),
+                    rec.action,
+                    record_path(),
+                ));
+            }
         }
+        heimdall::cardano::nonce_reservation::usable_as_nonce(wallet_utxos, nonce).map_err(
+            |e| {
+                format!(
+                    "--nonce-utxo: {e} ({wallet_address}). The transaction must spend it for \
+                     the signature to verify ([REG-10], [DRG-6])"
+                )
+            },
+        )?;
         if let Some(dir) = state_dir {
-            NonceReservation::new(nonce, action, now_secs()).save(dir)?;
+            // Already on chain — the caller named a UTxO the wallet holds — so
+            // it is recorded as submitted.
+            NonceReservation::new(nonce, action, now_secs(), true).save(dir)?;
         }
         println!("nonce utxo:        {nonce} (from --nonce-utxo)");
         return Ok(nonce);
     }
 
-    if let Some(existing) = NonceReservation::load_or_none(state_dir)? {
+    if let Some(existing) = existing {
         let nonce = existing.nonce()?;
+        // An outpoint is spendable once, so one record cannot serve two
+        // signatures. Handing a register reservation to `deregister-spo` would
+        // produce two files that both verify locally and of which only one can
+        // ever land — and the winner would delete the record while the operator
+        // believes the loser is in flight.
+        if existing.action != action {
+            return Err(format!(
+                "{} reserves {nonce} for a pending {}, and you are running a {action}. An \
+                 outpoint is spendable once, so one reservation cannot bind two signatures: \
+                 whichever transaction landed first would silently kill the other. Finish or \
+                 abandon the {} first — if it is abandoned, delete {}",
+                record_path(),
+                existing.action,
+                existing.action,
+                record_path(),
+            ));
+        }
         if still_unspent(wallet_utxos, nonce) {
             println!("nonce utxo:        {nonce} (reserved earlier, still unspent)");
             return Ok(nonce);
         }
-        return Err(format!(
-            "the reserved nonce UTxO {nonce} has been spent. Any signature already made against \
-             it is used up — the outpoint is what makes it single-use ([REG-10], [DRG-6]) — so a \
-             file waiting at the cold key cannot be submitted. Delete {} and run this again to \
-             reserve a fresh one, then take the NEW request to the cold key",
-            state_dir
-                .map(|d| heimdall::cardano::nonce_reservation::state_path(d)
-                    .display()
-                    .to_string())
-                .unwrap_or_else(|| "the reservation".to_string()),
-        ));
+        // Missing from a CONFIRMED-ONLY UTxO query means one of three things,
+        // and only the last is a dead signature. Saying "spent" for the other
+        // two sends an operator to delete a live reservation.
+        use heimdall::cardano::nonce_reservation::MissingNonce;
+        return Err(match existing.why_missing(now_secs()) {
+            MissingNonce::NeverSubmitted => format!(
+                "the reserved nonce UTxO {nonce} does not exist yet: it was recorded with \
+                 --no-submit-reservation and its transaction was never broadcast. Submit that \
+                 transaction (it was printed when the reservation was made) and run this again. \
+                 Nothing is lost — the signature is bound to {nonce} and will verify once the \
+                 UTxO exists"
+            ),
+            MissingNonce::NotConfirmedYet => format!(
+                "the reserved nonce UTxO {nonce} has not confirmed yet — it was created {} \
+                 seconds ago, and a UTxO query reports confirmed outputs only. Wait for a block \
+                 and run this again. Do NOT delete the reservation: the signature is bound to \
+                 {nonce} and is fine",
+                now_secs().saturating_sub(existing.created_at),
+            ),
+            MissingNonce::Spent => format!(
+                "the reserved nonce UTxO {nonce} has been spent. Any signature already made \
+                 against it is used up — the outpoint is what makes it single-use ([REG-10], \
+                 [DRG-6]) — so a file waiting at the cold key cannot be submitted. Delete {} \
+                 and run this again to reserve a fresh one, then take the NEW request to the \
+                 cold key",
+                record_path(),
+            ),
+        });
     }
 
     if !request_mode {
@@ -7341,14 +7637,23 @@ fn resolve_nonce(
     let built = build_nonce_reservation_tx(wallet_address, wallet_utxos, key, &Some(cost_models))?;
     println!("nonce utxo:        {} (new, 2 ADA)", built.outpoint);
     if submit_reservation {
+        // This is a chain write, and it happens on a command that has no
+        // --submit (the request path forbids it). Say so before doing it, not
+        // only after: an operator who expected a dry run should be able to read
+        // what was spent and why from this output alone.
+        println!("                   creating it costs one ordinary transaction and its fee;");
+        println!("                   pass --no-submit-reservation to broadcast it yourself.");
         let tx_id = submit_tx_blockfrost(cfg, project_id, &built.signed_tx_hex, rt)?;
         println!("nonce reserve tx:  {tx_id} submitted");
     } else {
         println!("nonce reserve tx:  NOT submitted (--no-submit-reservation)");
-        println!("                   submit it before the signed file comes back:");
+        println!("                   SUBMIT THIS before the signed file comes back — it is the");
+        println!("                   only copy, and the signature is bound to an outpoint that");
+        println!("                   does not exist until it lands:");
         println!("                   {}", built.signed_tx_hex);
     }
-    NonceReservation::new(built.outpoint, action, now_secs()).save(state_dir)?;
+    NonceReservation::new(built.outpoint, action, now_secs(), submit_reservation)
+        .save(state_dir)?;
     Ok(built.outpoint)
 }
 
@@ -7370,8 +7675,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     use heimdall::cardano::airgap::{SignedResponse, SigningRequest};
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
-    use heimdall::cardano::publish::WalletUtxo;
-    use heimdall::cardano::ref_script::find_ref_script;
+
     use heimdall::cardano::ref_script::{RefScriptOrigin, find_ref_script_anywhere};
     use heimdall::cardano::register_spo::{
         RegisterSpoRequest, RegistrationSignatures, build_register_spo_tx, pool_id_from_cold_vkey,
@@ -7510,7 +7814,10 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let wallet_raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &wallet_raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     let wallet_utxos = heimdall::cardano::nonce_reservation::mark_from_state_dir(
         wallet_utxos,
         cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
@@ -7939,7 +8246,7 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         DeregisterSpoRequest, RevocationSignature, build_deregister_spo_tx, revocation_message,
         verify_revocation,
     };
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::ref_script::{RefScriptOrigin, find_ref_script_anywhere};
     use heimdall::cardano::register_spo::pool_id_from_cold_vkey;
     use heimdall::cardano::registry::REGISTRATION_ROOT_KEY;
@@ -8039,7 +8346,10 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
     let wallet_raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &wallet_raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     // Flag any reserved nonce UTxO so fee and collateral selection leave it
     // alone for the rest of this run ([DRG-6]).
     let wallet_utxos = heimdall::cardano::nonce_reservation::mark_from_state_dir(
@@ -8131,6 +8441,9 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
             &registry_utxos,
             &treasury.hash_hex(),
             &treasury_utxos,
+            previous_registry
+                .as_ref()
+                .map(|(p, u)| (p.as_str(), u.as_slice())),
         )?,
     };
     let ban_policy = config_view.params.bans.spo_bans_policy_id;
@@ -8340,7 +8653,7 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     use bitcoin::secp256k1::{Keypair, Message};
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::treasury_info::update_y_sig_msg;
     use heimdall::cardano::treasury_spend::find_treasury_state;
     use heimdall::cardano::update_y::{UpdateYAuthorizer, UpdateYRequest, build_update_y_tx};
@@ -8364,7 +8677,7 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
         &config_policy_id,
     )
     .map_err(|e| format!("parameterize treasury_info: {e}"))?;
-    let registry = spos_registry_script(
+    let _registry = spos_registry_script(
         &blueprint_json,
         &reg_tx_id,
         u64::from(reg_index),
@@ -8390,7 +8703,10 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     let wallet_raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &wallet_raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     let treasury_utxos = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &treasury_addr))
         .map_err(|e| format!("treasury UTxO query: {e}"))?;
@@ -8512,10 +8828,7 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     use heimdall::cardano::apply_ban::{ApplyBanRequest, FaultProofUtxo, build_apply_ban_tx};
     use heimdall::cardano::ban_list::{BanPolicyParams, fault_token_name};
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::{
-        fault_verifier_script, spo_bans_script, spos_registry_script,
-    };
-    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::blueprint::{fault_verifier_script, spo_bans_script};
 
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
@@ -8672,7 +8985,10 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let invalid_hereafter = window.current_slot + w;
     let start_time_ms = window.block_time_ms + (w as i64) * 1000 - 1;
 
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &wallet_raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     // spec [PRE-5]: since rev 5.6 `spo-bans.ak` reads the registry policy from
     // Config #9 at run time, so the transaction must reference the Config UTxO
     // and the redeemer must name its index.
@@ -8736,13 +9052,12 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
 /// park it at the wallet. A later `apply-ban` consumes + burns it.
 fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::{fault_verifier_script, spos_registry_script};
+    use heimdall::cardano::blueprint::fault_verifier_script;
     use heimdall::cardano::fault_proof::{
         EquivocationEvidence as OnchainEquivocationEvidence, FaultProofEvidence,
         FaultProofMintRequest, Round1InvalidPayloadEvidence, Round2InvalidPayloadEvidence,
         build_fault_proof_mint_tx,
     };
-    use heimdall::cardano::publish::WalletUtxo;
 
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
@@ -8785,7 +9100,10 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
     let wallet_raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &wallet_raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
@@ -9858,7 +10176,7 @@ fn run_sweep_pegins(
     };
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
-    use heimdall::cardano::btc_rpc::broadcast_btc_tx;
+
     use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
     use heimdall::cardano::pegin_datum::parse_pegin_request;
     use heimdall::cardano::pegin_source::CardanoPegInSource;

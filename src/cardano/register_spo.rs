@@ -503,16 +503,22 @@ fn tx_id_bytes(tx_hash: &str) -> Result<[u8; 32], RegisterSpoError> {
 /// They differ: the fee input may carry native tokens (declared on the input,
 /// returned in the change), collateral may not. Neither may carry a reference
 /// script — that spend incurs the Conway per-byte fee the builder doesn't price.
-fn select_fee_and_collateral(
-    wallet_utxos: &[WalletUtxo],
+fn select_fee_and_collateral<'a>(
+    wallet_utxos: &'a [WalletUtxo],
     min_fee_lovelace: u64,
-) -> Result<(&WalletUtxo, &WalletUtxo), RegisterSpoError> {
+    nonce_utxo: &WalletUtxo,
+) -> Result<(&'a WalletUtxo, &'a WalletUtxo), RegisterSpoError> {
     let fee_utxo = select_fee(wallet_utxos, min_fee_lovelace).map_err(RegisterSpoError::Wallet)?;
-    // Collateral must be ada-only and DISTINCT from the fee input. Both calls
-    // also skip a `reserved` UTxO, which is how the nonce a cold signature is
-    // bound to survives the round trip to the cold key ([REG-10], [DRG-6]).
-    let coll_utxo =
-        select_collateral(wallet_utxos, &[fee_utxo]).map_err(RegisterSpoError::Wallet)?;
+    // Collateral must be ada-only and DISTINCT from every SPENT input — which
+    // since rev 5.6 is two, not one: the nonce is a second pubkey input.
+    //
+    // The `reserved` flag usually excludes it, but not always: on the
+    // documented recovery path the operator names the outpoint with
+    // `--nonce-utxo` after the state dir lost the record, so nothing is
+    // flagged. Passing it explicitly is what makes the invariant hold in that
+    // case too, rather than by luck.
+    let coll_utxo = select_collateral(wallet_utxos, &[fee_utxo, nonce_utxo])
+        .map_err(RegisterSpoError::Wallet)?;
     Ok((fee_utxo, coll_utxo))
 }
 
@@ -616,7 +622,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
     // Locate it in the wallet first: gone from the set means already spent, and
     // saying so here is worth more than the chain's "signature invalid".
     let nonce = req.sigs.nonce;
-    let nonce_utxo = req
+    let nonce_utxo: &WalletUtxo = req
         .wallet_utxos
         .iter()
         .find(|u| u.outpoint() == Some(nonce))
@@ -629,7 +635,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
         })?;
 
     let (fee_utxo, coll_utxo) =
-        select_fee_and_collateral(req.wallet_utxos, node_lovelace + 1_000_000)?;
+        select_fee_and_collateral(req.wallet_utxos, node_lovelace + 1_000_000, nonce_utxo)?;
 
     // The ledger orders tx inputs lexicographically by (tx_id, index); the
     // redeemer indices must point into that order.
@@ -1415,6 +1421,61 @@ mod tests {
         build_against_treasury_at(registry_elements, identity_pairs, "dd")
     }
 
+    /// As [`build_against`], with a caller-chosen wallet set.
+    fn build_against_wallet(
+        registry_elements: Vec<BfUtxo>,
+        identity_pairs: &[(Vec<u8>, Vec<u8>)],
+        wallet_utxos: Vec<WalletUtxo>,
+    ) -> Result<RegisterSpoTx, RegisterSpoError> {
+        let registry = registry_script();
+        let treasury = treasury_script(&registry.hash);
+        let trie = mpf::Trie::from_pairs(identity_pairs.iter().map(|(k, v)| (k, v))).unwrap();
+        let treasury_datum = TreasuryInfoDatum {
+            bifrost_identity_root: trie.root_hash(),
+            current_spos_frost_key: vec![0xAB; 32],
+        };
+        let nft_name = "ee".repeat(32);
+        let treasury_utxos = vec![BfUtxo {
+            tx_hash: "dd".repeat(32),
+            output_index: 0,
+            amount: vec![
+                BfAmount {
+                    unit: "lovelace".into(),
+                    quantity: "3104330".into(),
+                },
+                BfAmount {
+                    unit: format!("{}{nft_name}", treasury.hash_hex()),
+                    quantity: "1".into(),
+                },
+            ],
+            inline_datum: Some(hex::encode(treasury_datum.to_cbor())),
+            reference_script_hash: None,
+        }];
+        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
+        let sigs = test_sigs();
+        build_register_spo_tx(&RegisterSpoRequest {
+            registry_script: &registry,
+            treasury_script: &treasury,
+            treasury_asset_name_hex: &nft_name,
+            registry_utxos: &registry_elements,
+            treasury_utxos: &treasury_utxos,
+            previous_registry: None,
+            wallet_address: &wallet_addr,
+            wallet_utxos: &wallet_utxos,
+            key: &key,
+            sigs: &sigs,
+            bifrost_id_pk: bifrost_pk(),
+            bifrost_url: URL.to_vec(),
+            invalid_before: None,
+            invalid_hereafter: None,
+            registry_ref: None,
+            config_ref: ("cc".repeat(32), 0),
+            cost_models: None,
+        })
+    }
+
     /// As [`build_against`], but fallible and told about a migration window.
     fn build_with_previous(
         registry_elements: Vec<BfUtxo>,
@@ -1703,6 +1764,82 @@ mod tests {
             format!("{err}").to_lowercase().contains("root"),
             "expected a root mismatch, got {err}"
         );
+    }
+
+    /// The collateral input must be distinct from EVERY spent input, and since
+    /// rev 5.6 there are two pubkey inputs, not one.
+    ///
+    /// The `reserved` flag usually keeps the nonce out of selection, but not on
+    /// the documented recovery path: an operator who lost the state dir names
+    /// the outpoint with `--nonce-utxo`, and nothing is flagged. Without the
+    /// explicit exclusion the same outpoint appears in `inputs` and in
+    /// `collaterals`.
+    #[test]
+    fn collateral_is_never_the_nonce_even_when_it_is_not_flagged() {
+        let registry = registry_script();
+        let policy = registry.hash_hex();
+        let elements = vec![element_utxo(
+            &policy,
+            &"11".repeat(32),
+            0,
+            2_600_000,
+            REGISTRATION_ROOT_KEY,
+            &root_element(None),
+        )];
+        // Two pure-ada UTxOs and the nonce, with the flag NOT set — the
+        // recovery shape. The nonce is the second-richest, which is what
+        // `select_collateral` would otherwise return.
+        let built = build_against_wallet(
+            elements,
+            &[],
+            vec![
+                WalletUtxo {
+                    tx_hash: "aa".repeat(32),
+                    output_index: 0,
+                    lovelace: 50_000_000,
+                    tokens: Default::default(),
+                    has_ref_script: false,
+                    reserved: false,
+                },
+                WalletUtxo {
+                    tx_hash: "7a".repeat(32),
+                    output_index: 3,
+                    lovelace: 9_000_000,
+                    tokens: Default::default(),
+                    has_ref_script: false,
+                    reserved: false,
+                },
+                WalletUtxo {
+                    tx_hash: "bb".repeat(32),
+                    output_index: 1,
+                    lovelace: 6_000_000,
+                    tokens: Default::default(),
+                    has_ref_script: false,
+                    reserved: false,
+                },
+            ],
+        )
+        .expect("builds");
+        let tx: Tx = minicbor::decode(&hex::decode(&built.signed_tx_hex).unwrap()).unwrap();
+        let collateral: Vec<_> = tx
+            .transaction_body
+            .collateral
+            .as_ref()
+            .expect("collateral present")
+            .iter()
+            .map(|c| c.transaction_id.to_vec())
+            .collect();
+        assert!(
+            !collateral.contains(&[0x7a; 32].to_vec()),
+            "the nonce is a spent input; it must not also be the collateral"
+        );
+        let inputs: Vec<_> = tx
+            .transaction_body
+            .inputs
+            .iter()
+            .map(|i| i.transaction_id.to_vec())
+            .collect();
+        assert!(inputs.contains(&[0x7a; 32].to_vec()), "and it IS spent");
     }
 
     /// The retry the nonce is designed to survive ([REG-10]).

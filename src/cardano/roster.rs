@@ -276,6 +276,10 @@ pub fn registry_snapshot_during_migration(
     let treasury_state =
         find_treasury_state(treasury_utxos, treasury_policy_hex, treasury_asset_name_hex)?;
 
+    // The duplicate check stays on the CURRENT list alone: two live entries
+    // sharing an identity key is the invariant [REG-5] enforces, and a pool
+    // that appears in both lists during a migration is one registration seen
+    // twice, not two.
     let pairs = list.identity_pairs();
     let mut seen = BTreeSet::new();
     for (pk, _) in &pairs {
@@ -285,20 +289,16 @@ pub fn registry_snapshot_during_migration(
     }
     // The union, when a migration is in progress: entries the new list does not
     // carry yet are still the treasury's, because nothing removed them.
-    let mut trie_pairs = pairs.clone();
-    if let Some(prev) = &previous {
-        let prev_elements = find_registry_utxos(prev.utxos, prev.policy_hex)?;
-        let prev_list = RegistryList::from_elements(
-            prev_elements
-                .iter()
-                .map(|u| (u.asset_name.clone(), u.element.clone())),
-        )?;
-        for (pk, pool_id) in prev_list.identity_pairs() {
-            if seen.insert(pk.clone()) {
-                trie_pairs.push((pk, pool_id));
-            }
-        }
-    }
+    //
+    // Through the SAME function the three transaction builders use. What the
+    // identity root commits to is one rule, and a second copy of it here would
+    // be a copy that can disagree with the builders about which proof is valid
+    // — which is exactly the failure this whole path exists to avoid.
+    let trie_pairs = crate::cardano::register_spo::union_identity_pairs(
+        &list,
+        previous.as_ref().map(|p| (p.policy_hex, p.utxos)),
+    )
+    .map_err(|e| RosterError::Config(e.to_string()))?;
     let trie = mpf::Trie::from_pairs(trie_pairs).map_err(RosterError::Mpf)?;
     let computed = trie.root_hash();
     if computed != treasury_state.datum.bifrost_identity_root {

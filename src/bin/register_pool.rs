@@ -178,7 +178,12 @@ fn run() -> Result<(), String> {
             &wallet_addr,
         ))
         .map_err(|e| format!("fetch wallet utxos: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    // Marked like every other spending path: `select_inputs` skips a reserved
+    // nonce, and it can only do that if something sets the flag ([REG-10]).
+    let wallet_utxos: Vec<WalletUtxo> = heimdall::cardano::nonce_reservation::wallet_set(
+        &wallet_raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, &project_id))
         .ok();

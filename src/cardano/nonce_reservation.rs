@@ -39,8 +39,37 @@ pub struct NonceReservation {
     pub outpoint: String,
     /// Which command the reservation belongs to, so a stale one can be named.
     pub action: Action,
-    /// Unix seconds, for the `doctor` report.
+    /// Unix seconds. Not decoration: it is how "the reservation transaction has
+    /// not confirmed yet" is told apart from "the nonce was spent", which
+    /// Blockfrost cannot distinguish — it reports confirmed UTxOs only, so a
+    /// freshly created one is simply absent.
     pub created_at: u64,
+    /// Whether the transaction that creates this UTxO was broadcast.
+    ///
+    /// False after `--no-submit-reservation`, which prints the transaction and
+    /// leaves broadcasting to the operator. Without this the later "not in the
+    /// wallet" would be diagnosed as a spent nonce and the operator told to
+    /// throw away a signature that is perfectly good.
+    pub submitted: bool,
+}
+
+/// How long after a reservation is written its UTxO may legitimately be missing
+/// from a confirmed-only UTxO query. Preprod blocks are ~20 s; five minutes is
+/// many blocks and still short enough that a genuinely spent nonce is not
+/// mistaken for a slow one for long.
+pub const CONFIRMATION_GRACE_SECS: u64 = 300;
+
+/// Why a reserved outpoint is not among the wallet's UTxOs — which decides what
+/// the operator should do, and they are not the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingNonce {
+    /// The transaction was never broadcast. Broadcast it.
+    NeverSubmitted,
+    /// Broadcast recently enough that it may simply not have confirmed. Wait.
+    NotConfirmedYet,
+    /// Old enough that it should have confirmed. It was spent, and any
+    /// signature bound to it is used up.
+    Spent,
 }
 
 #[must_use]
@@ -50,13 +79,26 @@ pub fn state_path(state_dir: &Path) -> PathBuf {
 
 impl NonceReservation {
     #[must_use]
-    pub fn new(outpoint: NonceOutpoint, action: Action, created_at: u64) -> Self {
+    pub fn new(outpoint: NonceOutpoint, action: Action, created_at: u64, submitted: bool) -> Self {
         Self {
             version: RESERVATION_STATE_VERSION,
             outpoint: outpoint.to_string(),
             action,
             created_at,
+            submitted,
         }
+    }
+
+    /// Why the reserved UTxO is missing, given the time now.
+    #[must_use]
+    pub fn why_missing(&self, now: u64) -> MissingNonce {
+        if !self.submitted {
+            return MissingNonce::NeverSubmitted;
+        }
+        if now.saturating_sub(self.created_at) < CONFIRMATION_GRACE_SECS {
+            return MissingNonce::NotConfirmedYet;
+        }
+        MissingNonce::Spent
     }
 
     /// The reserved outpoint, parsed.
@@ -160,6 +202,75 @@ pub fn mark_from_state_dir(
     Ok(mark_reserved(utxos, reserved))
 }
 
+/// The form a wallet UTxO set must be built in on any path that can SPEND.
+///
+/// `WalletUtxo::from_bf` alone produces a set in which `reserved` is false for
+/// everything, and that is not a visible failure — it is a set in which the
+/// nonce looks spendable to every selector that consults the flag. Three
+/// separate paths were built that way before this existed. So the mapping and
+/// the marking are one call, it returns a `Result` the compiler will not let a
+/// caller drop, and the name says which of the two it is for.
+pub fn wallet_set(
+    raw: &[crate::cardano::bf_http::BfUtxo],
+    state_dir: Option<&Path>,
+) -> Result<Vec<WalletUtxo>, String> {
+    mark_from_state_dir(raw.iter().map(WalletUtxo::from_bf).collect(), state_dir)
+}
+
+/// [`wallet_set`] for the DAEMON, where an unreadable record must not become a
+/// liveness failure.
+///
+/// The difference is which failure is worse where. On a command the operator is
+/// running, refusing is right: they are about to make an air-gapped round trip
+/// and the state dir cannot tell them what is reserved. Inside `run-spo` the
+/// same refusal would stop the node posting treasury movements, bans and the
+/// key handoff — for a file that belongs to a registration flow — and it would
+/// surface as a chain error attached to an epoch operation that has nothing to
+/// do with a registration.
+///
+/// The node has already passed a startup gate that reads this file (preflight
+/// step 12), so an unreadable one here is a file that CHANGED under a running
+/// daemon. Say so loudly, once per read, and carry on with nothing marked:
+/// there is no outpoint to protect if the record cannot be parsed.
+pub fn wallet_set_for_daemon(
+    raw: &[crate::cardano::bf_http::BfUtxo],
+    state_dir: Option<&Path>,
+) -> Vec<WalletUtxo> {
+    let utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    match mark_from_state_dir(utxos.clone(), state_dir) {
+        Ok(marked) => marked,
+        Err(e) => {
+            tracing::warn!(
+                "the nonce reservation could not be read ({e}), so no wallet UTxO is being \
+                 held back. If a registration or exit signature is at a cold key right now, \
+                 its nonce is unprotected — fix the state dir, and check `heimdall doctor` \
+                 step 12"
+            );
+            utxos
+        }
+    }
+}
+
+/// Whether an outpoint may be used as a nonce at all.
+///
+/// `still_unspent` answers "does the wallet hold it"; this adds the one
+/// exclusion that matters and that a bare outpoint match cannot see. A UTxO
+/// carrying a reference script is spendable, but spending one destroys a
+/// deployed reference script and incurs the Conway per-byte fee no builder here
+/// prices — and `deploy-registry-ref` leaves exactly such a UTxO at this
+/// wallet, where `--nonce-utxo` would happily accept it.
+pub fn usable_as_nonce(utxos: &[WalletUtxo], nonce: NonceOutpoint) -> Result<(), String> {
+    match utxos.iter().find(|u| u.outpoint() == Some(nonce)) {
+        None => Err(format!("{nonce} is not an unspent UTxO of this wallet")),
+        Some(u) if u.has_ref_script => Err(format!(
+            "{nonce} carries a reference script. Spending it would destroy a deployed script \
+             — the registry reference script is very likely this one — and the transaction \
+             would also carry it as a reference input. Choose an ordinary UTxO"
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Whether the reserved outpoint is still among the wallet's UTxOs.
 #[must_use]
 pub fn still_unspent(utxos: &[WalletUtxo], reserved: NonceOutpoint) -> bool {
@@ -189,7 +300,7 @@ mod tests {
     fn round_trips_through_the_state_dir() {
         let dir = std::env::temp_dir().join(format!("heimdall-nonce-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let rec = NonceReservation::new(outpoint(7, 3), Action::Deregister, 1_700_000_000);
+        let rec = NonceReservation::new(outpoint(7, 3), Action::Deregister, 1_700_000_000, true);
         rec.save(&dir).expect("save");
         let back = NonceReservation::load(&dir)
             .expect("load")
@@ -208,7 +319,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             state_path(&dir),
-            br#"{"version":99,"outpoint":"00#0","action":"register","created_at":0}"#,
+            br#"{"version":99,"outpoint":"00#0","action":"register","created_at":0,"submitted":true}"#,
         )
         .unwrap();
         let err = NonceReservation::load(&dir).expect_err("must not be read as absent");
@@ -234,6 +345,63 @@ mod tests {
         assert!(!still_unspent(&set, outpoint(9, 9)));
         let marked = mark_reserved(set, Some(outpoint(9, 9)));
         assert!(marked.iter().all(|u| !u.reserved));
+    }
+
+    /// Absent from a CONFIRMED-ONLY UTxO query is three different situations,
+    /// and only one of them means the operator must make a second trip to the
+    /// cold key. Reporting the other two as "spent" is how a perfectly good
+    /// signature gets thrown away.
+    #[test]
+    fn a_missing_nonce_is_diagnosed_by_why_it_is_missing() {
+        let never = NonceReservation::new(outpoint(1, 0), Action::Register, 1_000, false);
+        assert_eq!(never.why_missing(1_000), MissingNonce::NeverSubmitted);
+        // Still not submitted, however long ago: age cannot make a transaction
+        // that was never broadcast into a spent one.
+        assert_eq!(never.why_missing(9_999_999), MissingNonce::NeverSubmitted);
+
+        let fresh = NonceReservation::new(outpoint(1, 0), Action::Register, 1_000, true);
+        assert_eq!(fresh.why_missing(1_010), MissingNonce::NotConfirmedYet);
+        assert_eq!(
+            fresh.why_missing(1_000 + CONFIRMATION_GRACE_SECS - 1),
+            MissingNonce::NotConfirmedYet
+        );
+        assert_eq!(
+            fresh.why_missing(1_000 + CONFIRMATION_GRACE_SECS),
+            MissingNonce::Spent
+        );
+    }
+
+    /// A UTxO carrying a reference script is spendable, and spending it destroys
+    /// a deployed script — `deploy-registry-ref` leaves exactly one at this
+    /// wallet, and `--nonce-utxo` would otherwise take it.
+    #[test]
+    fn a_reference_script_utxo_is_not_usable_as_a_nonce() {
+        let mut with_script = utxo(4, 0);
+        with_script.has_ref_script = true;
+        let set = vec![utxo(1, 0), with_script];
+        assert!(usable_as_nonce(&set, outpoint(1, 0)).is_ok());
+        let err = usable_as_nonce(&set, outpoint(4, 0)).expect_err("must refuse");
+        assert!(err.contains("reference script"), "{err}");
+        let err = usable_as_nonce(&set, outpoint(9, 9)).expect_err("must refuse");
+        assert!(err.contains("not an unspent UTxO"), "{err}");
+    }
+
+    /// The daemon variant must not turn an unreadable record into a liveness
+    /// failure: `run-spo` posts treasury movements, bans and the key handoff
+    /// through it, and none of them has anything to do with a registration.
+    #[test]
+    fn the_daemon_variant_survives_an_unreadable_record() {
+        let dir = std::env::temp_dir().join(format!("heimdall-nonce-d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(state_path(&dir), b"not json at all").unwrap();
+        // The command variant refuses, which is right where an operator is
+        // about to make a trip to a safe.
+        assert!(mark_from_state_dir(vec![utxo(1, 0)], Some(&dir)).is_err());
+        // The daemon carries on with nothing marked.
+        let set = wallet_set_for_daemon(&[], Some(&dir));
+        assert!(set.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Coin selection is where the reservation earns its keep: a daemon posting

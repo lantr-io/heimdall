@@ -439,8 +439,11 @@ pub fn build_deregister_spo_tx(
 
     let (fee_utxo, coll_utxo) = {
         let fee = select_fee(req.wallet_utxos, 2_000_000).map_err(DeregisterSpoError::Wallet)?;
-        let coll =
-            select_collateral(req.wallet_utxos, &[fee]).map_err(DeregisterSpoError::Wallet)?;
+        // Disjoint from BOTH spent pubkey inputs — see the note in
+        // `register_spo::select_fee_and_collateral`. The `reserved` flag does
+        // not cover the `--nonce-utxo` recovery path.
+        let coll = select_collateral(req.wallet_utxos, &[fee, nonce_utxo])
+            .map_err(DeregisterSpoError::Wallet)?;
         (fee, coll)
     };
 
