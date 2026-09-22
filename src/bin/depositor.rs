@@ -432,14 +432,14 @@ fn run() -> Result<(), String> {
 
     let raw = bitcoin::consensus::encode::serialize(&tx);
     println!("{}", hex::encode(&raw));
-    info!("txid: {}", tx.compute_txid());
+    info!("txid {}", tx.compute_txid());
 
     if cli.submit {
         let rpc = build_rpc(&cfg)?;
         rt.block_on(broadcast_btc_tx(&rpc, &raw))
             .map_err(|e| format!("broadcast failed: {e}"))?;
     } else {
-        info!("(dry run — pass --submit to broadcast)");
+        info!("dry run: nothing was broadcast; pass --submit to broadcast");
     }
 
     Ok(())
@@ -553,12 +553,18 @@ async fn discover_utxos(
 ) -> Result<Vec<Utxo>, String> {
     let via_wallet = list_unspent(client, rpc, address).await?;
     if !via_wallet.is_empty() {
-        info!("discovered {} UTXO(s) via listunspent", via_wallet.len());
+        info!(
+            "found {} via listunspent",
+            heimdall::epoch::log::plural(via_wallet.len(), "UTxO", "UTxOs")
+        );
         return Ok(via_wallet);
     }
-    warn!("listunspent unavailable or empty; falling back to scantxoutset (slower)");
+    warn!("listunspent is unavailable or empty; falling back to scantxoutset, which is slower");
     let via_scan = scan_utxos(client, rpc, address).await?;
-    info!("discovered {} UTXO(s) via scantxoutset", via_scan.len());
+    info!(
+        "found {} via scantxoutset",
+        heimdall::epoch::log::plural(via_scan.len(), "UTxO", "UTxOs")
+    );
     Ok(via_scan)
 }
 

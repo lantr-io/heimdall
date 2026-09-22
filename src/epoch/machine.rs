@@ -60,6 +60,7 @@ use crate::bitcoin::tm_builder::{
 use crate::cardano::pegin_datum::ParsedPegIn;
 use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInSource};
 use crate::epoch::dkg::dkg_phase;
+use crate::epoch::log::{countdown, plural, slot_time_ms, utc_hms};
 use crate::epoch::rotation;
 use crate::epoch::signing::sign_phase;
 use crate::epoch::state::{
@@ -295,7 +296,12 @@ async fn drive_to_movement(
     // whether the rotation landed without this node.
     let mut rotation_spent: Option<u64> = None;
     loop {
-        crate::epoch_log!(me, current_epoch(&phase), "==> phase = {}", phase.name());
+        // DEBUG, not INFO (spec [PR-12]). A phase transition is the machine's
+        // own bookkeeping; what an operator needs from it — a batch opening, a
+        // round waiting, a movement built — each has its own line saying so in
+        // words. Twelve `==> phase = X` lines per cycle said the same thing in
+        // the enum's vocabulary.
+        crate::epoch_debug!(me, current_epoch(&phase), "phase: {}", phase.name());
         // Rebuilt rather than cloned: `EpochPhase` is not `Clone` (a `Sign` or
         // `Submit` phase carries a whole `TreasuryMovement`), and only these two
         // variants are ones we would ever want to re-enter.
@@ -366,6 +372,17 @@ async fn drive_to_movement(
         // Captured before the phase is moved into the step, so both arms below can
         // say which phase the outcome belongs to.
         let stepped = phase.name();
+        // And WHICH EPOCH it belongs to (spec [PR-13]).
+        //
+        // The failure warnings below used to pass `current_epoch(&EpochPhase::Idle)`,
+        // which is the constant 0 — so every line reporting a failed step arrived
+        // as `[… epoch=0]` while the step that failed belonged to a real epoch.
+        // On the live node that is three days of `epoch=1554` progress lines with
+        // `epoch=0` failures interleaved, and no way to join the two: an operator
+        // grepping one epoch's story silently loses exactly the lines that say
+        // what went wrong. `TM NOT SIGNED` already worked around it locally with
+        // `resume.map_or(0, current_epoch)`, which is the same fix applied once.
+        let stepped_epoch = current_epoch(&phase);
         match step_phase(
             phase,
             chain,
@@ -509,7 +526,7 @@ async fn drive_to_movement(
                 // SPEND — which this daemon never performs, under any flag. So the
                 // daemon's whole duty here is to make the condition legible and
                 // name the command, with its precondition, rather than to act.
-                if stepped.starts_with("Sign") {
+                if stepped.starts_with(EpochPhase::SIGNING) {
                     unsigned_movements += 1;
                     let n = unsigned_movements;
                     config.health.update(|h| h.unsigned_movements = n);
@@ -527,12 +544,12 @@ async fn drive_to_movement(
                         // read on its own, so it has to name the epoch its
                         // `TM built` twin named or there is nothing to join on.
                         resume.as_ref().map_or(0, current_epoch),
-                        "TM NOT SIGNED: the 51% mode did not sign this movement ({}) — {n} \
-                         consecutive now. If this does not clear the treasury moves only \
-                         through the federation's emergency path, `heimdall federation-spend`, \
-                         which needs the treasury UTxO to be federation_csv_blocks deep on \
-                         Bitcoin and every federation member to run it with the same \
-                         --signers. No daemon does this",
+                        "treasury movement NOT SIGNED: the SPO roster could not sign it ({}) — \
+                         {n} in a row. If this does not clear, the treasury moves only through \
+                         the federation's emergency path, `heimdall federation-spend`, which \
+                         needs the treasury UTxO to be federation_csv_blocks deep on Bitcoin and \
+                         every federation member to run it with the same --signers. No daemon \
+                         does this",
                         crate::epoch::log::one_line(&e)
                     );
                 }
@@ -584,11 +601,15 @@ async fn drive_to_movement(
                 let wait = if peers.is_view_stale().await {
                     crate::epoch_warn!(
                         me,
-                        current_epoch(&EpochPhase::Idle),
-                        "chain read failed ({e}); STALE chain-view — settling back-off {:?} before re-read \
-                         (reconcile), then re-entering {}",
-                        config.dkg_reconcile_backoff,
-                        resume.as_ref().map_or("Idle", EpochPhase::name)
+                        stepped_epoch,
+                        "chain read failed: {}. This node's view of the chain is behind its \
+                         peers', so it waits {}s for the disagreement to settle before re-reading, \
+                         then re-enters {}",
+                        crate::epoch::log::one_line(&e),
+                        config.dkg_reconcile_backoff.as_secs().max(1),
+                        resume
+                            .as_ref()
+                            .map_or(EpochPhase::Idle.name(), EpochPhase::name)
                     );
                     // The settling wait replaces the ramp, so clear BOTH halves of
                     // its state — leaving `failed_in` set would say a ramp is
@@ -599,12 +620,14 @@ async fn drive_to_movement(
                 } else if deterministic {
                     crate::epoch_warn!(
                         me,
-                        current_epoch(&EpochPhase::Idle),
-                        "{stepped} failed on the frozen batch ({e}) — identical inputs give an \
-                         identical verdict, so this opportunity is spent rather than rebuilt. \
-                         Backing off {:?}, then waiting for the next opportunity from {}.",
-                        backoff,
-                        resume.as_ref().map_or("Idle", EpochPhase::name)
+                        stepped_epoch,
+                        "{stepped} failed on the frozen batch: {}. Identical inputs give an \
+                         identical verdict, so this opportunity is spent rather than rebuilt — \
+                         waiting for the next one, from {}.",
+                        crate::epoch::log::one_line(&e),
+                        resume
+                            .as_ref()
+                            .map_or(EpochPhase::Idle.name(), EpochPhase::name)
                     );
                     let w = backoff;
                     backoff = (backoff * 2).min(config.retry_backoff_max);
@@ -612,10 +635,13 @@ async fn drive_to_movement(
                 } else {
                     crate::epoch_warn!(
                         me,
-                        current_epoch(&EpochPhase::Idle),
-                        "{stepped} failed ({e}); backing off {:?} then re-entering {}",
-                        backoff,
-                        resume.as_ref().map_or("Idle", EpochPhase::name)
+                        stepped_epoch,
+                        "{stepped} failed: {}. Retrying in {}s, from {}",
+                        crate::epoch::log::one_line(&e),
+                        backoff.as_secs().max(1),
+                        resume
+                            .as_ref()
+                            .map_or(EpochPhase::Idle.name(), EpochPhase::name)
                     );
                     let w = backoff;
                     backoff = (backoff * 2).min(config.retry_backoff_max);
@@ -715,8 +741,9 @@ fn step_clears_ramp(failed_in: Option<&'static str>, stepped: &'static str) -> b
 /// catch-all for filesystem I/O and for comparisons against live chain reads,
 /// neither of which a retry reproduces.
 fn rejects_the_batch(stepped: &'static str, cause: &EpochError) -> bool {
-    (stepped == "BuildTm" && matches!(cause, EpochError::BatchRejected(_)))
-        || (stepped == "CollectPegins" && matches!(cause, EpochError::TriesBehind { .. }))
+    (stepped == EpochPhase::BUILD_TM && matches!(cause, EpochError::BatchRejected(_)))
+        || (stepped == EpochPhase::COLLECT_PEGINS
+            && matches!(cause, EpochError::TriesBehind { .. }))
 }
 
 /// Whether a failed attempt keeps its batch opportunity instead of handing it
@@ -963,9 +990,9 @@ fn record_movement_phase(
         crate::epoch_warn!(
             me,
             epoch,
-            "  treasury movement {} NOT recorded: protocol.state_dir is not configured, so this \
-             node tracks neither the completed-peg-outs nor the swept-peg-ins trie and cannot \
-             build or co-sign a later Treasury Movement",
+            "treasury movement {} NOT recorded: protocol.state_dir is not configured, so this \
+             node tracks neither the completed peg-outs nor the swept peg-ins ledger and cannot \
+             build or co-sign a later movement",
             tm.txid
         );
         return Ok(());
@@ -978,7 +1005,7 @@ fn record_movement_phase(
     crate::epoch_log!(
         me,
         epoch,
-        "RecordMovement: treasury movement {} is posted and awaiting confirmation; recorded in \
+        "treasury movement {} is posted and waiting for confirmation; recorded in \
          {} — the tries advance when the chain shows it as the head, however long that takes and \
          across restarts",
         tm.txid,
@@ -1021,7 +1048,7 @@ fn settle_pending_tm(
         crate::epoch_debug!(
             me,
             pending.epoch,
-            "  treasury movement {} is still unconfirmed (the head is still the {} it spends)",
+            "treasury movement {} is still unconfirmed (the head is still the {} it spends)",
             pending.txid,
             pending.spends
         );
@@ -1030,7 +1057,7 @@ fn settle_pending_tm(
     crate::epoch_log!(
         me,
         pending.epoch,
-        "  treasury head advanced to {} — folding the movement recorded against {} into both tries",
+        "the treasury advanced to {} — folding the movement recorded against {} into both ledgers",
         treasury.outpoint,
         pending.spends,
     );
@@ -1039,12 +1066,11 @@ fn settle_pending_tm(
     crate::epoch_event!(
         me,
         pending.epoch,
-        "TM confirmed: txid {} — treasury head is now {} ({} peg-out(s) completed, {} deposit(s) \
-         swept)",
+        "treasury movement confirmed: txid {}; the treasury is now {} — {} completed, {} swept",
         pending.txid,
         treasury.outpoint,
-        pending.fulfilled.len(),
-        pending.swept.len().saturating_sub(1),
+        plural(pending.fulfilled.len(), "peg-out", "peg-outs"),
+        plural(pending.swept.len().saturating_sub(1), "deposit", "deposits"),
     );
     PendingTm::clear(dir)
         .map_err(|e| EpochError::TmBuild(format!("pending treasury movement: {e}")))?;
@@ -1195,9 +1221,9 @@ fn advance_cpo_trie(
     crate::epoch_log!(
         me,
         epoch,
-        "  completed-peg-outs trie advanced to root {} ({} entr(y|ies))",
+        "completed peg-outs ledger advanced to root {} ({})",
         hex::encode(new_root),
-        trie.len(),
+        plural(trie.len(), "entry", "entries"),
     );
     Ok(())
 }
@@ -1247,9 +1273,9 @@ fn advance_spi_trie(
     crate::epoch_log!(
         me,
         epoch,
-        "  swept peg-ins trie advanced to root {} ({} entr(y|ies))",
+        "swept peg-ins ledger advanced to root {} ({})",
         hex::encode(new_root),
-        trie.len(),
+        plural(trie.len(), "entry", "entries"),
     );
     Ok(())
 }
@@ -1448,7 +1474,7 @@ async fn phase1_fallback(
             crate::epoch_warn!(
                 log_id,
                 epoch,
-                "  could not read the treasury to check for a Phase-1 fallback: {e}"
+                "could not read the treasury to check for a Phase-1 fallback: {e}"
             );
             return Err(dkg_err);
         }
@@ -1503,7 +1529,7 @@ async fn phase1_fallback(
             crate::epoch_log!(
                 log_id,
                 epoch,
-                "  no ceremony seat, and none needed: the treasury is held by SPO roster key \
+                "no ceremony seat, and none needed: the treasury is held by SPO roster key \
                  {}, not by Config y_federation {}, so this FEDERATION seat has nothing to \
                  sign. Idling until the next epoch boundary",
                 hex::encode(treasury.y_51.serialize()),
@@ -1529,7 +1555,7 @@ async fn phase1_fallback(
         crate::epoch_log!(
             log_id,
             epoch,
-            "  the treasury head is still locked under Config y_federation {}, so this movement \
+            "the treasury head is still locked under Config y_federation {}, so this movement \
              is the FEDERATION's to sign. This node holds no federation share, so it has \
              nothing to contribute until the treasury is handed to an SPO roster",
             hex::encode(treasury.config_y_fed.serialize())
@@ -1610,7 +1636,7 @@ async fn phase1_fallback(
         crate::epoch_warn!(
             log_id,
             epoch,
-            "  note: the federation threshold is {}-of-{}, but the signing rounds currently \
+            "note: the federation threshold is {}-of-{}, but the signing rounds currently \
              require ALL {} members to respond — a dark member stalls the movement rather than \
              being signed around",
             roster.min_signers,
@@ -1645,7 +1671,7 @@ async fn phase1_fallback(
         crate::epoch_log!(
             log_id,
             epoch,
-            "  the Update-Y is posted, but the treasury head is still locked under the \
+            "the Update-Y is posted, but the treasury head is still locked under the \
              federation key — making the handoff movement that pays it to the new roster \
              before standing down"
         );
@@ -1747,7 +1773,7 @@ async fn await_datum_rotation(
             Err(e) => crate::epoch_warn!(
                 log_id,
                 epoch,
-                "  handoff: could not re-read the treasury while waiting for the rotation to \
+                "handoff: could not re-read the treasury while waiting for the rotation to \
                  appear: {e}"
             ),
         }
@@ -1776,7 +1802,7 @@ async fn await_datum_rotation(
                 crate::epoch_warn!(
                     log_id,
                     epoch,
-                    "  handoff: the Update-Y for {} was posted but treasury_info still does not \
+                    "handoff: the Update-Y for {} was posted but treasury_info still does not \
                      name it — refusing to build a movement against a datum that has not \
                      caught up",
                     hex::encode(posted.serialize())
@@ -1822,7 +1848,7 @@ async fn wait_for_published_namespace(
             crate::epoch_log!(
                 log_id,
                 epoch,
-                "  handoff: waiting up to {budget:.0?} for the roster to start its ceremony"
+                "handoff: waiting up to {budget:.0?} for the roster to start its ceremony"
             );
             announced = true;
         }
@@ -1863,17 +1889,13 @@ async fn try_succession_handoff(
     let ctx = match chain.query_dkg_context(epoch, 0).await {
         Ok(c) => c,
         Err(e) => {
-            crate::epoch_log!(
-                log_id,
-                epoch,
-                "  handoff: no SPO roster to hand to yet ({e})"
-            );
+            crate::epoch_log!(log_id, epoch, "handoff: no SPO roster to hand to yet ({e})");
             return None;
         }
     };
     let spo_roster = ctx.to_roster();
     if spo_roster.participants.is_empty() {
-        crate::epoch_log!(log_id, epoch, "  handoff: the SPO registry is still empty");
+        crate::epoch_log!(log_id, epoch, "handoff: the SPO registry is still empty");
         return None;
     }
 
@@ -1898,7 +1920,7 @@ async fn try_succession_handoff(
         crate::epoch_log!(
             log_id,
             epoch,
-            "  handoff: the roster is not advertising one agreed DKG namespace yet — either the \
+            "handoff: the roster is not advertising one agreed DKG namespace yet — either the \
              ceremony has not run, or its members are in different ones"
         );
         return None;
@@ -1931,7 +1953,7 @@ async fn try_succession_handoff(
             crate::epoch_log!(
                 log_id,
                 epoch,
-                "  handoff: not yet — {why}. Holding the treasury under the federation key"
+                "handoff: not yet — {why}. Holding the treasury under the federation key"
             );
             return None;
         }
@@ -1939,7 +1961,7 @@ async fn try_succession_handoff(
     crate::epoch_log!(
         log_id,
         epoch,
-        "  handoff: the SPO roster's ceremony is complete and unchallenged; its key is {} \
+        "handoff: the SPO roster's ceremony is complete and unchallenged; its key is {} \
          (recomputed here from {} published round-1 commitment(s), not taken on trust)",
         hex::encode(y_51.serialize()),
         round1.len()
@@ -1951,12 +1973,12 @@ async fn try_succession_handoff(
             crate::epoch_log!(
                 log_id,
                 epoch,
-                "  handoff: already done (the datum names this key)"
+                "handoff: already done (the datum names this key)"
             );
             return None;
         }
         Err(e) => {
-            crate::epoch_warn!(log_id, epoch, "  handoff: cannot plan the rotation: {e}");
+            crate::epoch_warn!(log_id, epoch, "handoff: cannot plan the rotation: {e}");
             return None;
         }
     };
@@ -1966,7 +1988,7 @@ async fn try_succession_handoff(
             crate::epoch_warn!(
                 log_id,
                 epoch,
-                "  handoff: no schedule to bound the rounds: {e}"
+                "handoff: no schedule to bound the rounds: {e}"
             );
             return None;
         }
@@ -1978,14 +2000,14 @@ async fn try_succession_handoff(
     .await
     {
         Ok((sig, authority)) => {
-            crate::epoch_log!(log_id, epoch, "  handoff authorized by {authority}");
+            crate::epoch_log!(log_id, epoch, "handoff authorized by {authority}");
             sig
         }
         Err(e) => {
             crate::epoch_warn!(
                 log_id,
                 epoch,
-                "  handoff: the federation could not sign it: {e}"
+                "handoff: the federation could not sign it: {e}"
             );
             return None;
         }
@@ -2004,21 +2026,22 @@ async fn try_succession_handoff(
             crate::epoch_log!(
                 log_id,
                 epoch,
-                "  HANDOFF POSTED: tx {tx} — the treasury is now the SPO roster's. This node's \
+                "HANDOFF POSTED: tx {tx} — the treasury is now the SPO roster's. This node's \
                  federation share stops being the treasury's authority from here"
             );
             crate::epoch_event!(
                 log_id,
                 epoch,
-                "Update-Y posted (federation handoff): cardano tx {tx} — treasury key {} -> {}",
-                hex::encode(plan.current_key.serialize()),
-                hex::encode(plan.new_key.serialize())
+                "key handoff posted by the federation: Cardano tx {tx} — the treasury key \
+                 becomes {}, was {}",
+                hex::encode(plan.new_key.serialize()),
+                hex::encode(plan.current_key.serialize())
             );
         }
         Err(e) => crate::epoch_warn!(
             log_id,
             epoch,
-            "  handoff: this node's submission was not accepted ({e}) — another member's may \
+            "handoff: this node's submission was not accepted ({e}) — another member's may \
              have been, so the rotation is still expected"
         ),
     }
@@ -2037,16 +2060,45 @@ async fn epoch_start_phase(
     // entry (which also refreshes the roster after an aborted window).
     let ctx = chain.query_dkg_context(epoch, 0).await?;
 
-    // Say who the registry holds, but ONLY when it changed. A steady roster
-    // would otherwise republish the same line every boundary, and this one is
-    // long; a pool joining, leaving, being banned, or having its stake activate
-    // is rare and is exactly what an operator wants interrupting them.
+    // Every line from here on names this node by its pool id, so the table the
+    // labels come from is replaced BEFORE anything of this epoch is logged
+    // (spec [LG-5]). The index an identifier stands for is re-derived below from
+    // this very context, so the two cannot disagree.
+    crate::epoch::log::set_labels(&ctx.to_roster().participants);
+
+    // The roster this epoch runs on, and HOW its threshold follows from the
+    // stake behind it (spec [RS-1]). Every epoch, not only when it changed:
+    // stake moves every epoch and the threshold moves with it, so "6 of 7" is a
+    // fact about this epoch that an operator should be able to check against
+    // this epoch's own lines rather than scrolling for the last time it changed.
+    //
+    // One call per row ([RS-9]) — a multi-line event would carry the
+    // `[label epoch=E]` prefix on its first line only.
+    {
+        let me = config.identity.identifier;
+        for line in crate::epoch::log::roster_table(&ctx, me) {
+            crate::epoch_log!(me, epoch, "{line}");
+        }
+    }
+
+    // Say who the registry holds, but ONLY when it changed. The table above is
+    // this node's own record; this is the EVENT, which is pushed to whoever
+    // watches the channel, and a steady roster republishing it every boundary is
+    // how a channel teaches its readers to ignore it. A pool joining, leaving,
+    // being banned, or having its stake activate is rare and is exactly what an
+    // operator wants interrupting them.
     //
     // The comparison is against `/health`, so it survives across epochs without
     // threading state through the phase functions — and the same string is what
     // `/health` serves, so the two cannot disagree about what was last seen.
     {
-        let described = crate::epoch::log::describe_registry(&ctx);
+        // Uncapped for the comparison and for `/health`, capped for the event.
+        // `/health` is pulled on demand and can carry the whole set; the event is
+        // pushed to a channel with a 2,000-character message limit. The COMPARISON
+        // has to see the whole set or it stops noticing changes past the cap: one
+        // pool leaving and another joining leaves the counts and the first ten
+        // names identical.
+        let described = crate::epoch::log::describe_registry(&ctx, usize::MAX);
         let changed = {
             let mut changed = false;
             config.health.update(|h| {
@@ -2058,7 +2110,12 @@ async fn epoch_start_phase(
             changed
         };
         if changed {
-            crate::epoch_event!(config.identity.identifier, epoch, "registry: {described}");
+            crate::epoch_event!(
+                config.identity.identifier,
+                epoch,
+                "registry: {}",
+                crate::epoch::log::describe_registry(&ctx, crate::epoch::log::PEER_LIST_CAP)
+            );
         }
     }
 
@@ -2152,10 +2209,10 @@ async fn epoch_start_phase(
         // appear NOWHERE in the namespace — so if two nodes disagree here they
         // reject each other's honest payloads with no way to notice. This line
         // makes that disagreement visible directly instead of by inference.
-        crate::epoch_log!(
+        crate::epoch_debug!(
             me,
             epoch,
-            "ceremony ctx: t={} n={} attempt={} window={} anchor_ms={:?} candidates=[{}]",
+            "ceremony context: t={} n={} attempt={} window={} anchor_ms={:?} candidates=[{}]",
             ctx.threshold,
             ctx.participants.len(),
             ctx.attempt,
@@ -2281,7 +2338,7 @@ async fn narrow_at_handshake(
     crate::epoch_warn!(
         me,
         ctx.epoch,
-        "  candidate set reduced to {} of {} at the pre-ceremony handshake ({}); t is now {} \
+        "candidate set reduced to {} of {} at the pre-ceremony handshake ({}); t is now {} \
          (this node keeps advertising its roster read, n={} t={}, which is what peers compare)",
         narrowed.participants.len(),
         ctx.participants.len(),
@@ -2343,7 +2400,7 @@ async fn wait_for_roster_health(
             .collect::<BTreeMap<_, _>>()
     };
     loop {
-        let mut down = Vec::new();
+        let mut down: Vec<String> = Vec::new();
         let mut changed = false;
         for info in roster.participants.values() {
             if info.identifier == me {
@@ -2352,7 +2409,7 @@ async fn wait_for_roster_health(
             let health = peers.check_health(info).await;
             if !health.reachable {
                 // No new answer, so the last verdict on it stands.
-                down.push(crate::epoch::log::id_short(info.identifier));
+                down.push(crate::epoch::log::describe_peer(info));
                 continue;
             }
             let Compatibility::Incompatible { kind, reason } = health.compatibility(own) else {
@@ -2370,7 +2427,7 @@ async fn wait_for_roster_health(
             crate::epoch_warn!(
                 me,
                 ctx.epoch,
-                "  ⚠ EXCLUDING spo={} from the ceremony: {reason}. It is running and \
+                "EXCLUDING {} from the ceremony: {reason}. It is running and \
                  reachable — this is a disagreement, not an outage. Both sides log this, \
                  so that operator sees the same line from its own node. The reason says \
                  what to change: a version or blueprint difference needs an upgrade, a \
@@ -2378,7 +2435,7 @@ async fn wait_for_roster_health(
                  needs nothing — it clears once both nodes re-derive, at the latest at the \
                  next epoch — and a threshold difference against an older build that \
                  reports no roster digest needs that node upgraded.",
-                crate::epoch::log::id_short(info.identifier),
+                crate::epoch::log::describe_peer(info),
             );
             incompatible.insert(info.identifier, (kind, reason));
             changed = true;
@@ -2396,16 +2453,16 @@ async fn wait_for_roster_health(
             config.health.update(|h| h.excluded_peers = lines);
         }
         if down.is_empty() {
-            crate::epoch_log!(me, ctx.epoch, "health gate: full roster reachable");
+            crate::epoch_log!(me, ctx.epoch, "every roster member is reachable");
             return verdicts(&incompatible);
         }
         if tokio::time::Instant::now() >= deadline {
             crate::epoch_warn!(
                 me,
                 ctx.epoch,
-                "health gate: proceeding without unreachable peer(s) {:?} after {:?}",
-                down,
-                config.dkg_join_wait
+                "opening the ceremony without {}, which did not come online within {}s",
+                down.join(", "),
+                config.dkg_join_wait.as_secs()
             );
             return verdicts(&incompatible);
         }
@@ -2415,8 +2472,8 @@ async fn wait_for_roster_health(
         crate::epoch_debug!(
             me,
             ctx.epoch,
-            "health gate: waiting for peer(s) {:?}...",
-            down
+            "waiting for {} to come online before opening the ceremony",
+            down.join(", ")
         );
         tokio::time::sleep(poll).await;
     }
@@ -2441,8 +2498,9 @@ fn try_resume_dkg(
             crate::epoch_log!(
                 me,
                 epoch,
-                "resuming epoch {epoch} from persisted DKG (attempt {}) — skipping the ceremony",
-                saved.attempt
+                "resuming bridge epoch {epoch} from the key generation already on disk \
+                 (attempt {}) — no new ceremony this epoch",
+                saved.attempt + 1
             );
             Ok(Some(EpochPhase::PublishKeys {
                 epoch,
@@ -2495,10 +2553,13 @@ async fn publish_keys_phase(
     let group = group_xonly(&group_keys.verifying_key).map_err(EpochError::Frost)?;
     let y_51 = group.xonly;
 
-    crate::epoch_log!(
+    // The parity byte and the x-only convention are BIP-340 detail that never
+    // told an operator anything; the key itself belongs on the one event below,
+    // beside the treasury address it produces.
+    crate::epoch_debug!(
         me,
         epoch,
-        "PublishKeys: group_key = {} (derived point parity 0x{:02x}; stored x-only per BIP-340)",
+        "group key {} (derived point parity 0x{:02x}; stored x-only per BIP-340)",
         hex::encode(y_51.serialize()),
         group.parity_byte()
     );
@@ -2523,19 +2584,20 @@ async fn publish_keys_phase(
             let new_spend =
                 treasury_spend_info(&secp, y_51, treasury.y_fed, treasury.federation_csv_blocks);
             let new_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(new_spend.output_key());
-            crate::epoch_log!(
+            crate::epoch_debug!(
                 me,
                 epoch,
-                "  -> new treasury: output_key={} scriptPubKey={}",
+                "new treasury output_key={} scriptPubKey={}",
                 hex::encode(new_spend.output_key().to_x_only_public_key().serialize()),
                 hex::encode(new_spk.as_bytes())
             );
             crate::epoch_event!(
                 me,
                 epoch,
-                "New treasury address {} (Y_51={}) — this epoch's handoff pays the treasury there",
+                "group key for bridge epoch {epoch}: {}; the treasury address it produces is {}, \
+                 and this epoch's key handoff pays the treasury there",
+                hex::encode(y_51.serialize()),
                 treasury_address(&new_spk, config.bitcoin_network),
-                hex::encode(y_51.serialize())
             );
         }
         Err(e) => crate::epoch_debug!(
@@ -2559,7 +2621,7 @@ async fn publish_keys_phase(
         None => crate::epoch_log!(
             me,
             epoch,
-            "  no Update-Y needed (treasury_info already names this key, or no state to rotate)"
+            "no key handoff needed: the treasury_info UTxO already names this group key"
         ),
         Some(_) if rotation_spent => {
             return Err(EpochError::RoundSpent {
@@ -2574,7 +2636,7 @@ async fn publish_keys_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "  Update-Y: rotating treasury_info {} from {} to {}",
+                "key handoff: rotating the treasury_info UTxO {} from group key {} to {}",
                 plan.state_outpoint,
                 hex::encode(plan.current_key.serialize()),
                 hex::encode(plan.new_key.serialize())
@@ -2622,7 +2684,7 @@ async fn publish_keys_phase(
                 }
                 Err(e) => return Err(e),
             };
-            crate::epoch_log!(me, epoch, "  Update-Y authorized by {authority}");
+            crate::epoch_log!(me, epoch, "Update-Y authorized by {authority}");
 
             // WI-099: the cascade runs over the roster that PRODUCED the
             // signature, which is the outgoing one — only its members hold a
@@ -2670,7 +2732,7 @@ async fn publish_keys_phase(
                     crate::epoch_log!(
                         me,
                         epoch,
-                        "  Update-Y: {why} — standing down, as the cascade intends"
+                        "Update-Y: {why} — standing down, as the cascade intends"
                     );
                 };
                 if chain.plan_update_y(epoch, y_51).await?.is_none() {
@@ -2684,11 +2746,15 @@ async fn publish_keys_phase(
                 crate::epoch_log!(
                     me,
                     epoch,
-                    "  Update-Y: hop {} of the cascade behind {:?}, nothing posted yet — holding \
-                     the signature for {}s",
-                    c.hops_before(me).unwrap_or(0),
-                    c.leader(),
+                    "key handoff: waiting {}s for {} to post it; nothing on chain yet, \
+                     and this node posts only if that has not happened. Posting order: {}",
                     wait.as_secs(),
+                    crate::epoch::log::named_peer(&roster.participants, c.leader()),
+                    crate::epoch::log::describe_posting_order(
+                        c.sequence(),
+                        &roster.participants,
+                        me
+                    ),
                 );
                 tokio::time::sleep(wait).await;
                 if chain.plan_update_y(epoch, y_51).await?.is_none() {
@@ -2716,20 +2782,20 @@ async fn publish_keys_phase(
                     crate::epoch_warn!(
                         me,
                         epoch,
-                        "  Update-Y: this node's submission was not accepted ({}) — a peer's \
+                        "Update-Y: this node's submission was not accepted ({}) — a peer's \
                          may have been, so the rotation is still expected",
                         crate::epoch::log::one_line(&e)
                     );
                     return Err(e);
                 }
             };
-            crate::epoch_log!(me, epoch, "  Update-Y submitted: cardano tx {tx_id}");
+            crate::epoch_debug!(me, epoch, "key handoff submitted: Cardano tx {tx_id}");
             crate::epoch_event!(
                 me,
                 epoch,
-                "Update-Y posted: cardano tx {tx_id} — treasury key {} -> {}",
-                hex::encode(plan.current_key.serialize()),
-                hex::encode(plan.new_key.serialize())
+                "key handoff posted: Cardano tx {tx_id} — the treasury key becomes {}, was {}",
+                hex::encode(plan.new_key.serialize()),
+                hex::encode(plan.current_key.serialize())
             );
             // Wait for it to appear before letting the batch loop read the datum.
             // `submit_update_y` returns on ACCEPTANCE, and the next thing
@@ -2808,6 +2874,16 @@ async fn await_batch_opportunity(
     built: &mut BuiltBatch,
 ) -> EpochResult<BatchTurn> {
     use crate::epoch::batch::BatchWindow;
+    // Which batch this node last said it was waiting for, and when it said so —
+    // the state behind the heartbeat rule (spec [PR-1], [PR-2]).
+    //
+    // The loop below re-reads the grid every `batch_poll_ceiling` (5 min in
+    // production) and must go on doing so: that cadence is what keeps `/health`
+    // and the grid position fresh. What changed is that it no longer LOGS every
+    // pass. At 5 minutes against a 3-hour grid that was 288 identical lines a
+    // day, which is how a log teaches its reader to skip it — and the one line in
+    // the run that said something new looked exactly like the 287 that did not.
+    let mut announced: Option<(u64, i64)> = None;
     loop {
         let snapshot = chain.query_batch_snapshot().await?;
         let wait = match snapshot.batch {
@@ -2827,13 +2903,15 @@ async fn await_batch_opportunity(
                         next_slot: snapshot.batch.next().map(|n| n.slot),
                     });
                 });
+                // Spec [PR-4]. In UTC, not slots: a slot number is a fact about
+                // the ledger, and the operator's question is what time it is.
                 crate::epoch_log!(
                     me,
                     epoch,
-                    "═══ batch B_{} @ slot {} (membership cutoff: created at or before slot {}) ═══",
+                    "batch B_{} opened at {}; requests created before {} qualify",
                     b.index,
-                    b.slot,
-                    b.cutoff_slot
+                    utc_hms(slot_time_ms(snapshot.now_ms, snapshot.slot, b.slot)),
+                    utc_hms(slot_time_ms(snapshot.now_ms, snapshot.slot, b.cutoff_slot)),
                 );
                 return Ok(BatchTurn::Build(Some(b)));
             }
@@ -2879,13 +2957,16 @@ async fn await_batch_opportunity(
                         crate::epoch_log!(
                             me,
                             epoch,
-                            "batch B_{} @ slot {} passes unused: its round-1 window closed at \
-                             slot {} and the chain is at slot {}. A round opened now would close \
-                             on entry with nobody to sign alongside.",
+                            "batch B_{} skipped: its signing window closed at {}, and it is now \
+                             {}. A round opened now would close on entry with nobody to sign \
+                             alongside.",
                             b.index,
-                            b.slot,
-                            b.slot.saturating_add(snapshot.sign_r1_window),
-                            snapshot.slot,
+                            utc_hms(slot_time_ms(
+                                snapshot.now_ms,
+                                snapshot.slot,
+                                b.slot.saturating_add(snapshot.sign_r1_window)
+                            )),
+                            utc_hms(snapshot.now_ms),
                         );
                     }
                 }
@@ -2899,15 +2980,43 @@ async fn await_batch_opportunity(
                 // opportunities. What was missing is the same facts somewhere an
                 // operator can query instead of grepping, which is the update
                 // below.
-                crate::epoch_log!(
-                    me,
-                    epoch,
-                    "waiting for batch B_{} at slot {} ({} slot(s) from slot {})",
-                    b.index,
-                    b.slot,
-                    b.slot.saturating_sub(snapshot.slot),
-                    snapshot.slot,
-                );
+                // Once when the wait starts or its target changes, then hourly.
+                // An hour is short against a grid measured in hours and long
+                // enough that a quiet node stays readable — and a node that has
+                // genuinely stopped still shows it, because the heartbeat keeps
+                // coming while the countdown does not shrink.
+                const HEARTBEAT_MS: i64 = 3_600_000;
+                let fresh = !matches!(announced, Some((index, _)) if index == b.index);
+                let due = match announced {
+                    Some((index, said_ms)) if index == b.index => {
+                        snapshot.now_ms.saturating_sub(said_ms) >= HEARTBEAT_MS
+                    }
+                    _ => true,
+                };
+                if due {
+                    let at = slot_time_ms(snapshot.now_ms, snapshot.slot, b.slot);
+                    if fresh {
+                        crate::epoch_log!(
+                            me,
+                            epoch,
+                            "waiting for batch B_{} at {} {}, slot {}",
+                            b.index,
+                            utc_hms(at),
+                            countdown(at, snapshot.now_ms),
+                            b.slot,
+                        );
+                    } else {
+                        crate::epoch_log!(
+                            me,
+                            epoch,
+                            "still waiting for batch B_{} at {} {}",
+                            b.index,
+                            utc_hms(at),
+                            countdown(at, snapshot.now_ms),
+                        );
+                    }
+                    announced = Some((b.index, snapshot.now_ms));
+                }
                 config.health.update(|h| {
                     h.epoch = Some(epoch);
                     h.activity = format!("waiting for batch B_{}", b.index);
@@ -2963,6 +3072,31 @@ fn hop_to_opportunity(
     ceiling: std::time::Duration,
 ) -> std::time::Duration {
     std::time::Duration::from_secs(next_slot.saturating_sub(now_slot).max(1)).min(ceiling)
+}
+
+/// Whether this unusable peg-in request is worth a line, for this bridge epoch
+/// (spec [IN-22], [IN-25]).
+///
+/// A request the bridge cannot sweep — a deposit that pays nothing to the peg-in
+/// Taproot, say — stays on Cardano until its depositor acts, so the source keeps
+/// offering it and the reason keeps being true. Logging it per batch made one
+/// stuck request a warning every three hours for ever, which is how an operator
+/// learns to filter out the whole category. Once per epoch is often enough to
+/// notice and rare enough to read; the epoch boundary re-reports it because by
+/// then it IS news again that nothing has changed.
+fn report_pegin_once(epoch: u64, cardano_utxo: &str) -> bool {
+    static REPORTED: std::sync::LazyLock<
+        std::sync::Mutex<(u64, std::collections::BTreeSet<String>)>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new((u64::MAX, Default::default())));
+    let Ok(mut seen) = REPORTED.lock() else {
+        // A poisoned lock must not silence a warning; say it again instead.
+        return true;
+    };
+    if seen.0 != epoch {
+        seen.0 = epoch;
+        seen.1.clear();
+    }
+    seen.1.insert(cardano_utxo.to_string())
 }
 
 /// A peg-in request's place in the batch's total order.
@@ -3023,8 +3157,7 @@ async fn collect_pegins_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "CollectPegins: no batch opportunity remains this epoch — waiting for the next \
-                 boundary"
+                "no batch opportunity remains this bridge epoch — waiting for the next one"
             );
             return Ok(EpochPhase::Idle);
         };
@@ -3046,10 +3179,10 @@ async fn collect_pegins_phase(
         crate::epoch_warn!(
             me,
             epoch,
-            "  batch B_{} passes UNUSED: a treasury movement is still in flight against the \
-             current tip {}",
+            "batch B_{} skipped: treasury movement {} is still waiting for Bitcoin \
+             confirmation, so the treasury cannot be spent again yet",
             b.index,
-            treasury.outpoint
+            treasury.outpoint.txid
         );
     };
 
@@ -3101,10 +3234,24 @@ async fn collect_pegins_phase(
     // One libsecp256k1 context for the whole scan: `recognise_pegin` may try
     // several trees per request, and building one per attempt dominated the cost.
     let secp = bitcoin::key::Secp256k1::new();
-    for req in pegin_source
+    // Say what the queue HELD, before saying what happened to it. The lines
+    // below report only exceptions — swept, deferred, stranded — so a queue of
+    // three requests that all passed produced no line at all, and an operator
+    // could not tell "read it, all fine" from "never read it".
+    let requests = pegin_source
         .query_pegin_requests(&config.pegin_policy_id)
-        .await?
-    {
+        .await?;
+    crate::epoch_log!(
+        me,
+        epoch,
+        "read the peg-in queue: {}",
+        if requests.is_empty() {
+            "nothing waiting".to_string()
+        } else {
+            plural(requests.len(), "request", "requests")
+        }
+    );
+    for req in requests {
         if accepted.contains_key(&req.cardano_utxo) {
             continue;
         }
@@ -3118,7 +3265,7 @@ async fn collect_pegins_phase(
                     crate::epoch_debug!(
                         me,
                         epoch,
-                        "  skipped peg-in {}: deposit {}:{} was already swept",
+                        "skipped peg-in {}: deposit {}:{} was already swept",
                         req.cardano_utxo,
                         parsed.btc_txid,
                         parsed.btc_vout
@@ -3170,7 +3317,7 @@ async fn collect_pegins_phase(
                             crate::epoch_warn!(
                                 me,
                                 epoch,
-                                "  peg-in {} deposits {} sat ({}:{}) at an address this \
+                                "peg-in {} deposits {} sat ({}:{}) at an address this \
                                  bridge no longer sweeps — internal key {}, Q_auth {}. No \
                                  movement signs under that key, so recovery is the federation \
                                  leaf after {} blocks or the depositor's refund after {}",
@@ -3195,7 +3342,7 @@ async fn collect_pegins_phase(
                             crate::epoch_debug!(
                                 me,
                                 epoch,
-                                "  deferring peg-in {}: it pays the address the bridge now \
+                                "deferring peg-in {}: it pays the address the bridge now \
                                  publishes, which the current head cannot spend",
                                 req.cardano_utxo
                             );
@@ -3236,7 +3383,7 @@ async fn collect_pegins_phase(
                     crate::epoch_warn!(
                         me,
                         epoch,
-                        "  dropped peg-in {loser}: deposit {}:{} is also claimed by {winner}, \
+                        "dropped peg-in {loser}: deposit {}:{} is also claimed by {winner}, \
                          which is earlier in the batch's FIFO order — a movement cannot spend one \
                          outpoint twice, and the earlier request is the one that can be eligible",
                         deposit_txid,
@@ -3248,7 +3395,16 @@ async fn collect_pegins_phase(
                 accepted.insert(req.cardano_utxo.clone(), parsed);
             }
             Err(e) => {
-                crate::epoch_warn!(me, epoch, "  dropped peg-in {}: {}", req.cardano_utxo, e);
+                if report_pegin_once(epoch, &req.cardano_utxo.to_string()) {
+                    crate::epoch_warn!(
+                        me,
+                        epoch,
+                        "peg-in request {} skipped: {}. It will not be swept until that is \
+                         resolved; this is said once per bridge epoch, not once per batch",
+                        req.cardano_utxo,
+                        e
+                    );
+                }
             }
         }
     }
@@ -3256,7 +3412,7 @@ async fn collect_pegins_phase(
         crate::epoch_log!(
             me,
             epoch,
-            "  {} peg-in request(s) name a deposit a confirmed TM already swept — skipped, \
+            "{} name a deposit an already-confirmed treasury movement swept — skipped, \
              awaiting their depositors' mint. If a LIVE deposit is missing from a batch, this \
              trie is what excluded it: check it with reconstruct-spi-trie",
             skipped_swept
@@ -3274,7 +3430,7 @@ async fn collect_pegins_phase(
         crate::epoch_warn!(
             me,
             epoch,
-            "  {} peg-in(s) wait for the handoff: they pay the address the treasury_info datum \
+            "{} wait for the key handoff: they pay the address the treasury_info UTxO \
              publishes, and the head is still locked under the key it supersedes. Expected \
              briefly after an Update-Y; persisting means the handoff movement is not happening",
             deferred
@@ -3287,7 +3443,7 @@ async fn collect_pegins_phase(
         crate::epoch_warn!(
             me,
             epoch,
-            "  {} peg-in(s) sit at a retired address and CANNOT be swept — see the warnings \
+            "{} sit at a retired address and CANNOT be swept — see the warnings \
              above. {} in total now; /health lists them",
             newly_stranded,
             stranded
@@ -3302,7 +3458,7 @@ async fn collect_pegins_phase(
         crate::epoch_log!(
             me,
             epoch,
-            "  {} peg-in(s) pay the OUTGOING address and this movement is the handoff — the \
+            "{} pay the OUTGOING address and this movement is the key handoff — the \
              last one that can sweep them, since its change moves the treasury to {}",
             accepted.len(),
             hex::encode(treasury.authorized_key.serialize())
@@ -3313,10 +3469,41 @@ async fn collect_pegins_phase(
     crate::epoch_log!(
         me,
         epoch,
-        "  -> froze {} peg-in(s) for BuildTm{}",
-        frozen_pegins.len(),
-        batch.map_or_else(String::new, |b| format!(" at batch B_{}", b.index))
+        "{}{}",
+        if frozen_pegins.is_empty() {
+            "no peg-in deposits are eligible, so this movement sweeps none".to_string()
+        } else {
+            format!(
+                "this movement sweeps {}; the set is fixed here, so every node builds \
+                 the identical transaction",
+                plural(frozen_pegins.len(), "peg-in deposit", "peg-in deposits")
+            )
+        },
+        batch.map_or_else(String::new, |b| format!(" (batch B_{})", b.index))
     );
+    // Which coins, and for how much. The count alone cannot be reconciled
+    // against the treasury figure the next line prints, and these are the
+    // outpoints the movement spends — the identity an operator matches against a
+    // depositor's claim that their peg-in has not arrived.
+    for d in frozen_pegins.iter().take(crate::epoch::log::PEER_LIST_CAP) {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  sweeping {} sat from {}:{} (request {})",
+            d.value.to_sat(),
+            d.btc_txid,
+            d.btc_vout,
+            d.cardano_utxo
+        );
+    }
+    if frozen_pegins.len() > crate::epoch::log::PEER_LIST_CAP {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "  … and {} more not listed",
+            frozen_pegins.len() - crate::epoch::log::PEER_LIST_CAP
+        );
+    }
 
     Ok(EpochPhase::BuildTm {
         epoch,
@@ -3459,7 +3646,7 @@ fn freeze_pegins(
         crate::epoch_log!(
             me,
             epoch,
-            "  batch B_{} (slot {}, cutoff {}): {} peg-in(s) eligible, {} newer than the cutoff \
+            "batch B_{} (slot {}, cutoff {}): {} peg-in(s) eligible, {} newer than the cutoff \
              — the latter roll over to a later batch",
             batch.index,
             batch.slot,
@@ -3533,7 +3720,7 @@ fn freeze_pegouts(
         crate::epoch_log!(
             me,
             epoch,
-            "  batch B_{} (slot {}, cutoff {}): {} peg-out(s) frozen, {} newer than the cutoff, \
+            "batch B_{} (slot {}, cutoff {}): {} peg-out(s) frozen, {} newer than the cutoff, \
              {} over the {cap}-peg-out byte budget — all deferred to a later batch",
             batch.index,
             batch.slot,
@@ -3626,8 +3813,8 @@ fn load_cpo_trie(
         crate::epoch_warn!(
             me,
             epoch,
-            "  completed-peg-outs trie: no protocol.state_dir configured — using the empty \
-             (genesis) trie; set state_dir before paying peg-outs on a live bridge"
+            "completed peg-outs ledger: no protocol.state_dir configured — using the empty \
+             (genesis) ledger; set state_dir before paying peg-outs on a live bridge"
         );
         return Ok(CpoTrie::empty());
     };
@@ -3636,8 +3823,8 @@ fn load_cpo_trie(
             crate::epoch_log!(
                 me,
                 epoch,
-                "  completed-peg-outs trie: {} entr(y|ies), root {}",
-                t.len(),
+                "completed peg-outs ledger: {}, root {}",
+                plural(t.len(), "entry", "entries"),
                 hex::encode(t.root())
             );
             Ok(t)
@@ -3646,8 +3833,8 @@ fn load_cpo_trie(
             crate::epoch_warn!(
                 me,
                 epoch,
-                "  completed-peg-outs trie: no persisted state at {} — using the empty (genesis) \
-                 trie; run `reconstruct-cpo-trie` if this bridge already has history",
+                "completed peg-outs ledger: no persisted state at {} — using the empty (genesis) \
+                 ledger; run `reconstruct-cpo-trie` if this bridge already has history",
                 dir.display()
             );
             Ok(CpoTrie::empty())
@@ -3742,8 +3929,8 @@ async fn cross_check_bridge_roots(
             crate::epoch_log!(
                 me,
                 epoch,
-                "  local tries match the bridge state singleton at head {} (cpo_root {}, spi_root \
-                 {})",
+                "local ledgers match the bridge state record at {} (completed peg-outs root {}, \
+                 swept peg-ins root {})",
                 roots.head,
                 hex::encode(roots.cpo_root),
                 hex::encode(roots.spi_root),
@@ -3754,9 +3941,9 @@ async fn cross_check_bridge_roots(
             crate::epoch_warn!(
                 me,
                 epoch,
-                "  no cpo_policy_id configured — neither local trie root was cross-checked \
-                 against the bridge state singleton. Set cardano.cpo_policy_id before trusting \
-                 these tries to sign with."
+                "no cpo_policy_id configured — neither local ledger root was cross-checked \
+                 against the bridge state record. Set cardano.cpo_policy_id before trusting \
+                 these ledgers to sign with."
             );
             Ok(CpoTrust::Unverified)
         }
@@ -3796,7 +3983,7 @@ async fn build_tm_phase(
     frozen_pegins: Vec<ParsedPegIn>,
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
-    crate::epoch_log!(me, epoch, "BuildTm: querying chain for treasury / pegouts");
+    crate::epoch_log!(me, epoch, "reading the treasury and the open peg-outs");
 
     // Both tries are CUMULATIVE state, and a TM commits the root that holds
     // AFTER it. Without somewhere to persist them, every build reloads an empty
@@ -3850,9 +4037,9 @@ async fn build_tm_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "BuildTm: previous treasury movement not yet confirmed on Bitcoin, re-reading in \
-                 {:?}",
-                config.batch_poll_ceiling
+                "the previous treasury movement is not yet confirmed on Bitcoin; re-reading \
+                 in {}s",
+                config.batch_poll_ceiling.as_secs()
             );
             tokio::time::sleep(config.batch_poll_ceiling).await;
             continue;
@@ -3860,7 +4047,7 @@ async fn build_tm_phase(
         crate::epoch_warn!(
             me,
             epoch,
-            "  batch B_{} is given up: a movement went in flight between collection and the \
+            "batch B_{} given up: a movement went in flight between collection and the \
              build, and this batch's round 1 closes at a fixed slot — waiting for it would spend \
              the round with nobody to sign alongside. Rejoining at the next opportunity.",
             b.index
@@ -3906,18 +4093,25 @@ async fn build_tm_phase(
     crate::epoch_log!(
         me,
         epoch,
-        "  chain query: treasury={} sat, {} eligible pegins, {} open pegouts, fee_rate={}sat/vb \
-         (params: {}); byte budget: max_tx_size={}, non-batch overhead={} → at most {} peg-outs, \
-         or {} peg-ins with none",
+        "treasury holds {} sat; {} eligible, {} open; fee {} sat/vB",
         treasury.value.to_sat(),
-        frozen_pegins.len(),
-        pegouts.len(),
+        plural(frozen_pegins.len(), "peg-in", "peg-ins"),
+        plural(pegouts.len(), "peg-out", "peg-outs"),
         snapshot.tm_params.fee_rate_sat_per_vb,
-        snapshot.source,
+    );
+    // The deployment arithmetic behind the line above. DEBUG because it answers
+    // a question only a full batch raises — why this many and no more — and
+    // printing it every batch buried the four numbers that change.
+    crate::epoch_debug!(
+        me,
+        epoch,
+        "byte budget: max_tx_size={}, non-batch overhead={} → at most {} peg-outs, or {} peg-ins \
+         with none (params from {})",
         budget.max_tx_size,
         budget.envelope,
         budget.max_pegouts(),
         budget.max_pegins_with(0),
+        snapshot.source,
     );
 
     // --- Who signs this movement, and where the coins go ---
@@ -3945,7 +4139,7 @@ async fn build_tm_phase(
         crate::epoch_log!(
             me,
             epoch,
-            "BuildTm: not this node's movement to sign — the treasury head {} is locked under \
+            "not this node's movement to sign — the treasury {} is locked under \
              {}, and this node holds no share of it (the datum authorizes {}). Waiting for the \
              holder of that key to move the treasury",
             treasury.outpoint,
@@ -3967,7 +4161,7 @@ async fn build_tm_phase(
         crate::epoch_log!(
             me,
             epoch,
-            "  the treasury head is locked under {}, which is not this epoch's ceremony key — \
+            "the treasury head is locked under {}, which is not this epoch's ceremony key — \
              signing with {} ({}-of-{}) and paying the change to the datum's authorized key {}{}",
             hex::encode(treasury.y_51.serialize()),
             holder,
@@ -4047,7 +4241,7 @@ async fn build_tm_phase(
             crate::epoch_warn!(
                 me,
                 epoch,
-                "  skipping ALL {} open peg-out(s): the completed-peg-outs trie was not \
+                "skipping ALL {} open peg-out(s): the completed-peg-outs trie was not \
                  cross-checked against the chain (no cardano.cpo_policy_id), and it is the only \
                  record of what an earlier movement already paid — paying without it would \
                  re-pay every open request on every movement. Peg-ins are unaffected. Set \
@@ -4157,7 +4351,7 @@ async fn build_tm_phase(
         crate::epoch_log!(
             me,
             epoch,
-            "  skipped peg-out → {} ({} sat): {}",
+            "skipped peg-out → {} ({} sat): {}",
             hex::encode(s.script_pubkey.as_bytes()),
             s.amount.to_sat(),
             s.reason,
@@ -4224,7 +4418,7 @@ async fn build_tm_phase(
         crate::epoch_log!(
             me,
             epoch,
-            "  nothing to move: no peg-ins, no peg-outs, and the treasury already sits at the \
+            "nothing to move: no peg-ins, no peg-outs, and the treasury already sits at the \
              address the datum authorizes ({}). {} passes unused rather than paying a fee to \
              recreate the same output — and holding the treasury for the whole confirmation \
              window while it does",
@@ -4261,8 +4455,8 @@ async fn build_tm_phase(
     crate::epoch_log!(
         me,
         epoch,
-        "  -> built unsigned tx: txid={} ({num_inputs} inputs), commits completed-peg-outs \
-         root {} over {} fulfilled peg-out(s)",
+        "built the unsigned transaction: txid {} ({num_inputs} inputs), committing completed \
+         peg-outs root {} over {} fulfilled",
         tm.txid,
         hex::encode(tm.cpo_root),
         tm.fulfilled.len(),
@@ -4270,13 +4464,11 @@ async fn build_tm_phase(
     crate::epoch_event!(
         me,
         epoch,
-        "TM built: txid {} — {} input(s) ({} deposit(s) swept), {} output(s), {} peg-out(s) paid; \
-         signing starts",
+        "treasury movement built: txid {}; sweeps {}, pays {}, {} outputs. Signing starts",
         tm.txid,
-        num_inputs,
-        num_inputs.saturating_sub(1),
+        plural(num_inputs.saturating_sub(1), "deposit", "deposits"),
+        plural(tm.fulfilled.len(), "peg-out", "peg-outs"),
         tm.unsigned_tx.output.len(),
-        tm.fulfilled.len(),
     );
 
     // Read before the roster moves into the phase — the retry budget shrinks with
@@ -4289,20 +4481,45 @@ async fn build_tm_phase(
     // commits in round 1 and then goes quiet — a crash does it as readily as
     // malice — denies the movement outright, because a round-2 shortfall cannot be
     // aggregated over the survivors and there is no room to re-run round 1.
-    if batch.is_some() && window.max_attempts() < 2 {
-        crate::epoch_warn!(
-            me,
-            epoch,
-            "  the published schedule leaves room for ONE signing attempt at this opportunity \
-             (tm_batch_interval vs {} + {} per attempt, less {} × {} slots of posting margin) — \
-             a single member that commits and then withholds denies this movement, with no \
-             second attempt to exclude it from. Widen tm_batch_interval or shorten the sign \
-             windows.",
-            snapshot.sign_r1_window,
-            snapshot.sign_r2_window,
-            roster_size,
-            snapshot.leader_slot_t,
-        );
+    // Two ways to arrive at one attempt, and they take DIFFERENT remedies, so the
+    // line has to say which one this is. `max_sign_attempts` divides by the room
+    // to the NEXT opportunity, so the last batch of an epoch has no divisor at all
+    // and floors to 1 however wide the grid is. Telling that operator to widen
+    // `tm_batch_interval` sends them the wrong way: a wider grid is FEWER batches,
+    // and the last one still has no successor.
+    if let Some(this_batch) = batch
+        && window.max_attempts() < 2
+    {
+        let margin = u64::from(roster_size).saturating_mul(snapshot.leader_slot_t);
+        match next_opportunity(&snapshot) {
+            None => crate::epoch_warn!(
+                me,
+                epoch,
+                "this is the last batch of bridge epoch {epoch}: no later one is scheduled \
+                 before final_tm_cutoff, so it has room for ONE signing attempt. A single \
+                 member that commits and then withholds denies this movement, with no second \
+                 attempt to exclude it from — the work is not lost, the next bridge epoch's \
+                 first batch picks it up. To give the last batch a second attempt, move \
+                 final_tm_cutoff later in the Config, or shorten sign_r1_window and \
+                 sign_r2_window ({} + {} slots now, against {} slots of posting margin).",
+                snapshot.sign_r1_window,
+                snapshot.sign_r2_window,
+                margin,
+            ),
+            Some(next) => crate::epoch_warn!(
+                me,
+                epoch,
+                "the published schedule leaves room for ONE signing attempt at this \
+                 opportunity: {} slots to the next batch, less {} of posting margin, against \
+                 {} + {} per attempt. A single member that commits and then withholds denies \
+                 this movement, with no second attempt to exclude it from. Widen \
+                 tm_batch_interval, or shorten sign_r1_window and sign_r2_window.",
+                next.saturating_sub(this_batch.slot),
+                margin,
+                snapshot.sign_r1_window,
+                snapshot.sign_r2_window,
+            ),
+        }
     }
     Ok(EpochPhase::Sign {
         epoch,
@@ -4557,7 +4774,7 @@ async fn submit_phase(
     crate::epoch_log!(
         me,
         epoch,
-        "Submit: verifying {} per-input signatures",
+        "verifying {} per-input signatures before posting",
         tm.signatures.len()
     );
     for (i, sig_opt) in tm.signatures.iter().enumerate() {
@@ -4576,7 +4793,7 @@ async fn submit_phase(
         crate::epoch_debug!(
             me,
             epoch,
-            "  input {i}: schnorr sig verifies under output key"
+            "input {i}: schnorr sig verifies under output key"
         );
     }
 
@@ -4607,7 +4824,7 @@ async fn submit_phase(
     crate::epoch_log!(
         me,
         epoch,
-        "Submit: signed treasury movement — txid={} ({} bytes)\n    raw tx: {}",
+        "treasury movement signed: txid {} ({} bytes)\n    raw tx: {}",
         tm.txid,
         tx_bytes.len(),
         hex::encode(&tx_bytes)
@@ -4626,6 +4843,19 @@ async fn submit_phase(
         )
         .ok_or_else(|| EpochError::Transition("empty roster at Submit".into()))?;
 
+    // The whole order, once, before anything depends on it. Exactly one node
+    // needs to broadcast; the order says who tries first and who covers. It is
+    // re-elected per movement from the txid being spent, so there is no standing
+    // "leader" to look up — which is why the log has to state it each time.
+    crate::epoch_log!(
+        me,
+        epoch,
+        "posting order for this movement: {}. Derived from the previous movement's \
+         txid, so every node computes the same order without coordinating; each \
+         waits {}s past the one before it and posts only if nobody has.",
+        crate::epoch::log::describe_posting_order(cascade.sequence(), &roster.participants, me),
+        snapshot.leader_slot_t,
+    );
     match cascade_wait(
         &cascade,
         me,
@@ -4637,8 +4867,8 @@ async fn submit_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "Submit: elected to post first (sequence {tm_sequence}, roster of {}) — \
-                 broadcasting signed tx; txid = {} ({} bytes)",
+                "posting: this node is first of {} for this movement — broadcasting now. \
+                 txid {} ({} bytes)",
                 cascade.len(),
                 tm.txid,
                 tx_bytes.len()
@@ -4655,9 +4885,8 @@ async fn submit_phase(
                 crate::epoch_log!(
                     me,
                     epoch,
-                    "Submit: hop {hops} of the cascade, and {:?} has already posted — standing \
-                     down without waiting, as the cascade intends",
-                    cascade.leader()
+                    "posting: {} has already posted this movement — nothing to do.",
+                    crate::epoch::log::named_peer(&roster.participants, cascade.leader())
                 );
                 return Ok(EpochPhase::RecordMovement {
                     epoch,
@@ -4670,19 +4899,18 @@ async fn submit_phase(
             crate::epoch_log!(
                 me,
                 epoch,
-                "Submit: hop {hops} of the cascade behind {:?} (T={} slots), nothing posted yet \
-                 — holding the witnessed tx ({} bytes) for {}s",
-                cascade.leader(),
-                snapshot.leader_slot_t,
-                tx_bytes.len(),
+                "posting: waiting {}s for {} to post; nothing on chain yet, and this node \
+                 posts only if that has not happened.",
                 wait.as_secs(),
+                crate::epoch::log::named_peer(&roster.participants, cascade.leader()),
             );
             tokio::time::sleep(wait).await;
             if predecessor_posted(chain, &tm).await? {
                 crate::epoch_log!(
                     me,
                     epoch,
-                    "Submit: a predecessor posted while this node waited — standing down"
+                    "posting: another node posted this movement while this one waited — \
+                     nothing to do."
                 );
                 return Ok(EpochPhase::RecordMovement {
                     epoch,
@@ -4695,10 +4923,13 @@ async fn submit_phase(
             crate::epoch_warn!(
                 me,
                 epoch,
-                "Submit: nobody posted within {hops} hop(s) of the cascade — taking over and \
-                 broadcasting; txid = {} ({} bytes)",
+                "posting: nobody posted within {}s, so this node is taking over and \
+                 broadcasting. txid {} ({} bytes). The {} ahead of it in the order are \
+                 down or stuck.",
+                wait.as_secs(),
                 tm.txid,
-                tx_bytes.len()
+                tx_bytes.len(),
+                crate::epoch::log::plural(usize::try_from(hops).unwrap_or(0), "node", "nodes"),
             );
         }
     }
@@ -4732,7 +4963,8 @@ async fn submit_phase(
         crate::epoch_event_warn!(
             me,
             epoch,
-            "TM post FAILED: txid {} — this node could not complete the Post-TM ({e}). The \
+            "treasury movement post FAILED: txid {} — this node could not finish posting it \
+             ({e}). The \
              Cardano submit may already have been ACCEPTED before the failure, so do not \
              assume nothing went out: if it landed, the watchtower relays the movement and \
              Bitcoin confirms it. This node recorded no pending movement for it either way, \
@@ -4747,12 +4979,12 @@ async fn submit_phase(
     crate::epoch_event!(
         me,
         epoch,
-        "TM posted: txid {} — Post-TM submitted ({} bytes; {} peg-out(s) paid, {} deposit(s) \
-         swept); awaiting Bitcoin confirmation",
+        "treasury movement posted: txid {} ({} bytes); pays {}, sweeps {}. Waiting for Bitcoin \
+         confirmation",
         tm.txid,
         tx_bytes.len(),
-        tm.fulfilled.len(),
-        tm.num_inputs().saturating_sub(1),
+        plural(tm.fulfilled.len(), "peg-out", "peg-outs"),
+        plural(tm.num_inputs().saturating_sub(1), "deposit", "deposits"),
     );
 
     // Persist the witnessed tx back into `tm` so callers can inspect it.
@@ -9745,16 +9977,16 @@ mod tests {
     #[test]
     fn only_the_phase_that_failed_clears_the_retry_ramp() {
         assert!(
-            !step_clears_ramp(Some("BuildTm"), "CollectPegins"),
+            !step_clears_ramp(Some(EpochPhase::BUILD_TM), EpochPhase::COLLECT_PEGINS),
             "re-entering CollectPegins is the BuildTm failure's own consequence, not recovery \
              from it"
         );
         assert!(
-            step_clears_ramp(Some("BuildTm"), "BuildTm"),
+            step_clears_ramp(Some(EpochPhase::BUILD_TM), EpochPhase::BUILD_TM),
             "the phase that failed having now succeeded is exactly what recovery is"
         );
         assert!(
-            step_clears_ramp(None, "CollectPegins"),
+            step_clears_ramp(None, EpochPhase::COLLECT_PEGINS),
             "with nothing outstanding the ramp is already at its minimum"
         );
     }
@@ -9783,19 +10015,25 @@ mod tests {
         };
 
         assert!(
-            rejects_the_batch("BuildTm", &EpochError::BatchRejected("spi root".into())),
+            rejects_the_batch(
+                EpochPhase::BUILD_TM,
+                &EpochError::BatchRejected("spi root".into())
+            ),
             "a verdict on the frozen batch, raised where the batch is frozen"
         );
         assert!(
             !rejects_the_batch(
-                "CollectPegins",
+                EpochPhase::COLLECT_PEGINS,
                 &EpochError::BatchRejected("spi root".into())
             ),
             "settle_pending_tm runs here AFTER the opportunity is marked — nothing is frozen yet, \
              so this must not spend it"
         );
         assert!(
-            !rejects_the_batch("BuildTm", &EpochError::TmBuild("trie write: ENOSPC".into())),
+            !rejects_the_batch(
+                EpochPhase::BUILD_TM,
+                &EpochError::TmBuild("trie write: ENOSPC".into())
+            ),
             "TmBuild is the catch-all for filesystem I/O and live chain comparisons, which a \
              retry does reproduce differently"
         );
@@ -9823,13 +10061,13 @@ mod tests {
     #[test]
     fn a_failed_runtime_repair_is_terminal_for_this_opportunity() {
         assert!(rejects_the_batch(
-            "CollectPegins",
+            EpochPhase::COLLECT_PEGINS,
             &EpochError::TriesBehind {
                 why: "history backend unavailable".into(),
             }
         ));
         assert!(!rejects_the_batch(
-            "BuildTm",
+            EpochPhase::BUILD_TM,
             &EpochError::TriesBehind {
                 why: "history backend unavailable".into(),
             }

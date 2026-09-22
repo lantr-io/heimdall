@@ -102,7 +102,7 @@ use crate::bitcoin::tm_builder::TmParams;
 use crate::cardano::bf_http::{self, BfUtxo};
 use crate::cardano::plutus;
 use crate::epoch::batch::{BatchWindow, GridParams};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Field count of the rev-5.5 Config datum (spec §Config datum). Appends are the
 /// legal evolution, so a reader accepts MORE fields and refuses fewer.
@@ -1129,7 +1129,7 @@ pub async fn batch_at(
         },
         None => {
             let next = grid.next(snapshot.slot);
-            info!(
+            debug!(
                 "[batch] slot {} is outside this epoch's batch grid (before B_1, or past \
                  final_tm_cutoff) — the opportunity passes unused; next: {}",
                 snapshot.slot,

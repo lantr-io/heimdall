@@ -47,7 +47,7 @@ use crate::cardano::roster::{
 };
 use crate::cardano::stake::{StakeSource, fetch_pool_stake_src};
 use crate::epoch::state::{Roster, SpoInfo};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Security threshold as a percentage of total eligible stake: any `t`
 /// signers must control STRICTLY MORE than this (spec: Y_51 → 51%).
@@ -412,6 +412,17 @@ pub fn eligible_pool_ids(
 /// [`FROST_MIN_PARTICIPANTS`] (a no-op for `n >= 2` with real stake, but
 /// defends the degenerate single-whale case).
 fn stake_weighted_threshold(stakes: &[u64], total: u64) -> u16 {
+    security_threshold_k(stakes, total).max(FROST_MIN_PARTICIPANTS)
+}
+
+/// The `k` the security threshold alone implies, BEFORE the
+/// [`FROST_MIN_PARTICIPANTS`] clamp: smallest `k` whose `k` lowest stakes sum to
+/// strictly more than [`SECURITY_THRESHOLD_PERCENT`]% of `total`.
+///
+/// Split out of [`stake_weighted_threshold`] so the log line that EXPLAINS a
+/// threshold can say whether the clamp was what decided it, without a second
+/// copy of the rule drifting from this one (spec [RS-6], [RS-7]).
+pub(crate) fn security_threshold_k(stakes: &[u64], total: u64) -> u16 {
     let mut ascending: Vec<u64> = stakes.to_vec();
     ascending.sort_unstable();
     // Need bottom_k * 100 > total * PERCENT (u128 to avoid overflow).
@@ -425,7 +436,7 @@ fn stake_weighted_threshold(stakes: &[u64], total: u64) -> u16 {
             break;
         }
     }
-    k.max(FROST_MIN_PARTICIPANTS)
+    k
 }
 
 /// Derive the Round-0 [`DkgContext`] from a registry snapshot, the active-ban
@@ -955,7 +966,7 @@ pub async fn fetch_dkg_context(
         let short = |v: &[u8]| hex::encode(&v[..4.min(v.len())]);
         let bans_short: Vec<String> = active_bans.iter().map(|b| short(b)).collect();
         let elig_short: Vec<String> = eligible.iter().map(|e| short(e)).collect();
-        info!(
+        debug!(
             "[chain-view] epoch={epoch} attempt={attempt} epoch_start_ms={epoch_start_ms} \
              registered={} active_bans=[{}] eligible=[{}]",
             snapshot.spos.len(),

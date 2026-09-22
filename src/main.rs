@@ -22,7 +22,7 @@ use heimdall::federation::{
 use heimdall::frost::xonly::group_xonly;
 use heimdall::http::peer_network::HttpPeerNetwork;
 use heimdall::http::server::router;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Parser)]
 #[command(
@@ -1917,6 +1917,20 @@ fn main() {
                 }
             }
 
+            // The banner goes FIRST, before the preflight gate prints a word.
+            // Which build is running, and against which networks, is the frame
+            // every later line is read in — including a preflight FAILURE, where
+            // it is the first thing anyone asks and the startup block below never
+            // gets reached to answer it. Version and both networks on one line:
+            // they are one answer, and a node pointed at the wrong BITCOIN
+            // network is the same class of fault as the wrong Cardano one.
+            info!(
+                "heimdall {} starting on cardano {} / bitcoin {}",
+                env!("HEIMDALL_VERSION"),
+                cfg.cardano.network.as_deref().unwrap_or("unset"),
+                cfg.bitcoin.network
+            );
+
             // WI-053's startup gate, which used to run only in `run-mover`.
             // This is the packaged daemon now, so it is the one that has to
             // refuse to start on a misconfiguration rather than join a ceremony
@@ -2643,9 +2657,9 @@ async fn apply_tm_policy(
         heimdall::cardano::bf_http::base_url(project_id, cfg.cardano.blockfrost_url.as_deref());
     let cbor = heimdall::cardano::publish::resolve_tm_script(&base_url, project_id, tm_script_hash)
         .await?;
-    info!(
-        "[config] TM validator {tm_script_hash} ({} bytes) sourced from the chain and verified \
-         against Config #5",
+    debug!(
+        "treasury movement validator {tm_script_hash} ({} bytes) sourced from the chain and \
+         verified against the bridge Config",
         cbor.len() / 2
     );
     Ok(chain.with_tm_policy(&cbor))
@@ -2662,20 +2676,28 @@ async fn run_spo(
     tries_rebuilt: Option<String>,
     no_auto_migrate: bool,
 ) {
+    // The startup block (spec [ST-1]).
+    //
+    // Collected rather than logged where each fact is resolved, and emitted as
+    // one contiguous block below. The facts are discovered hundreds of lines
+    // apart — the Config read, the registry, the wallet, the listeners — and
+    // printing each where it lands gave an operator eighteen lines in no order,
+    // four of them said twice, with no version among them. A support question
+    // starts with "which build, which network, which bridge, which pool", and
+    // until this none of the four was on one screen.
+    let mut startup: Vec<String> = Vec::new();
+    let mut startup_warnings: Vec<String> = Vec::new();
+    let mut test_run: Vec<String> = Vec::new();
+
     // The treasury's federation identity: the treasury_info datum where the bridge
     // has one, this node's `[bitcoin]` keys otherwise (WI-069). Fatal on failure —
     // it is an input to the treasury ADDRESS, so continuing on a guess means
     // signing for an address no other SPO is using.
     let federation = match resolve_federation(&cfg).await {
-        Ok(f) => {
-            info!(
-                "[federation] Y_fed {}, csv {} — {}",
-                hex::encode(f.y_fed.serialize()),
-                f.csv_blocks,
-                f.origin
-            );
-            f
-        }
+        // Not logged here: preflight check 8 has already reported this exact
+        // federation identity, and saying it twice in twenty lines is how a
+        // startup log teaches its reader to skim.
+        Ok(f) => f,
         Err(e) => {
             error!("Error: {e}");
             std::process::exit(1);
@@ -2823,11 +2845,10 @@ async fn run_spo(
         // nothing to sweep, and "0 eligible peg-ins" was the only symptom either
         // way. That is the state to be able to tell apart at a glance: this is
         // where deposits are found, and the policy is what a request NFT carries.
-        info!(
-            "peg-in requests:      {} (policy {})",
-            bridge.pegin_script_address, bridge.pegin_policy_id
-        );
-        info!("peg-out requests:     {}", bridge.pegout_script_address);
+        startup.push(format!(
+            "peg-in requests at {} (policy {}); peg-out requests at {}",
+            bridge.pegin_script_address, bridge.pegin_policy_id, bridge.pegout_script_address
+        ));
         bf_chain =
             bf_chain.with_pegout_source(&bridge.pegout_script_address, &bridge.bridged_token_unit);
 
@@ -2837,13 +2858,17 @@ async fn run_spo(
         // quiet ceremony.
         match heimdall::cardano::wallet::resolve_wallet(&cfg.cardano) {
             Ok(wallet) => {
-                info!(
-                    "Cardano wallet address: {} (key from {})",
+                startup.push(format!(
+                    "wallet {} (key from {})",
                     wallet.address, wallet.source
-                );
+                ));
                 bf_chain = bf_chain.with_wallet(wallet);
             }
-            Err(e) => warn!("no Cardano wallet, so this node cannot post: {e}"),
+            Err(e) => {
+                startup_warnings.push(format!(
+                    "no Cardano wallet: {e}. This node signs but cannot post"
+                ));
+            }
         }
 
         bf_chain = bf_chain.with_submit_config(cfg.cardano.submit_oracle);
@@ -2859,12 +2884,7 @@ async fn run_spo(
             // causes when only some of the roster has it does not name itself: the
             // candidate set still agrees, so nothing looks wrong until a ceremony
             // quietly fails to aggregate.
-            warn!(
-                "[stake] TEST RUN: the DKG roster is weighted by live_stake, not the epoch \
-                 snapshot (cardano.demo_live_stake). A pool registered this epoch counts \
-                 immediately instead of waiting two epoch boundaries — and live_stake drifts, \
-                 so EVERY node of this roster must set it too. It is refused on mainnet"
-            );
+            test_run.push("demo_live_stake".to_string());
         }
         // TEST-RUN ONLY: the virtual epoch. Validated at config load, so a config
         // that got this far cannot fail here — but it is still reported rather
@@ -2884,13 +2904,7 @@ async fn run_spo(
             // decides the DKG NAMESPACE, so a node that has it and a node that
             // does not never fetch each other's payloads at all. Neither side
             // errors; each waits for a ceremony the other cannot see.
-            warn!(
-                "[epoch] TEST RUN: the bridge cycle is a {slots}-slot VIRTUAL epoch \
-                 (cardano.demo_virtual_epoch_slots), not Cardano's five-day one, and the \
-                 ceremony deadlines are rescaled to fit it. EVERY node of this roster must \
-                 set the same value — a mismatch splits the DKG namespace. It is refused on \
-                 mainnet"
-            );
+            test_run.push(format!("demo_virtual_epoch_slots={slots}"));
         }
         bf_chain = bf_chain
             .with_demo_exclude_unstaked(cfg.cardano.demo_exclude_unstaked)
@@ -2910,11 +2924,7 @@ async fn run_spo(
             bridge_config.as_ref().map(|v| &v.params),
         ) {
             Ok(Some(source)) => {
-                info!("on-chain SPO registry: {}", source.registry_address);
-                info!(
-                    "note: eligible roster = registry − active bans; FROST threshold is \
-                     stake-weighted (WI-012) — demo.min_signers is ignored on this path"
-                );
+                startup.push(format!("SPO registry at {}", source.registry_address));
                 // N10c: the same treasury_info the roster is verified against is
                 // the one a completed DKG rotates (Update-Y). READING that roster
                 // needs only the published ids, but SPENDING the state UTxO needs
@@ -2925,7 +2935,11 @@ async fn run_spo(
                 // then repeats that every cycle with nothing in this log to
                 // explain it.
                 if source.can_hand_off_key() {
-                    info!("on-chain key handoff:  enabled (Update-Y after each DKG)");
+                    startup.push(
+                        "key handoff enabled: this node can rotate the treasury_info UTxO after a \
+                         ceremony"
+                            .to_string(),
+                    );
                 } else {
                     warn!(
                         "on-chain key handoff:  NOT possible on this node — the roster comes \
@@ -2944,10 +2958,10 @@ async fn run_spo(
                     bridge_config.as_ref().map(|v| &v.params),
                 ) {
                     Ok(Some(bans)) => {
-                        info!(
-                            "on-chain ban list:     {} ({})",
+                        startup.push(format!(
+                            "ban list at {} ({})",
                             bans.ban_address, bans.origin
-                        );
+                        ));
                         bf_chain = bf_chain.with_ban_source(bans);
                         match heimdall::cardano::blockfrost_chain::DkgFaultBanFlow::from_config(
                             &cfg.cardano,
@@ -2956,7 +2970,11 @@ async fn run_spo(
                         .await
                         {
                             Ok(Some(flow)) => {
-                                info!("automatic DKG fault banning: enabled");
+                                startup.push(
+                                    "automatic fault banning enabled: a proven cheat is published \
+                                     on chain"
+                                        .to_string(),
+                                );
                                 bf_chain = bf_chain.with_dkg_fault_ban_flow(flow);
                             }
                             // Reading the ban list and enforcing faults are
@@ -2964,10 +2982,11 @@ async fn run_spo(
                             // way, and detection already excludes a cheater
                             // from the ceremony. Without the enforcement keys
                             // the cheating simply costs nothing on chain.
-                            Ok(None) => info!(
-                                "automatic DKG fault banning: disabled (no fault-enforcement \
-                                 keys) — roster IS ban-filtered; faults are detected and \
+                            Ok(None) => startup.push(
+                                "automatic fault banning disabled (no fault-enforcement keys); \
+                                 the roster is still ban-filtered, and a cheat is detected and \
                                  excluded but not published on chain"
+                                    .to_string(),
                             ),
                             Err(e) => {
                                 error!("DKG fault-ban flow config: {e}");
@@ -3268,7 +3287,9 @@ async fn run_spo(
             me.pool_id.len()
         )
     });
-    let spo_label = hex::encode(&my_pool_id[..4]);
+    // The pool label, not a 4-byte hex prefix of the pool id: [LG-2] is what the
+    // rest of the log uses, and an operator has never seen those four bytes.
+    let spo_label = heimdall::epoch::log::pool_short(&my_pool_id, 0);
     let net = Arc::new(HttpPeerNetwork::new(secp, keypair, my_pool_id));
     // The [SPI-4] proof route loads the swept peg-ins trie from
     // `protocol.state_dir` per request; without it the route answers 503.
@@ -3351,15 +3372,69 @@ async fn run_spo(
         info!("[health] operator surface disabled (health.enabled = false)");
     }
 
+    // ── The startup block (spec [ST-1]) ─────────────────────────────
+    //
+    // Ordered so the first lines answer the questions a support request opens
+    // with. The preflight report above has already checked each of these for
+    // reachability; this says what they ARE, in one place, for the operator who
+    // scrolls back to a restart three days later. The version and the networks
+    // are NOT here: they are printed before the gate runs, so a node that fails
+    // preflight has still said which build it is.
+    //
+    // The Config NFT is what identifies a Bifrost deployment: two bridges on one
+    // network differ only by it, and a node pointed at the wrong one looks
+    // perfectly healthy while it signs for nothing.
+    match config_locator(&cfg) {
+        Some(loc) => info!(
+            "bridge deployment: Config NFT {} at {}",
+            loc.nft_unit, loc.address
+        ),
+        None => info!("bridge deployment: none (fixture mode)"),
+    }
+    // The FULL pool id here, once, so the short label every other line carries
+    // has something to be read against ([ST-3]).
+    if me.pool_id.is_empty() {
+        info!(
+            "this node: spo#{} (no pool id) at {}",
+            heimdall::epoch::log::id_short(id),
+            me.bifrost_url
+        );
+    } else {
+        info!(
+            "this node: {} at {}",
+            heimdall::epoch::log::pool_label(&me.pool_id),
+            me.bifrost_url
+        );
+    }
     info!(
-        "=== Heimdall SPO {spo_label} ({}-of-{}) ===",
-        roster.min_signers, roster.max_signers
+        "roster: {} eligible, threshold {} of {}",
+        roster.max_signers, roster.min_signers, roster.max_signers
     );
-    info!("Listening on {bind_addr}:{port}");
+    for line in &startup {
+        info!("{line}");
+    }
     info!(
-        "Waiting for the other {} SPOs to come online...",
-        roster.max_signers - 1
+        "peers listen on {bind_addr}:{port}; {}",
+        if cfg.health.enabled {
+            format!("health on http://{}", cfg.health.bind)
+        } else {
+            "health surface disabled".to_string()
+        }
     );
+    for line in &startup_warnings {
+        warn!("{line}");
+    }
+    if !test_run.is_empty() {
+        // WARN, and naming the flags rather than explaining them: preflight
+        // check 1 prints the whole consequence of each. What this line is for is
+        // the operator who scrolls past the preflight and needs to know, in one
+        // glance, that this node is not running the production rules.
+        warn!(
+            "TEST RUN: {} — every node of this roster must match, and these are refused on \
+             mainnet",
+            test_run.join(", ")
+        );
+    }
 
     let peers: Arc<dyn PeerNetwork> = net;
     // On the registry path, carry this node's stable bifrost key so the loop can
@@ -3447,6 +3522,77 @@ async fn run_spo(
         );
     }
 
+    // What is actually waiting, once, at startup. Until this the log said
+    // nothing about the queues until a batch opened — so a node that had just
+    // been restarted looked identical whether three peg-ins were pending or
+    // none, and the answer was a `cardano-cli` query away rather than in front
+    // of the operator. Two reads at boot, not per heartbeat: the batch loop
+    // re-reads them at every opportunity anyway, and doing it on the 5-minute
+    // tick was what kept this out of the design.
+    //
+    // A failed read must NOT stop the node: the queues are informational here,
+    // and the batch that needs them will read them again and fail loudly if the
+    // source is really gone.
+    {
+        let pegins = pegin_source
+            .query_pegin_requests(&config.pegin_policy_id)
+            .await;
+        let pegouts = chain.query_pegout_requests().await;
+        match (pegins, pegouts) {
+            (Ok(pi), Ok(po)) if pi.is_empty() && po.is_empty() => info!(
+                "request queues: nothing waiting — no peg-in requests, no peg-outs. Both \
+                 addresses are re-read at every batch opportunity."
+            ),
+            (Ok(pi), Ok(po)) => {
+                let owed: u64 = po.iter().map(|r| r.amount.to_sat()).sum();
+                info!(
+                    "request queues: {} and {} ({owed} sat gross) waiting. Both addresses are \
+                     re-read at every batch opportunity — a peg-in is swept once its deposit \
+                     is deep enough on Bitcoin, a peg-out is paid by the next movement.",
+                    heimdall::epoch::log::plural(pi.len(), "peg-in request", "peg-in requests"),
+                    heimdall::epoch::log::plural(po.len(), "peg-out", "peg-outs"),
+                );
+                // One line each, so the operator can look a request up rather
+                // than only count it. The peg-in's own amount is NOT here: which
+                // output of the referenced Bitcoin transaction is the deposit is
+                // decided by matching it against the epoch's peg-in tree, and the
+                // group key that builds is not resolved until the ceremony. The
+                // batch that sweeps it reports the value.
+                let net = cfg.bitcoin.parsed_network().ok();
+                for r in pi.iter().take(heimdall::epoch::log::PEER_LIST_CAP) {
+                    info!("  peg-in request {}", r.cardano_utxo);
+                }
+                for r in po.iter().take(heimdall::epoch::log::PEER_LIST_CAP) {
+                    let to = net
+                        .and_then(|n| bitcoin::Address::from_script(&r.script_pubkey, n).ok())
+                        .map_or_else(
+                            || hex::encode(r.script_pubkey.as_bytes()),
+                            |a| a.to_string(),
+                        );
+                    info!(
+                        "  peg-out {} sat to {to} (fee {} sat, pays {} sat)",
+                        r.amount.to_sat(),
+                        r.per_pegout_fee.to_sat(),
+                        r.amount.to_sat().saturating_sub(r.per_pegout_fee.to_sat()),
+                    );
+                }
+                let hidden = pi.len().saturating_sub(heimdall::epoch::log::PEER_LIST_CAP)
+                    + po.len().saturating_sub(heimdall::epoch::log::PEER_LIST_CAP);
+                if hidden > 0 {
+                    info!("  … and {hidden} more not listed");
+                }
+            }
+            (pi, po) => warn!(
+                "request queues could not be read at startup: {}. The next batch reads them \
+                 again; this line is informational only.",
+                pi.err()
+                    .map(|e| e.to_string())
+                    .or_else(|| po.err().map(|e| e.to_string()))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+
     let t0 = Instant::now();
     // Movement after movement, for ever, paced by the protocol's batch grid
     // (`B_i = epoch_start + i × tm_batch_interval`) rather than by the epoch
@@ -3465,7 +3611,10 @@ async fn run_spo(
     let err =
         heimdall::epoch::run_epoch_daemon(chain, pegin_source, peers, clock, rng, &config, |tm| {
             cycles += 1;
-            info!("Cycle {cycles} complete ({:.2?} since start)", t0.elapsed());
+            info!(
+                "movement {cycles} of this run complete, {} minutes since start",
+                t0.elapsed().as_secs() / 60
+            );
             log_tm_summary(tm);
             // POSTED, not confirmed. The Bitcoin confirmation is ~100 blocks plus
             // the oracle's challenge-aging window away; the node does not wait for
@@ -3473,8 +3622,9 @@ async fn run_spo(
             // it arrive). It records what the movement owes its tries and returns
             // to the grid, where opportunities pass unused until the tip frees up.
             info!(
-                "=== SPO {spo_label} cycle {cycles} complete — movement posted, awaiting \
-                 confirmation; waiting for the next batch opportunity ==="
+                "{spo_label}: movement {cycles} posted and awaiting Bitcoin confirmation. \
+                 Back to the batch grid — opportunities pass unused until the treasury \
+                 head is free again."
             );
         })
         .await;
@@ -9828,6 +9978,60 @@ fn run_show_config_params(cfg: &HeimdallConfig) -> Result<(), String> {
              stability_window={}",
             s.leader_slot_t, s.tm_recovery_window, s.final_tm_cutoff, s.stability_window
         );
+        // On a virtual epoch the published numbers are NOT the ones that run: an
+        // offset from the cycle start is rescaled, a duration is not. Printing
+        // only the published side invites exactly the wrong arithmetic — a
+        // 345600-slot cutoff read against an 86400-slot cycle looks like it sits
+        // three days past the end of its own epoch. Same rescale as the daemon's,
+        // through the same function, so this cannot drift from what runs.
+        let scheme = heimdall::epoch::virtual_epoch::EpochScheme::from_slots(
+            cfg.cardano.demo_virtual_epoch_slots,
+        )
+        .map_err(|e| format!("cardano.demo_virtual_epoch_slots: {e}"))?;
+        if let Some(slots) = scheme.virtual_slots() {
+            let f = scheme
+                .schedule(s, cfg.protocol.ceremony_floor_slots())
+                .map_err(|e| {
+                    format!("the virtual epoch cannot hold this bridge's schedule: {e}")
+                })?;
+            println!(
+                "      IN FORCE on this node's {slots}-slot virtual epoch \
+                 (offsets rescale by {slots}/{}; durations do not):",
+                heimdall::epoch::virtual_epoch::CARDANO_EPOCH_SLOTS
+            );
+            println!(
+                "        dkg_r1_deadline={} dkg_r2_deadline={} update_y_deadline={}",
+                f.dkg_r1_deadline, f.dkg_r2_deadline, f.update_y_deadline
+            );
+            println!(
+                "        final_tm_cutoff={}   (unchanged: tm_batch_interval={} \
+                 sign_r1_window={} sign_r2_window={} leader_slot_t={} \
+                 tm_recovery_window={} stability_window={})",
+                f.final_tm_cutoff,
+                f.tm_batch_interval,
+                f.sign_r1_window,
+                f.sign_r2_window,
+                f.leader_slot_t,
+                f.tm_recovery_window,
+                f.stability_window
+            );
+            // `B_i ≤ final_tm_cutoff`, so the count is the floor of the division.
+            let batches = u64::try_from(f.final_tm_cutoff).unwrap_or(0)
+                / u64::try_from(f.tm_batch_interval).unwrap_or(1).max(1);
+            if batches == 0 {
+                println!(
+                    "        => NO batch opportunity fits: B_1 falls at {} and the cutoff \
+                     is {}. This cycle can move nothing.",
+                    f.tm_batch_interval, f.final_tm_cutoff
+                );
+            } else {
+                println!(
+                    "        => {batches} batch opportunit{} per cycle, B_1 to B_{batches}; \
+                     the last has no successor, so it runs ONE signing attempt",
+                    if batches == 1 { "y" } else { "ies" }
+                );
+            }
+        }
     }
     {
         let b = &snapshot.config.params.bans;

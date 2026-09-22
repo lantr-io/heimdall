@@ -171,6 +171,19 @@ impl Cascade {
         &self.order
     }
 
+    /// Participants in POSTING order: the primary leader first, then each node
+    /// that would take over from it, wrapping around.
+    ///
+    /// [`Self::order`] is the spec's order, which is the roster sorted by pool
+    /// id; where the cascade STARTS in it is `leader_index`. An operator asking
+    /// "who posts this movement, and who covers if they do not" wants this
+    /// rotation, and deriving it at the call site would mean exposing
+    /// `leader_index` for no other reason.
+    pub fn sequence(&self) -> impl Iterator<Item = Identifier> + '_ {
+        let n = self.order.len();
+        (0..n).map(move |k| self.order[(self.leader_index + k) % n])
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.order.len()

@@ -219,7 +219,7 @@ fn run() -> Result<(), String> {
     println!("{}", built.signed_tx_hex);
 
     if !cli.submit {
-        info!("(dry run — pass --submit to broadcast via Blockfrost)");
+        info!("dry run: nothing was submitted; pass --submit to submit via Blockfrost");
         return Ok(());
     }
     let cbor = hex::decode(&built.signed_tx_hex).map_err(|e| e.to_string())?;
@@ -231,7 +231,7 @@ fn run() -> Result<(), String> {
     let tx_hash = rt
         .block_on(api.transactions_submit(cbor))
         .map_err(|e| format!("blockfrost submit: {e}"))?;
-    info!("submitted: tx_hash={tx_hash}");
+    info!("submitted: txid {tx_hash}");
     Ok(())
 }
 
