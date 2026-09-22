@@ -2101,7 +2101,17 @@ impl BlockfrostCardanoChain {
         // though its value is declared on the input and comes back in the change; the effect was
         // that a wallet whose ADA all sat behind tokens looked empty (WI-20260910-5DRP6).
         // Collateral still has to be ada-only, and `select_collateral` is where that is decided.
-        Ok(utxos.iter().map(WalletUtxo::from_bf).collect())
+        //
+        // The reserved nonce is flagged out here, once, for every builder that
+        // goes through this accessor: an operator's registration or exit
+        // signature may be at a cold key right now, and the daemon posting
+        // movements and bans from the same wallet must not spend the outpoint it
+        // names ([REG-10], [DRG-6]).
+        crate::cardano::nonce_reservation::mark_from_state_dir(
+            utxos.iter().map(WalletUtxo::from_bf).collect(),
+            self.state_dir.as_deref(),
+        )
+        .map_err(EpochError::Chain)
     }
 
     async fn submit_cardano_tx(&self, label: &str, signed_tx_hex: &str) -> EpochResult<String> {

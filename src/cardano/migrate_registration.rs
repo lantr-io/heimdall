@@ -174,7 +174,11 @@ pub fn build_migrate_registration_tx(
         req.previous_registry_utxos,
         req.previous_registry_policy_hex,
     )?;
-    let prev_list = RegistryList::from_elements(
+    // Parsed for its integrity check alone: a previous list that does not form
+    // a well-linked chain is not one a registration can be read out of. The
+    // bindings come back through `union_identity_pairs` below, which is the one
+    // copy of the rule all three builders share.
+    let _prev_list = RegistryList::from_elements(
         prev_elements
             .iter()
             .map(|u| (u.asset_name.clone(), u.element.clone())),
@@ -243,17 +247,13 @@ pub fn build_migrate_registration_tx(
         req.treasury_policy_hex,
         req.treasury_asset_name_hex,
     )?;
-    let mut seen: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
-    let mut identity_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for (pk, pool) in list
-        .identity_pairs()
-        .into_iter()
-        .chain(prev_list.identity_pairs())
-    {
-        if seen.insert(pk.clone()) {
-            identity_pairs.push((pk, pool));
-        }
-    }
+    let identity_pairs = crate::cardano::register_spo::union_identity_pairs(
+        &list,
+        Some((
+            req.previous_registry_policy_hex,
+            req.previous_registry_utxos,
+        )),
+    )?;
     let identity_trie = mpf::Trie::from_pairs(identity_pairs)
         .map_err(crate::cardano::treasury_info::TreasuryInfoError::Mpf)?;
     if identity_trie.root_hash() != state.datum.bifrost_identity_root {

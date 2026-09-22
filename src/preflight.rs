@@ -1294,7 +1294,8 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 "nonce reservation",
                 Status::Warn,
                 format!(
-                    "{} reserved for a pending {}, but the wallet's UTxOs could not be read to                      check it is still unspent",
+                    "{} reserved for a pending {}, but the wallet's UTxOs could not be read to \
+                     check it is still unspent",
                     rec.outpoint, rec.action
                 ),
             ),
@@ -1305,7 +1306,8 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                         "nonce reservation",
                         Status::Pass,
                         format!(
-                            "{} reserved for a pending {} and still unspent — fee and                              collateral selection skip it",
+                            "{} reserved for a pending {} and still unspent — fee and \
+                             collateral selection skip it",
                             rec.outpoint, rec.action
                         ),
                     );
@@ -1315,10 +1317,16 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                         "nonce reservation",
                         Status::Warn,
                         format!(
-                            "{} is reserved for a pending {} but is no longer an unspent UTxO                              of this wallet. Any signature made against it is used up: the                              outpoint is what makes it single-use ([REG-10], [DRG-6]), and the                              transaction that would carry it can no longer be built",
+                            "{} is reserved for a pending {} but is no longer an unspent UTxO \
+                             of this wallet. Any signature made against it is used up: the \
+                             outpoint is what makes it single-use ([REG-10], [DRG-6]), and \
+                             the transaction that would carry it can no longer be built",
                             rec.outpoint, rec.action
                         ),
-                        "Delete `nonce-reservation.json` from the state dir and run                          `heimdall register-spo` (or `deregister-spo`) again: it reserves a                          fresh UTxO and writes a new request. The file already at the cold key                          cannot be used — take the new one.",
+                        "Delete `nonce-reservation.json` from the state dir and run \
+                         `heimdall register-spo` (or `deregister-spo`) again: it reserves a \
+                         fresh UTxO and writes a new request. The file already at the cold \
+                         key cannot be used — take the new one.",
                     );
                 }
             }

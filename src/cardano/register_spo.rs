@@ -397,6 +397,17 @@ pub struct RegisterSpoRequest<'a> {
     pub registry_utxos: &'a [BfUtxo],
     /// UTxOs at the treasury script address.
     pub treasury_utxos: &'a [BfUtxo],
+    /// `(policy hex, UTxOs)` of the registry a migration is coming FROM —
+    /// Config #13, `None` when no migration is in progress ([CFG-10]).
+    ///
+    /// Needed for the identity trie, not for the transaction. `Migrate` does
+    /// not move the Treasury state's `bifrost_identity_root` ([MIG-3]), so
+    /// while pools are crossing, the root commits to the bindings of BOTH
+    /// lists. A registration that rebuilt the trie from the current list alone
+    /// would compute a different root, and `apply_registration` would refuse
+    /// before building anything — which is to say joining the bridge would be
+    /// impossible for the length of the migration.
+    pub previous_registry: Option<(&'a str, &'a [BfUtxo])>,
     pub wallet_address: &'a str,
     pub wallet_utxos: &'a [WalletUtxo],
     /// Wallet payment key (fees/collateral) — NOT the cold key.
@@ -437,6 +448,47 @@ pub struct RegisterSpoTx {
     pub anchor_asset_name: Vec<u8>,
     /// The continued treasury datum's `bifrost_identity_root`.
     pub new_bifrost_identity_root: mpf::Hash,
+}
+
+/// One `bifrost_id_pk -> pool_id` binding, as the MPF trie stores it.
+pub type IdentityPair = (Vec<u8>, Vec<u8>);
+
+/// The `bifrost_id_pk -> pool_id` bindings the Treasury state's identity root
+/// commits to: the current registry list, plus the previous one while a
+/// migration is in progress ([CFG-10], [MIG-3]).
+///
+/// Shared by `register_spo`, `deregister_spo` and `migrate_registration`,
+/// because getting it wrong is the same failure in all three: a trie that does
+/// not rebuild the treasury's root, and a proof the validator rejects.
+///
+/// Deduplicated by identity key, which is also the invariant the trie itself
+/// encodes — [REG-5] exists to make `bifrost_id_pk` globally unique, so a pool
+/// present in both lists is one entry, not two.
+pub fn union_identity_pairs(
+    current: &RegistryList,
+    previous: Option<(&str, &[BfUtxo])>,
+) -> Result<Vec<IdentityPair>, RegisterSpoError> {
+    let mut seen: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut pairs: Vec<IdentityPair> = Vec::new();
+    for (pk, pool_id) in current.identity_pairs() {
+        if seen.insert(pk.clone()) {
+            pairs.push((pk, pool_id));
+        }
+    }
+    if let Some((policy_hex, utxos)) = previous {
+        let elements = find_registry_utxos(utxos, policy_hex)?;
+        let list = RegistryList::from_elements(
+            elements
+                .iter()
+                .map(|u| (u.asset_name.clone(), u.element.clone())),
+        )?;
+        for (pk, pool_id) in list.identity_pairs() {
+            if seen.insert(pk.clone()) {
+                pairs.push((pk, pool_id));
+            }
+        }
+    }
+    Ok(pairs)
 }
 
 /// Decode `tx_hash` hex into the 32-byte id whisky sorts inputs by.
@@ -498,8 +550,14 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
 
     // Treasury leg: rebuild the identity trie from the (pre-insert) list and
     // derive the post-registration datum + absence proof.
-    let identity_trie =
-        mpf::Trie::from_pairs(list.identity_pairs()).map_err(TreasuryInfoError::Mpf)?;
+    //
+    // From BOTH lists while a registry migration is in progress: the root the
+    // treasury carries commits to every binding written under either policy,
+    // because `Migrate` carries one across without moving it. Keyed by
+    // `bifrost_id_pk`, so a pool that has already migrated — and is therefore
+    // in both lists — contributes once.
+    let identity_trie = mpf::Trie::from_pairs(union_identity_pairs(&list, req.previous_registry)?)
+        .map_err(TreasuryInfoError::Mpf)?;
     let state = find_treasury_state(
         req.treasury_utxos,
         &req.treasury_script.hash_hex(),
@@ -807,6 +865,32 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
             // spec [REG-10]. The one index whose drift the chain reports as
             // nothing but a bad signature, so it is worth naming here.
             at(nonce_input_index, &nonce_ref, "nonce")?;
+            // And the one REFERENCE index this transaction carries. Computed
+            // before the build like every other, so it is a prediction until
+            // something compares it; `migrate_registration` and `apply_ban`
+            // check theirs, and an unchecked one would surface only as a
+            // phase-2 failure with nothing to point at.
+            {
+                let refs: Vec<_> = tx
+                    .transaction_body
+                    .reference_inputs
+                    .as_ref()
+                    .map(|s| s.iter().collect())
+                    .unwrap_or_default();
+                let got = refs.get(config_ref_index as usize).ok_or_else(|| {
+                    RegisterSpoError::Build(format!(
+                        "Config reference index {config_ref_index} out of range"
+                    ))
+                })?;
+                if hex::encode(got.transaction_id.as_slice()) != req.config_ref.0
+                    || got.index != u64::from(req.config_ref.1)
+                {
+                    return Err(RegisterSpoError::Build(format!(
+                        "Config not at redeemer reference index {config_ref_index} — reference \
+                         ordering changed"
+                    )));
+                }
+            }
         }
 
         hex::encode(
@@ -1331,6 +1415,87 @@ mod tests {
         build_against_treasury_at(registry_elements, identity_pairs, "dd")
     }
 
+    /// As [`build_against`], but fallible and told about a migration window.
+    fn build_with_previous(
+        registry_elements: Vec<BfUtxo>,
+        identity_pairs: &[(Vec<u8>, Vec<u8>)],
+        previous: Option<(&str, &[BfUtxo])>,
+    ) -> Result<RegisterSpoTx, RegisterSpoError> {
+        let registry = registry_script();
+        let treasury = treasury_script(&registry.hash);
+        let trie = mpf::Trie::from_pairs(identity_pairs.iter().map(|(k, v)| (k, v))).unwrap();
+        let treasury_datum = TreasuryInfoDatum {
+            bifrost_identity_root: trie.root_hash(),
+            current_spos_frost_key: vec![0xAB; 32],
+        };
+        let nft_name = "ee".repeat(32);
+        let treasury_utxos = vec![BfUtxo {
+            tx_hash: "dd".repeat(32),
+            output_index: 0,
+            amount: vec![
+                BfAmount {
+                    unit: "lovelace".into(),
+                    quantity: "3104330".into(),
+                },
+                BfAmount {
+                    unit: format!("{}{nft_name}", treasury.hash_hex()),
+                    quantity: "1".into(),
+                },
+            ],
+            inline_datum: Some(hex::encode(treasury_datum.to_cbor())),
+            reference_script_hash: None,
+        }];
+        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
+        let wallet_utxos = vec![
+            WalletUtxo {
+                tx_hash: "aa".repeat(32),
+                output_index: 0,
+                lovelace: 50_000_000,
+                tokens: Default::default(),
+                has_ref_script: false,
+                reserved: false,
+            },
+            WalletUtxo {
+                tx_hash: "bb".repeat(32),
+                output_index: 1,
+                lovelace: 6_000_000,
+                tokens: Default::default(),
+                has_ref_script: false,
+                reserved: false,
+            },
+            WalletUtxo {
+                tx_hash: "7a".repeat(32),
+                output_index: 3,
+                lovelace: 2_000_000,
+                tokens: Default::default(),
+                has_ref_script: false,
+                reserved: true,
+            },
+        ];
+        let sigs = test_sigs();
+        build_register_spo_tx(&RegisterSpoRequest {
+            registry_script: &registry,
+            treasury_script: &treasury,
+            treasury_asset_name_hex: &nft_name,
+            registry_utxos: &registry_elements,
+            treasury_utxos: &treasury_utxos,
+            previous_registry: previous,
+            wallet_address: &wallet_addr,
+            wallet_utxos: &wallet_utxos,
+            key: &key,
+            sigs: &sigs,
+            bifrost_id_pk: bifrost_pk(),
+            bifrost_url: URL.to_vec(),
+            invalid_before: None,
+            invalid_hereafter: None,
+            registry_ref: None,
+            config_ref: ("cc".repeat(32), 0),
+            cost_models: None,
+        })
+    }
+
     /// As [`build_against`], with the Treasury state UTxO at a caller-chosen
     /// outpoint — for the lost-race test below.
     fn build_against_treasury_at(
@@ -1405,6 +1570,7 @@ mod tests {
             treasury_asset_name_hex: &nft_name,
             registry_utxos: &registry_elements,
             treasury_utxos: &treasury_utxos,
+            previous_registry: None,
             wallet_address: &wallet_addr,
             wallet_utxos: &wallet_utxos,
             key: &key,
@@ -1463,6 +1629,82 @@ mod tests {
         )
     }
 
+    /// Joining the bridge must still work while a registry migration is running
+    /// ([CFG-10], [MIG-3]).
+    ///
+    /// `Migrate` carries a registration across without moving the Treasury
+    /// state's identity root, so during a window the root commits to the
+    /// bindings of BOTH lists. A registration that rebuilt the trie from the
+    /// current list alone would compute a different root and `apply_registration`
+    /// would refuse — which is to say nobody could join, and nobody could leave,
+    /// for the length of the rollout. And a rollout is exactly when an operator
+    /// is most likely to be doing one of the two.
+    #[test]
+    fn registering_works_while_a_migration_is_in_progress() {
+        let registry = registry_script();
+        let policy = registry.hash_hex();
+        // The previous registry still holds a pool that has not migrated. Its
+        // binding is in the treasury root and in neither the current list nor
+        // this registrant's own.
+        let previous_policy = "b2".repeat(28);
+        let stranded_pool = [0x99u8; 28];
+        let stranded_pk = b"pk-not-yet-migrated".to_vec();
+        let previous = vec![
+            element_utxo(
+                &previous_policy,
+                &"77".repeat(32),
+                0,
+                2_600_000,
+                REGISTRATION_ROOT_KEY,
+                &root_element(Some(&stranded_pool)),
+            ),
+            element_utxo(
+                &previous_policy,
+                &"88".repeat(32),
+                0,
+                2_600_000,
+                &stranded_pool,
+                &node_element(&stranded_pk, None),
+            ),
+        ];
+        let elements = vec![element_utxo(
+            &policy,
+            &"11".repeat(32),
+            0,
+            2_600_000,
+            REGISTRATION_ROOT_KEY,
+            &root_element(None),
+        )];
+
+        // The treasury root is the UNION — here, just the stranded pool, since
+        // the current list is empty.
+        let pairs = vec![(stranded_pk.clone(), stranded_pool.to_vec())];
+        let built = build_with_previous(
+            elements,
+            &pairs,
+            Some((previous_policy.as_str(), previous.as_slice())),
+        )
+        .expect("a registration during a migration window must build");
+        assert_eq!(built.pool_id, test_pool_id());
+
+        // Without the previous list the same registration cannot be built: the
+        // trie rebuilt from the current list alone is a different trie.
+        let elements = vec![element_utxo(
+            &policy,
+            &"11".repeat(32),
+            0,
+            2_600_000,
+            REGISTRATION_ROOT_KEY,
+            &root_element(None),
+        )];
+        let err = build_with_previous(elements, &pairs, None)
+            .expect_err("the current list alone cannot rebuild the root");
+        assert!(
+            format!("{err}").to_lowercase().contains("root"),
+            "expected a root mismatch, got {err}"
+        );
+    }
+
     /// The retry the nonce is designed to survive ([REG-10]).
     ///
     /// The Treasury state UTxO is spent by every pool's registration, exit and
@@ -1492,9 +1734,11 @@ mod tests {
 
         // The first attempt loses the race for the Treasury state at dd…#0.
         let (first, _, _, _) = build_against_treasury_at(elements(), &[], "dd");
-        // It is now at cc…#0. The signatures are unchanged — the same
+        // It is now at c1…#0. The signatures are unchanged — the same
         // `test_sigs()` both times — and the transaction still builds.
-        let (retry, tx, _, _) = build_against_treasury_at(elements(), &[], "cc");
+        // (Not cc…: that is this fixture's Config reference outpoint, and an
+        // outpoint cannot be both a spent input and a reference input.)
+        let (retry, tx, _, _) = build_against_treasury_at(elements(), &[], "c1");
 
         assert_eq!(first.pool_id, retry.pool_id);
         assert_ne!(
@@ -1505,7 +1749,7 @@ mod tests {
         assert!(
             inputs
                 .iter()
-                .any(|i| i.transaction_id.as_slice() == [0xcc; 32]),
+                .any(|i| i.transaction_id.as_slice() == [0xc1; 32]),
             "the retry spends the treasury state where it now is"
         );
         let (nonce_in, ..) = decoded_register_redeemer(&tx);
@@ -1783,6 +2027,7 @@ mod tests {
             treasury_asset_name_hex: &"ee".repeat(32),
             registry_utxos: &elements,
             treasury_utxos: &[],
+            previous_registry: None,
             wallet_address: &wallet_addr,
             wallet_utxos: &wallet_utxos,
             key: &key,
@@ -1832,6 +2077,7 @@ mod tests {
         let req = RegisterSpoRequest {
             registry_utxos: &elements,
             treasury_utxos: &treasury_utxos,
+            previous_registry: None,
             ..req
         };
         assert!(matches!(

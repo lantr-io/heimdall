@@ -259,6 +259,13 @@ pub struct DeregisterSpoRequest<'a> {
     pub registry_utxos: &'a [BfUtxo],
     /// UTxOs at the treasury script address.
     pub treasury_utxos: &'a [BfUtxo],
+    /// `(policy hex, UTxOs)` of the registry a migration is coming FROM —
+    /// Config #13, `None` when none is in progress. As for `register_spo`: the
+    /// identity root commits to both lists' bindings while pools are crossing,
+    /// so a removal proof built from the current list alone would be rejected,
+    /// and leaving the bridge would be impossible for the length of the
+    /// migration.
+    pub previous_registry: Option<(&'a str, &'a [BfUtxo])>,
     pub wallet_address: &'a str,
     pub wallet_utxos: &'a [WalletUtxo],
     /// Wallet payment key (fees/collateral) — NOT the cold key.
@@ -348,8 +355,15 @@ pub fn build_deregister_spo_tx(
 
     // Treasury leg: rebuild the identity trie from the (pre-removal) list and
     // derive the post-deregistration datum + removal proof.
-    let identity_trie =
-        mpf::Trie::from_pairs(list.identity_pairs()).map_err(TreasuryInfoError::Mpf)?;
+    //
+    // From BOTH lists while a registry migration is in progress — see the note
+    // on `previous_registry`, and `register_spo::union_identity_pairs`, which
+    // is the one copy of this rule.
+    let identity_trie = mpf::Trie::from_pairs(crate::cardano::register_spo::union_identity_pairs(
+        &list,
+        req.previous_registry,
+    )?)
+    .map_err(TreasuryInfoError::Mpf)?;
     let state = find_treasury_state(
         req.treasury_utxos,
         &req.treasury_script.hash_hex(),
@@ -663,6 +677,32 @@ pub fn build_deregister_spo_tx(
             // spec [DRG-6]. Checked here because the chain will not tell you:
             // a nonce at the wrong index fails as "signature invalid".
             at(nonce_input_index, &nonce_ref, "nonce")?;
+            // And the one REFERENCE index this transaction carries. Computed
+            // before the build like every other, so it is a prediction until
+            // something compares it; `migrate_registration` and `apply_ban`
+            // check theirs, and an unchecked one would surface only as a
+            // phase-2 failure with nothing to point at.
+            {
+                let refs: Vec<_> = tx
+                    .transaction_body
+                    .reference_inputs
+                    .as_ref()
+                    .map(|s| s.iter().collect())
+                    .unwrap_or_default();
+                let got = refs.get(config_ref_index as usize).ok_or_else(|| {
+                    DeregisterSpoError::Build(format!(
+                        "Config reference index {config_ref_index} out of range"
+                    ))
+                })?;
+                if hex::encode(got.transaction_id.as_slice()) != req.config_ref.0
+                    || got.index != u64::from(req.config_ref.1)
+                {
+                    return Err(DeregisterSpoError::Build(format!(
+                        "Config not at redeemer reference index {config_ref_index} — reference \
+                         ordering changed"
+                    )));
+                }
+            }
         }
 
         hex::encode(
@@ -1004,6 +1044,7 @@ mod tests {
             treasury_asset_name_hex: &nft_name,
             registry_utxos: &registry_elements,
             treasury_utxos: &treasury_utxos,
+            previous_registry: None,
             wallet_address: &wallet_addr,
             wallet_utxos: &wallet_utxos,
             key: &key,

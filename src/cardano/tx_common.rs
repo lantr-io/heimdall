@@ -182,9 +182,17 @@ pub fn build_collateral_top_up(
         } else {
             COLLATERAL_UTXOS_WANTED - had
         };
+        // `!u.reserved` matters more here than in `select_fee`, and for the
+        // opposite reason: this builder reaches for SMALL UTxOs to consolidate,
+        // and a reserved nonce is a small UTxO. `select_fee` takes the richest
+        // and would rarely touch it by accident; this one would take it first.
+        // The shape that made it real: an operator reserves a nonce, leaves for
+        // the safe, preflight reports collateral short, and somebody runs
+        // `ensure-collateral` — which consumes the nonce, killing a signature
+        // whose trip has already been made ([REG-10], [DRG-6]).
         let mut pool: Vec<&WalletUtxo> = wallet_utxos
             .iter()
-            .filter(|u| !u.has_ref_script && (spend_candidates || !is_candidate(u)))
+            .filter(|u| !u.has_ref_script && !u.reserved && (spend_candidates || !is_candidate(u)))
             .collect();
         pool.sort_by_key(|u| std::cmp::Reverse(u.lovelace));
 
@@ -210,7 +218,7 @@ pub fn build_collateral_top_up(
     let Some((created, picked)) = plan else {
         let total: u64 = wallet_utxos
             .iter()
-            .filter(|u| !u.has_ref_script)
+            .filter(|u| !u.has_ref_script && !u.reserved)
             .map(|u| u.lovelace)
             .sum();
         return Err(format!(

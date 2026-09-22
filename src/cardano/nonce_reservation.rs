@@ -142,6 +142,24 @@ pub fn mark_reserved(utxos: Vec<WalletUtxo>, reserved: Option<NonceOutpoint>) ->
         .collect()
 }
 
+/// Read the reservation from `state_dir` and flag it on a fetched wallet set,
+/// in one call.
+///
+/// The form every command path should use. `mark_reserved` alone is easy to
+/// forget — and forgetting it is not a visible failure, it is a wallet set in
+/// which the nonce looks spendable to every selector that consults the flag.
+/// `ensure-collateral` forgot exactly that, and `build_collateral_top_up`
+/// reaches for SMALL UTxOs, which is what a 2 ADA reservation is.
+pub fn mark_from_state_dir(
+    utxos: Vec<WalletUtxo>,
+    state_dir: Option<&Path>,
+) -> Result<Vec<WalletUtxo>, String> {
+    let reserved = NonceReservation::load_or_none(state_dir)?
+        .map(|r| r.nonce())
+        .transpose()?;
+    Ok(mark_reserved(utxos, reserved))
+}
+
 /// Whether the reserved outpoint is still among the wallet's UTxOs.
 #[must_use]
 pub fn still_unspent(utxos: &[WalletUtxo], reserved: NonceOutpoint) -> bool {

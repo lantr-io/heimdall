@@ -5751,7 +5751,13 @@ fn run_ensure_collateral(cfg: &HeimdallConfig, submit: bool) -> Result<(), Strin
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    // Flag the reserved nonce, if any. This command consolidates SMALL UTxOs,
+    // so without it a 2 ADA reservation is the first thing it would spend —
+    // killing a cold signature already on its way to a safe ([REG-10]).
+    let wallet_utxos = heimdall::cardano::nonce_reservation::mark_from_state_dir(
+        raw.iter().map(WalletUtxo::from_bf).collect(),
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
 
     let total: u64 = wallet_utxos.iter().map(|u| u.lovelace).sum();
     let with_tokens = wallet_utxos.iter().filter(|u| !u.tokens.is_empty()).count();
@@ -6958,6 +6964,47 @@ impl MigrationContext {
     }
 }
 
+/// Wait for `pool_id`'s migration to confirm, then re-read the chain.
+///
+/// The next pool's insert is planned against the anchor this one just rewrote,
+/// so building it against a pre-confirmation read would plan against an
+/// outpoint that no longer exists. Blockfrost reports confirmed UTxOs only,
+/// which is exactly why the wait is needed and exactly what makes it
+/// observable: when the pool's node shows up in the current list, its
+/// transaction is on chain.
+///
+/// `Ok(None)` means the window closed under us — Config #13 was cleared — which
+/// is a reason to stop rather than an error.
+async fn await_migration(
+    cfg: &HeimdallConfig,
+    pool_id: &[u8],
+) -> Result<Option<MigrationContext>, String> {
+    // Preprod blocks are ~20 s; sixty tries at five seconds is five minutes,
+    // which is generous for one block and short enough that a stuck rollout is
+    // noticed rather than waited out.
+    const TRIES: usize = 60;
+    const DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+    for attempt in 0..TRIES {
+        tokio::time::sleep(DELAY).await;
+        let Some(fresh) = migration_context(cfg).await? else {
+            return Ok(None);
+        };
+        let (current, _) = fresh.lists()?;
+        if current.get(pool_id).is_some() {
+            return Ok(Some(fresh));
+        }
+        if attempt == TRIES / 2 {
+            println!("  (still waiting for {} to confirm)", hex::encode(pool_id));
+        }
+    }
+    Err(format!(
+        "{} did not appear in the current registry within {} seconds of its transaction being \
+         submitted",
+        hex::encode(pool_id),
+        TRIES * DELAY.as_secs() as usize,
+    ))
+}
+
 /// `heimdall migrate-registration [--all]`.
 fn run_migrate_registration(cfg: &HeimdallConfig, all: bool, submit: bool) -> Result<(), String> {
     use heimdall::cardano::migrate_registration::{MembershipState, classify};
@@ -7014,38 +7061,58 @@ fn run_migrate_registration(cfg: &HeimdallConfig, all: bool, submit: bool) -> Re
     }
     println!("to migrate:        {}", targets.len());
 
-    // Each migration is its own transaction and its own anchor spend, so two in
-    // a row race for the anchor the second one planned against. Re-read the
-    // current list between them rather than build a batch this branch cannot
-    // validate anyway.
+    // Each migration is its own transaction and spends the anchor its insert
+    // was planned against, so two in a row race for it — and early in a
+    // migration every pool plans against the SAME anchor, the list root, since
+    // the new list is empty. Submitting them back to back would land one and
+    // have the chain reject the rest.
+    //
+    // So each one waits for its predecessor to confirm before the next is
+    // built. Blockfrost's UTxO endpoint is confirmed-only, which is what makes
+    // the wait necessary and also what makes it observable: the pool's node
+    // appearing in the current list IS the confirmation. Slow — a block each —
+    // and that is the right trade for a federation step run once per rollout,
+    // against a command that otherwise reports 19 failures out of 20 and
+    // migrates one pool.
     let mut ctx = ctx;
     let mut failures = 0usize;
+    let mut done = 0usize;
     for pool_id in &targets {
         match ctx.migrate(&rt, cfg, pool_id, submit) {
             Ok(MigrationOutcome::Migrated { tx_hash }) => {
                 println!("  {} → submitted {tx_hash}", hex::encode(pool_id));
+                done += 1;
             }
             Ok(MigrationOutcome::Built) => {
                 println!(
                     "  {} → built (dry run — pass --submit)",
                     hex::encode(pool_id)
                 );
+                done += 1;
             }
             Err(e) => {
                 failures += 1;
                 println!("  {} → FAILED: {e}", hex::encode(pool_id));
             }
         }
-        if submit && targets.len() > 1 {
-            // Re-read, so the next pool's anchor and wallet UTxOs are the ones
-            // the previous transaction left behind.
-            match rt.block_on(migration_context(cfg)) {
-                Ok(Some(fresh)) => ctx = fresh,
-                Ok(None) => break,
-                Err(e) => {
-                    println!("  (could not re-read the chain: {e})");
-                    break;
-                }
+        // Nothing to wait for after the last one, and nothing to wait for at
+        // all in a dry run — no transaction was sent.
+        if !submit || done + failures >= targets.len() {
+            continue;
+        }
+        match rt.block_on(await_migration(cfg, pool_id)) {
+            Ok(Some(fresh)) => ctx = fresh,
+            Ok(None) => {
+                println!("  (the migration window closed — Config #13 is no longer set)");
+                break;
+            }
+            Err(e) => {
+                println!(
+                    "  (stopping: {e}. Each migration is independent, so what landed is landed \
+                     — re-run for the rest)"
+                );
+                failures += targets.len() - done - failures;
+                break;
             }
         }
     }
@@ -7137,6 +7204,44 @@ async fn auto_migrate_registration(cfg: &HeimdallConfig, disabled: bool) -> Opti
             Some(format!("migratable {from} -> {to} (last attempt failed)"))
         }
     }
+}
+
+/// The previous registry's address and UTxOs, while a migration is in progress
+/// ([CFG-10]).
+///
+/// `register-spo` and `deregister-spo` both need it, and for the same reason
+/// they did not need it before rev 5.6: the Treasury state's identity root
+/// commits to the bindings of BOTH lists while pools are crossing, because
+/// `Migrate` carries one across without moving the root. A proof built from the
+/// current list alone is rejected, so without this, joining and leaving would
+/// both be impossible for the length of a migration — and a migration is
+/// exactly when an operator is most likely to be doing one of them.
+///
+/// `None` when Config #13 is unset, which is every day that is not a rollout.
+async fn previous_registry_utxos(
+    params: &heimdall::cardano::config_params::ConfigParams,
+    base_url: &str,
+    project_id: &str,
+    mainnet: bool,
+) -> Result<Option<(String, Vec<heimdall::cardano::bf_http::BfUtxo>)>, String> {
+    let Some(previous) = params.registry.previous_spos_registry_policy_id else {
+        return Ok(None);
+    };
+    let network = if mainnet {
+        pallas_addresses::Network::Mainnet
+    } else {
+        pallas_addresses::Network::Testnet
+    };
+    let address = heimdall::cardano::blueprint::script_enterprise_address(&previous, network);
+    let utxos = heimdall::cardano::bf_http::fetch_address_utxos(base_url, project_id, &address)
+        .await
+        .map_err(|e| format!("previous registry UTxO query: {e}"))?;
+    println!(
+        "migration:         in progress from {} ({} node(s) still there)",
+        hex::encode(previous),
+        utxos.len().saturating_sub(1)
+    );
+    Ok(Some((hex::encode(previous), utxos)))
 }
 
 /// Resolve the nonce outpoint a registration or exit signature will be bound to
@@ -7406,13 +7511,10 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
     let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
-    let reserved_outpoint = heimdall::cardano::nonce_reservation::NonceReservation::load_or_none(
+    let wallet_utxos = heimdall::cardano::nonce_reservation::mark_from_state_dir(
+        wallet_utxos,
         cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
-    )?
-    .map(|r| r.nonce())
-    .transpose()?;
-    let wallet_utxos =
-        heimdall::cardano::nonce_reservation::mark_reserved(wallet_utxos, reserved_outpoint);
+    )?;
     // In request mode the nonce is resolved at step 1 instead, AFTER every
     // read-only check: resolving it there can submit a reservation transaction,
     // and the point of step 1 is that nothing is spent until the command has
@@ -7739,6 +7841,14 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let config_view = rt
         .block_on(config_view_async(cfg))?
         .ok_or("register-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
+    // spec [CFG-10]: while a registry migration is in progress the identity root
+    // commits to BOTH lists, so the absence proof has to be built against both.
+    let previous_registry = rt.block_on(previous_registry_utxos(
+        &config_view.params,
+        &base_url,
+        pid,
+        network == pallas_addresses::Network::Mainnet,
+    ))?;
 
     let req = RegisterSpoRequest {
         registry_script: &registry,
@@ -7752,6 +7862,9 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         config_ref: (config_view.utxo.tx_hash.clone(), config_view.utxo.index),
         registry_utxos: &registry_utxos,
         treasury_utxos: &treasury_utxos,
+        previous_registry: previous_registry
+            .as_ref()
+            .map(|(p, u)| (p.as_str(), u.as_slice())),
         wallet_address: &wallet_addr,
         wallet_utxos: &wallet_utxos,
         key: &key,
@@ -7929,13 +8042,10 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
     let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
     // Flag any reserved nonce UTxO so fee and collateral selection leave it
     // alone for the rest of this run ([DRG-6]).
-    let reserved_outpoint = heimdall::cardano::nonce_reservation::NonceReservation::load_or_none(
+    let wallet_utxos = heimdall::cardano::nonce_reservation::mark_from_state_dir(
+        wallet_utxos,
         cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
-    )?
-    .map(|r| r.nonce())
-    .transpose()?;
-    let wallet_utxos =
-        heimdall::cardano::nonce_reservation::mark_reserved(wallet_utxos, reserved_outpoint);
+    )?;
     let registry_utxos = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
         .map_err(|e| format!("registry UTxO query: {e}"))?;
@@ -8001,6 +8111,14 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
     let config_view = rt
         .block_on(config_view_async(cfg))?
         .ok_or("deregister-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
+    // spec [CFG-10]: as for register-spo — the identity root commits to both
+    // lists while a migration is in progress, so the removal proof needs both.
+    let previous_registry = rt.block_on(previous_registry_utxos(
+        &config_view.params,
+        &base_url,
+        pid,
+        network == pallas_addresses::Network::Mainnet,
+    ))?;
 
     // A leaving pool is already in the registry, so its id can always be found
     // here — by the bifrost key this node runs on, the same lookup `doctor`
@@ -8108,6 +8226,9 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         config_ref: (config_view.utxo.tx_hash.clone(), config_view.utxo.index),
         registry_utxos: &registry_utxos,
         treasury_utxos: &treasury_utxos,
+        previous_registry: previous_registry
+            .as_ref()
+            .map(|(p, u)| (p.as_str(), u.as_slice())),
         wallet_address: &wallet_addr,
         wallet_utxos: &wallet_utxos,
         key: &key,

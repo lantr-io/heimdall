@@ -13,10 +13,10 @@ derives a policy id no deployment has and reads an empty registry.
 | | |
 |---|---|
 | upstream | `FluidTokens/ft-bifrost-bridge` |
-| commit | `9508705476f9a7d7ccccdd813864779377212e89` |
+| commit | `096f76c22e7e6143ec2ae26603061fc3aa32208f` |
 | path | `onchain/plutus.json` |
 | aiken | `v1.1.23+8949565` (from the blueprint preamble) |
-| sha256 | `22d4bf6f839d61fa3a746043a43b8259609ceb98087a2e31a805b92b9802fdbb` |
+| sha256 | `a13e9161539dcf58dcbda1902e5cf276e4d6b8e6ed0e344c31597a94eb90962c` |
 
 ## Refreshing it
 

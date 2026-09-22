@@ -46,7 +46,7 @@ pub const EMBEDDED_BLUEPRINT: &str = include_str!("../../assets/plutus.json");
 /// The upstream commit `EMBEDDED_BLUEPRINT` was taken from, for `--version` and
 /// for the startup report — so a node can say which contracts it speaks without
 /// anyone diffing a 400 kB file.
-pub const EMBEDDED_BLUEPRINT_COMMIT: &str = "9508705476f9a7d7ccccdd813864779377212e89";
+pub const EMBEDDED_BLUEPRINT_COMMIT: &str = "096f76c22e7e6143ec2ae26603061fc3aa32208f";
 
 /// The blueprint to derive scripts from: the operator's file when one is named,
 /// the embedded copy otherwise.
@@ -430,9 +430,15 @@ pub fn fault_verifier_equivocation_script(
 ///
 /// 1. `config_policy_id` — the Config NFT policy id. REPLACED
 ///    `registration_script_hash` in rev 5.6 ([PRE-5]): the validator now reads
-///    the registry policy from Config #9 at run time, so a registry revision no
-///    longer makes a new ban policy, a fresh `ban-root` and a Config #8 move.
-///    Config #8 pays for that swap once, with the rev-5.6 deployment.
+///    the registry policy from Config #9 at run time, which removes the DIRECT
+///    dependency of this hash on the registry's.
+///
+///    Not the transitive one. Parameter 2 below is the fault-verifier policies,
+///    and each of those takes the registry policy as its own compile parameter
+///    — so this hash is still a function of the registry hash by way of them,
+///    and a later registry revision will still move the ban policy, strand live
+///    bans and need a Config #8 move. Ending that means the fault verifiers
+///    reading #9 from the Config too.
 /// 2. `fault_proof_policy_ids` — the authorized fault-verifier policies. The
 ///    contract's `ban_config_ok` requires **exactly 3, all distinct**, and the
 ///    hash is order-sensitive, so pass them in the exact deployment order.
@@ -747,22 +753,22 @@ mod embedded_blueprint_tests {
         );
         assert_eq!(
             registry.hash_hex(),
-            "c5e156090a31a6758b2e8dd278f40a603f6f926b05b441040307c417",
+            "2910c959951a87646ca55735d907ec4943de34194ca508e7c1aa5980",
             "spos_registry"
         );
         assert_eq!(
             r1.hash_hex(),
-            "8aa81c055814b3ae4696c0c4dff18f4b1ca2ae5418a7e45b27172c14",
+            "54bfa34054fb9bbba4b75c95d714c87d19af3ca55d310aa9cf1a0474",
             "fault_verifier round1"
         );
         assert_eq!(
             r2.hash_hex(),
-            "0ffa58bf03d123946e99eaacef5c0e089e78f54c128fa7a0d20e5998",
+            "f657801501521f7e0fef9c5abf544a88da6033554bf0cf63dcc8d143",
             "fault_verifier round2"
         );
         assert_eq!(
             eq.hash_hex(),
-            "eb64db58374361c59009046d2da97722f9c3a1cb6636c8d1e63d705f",
+            "c6d20d41007783fdfa903665f56f55cf748425c3142cad5d3de7f539",
             "fault_verifier equivocation"
         );
     }
