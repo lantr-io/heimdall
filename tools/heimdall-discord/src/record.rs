@@ -307,9 +307,9 @@ mod tests {
 
     // The literals heimdall's own `logging` tests pin
     // (`event_lines_keep_the_shape_the_relay_parses`).
-    const JOURNAL_TEXT: &str = "<6>heimdall::event: [pool1zk3ns…q7wd epoch=307] key generation complete";
-    const PLAIN: &str =
-        "2026-09-05T10:00:00Z  INFO heimdall::event: [pool1zk3ns…q7wd epoch=307] key generation complete";
+    const JOURNAL_TEXT: &str =
+        "<6>heimdall::event: [pool1zk3ns…q7wd epoch=307] key generation complete";
+    const PLAIN: &str = "2026-09-05T10:00:00Z  INFO heimdall::event: [pool1zk3ns…q7wd epoch=307] key generation complete";
     const TRACING_JSON: &str = r#"{"timestamp":"2026-09-05T10:00:00Z","level":"INFO","fields":{"message":"[pool1zk3ns…q7wd epoch=307] key generation complete"},"target":"heimdall::event"}"#;
 
     fn event(level: Level, unit: Option<&str>) -> Record {
@@ -372,7 +372,10 @@ mod tests {
         assert_eq!(record.level, Level::Warn);
         assert_eq!(record.unit.as_deref(), Some("heimdall@spo1"));
         assert_eq!(record.target.as_deref(), Some("heimdall::epoch::dkg"));
-        assert_eq!(record.message, "[pool1zk3ns…q7wd epoch=307] key generation round 1: dropping the package from member #2");
+        assert_eq!(
+            record.message,
+            "[pool1zk3ns…q7wd epoch=307] key generation round 1: dropping the package from member #2"
+        );
         assert!(!record.is_event());
     }
 
