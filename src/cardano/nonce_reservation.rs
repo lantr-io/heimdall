@@ -288,6 +288,21 @@ mod tests {
         NonceOutpoint::new([seed; 32], index)
     }
 
+    /// A raw Blockfrost UTxO, so the lenient path can be exercised on a wallet
+    /// that actually has something in it.
+    fn bf_ada_utxo(tx_hash: &str, index: u32, lovelace: u64) -> crate::cardano::bf_http::BfUtxo {
+        crate::cardano::bf_http::BfUtxo {
+            tx_hash: tx_hash.to_string(),
+            output_index: index,
+            amount: vec![crate::cardano::bf_http::BfAmount {
+                unit: "lovelace".into(),
+                quantity: lovelace.to_string(),
+            }],
+            inline_datum: None,
+            reference_script_hash: None,
+        }
+    }
+
     fn utxo(seed: u8, index: u32) -> WalletUtxo {
         WalletUtxo {
             tx_hash: hex::encode([seed; 32]),
@@ -401,9 +416,19 @@ mod tests {
         // The command variant refuses, which is right where an operator is
         // about to make a trip to a safe.
         assert!(mark_from_state_dir(vec![utxo(1, 0)], Some(&dir)).is_err());
-        // The daemon carries on with nothing marked.
-        let set = wallet_set_lenient(&[], Some(&dir));
-        assert!(set.is_empty());
+        // The daemon carries on WITH THE WALLET — that is the property, and an
+        // empty input slice cannot check it: an implementation that returned
+        // `Vec::new()` on a parse error would pass, and every daemon path would
+        // then fail with "no wallet UTxO available for the fee input", which is
+        // the liveness failure this function exists to prevent.
+        let raw = [bf_ada_utxo(&hex::encode([1u8; 32]), 0, 9_000_000)];
+        let set = wallet_set_lenient(&raw, Some(&dir));
+        assert_eq!(set.len(), 1, "the wallet comes back intact");
+        assert!(
+            !set[0].reserved,
+            "and unmarked — there is nothing to protect"
+        );
+        assert_eq!(set[0].lovelace, 9_000_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

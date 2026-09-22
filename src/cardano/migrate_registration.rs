@@ -74,6 +74,95 @@ pub enum MembershipState {
     AlreadyLeft,
 }
 
+/// How many migrated-and-then-exited pools the window check will account for.
+///
+/// Normally zero: `build_deregister_spo_tx` refuses an exit by a migrated pool
+/// mid-window precisely because it strands everyone's registry changes, so the
+/// only way to produce one is the deliberate `--allow-during-migration`. Two is
+/// room for that having been used, twice, with the roster's agreement.
+///
+/// It is bounded because the search is over subsets: unbounded would be both
+/// slow and a licence to explain away any list at all, which is the opposite of
+/// what the check is for.
+pub const MAX_DEPARTED: usize = 2;
+
+/// Which bindings the Treasury state's identity root says are GONE, out of the
+/// ones only the previous list still carries.
+///
+/// This is what makes the migration window verifiable rather than merely
+/// tolerated. `Migrate` does not move the root, so during a window the root
+/// commits to the union of the two lists — except for pools that migrated and
+/// then exited, whose binding the exit deleted while their frozen old node
+/// stayed behind. Those are the only legitimate reason the union can fail to
+/// rebuild the root.
+///
+/// So: try dropping each subset of the previous-only bindings, smallest first,
+/// up to [`MAX_DEPARTED`]. `Some(set)` means the list IS explained — every
+/// element of the current list is accounted for by the root, which is the
+/// property the check exists to establish. `None` means it is not, and the
+/// caller must treat that as it treats any root mismatch: a list that does not
+/// match the chain's own record of who is registered.
+///
+/// The security this preserves: a fabricated element added to the CURRENT list
+/// appears in every candidate subset, so no subset can match. Accepting the
+/// union unconditionally — the first version of this — would have admitted one.
+#[must_use]
+pub fn departed_bindings(
+    union: &[crate::cardano::register_spo::IdentityPair],
+    previous_only_pks: &[Vec<u8>],
+    treasury_root: mpf::Hash,
+) -> Option<std::collections::BTreeSet<Vec<u8>>> {
+    let root_of = |dropped: &std::collections::BTreeSet<Vec<u8>>| -> Option<mpf::Hash> {
+        let kept: Vec<_> = union
+            .iter()
+            .filter(|(pk, _)| !dropped.contains(pk))
+            .cloned()
+            .collect();
+        mpf::Trie::from_pairs(kept).ok().map(|t| t.root_hash())
+    };
+
+    // Smallest first: no departures is the normal answer, and the answer that
+    // needs no explaining.
+    let none = std::collections::BTreeSet::new();
+    if root_of(&none) == Some(treasury_root) {
+        return Some(none);
+    }
+    // Sizes 1 and 2, written as the two nested loops they are. MAX_DEPARTED is
+    // 2 because an exit mid-window takes a deliberate override, so a general
+    // subset enumeration would be machinery nobody can check for a case nobody
+    // should reach.
+    const _: () = assert!(MAX_DEPARTED == 2, "the loops below enumerate sizes 1 and 2");
+    for (i, a) in previous_only_pks.iter().enumerate() {
+        let one: std::collections::BTreeSet<Vec<u8>> = [a.clone()].into_iter().collect();
+        if root_of(&one) == Some(treasury_root) {
+            return Some(one);
+        }
+        for b in previous_only_pks.iter().skip(i + 1) {
+            let two: std::collections::BTreeSet<Vec<u8>> =
+                [a.clone(), b.clone()].into_iter().collect();
+            if root_of(&two) == Some(treasury_root) {
+                return Some(two);
+            }
+        }
+    }
+    None
+}
+
+/// The identity keys only the PREVIOUS list carries — the candidates for having
+/// migrated and then left.
+#[must_use]
+pub fn previous_only_pks(current: &RegistryList, previous: &RegistryList) -> Vec<Vec<u8>> {
+    let in_current: std::collections::BTreeSet<Vec<u8>> = current
+        .iter()
+        .map(|(_, data)| data.bifrost_id_pk.clone())
+        .collect();
+    previous
+        .iter()
+        .map(|(_, data)| data.bifrost_id_pk.clone())
+        .filter(|pk| !in_current.contains(pk))
+        .collect()
+}
+
 /// Classify one Bifrost identity key against the two lists.
 ///
 /// `previous` is `None` when Config #13 is unset — no migration is in progress,
@@ -117,16 +206,19 @@ pub fn classify_against_root(
     let Some(pool_id) = previous.and_then(find) else {
         return MembershipState::NotRegistered;
     };
-    // Does dropping this pool's binding make the union rebuild the treasury's
-    // root? If so the treasury no longer holds it, which only happens after an
-    // exit under the new registry.
-    if let Some((union, root)) = identity_root {
-        let without: Vec<(Vec<u8>, Vec<u8>)> = union
-            .iter()
-            .filter(|(pk, _)| pk.as_slice() != bifrost_id_pk)
-            .cloned()
-            .collect();
-        if mpf::Trie::from_pairs(without).is_ok_and(|t| t.root_hash() == root) {
+    // Is this pool among the bindings the treasury root says are gone?
+    //
+    // Through the same subset search the roster read uses, not a one-off "drop
+    // just me" test: with TWO pools already migrated-and-left, dropping only
+    // this one never rebuilds the root, so both would read as migratable and
+    // both would warn and fail a build at every restart.
+    if let Some((union, root)) = identity_root
+        && let Some(previous) = previous
+    {
+        let candidates = previous_only_pks(current, previous);
+        if departed_bindings(union, &candidates, root)
+            .is_some_and(|departed| departed.contains(bifrost_id_pk))
+        {
             return MembershipState::AlreadyLeft;
         }
     }

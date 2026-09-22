@@ -1329,8 +1329,10 @@ previous registry policy, and carries the registration across by itself — no c
 the safe, no `register-spo`. The transaction it posts proves your existing binding against the
 identity record the bridge already holds; it reproduces what your pool consented to and can change
 nothing else, which is why it needs no signature and why anyone may submit it for anyone. Expect
-one `warn` line naming the two policies, and `registry migrating <old> -> <new>` on `heimdall
-status` until it lands.
+one `warn` line naming the two policies, and a `migration  migrating <old> -> <new>` line on
+`heimdall status` until it lands. That is its own key: `registry` on the line above is the roster
+summary, and the two are deliberately separate so a scraper keying on the first column does not
+collapse them.
 
 You may also find yourself already migrated: the federation carries every pool that has not moved
 shortly after the governance update, so the roster is complete regardless of when each operator
@@ -1341,8 +1343,9 @@ Two things worth knowing rather than doing:
 
 - `heimdall migrate-registration` runs it by hand, and `--no-auto-migrate` on `run-spo` turns the
   automatic version off. Neither is needed in the normal case. Until a migration lands the node is
-  outside the roster, and `/health` says so — `migration migrating <old> -> <new>` while it is in
-  flight, `migration migrated <old> -> <new>` once it confirms.
+  outside the roster, and both surfaces say so. `heimdall status` prints a `migration` line,
+  `migrating <old> -> <new>` while it is in flight and `migrated <old> -> <new>` once it confirms;
+  `/health` is JSON and carries the same text under `registry_migration`.
 - Joining and leaving both keep working during a migration, and `doctor` step 6 reports an
   un-migrated node as a Warn rather than a Fail so the daemon starts and fixes it. If you try to
   leave before crossing, the command says to migrate first.

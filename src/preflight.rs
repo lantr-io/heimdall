@@ -954,6 +954,25 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             snapshot.spos.len()
                         ),
                     );
+                } else if let Some(y_fed) = federation_y_fed.as_deref() {
+                    // Checked BEFORE the migration arms. A Phase-1 federation
+                    // member is not a pool and never registers, so telling it
+                    // the previous registry could not be read is advice that
+                    // does not apply to it.
+                    b.push(
+                        6,
+                        "registration status",
+                        Status::Pass,
+                        format!(
+                            "not registered, and does not need to be – this node is a \
+                             FEDERATION member, not a Cardano pool: it holds a share of the \
+                             bridge's y_federation {y_fed}. Registration is how a pool joins \
+                             the roster and does not apply here; whether the federation has \
+                             work THIS epoch is re-read from chain every epoch, not decided at \
+                             startup ({} SPOs registered so far)",
+                            snapshot.spos.len()
+                        ),
+                    );
                 } else if let Err(e) = &migratable_pool_id {
                     // Could not tell whether this pool is merely on the wrong
                     // side of a migration. Warn, not Fail: a provider blip must
@@ -989,29 +1008,12 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             hex::encode(pool_id)
                         ),
                     );
-                } else if let Some(y_fed) = federation_y_fed.as_deref() {
-                    // WI-098. Registration is still the path to a roster seat,
-                    // and step 6 still fails for a node that is neither
-                    // registered nor a federation member. But this node is not a
-                    // pool at all: it holds a share of the bridge's y_federation,
-                    // and refusing to start it would idle the only party that can
-                    // move a treasury still locked under that key, on the grounds
-                    // that it had not joined a roster it was never eligible for.
-                    b.push(
-                        6,
-                        "registration status",
-                        Status::Pass,
-                        format!(
-                            "not registered, and does not need to be – this node is a \
-                             FEDERATION member, not a Cardano pool: it holds a share of the \
-                             bridge's y_federation {y_fed}. Registration is how a pool joins \
-                             the roster and does not apply here; whether the federation has \
-                             work THIS epoch is re-read from chain every epoch, not decided at \
-                             startup ({} SPOs registered so far)",
-                            snapshot.spos.len()
-                        ),
-                    );
                 } else {
+                    // WI-098 note, for the arm above: a federation member is not
+                    // a pool at all, and refusing to start it would idle the only
+                    // party that can move a treasury still locked under
+                    // y_federation, on the grounds that it had not joined a
+                    // roster it was never eligible for.
                     // Not a misconfiguration, and the message must not read like
                     // one: this is the state EVERY node is in until its operator
                     // registers it, and registering is a deliberate one-time act
@@ -1371,21 +1373,32 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     match crate::cardano::nonce_reservation::NonceReservation::load_or_none(
         cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
     ) {
-        // Fail, not Warn, and this is the right place for it: `run-spo`'s gate
-        // exits on a Fail, so an unreadable record stops the node HERE, where
-        // an operator is looking, rather than mid-epoch inside a treasury
-        // movement that has nothing to do with a registration. The daemon's own
-        // read is deliberately non-fatal for the same reason.
+        // Warn, not Fail — reversing an earlier call, on the grounds that the
+        // two failures are not the same size. `run-spo`'s gate exits on a Fail,
+        // so a Fail here takes a correctly-configured SIGNING node off the
+        // roster over a file that belongs to a registration flow: no DKG, no
+        // round-1 commitment, no co-signed movement, and a fault for the epoch.
+        // The thing it would protect is one operator's 2 ADA nonce.
+        //
+        // It is not silent: `wallet_set_lenient` warns on every daemon read
+        // that finds the record unreadable, and this line says the same on
+        // every `doctor`. And nothing in the tree cleans up an abandoned
+        // reservation, so a bumped `RESERVATION_STATE_VERSION` would otherwise
+        // stop every node that ever ran `register-spo` and changed its mind.
         Err(e) => b.push_fix(
             12,
             "nonce reservation",
-            Status::Fail,
-            format!("could not read the nonce reservation ({e})"),
+            Status::Warn,
+            format!(
+                "could not read the nonce reservation ({e}) — no wallet UTxO is being held \
+                 back, so a signature at a cold key right now is unprotected"
+            ),
             "the file records which wallet UTxO a pending registration or exit signature is \
              bound to, and a record this build cannot read is one it cannot protect. If no \
              signature is in flight, delete `nonce-reservation.json` from the state dir. If \
              one is, read its `nonce_outpoint` out of the signed file and pass it as \
-             `--nonce-utxo` instead.",
+             `--nonce-utxo` instead — the register and exit commands tolerate an unreadable \
+             record on that path precisely so this is possible.",
         ),
         Ok(None) => b.push(
             12,
@@ -1454,23 +1467,63 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                                 now.saturating_sub(rec.created_at)
                             ),
                         ),
-                        MissingNonce::Spent => b.push_fix(
-                            12,
-                            "nonce reservation",
-                            Status::Warn,
-                            format!(
-                                "{} is reserved for a pending {} but is no longer an unspent \
-                                 UTxO of this wallet. Any signature made against it is used \
-                                 up: the outpoint is what makes it single-use ([REG-10], \
-                                 [DRG-6]), and the transaction that would carry it can no \
-                                 longer be built",
-                                rec.outpoint, rec.action
-                            ),
-                            "Delete `nonce-reservation.json` from the state dir and run \
-                             `heimdall register-spo` (or `deregister-spo`) again: it reserves \
-                             a fresh UTxO and writes a new request. The file already at the \
-                             cold key cannot be used — take the new one.",
-                        ),
+                        // A spent nonce has two very different meanings, and
+                        // step 6 has already worked out which: if this pool is
+                        // now in the state the reservation was FOR, the
+                        // transaction it belonged to landed — after the
+                        // command's own five-minute wait gave up — and the
+                        // record is stale bookkeeping, not a dead signature.
+                        // Telling that operator to re-register would send them
+                        // into AlreadyRegistered, or back to the safe for a
+                        // signature nobody needs.
+                        MissingNonce::Spent => {
+                            let registered = bifrost_pk.is_some_and(|pk| {
+                                snapshot.as_ref().is_some_and(|s| {
+                                    s.as_ref().is_ok_and(|snap| {
+                                        snap.spos.iter().any(|x| x.bifrost_id_pk == pk)
+                                    })
+                                })
+                            });
+                            let done = match rec.action {
+                                crate::cardano::airgap::Action::Register => registered,
+                                crate::cardano::airgap::Action::Deregister => !registered,
+                            };
+                            if done {
+                                b.push_fix(
+                                    12,
+                                    "nonce reservation",
+                                    Status::Warn,
+                                    format!(
+                                        "{} is a leftover: its {} landed (step 6 agrees), and \
+                                         the transaction spent the nonce. Nothing is wrong \
+                                         with this node",
+                                        rec.outpoint, rec.action
+                                    ),
+                                    "Delete `nonce-reservation.json` from the state dir. The \
+                                     command's confirmation wait timed out before the \
+                                     transaction landed, so the record was never cleared.",
+                                );
+                            } else {
+                                b.push_fix(
+                                    12,
+                                    "nonce reservation",
+                                    Status::Warn,
+                                    format!(
+                                        "{} is reserved for a pending {} but is no longer an \
+                                         unspent UTxO of this wallet, and step 6 does not show \
+                                         that {} as done. Any signature made against it is \
+                                         used up: the outpoint is what makes it single-use \
+                                         ([REG-10], [DRG-6])",
+                                        rec.outpoint, rec.action, rec.action
+                                    ),
+                                    "Delete `nonce-reservation.json` from the state dir and \
+                                     run `heimdall register-spo` (or `deregister-spo`) again: \
+                                     it reserves a fresh UTxO and writes a new request. The \
+                                     file already at the cold key cannot be used — take the \
+                                     new one.",
+                                );
+                            }
+                        }
                     }
                 }
             }

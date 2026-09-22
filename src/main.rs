@@ -3346,10 +3346,14 @@ async fn run_spo(
         // finish the sentence. Without this the line reads "migrating" for the
         // life of the process — including long after it landed — and the
         // "migrated" state the operator guide describes is never reached.
-        if let (Some(pool_id), Some(watch)) = (migration.pending, migration.watch) {
+        if let Some(pending) = migration.pending {
+            let PendingMigration {
+                pool_id,
+                settled,
+                watch,
+            } = pending;
             let watch_health = health.clone();
             let watch_cfg = cfg.clone();
-            let settled = migration.settled;
             tokio::spawn(async move {
                 // Watch, and RETRY. One attempt was not enough: an anchor race
                 // is the expected failure when several nodes restart together
@@ -3405,6 +3409,20 @@ async fn run_spo(
                         Err(e) => warn!("registry migration retry {attempt}: {e}"),
                     }
                 }
+                // One last look before declaring anything. `landed` returns
+                // false on ANY read failure, so a provider outage across the
+                // whole window looks identical to a migration that never
+                // happened — and overwriting the line on that basis would
+                // report a pool that IS registered as one that is not, which is
+                // the confusion this watcher exists to remove.
+                if watch.landed(&pool_id).await {
+                    info!(
+                        pool_id = %hex::encode(&pool_id),
+                        "registry migration confirmed on the final check"
+                    );
+                    watch_health.update(|h| h.registry_migration = Some(settled.clone()));
+                    return;
+                }
                 warn!(
                     pool_id = %hex::encode(&pool_id),
                     "registry migration still has not landed after {ATTEMPTS} attempts. This \
@@ -3413,9 +3431,28 @@ async fn run_spo(
                      may run it for anyone"
                 );
                 watch_health.update(|h| {
-                    h.registry_migration =
-                        Some("migration not landed after 6 attempts — see the log".to_string());
+                    h.registry_migration = Some(
+                        "migration not landed after 6 attempts — still watching; see the log"
+                            .to_string(),
+                    );
                 });
+                // Keep watching, quietly and slowly. The federation's `--all`
+                // pass or another operator can land this pool at any time, and
+                // a watcher that exited would leave the line above standing for
+                // the life of the process — indistinguishable from a pool that
+                // never migrated at all.
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    if watch.landed(&pool_id).await {
+                        info!(
+                            pool_id = %hex::encode(&pool_id),
+                            "registry migration landed after all — this node is in the current \
+                             registry"
+                        );
+                        watch_health.update(|h| h.registry_migration = Some(settled.clone()));
+                        return;
+                    }
+                }
             });
         }
     }
@@ -7547,27 +7584,60 @@ fn run_migrate_registration(cfg: &HeimdallConfig, all: bool, submit: bool) -> Re
 struct MigrationHealth {
     /// What `/health` and `heimdall status` say now.
     state: String,
-    /// The pool whose migration is in flight, if one is. While this is `Some`,
-    /// `state` is provisional and a watcher replaces it with `settled` once the
-    /// transaction confirms.
-    pending: Option<Vec<u8>>,
+    /// Set when `state` is PROVISIONAL: a migration is in flight and a watcher
+    /// will replace the line once it lands.
+    ///
+    /// One field, not three Options. The previous shape let a failed
+    /// `MigrationWatch` construction be silently dropped by a tuple pattern,
+    /// which left `/health` advertising "migrating, retrying" for the life of
+    /// the process with nothing retrying and nothing able to replace the
+    /// string. A single `Option` makes that a case the constructor has to
+    /// answer.
+    pending: Option<PendingMigration>,
+}
+
+/// A migration in flight, and everything needed to finish reporting it.
+struct PendingMigration {
+    pool_id: Vec<u8>,
     /// What to say once it lands.
     settled: String,
-    /// The one address the watcher polls. Carried rather than re-derived for
-    /// the reason [`MigrationWatch`] gives, and so the poll costs one query
-    /// instead of a full context rebuild — 360 of those, at 7-9 requests each,
-    /// would be thousands of provider calls per node start.
-    watch: Option<MigrationWatch>,
+    /// The one address the watcher polls. Carried rather than re-derived, and
+    /// so the poll costs one query instead of a full context rebuild — 360 of
+    /// those, at 7-9 requests each, would be thousands of provider calls per
+    /// node start.
+    watch: MigrationWatch,
 }
 
 impl MigrationHealth {
     /// A report that will not change without a restart.
     fn settled(state: String) -> Self {
         Self {
-            settled: state.clone(),
             state,
             pending: None,
-            watch: None,
+        }
+    }
+
+    /// A migration in flight — or, when the watch could not be built, a settled
+    /// report that says so instead of a provisional one nothing will finish.
+    fn in_flight(
+        state: String,
+        settled: String,
+        pool_id: Vec<u8>,
+        watch: Result<MigrationWatch, String>,
+    ) -> Self {
+        match watch {
+            Ok(watch) => Self {
+                state,
+                pending: Some(PendingMigration {
+                    pool_id,
+                    settled,
+                    watch,
+                }),
+            },
+            Err(e) => {
+                warn!("registry migration: cannot watch for confirmation ({e})");
+                Self::settled(format!("{state}; not watched ({e})"))
+            }
         }
     }
 }
@@ -7628,24 +7698,21 @@ async fn auto_migrate_registration(
     let pk = keypair.x_only_public_key().0.serialize();
     let union = ctx.union_identity_pairs().ok();
     let root = ctx.identity_root().ok();
-    let pool_id = match classify_against_root(
-        &pk,
-        &current,
-        Some(&previous),
-        union.as_deref().zip(root),
-    ) {
-        MembershipState::Current | MembershipState::NotRegistered => return None,
-        // Gone by choice. Reporting it as migratable would warn and fail a
-        // build at every restart until Config #13 is cleared, about a pool that
-        // is exactly where its operator put it.
-        MembershipState::AlreadyLeft => {
-            return Some(MigrationHealth::settled(
-                "left the bridge under the current registry; the previous list still holds an                  inert node"
-                    .to_string(),
-            ));
-        }
-        MembershipState::Migratable { pool_id } => pool_id,
-    };
+    let pool_id =
+        match classify_against_root(&pk, &current, Some(&previous), union.as_deref().zip(root)) {
+            MembershipState::Current | MembershipState::NotRegistered => return None,
+            // Gone by choice. Reporting it as migratable would warn and fail a
+            // build at every restart until Config #13 is cleared, about a pool that
+            // is exactly where its operator put it.
+            MembershipState::AlreadyLeft => {
+                return Some(MigrationHealth::settled(
+                    "left the bridge under the current registry; the previous list still \
+                 holds an inert node"
+                        .to_string(),
+                ));
+            }
+            MembershipState::Migratable { pool_id } => pool_id,
+        };
 
     let from = &ctx.previous_policy_hex;
     let to = ctx.registry.hash_hex();
@@ -7675,12 +7742,12 @@ async fn auto_migrate_registration(
             // Watched: the line must not still say "migrating" an hour after
             // it landed, and the "migrated" state this reports is otherwise one
             // no code path ever produces.
-            Some(MigrationHealth {
-                state: format!("migrating {from} -> {to}"),
-                pending: Some(pool_id.clone()),
-                settled: format!("migrated {from} -> {to}"),
-                watch: ctx.watch(cfg).ok(),
-            })
+            Some(MigrationHealth::in_flight(
+                format!("migrating {from} -> {to}"),
+                format!("migrated {from} -> {to}"),
+                pool_id.clone(),
+                ctx.watch(cfg),
+            ))
         }
         Err(e) => {
             // An anchor race is the expected failure when several pools migrate
@@ -7694,12 +7761,12 @@ async fn auto_migrate_registration(
                  it lands this node is outside the roster; `heimdall migrate-registration` \
                  does it by hand, and anyone may run it"
             );
-            Some(MigrationHealth {
-                state: format!("migrating {from} -> {to} (first attempt failed, retrying)"),
-                pending: Some(pool_id.clone()),
-                settled: format!("migrated {from} -> {to}"),
-                watch: ctx.watch(cfg).ok(),
-            })
+            Some(MigrationHealth::in_flight(
+                format!("migrating {from} -> {to} (first attempt failed, retrying)"),
+                format!("migrated {from} -> {to}"),
+                pool_id.clone(),
+                ctx.watch(cfg),
+            ))
         }
     }
 }
@@ -7776,6 +7843,9 @@ fn resolve_nonce(
     override_utxo: Option<&str>,
     action: heimdall::cardano::airgap::Action,
     request_mode: bool,
+    // A cold signature is already in hand — the return leg of an air-gapped
+    // round trip, where the nonce is not this run's to choose.
+    returning_signature: bool,
     submit_reservation: bool,
 ) -> Result<heimdall::cardano::tx_common::NonceOutpoint, String> {
     use heimdall::cardano::bf_http;
@@ -7815,6 +7885,24 @@ fn resolve_nonce(
     if let Some(rec) = &existing
         && rec.action != action
     {
+        // A spent outpoint reserves nothing, so blocking the opposite command
+        // over it is an explanation that is not true — and the remedy it
+        // suggests ("finish the register first") is a command that now fails
+        // with AlreadyRegistered. Say what is actually wrong.
+        if let Ok(held) = rec.nonce()
+            && !still_unspent(wallet_utxos, held)
+            && rec.why_missing(now_secs())
+                == heimdall::cardano::nonce_reservation::MissingNonce::Spent
+        {
+            return Err(format!(
+                "{} still records {held} for a pending {}, but that outpoint has been spent, so \
+                 it reserves nothing and no signature bound to it can be used. Delete {} and \
+                 run this {action} again",
+                record_path(),
+                rec.action,
+                record_path(),
+            ));
+        }
         return Err(format!(
             "{} reserves {} for a pending {}, and you are running a {action}. An outpoint is \
              spendable once, so one reservation cannot bind two signatures: whichever \
@@ -7918,8 +8006,23 @@ fn resolve_nonce(
     }
 
     if !request_mode {
-        // One machine: the fee input is the nonce. `build_register_spo_tx` and
-        // its exit twin recognise that case and do not add a second input.
+        // The one-machine flow — and ONLY that. A cold signature already in
+        // hand means the return leg of an air-gapped round trip, where the
+        // nonce was chosen when the request was written and is recorded. If the
+        // record is gone, adopting the wallet's richest UTxO here would build a
+        // transaction against an outpoint the signature does not name: with
+        // `--signed` that surfaces as a field-drift error that never mentions
+        // the remedy, and with `--cold-sig` as "cold signature invalid", which
+        // sends the operator back to the safe over a key that was never wrong.
+        if returning_signature {
+            return Err(format!(
+                "this run has a cold signature in hand but no record of the nonce it is bound \
+                 to — {} holds nothing. The signature names one outpoint and no other \
+                 transaction can carry it. Read `nonce_outpoint` out of the signed file and \
+                 pass it as `--nonce-utxo <txid>#<index>`",
+                record_path(),
+            ));
+        }
         let fee = heimdall::cardano::tx_common::select_fee(wallet_utxos, 3_000_000)?;
         let nonce = fee
             .outpoint()
@@ -7937,6 +8040,15 @@ fn resolve_nonce(
         .map_err(|e| format!("fetch cost models: {e}"))?;
     let built = build_nonce_reservation_tx(wallet_address, wallet_utxos, key, &Some(cost_models))?;
     println!("nonce utxo:        {} (new, 2 ADA)", built.outpoint);
+    // Recorded BEFORE the broadcast, as not-yet-submitted, and flipped after.
+    //
+    // The other order loses money and time on an ordinary network fault: the
+    // node accepts the transaction, the HTTP response is lost, `?` propagates,
+    // and no record is written — so the operator never learns the outpoint, the
+    // re-run creates a SECOND 2 ADA output, and the first is invisible to every
+    // selector and to `doctor`. Each flaky submit leaks another. Writing first
+    // is crash-safe and is the ordering `--no-submit-reservation` already has.
+    NonceReservation::new(built.outpoint, action, now_secs(), false).save(state_dir)?;
     if submit_reservation {
         // This is a chain write, and it happens on a command that has no
         // --submit (the request path forbids it). Say so before doing it, not
@@ -7946,6 +8058,7 @@ fn resolve_nonce(
         println!("                   pass --no-submit-reservation to broadcast it yourself.");
         let tx_id = submit_tx_blockfrost(cfg, project_id, &built.signed_tx_hex, rt)?;
         println!("nonce reserve tx:  {tx_id} submitted");
+        NonceReservation::new(built.outpoint, action, now_secs(), true).save(state_dir)?;
     } else {
         println!("nonce reserve tx:  NOT submitted (--no-submit-reservation)");
         println!("                   SUBMIT THIS before the signed file comes back — it is the");
@@ -7953,8 +8066,6 @@ fn resolve_nonce(
         println!("                   does not exist until it lands:");
         println!("                   {}", built.signed_tx_hex);
     }
-    NonceReservation::new(built.outpoint, action, now_secs(), submit_reservation)
-        .save(state_dir)?;
     Ok(built.outpoint)
 }
 
@@ -8145,6 +8256,9 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
             args.nonce_utxo.as_deref(),
             heimdall::cardano::airgap::Action::Register,
             false,
+            // The return leg: a cold signature is in hand, so the nonce it
+            // names is not this run's to choose.
+            true,
             !args.no_submit_reservation,
         )?)
     };
@@ -8386,6 +8500,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
             args.nonce_utxo.as_deref(),
             heimdall::cardano::airgap::Action::Register,
             true,
+            false,
             !args.no_submit_reservation,
         )?;
         let request = SigningRequest::register(
@@ -8452,6 +8567,27 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let config_view = rt
         .block_on(config_view_async(cfg))?
         .ok_or("register-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
+
+    // spec [PRE-4]: the registry this command derived from the EMBEDDED
+    // blueprint must be the one Config #9 names.
+    //
+    // This branch moves the registry policy, and the whole rollout has a window
+    // in which the two disagree: an operator who installs the new package
+    // before governance moves #9 derives the new, undeployed address, finds no
+    // root element there, and dies inside the list parser with "missing root" —
+    // with nothing naming the version skew, although the published policy id is
+    // right here. `migration_context` already makes this comparison; the two
+    // commands that an operator actually runs did not.
+    if registry.hash != config_view.params.registry.spos_registry_policy_id {
+        return Err(format!(
+            "this heimdall derives registry policy {} from its embedded contracts, but the \
+             bridge Config names {} at #9. Either this package is newer than the governance \
+             Update that moves #9 — wait for it — or it is older than the deployed registry, \
+             in which case upgrade",
+            registry.hash_hex(),
+            hex::encode(config_view.params.registry.spos_registry_policy_id),
+        ));
+    }
     // spec [CFG-10]: while a registry migration is in progress the identity root
     // commits to BOTH lists, so the absence proof has to be built against both.
     let previous_registry = rt.block_on(previous_registry_utxos(
@@ -8799,6 +8935,27 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
     let config_view = rt
         .block_on(config_view_async(cfg))?
         .ok_or("deregister-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
+
+    // spec [PRE-4]: the registry this command derived from the EMBEDDED
+    // blueprint must be the one Config #9 names.
+    //
+    // This branch moves the registry policy, and the whole rollout has a window
+    // in which the two disagree: an operator who installs the new package
+    // before governance moves #9 derives the new, undeployed address, finds no
+    // root element there, and dies inside the list parser with "missing root" —
+    // with nothing naming the version skew, although the published policy id is
+    // right here. `migration_context` already makes this comparison; the two
+    // commands that an operator actually runs did not.
+    if registry.hash != config_view.params.registry.spos_registry_policy_id {
+        return Err(format!(
+            "this heimdall derives registry policy {} from its embedded contracts, but the \
+             bridge Config names {} at #9. Either this package is newer than the governance \
+             Update that moves #9 — wait for it — or it is older than the deployed registry, \
+             in which case upgrade",
+            registry.hash_hex(),
+            hex::encode(config_view.params.registry.spos_registry_policy_id),
+        ));
+    }
     // spec [CFG-10]: as for register-spo — the identity root commits to both
     // lists while a migration is in progress, so the removal proof needs both.
     let previous_registry = rt.block_on(previous_registry_utxos(
@@ -8850,6 +9007,8 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         args.nonce_utxo.as_deref(),
         heimdall::cardano::airgap::Action::Deregister,
         request_mode,
+        // Not in request mode means a cold signature is already in hand.
+        !request_mode,
         !args.no_submit_reservation,
     )?;
 
@@ -11256,6 +11415,16 @@ fn run_sweep_pegins(
         // transaction; with nothing able to broadcast, the guard has no subject.
         chain = chain.with_submit_config(cfg.cardano.submit_oracle);
         chain = chain.with_validity_window(cfg.cardano.tm_validity_window_secs.unwrap_or(1800));
+        // The daemon's construction chains this and this one did not, so every
+        // wallet read here marked nothing — and unlike a collateral pick,
+        // `select_fee` SPENDS what it picks. A reserved nonce that happened to
+        // be the richest UTxO would have gone straight into a sweep.
+        chain = chain.with_state_dir(
+            cfg.protocol
+                .state_dir
+                .as_ref()
+                .map(std::path::PathBuf::from),
+        );
         let chain = rt.block_on(apply_tm_policy(chain, cfg, &bridge.tm_policy_id))?;
         // The data-availability hint describes the peg-outs of the tx being posted.
         // Under --existing-tm-hex the posted bytes are somebody ELSE'S transaction:

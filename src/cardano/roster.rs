@@ -294,30 +294,77 @@ pub fn registry_snapshot_during_migration(
     // identity root commits to is one rule, and a second copy of it here would
     // be a copy that can disagree with the builders about which proof is valid
     // — which is exactly the failure this whole path exists to avoid.
-    let trie_pairs = crate::cardano::register_spo::union_identity_pairs(
+    // An unreadable PREVIOUS list degrades to the strict check on the current
+    // one; it must not halt the node. Config #13 naming an address with no root
+    // element — a typo in a governance Update, a moved root NFT, an empty page
+    // from the provider — would otherwise abort every roster read on the bridge
+    // until a second Update fixed it. That is a worse outcome than the mismatch
+    // this whole path exists to tolerate, and the tolerance is what [CFG-10] is
+    // for. If the migration is in fact complete, the strict check passes and
+    // nothing is lost; if it is not, the mismatch below reports it honestly.
+    let trie_pairs = match crate::cardano::register_spo::union_identity_pairs(
         &list,
         previous.as_ref().map(|p| (p.policy_hex, p.utxos)),
-    )
-    .map_err(|e| RosterError::Config(e.to_string()))?;
-    let trie = mpf::Trie::from_pairs(trie_pairs).map_err(RosterError::Mpf)?;
+    ) {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            tracing::warn!(
+                "a registry migration is in progress but the previous registry list could not \
+                 be read ({e}), so the identity root is checked against the current list \
+                 alone. If pools are still crossing, that check will not match and the roster \
+                 read fails — fix Config #13 or the provider"
+            );
+            list.identity_pairs()
+        }
+    };
+    let trie = mpf::Trie::from_pairs(trie_pairs.clone()).map_err(RosterError::Mpf)?;
     let computed = trie.root_hash();
     if computed != treasury_state.datum.bifrost_identity_root {
-        if previous.is_none() {
+        let Some(prev) = &previous else {
             return Err(RosterError::RootMismatch {
                 datum: treasury_state.datum.bifrost_identity_root,
                 computed,
             });
-        }
-        // Inside a declared migration window. The one shape that produces this
-        // is a pool that migrated and then exited, leaving its frozen old-list
-        // node behind; say so rather than halt.
-        tracing::warn!(
-            datum = %hex::encode(treasury_state.datum.bifrost_identity_root),
-            computed = %hex::encode(computed),
-            "identity root does not match the union of the old and new registry lists. \
-             A registry migration is in progress (Config #13), and a pool that migrated and \
-             then exited leaves its old-list node behind, which is the expected cause. The \
-             roster is taken from the list Config #9 names, as always."
+        };
+        // Inside a declared migration window — and still a HARD check, which is
+        // the point of doing the work rather than warning.
+        //
+        // The one legitimate reason the union can fail to rebuild the root is a
+        // pool that migrated and then exited: the exit deleted its binding while
+        // its frozen old-list node stayed. So ask whether some small set of
+        // departures explains the difference. If one does, the current list is
+        // accounted for by the chain's own record and the read is as trustworthy
+        // as it is outside a window. If none does, this is a list the Treasury
+        // state does not vouch for, and it is refused exactly as before.
+        //
+        // The first version of this warned and returned the list anyway. That
+        // turned the only off-chain proof that a Blockfrost response has not
+        // been tampered with into a log line, for an unbounded window — a
+        // fabricated element carrying an attacker's bifrost_id_pk would have
+        // been admitted straight into the DKG candidate set.
+        let prev_elements = find_registry_utxos(prev.utxos, prev.policy_hex)?;
+        let prev_list = RegistryList::from_elements(
+            prev_elements
+                .iter()
+                .map(|u| (u.asset_name.clone(), u.element.clone())),
+        )?;
+        let candidates = crate::cardano::migrate_registration::previous_only_pks(&list, &prev_list);
+        let Some(departed) = crate::cardano::migrate_registration::departed_bindings(
+            &trie_pairs,
+            &candidates,
+            treasury_state.datum.bifrost_identity_root,
+        ) else {
+            return Err(RosterError::RootMismatch {
+                datum: treasury_state.datum.bifrost_identity_root,
+                computed,
+            });
+        };
+        tracing::info!(
+            departed = departed.len(),
+            "a registry migration is in progress and {} pool(s) migrated and then left, which \
+             is what the identity root and the two lists differ by. The list is accounted for; \
+             the roster is taken from the list Config #9 names, as always",
+            departed.len(),
         );
     }
 

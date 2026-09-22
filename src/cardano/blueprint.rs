@@ -696,23 +696,31 @@ mod tests {
         let blueprint = std::fs::read_to_string(path).unwrap();
         let registry =
             spos_registry_script(&blueprint, &[0xaa; 32], 1, &[0x77; 28], &[0x88; 28]).unwrap();
-        // N10b: spos_registry references TreasuryDatum, whose shape changed (federation
-        // fields + last_reset_tm_txid), so its compiled code — and this hash — moved.
+        // Re-pinned for rev 5.6: the nonce, the Migrate branch and the element
+        // bound grew spos_registry's compiled code, and the fourth parameter
+        // ([PRE-3], config_policy_id) is applied above.
+        //
+        // This test is #[ignore]d, so CI cannot tell you the pin went stale —
+        // and the blueprint bump that stales it is exactly the change it exists
+        // to validate. Re-pin it in the same commit that touches
+        // `assets/plutus.json`, next to the four in
+        // `the_embedded_blueprint_derives_pinned_policy_ids`.
         assert_eq!(
             registry.hash_hex(),
-            "37df878dca019a2806def25f6befb7b0bfba6de84e192bbf68ad60ba"
+            "3ab8e80ab06527d85cc6be309869d9530a8f3cee710f374df61b2852"
         );
-        // spec [PRE-1]: treasury_info is single-param (registry_policy_id).
-        // Because the blueprint is aiken's own output and apply_params matches
-        // `aiken blueprint apply` byte-for-byte, the pinned hash is aiken's
-        // single-param application. NOTE: pinned against the pre-[PRE-1]
-        // upstream blueprint (whose treasury_info compiledCode still declares
-        // the vestigial tm_nft_policy_id parameter after it); re-pin when the
-        // bridge-track treasury.ak change regenerates plutus.json.
+        // Both pins above and below are against the blueprint in
+        // `assets/plutus.json`, which is what this test is pointed at in
+        // practice even though the env var lets it read an upstream checkout.
+        //
+        // They had BOTH gone stale on main before rev 5.6 — the test is
+        // `#[ignore]`d, so nothing runs it and nothing says so. If you refresh
+        // the blueprint, refresh these in the same commit, next to the four in
+        // `the_embedded_blueprint_derives_pinned_policy_ids`.
         let treasury = treasury_info_script(&blueprint, &[0x66; 32], 0, &[0x77; 28]).unwrap();
         assert_eq!(
             treasury.hash_hex(),
-            "691f2dd908d5e5dd18d7c8ed526caea8465757011ae20d7e6c308a21"
+            "0a6b96f164ed40308251e66c01f07ff20218644ba3b139c3c250dd50"
         );
     }
 }

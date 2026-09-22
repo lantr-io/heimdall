@@ -385,6 +385,40 @@ pub fn build_nonce_reservation_tx(
     let tx: Tx = minicbor::decode(&bytes).map_err(|e| format!("signed tx minicbor decode: {e}"))?;
     let tx_hash: [u8; 32] = *tx.transaction_body.compute_hash();
 
+    // Index 0 is a PREDICTION until something compares it, and this is the one
+    // prediction in the whole scheme that a cold key signs over. Every other
+    // index this design introduces is re-checked against the transaction that
+    // was actually built; this one rested on a comment. If whisky ever ordered
+    // the change output first, or folded the explicit output into change, the
+    // request file would name an outpoint that never exists — and the operator
+    // would come back from the safe to "the nonce UTxO is not in the wallet",
+    // which then reads as a spent nonce and a wasted signature.
+    let lovelace_of = |o: &pallas_primitives::conway::TransactionOutput| -> u64 {
+        match o {
+            pallas_primitives::conway::PseudoTransactionOutput::PostAlonzo(o) => match &o.value {
+                pallas_primitives::conway::Value::Coin(c) => *c,
+                pallas_primitives::conway::Value::Multiasset(c, _) => *c,
+            },
+            pallas_primitives::conway::PseudoTransactionOutput::Legacy(o) => match &o.amount {
+                pallas_primitives::alonzo::Value::Coin(c) => *c,
+                pallas_primitives::alonzo::Value::Multiasset(c, _) => *c,
+            },
+        }
+    };
+    let first = tx
+        .transaction_body
+        .outputs
+        .first()
+        .ok_or("the reservation transaction has no outputs")?;
+    let got = lovelace_of(first);
+    if got != NONCE_RESERVATION_LOVELACE {
+        return Err(format!(
+            "the reservation transaction's output 0 holds {got} lovelace, not the \
+             {NONCE_RESERVATION_LOVELACE} this reserves — the builder put something else \
+             first, so the outpoint a cold key would sign over is not the reserved one"
+        ));
+    }
+
     Ok(NonceReservationTx {
         signed_tx_hex,
         outpoint: NonceOutpoint { tx_hash, index: 0 },
