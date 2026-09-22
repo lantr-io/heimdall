@@ -6756,7 +6756,11 @@ async fn migration_context(cfg: &HeimdallConfig) -> Result<Option<MigrationConte
     };
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(None)?;
-    let registry_bootstrap = resolve_one_shot(cfg, None)?;
+    // Config #12, from the view just read. NOT `resolve_one_shot`: that helper
+    // builds its own tokio runtime and blocks on it, which panics when called
+    // from inside one — and this function runs on `run-spo`'s async startup
+    // path.
+    let registry_bootstrap = view.params.federation_one_shot.clone();
     let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
     let (treasury_bootstrap, config_policy_id) =
         heimdall::cardano::roster::treasury_derivation_inputs(
@@ -6891,14 +6895,12 @@ impl MigrationContext {
         Ok((current, previous))
     }
 
-    /// Build, and with `submit`, broadcast one pool's migration.
-    fn migrate(
+    /// Build one pool's migration transaction. Pure and synchronous — no chain
+    /// access, so it is safe to call from either an async or a blocking caller.
+    fn build(
         &self,
-        rt: &tokio::runtime::Runtime,
-        cfg: &HeimdallConfig,
         pool_id: &[u8],
-        submit: bool,
-    ) -> Result<MigrationOutcome, String> {
+    ) -> Result<heimdall::cardano::migrate_registration::MigrateRegistrationTx, String> {
         use heimdall::cardano::migrate_registration::{
             MigrateRegistrationRequest, build_migrate_registration_tx,
         };
@@ -6920,13 +6922,39 @@ impl MigrationContext {
             registry_ref: self.registry_ref.clone(),
             cost_models: Some(self.cost_models.clone()),
         };
-        let built = build_migrate_registration_tx(&req)
-            .map_err(|e| format!("build migrate_spo tx for {}: {e}", hex::encode(pool_id)))?;
+        build_migrate_registration_tx(&req)
+            .map_err(|e| format!("build migrate_spo tx for {}: {e}", hex::encode(pool_id)))
+    }
+
+    /// Build and, with `submit`, broadcast — for the blocking CLI caller.
+    fn migrate(
+        &self,
+        rt: &tokio::runtime::Runtime,
+        cfg: &HeimdallConfig,
+        pool_id: &[u8],
+        submit: bool,
+    ) -> Result<MigrationOutcome, String> {
+        let built = self.build(pool_id)?;
         if !submit {
             return Ok(MigrationOutcome::Built);
         }
         let tx_hash = submit_tx_blockfrost(cfg, &self.project_id, &built.signed_tx_hex, rt)?;
         Ok(MigrationOutcome::Migrated { tx_hash })
+    }
+
+    /// The same, for an async caller. Submits through the Blockfrost client
+    /// directly rather than through a nested runtime.
+    async fn migrate_async(&self, cfg: &HeimdallConfig, pool_id: &[u8]) -> Result<String, String> {
+        let built = self.build(pool_id)?;
+        let cbor = hex::decode(&built.signed_tx_hex).map_err(|e| e.to_string())?;
+        let mut settings = blockfrost::BlockFrostSettings::new();
+        if let Some(url) = cfg.cardano.blockfrost_url.as_deref() {
+            settings.base_url = Some(url.to_string());
+        }
+        blockfrost::BlockfrostAPI::new(&self.project_id, settings)
+            .transactions_submit(cbor)
+            .await
+            .map_err(|e| format!("blockfrost submit: {e}"))
     }
 }
 
@@ -7087,15 +7115,8 @@ async fn auto_migrate_registration(cfg: &HeimdallConfig, disabled: bool) -> Opti
         "a registry migration is in progress and this pool is still under the previous \
          registry ({from}). Carrying it across to {to} — no cold key is needed"
     );
-    // The builders are blocking and take their own runtime, as every other
-    // heimdall transaction builder does. `block_in_place` keeps that off the
-    // async worker. One transaction, once, before the daemon starts.
-    let built = tokio::task::block_in_place(|| {
-        let inner = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-        ctx.migrate(&inner, cfg, &pool_id, true)
-    });
-    match built {
-        Ok(MigrationOutcome::Migrated { tx_hash }) => {
+    match ctx.migrate_async(cfg, &pool_id).await {
+        Ok(tx_hash) => {
             info!(
                 pool_id = %hex::encode(&pool_id),
                 "registry migration submitted: {tx_hash}. It takes effect for the roster at the \
@@ -7103,7 +7124,6 @@ async fn auto_migrate_registration(cfg: &HeimdallConfig, disabled: bool) -> Opti
             );
             Some(format!("migrating {from} -> {to}"))
         }
-        Ok(MigrationOutcome::Built) => Some(format!("migrating {from} -> {to}")),
         Err(e) => {
             // An anchor race is the expected failure when several pools migrate
             // at once, including the federation's `--all` pass. Nothing is lost:
