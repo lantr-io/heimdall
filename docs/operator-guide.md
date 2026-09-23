@@ -1729,6 +1729,13 @@ and the Treasury state's identity record carries over untouched. So binocular's 
 the bridge does not change either: its own scripts (`config.ak`, the peg and TM validators) are the
 ones this bridge was deployed with, and they remain that version after the revision.
 
+**No cold key is needed at any step.** `Migrate` proves each pool's existing binding against the
+Treasury state's identity record and copies its registration across verbatim. Because it can only
+reproduce what the pool already signed, the contract accepts it with no signature, from anyone.
+A pool's cold key is next needed only to join or to leave, and then in the new request format:
+the signature is bound to one wallet UTxO. An exit file signed before the upgrade is refused
+("sign again: the message format changed"). Tell operators who are holding one.
+
 ### Before you start
 
 - **Two unspent wallet UTxOs** at the wallet that will deploy, called `R` and `B` below. Each new
