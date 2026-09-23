@@ -7,8 +7,9 @@ epoch's distributed key generation and co-signs Treasury Movements with FROST th
 This guide goes from a clean machine to a registered, running, monitored daemon. Follow it top to
 bottom — the order matters, and **registration is not part of starting**: a node that is installed,
 configured and enabled but never registered will run quietly forever and contribute nothing. The
-two appendices at the end are off that path: one for standing a bridge up rather than joining one,
-one for running a test bridge on a shorter cycle.
+three appendices at the end are off that path: one for standing a bridge up rather than joining one,
+one for carrying a running bridge across a registry revision, and one for running a test bridge on a
+shorter cycle.
 
 Done this before? The [Quick path](#quick-path) is the whole join on one screen, every block
 copy-pastable, each step linking to the section that explains it.
@@ -1324,7 +1325,11 @@ today. Finding that out while the old binary is still serving gives you a workin
 from.
 
 **A contracts release that revises the registry costs you nothing but this upgrade.** Install the
-package and restart. The node notices at startup that its membership token still sits under the
+package once the bridge's governance Update has moved the registry (the release announcement says
+when), and restart. Installing it earlier gains nothing: until the Update, the new package's
+`register-spo` and `deregister-spo` refuse with a message saying the package is newer than the
+bridge, and a node configured to publish fault proofs starts with that switched off (a `warn` line
+and doctor step 5 say so) until the Update lands and it is restarted. The node notices at startup that its membership token still sits under the
 previous registry policy, and carries the registration across by itself — no cold key, no trip to
 the safe, no `register-spo`. The transaction it posts proves your existing binding against the
 identity record the bridge already holds; it reproduces what your pool consented to and can change
@@ -1360,6 +1365,10 @@ Two things worth knowing rather than doing:
   was never enough.
 - Your old registration node stays in the old list with its min-ADA in it. Recovering that would
   need the old cold signature, and the old registry cannot accept one any more. Treat it as spent.
+
+The other half of a revision (deploying the new registry, the governance Update, carrying the
+stragglers across and closing the window) belongs to whoever runs the bridge. It is in
+[Appendix: carrying a bridge across a registry revision](#appendix-carrying-a-bridge-across-a-registry-revision).
 
 
 ### Leaving the bridge
@@ -1702,6 +1711,144 @@ with it, but say plainly what it means: **whoever holds that seed can sweep the 
 alone once the CSV delay passes.** A node holding both a seed and a ceremony share is refused —
 they are different keys locking different treasuries, and nothing can tell which one is this
 bridge's.
+
+---
+
+## Appendix: carrying a bridge across a registry revision
+
+**This is not part of running a node.** An SPO's whole part in a revision is in
+[Upgrades](#upgrades): install the package after the governance Update, restart, and the node
+carries itself across. This appendix is for the people who run the bridge, the ones holding the
+Config's update key and the federation wallet. It is the order in which the rest happens.
+
+A registry revision is a new `spos-registry.ak`, so a new membership-token policy, and with it a
+new `spo-bans.ak`. The three fault verifiers are compiled from the registry hash and the ban policy
+from theirs, so the ban list moves whenever the registry does. **Nothing else is redeployed.** The
+Config NFT, the treasury, the bridge state, the peg scripts and the TM chain stay where they are,
+and the Treasury state's identity record carries over untouched. So binocular's configuration for
+the bridge does not change either: its own scripts (`config.ak`, the peg and TM validators) are the
+ones this bridge was deployed with, and they remain that version after the revision.
+
+### Before you start
+
+- **Two unspent wallet UTxOs** at the wallet that will deploy, called `R` and `B` below. Each new
+  script is compiled from the outpoint its first transaction spends, so they must stay unspent
+  until steps 1 and 2 have used them. The bridge's original one-shot, Config #12, cannot be reused:
+  it was spent at genesis. It stays the treasury's.
+- **The new heimdall on the deploying machine**, and a binocular whose `update-config` has
+  `--migrate-registry-to`. Operators install the new heimdall only after step 3.
+- **A quiet stretch before an epoch boundary.** The roster is a snapshot of the list Config #9
+  names, taken at the boundary. Steps 3 and 4 should both be done before the next one, or the
+  pools that have not crossed yet are missing from that epoch's roster.
+- **A decision on every active ban.** The new ban list starts empty, and after step 3 the old one
+  is no longer read. A ban that must survive is re-applied in step 5.
+
+### Step 1 — deploy the new registry
+
+```bash
+heimdall bootstrap-registry  --config heimdall.toml --registry-bootstrap R --submit
+heimdall deploy-registry-ref --config heimdall.toml --registry-bootstrap R --submit
+```
+
+`--registry-bootstrap` names the registry's own one-shot. While the Config is readable it does
+not touch the treasury, whose one-shot stays #12, so the new registry is compiled against the
+treasury that already exists. Note the registry policy `bootstrap-registry` prints: it is the
+value for #9.
+
+### Step 2 — deploy its ban list
+
+```bash
+heimdall bootstrap-ban-list  --config heimdall.toml --registry-bootstrap R --ban-bootstrap B --submit
+heimdall deploy-fault-ref    --config heimdall.toml --registry-bootstrap R --kind round1 --submit
+heimdall deploy-fault-ref    --config heimdall.toml --registry-bootstrap R --kind round2 --submit
+heimdall deploy-fault-ref    --config heimdall.toml --registry-bootstrap R --kind equivocation --submit
+heimdall deploy-spo-bans-ref --config heimdall.toml --registry-bootstrap R --ban-bootstrap B \
+    --base-ban-duration-ms <…> --max-faults-before-permanent <…> --max-validity-window-ms <…> --submit
+heimdall init-scripts        --config heimdall.toml --registry-bootstrap R --ban-bootstrap B \
+    --base-ban-duration-ms <…> --max-faults-before-permanent <…> --max-validity-window-ms <…> --submit
+```
+
+`--registry-bootstrap R` makes `bootstrap-ban-list` take the fault-verifier policies from the new
+registry, and accept that #8 still names the old ban list. It prints the new ban policy, which is
+the value for #8. The three schedule values are the ones the Config already publishes;
+`heimdall show-config-params` prints them. `init-scripts` registers the new ban policy's withdraw
+credential, which every ban needs.
+
+Until step 3, none of this is read by anyone: the Config still names the old registry and ban list.
+
+### Step 3 — the governance Update
+
+One Update moves #9 and #8 and records where the pools are crossing from:
+
+```bash
+binocular update-config --migrate-registry-to <policy from step 1> \
+    --spo-bans-policy <policy from step 2> --dry-run
+```
+
+Read the dry run: it prints every field it changes. Expect exactly #9 (the new registry), #8 (the
+new ban list) and #13 (`previous_spos_registry_policy_id`, the registry #9 held until now). Then
+run it without `--dry-run`. #13 is taken from the datum rather than typed, so it cannot name the
+wrong list. The command refuses a registry move without `--spo-bans-policy`, and refuses to start a
+migration while another is still recorded.
+
+From this Update on, the bridge is in a **migration window**. Registrations and exits keep working,
+under the new registry, and every node checks the Treasury state's identity record against both
+lists.
+
+### Step 4 — carry every pool across
+
+```bash
+heimdall migrate-registration --config heimdall.toml --all --submit
+```
+
+This carries every pool still in the previous list, one transaction each, waiting for each to
+confirm: early in a migration they all insert at the same point of the new list, so submitting them
+together would land one and lose the rest. It needs no key and pays each new node's min-ADA. It is
+what makes the next roster complete whatever the operators do. A node that restarts on the new
+package first finds itself already registered; one that upgraded before this ran has carried itself
+across.
+
+Then tell operators to upgrade. If this command reports failures, run it again. Each migration is
+independent, and it skips what has already landed.
+
+### Step 5 — re-apply the bans that must survive
+
+Bans do not carry over. The old ban list is no longer read after step 3, and a ban on the new one
+needs a fault proof minted under the new fault verifiers. Re-apply the ones decided on before you
+started, with `heimdall fault-proof-mint` and `heimdall apply-ban`.
+
+### Step 6 — check that the roster came through whole
+
+- `heimdall show-roster` lists every pool under the new registry.
+- On each node, `heimdall status` shows `migrated <old> -> <new>` (or nothing, for a node another
+  pass carried across), and `doctor` step 6 passes.
+- At the next boundary, `roster_size` and `threshold` on `/health` match the epoch before the
+  revision. Then the roster hands the treasury over with Update-Y as usual.
+
+### Step 7 — close the window
+
+Once `migrate-registration --all` reports nothing left to migrate, end the window:
+
+```bash
+binocular update-config --end-registry-migration
+```
+
+This empties #13, and every node goes back to checking the identity record against the current
+list alone. The old list stays on chain, inert, holding its nodes' min-ADA. Nothing reads it any
+more.
+
+### If something goes wrong
+
+- **A node logs that the two lists do not explain the identity record.** Usually a provider
+  returned the lists from two different blocks. It clears on the next read. If it persists, run
+  step 4 again: the check can account for any number of departures once nobody is left to cross,
+  but only two while many are.
+- **`deregister-spo` refuses an exit during the window.** It does that only when the exit would
+  push the record beyond what nodes can reconstruct (a third departure while more than two pools
+  are still to cross). Step 4 is the remedy, and anyone may run it.
+- **`register-spo` refuses a pool as still under the previous registry.** It must be carried
+  across, not registered again: a second registration would leave an identity binding nothing can
+  ever remove. Step 4, or `migrate-registration` for that pool.
 
 ---
 

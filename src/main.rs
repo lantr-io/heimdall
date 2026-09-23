@@ -3166,7 +3166,9 @@ async fn run_spo(
                         )
                         .await
                         {
-                            Ok(Some(flow)) => {
+                            Ok(heimdall::cardano::blockfrost_chain::FaultEnforcement::Enabled(
+                                flow,
+                            )) => {
                                 startup.push(
                                     "automatic fault banning enabled: a proven cheat is published \
                                      on chain"
@@ -3174,12 +3176,25 @@ async fn run_spo(
                                 );
                                 bf_chain = bf_chain.with_dkg_fault_ban_flow(flow);
                             }
+                            // A package ahead of (or behind) the governance
+                            // Update that moved the ban list. Not a reason to
+                            // leave the roster: say so, and run without
+                            // publishing until the two agree — a restart after
+                            // the Update picks enforcement back up.
+                            Ok(
+                                heimdall::cardano::blockfrost_chain::FaultEnforcement::ContractsDiffer(
+                                    why,
+                                ),
+                            ) => {
+                                warn!("DKG fault-ban flow: {why}");
+                                startup.push(format!("automatic fault banning OFF: {why}"));
+                            }
                             // Reading the ban list and enforcing faults are
                             // separate (WI-060): the roster is filtered either
                             // way, and detection already excludes a cheater
                             // from the ceremony. Without the enforcement keys
                             // the cheating simply costs nothing on chain.
-                            Ok(None) => startup.push(
+                            Ok(heimdall::cardano::blockfrost_chain::FaultEnforcement::NotConfigured) => startup.push(
                                 "automatic fault banning disabled (no fault-enforcement keys); \
                                  the roster is still ban-filtered, and a cheat is detected and \
                                  excluded but not published on chain"

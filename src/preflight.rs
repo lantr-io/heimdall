@@ -764,12 +764,21 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     config.as_ref().map(|v| &v.params),
                 )
                 .await;
+                use crate::cardano::blockfrost_chain::FaultEnforcement;
                 let (status, enforcement_note) = match &enforcement {
-                    Ok(Some(_)) => (Status::Pass, "fault enforcement configured".to_string()),
-                    Ok(None) => (
+                    Ok(FaultEnforcement::Enabled(_)) => {
+                        (Status::Pass, "fault enforcement configured".to_string())
+                    }
+                    Ok(FaultEnforcement::NotConfigured) => (
                         Status::Pass,
                         "detection only — faults excluded, not published".to_string(),
                     ),
+                    // Warn: the daemon starts, and the right fix is usually
+                    // the bridge's governance Update catching up, not a config
+                    // edit.
+                    Ok(FaultEnforcement::ContractsDiffer(why)) => {
+                        (Status::Warn, format!("fault enforcement OFF — {why}"))
+                    }
                     Err(e) => (
                         Status::Fail,
                         format!("fault enforcement half-configured: {e}"),

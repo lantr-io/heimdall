@@ -92,6 +92,26 @@ pub struct DkgFaultBanFlow {
     srs_path: PathBuf,
 }
 
+/// What a node's fault-enforcement keys amount to on the bridge it reads.
+#[derive(Debug)]
+pub enum FaultEnforcement {
+    /// Configured and consistent with the bridge: a proven cheat is published.
+    Enabled(DkgFaultBanFlow),
+    /// No enforcement key is set. Detection still excludes a cheat.
+    NotConfigured,
+    /// Configured, but this build's contracts do not produce the ban list
+    /// Config #8 names — a package installed ahead of, or behind, the
+    /// governance Update that moves it. Nothing is published until the two
+    /// agree; detection still excludes a cheat. The string says which policy
+    /// the Config names.
+    ///
+    /// Not an error, because it is not a misconfiguration: an operator who
+    /// upgrades the evening before a registry revision has done nothing wrong,
+    /// and exiting would take a signing node off the roster over a feature
+    /// that only decides whether cheating costs anything.
+    ContractsDiffer(String),
+}
+
 impl DkgFaultBanFlow {
     /// Build the automatic DKG fault-ban configuration — the *enforcement*
     /// half: proving a fault on chain and applying the ban.
@@ -104,10 +124,12 @@ impl DkgFaultBanFlow {
     /// commitments, so a bad round 1 package is dropped and the offender
     /// excluded whether or not this flow exists.
     ///
-    /// So: absent the whole enforcement key set, this returns `None` and the
-    /// node still filters its roster. Present *any* of it, every field is
-    /// required — a half-configured publish path must fail at startup, not
-    /// after a fault is detected.
+    /// So: absent the whole enforcement key set, this returns `NotConfigured`
+    /// and the node still filters its roster. Present *any* of it, every field
+    /// is required — a half-configured publish path must fail at startup, not
+    /// after a fault is detected. The one exception is a contracts version that
+    /// differs from the bridge's (`ContractsDiffer`), which is a rollout state,
+    /// not a configuration.
     ///
     /// `config` is the decoded bridge Config: it supplies the ban schedule
     /// (params[4..6]) when the bridge publishes one, and its ban policy id (#8) is
@@ -119,7 +141,7 @@ impl DkgFaultBanFlow {
     pub async fn from_config(
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
-    ) -> Result<Option<Self>, String> {
+    ) -> Result<FaultEnforcement, String> {
         let enforcement_keys = [
             &cardano.fault_proof_srs_path,
             &cardano.spo_bans_ref,
@@ -128,7 +150,7 @@ impl DkgFaultBanFlow {
             &cardano.fault_verifier_equivocation_ref,
         ];
         if enforcement_keys.iter().all(|k| k.is_none()) {
-            return Ok(None);
+            return Ok(FaultEnforcement::NotConfigured);
         }
         let Some(one_shot) = cardano.federation_one_shot.as_deref() else {
             return Err(
@@ -258,7 +280,7 @@ impl DkgFaultBanFlow {
                 )?;
                 let base_url =
                     crate::cardano::bf_http::base_url(pid, cardano.blockfrost_url.as_deref());
-                crate::cardano::revision::one_shot_for(
+                let found = crate::cardano::revision::one_shot_for(
                     &base_url,
                     pid,
                     ban_bootstrap,
@@ -266,18 +288,21 @@ impl DkgFaultBanFlow {
                     crate::cardano::ban_list::BAN_ROOT_KEY,
                     |o| derive_bans(o).map(|s| s.hash),
                 )
-                .await?
-                .ok_or_else(|| {
-                    format!(
-                        "the fault-enforcement keys cannot derive the spo_bans policy the bridge \
-                         Config publishes ({}, field #8) — neither from the federation one-shot \
-                         nor from the outpoint that ban list's root mint spent. An ApplyBan \
-                         built here would confirm into a ban list no other SPO reads. Check \
-                         cardano.fault_proof_policies against this bridge; the schedule comes \
-                         from the Config itself (params[4..6]), so it cannot be what disagrees",
+                .await?;
+                // No outpoint this build can compile derives #8. The schedule
+                // and the fault policies both came from the Config, so what
+                // differs is the contracts release: an ApplyBan built here
+                // would confirm into a ban list no other SPO reads.
+                let Some(found) = found else {
+                    return Ok(FaultEnforcement::ContractsDiffer(format!(
+                        "this build's contracts do not produce the ban list the bridge Config \
+                         names ({}, field #8) — the package is newer or older than the bridge's \
+                         last governance Update. Fault proofs are not published until the two \
+                         agree; a cheat is still detected and excluded",
                         hex::encode(published),
-                    )
-                })?
+                    )));
+                };
+                found
             }
         };
         let spo_bans = derive_bans(&ban_bootstrap)?;
@@ -332,7 +357,7 @@ impl DkgFaultBanFlow {
         )
         .await?;
 
-        Ok(Some(Self {
+        Ok(FaultEnforcement::Enabled(Self {
             blueprint_path: blueprint_path.to_string(),
             registry_policy,
             round1_fault,
@@ -4541,12 +4566,12 @@ mod tests {
             registry_blueprint: Some("plutus.json".to_string()),
             ..Default::default()
         };
-        assert!(
+        assert!(matches!(
             DkgFaultBanFlow::from_config(&cardano, None)
                 .await
-                .expect("no enforcement keys is a valid configuration")
-                .is_none()
-        );
+                .expect("no enforcement keys is a valid configuration"),
+            super::FaultEnforcement::NotConfigured
+        ));
 
         // One enforcement key present → the path is on, and the rest must
         // resolve. The four *_ref keys are no longer among the things that MUST
