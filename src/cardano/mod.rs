@@ -48,6 +48,7 @@ pub mod register_pool;
 pub mod register_spo;
 pub mod registry;
 pub mod retry;
+pub mod revision;
 pub mod roster;
 pub mod spi_trie;
 pub mod stake;

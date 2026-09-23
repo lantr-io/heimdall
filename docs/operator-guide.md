@@ -1349,11 +1349,12 @@ Two things worth knowing rather than doing:
 - Joining and leaving both keep working during a migration, and `doctor` step 6 reports an
   un-migrated node as a Warn rather than a Fail so the daemon starts and fixes it. If you try to
   leave before crossing, the command says to migrate first.
-- **Do not leave during a migration**, and `deregister-spo` will not let you if you crossed: the
-  exit removes your identity from the treasury while your old node stays in the frozen previous
-  list, and after that no pool on the bridge can register, exit or migrate until Config #13 is
-  cleared. Wait for the window to close. `--allow-during-migration` overrides it, and the name is
-  the consequence — only with the roster's agreement.
+- Leaving after you crossed works too. Your exit removes your identity from the treasury while
+  your old node stays in the frozen previous list, and every node accounts for that by working out
+  which pools left. It can do that for any number of exits once the federation's `--all` pass has
+  run. Before that pass it can handle at most two. So if a third pool tries to leave while others
+  are still waiting to cross, `deregister-spo` refuses and tells you to run
+  `heimdall migrate-registration --all` first. That command needs no key, and anyone may run it.
 - If the node's own migration does not land it keeps trying, six times over about half an hour.
   An anchor race is the expected failure when several operators restart at once, so one attempt
   was never enough.
@@ -1491,8 +1492,8 @@ authorization to leave that anyone holding it can post: `sign-with-pool-key` wri
 | `[3/12] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
 | `[12/12] nonce reservation WARN` naming a spent UTxO | the UTxO a pending registration or exit signature is bound to has been spent, so the file waiting at the cold key can no longer be used. Delete `nonce-reservation.json` from the state dir, run the request command again, and take the NEW request to the safe. |
 | `[12/12] nonce reservation WARN … has not confirmed yet` | nothing is wrong. A UTxO query reports confirmed outputs only, so a reservation made in the last few minutes is simply not visible yet. Wait for a block. **Do not delete it** — the signature is bound to that outpoint and is fine. |
-| `[12/12] nonce reservation WARN … does not exist yet` | you passed `--no-submit-reservation` and never broadcast the transaction it printed. Submit it. Nothing needs re-signing. |
-| `[12/12] nonce reservation FAIL` | the record exists but this build cannot read it, and `run-spo` will not start on it. If no signature is in flight, delete the file. If one is, read its `nonce_outpoint` out of the signed file and pass it as `--nonce-utxo` instead. |
+| `[12/12] nonce reservation WARN … does not exist yet` | the transaction that creates it was never broadcast — you passed `--no-submit-reservation`, or the broadcast failed. Run the request command again without that flag: it sends the transaction the record kept. Nothing needs re-signing. |
+| `[12/12] nonce reservation WARN could not read the nonce reservation` | the record exists but this build cannot read it. `run-spo` still starts — this is a Warn so a signing node is not taken off the roster over a registration file — but no wallet UTxO is held back. If no signature is in flight, delete the file. If one is, read its `nonce_outpoint` out of the signed file and pass it as `--nonce-utxo` instead. |
 | `[6/12] registration status WARN … under the PREVIOUS registry` | a registry migration is in progress and this node has not crossed yet. Starting the node is the fix: it carries itself across. `heimdall migrate-registration` does it by hand. |
 | `[6/12] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command, including the `--signed` form for a cold key that is not on this machine. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
 | `no reference script for the registry` right after `deploy-registry-ref` succeeded | the provider's address listing has not shown the script yet – pass the outpoint the deploy printed, `--registry-ref <tx_hash>:0` (step 6) |

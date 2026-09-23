@@ -266,10 +266,6 @@ pub struct DeregisterSpoRequest<'a> {
     /// and leaving the bridge would be impossible for the length of the
     /// migration.
     pub previous_registry: Option<(&'a str, &'a [BfUtxo])>,
-    /// Leave anyway, during a migration window, knowing it stops every other
-    /// pool's registry change until Config #13 is cleared. See the refusal in
-    /// the builder for what it costs.
-    pub allow_during_migration: bool,
     pub wallet_address: &'a str,
     pub wallet_utxos: &'a [WalletUtxo],
     /// Wallet payment key (fees/collateral) — NOT the cold key.
@@ -309,6 +305,75 @@ pub struct DeregisterSpoTx {
     /// Lovelace freed from the removed element's UTxO — it lands in the
     /// change output, i.e. at `wallet_address`.
     pub freed_lovelace: u64,
+}
+
+/// Refuse the one exit a migration window cannot absorb.
+///
+/// A pool whose identity the frozen previous list also carries — it migrated,
+/// or it rejoined under the same key after leaving — becomes a DEPARTURE when
+/// it exits: its binding leaves the root, its old node stays. Every node then
+/// has to explain the root by finding which pools departed, and that search
+/// reaches only so far from either end
+/// ([`crate::cardano::migrate_registration::SEARCH_DEPTH`]). Past that, no node
+/// can rebuild the root and every roster read on the bridge fails. So this
+/// exit is refused exactly when it would go past that, and not otherwise —
+/// which after the federation's `--all` pass is never.
+fn refuse_unexplainable_exit(
+    previous: Option<&RegistryList>,
+    window: &crate::cardano::migrate_registration::IdentityWindow,
+    bifrost_id_pk: &[u8],
+) -> Result<(), RegisterSpoError> {
+    let becomes_departure =
+        previous.is_some_and(|prev| prev.iter().any(|(_, d)| d.bifrost_id_pk == bifrost_id_pk));
+    if !becomes_departure || window.one_more_departure_fits() {
+        return Ok(());
+    }
+    Err(RegisterSpoError::Build(format!(
+        "{} pool(s) have migrated and then left during this registry migration, and {} are \
+         still to be carried across. One more such exit would leave the Treasury state's \
+         identity root beyond what any node can rebuild from the two lists, and every roster \
+         read on the bridge would fail. Run `heimdall migrate-registration --all` first — it \
+         needs no key and anyone may run it — and then exit",
+        window.departed.len(),
+        window.unmigrated.len(),
+    )))
+}
+
+/// Whether `pool_id` can leave now — in the current registry, and not the exit
+/// [`refuse_unexplainable_exit`] refuses — from raw chain reads.
+///
+/// For the request half of `deregister-spo`, which reserves a nonce and sends
+/// the operator to the cold key: an exit that will be refused should be
+/// refused before either.
+pub fn check_exit_allowed(
+    registry_policy_hex: &str,
+    registry_utxos: &[BfUtxo],
+    treasury_policy_hex: &str,
+    treasury_utxos: &[BfUtxo],
+    previous_registry: Option<(&str, &[BfUtxo])>,
+    pool_id: &[u8],
+) -> Result<(), DeregisterSpoError> {
+    let list = crate::cardano::register_spo::registry_list_from_utxos(
+        registry_utxos,
+        registry_policy_hex,
+    )?;
+    let bifrost_id_pk = list
+        .get(pool_id)
+        .ok_or(DeregisterSpoError::Registry(RegistryError::NotRegistered))?
+        .bifrost_id_pk
+        .clone();
+    let state = find_treasury_state(
+        treasury_utxos,
+        treasury_policy_hex,
+        &hex::encode(crate::cardano::config_params::TREASURY_INFO_ASSET_NAME),
+    )?;
+    crate::cardano::register_spo::identity_trie_for(
+        &list,
+        previous_registry,
+        state.datum.bifrost_identity_root,
+        |previous, window| refuse_unexplainable_exit(previous, window, &bifrost_id_pk),
+    )?;
+    Ok(())
 }
 
 /// Decode `tx_hash` hex into the 32-byte id whisky sorts inputs by.
@@ -358,61 +423,19 @@ pub fn build_deregister_spo_tx(
     let node = find(&plan.removed_asset_name);
 
     // Treasury leg: rebuild the identity trie from the (pre-removal) list and
-    // derive the post-deregistration datum + removal proof.
-    //
-    // spec [CFG-10]: an exit BY A MIGRATED POOL, mid-window, strands every other
-    // pool's registry change.
-    //
-    // This transaction removes the pool's binding from the Treasury state's
-    // identity root, but its node in the previous list is frozen and stays.
-    // From then on the union of the two lists over-counts by exactly this pool,
-    // so no register, exit or migrate can rebuild the root — every one of them
-    // refuses until Config #13 is cleared. The roster still reads (that check
-    // only warns), so the bridge runs; what stops is membership changing.
-    //
-    // The operator cannot see this coming, and the cost falls on everyone else,
-    // so the builder refuses rather than warns. `allow_during_migration` is the
-    // deliberate override, and its name is the consequence.
-    if !req.allow_during_migration
-        && let Some((policy_hex, utxos)) = req.previous_registry
-    {
-        let in_previous = find_registry_utxos(utxos, policy_hex)
-            .ok()
-            .and_then(|elements| {
-                RegistryList::from_elements(
-                    elements
-                        .iter()
-                        .map(|u| (u.asset_name.clone(), u.element.clone())),
-                )
-                .ok()
-            })
-            .is_some_and(|prev| prev.get(&pool_id).is_some());
-        if in_previous {
-            return Err(DeregisterSpoError::Build(format!(
-                "pool {} migrated from the previous registry, and a migration is still in \
-                 progress (Config #13 names {policy_hex}). Leaving now removes this pool's \
-                 identity from the Treasury state while its node stays in the frozen previous \
-                 list, so the two lists no longer rebuild the identity root — and every other \
-                 pool's registration, exit and migration refuses until #13 is cleared. Wait \
-                 for the window to close, then exit. If the roster has agreed to bear that, \
-                 pass --allow-during-migration",
-                hex::encode(pool_id),
-            )));
-        }
-    }
-
-    // From BOTH lists while a registry migration is in progress — see the note
-    // on `previous_registry`, and `register_spo::union_identity_pairs`, which
-    // is the one copy of this rule.
-    let identity_trie = mpf::Trie::from_pairs(crate::cardano::register_spo::union_identity_pairs(
-        &list,
-        req.previous_registry,
-    )?)
-    .map_err(TreasuryInfoError::Mpf)?;
+    // derive the post-deregistration datum + removal proof — against the
+    // bindings the root commits to, which during a migration window is both
+    // lists minus the pools that have already left (`identity_trie_for`).
     let state = find_treasury_state(
         req.treasury_utxos,
         &req.treasury_script.hash_hex(),
         req.treasury_asset_name_hex,
+    )?;
+    let identity_trie = crate::cardano::register_spo::identity_trie_for(
+        &list,
+        req.previous_registry,
+        state.datum.bifrost_identity_root,
+        |previous, window| refuse_unexplainable_exit(previous, window, &bifrost_id_pk),
     )?;
     let (new_treasury_datum, removal_proof) =
         apply_deregistration(&state.datum, &identity_trie, &bifrost_id_pk, &pool_id)?;
@@ -436,19 +459,11 @@ pub fn build_deregister_spo_tx(
             script_size: None,
         });
     }
-    let config_ref_index = {
-        let mut keys: Vec<(Vec<u8>, u32)> = reference_inputs
-            .iter()
-            .map(|r| (hex::decode(&r.tx_hash).unwrap_or_default(), r.tx_index))
-            .collect();
-        keys.sort();
-        keys.dedup();
-        let want = (
-            hex::decode(&req.config_ref.0).unwrap_or_default(),
-            req.config_ref.1,
-        );
-        u64::try_from(keys.iter().position(|k| *k == want).unwrap_or(0)).unwrap_or(0)
-    };
+    let config_ref_index = crate::cardano::tx_common::reference_input_index(
+        &reference_inputs,
+        &req.config_ref.0,
+        req.config_ref.1,
+    );
 
     let (treasury_in, treasury_out) = treasury_spend_leg(
         &state,
@@ -730,27 +745,14 @@ pub fn build_deregister_spo_tx(
             // something compares it; `migrate_registration` and `apply_ban`
             // check theirs, and an unchecked one would surface only as a
             // phase-2 failure with nothing to point at.
-            {
-                let refs: Vec<_> = tx
-                    .transaction_body
-                    .reference_inputs
-                    .as_ref()
-                    .map(|s| s.iter().collect())
-                    .unwrap_or_default();
-                let got = refs.get(config_ref_index as usize).ok_or_else(|| {
-                    DeregisterSpoError::Build(format!(
-                        "Config reference index {config_ref_index} out of range"
-                    ))
-                })?;
-                if hex::encode(got.transaction_id.as_slice()) != req.config_ref.0
-                    || got.index != u64::from(req.config_ref.1)
-                {
-                    return Err(DeregisterSpoError::Build(format!(
-                        "Config not at redeemer reference index {config_ref_index} — reference \
-                         ordering changed"
-                    )));
-                }
-            }
+            crate::cardano::tx_common::check_reference_at(
+                &tx,
+                config_ref_index,
+                &req.config_ref.0,
+                req.config_ref.1,
+                "Config",
+            )
+            .map_err(DeregisterSpoError::Build)?;
         }
 
         hex::encode(
@@ -1027,7 +1029,7 @@ mod tests {
         identity_pairs: &[(Vec<u8>, Vec<u8>)],
         sig: &RevocationSignature,
     ) -> Result<(DeregisterSpoTx, Tx, ParameterizedScript, mpf::Hash), DeregisterSpoError> {
-        build_against_migration(registry_elements, identity_pairs, sig, None, false)
+        build_against_migration(registry_elements, identity_pairs, sig, None)
     }
 
     /// As [`build_against`], during a migration window.
@@ -1036,7 +1038,6 @@ mod tests {
         identity_pairs: &[(Vec<u8>, Vec<u8>)],
         sig: &RevocationSignature,
         previous: Option<(&str, &[BfUtxo])>,
-        allow_during_migration: bool,
     ) -> Result<(DeregisterSpoTx, Tx, ParameterizedScript, mpf::Hash), DeregisterSpoError> {
         let registry = registry_script();
         let treasury = treasury_script(&registry.hash);
@@ -1104,7 +1105,6 @@ mod tests {
             registry_utxos: &registry_elements,
             treasury_utxos: &treasury_utxos,
             previous_registry: previous,
-            allow_during_migration,
             wallet_address: &wallet_addr,
             wallet_utxos: &wallet_utxos,
             key: &key,
@@ -1376,72 +1376,94 @@ mod tests {
         );
     }
 
-    /// An exit by a MIGRATED pool, mid-window, is refused — and the refusal is
-    /// not paternalism, it is the only place the cost is visible.
-    ///
-    /// The transaction removes this pool's binding from the Treasury state's
-    /// identity root while its node stays in the frozen previous list. The two
-    /// lists then over-count by exactly this pool, so no register, exit or
-    /// migrate on the whole bridge can rebuild the root until Config #13 is
-    /// cleared. The operator cannot see that coming and does not pay for it.
+    /// A previous-registry list holding exactly `entries` (`pool_id`, `pk`),
+    /// linked in key order the way the on-chain list is.
+    fn previous_list(policy: &str, entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<BfUtxo> {
+        let mut sorted = entries.to_vec();
+        sorted.sort();
+        let mut out = vec![element_utxo(
+            policy,
+            &"77".repeat(32),
+            0,
+            2_600_000,
+            REGISTRATION_ROOT_KEY,
+            &root_element(sorted.first().map(|(p, _)| p.as_slice())),
+        )];
+        for (i, (pool_id, pk)) in sorted.iter().enumerate() {
+            out.push(element_utxo(
+                policy,
+                &format!("{:02x}", 0x80 + i).repeat(32),
+                0,
+                2_800_000,
+                pool_id,
+                &node_element(pk, sorted.get(i + 1).map(|(p, _)| p.as_slice())),
+            ));
+        }
+        out
+    }
+
+    /// An exit by a MIGRATED pool, mid-window, is allowed. It becomes a
+    /// departure — its binding leaves the root while its frozen old node stays
+    /// — and the builders account for that by searching for which pools left,
+    /// rather than by refusing every exit until Config #13 is cleared.
     #[test]
-    fn an_exit_by_a_migrated_pool_is_refused_during_a_window() {
+    fn a_migrated_pool_may_leave_during_a_window() {
         let registry = registry_script();
         let policy = registry.hash_hex();
         let previous_policy = "b2".repeat(28);
         let (elements, pairs, _) = chain(&policy, true, true);
         // The same pool, still present in the previous list: it migrated.
-        let previous = vec![
-            element_utxo(
-                &previous_policy,
-                &"77".repeat(32),
-                0,
-                2_600_000,
-                REGISTRATION_ROOT_KEY,
-                &root_element(Some(&test_pool_id())),
-            ),
-            element_utxo(
-                &previous_policy,
-                &"88".repeat(32),
-                0,
-                2_800_000,
-                &test_pool_id(),
-                &node_element(&SELF_PK, None),
-            ),
-        ];
-
-        let err = build_against_migration(
-            elements.clone(),
-            &pairs,
-            &test_sig(),
-            Some((previous_policy.as_str(), previous.as_slice())),
-            false,
-        )
-        .expect_err("must refuse");
-        let msg = format!("{err}");
-        assert!(msg.contains("migration is still in progress"), "{msg}");
-        assert!(msg.contains("--allow-during-migration"), "{msg}");
-
-        // A pool that is NOT in the previous list registered fresh under the
-        // current registry during the window. Its exit removes its binding from
-        // both the root and the current list, so the union still matches and
-        // nobody else is affected — it must not be refused.
-        let previous_without_us = vec![element_utxo(
+        let previous = previous_list(
             &previous_policy,
-            &"77".repeat(32),
-            0,
-            2_600_000,
-            REGISTRATION_ROOT_KEY,
-            &root_element(None),
-        )];
+            &[(test_pool_id().to_vec(), SELF_PK.to_vec())],
+        );
         build_against_migration(
             elements,
             &pairs,
             &test_sig(),
-            Some((previous_policy.as_str(), previous_without_us.as_slice())),
-            false,
+            Some((previous_policy.as_str(), previous.as_slice())),
         )
-        .expect("a pool that never migrated may leave during a window");
+        .expect("a migrated pool may leave while the window can absorb it");
+    }
+
+    /// The one exit that IS refused: two pools have already migrated and left,
+    /// three more are still to cross, and this migrated pool leaving would make
+    /// a third departure. No node could then explain the root from either end
+    /// of the search, and every roster read on the bridge would fail. The
+    /// refusal says what fixes it — the `--all` pass — which anyone may run.
+    #[test]
+    fn an_exit_the_window_cannot_absorb_is_refused_with_the_remedy() {
+        let registry = registry_script();
+        let policy = registry.hash_hex();
+        let previous_policy = "b2".repeat(28);
+        let (elements, mut pairs, _) = chain(&policy, true, true);
+        let departed: Vec<(Vec<u8>, Vec<u8>)> = (0..2u8)
+            .map(|i| (vec![0xd0 + i; 28], vec![0xd0 + i; 32]))
+            .collect();
+        let unmigrated: Vec<(Vec<u8>, Vec<u8>)> = (0..3u8)
+            .map(|i| (vec![0xe0 + i; 28], vec![0xe0 + i; 32]))
+            .collect();
+        let mut entries = vec![(test_pool_id().to_vec(), SELF_PK.to_vec())];
+        entries.extend(departed.iter().cloned());
+        entries.extend(unmigrated.iter().cloned());
+        let previous = previous_list(&previous_policy, &entries);
+        // The root: the current list plus the pools still to cross. The two
+        // that left are gone from it.
+        pairs.extend(
+            unmigrated
+                .iter()
+                .map(|(pool, pk)| (pk.clone(), pool.clone())),
+        );
+
+        let err = build_against_migration(
+            elements,
+            &pairs,
+            &test_sig(),
+            Some((previous_policy.as_str(), previous.as_slice())),
+        )
+        .expect_err("a third departure with three still to cross must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("migrate-registration --all"), "{msg}");
     }
 
     /// A cold key that never registered has nothing to remove — and the error

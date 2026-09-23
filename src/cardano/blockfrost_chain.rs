@@ -77,7 +77,9 @@ pub struct DkgFaultScriptRef {
 #[derive(Debug, Clone)]
 pub struct DkgFaultBanFlow {
     blueprint_path: String,
-    registry: crate::cardano::blueprint::ParameterizedScript,
+    /// The registry policy the fault verifiers are parameterized by and the
+    /// accused pool's node is found under. Only its hash is ever needed.
+    registry_policy: [u8; 28],
     round1_fault: crate::cardano::blueprint::ParameterizedScript,
     round2_fault: crate::cardano::blueprint::ParameterizedScript,
     equivocation_fault: crate::cardano::blueprint::ParameterizedScript,
@@ -163,34 +165,43 @@ impl DkgFaultBanFlow {
             .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
         let (reg_tx_id, reg_index) = crate::cardano::roster::parse_outref(registry_bootstrap)
             .map_err(|e| format!("registry bootstrap outref: {e}"))?;
-        let (ban_tx_id, ban_index) = crate::cardano::roster::parse_outref(ban_bootstrap)
-            .map_err(|e| format!("ban bootstrap outref: {e}"))?;
         // Rev 5.5: the registry policy is downstream of the treasury policy, which
         // is downstream of the Config identity.
         let (treasury_bootstrap, config_policy_id) =
             crate::cardano::roster::treasury_derivation_inputs(cardano)?;
         let (tsy_tx_id, tsy_index) = crate::cardano::roster::parse_outref(&treasury_bootstrap)
             .map_err(|e| format!("treasury bootstrap outref: {e}"))?;
-        let registry = crate::cardano::blueprint::registry_policy_from_bootstraps(
-            &blueprint_json,
-            (&reg_tx_id, u64::from(reg_index)),
-            (&tsy_tx_id, u64::from(tsy_index)),
-            &config_policy_id,
-        )
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+        // The registry the Config names at #9, when there is a Config. Only its
+        // hash parameterizes the fault verifiers, and after a registry revision
+        // the one Config #12 compiles to is the registry the bridge LEFT: fault
+        // proofs minted under verifiers derived from it are ones the ban policy
+        // does not accept, and the check below would stop this node at startup.
+        let registry_policy = match config {
+            Some(c) => c.registry.spos_registry_policy_id,
+            None => {
+                crate::cardano::blueprint::registry_policy_from_bootstraps(
+                    &blueprint_json,
+                    (&reg_tx_id, u64::from(reg_index)),
+                    (&tsy_tx_id, u64::from(tsy_index)),
+                    &config_policy_id,
+                )
+                .map_err(|e| format!("parameterize spos_registry: {e}"))?
+                .hash
+            }
+        };
         let round1_fault = crate::cardano::blueprint::fault_verifier_round1_script(
             &blueprint_json,
-            &registry.hash,
+            &registry_policy,
         )
         .map_err(|e| format!("parameterize fault_verifier_round1: {e}"))?;
         let round2_fault = crate::cardano::blueprint::fault_verifier_round2_script(
             &blueprint_json,
-            &registry.hash,
+            &registry_policy,
         )
         .map_err(|e| format!("parameterize fault_verifier_round2: {e}"))?;
         let equivocation_fault = crate::cardano::blueprint::fault_verifier_equivocation_script(
             &blueprint_json,
-            &registry.hash,
+            &registry_policy,
         )
         .map_err(|e| format!("parameterize fault_verifier_equivocation: {e}"))?;
         let ban_params = crate::cardano::ban_list::BanPolicyParams::resolve(cardano, config)
@@ -212,38 +223,64 @@ impl DkgFaultBanFlow {
                 hex::encode(own_fault_policies[2])
             ));
         }
-        let spo_bans = crate::cardano::blueprint::spo_bans_script(
-            &blueprint_json,
-            // spec [PRE-5]: the Config NFT policy, NOT the registry hash. The
-            // validator reads the registry policy from Config #9 at run time,
-            // so this parameter no longer moves when the registry is revised.
-            &config_policy_id,
-            &ban_params.fault_proof_policies,
-            ban_params.base_ban_duration_ms,
-            ban_params.max_faults_before_permanent,
-            ban_params.max_validity_window_ms,
-            &ban_tx_id,
-            u64::from(ban_index),
-        )
-        .map_err(|e| format!("parameterize spo_bans: {e}"))?;
-
-        // The enforcement half derives the policy from seven local parameters,
-        // so it can land on an address the bridge does not use — an ApplyBan
-        // that confirms into a list nobody reads. Where the Config publishes the
-        // policy id there is a right answer to compare against, so compare.
-        if let Some(published) = config.map(|c| &c.bans)
-            && published.spo_bans_policy_id != spo_bans.hash
-        {
-            return Err(format!(
-                "the fault-enforcement keys derive spo_bans policy {} but the bridge Config \
-                 publishes {} (field #8) — an ApplyBan built here would confirm into a ban \
-                 list no other SPO reads. Check cardano.ban_bootstrap, \
-                 cardano.fault_proof_policies against this bridge — the schedule half comes \
-                 from the Config itself (params[4..6]), so it cannot be what disagrees",
-                spo_bans.hash_hex(),
-                hex::encode(published.spo_bans_policy_id),
-            ));
-        }
+        let derive_bans =
+            |outref: &str| -> Result<crate::cardano::blueprint::ParameterizedScript, String> {
+                let (tx_id, index) = crate::cardano::roster::parse_outref(outref)
+                    .map_err(|e| format!("ban bootstrap outref: {e}"))?;
+                crate::cardano::blueprint::spo_bans_script(
+                    &blueprint_json,
+                    // spec [PRE-5]: the Config NFT policy, NOT the registry hash. The
+                    // validator reads the registry policy from Config #9 at run time.
+                    &config_policy_id,
+                    &ban_params.fault_proof_policies,
+                    ban_params.base_ban_duration_ms,
+                    ban_params.max_faults_before_permanent,
+                    ban_params.max_validity_window_ms,
+                    &tx_id,
+                    u64::from(index),
+                )
+                .map_err(|e| format!("parameterize spo_bans: {e}"))
+            };
+        // The ban list's own one-shot: Config #12 until the ban list is
+        // revised, and after that the outpoint its ban-root mint spent — found
+        // on chain and accepted only if it derives the policy #8 names
+        // (`cardano::revision`). Deriving from #12 regardless made every node
+        // with enforcement keys exit at startup once #8 moved.
+        let ban_bootstrap = match config.map(|c| c.bans.spo_bans_policy_id) {
+            None => ban_bootstrap.to_string(),
+            Some(published) if derive_bans(ban_bootstrap)?.hash == published => {
+                ban_bootstrap.to_string()
+            }
+            Some(published) => {
+                let pid = cardano.blockfrost_project_id.as_deref().ok_or(
+                    "the ban list was bootstrapped from an outpoint other than Config #12, and \
+                     finding it needs a chain: set cardano.blockfrost_project_id",
+                )?;
+                let base_url =
+                    crate::cardano::bf_http::base_url(pid, cardano.blockfrost_url.as_deref());
+                crate::cardano::revision::one_shot_for(
+                    &base_url,
+                    pid,
+                    ban_bootstrap,
+                    &published,
+                    crate::cardano::ban_list::BAN_ROOT_KEY,
+                    |o| derive_bans(o).map(|s| s.hash),
+                )
+                .await?
+                .ok_or_else(|| {
+                    format!(
+                        "the fault-enforcement keys cannot derive the spo_bans policy the bridge \
+                         Config publishes ({}, field #8) — neither from the federation one-shot \
+                         nor from the outpoint that ban list's root mint spent. An ApplyBan \
+                         built here would confirm into a ban list no other SPO reads. Check \
+                         cardano.fault_proof_policies against this bridge; the schedule comes \
+                         from the Config itself (params[4..6]), so it cannot be what disagrees",
+                        hex::encode(published),
+                    )
+                })?
+            }
+        };
+        let spo_bans = derive_bans(&ban_bootstrap)?;
 
         // Locations, resolved last because discovery needs the script HASHES the
         // derivation above produces. A configured value still wins; unset means
@@ -259,7 +296,9 @@ impl DkgFaultBanFlow {
         let spo_bans_ref = resolve_script_ref(
             cardano,
             wallet_address,
-            one_shot,
+            // The ban list's own one-shot: whoever spent it deployed this ban
+            // list, and parked its reference script beside it.
+            &ban_bootstrap,
             &cardano.spo_bans_ref,
             &spo_bans,
             "spo_bans",
@@ -295,7 +334,7 @@ impl DkgFaultBanFlow {
 
         Ok(Some(Self {
             blueprint_path: blueprint_path.to_string(),
-            registry,
+            registry_policy,
             round1_fault,
             round2_fault,
             equivocation_fault,
@@ -2218,7 +2257,8 @@ impl BlockfrostCardanoChain {
             PreparedDkgFault::Equivocation { .. } => Vec::new(),
         };
 
-        let registry_addr = flow.registry.enterprise_address(network);
+        let registry_addr =
+            crate::cardano::blueprint::script_enterprise_address(&flow.registry_policy, network);
         let registry_raw = crate::cardano::bf_http::fetch_address_utxos(
             &self.bf_base_url,
             &self.bf_project_id,
@@ -2228,7 +2268,7 @@ impl BlockfrostCardanoChain {
         .map_err(|e| EpochError::Chain(format!("registry UTxO query: {e}")))?;
         let reg_unit = format!(
             "{}{}",
-            flow.registry.hash_hex(),
+            hex::encode(flow.registry_policy),
             hex::encode(accused_pool_id)
         );
         let reg_node = registry_raw

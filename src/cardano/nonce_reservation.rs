@@ -44,13 +44,22 @@ pub struct NonceReservation {
     /// Blockfrost cannot distinguish — it reports confirmed UTxOs only, so a
     /// freshly created one is simply absent.
     pub created_at: u64,
-    /// Whether the transaction that creates this UTxO was broadcast.
+    /// Whether the transaction that creates this UTxO is known to have been
+    /// broadcast — accepted by the provider, or seen in the wallet since.
     ///
     /// False after `--no-submit-reservation`, which prints the transaction and
-    /// leaves broadcasting to the operator. Without this the later "not in the
-    /// wallet" would be diagnosed as a spent nonce and the operator told to
-    /// throw away a signature that is perfectly good.
+    /// leaves broadcasting to the operator, and after a broadcast that failed.
+    /// Without this the later "not in the wallet" would be diagnosed as a spent
+    /// nonce and the operator told to throw away a signature that is perfectly
+    /// good. Set once the UTxO is SEEN, too ([`Self::seen_on_chain`]): a record
+    /// left at false after its UTxO existed would read "never submitted"
+    /// forever, including after the nonce was spent.
     pub submitted: bool,
+    /// The signed transaction that creates the UTxO, hex — kept so a broadcast
+    /// that failed, or one left to the operator, can be sent again from the
+    /// record instead of from a terminal scrollback that may be gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation_tx: Option<String>,
 }
 
 /// How long after a reservation is written its UTxO may legitimately be missing
@@ -86,7 +95,35 @@ impl NonceReservation {
             action,
             created_at,
             submitted,
+            reservation_tx: None,
         }
+    }
+
+    /// This record, carrying the signed transaction that creates the UTxO.
+    #[must_use]
+    pub fn with_tx(mut self, signed_tx_hex: String) -> Self {
+        self.reservation_tx = Some(signed_tx_hex);
+        self
+    }
+
+    /// Record that the UTxO has been seen in the wallet, so it WAS broadcast.
+    ///
+    /// Returns whether anything changed, so a caller saves only then. The
+    /// transaction is dropped from the record once it cannot be needed again.
+    pub fn seen_on_chain(&mut self) -> bool {
+        if self.submitted && self.reservation_tx.is_none() {
+            return false;
+        }
+        self.submitted = true;
+        self.reservation_tx = None;
+        true
+    }
+
+    /// Record a broadcast that the provider accepted, at `now` — the moment the
+    /// confirmation grace starts from.
+    pub fn broadcast_at(&mut self, now: u64) {
+        self.submitted = true;
+        self.created_at = now;
     }
 
     /// Why the reserved UTxO is missing, given the time now.
@@ -199,7 +236,61 @@ pub fn mark_from_state_dir(
     let reserved = NonceReservation::load_or_none(state_dir)?
         .map(|r| r.nonce())
         .transpose()?;
-    Ok(mark_reserved(utxos, reserved))
+    Ok(mark_in_flight(mark_reserved(utxos, reserved)))
+}
+
+/// How long a wallet input this process spent is held back from selection
+/// after its transaction was accepted. Long enough for many blocks — a
+/// transaction that has not landed by then has been dropped, and its inputs
+/// are spendable again.
+const IN_FLIGHT_SECS: u64 = 600;
+
+/// Wallet outpoints this process has spent in transactions the provider
+/// accepted and that may not have confirmed yet, with when.
+static IN_FLIGHT: std::sync::Mutex<Vec<(NonceOutpoint, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Hold `spent` back from every wallet read in this process until its
+/// transaction has had time to confirm.
+///
+/// Blockfrost reports CONFIRMED UTxOs only, so for a block or two after a
+/// submission the inputs it spent still look unspent. One writer never notices;
+/// two do. `run-spo` has two: the epoch loop, and the registry migration it
+/// performs at startup and retries in the background from the same wallet. Both
+/// take the richest UTxO for a fee, so without this the second transaction
+/// spends what the first already did, and is rejected — which, when the second
+/// is a treasury movement or the key handoff, is a missed epoch operation over
+/// a registration chore.
+pub fn note_in_flight(spent: impl IntoIterator<Item = NonceOutpoint>) {
+    let now = std::time::Instant::now();
+    let mut held = IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.extend(spent.into_iter().map(|o| (o, now)));
+}
+
+/// Flag every in-flight outpoint in a freshly fetched wallet set, dropping the
+/// ones that have aged out.
+fn mark_in_flight(utxos: Vec<WalletUtxo>) -> Vec<WalletUtxo> {
+    let held: Vec<NonceOutpoint> = {
+        let mut held = IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|(_, at)| at.elapsed().as_secs() < IN_FLIGHT_SECS);
+        held.iter().map(|(o, _)| *o).collect()
+    };
+    if held.is_empty() {
+        return utxos;
+    }
+    utxos
+        .into_iter()
+        .map(|mut u| {
+            if u.outpoint().is_some_and(|o| held.contains(&o)) {
+                u.reserved = true;
+            }
+            u
+        })
+        .collect()
 }
 
 /// The form a wallet UTxO set must be built in on any path that can SPEND.
@@ -242,6 +333,7 @@ pub fn wallet_set_lenient(
     let utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
     match mark_from_state_dir(utxos.clone(), state_dir) {
         Ok(marked) => marked,
+        // The in-flight hold does not depend on the file, so it still applies.
         Err(e) => {
             tracing::warn!(
                 "the nonce reservation could not be read ({e}), so no wallet UTxO is being \
@@ -249,7 +341,7 @@ pub fn wallet_set_lenient(
                  its nonce is unprotected — fix the state dir, and check `heimdall doctor` \
                  step 12"
             );
-            utxos
+            mark_in_flight(utxos)
         }
     }
 }
@@ -389,6 +481,55 @@ mod tests {
         );
     }
 
+    /// A reservation made with `--no-submit-reservation` and broadcast by hand
+    /// must stop reading "never submitted" once its UTxO has been seen —
+    /// otherwise, after the registration spends it, every diagnosis says
+    /// "submit it" instead of "used up", and the opposite command is refused
+    /// with advice that can no longer be followed.
+    #[test]
+    fn a_reservation_seen_on_chain_is_diagnosed_as_spent_once_it_is_gone() {
+        let mut rec = NonceReservation::new(outpoint(1, 0), Action::Register, 1_000, false)
+            .with_tx("84a4".into());
+        assert_eq!(rec.why_missing(1_000_000), MissingNonce::NeverSubmitted);
+        assert!(rec.seen_on_chain(), "the first sighting changes the record");
+        assert!(!rec.seen_on_chain(), "and the second does not");
+        assert!(
+            rec.reservation_tx.is_none(),
+            "the transaction is no longer needed"
+        );
+        assert_eq!(rec.why_missing(1_000_000), MissingNonce::Spent);
+    }
+
+    /// The record written before a broadcast must carry the transaction, and a
+    /// record written by an older binary — no `reservation_tx` field — must
+    /// still load.
+    #[test]
+    fn the_reservation_transaction_round_trips_and_is_optional() {
+        let dir = std::env::temp_dir().join(format!("heimdall-nonce-tx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = NonceReservation::new(outpoint(5, 1), Action::Deregister, 7, false)
+            .with_tx("abcd".into());
+        rec.save(&dir).expect("save");
+        let back = NonceReservation::load(&dir)
+            .expect("load")
+            .expect("present");
+        assert_eq!(back.reservation_tx.as_deref(), Some("abcd"));
+
+        std::fs::write(
+            state_path(&dir),
+            format!(
+                r#"{{"version":1,"outpoint":"{}","action":"register","created_at":0,"submitted":true}}"#,
+                outpoint(5, 1)
+            ),
+        )
+        .unwrap();
+        let old = NonceReservation::load(&dir)
+            .expect("load")
+            .expect("present");
+        assert!(old.reservation_tx.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A UTxO carrying a reference script is spendable, and spending it destroys
     /// a deployed script — `deploy-registry-ref` leaves exactly one at this
     /// wallet, and `--nonce-utxo` would otherwise take it.
@@ -430,6 +571,25 @@ mod tests {
         );
         assert_eq!(set[0].lovelace, 9_000_000);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An input spent by a transaction this process submitted is held back from
+    /// the next wallet read, though the provider still lists it — the epoch
+    /// loop must not pick the fee input a startup migration just spent.
+    #[test]
+    fn an_in_flight_input_is_held_back_from_the_next_read() {
+        // A seed no other test uses: the hold is process-wide.
+        let spent = outpoint(0xe7, 3);
+        let raw = [
+            bf_ada_utxo(&hex::encode([0xe7u8; 32]), 3, 90_000_000),
+            bf_ada_utxo(&hex::encode([0xe8u8; 32]), 0, 5_000_000),
+        ];
+        note_in_flight([spent]);
+        let set = wallet_set(&raw, None).expect("no state dir to read");
+        assert!(set[0].reserved, "the spent input is held back");
+        assert!(!set[1].reserved, "and nothing else is");
+        let fee = crate::cardano::tx_common::select_fee(&set, 1_000_000).expect("the other pays");
+        assert_eq!(fee.tx_hash, hex::encode([0xe8u8; 32]));
     }
 
     // Coin selection is where the reservation earns its keep: a daemon posting

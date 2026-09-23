@@ -453,42 +453,131 @@ pub struct RegisterSpoTx {
 /// One `bifrost_id_pk -> pool_id` binding, as the MPF trie stores it.
 pub type IdentityPair = (Vec<u8>, Vec<u8>);
 
-/// The `bifrost_id_pk -> pool_id` bindings the Treasury state's identity root
-/// commits to: the current registry list, plus the previous one while a
-/// migration is in progress ([CFG-10], [MIG-3]).
+/// Parse the registry list held at `utxos` under `policy_hex`.
 ///
-/// Shared by `register_spo`, `deregister_spo` and `migrate_registration`,
-/// because getting it wrong is the same failure in all three: a trie that does
-/// not rebuild the treasury's root, and a proof the validator rejects.
+/// The one copy of "find the elements, then link them into a list" — it was
+/// written out wherever a list was needed, and a fix to one copy (a torn read, a
+/// stricter shape check) left the others as they were.
+pub fn registry_list_from_utxos(
+    utxos: &[BfUtxo],
+    policy_hex: &str,
+) -> Result<RegistryList, RegisterSpoError> {
+    let elements = find_registry_utxos(utxos, policy_hex)?;
+    Ok(RegistryList::from_elements(
+        elements
+            .iter()
+            .map(|u| (u.asset_name.clone(), u.element.clone())),
+    )?)
+}
+
+/// Whether `pool_id` is in the registry list at `utxos`, or `None` when the
+/// list cannot be read — which is not an answer, and a caller polling for a
+/// confirmation must keep polling.
+#[must_use]
+pub fn pool_in_registry(utxos: &[BfUtxo], policy_hex: &str, pool_id: &[u8]) -> Option<bool> {
+    registry_list_from_utxos(utxos, policy_hex)
+        .ok()
+        .map(|list| list.get(pool_id).is_some())
+}
+
+/// The identity trie a proof against the Treasury state's root must be built
+/// from.
 ///
-/// Deduplicated by identity key, which is also the invariant the trie itself
-/// encodes — [REG-5] exists to make `bifrost_id_pk` globally unique, so a pool
-/// present in both lists is one entry, not two.
-pub fn union_identity_pairs(
+/// Outside a migration window: the current list, exactly as always — a
+/// mismatch surfaces from `apply_registration` / `apply_deregistration` as the
+/// root mismatch it is. Inside one: the bindings
+/// [`crate::cardano::migrate_registration::explain_identity_root`] finds the
+/// root commits to, which is the one rule the roster read and all three
+/// builders share. `check` sees the window before the trie is built, for the
+/// refusals that only a window can motivate.
+pub fn identity_trie_for(
     current: &RegistryList,
-    previous: Option<(&str, &[BfUtxo])>,
-) -> Result<Vec<IdentityPair>, RegisterSpoError> {
-    let mut seen: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
-    let mut pairs: Vec<IdentityPair> = Vec::new();
-    for (pk, pool_id) in current.identity_pairs() {
-        if seen.insert(pk.clone()) {
-            pairs.push((pk, pool_id));
-        }
+    previous_registry: Option<(&str, &[BfUtxo])>,
+    root: mpf::Hash,
+    check: impl FnOnce(
+        Option<&RegistryList>,
+        &crate::cardano::migrate_registration::IdentityWindow,
+    ) -> Result<(), RegisterSpoError>,
+) -> Result<mpf::Trie, RegisterSpoError> {
+    if previous_registry.is_none() {
+        return Ok(mpf::Trie::from_pairs(current.identity_pairs()).map_err(TreasuryInfoError::Mpf)?);
     }
-    if let Some((policy_hex, utxos)) = previous {
-        let elements = find_registry_utxos(utxos, policy_hex)?;
-        let list = RegistryList::from_elements(
-            elements
-                .iter()
-                .map(|u| (u.asset_name.clone(), u.element.clone())),
-        )?;
-        for (pk, pool_id) in list.identity_pairs() {
-            if seen.insert(pk.clone()) {
-                pairs.push((pk, pool_id));
-            }
-        }
+    let (previous, window) = crate::cardano::migrate_registration::read_identity_window(
+        current,
+        previous_registry,
+        root,
+    )?;
+    check(previous.as_ref(), &window)?;
+    Ok(window.trie().map_err(TreasuryInfoError::Mpf)?)
+}
+
+/// Refuse a registration that would put a SECOND binding for a pool into the
+/// identity root.
+///
+/// The trie is keyed by `bifrost_id_pk`, so the absence proof [REG-5] asks for
+/// says nothing about `pool_id`. Outside a migration window the list's own
+/// uniqueness covers that. Inside one, a pool still registered under the
+/// previous registry is in the root but not in the list a registration inserts
+/// into, so it could register again under a new key — and then carry two
+/// bindings no transaction can remove: its old one cannot be migrated (the pool
+/// is in the current list) and cannot be exited (the old `Deregister` no longer
+/// passes [TSY-13]). Once Config #13 is cleared the current list alone no
+/// longer rebuilds the root, and every roster read on the bridge fails.
+///
+/// A pool that migrated and then LEFT is free to register again: its old
+/// binding is already gone from the root.
+fn refuse_second_binding(
+    previous: Option<&RegistryList>,
+    window: &crate::cardano::migrate_registration::IdentityWindow,
+    pool_id: &[u8],
+) -> Result<(), RegisterSpoError> {
+    let Some(old) = previous.and_then(|prev| prev.get(pool_id)) else {
+        return Ok(());
+    };
+    if window.departed.contains(&old.bifrost_id_pk) {
+        return Ok(());
     }
-    Ok(pairs)
+    Err(RegisterSpoError::Build(format!(
+        "pool {} is still registered under the previous registry (bifrost key {}), and a \
+         migration is in progress. Carry it across instead of registering again — `run-spo` \
+         does it at startup, and `heimdall migrate-registration` does it by hand, with no cold \
+         key. Registering afresh would leave its old binding in the Treasury state where no \
+         transaction can ever remove it",
+        hex::encode(pool_id),
+        hex::encode(&old.bifrost_id_pk),
+    )))
+}
+
+/// [`refuse_second_binding`] from raw chain reads, for a caller that wants the
+/// answer before it asks a cold key for anything.
+pub fn check_register_allowed(
+    registry_policy_hex: &str,
+    registry_utxos: &[BfUtxo],
+    treasury_policy_hex: &str,
+    treasury_utxos: &[BfUtxo],
+    previous_registry: Option<(&str, &[BfUtxo])>,
+    pool_id: &[u8],
+) -> Result<(), RegisterSpoError> {
+    if previous_registry.is_none() {
+        return Ok(());
+    }
+    let list = registry_list_from_utxos(registry_utxos, registry_policy_hex)?;
+    if list.get(pool_id).is_some() {
+        return Err(RegisterSpoError::Registry(
+            crate::cardano::registry::RegistryError::AlreadyRegistered,
+        ));
+    }
+    let state = find_treasury_state(
+        treasury_utxos,
+        treasury_policy_hex,
+        &hex::encode(crate::cardano::config_params::TREASURY_INFO_ASSET_NAME),
+    )?;
+    let (previous, window) = crate::cardano::migrate_registration::read_identity_window(
+        &list,
+        previous_registry,
+        state.datum.bifrost_identity_root,
+    )?;
+    refuse_second_binding(previous.as_ref(), &window, pool_id)
 }
 
 /// Decode `tx_hash` hex into the 32-byte id whisky sorts inputs by.
@@ -556,18 +645,16 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
 
     // Treasury leg: rebuild the identity trie from the (pre-insert) list and
     // derive the post-registration datum + absence proof.
-    //
-    // From BOTH lists while a registry migration is in progress: the root the
-    // treasury carries commits to every binding written under either policy,
-    // because `Migrate` carries one across without moving it. Keyed by
-    // `bifrost_id_pk`, so a pool that has already migrated — and is therefore
-    // in both lists — contributes once.
-    let identity_trie = mpf::Trie::from_pairs(union_identity_pairs(&list, req.previous_registry)?)
-        .map_err(TreasuryInfoError::Mpf)?;
     let state = find_treasury_state(
         req.treasury_utxos,
         &req.treasury_script.hash_hex(),
         req.treasury_asset_name_hex,
+    )?;
+    let identity_trie = identity_trie_for(
+        &list,
+        req.previous_registry,
+        state.datum.bifrost_identity_root,
+        |previous, window| refuse_second_binding(previous, window, &pool_id),
     )?;
     let (new_treasury_datum, absence_proof) =
         apply_registration(&state.datum, &identity_trie, &req.bifrost_id_pk, &pool_id)?;
@@ -591,19 +678,11 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
             script_size: None,
         });
     }
-    let config_ref_index = {
-        let mut keys: Vec<(Vec<u8>, u32)> = reference_inputs
-            .iter()
-            .map(|r| (hex::decode(&r.tx_hash).unwrap_or_default(), r.tx_index))
-            .collect();
-        keys.sort();
-        keys.dedup();
-        let want = (
-            hex::decode(&req.config_ref.0).unwrap_or_default(),
-            req.config_ref.1,
-        );
-        u64::try_from(keys.iter().position(|k| *k == want).unwrap_or(0)).unwrap_or(0)
-    };
+    let config_ref_index = crate::cardano::tx_common::reference_input_index(
+        &reference_inputs,
+        &req.config_ref.0,
+        req.config_ref.1,
+    );
 
     let (treasury_in, treasury_out) = treasury_spend_leg(
         &state,
@@ -876,27 +955,14 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
             // something compares it; `migrate_registration` and `apply_ban`
             // check theirs, and an unchecked one would surface only as a
             // phase-2 failure with nothing to point at.
-            {
-                let refs: Vec<_> = tx
-                    .transaction_body
-                    .reference_inputs
-                    .as_ref()
-                    .map(|s| s.iter().collect())
-                    .unwrap_or_default();
-                let got = refs.get(config_ref_index as usize).ok_or_else(|| {
-                    RegisterSpoError::Build(format!(
-                        "Config reference index {config_ref_index} out of range"
-                    ))
-                })?;
-                if hex::encode(got.transaction_id.as_slice()) != req.config_ref.0
-                    || got.index != u64::from(req.config_ref.1)
-                {
-                    return Err(RegisterSpoError::Build(format!(
-                        "Config not at redeemer reference index {config_ref_index} — reference \
-                         ordering changed"
-                    )));
-                }
-            }
+            crate::cardano::tx_common::check_reference_at(
+                &tx,
+                config_ref_index,
+                &req.config_ref.0,
+                req.config_ref.1,
+                "Config",
+            )
+            .map_err(RegisterSpoError::Build)?;
         }
 
         hex::encode(
@@ -1764,6 +1830,72 @@ mod tests {
             format!("{err}").to_lowercase().contains("root"),
             "expected a root mismatch, got {err}"
         );
+    }
+
+    /// A pool still registered under the previous registry must be carried
+    /// across, not registered afresh under a new key. The identity trie is keyed
+    /// by `bifrost_id_pk`, so the absence proof says nothing about `pool_id`:
+    /// built, this would leave the pool with two bindings in the root, the old
+    /// one beyond any transaction's reach — and once Config #13 is cleared,
+    /// every roster read on the bridge fails.
+    ///
+    /// A pool that migrated and then LEFT is different: its old binding is gone
+    /// from the root, and it is free to join again.
+    #[test]
+    fn a_pool_still_under_the_previous_registry_cannot_register_afresh() {
+        let registry = registry_script();
+        let policy = registry.hash_hex();
+        let previous_policy = "b2".repeat(28);
+        let old_pk = b"this-pools-old-bifrost-key".to_vec();
+        let previous = vec![
+            element_utxo(
+                &previous_policy,
+                &"77".repeat(32),
+                0,
+                2_600_000,
+                REGISTRATION_ROOT_KEY,
+                &root_element(Some(&test_pool_id())),
+            ),
+            element_utxo(
+                &previous_policy,
+                &"88".repeat(32),
+                0,
+                2_600_000,
+                &test_pool_id(),
+                &node_element(&old_pk, None),
+            ),
+        ];
+        let empty_current = || {
+            vec![element_utxo(
+                &policy,
+                &"11".repeat(32),
+                0,
+                2_600_000,
+                REGISTRATION_ROOT_KEY,
+                &root_element(None),
+            )]
+        };
+
+        // Not carried across yet: its old binding is in the root.
+        let unmigrated = vec![(old_pk.clone(), test_pool_id().to_vec())];
+        let err = build_with_previous(
+            empty_current(),
+            &unmigrated,
+            Some((previous_policy.as_str(), previous.as_slice())),
+        )
+        .expect_err("must refuse a second binding for the same pool");
+        assert!(
+            format!("{err}").contains("still registered under the previous registry"),
+            "{err}"
+        );
+
+        // Migrated and then left: the root no longer holds it.
+        build_with_previous(
+            empty_current(),
+            &[],
+            Some((previous_policy.as_str(), previous.as_slice())),
+        )
+        .expect("a pool that left may register again");
     }
 
     /// The collateral input must be distinct from EVERY spent input, and since

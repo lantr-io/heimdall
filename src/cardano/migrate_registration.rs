@@ -20,6 +20,8 @@
 //! latter would need the old cold signature, and once Config #9 has moved the
 //! old `Deregister` cannot satisfy [TSY-13] anyway.
 
+use std::collections::BTreeSet;
+
 use pallas_codec::minicbor;
 use pallas_primitives::PlutusData;
 use pallas_primitives::conway::Tx;
@@ -33,7 +35,8 @@ use crate::cardano::mpf;
 use crate::cardano::plutus::{constr, int};
 use crate::cardano::publish::WalletUtxo;
 use crate::cardano::register_spo::{
-    RegisterSpoError, find_registry_utxos, registration_list_action_redeemer,
+    IdentityPair, RegisterSpoError, find_registry_utxos, registration_list_action_redeemer,
+    registry_list_from_utxos,
 };
 use crate::cardano::registry::{RegistrationNodeData, RegistryError, RegistryList};
 use crate::cardano::treasury_info::proof_to_plutus_data;
@@ -74,93 +77,144 @@ pub enum MembershipState {
     AlreadyLeft,
 }
 
-/// How many migrated-and-then-exited pools the window check will account for.
+/// How far the window search reaches from either end: up to this many pools
+/// that migrated and then left, OR up to this many still waiting to cross.
 ///
-/// Normally zero: `build_deregister_spo_tx` refuses an exit by a migrated pool
-/// mid-window precisely because it strands everyone's registry changes, so the
-/// only way to produce one is the deliberate `--allow-during-migration`. Two is
-/// room for that having been used, twice, with the roster's agreement.
+/// Both ends, because the two regimes a window passes through are both common.
+/// Just after the governance Update almost everyone is still to cross and few
+/// have left; after the federation's `--all` pass nobody is left to cross and
+/// any number may have left since. A search from one end only would fail the
+/// second regime as soon as a third pool exited — and a failed search fails
+/// every roster read on the bridge.
 ///
-/// It is bounded because the search is over subsets: unbounded would be both
-/// slow and a licence to explain away any list at all, which is the opposite of
-/// what the check is for.
-pub const MAX_DEPARTED: usize = 2;
+/// Bounded because the search is over subsets. What it cannot reach is the
+/// middle — more than this many departures AND more than this many still to
+/// cross — and [`IdentityWindow::one_more_departure_fits`] is what keeps an exit
+/// from taking the window there.
+pub const SEARCH_DEPTH: usize = 2;
 
-/// Which bindings the Treasury state's identity root says are GONE, out of the
-/// ones only the previous list still carries.
+/// The Treasury state's identity root, accounted for by the two registry lists.
 ///
-/// This is what makes the migration window verifiable rather than merely
-/// tolerated. `Migrate` does not move the root, so during a window the root
-/// commits to the union of the two lists — except for pools that migrated and
-/// then exited, whose binding the exit deleted while their frozen old node
-/// stayed behind. Those are the only legitimate reason the union can fail to
-/// rebuild the root.
+/// `Migrate` does not move the root, so during a window it commits to the
+/// union of the two lists — minus the pools that migrated and then exited,
+/// whose binding the exit deleted while their frozen old node stayed behind.
+/// This is that set, computed once and used by everything that proves against
+/// the root: the roster read and all three builders. Building from the raw
+/// union instead, as they once did, made a single mid-window exit stop every
+/// registration, exit and migration on the bridge until Config #13 was cleared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityWindow {
+    /// The bindings the root commits to — what every proof is built against.
+    pub pairs: Vec<IdentityPair>,
+    /// Identity keys only the previous list carries whose binding the root
+    /// still holds: pools not yet carried across.
+    pub unmigrated: BTreeSet<Vec<u8>>,
+    /// Identity keys only the previous list carries whose binding the root no
+    /// longer holds: pools that migrated and then left.
+    pub departed: BTreeSet<Vec<u8>>,
+}
+
+impl IdentityWindow {
+    /// The identity trie these bindings form.
+    pub fn trie(&self) -> Result<mpf::Trie, mpf::MpfError> {
+        mpf::Trie::from_pairs(self.pairs.clone())
+    }
+
+    /// Whether the window can absorb one more departure and still be explained.
+    ///
+    /// An exit by a pool whose identity the previous list also carries turns it
+    /// into a departure. Past [`SEARCH_DEPTH`] departures the search can only
+    /// explain the root from the other end, which needs few pools left to
+    /// cross — and if both are many, no node can rebuild the root and every
+    /// roster read fails. That is the one exit worth refusing, and running
+    /// `migrate-registration --all` first (anyone may) always makes it fit.
+    #[must_use]
+    pub fn one_more_departure_fits(&self) -> bool {
+        self.departed.len() < SEARCH_DEPTH || self.unmigrated.len() <= SEARCH_DEPTH
+    }
+}
+
+/// Explain `root` by the current list's bindings and, during a migration
+/// window, the previous list's.
 ///
-/// So: try dropping each subset of the previous-only bindings, smallest first,
-/// up to [`MAX_DEPARTED`]. `Some(set)` means the list IS explained — every
-/// element of the current list is accounted for by the root, which is the
-/// property the check exists to establish. `None` means it is not, and the
-/// caller must treat that as it treats any root mismatch: a list that does not
-/// match the chain's own record of who is registered.
+/// `None` means no reachable set of departures does — the lists are not the
+/// ones the Treasury state vouches for, and the caller must treat that as it
+/// treats any root mismatch. Outside a window (`previous` is `None`) the check
+/// is the strict one it always was: the current list alone.
 ///
-/// The security this preserves: a fabricated element added to the CURRENT list
-/// appears in every candidate subset, so no subset can match. Accepting the
-/// union unconditionally — the first version of this — would have admitted one.
+/// The security this preserves: only identity keys the previous list carries
+/// and the current one does not are ever dropped, so a fabricated element
+/// added to the CURRENT list is in every candidate and no candidate matches.
+///
+/// What it cannot see, inside a window: which pools have crossed. `Migrate`
+/// leaves the root alone by design ([MIG-3]), so a current list that omits a
+/// migrated pool, or carries an unmigrated pool's exact binding, rebuilds the
+/// same root as the true one. That is a property of the contract, not of this
+/// search, and it ends when the window does.
 #[must_use]
-pub fn departed_bindings(
-    union: &[crate::cardano::register_spo::IdentityPair],
-    previous_only_pks: &[Vec<u8>],
-    treasury_root: mpf::Hash,
-) -> Option<std::collections::BTreeSet<Vec<u8>>> {
-    let root_of = |dropped: &std::collections::BTreeSet<Vec<u8>>| -> Option<mpf::Hash> {
-        let kept: Vec<_> = union
+pub fn explain_identity_root(
+    current: &[IdentityPair],
+    previous: Option<&[IdentityPair]>,
+    root: mpf::Hash,
+) -> Option<IdentityWindow> {
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut union: Vec<IdentityPair> = Vec::new();
+    for (pk, pool_id) in current {
+        if seen.insert(pk.clone()) {
+            union.push((pk.clone(), pool_id.clone()));
+        }
+    }
+    let mut previous_only: Vec<Vec<u8>> = Vec::new();
+    for (pk, pool_id) in previous.unwrap_or_default() {
+        if seen.insert(pk.clone()) {
+            union.push((pk.clone(), pool_id.clone()));
+            previous_only.push(pk.clone());
+        }
+    }
+    let n = previous_only.len();
+    // Smallest first from each end: no departures (the start of a window), all
+    // departed (the end of one), then one and two from each side.
+    let mut candidates: Vec<BTreeSet<usize>> = vec![BTreeSet::new(), (0..n).collect()];
+    for i in 0..n {
+        candidates.push([i].into_iter().collect());
+        candidates.push((0..n).filter(|&k| k != i).collect());
+    }
+    const _: () = assert!(SEARCH_DEPTH == 2, "the loops enumerate sizes 0, 1 and 2");
+    for i in 0..n {
+        for j in i + 1..n {
+            candidates.push([i, j].into_iter().collect());
+            candidates.push((0..n).filter(|&k| k != i && k != j).collect());
+        }
+    }
+    let mut tried: BTreeSet<BTreeSet<usize>> = BTreeSet::new();
+    for dropped in candidates {
+        if !tried.insert(dropped.clone()) {
+            continue;
+        }
+        let departed: BTreeSet<Vec<u8>> =
+            dropped.iter().map(|&k| previous_only[k].clone()).collect();
+        let pairs: Vec<IdentityPair> = union
             .iter()
-            .filter(|(pk, _)| !dropped.contains(pk))
+            .filter(|(pk, _)| !departed.contains(pk))
             .cloned()
             .collect();
-        mpf::Trie::from_pairs(kept).ok().map(|t| t.root_hash())
-    };
-
-    // Smallest first: no departures is the normal answer, and the answer that
-    // needs no explaining.
-    let none = std::collections::BTreeSet::new();
-    if root_of(&none) == Some(treasury_root) {
-        return Some(none);
-    }
-    // Sizes 1 and 2, written as the two nested loops they are. MAX_DEPARTED is
-    // 2 because an exit mid-window takes a deliberate override, so a general
-    // subset enumeration would be machinery nobody can check for a case nobody
-    // should reach.
-    const _: () = assert!(MAX_DEPARTED == 2, "the loops below enumerate sizes 1 and 2");
-    for (i, a) in previous_only_pks.iter().enumerate() {
-        let one: std::collections::BTreeSet<Vec<u8>> = [a.clone()].into_iter().collect();
-        if root_of(&one) == Some(treasury_root) {
-            return Some(one);
-        }
-        for b in previous_only_pks.iter().skip(i + 1) {
-            let two: std::collections::BTreeSet<Vec<u8>> =
-                [a.clone(), b.clone()].into_iter().collect();
-            if root_of(&two) == Some(treasury_root) {
-                return Some(two);
-            }
+        let Ok(trie) = mpf::Trie::from_pairs(pairs.clone()) else {
+            continue;
+        };
+        if trie.root_hash() == root {
+            let unmigrated = previous_only
+                .iter()
+                .filter(|pk| !departed.contains(*pk))
+                .cloned()
+                .collect();
+            return Some(IdentityWindow {
+                pairs,
+                unmigrated,
+                departed,
+            });
         }
     }
     None
-}
-
-/// The identity keys only the PREVIOUS list carries — the candidates for having
-/// migrated and then left.
-#[must_use]
-pub fn previous_only_pks(current: &RegistryList, previous: &RegistryList) -> Vec<Vec<u8>> {
-    let in_current: std::collections::BTreeSet<Vec<u8>> = current
-        .iter()
-        .map(|(_, data)| data.bifrost_id_pk.clone())
-        .collect();
-    previous
-        .iter()
-        .map(|(_, data)| data.bifrost_id_pk.clone())
-        .filter(|pk| !in_current.contains(pk))
-        .collect()
 }
 
 /// Classify one Bifrost identity key against the two lists.
@@ -176,16 +230,16 @@ pub fn classify(
     classify_against_root(bifrost_id_pk, current, previous, None)
 }
 
-/// [`classify`], given the union of the two lists' bindings and the Treasury
-/// state's identity root — which is what tells a pool waiting to migrate apart
-/// from one that migrated and then left.
+/// [`classify`], given the window the Treasury state's identity root explains —
+/// which is what tells a pool waiting to migrate apart from one that migrated
+/// and then left.
 ///
 /// The lists alone cannot: `Migrate` leaves the old node behind, and an exit
 /// under the new registry removes only the new one, so both shapes read as
 /// "absent from current, present in previous". The root can, because an exit
 /// deletes the binding from it.
 ///
-/// Without the root, `Migratable` is the safe guess — a migration that should
+/// Without the window, `Migratable` is the safe guess — a migration that should
 /// not happen is refused by the builder, where a missed one leaves a pool out
 /// of the roster.
 #[must_use]
@@ -193,7 +247,7 @@ pub fn classify_against_root(
     bifrost_id_pk: &[u8],
     current: &RegistryList,
     previous: Option<&RegistryList>,
-    identity_root: Option<(&[crate::cardano::register_spo::IdentityPair], mpf::Hash)>,
+    window: Option<&IdentityWindow>,
 ) -> MembershipState {
     let find = |list: &RegistryList| -> Option<Vec<u8>> {
         list.iter()
@@ -206,23 +260,48 @@ pub fn classify_against_root(
     let Some(pool_id) = previous.and_then(find) else {
         return MembershipState::NotRegistered;
     };
-    // Is this pool among the bindings the treasury root says are gone?
-    //
-    // Through the same subset search the roster read uses, not a one-off "drop
-    // just me" test: with TWO pools already migrated-and-left, dropping only
-    // this one never rebuilds the root, so both would read as migratable and
-    // both would warn and fail a build at every restart.
-    if let Some((union, root)) = identity_root
-        && let Some(previous) = previous
-    {
-        let candidates = previous_only_pks(current, previous);
-        if departed_bindings(union, &candidates, root)
-            .is_some_and(|departed| departed.contains(bifrost_id_pk))
-        {
-            return MembershipState::AlreadyLeft;
-        }
+    if window.is_some_and(|w| w.departed.contains(bifrost_id_pk)) {
+        return MembershipState::AlreadyLeft;
     }
     MembershipState::Migratable { pool_id }
+}
+
+/// Parse both lists and the Treasury state's root, and explain the root —
+/// the one read every builder starts from.
+///
+/// Errors name which of the reads failed; a root no reachable window explains
+/// is an error here, because a proof built against it is one the validator
+/// rejects after the fee.
+pub fn read_identity_window(
+    current: &RegistryList,
+    previous: Option<(&str, &[BfUtxo])>,
+    root: mpf::Hash,
+) -> Result<(Option<RegistryList>, IdentityWindow), RegisterSpoError> {
+    let previous = previous
+        .map(|(policy_hex, utxos)| registry_list_from_utxos(utxos, policy_hex))
+        .transpose()?;
+    let previous_pairs = previous.as_ref().map(RegistryList::identity_pairs);
+    let window = explain_identity_root(&current.identity_pairs(), previous_pairs.as_deref(), root)
+        .ok_or_else(|| {
+            RegisterSpoError::Build(format!(
+                "the registry {} not rebuild the Treasury state's identity root ({} in the datum), \
+             so a proof built here would be rejected on chain. {}",
+                if previous.is_some() {
+                    "lists do"
+                } else {
+                    "list does"
+                },
+                hex::encode(root),
+                if previous.is_some() {
+                    "During a migration window that means more pools have both left and still to \
+                 cross than any node can account for, or a provider returned a torn read — \
+                 retry, and if it persists run `heimdall migrate-registration --all`"
+                } else {
+                    "The provider's answer is torn or stale — retry"
+                },
+            ))
+        })?;
+    Ok((previous, window))
 }
 
 /// `SposRegistryMintRedeemer::Migrate` — constructor 3, field order pinned by
@@ -312,8 +391,8 @@ pub fn build_migrate_registration_tx(
     )?;
     // Parsed for its integrity check alone: a previous list that does not form
     // a well-linked chain is not one a registration can be read out of. The
-    // bindings come back through `union_identity_pairs` below, which is the one
-    // copy of the rule all three builders share.
+    // bindings come back through `read_identity_window` below, which is the one
+    // copy of the rule every builder shares.
     let _prev_list = RegistryList::from_elements(
         prev_elements
             .iter()
@@ -365,45 +444,38 @@ pub fn build_migrate_registration_tx(
         .expect("plan_insert anchors on an element from this snapshot");
 
     // ── [MIG-3]: the membership proof, against the trie the Treasury state's
-    // root commits to — which during a migration window is the UNION of the two
-    // lists, not the previous one alone.
+    // root commits to — during a window, both lists minus the pools that have
+    // already left, found by the one rule every builder and the roster read
+    // share (`explain_identity_root`).
     //
-    // `Migrate` does not move the root ([MIG-6]), so every binding written under
-    // the previous registry is still in it. But the new registry is live the
-    // moment Config #9 moves: a pool that has never been in the old list can
-    // register under it, and that insertion DOES move the root. Rebuilding from
-    // the previous list alone would then miss that entry, produce a different
-    // root, and yield a proof the validator rejects — after the fee.
-    //
-    // Keyed by `bifrost_id_pk`, so a pool present in both lists (migrated
-    // already) contributes once; the trie holds one entry per identity key,
-    // which is the uniqueness [REG-5] exists to enforce.
+    // Not the previous list alone: the new registry is live the moment Config
+    // #9 moves, and a pool that was never in the old list can register under
+    // it, which DOES move the root. And not the raw union: a pool that migrated
+    // and then left is gone from the root but not from the frozen old list.
     let state = find_treasury_state(
         req.treasury_utxos,
         req.treasury_policy_hex,
         req.treasury_asset_name_hex,
     )?;
-    let identity_pairs = crate::cardano::register_spo::union_identity_pairs(
+    let (_, window) = read_identity_window(
         &list,
         Some((
             req.previous_registry_policy_hex,
             req.previous_registry_utxos,
         )),
+        state.datum.bifrost_identity_root,
     )?;
-    let identity_trie = mpf::Trie::from_pairs(identity_pairs)
-        .map_err(crate::cardano::treasury_info::TreasuryInfoError::Mpf)?;
-    if identity_trie.root_hash() != state.datum.bifrost_identity_root {
+    if window.departed.contains(&node_data.bifrost_id_pk) {
         return Err(RegisterSpoError::Build(format!(
-            "the two registry lists do not rebuild the Treasury state's identity root ({} from \
-             the lists, {} in the datum), so a membership proof built here would be rejected on \
-             chain. The shape that causes it: a pool that migrated and then exited under the new \
-             registry is gone from the trie but still sits in the frozen old list, so the union \
-             over-counts by that pool. Refusing here costs nothing; spending a fee to find out \
-             costs a fee",
-            hex::encode(identity_trie.root_hash()),
-            hex::encode(state.datum.bifrost_identity_root),
+            "pool {} migrated and then left: its binding is gone from the Treasury state, so \
+             there is nothing to carry across. Its node in the previous list is inert. To join \
+             again, register",
+            hex::encode(req.pool_id)
         )));
     }
+    let identity_trie = window
+        .trie()
+        .map_err(crate::cardano::treasury_info::TreasuryInfoError::Mpf)?;
     let membership_proof = identity_trie
         .prove_membership(&node_data.bifrost_id_pk)
         .map_err(crate::cardano::treasury_info::TreasuryInfoError::Mpf)?;
@@ -441,14 +513,12 @@ pub fn build_migrate_registration_tx(
         });
     }
     let ref_index_of = |tx_hash: &str, index: u32| -> i64 {
-        let mut keys: Vec<(Vec<u8>, u32)> = reference_inputs
-            .iter()
-            .map(|r| (hex::decode(&r.tx_hash).unwrap_or_default(), r.tx_index))
-            .collect();
-        keys.sort();
-        keys.dedup();
-        let want = (hex::decode(tx_hash).unwrap_or_default(), index);
-        keys.iter().position(|k| *k == want).unwrap_or(0) as i64
+        i64::try_from(crate::cardano::tx_common::reference_input_index(
+            &reference_inputs,
+            tx_hash,
+            index,
+        ))
+        .unwrap_or(0)
     };
     let old_node_ref_index = ref_index_of(&old_node.tx_hash, old_node.output_index);
     let treasury_ref_index = ref_index_of(&state.tx_hash, state.output_index);
@@ -654,29 +724,17 @@ pub fn build_migrate_registration_tx(
                 };
             at_input(anchor_input_index, &anchor_ref, "anchor")?;
 
-            let refs: Vec<_> = tx
-                .transaction_body
-                .reference_inputs
-                .iter()
-                .flat_map(|s| s.iter())
-                .collect();
-            let at_ref = |i: i64,
-                          tx_hash: &str,
-                          index: u32,
-                          what: &str|
-             -> Result<(), RegisterSpoError> {
-                let got = refs.get(i as usize).ok_or_else(|| {
-                    RegisterSpoError::Build(format!("{what} reference index {i} out of range"))
-                })?;
-                if hex::encode(got.transaction_id.as_slice()) != tx_hash
-                    || got.index != u64::from(index)
-                {
-                    return Err(RegisterSpoError::Build(format!(
-                        "{what} not at redeemer reference index {i} — reference ordering changed"
-                    )));
-                }
-                Ok(())
-            };
+            let at_ref =
+                |i: i64, tx_hash: &str, index: u32, what: &str| -> Result<(), RegisterSpoError> {
+                    crate::cardano::tx_common::check_reference_at(
+                        &tx,
+                        u64::try_from(i).unwrap_or(u64::MAX),
+                        tx_hash,
+                        index,
+                        what,
+                    )
+                    .map_err(RegisterSpoError::Build)
+                };
             at_ref(
                 old_node_ref_index,
                 &old_node.tx_hash,
@@ -821,21 +879,27 @@ mod tests {
     fn a_pool_that_migrated_and_then_left_is_not_migratable() {
         let current = list(&[(POOL_B, PK_B)]);
         let previous = list(&[(POOL_A, PK_A), (POOL_B, PK_B)]);
-        let union = crate::cardano::register_spo::union_identity_pairs(&current, None).unwrap();
         let both: Vec<(Vec<u8>, Vec<u8>)> = vec![
             (PK_A.to_vec(), POOL_A.to_vec()),
             (PK_B.to_vec(), POOL_B.to_vec()),
         ];
+        let explain = |root| {
+            explain_identity_root(
+                &current.identity_pairs(),
+                Some(&previous.identity_pairs()),
+                root,
+            )
+            .expect("the root is explained")
+        };
 
-        // A has NOT left: the treasury root still holds both bindings, so the
-        // union rebuilds it and dropping A does not.
+        // A has NOT left: the treasury root still holds both bindings.
         let root_with_both = mpf::Trie::from_pairs(both.clone()).unwrap().root_hash();
         assert_eq!(
             classify_against_root(
                 PK_A,
                 &current,
                 Some(&previous),
-                Some((&both, root_with_both))
+                Some(&explain(root_with_both))
             ),
             MembershipState::Migratable {
                 pool_id: POOL_A.to_vec()
@@ -843,18 +907,20 @@ mod tests {
         );
 
         // A HAS left: the treasury root is the union MINUS A.
-        let root_without_a = mpf::Trie::from_pairs(union.clone()).unwrap().root_hash();
+        let root_without_a = mpf::Trie::from_pairs(current.identity_pairs())
+            .unwrap()
+            .root_hash();
         assert_eq!(
             classify_against_root(
                 PK_A,
                 &current,
                 Some(&previous),
-                Some((&both, root_without_a))
+                Some(&explain(root_without_a))
             ),
             MembershipState::AlreadyLeft
         );
 
-        // With no root the answer is the safe guess, unchanged: a migration
+        // With no window the answer is the safe guess, unchanged: a migration
         // that should not happen is refused by the builder, where a missed one
         // leaves a pool out of the roster.
         assert_eq!(
@@ -863,6 +929,73 @@ mod tests {
                 pool_id: POOL_A.to_vec()
             }
         );
+    }
+
+    fn pairs_for(ids: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        ids.iter().map(|&i| (vec![i; 32], vec![i; 28])).collect()
+    }
+
+    fn root_of(pairs: &[(Vec<u8>, Vec<u8>)]) -> mpf::Hash {
+        mpf::Trie::from_pairs(pairs.to_vec()).unwrap().root_hash()
+    }
+
+    /// Late in a window everyone has crossed and any number may have left
+    /// since. A search that only dropped up to two departures would fail there
+    /// on the third exit — and a failed search fails every roster read. The
+    /// other end of the search is what covers it.
+    #[test]
+    fn any_number_of_departures_is_explained_once_nobody_is_left_to_cross() {
+        let current = pairs_for(&[1, 2]);
+        let mut previous = current.clone();
+        previous.extend(pairs_for(&[10, 11, 12, 13, 14]));
+        let w = explain_identity_root(&current, Some(&previous), root_of(&current))
+            .expect("five departures, nobody to cross");
+        assert_eq!(w.departed.len(), 5);
+        assert!(w.unmigrated.is_empty());
+        assert!(w.one_more_departure_fits(), "and more exits are fine");
+    }
+
+    /// Early in a window almost everyone is still to cross.
+    #[test]
+    fn a_few_departures_are_explained_while_many_are_still_to_cross() {
+        let current = pairs_for(&[1]);
+        let mut previous = current.clone();
+        previous.extend(pairs_for(&[10, 11, 20, 21, 22, 23]));
+        let mut root_pairs = current.clone();
+        root_pairs.extend(pairs_for(&[20, 21, 22, 23]));
+        let w = explain_identity_root(&current, Some(&previous), root_of(&root_pairs))
+            .expect("two departures, four to cross");
+        assert_eq!(
+            w.departed,
+            [vec![10u8; 32], vec![11u8; 32]].into_iter().collect()
+        );
+        assert_eq!(w.unmigrated.len(), 4);
+        assert!(
+            !w.one_more_departure_fits(),
+            "a third departure with four still to cross is past both ends"
+        );
+    }
+
+    /// A fabricated element in the CURRENT list is in every candidate, so no
+    /// set of departures explains it away.
+    #[test]
+    fn a_fabricated_current_element_is_never_explained() {
+        let honest = pairs_for(&[1, 2]);
+        let previous = pairs_for(&[1, 2, 3]);
+        let mut forged = honest.clone();
+        forged.push((vec![0x66; 32], vec![0x66; 28]));
+        let mut root_pairs = honest.clone();
+        root_pairs.extend(pairs_for(&[3]));
+        assert!(explain_identity_root(&forged, Some(&previous), root_of(&root_pairs)).is_none());
+        assert!(explain_identity_root(&honest, Some(&previous), root_of(&root_pairs)).is_some());
+    }
+
+    /// Outside a window the check is the strict one: the current list alone.
+    #[test]
+    fn outside_a_window_only_the_current_list_explains_the_root() {
+        let current = pairs_for(&[1, 2]);
+        assert!(explain_identity_root(&current, None, root_of(&current)).is_some());
+        assert!(explain_identity_root(&current, None, root_of(&pairs_for(&[1]))).is_none());
     }
 
     /// Constructor 3 with the six fields the Aiken type pins, in order. There is

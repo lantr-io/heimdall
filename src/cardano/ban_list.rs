@@ -1177,7 +1177,16 @@ impl BanListSource {
         // disagreement: #8 is authoritative and these keys are on their way out
         // (the enforcement path fails loudly on its own if it needs them). Say so
         // and carry on rather than bricking a node over config it no longer uses.
-        if cardano.federation_one_shot.is_some() {
+        //
+        // Only where local keys ARE present. The one-shot is always set here —
+        // it comes from this same Config since WI-090 — so gating on it ran the
+        // check on every node, and after a registry revision every node's
+        // derivation fails (the ban list and the fault verifiers no longer come
+        // from #12), which turned into a warning on every roster read telling
+        // operators to delete keys they never had.
+        let has_local_keys =
+            !cardano.fault_proof_policies.is_empty() || cardano.registry_blueprint.is_some();
+        if cardano.federation_one_shot.is_some() && has_local_keys {
             match Self::from_local_keys(cardano, config) {
                 Ok(Some(local)) if local.ban_policy_hex != source.ban_policy_hex => {
                     return Err(BanListError::Config(format!(

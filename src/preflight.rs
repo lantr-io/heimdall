@@ -896,21 +896,32 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     Some((address, policy_hex)) => {
                         match bf_http::fetch_address_utxos(&base_url, &project_id, address).await {
                             Err(e) => Err(format!("previous registry UTxO query: {e}")),
-                            Ok(utxos) => crate::cardano::register_spo::find_registry_utxos(
+                            Ok(utxos) => crate::cardano::register_spo::registry_list_from_utxos(
                                 &utxos, policy_hex,
                             )
                             .map_err(|e| format!("previous registry list: {e}"))
-                            .and_then(|elements| {
-                                crate::cardano::registry::RegistryList::from_elements(
-                                    elements
-                                        .iter()
-                                        .map(|u| (u.asset_name.clone(), u.element.clone())),
-                                )
-                                .map_err(|e| format!("previous registry list: {e}"))
-                            })
                             .map(|list| {
+                                // In the previous list is not enough: a pool that
+                                // migrated and then LEFT is there too, inert, and
+                                // telling it that it is about to carry itself
+                                // across is the opposite of what `run-spo` will
+                                // do. The root says which: its exit deleted the
+                                // binding. Such a pool is simply not registered.
+                                let current: Vec<_> = snap
+                                    .spos
+                                    .iter()
+                                    .map(|s| (s.bifrost_id_pk.clone(), s.pool_id.clone()))
+                                    .collect();
+                                let left =
+                                    crate::cardano::migrate_registration::explain_identity_root(
+                                        &current,
+                                        Some(&list.identity_pairs()),
+                                        snap.identity_root,
+                                    )
+                                    .is_some_and(|w| w.departed.contains(pk.as_slice()));
                                 list.iter()
                                     .find(|(_, data)| data.bifrost_id_pk == pk)
+                                    .filter(|_| !left)
                                     .map(|(pool_id, _)| pool_id.to_vec())
                             }),
                         }
@@ -1445,14 +1456,15 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             "nonce reservation",
                             Status::Warn,
                             format!(
-                                "{} is reserved for a pending {} but does not exist yet — it \
-                                 was recorded with --no-submit-reservation and its transaction \
-                                 was never broadcast",
+                                "{} is reserved for a pending {} but does not exist yet — its \
+                                 transaction was never broadcast (--no-submit-reservation, or a \
+                                 broadcast that failed)",
                                 rec.outpoint, rec.action
                             ),
-                            "Submit the transaction that command printed. The signature is \
-                             bound to this outpoint and verifies once the UTxO exists; nothing \
-                             needs re-signing.",
+                            "Run the request command again without --no-submit-reservation: it \
+                             sends the transaction the record kept. The signature is bound to \
+                             this outpoint and verifies once the UTxO exists; nothing needs \
+                             re-signing.",
                         ),
                         MissingNonce::NotConfirmedYet => b.push(
                             12,
@@ -1618,7 +1630,13 @@ async fn wallet_collateral_utxos(
     // a reserved nonce, so a step that counted candidates on an UNMARKED set
     // would apply a looser rule than the builders it reports on — and pass a
     // wallet whose next script transaction cannot find collateral.
-    crate::cardano::nonce_reservation::wallet_set(&raw, state_dir)
+    //
+    // Leniently, as the daemon's own builders read it: an unreadable record is
+    // step 12's finding, and failing THIS step over it reported "could not read
+    // the wallet's UTxOs" — true of nothing, and hiding the real cause.
+    Ok(crate::cardano::nonce_reservation::wallet_set_lenient(
+        &raw, state_dir,
+    ))
 }
 
 /// Look for the registry reference script at the operator's own wallet address —

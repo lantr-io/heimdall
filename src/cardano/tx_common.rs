@@ -849,6 +849,72 @@ pub fn build_oneshot_bootstrap_tx(
     })
 }
 
+/// The outpoints a signed transaction spends, from its CBOR hex.
+pub fn spent_outpoints(signed_tx_hex: &str) -> Result<Vec<NonceOutpoint>, String> {
+    let bytes = hex::decode(signed_tx_hex).map_err(|e| format!("tx hex: {e}"))?;
+    let tx: Tx = minicbor::decode(&bytes).map_err(|e| format!("tx decode: {e}"))?;
+    tx.transaction_body
+        .inputs
+        .iter()
+        .map(|i| {
+            let id: [u8; 32] = i
+                .transaction_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| "tx input with a malformed id".to_string())?;
+            let index = u32::try_from(i.index).map_err(|_| "tx input index overflows u32")?;
+            Ok(NonceOutpoint::new(id, index))
+        })
+        .collect()
+}
+
+/// Where `(tx_hash, index)` will sit among `reference_inputs` once the built
+/// transaction carries them — sorted by `(tx_id, index)` and deduplicated, which
+/// is what the post-build fixup does to the set whisky emits. A redeemer that
+/// names a reference input by position must be computed against that order.
+#[must_use]
+pub fn reference_input_index(reference_inputs: &[RefTxIn], tx_hash: &str, index: u32) -> u64 {
+    let mut keys: Vec<(Vec<u8>, u32)> = reference_inputs
+        .iter()
+        .map(|r| (hex::decode(&r.tx_hash).unwrap_or_default(), r.tx_index))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    let want = (hex::decode(tx_hash).unwrap_or_default(), index);
+    u64::try_from(keys.iter().position(|k| *k == want).unwrap_or(0)).unwrap_or(0)
+}
+
+/// Check that reference input `i` of the BUILT transaction is `(tx_hash,
+/// index)`.
+///
+/// A reference index is a prediction until something compares it with the
+/// transaction that was actually built, and a wrong one surfaces on chain only
+/// as a phase-2 failure with nothing to point at.
+pub fn check_reference_at(
+    tx: &Tx,
+    i: u64,
+    tx_hash: &str,
+    index: u32,
+    what: &str,
+) -> Result<(), String> {
+    let refs: Vec<_> = tx
+        .transaction_body
+        .reference_inputs
+        .as_ref()
+        .map(|s| s.iter().collect())
+        .unwrap_or_default();
+    let got = usize::try_from(i)
+        .ok()
+        .and_then(|i| refs.get(i))
+        .ok_or_else(|| format!("{what} reference index {i} out of range"))?;
+    if hex::encode(got.transaction_id.as_slice()) != tx_hash || got.index != u64::from(index) {
+        return Err(format!(
+            "{what} not at redeemer reference index {i} — reference ordering changed"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
