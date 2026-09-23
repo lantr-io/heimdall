@@ -1508,6 +1508,10 @@ struct RegistryScripts {
     registry_bootstrap: String,
     /// The Config NFT policy — the root of every federation script hash.
     config_policy_id: [u8; 28],
+    /// The blueprint these were compiled from, for the command's further
+    /// derivations: it must be the SAME release, or a ban list or fault
+    /// verifier derived next to this registry belongs to another bridge.
+    blueprint: std::borrow::Cow<'static, str>,
 }
 
 /// The treasury script, its genesis one-shot, and the Config NFT policy.
@@ -1576,13 +1580,26 @@ fn treasury_script(
 /// will then say.
 async fn registry_scripts(
     cfg: &HeimdallConfig,
-    blueprint_json: &str,
+    blueprint_path: Option<&str>,
     view: Option<&heimdall::cardano::config_params::ConfigView>,
     registry_override: Option<&str>,
+    deploys: bool,
 ) -> Result<RegistryScripts, String> {
-    use heimdall::cardano::blueprint::spos_registry_script;
+    use heimdall::cardano::blueprint::{ContractsRelease, spos_registry_script};
 
     let registry_override = registry_override.map(str::trim).filter(|s| !s.is_empty());
+    // Which contracts release to compile with. The one the bridge's registry
+    // runs, as the Config says — except for a command that DEPLOYS a registry
+    // revision (`--registry-bootstrap` naming a new one-shot while the Config
+    // still names the old registry), which compiles the newest release this
+    // heimdall carries; and at genesis, where there is no Config yet.
+    let release = match view {
+        None => ContractsRelease::LATEST,
+        Some(_) if deploys && registry_override.is_some() => ContractsRelease::LATEST,
+        Some(v) => v.params.registry.contracts_release,
+    };
+    let blueprint = heimdall::cardano::blueprint::load_blueprint_for(release, blueprint_path)?;
+    let blueprint_json: &str = &blueprint;
     let (treasury, genesis, config_policy_id) =
         treasury_script(cfg, blueprint_json, view, registry_override)?;
     let derive =
@@ -1630,23 +1647,52 @@ async fn registry_scripts(
         registry,
         registry_bootstrap,
         config_policy_id,
+        blueprint,
     })
 }
 
 /// [`registry_scripts`] for a blocking command, reading the Config itself.
 fn registry_scripts_blocking(
     cfg: &HeimdallConfig,
-    blueprint_json: &str,
+    blueprint_path: Option<&str>,
     registry_override: Option<&str>,
+    deploys: bool,
 ) -> Result<RegistryScripts, String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
     let view = config_view(&rt, cfg)?;
     rt.block_on(registry_scripts(
         cfg,
-        blueprint_json,
+        blueprint_path,
         view.as_ref(),
         registry_override,
+        deploys,
     ))
+}
+
+/// Registering and leaving with this heimdall need a rev-5.6 registry.
+///
+/// Its registration and exit messages are bound to a nonce outpoint ([REG-10],
+/// [DRG-6]); a rev-5.5 registry verifies the unbound kind and would reject them
+/// on chain, after the fee and after a trip to the cold key. So until the
+/// bridge's registry revision this heimdall refuses, and says what to do,
+/// rather than build a transaction that cannot land. It still RUNS a rev-5.5
+/// bridge — roster, ceremonies, signing — exactly as the previous release did.
+fn refuse_before_revision(
+    view: &heimdall::cardano::config_params::ConfigView,
+    what: &str,
+) -> Result<(), String> {
+    if view.params.registry.contracts_release
+        == heimdall::cardano::blueprint::ContractsRelease::Rev55
+    {
+        return Err(format!(
+            "{what}: this bridge's registry still runs the rev-5.5 contracts, whose registration \
+             and exit signatures are not bound to a nonce. This heimdall builds only the bound \
+             kind, which that registry rejects. Join or leave after the bridge's registry \
+             revision (the governance Update that appends Config #13), or with the previous \
+             heimdall release"
+        ));
+    }
+    Ok(())
 }
 
 /// spec [PRE-4]: the registry a command compiled must be the one Config #9
@@ -2922,6 +2968,19 @@ async fn run_spo(
             std::process::exit(1);
         }
     };
+    // The contracts release the bridge's registry runs. Recorded before the peer
+    // listener starts, because the handshake reports it: a node that answered
+    // with the newest release it carries would be refused by every peer still on
+    // the previous heimdall, and a roster could not upgrade one node at a time.
+    if let Some(view) = &bridge_config {
+        let release = view.params.registry.contracts_release;
+        heimdall::cardano::blueprint::set_release_in_effect(release);
+        info!(
+            "contracts: the bridge's registry runs {} (blueprint {})",
+            release.label(),
+            &release.commit()[..7]
+        );
+    }
     // ── the entry an operator never runs (spec [MIG-1], §SPO Registration
     // section 8) ──
     //
@@ -2931,11 +2990,11 @@ async fn run_spo(
     // to, so it needs no signature at all. An operator's whole upgrade is
     // installing the package and restarting.
     //
-    // At startup rather than on a timer, because a restart IS the upgrade: a
-    // node that was already running when Config #13 moved picks it up at its next
-    // restart, or by `heimdall migrate-registration`, or by whoever ran
-    // `--all` — every route ends in the same place, and the chain, not this
-    // process, is what remembers.
+    // At startup, and then every half hour while the node runs (below): a node
+    // already running on this version when Config #13 moves carries itself
+    // across at its next look, as does one restarted onto it. Every route —
+    // this, `heimdall migrate-registration`, the federation's `--all` — ends in
+    // the same place, and the chain, not this process, is what remembers.
     let registry_migration = auto_migrate_registration(&cfg, no_auto_migrate).await;
 
     let contracts = match bridge_config.as_ref() {
@@ -3174,7 +3233,7 @@ async fn run_spo(
                                      on chain"
                                         .to_string(),
                                 );
-                                bf_chain = bf_chain.with_dkg_fault_ban_flow(flow);
+                                bf_chain = bf_chain.with_dkg_fault_ban_flow(*flow);
                             }
                             // A package ahead of (or behind) the governance
                             // Update that moved the ban list. Not a reason to
@@ -3541,6 +3600,9 @@ async fn run_spo(
     if let Some(why) = tries_rebuilt {
         health.update(|h| h.tries_rebuilt_at_startup = Some(why));
     }
+    // Whether a migration watcher is running, so the periodic re-check below
+    // does not start a second one for the same pool.
+    let migration_watching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let Some(migration) = registry_migration {
         health.update(|h| h.registry_migration = Some(migration.state.clone()));
         // A migration in flight is reported provisionally, so something has to
@@ -3548,114 +3610,47 @@ async fn run_spo(
         // life of the process — including long after it landed — and the
         // "migrated" state the operator guide describes is never reached.
         if let Some(pending) = migration.pending {
-            let PendingMigration {
-                pool_id,
-                settled,
-                watch,
-            } = pending;
-            let watch_health = health.clone();
-            let watch_cfg = cfg.clone();
+            migration_watching.store(true, std::sync::atomic::Ordering::Relaxed);
+            let done = migration_watching.clone();
+            let (watch_health, watch_cfg) = (health.clone(), cfg.clone());
             tokio::spawn(async move {
-                // Watch, and RETRY. One attempt was not enough: an anchor race
-                // is the expected failure when several nodes restart together
-                // after the same governance Update, and a transaction that
-                // Blockfrost accepted can still lose that race and be dropped.
-                // Either way the node is outside the roster, and the previous
-                // behaviour left it there until a human ran the command.
-                //
-                // Six attempts over roughly half an hour. Each poll is ONE
-                // address query, deliberately not a `migration_context`
-                // rebuild — that is 7-9 provider calls, and it returns `None`
-                // the moment Config #13 is cleared, which is the normal end of
-                // a rollout and would make the landing unobservable.
-                const ATTEMPTS: u32 = 6;
-                const POLLS_PER_ATTEMPT: u32 = 60;
-                for attempt in 1..=ATTEMPTS {
-                    for _ in 0..POLLS_PER_ATTEMPT {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        if watch.landed(&pool_id).await {
-                            info!(
-                                pool_id = %hex::encode(&pool_id),
-                                "registry migration confirmed; this node is in the current \
-                                 registry"
-                            );
-                            watch_health.update(|h| h.registry_migration = Some(settled.clone()));
-                            return;
-                        }
-                    }
-                    if attempt == ATTEMPTS {
-                        break;
-                    }
-                    // Not there after five minutes. Build a fresh context — the
-                    // anchor has moved if somebody else's migration landed — and
-                    // try again.
-                    warn!(
-                        pool_id = %hex::encode(&pool_id),
-                        "registry migration has not landed after attempt {attempt} of \
-                         {ATTEMPTS}; retrying"
-                    );
-                    match migration_context(&watch_cfg, true).await {
-                        // Config #13 cleared under us. Whether this pool made it
-                        // across is now answered by the list alone, and the poll
-                        // above is what answers it — keep polling, stop retrying.
-                        Ok(None) => continue,
-                        Ok(Some(ctx)) => {
-                            if let Err(e) = ctx.migrate_async(&watch_cfg, &pool_id).await {
-                                warn!(
-                                    pool_id = %hex::encode(&pool_id),
-                                    "registry migration retry {attempt} did not submit ({e})"
-                                );
-                            }
-                        }
-                        Err(e) => warn!("registry migration retry {attempt}: {e}"),
-                    }
-                }
-                // One last look before declaring anything. `landed` returns
-                // false on ANY read failure, so a provider outage across the
-                // whole window looks identical to a migration that never
-                // happened — and overwriting the line on that basis would
-                // report a pool that IS registered as one that is not, which is
-                // the confusion this watcher exists to remove.
-                if watch.landed(&pool_id).await {
-                    info!(
-                        pool_id = %hex::encode(&pool_id),
-                        "registry migration confirmed on the final check"
-                    );
-                    watch_health.update(|h| h.registry_migration = Some(settled.clone()));
-                    return;
-                }
-                warn!(
-                    pool_id = %hex::encode(&pool_id),
-                    "registry migration still has not landed after {ATTEMPTS} attempts. This \
-                     node is outside the roster until it does — run `heimdall \
-                     migrate-registration`, or wait for the federation's --all pass; anyone \
-                     may run it for anyone"
-                );
-                watch_health.update(|h| {
-                    h.registry_migration = Some(
-                        "migration not landed after 6 attempts — still watching; see the log"
-                            .to_string(),
-                    );
-                });
-                // Keep watching, quietly and slowly. The federation's `--all`
-                // pass or another operator can land this pool at any time, and
-                // a watcher that exited would leave the line above standing for
-                // the life of the process — indistinguishable from a pool that
-                // never migrated at all.
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    if watch.landed(&pool_id).await {
-                        info!(
-                            pool_id = %hex::encode(&pool_id),
-                            "registry migration landed after all — this node is in the current \
-                             registry"
-                        );
-                        watch_health.update(|h| h.registry_migration = Some(settled.clone()));
-                        return;
-                    }
-                }
+                watch_migration(watch_health, watch_cfg, pending).await;
+                done.store(false, std::sync::atomic::Ordering::Relaxed);
             });
         }
+    }
+    // A registry revision does not wait for restarts: the governance Update
+    // can land while this node runs, and one that only looked at startup would
+    // sit outside the new registry until an operator restarted it or the
+    // federation's `--all` pass reached it. So look again, every half hour —
+    // one Config read when no migration is in progress — and carry this pool
+    // across, or, with --no-auto-migrate, report it ready to migrate.
+    {
+        let (recheck_health, recheck_cfg) = (health.clone(), cfg.clone());
+        let watching = migration_watching.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+                if watching.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let Some(migration) =
+                    auto_migrate_registration(&recheck_cfg, no_auto_migrate).await
+                else {
+                    continue;
+                };
+                recheck_health.update(|h| h.registry_migration = Some(migration.state.clone()));
+                if let Some(pending) = migration.pending {
+                    watching.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let done = watching.clone();
+                    let (h, c) = (recheck_health.clone(), recheck_cfg.clone());
+                    tokio::spawn(async move {
+                        watch_migration(h, c, pending).await;
+                        done.store(false, std::sync::atomic::Ordering::Relaxed);
+                    });
+                }
+            }
+        });
     }
     if cfg.health.enabled {
         tokio::spawn(heimdall::health::serve(
@@ -5996,7 +5991,6 @@ fn run_bootstrap_registry(
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let pid = cfg
         .cardano
         .blockfrost_project_id
@@ -6007,8 +6001,8 @@ fn run_bootstrap_registry(
     // With a readable Config, `--registry-bootstrap` names the REGISTRY's
     // one-shot and the treasury stays on #12 — which is what a registry
     // revision's deploy needs: the new registry, compiled against the treasury
-    // that exists. At genesis there is no Config and it is the one outpoint for
-    // both (`registry_scripts`).
+    // that exists, from the newest contracts release. At genesis there is no
+    // Config and it is the one outpoint for both (`registry_scripts`).
     let bridge_config = config_view(&rt, cfg)?;
     let RegistryScripts {
         registry,
@@ -6016,9 +6010,10 @@ fn run_bootstrap_registry(
         ..
     } = rt.block_on(registry_scripts(
         cfg,
-        &blueprint_json,
+        blueprint_path,
         bridge_config.as_ref(),
         registry_bootstrap,
+        true,
     ))?;
     let registry_bootstrap = &registry_bootstrap;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
@@ -6089,8 +6084,6 @@ fn run_bootstrap_ban_list(
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
-
     // The ban policy is parameterized by the CONFIG NFT policy + the
     // fault-policy set + ban schedule + its own one-shot outref. Everything but
     // the outref is config-pinned (shared with apply-ban) so the derived policy
@@ -6109,8 +6102,9 @@ fn run_bootstrap_ban_list(
     let RegistryScripts {
         registry: target_registry,
         config_policy_id,
+        blueprint: blueprint_json,
         ..
-    } = registry_scripts_blocking(cfg, &blueprint_json, registry_bootstrap)?;
+    } = registry_scripts_blocking(cfg, blueprint_path, registry_bootstrap, true)?;
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     // The ban schedule is a property of the deployment, not of this operator, so
@@ -6179,9 +6173,9 @@ fn run_bootstrap_ban_list(
     };
     let spo_bans = spo_bans_script(
         &blueprint_json,
-        // spec [PRE-5]: the Config NFT policy, NOT the registry hash. The
-        // validator reads the registry policy from Config #9 at run time, so
-        // this parameter no longer changes when the registry is revised.
+        // The registry policy (rev 5.5's first parameter) and the Config NFT
+        // policy (rev 5.6's, [PRE-5]): the blueprint's parameter list picks.
+        &target_registry.hash,
         &config_policy_id,
         &params.fault_proof_policies,
         params.base_ban_duration_ms,
@@ -6356,7 +6350,6 @@ fn run_deploy_registry_ref(
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     let pid = cfg
         .cardano
         .blockfrost_project_id
@@ -6367,14 +6360,15 @@ fn run_deploy_registry_ref(
     // With a readable Config, `--registry-bootstrap` names the REGISTRY's
     // one-shot and the treasury stays on #12 — which is what a registry
     // revision's deploy needs: the new registry, compiled against the treasury
-    // that exists. At genesis there is no Config and it is the one outpoint for
-    // both (`registry_scripts`).
+    // that exists, from the newest contracts release. At genesis there is no
+    // Config and it is the one outpoint for both (`registry_scripts`).
     let bridge_config = config_view(&rt, cfg)?;
     let RegistryScripts { registry, .. } = rt.block_on(registry_scripts(
         cfg,
-        &blueprint_json,
+        blueprint_path,
         bridge_config.as_ref(),
         registry_bootstrap,
+        true,
     ))?;
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
@@ -6443,13 +6437,15 @@ fn run_deploy_fault_ref(
 
     use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     // The registry the bridge names at #9 — not necessarily the one Config
     // #12 compiles to, which after a registry revision is the registry the
     // bridge left (`registry_scripts`). With --registry-bootstrap, the one that
     // outpoint compiles, which is how a revision's next registry is named.
-    let RegistryScripts { registry, .. } =
-        registry_scripts_blocking(cfg, &blueprint_json, registry_bootstrap)?;
+    let RegistryScripts {
+        registry,
+        blueprint: blueprint_json,
+        ..
+    } = registry_scripts_blocking(cfg, blueprint_path, registry_bootstrap, true)?;
     let verifier = match kind {
         "round1" => fault_verifier_round1_script(&blueprint_json, &registry.hash),
         "round2" => fault_verifier_round2_script(&blueprint_json, &registry.hash),
@@ -6535,7 +6531,6 @@ fn run_deploy_spo_bans_ref(
 
     use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     // The registry the bridge names at #9 — not necessarily the one Config
     // #12 compiles to, which after a registry revision is the registry the
     // bridge left (`registry_scripts`). With --registry-bootstrap, the one that
@@ -6543,8 +6538,9 @@ fn run_deploy_spo_bans_ref(
     let RegistryScripts {
         registry,
         config_policy_id,
+        blueprint: blueprint_json,
         ..
-    } = registry_scripts_blocking(cfg, &blueprint_json, registry_bootstrap)?;
+    } = registry_scripts_blocking(cfg, blueprint_path, registry_bootstrap, true)?;
     let r1 = fault_verifier_round1_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("fault_verifier_round1: {e}"))?;
     let r2 = fault_verifier_round2_script(&blueprint_json, &registry.hash)
@@ -6555,9 +6551,9 @@ fn run_deploy_spo_bans_ref(
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
     let spo_bans = spo_bans_script(
         &blueprint_json,
-        // spec [PRE-5]: the Config NFT policy, NOT the registry hash. The
-        // validator reads the registry policy from Config #9 at run time, so
-        // this parameter no longer changes when the registry is revised.
+        // The registry policy (rev 5.5's first parameter) and the Config NFT
+        // policy (rev 5.6's, [PRE-5]): the blueprint's parameter list picks.
+        &registry.hash,
         &config_policy_id,
         &policies,
         base_ban_duration_ms,
@@ -6654,7 +6650,6 @@ fn run_init_scripts(
     // DkgFaultBanFlow::from_config do — recomputing the fault-verifier policy
     // ids from the blueprint rather than reading cfg.fault_proof_policies, so
     // the credential we register cannot drift from the one ApplyBan withdraws.
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
     // The registry the bridge names at #9 — not necessarily the one Config
     // #12 compiles to, which after a registry revision is the registry the
     // bridge left (`registry_scripts`). With --registry-bootstrap, the one that
@@ -6663,8 +6658,9 @@ fn run_init_scripts(
         registry,
         config_policy_id,
         registry_bootstrap,
+        blueprint: blueprint_json,
         ..
-    } = registry_scripts_blocking(cfg, &blueprint_json, registry_bootstrap)?;
+    } = registry_scripts_blocking(cfg, blueprint_path, registry_bootstrap, true)?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
     let r1 = fault_verifier_round1_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("fault_verifier_round1: {e}"))?;
@@ -6675,9 +6671,9 @@ fn run_init_scripts(
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
     let spo_bans = spo_bans_script(
         &blueprint_json,
-        // spec [PRE-5]: the Config NFT policy, NOT the registry hash. The
-        // validator reads the registry policy from Config #9 at run time, so
-        // this parameter no longer changes when the registry is revised.
+        // The registry policy (rev 5.5's first parameter) and the Config NFT
+        // policy (rev 5.6's, [PRE-5]): the blueprint's parameter list picks.
+        &registry.hash,
         &config_policy_id,
         &[r1.hash, r2.hash, eq.hash],
         base_ban_duration_ms,
@@ -7305,7 +7301,6 @@ async fn migration_context(
         pallas_addresses::Network::Testnet
     };
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(None)?;
     // The registry Config #9 names — during a migration, by definition, NOT
     // the one Config #12 compiles to (`registry_scripts`). Not
     // `resolve_one_shot` either: that helper builds its own tokio runtime and
@@ -7315,7 +7310,7 @@ async fn migration_context(
         registry,
         registry_bootstrap,
         ..
-    } = registry_scripts(cfg, &blueprint_json, Some(&view), None).await?;
+    } = registry_scripts(cfg, None, Some(&view), None, false).await?;
 
     let project_id = cfg
         .cardano
@@ -7828,6 +7823,117 @@ impl MigrationHealth {
                 warn!("registry migration: cannot watch for confirmation ({e})");
                 Self::settled(format!("{state}; not watched ({e})"))
             }
+        }
+    }
+}
+
+/// Watch a submitted migration until it lands, retrying it, and finish the
+/// `/health` line it started. Shared by the startup migration and the periodic
+/// re-check, which both hand over the same `PendingMigration`.
+async fn watch_migration(
+    watch_health: heimdall::health::HealthHandle,
+    watch_cfg: HeimdallConfig,
+    pending: PendingMigration,
+) {
+    let PendingMigration {
+        pool_id,
+        settled,
+        watch,
+    } = pending;
+    // Watch, and RETRY. One attempt was not enough: an anchor race
+    // is the expected failure when several nodes restart together
+    // after the same governance Update, and a transaction that
+    // Blockfrost accepted can still lose that race and be dropped.
+    // Either way the node is outside the roster, and the previous
+    // behaviour left it there until a human ran the command.
+    //
+    // Six attempts over roughly half an hour. Each poll is ONE
+    // address query, deliberately not a `migration_context`
+    // rebuild — that is 7-9 provider calls, and it returns `None`
+    // the moment Config #13 is cleared, which is the normal end of
+    // a rollout and would make the landing unobservable.
+    const ATTEMPTS: u32 = 6;
+    const POLLS_PER_ATTEMPT: u32 = 60;
+    for attempt in 1..=ATTEMPTS {
+        for _ in 0..POLLS_PER_ATTEMPT {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if watch.landed(&pool_id).await {
+                info!(
+                    pool_id = %hex::encode(&pool_id),
+                    "registry migration confirmed; this node is in the current \
+                     registry"
+                );
+                watch_health.update(|h| h.registry_migration = Some(settled.clone()));
+                return;
+            }
+        }
+        if attempt == ATTEMPTS {
+            break;
+        }
+        // Not there after five minutes. Build a fresh context — the
+        // anchor has moved if somebody else's migration landed — and
+        // try again.
+        warn!(
+            pool_id = %hex::encode(&pool_id),
+            "registry migration has not landed after attempt {attempt} of \
+             {ATTEMPTS}; retrying"
+        );
+        match migration_context(&watch_cfg, true).await {
+            // Config #13 cleared under us. Whether this pool made it
+            // across is now answered by the list alone, and the poll
+            // above is what answers it — keep polling, stop retrying.
+            Ok(None) => continue,
+            Ok(Some(ctx)) => {
+                if let Err(e) = ctx.migrate_async(&watch_cfg, &pool_id).await {
+                    warn!(
+                        pool_id = %hex::encode(&pool_id),
+                        "registry migration retry {attempt} did not submit ({e})"
+                    );
+                }
+            }
+            Err(e) => warn!("registry migration retry {attempt}: {e}"),
+        }
+    }
+    // One last look before declaring anything. `landed` returns
+    // false on ANY read failure, so a provider outage across the
+    // whole window looks identical to a migration that never
+    // happened — and overwriting the line on that basis would
+    // report a pool that IS registered as one that is not, which is
+    // the confusion this watcher exists to remove.
+    if watch.landed(&pool_id).await {
+        info!(
+            pool_id = %hex::encode(&pool_id),
+            "registry migration confirmed on the final check"
+        );
+        watch_health.update(|h| h.registry_migration = Some(settled.clone()));
+        return;
+    }
+    warn!(
+        pool_id = %hex::encode(&pool_id),
+        "registry migration still has not landed after {ATTEMPTS} attempts. This \
+         node is outside the roster until it does — run `heimdall \
+         migrate-registration`, or wait for the federation's --all pass; anyone \
+         may run it for anyone"
+    );
+    watch_health.update(|h| {
+        h.registry_migration =
+            Some("migration not landed after 6 attempts — still watching; see the log".to_string());
+    });
+    // Keep watching, quietly and slowly. The federation's `--all`
+    // pass or another operator can land this pool at any time, and
+    // a watcher that exited would leave the line above standing for
+    // the life of the process — indistinguishable from a pool that
+    // never migrated at all.
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        if watch.landed(&pool_id).await {
+            info!(
+                pool_id = %hex::encode(&pool_id),
+                "registry migration landed after all — this node is in the current \
+                 registry"
+            );
+            watch_health.update(|h| h.registry_migration = Some(settled.clone()));
+            return;
         }
     }
 }
@@ -8365,7 +8471,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let config_view = rt
         .block_on(config_view_async(cfg))?
         .ok_or("register-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
+    refuse_before_revision(&config_view, "register-spo")?;
     let RegistryScripts {
         treasury,
         registry,
@@ -8373,9 +8479,10 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         ..
     } = rt.block_on(registry_scripts(
         cfg,
-        &blueprint_json,
+        args.blueprint.as_deref(),
         Some(&config_view),
         args.registry_bootstrap.as_deref(),
+        false,
     ))?;
     check_published_registry(&registry, &config_view)?;
 
@@ -8992,7 +9099,7 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
     let config_view = rt
         .block_on(config_view_async(cfg))?
         .ok_or("deregister-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
+    refuse_before_revision(&config_view, "deregister-spo")?;
     let RegistryScripts {
         treasury,
         registry,
@@ -9000,9 +9107,10 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         ..
     } = rt.block_on(registry_scripts(
         cfg,
-        &blueprint_json,
+        args.blueprint.as_deref(),
         Some(&config_view),
         args.registry_bootstrap.as_deref(),
+        false,
     ))?;
     check_published_registry(&registry, &config_view)?;
 
@@ -9576,7 +9684,6 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
     // The registry the bridge names at #9 — not necessarily the one Config
     // #12 compiles to, which after a registry revision is the registry the
     // bridge left (`registry_scripts`). With --registry-bootstrap, the one that
@@ -9584,8 +9691,14 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let RegistryScripts {
         registry,
         config_policy_id,
+        blueprint: blueprint_json,
         ..
-    } = registry_scripts_blocking(cfg, &blueprint_json, args.registry_bootstrap.as_deref())?;
+    } = registry_scripts_blocking(
+        cfg,
+        args.blueprint.as_deref(),
+        args.registry_bootstrap.as_deref(),
+        false,
+    )?;
     let fault_kind = parse_fault_verifier_kind(&args.fault_kind)?;
     let fault = fault_verifier_script(&blueprint_json, fault_kind, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
@@ -9604,8 +9717,9 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
             let (tx_id, index) = parse_cardano_outref(outref)?;
             spo_bans_script(
                 &blueprint_json,
-                // spec [PRE-5]: the Config NFT policy, NOT the registry hash. The
-                // validator reads the registry policy from Config #9 at run time.
+                // The registry policy (rev 5.5) and the Config NFT policy (rev 5.6,
+                // [PRE-5]): the blueprint's parameter list picks.
+                &registry.hash,
                 &config_policy_id,
                 &params.fault_proof_policies,
                 params.base_ban_duration_ms,
@@ -9822,13 +9936,20 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
     // The registry the bridge names at #9 — not necessarily the one Config
     // #12 compiles to, which after a registry revision is the registry the
     // bridge left (`registry_scripts`). With --registry-bootstrap, the one that
     // outpoint compiles, which is how a revision's next registry is named.
-    let RegistryScripts { registry, .. } =
-        registry_scripts_blocking(cfg, &blueprint_json, args.registry_bootstrap.as_deref())?;
+    let RegistryScripts {
+        registry,
+        blueprint: blueprint_json,
+        ..
+    } = registry_scripts_blocking(
+        cfg,
+        args.blueprint.as_deref(),
+        args.registry_bootstrap.as_deref(),
+        false,
+    )?;
     let json = std::fs::read_to_string(&args.evidence_file)
         .map_err(|e| format!("read evidence file {}: {e}", args.evidence_file))?;
     let ev: EvidenceFile = serde_json::from_str(&json)

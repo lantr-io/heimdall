@@ -1047,9 +1047,10 @@ impl BanListSource {
         }
         let bans = blueprint::spo_bans_script(
             &blueprint_json,
-            // spec [PRE-5]: the Config NFT policy, NOT the registry hash — see
-            // the note on `spo_bans_script`. The registry is still derived
-            // above, because the three fault policies ARE functions of it.
+            // The registry policy (rev 5.5) and the Config NFT policy (rev 5.6,
+            // [PRE-5]) — see `spo_bans_script`: the blueprint's parameter list
+            // picks.
+            &registry.hash,
             config_policy_id,
             &params.fault_proof_policies,
             params.base_ban_duration_ms,

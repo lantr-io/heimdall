@@ -1355,6 +1355,7 @@ mod tests {
             spos_registry_policy_id: [0xc1; 28],
             treasury_info_policy_id: [0xc2; 28],
             previous_spos_registry_policy_id: None,
+            contracts_release: crate::cardano::blueprint::ContractsRelease::Rev56,
         };
         // #12 is what the local derivations in these tests compile against since
         // WI-090: `resolve` takes the one-shot from the Config, not from

@@ -1324,14 +1324,17 @@ step 10 (`local tries`) did exactly that — so a node that ran yesterday can re
 today. Finding that out while the old binary is still serving gives you a working node to fix it
 from.
 
-**A contracts release that revises the registry costs you nothing but this upgrade.** Install the
-package once the bridge's governance Update has moved the registry (the release announcement says
-when), and restart. Installing it earlier gains nothing: until the Update, the new package's
-`register-spo` and `deregister-spo` refuse with a message saying the package is newer than the
-bridge, and a node configured to publish fault proofs starts with that switched off (a `warn` line
-and doctor step 5 say so) until the Update lands and it is restarted. The node notices at startup that its membership token still sits under the
-previous registry policy, and carries the registration across by itself — no cold key, no trip to
-the safe, no `register-spo`. The transaction it posts proves your existing binding against the
+**A contracts release that revises the registry costs you nothing but this upgrade, and you
+choose when.** Install it whenever suits you, before the bridge's governance Update. Until that
+Update the new package runs the bridge exactly as the previous release does. It uses the same
+contracts, and it reports the same blueprint digest in the pre-ceremony handshake, so it holds
+ceremonies with nodes that have not upgraded yet. It reads which contracts the registry runs from
+the Config, the same way every node does. The one thing it will not do before the Update is
+register or leave: `register-spo` and `deregister-spo` refuse, and say so.
+
+Once the Update has moved the registry, the node notices within half an hour, with no restart,
+that its membership token still sits under the previous registry policy. It then carries the
+registration across by itself: no cold key, no trip to the safe, no `register-spo`. The transaction it posts proves your existing binding against the
 identity record the bridge already holds; it reproduces what your pool consented to and can change
 nothing else, which is why it needs no signature and why anyone may submit it for anyone. Expect
 one `warn` line naming the two policies, and a `migration  migrating <old> -> <new>` line on
@@ -1742,8 +1745,13 @@ the signature is bound to one wallet UTxO. An exit file signed before the upgrad
   script is compiled from the outpoint its first transaction spends, so they must stay unspent
   until steps 1 and 2 have used them. The bridge's original one-shot, Config #12, cannot be reused:
   it was spent at genesis. It stays the treasury's.
-- **The new heimdall on the deploying machine**, and a binocular whose `update-config` has
-  `--migrate-registry-to`. Operators install the new heimdall only after step 3.
+- **The roster on the new heimdall.** Operators upgrade first, at their own pace. The new version
+  runs the unrevised bridge exactly as the previous one does, so a roster that is half upgraded
+  keeps holding ceremonies. Do step 3 once every node runs it. A node still on the previous
+  release cannot read the roster while pools are crossing: it checks the identity record against
+  the new list alone, and it will not hold a ceremony with the upgraded nodes, because the
+  contracts it reports differ from theirs. The deploying machine also needs a binocular whose
+  `update-config` has `--migrate-registry-to`.
 - **A quiet stretch before an epoch boundary.** The roster is a snapshot of the list Config #9
   names, taken at the boundary. Steps 3 and 4 should both be done before the next one, or the
   pools that have not crossed yet are missing from that epoch's roster.
@@ -1815,7 +1823,8 @@ what makes the next roster complete whatever the operators do. A node that resta
 package first finds itself already registered; one that upgraded before this ran has carried itself
 across.
 
-Then tell operators to upgrade. If this command reports failures, run it again. Each migration is
+Nodes already on the new heimdall carry themselves across within half an hour whether or not this
+has run. If this command reports failures, run it again. Each migration is
 independent, and it skips what has already landed.
 
 ### Step 5 — re-apply the bans that must survive

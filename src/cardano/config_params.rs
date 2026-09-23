@@ -237,6 +237,16 @@ pub struct RegistryParams {
     /// leaves a registered pool out of the roster or tells an unregistered
     /// operator to wait for a migration that is not coming.
     pub previous_spos_registry_policy_id: Option<[u8; 28]>,
+    /// The contracts release the registry #9 names runs — rev 5.6 when the
+    /// datum carries #13 at all, empty or not, rev 5.5 when it predates it.
+    ///
+    /// Read from the arity rather than from a derivation because the arity is
+    /// what the two releases' Config writers differ in, and every node reads it
+    /// identically: a rev-5.6 genesis writes #13 empty, and the governance
+    /// Update that revises a rev-5.5 registry appends it. The distinction
+    /// `previous_spos_registry_policy_id` collapses (absent vs empty) is exactly
+    /// the one this keeps.
+    pub contracts_release: crate::cardano::blueprint::ContractsRelease,
 }
 
 /// Config #1–#6 — the bridge's contract identifiers.
@@ -640,6 +650,11 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
         spos_registry_policy_id: field_hash28(fields, 9, "spos_registry_policy_id")?,
         treasury_info_policy_id: field_hash28(fields, 10, "treasury_info_policy_id")?,
         previous_spos_registry_policy_id,
+        contracts_release: if fields.get(13).is_some() {
+            crate::cardano::blueprint::ContractsRelease::Rev56
+        } else {
+            crate::cardano::blueprint::ContractsRelease::Rev55
+        },
     };
 
     // #11, the federation leaf key (WI-069). It moved here from the
@@ -799,6 +814,7 @@ pub(crate) fn test_config_params() -> ConfigParams {
             spos_registry_policy_id: [0; 28],
             treasury_info_policy_id: [0; 28],
             previous_spos_registry_policy_id: None,
+            contracts_release: crate::cardano::blueprint::ContractsRelease::Rev56,
         },
         y_federation: [0xf9; 32],
         federation_one_shot: format!("{}:0", "c3".repeat(32)),
@@ -1613,6 +1629,11 @@ mod tests {
     fn a_config_without_the_append_means_no_migration() {
         let p = parse_config_datum(&config_datum(7, 1_000, 100_000)).unwrap();
         assert_eq!(p.registry.previous_spos_registry_policy_id, None);
+        // No #13 at all: the registry is the rev-5.5 one.
+        assert_eq!(
+            p.registry.contracts_release,
+            crate::cardano::blueprint::ContractsRelease::Rev55
+        );
     }
 
     /// A present but zero-length #13 means the same: the field exists and says
@@ -1624,6 +1645,12 @@ mod tests {
         fields.push(bytes(&[]));
         let p = parse_config_datum(&constr(0, fields)).unwrap();
         assert_eq!(p.registry.previous_spos_registry_policy_id, None);
+        // Present, even empty: a rev-5.6 registry — a rev-5.6 genesis writes it
+        // empty, and a closed migration window leaves it empty.
+        assert_eq!(
+            p.registry.contracts_release,
+            crate::cardano::blueprint::ContractsRelease::Rev56
+        );
     }
 
     /// Set, it names the policy a migration comes FROM ([MIG-1]).
