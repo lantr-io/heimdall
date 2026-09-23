@@ -1077,6 +1077,7 @@ mod tests {
 
     fn snapshot(spos: Vec<RegisteredSpo>) -> RegistrySnapshot {
         RegistrySnapshot {
+            departed: Default::default(),
             spos,
             identity_root: [0u8; 32],
             treasury_state: TreasuryStateUtxo {

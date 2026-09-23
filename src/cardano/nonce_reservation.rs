@@ -233,10 +233,43 @@ pub fn mark_from_state_dir(
     utxos: Vec<WalletUtxo>,
     state_dir: Option<&Path>,
 ) -> Result<Vec<WalletUtxo>, String> {
-    let reserved = NonceReservation::load_or_none(state_dir)?
-        .map(|r| r.nonce())
-        .transpose()?;
-    Ok(mark_in_flight(mark_reserved(utxos, reserved)))
+    let record = NonceReservation::load_or_none(state_dir)?;
+    let reserved = record.as_ref().map(|r| r.nonce()).transpose()?;
+    // The reservation transaction's own inputs, while it may not have landed.
+    //
+    // Until it does, the nonce is only an outpoint on paper, and what makes it
+    // real is the UTxO the reservation spends. Blockfrost still lists that one
+    // as unspent, so any other process on this wallet — `run-spo` above all —
+    // could pick it for a fee, and then either its own transaction is rejected
+    // or the reservation can never land and the request names an outpoint that
+    // will never exist. With `--no-submit-reservation` that window is however
+    // long the operator takes. Read from the record, so it holds across
+    // processes, which the in-flight hold cannot.
+    let funding = record
+        .as_ref()
+        .and_then(|r| r.reservation_tx.as_deref())
+        .and_then(|tx| crate::cardano::tx_common::spent_outpoints(tx).ok())
+        .unwrap_or_default();
+    Ok(mark_in_flight(mark_outpoints(
+        mark_reserved(utxos, reserved),
+        &funding,
+    )))
+}
+
+/// Flag every UTxO in `held` as reserved.
+fn mark_outpoints(utxos: Vec<WalletUtxo>, held: &[NonceOutpoint]) -> Vec<WalletUtxo> {
+    if held.is_empty() {
+        return utxos;
+    }
+    utxos
+        .into_iter()
+        .map(|mut u| {
+            if u.outpoint().is_some_and(|o| held.contains(&o)) {
+                u.reserved = true;
+            }
+            u
+        })
+        .collect()
 }
 
 /// How long a wallet input this process spent is held back from selection
@@ -279,18 +312,7 @@ fn mark_in_flight(utxos: Vec<WalletUtxo>) -> Vec<WalletUtxo> {
         held.retain(|(_, at)| at.elapsed().as_secs() < IN_FLIGHT_SECS);
         held.iter().map(|(o, _)| *o).collect()
     };
-    if held.is_empty() {
-        return utxos;
-    }
-    utxos
-        .into_iter()
-        .map(|mut u| {
-            if u.outpoint().is_some_and(|o| held.contains(&o)) {
-                u.reserved = true;
-            }
-            u
-        })
-        .collect()
+    mark_outpoints(utxos, &held)
 }
 
 /// The form a wallet UTxO set must be built in on any path that can SPEND.
@@ -592,7 +614,49 @@ mod tests {
         assert_eq!(fee.tx_hash, hex::encode([0xe8u8; 32]));
     }
 
-    // Coin selection is where the reservation earns its keep: a daemon posting
+    /// The UTxO a reservation transaction spends is held back from every wallet
+    /// read that sees the record — another process's included — until the
+    /// reservation lands, so nothing else can spend it out from under the nonce.
+    #[test]
+    fn the_reservation_transactions_input_is_held_back_until_it_lands() {
+        use crate::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+        const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                                abandon abandon abandon about";
+        let key = derive_payment_key(MNEMONIC).unwrap();
+        let addr =
+            wallet_address_from_mnemonic(MNEMONIC, pallas_addresses::Network::Testnet).unwrap();
+        let mut funding = utxo(0xf1, 0);
+        funding.lovelace = 50_000_000;
+        let other = utxo(0xf2, 1);
+        let built = crate::cardano::tx_common::build_nonce_reservation_tx(
+            &addr,
+            &[funding.clone(), other.clone()],
+            &key,
+            &None,
+        )
+        .expect("a reservation builds");
+
+        let dir = std::env::temp_dir().join(format!("heimdall-nonce-fund-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        NonceReservation::new(built.outpoint, Action::Register, 0, false)
+            .with_tx(built.signed_tx_hex.clone())
+            .save(&dir)
+            .unwrap();
+        let spent = crate::cardano::tx_common::spent_outpoints(&built.signed_tx_hex).unwrap();
+        assert_eq!(spent.len(), 1, "one funding input");
+
+        let marked = mark_from_state_dir(vec![funding.clone(), other.clone()], Some(&dir)).unwrap();
+        for u in &marked {
+            let is_funding = u.outpoint().is_some_and(|o| spent.contains(&o));
+            assert_eq!(
+                u.reserved, is_funding,
+                "only the reservation's input is held back"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Coin selection is where the reservation earns its keep: a daemon posting    // Coin selection is where the reservation earns its keep: a daemon posting
     // a movement mid-round-trip must not take the nonce for a fee, even when it
     // is the richest UTxO in the wallet.
     #[test]

@@ -210,6 +210,12 @@ pub struct RegistrySnapshot {
     pub identity_root: mpf::Hash,
     /// The `treasury_info` state UTxO the root was checked against.
     pub treasury_state: TreasuryStateUtxo,
+    /// Identity keys the previous registry still lists whose binding the
+    /// root no longer holds — pools that migrated and then left. Empty outside a
+    /// migration window. Carried so a caller that needs it (finding its own
+    /// pool, doctor step 6) reads the answer the check already computed rather
+    /// than searching again.
+    pub departed: BTreeSet<Vec<u8>>,
 }
 
 /// Build a verified registry snapshot from caller-fetched UTxO sets.
@@ -367,6 +373,7 @@ pub fn registry_snapshot_during_migration(
         identity_root: treasury_state.datum.bifrost_identity_root,
         spos,
         treasury_state,
+        departed: window.departed,
     })
 }
 

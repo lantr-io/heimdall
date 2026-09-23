@@ -776,9 +776,9 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     // Warn: the daemon starts, and the right fix is usually
                     // the bridge's governance Update catching up, not a config
                     // edit.
-                    Ok(FaultEnforcement::ContractsDiffer(why)) => {
-                        (Status::Warn, format!("fault enforcement OFF — {why}"))
-                    }
+                    Ok(
+                        FaultEnforcement::ContractsDiffer(why) | FaultEnforcement::Unavailable(why),
+                    ) => (Status::Warn, format!("fault enforcement OFF — {why}")),
                     Err(e) => (
                         Status::Fail,
                         format!("fault enforcement half-configured: {e}"),
@@ -914,20 +914,10 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                                 // migrated and then LEFT is there too, inert, and
                                 // telling it that it is about to carry itself
                                 // across is the opposite of what `run-spo` will
-                                // do. The root says which: its exit deleted the
+                                // do. The root says which, and the snapshot's own
+                                // check already read it: its exit deleted the
                                 // binding. Such a pool is simply not registered.
-                                let current: Vec<_> = snap
-                                    .spos
-                                    .iter()
-                                    .map(|s| (s.bifrost_id_pk.clone(), s.pool_id.clone()))
-                                    .collect();
-                                let left =
-                                    crate::cardano::migrate_registration::explain_identity_root(
-                                        &current,
-                                        Some(&list.identity_pairs()),
-                                        snap.identity_root,
-                                    )
-                                    .is_some_and(|w| w.departed.contains(pk.as_slice()));
+                                let left = snap.departed.contains(pk.as_slice());
                                 list.iter()
                                     .find(|(_, data)| data.bifrost_id_pk == pk)
                                     .filter(|_| !left)

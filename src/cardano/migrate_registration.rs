@@ -172,6 +172,43 @@ pub fn explain_identity_root(
         }
     }
     let n = previous_only.len();
+    let pair_of: std::collections::BTreeMap<&Vec<u8>, &Vec<u8>> =
+        union.iter().map(|(pk, pool)| (pk, pool)).collect();
+    // Two tries, built once: all of it (nobody departed), and the current list
+    // alone (every previous-only pool departed). Every candidate is one of them
+    // with at most two keys taken out or put back. The trie is persistent and
+    // caches its node hashes, so such a candidate costs one or two paths of
+    // hashing, not a rebuild — the search that used to rebuild ~n² full tries,
+    // on the roster read's thread, now touches ~n² short paths.
+    let Ok(all) = mpf::Trie::from_pairs(union.clone()) else {
+        return None;
+    };
+    let current_only = union
+        .iter()
+        .filter(|(pk, _)| !previous_only.contains(pk))
+        .try_fold(mpf::Trie::empty(), |t, (pk, pool)| t.insert(pk, pool));
+    let Ok(current_only) = current_only else {
+        return None;
+    };
+    // A candidate is the set of previous-only indices that DEPARTED, reached
+    // either by dropping them from `all` or by putting the others back into
+    // `current_only` — whichever is the shorter walk.
+    let root_of = |departed: &BTreeSet<usize>| -> Option<mpf::Hash> {
+        if departed.len() <= n - departed.len() {
+            let mut t = all.clone();
+            for &k in departed {
+                t = t.delete(&previous_only[k]).ok()?;
+            }
+            Some(t.root_hash())
+        } else {
+            let mut t = current_only.clone();
+            for k in (0..n).filter(|k| !departed.contains(k)) {
+                let pk = &previous_only[k];
+                t = t.insert(pk, pair_of.get(pk)?).ok()?;
+            }
+            Some(t.root_hash())
+        }
+    };
     // Smallest first from each end: no departures (the start of a window), all
     // departed (the end of one), then one and two from each side.
     let mut candidates: Vec<BTreeSet<usize>> = vec![BTreeSet::new(), (0..n).collect()];
@@ -191,6 +228,9 @@ pub fn explain_identity_root(
         if !tried.insert(dropped.clone()) {
             continue;
         }
+        if root_of(&dropped) != Some(root) {
+            continue;
+        }
         let departed: BTreeSet<Vec<u8>> =
             dropped.iter().map(|&k| previous_only[k].clone()).collect();
         let pairs: Vec<IdentityPair> = union
@@ -198,21 +238,16 @@ pub fn explain_identity_root(
             .filter(|(pk, _)| !departed.contains(pk))
             .cloned()
             .collect();
-        let Ok(trie) = mpf::Trie::from_pairs(pairs.clone()) else {
-            continue;
-        };
-        if trie.root_hash() == root {
-            let unmigrated = previous_only
-                .iter()
-                .filter(|pk| !departed.contains(*pk))
-                .cloned()
-                .collect();
-            return Some(IdentityWindow {
-                pairs,
-                unmigrated,
-                departed,
-            });
-        }
+        let unmigrated = previous_only
+            .iter()
+            .filter(|pk| !departed.contains(*pk))
+            .cloned()
+            .collect();
+        return Some(IdentityWindow {
+            pairs,
+            unmigrated,
+            departed,
+        });
     }
     None
 }
@@ -988,6 +1023,32 @@ mod tests {
         root_pairs.extend(pairs_for(&[3]));
         assert!(explain_identity_root(&forged, Some(&previous), root_of(&root_pairs)).is_none());
         assert!(explain_identity_root(&honest, Some(&previous), root_of(&root_pairs)).is_some());
+    }
+
+    /// The incremental search finds the same answer a from-scratch rebuild
+    /// would, from either end, on a window large enough that it matters.
+    #[test]
+    fn the_incremental_search_agrees_with_rebuilding() {
+        let current = pairs_for(&(1..=30).collect::<Vec<u8>>());
+        let mut previous = current.clone();
+        previous.extend(pairs_for(&(100..=140).collect::<Vec<u8>>()));
+        // Two departed, the rest still to cross.
+        let mut root_pairs = current.clone();
+        root_pairs.extend(pairs_for(&(102..=140).collect::<Vec<u8>>()));
+        let w = explain_identity_root(&current, Some(&previous), root_of(&root_pairs))
+            .expect("explained");
+        assert_eq!(
+            w.departed,
+            [vec![100u8; 32], vec![101u8; 32]].into_iter().collect()
+        );
+        assert_eq!(root_of(&w.pairs), root_of(&root_pairs));
+        // All but one departed.
+        let mut root_pairs = current.clone();
+        root_pairs.extend(pairs_for(&[120]));
+        let w = explain_identity_root(&current, Some(&previous), root_of(&root_pairs))
+            .expect("explained");
+        assert_eq!(w.unmigrated, [vec![120u8; 32]].into_iter().collect());
+        assert_eq!(w.departed.len(), 40);
     }
 
     /// Outside a window the check is the strict one: the current list alone.

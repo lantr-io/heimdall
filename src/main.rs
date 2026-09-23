@@ -1593,9 +1593,20 @@ async fn registry_scripts(
     // revision (`--registry-bootstrap` naming a new one-shot while the Config
     // still names the old registry), which compiles the newest release this
     // heimdall carries; and at genesis, where there is no Config yet.
+    //
+    // A revision is an override naming an outpoint OTHER than Config #12. The
+    // flag's older help told operators to pass the bridge's own one-shot, and
+    // #12 is what the current registry was compiled from — taking that as a
+    // revision compiled the newest release against it and, for
+    // `bootstrap-ban-list`, minted a ban root under a policy no bridge uses.
+    let names_genesis = |o: &str, v: &heimdall::cardano::config_params::ConfigView| {
+        parse_cardano_outref(o).ok() == parse_cardano_outref(&v.params.federation_one_shot).ok()
+    };
     let release = match view {
         None => ContractsRelease::LATEST,
-        Some(_) if deploys && registry_override.is_some() => ContractsRelease::LATEST,
+        Some(v) if deploys && registry_override.is_some_and(|o| !names_genesis(o, v)) => {
+            ContractsRelease::LATEST
+        }
         Some(v) => v.params.registry.contracts_release,
     };
     let blueprint = heimdall::cardano::blueprint::load_blueprint_for(release, blueprint_path)?;
@@ -1690,6 +1701,28 @@ fn refuse_before_revision(
              kind, which that registry rejects. Join or leave after the bridge's registry \
              revision (the governance Update that appends Config #13), or with the previous \
              heimdall release"
+        ));
+    }
+    Ok(())
+}
+
+/// Fault proofs and bans with this heimdall need a rev-5.6 ban list.
+///
+/// Its `ApplyBan` carries a Config reference index that a rev-5.5 ban list does
+/// not expect, so on a bridge whose registry is still rev 5.5 the transaction
+/// fails — after a fault proof has been minted and paid for. Refused up front,
+/// like registering and leaving ([`refuse_before_revision`]).
+fn refuse_ban_before_revision(
+    view: &heimdall::cardano::config_params::ConfigView,
+    what: &str,
+) -> Result<(), String> {
+    if view.params.registry.contracts_release
+        == heimdall::cardano::blueprint::ContractsRelease::Rev55
+    {
+        return Err(format!(
+            "{what}: this bridge's registry still runs the rev-5.5 contracts, whose ban list \
+             takes a different ApplyBan than this heimdall builds. Publish faults and bans after \
+             the bridge's registry revision, or with the previous heimdall release"
         ));
     }
     Ok(())
@@ -1911,19 +1944,8 @@ fn find_own_pool_id(
                     .ok()
                     .map(|prev| prev.identity_pairs())
             });
-            let current_pairs: Vec<_> = snapshot
-                .spos
-                .iter()
-                .map(|s| (s.bifrost_id_pk.clone(), s.pool_id.clone()))
-                .collect();
-            let departed = in_previous.as_deref().is_some_and(|prev| {
-                heimdall::cardano::migrate_registration::explain_identity_root(
-                    &current_pairs,
-                    Some(prev),
-                    snapshot.identity_root,
-                )
-                .is_some_and(|w| w.departed.contains(our_pk.as_slice()))
-            });
+            // The snapshot's own check already worked out which pools left.
+            let departed = snapshot.departed.contains(our_pk.as_slice());
             let unmigrated = !departed
                 && in_previous
                     .as_deref()
@@ -3243,6 +3265,9 @@ async fn run_spo(
                             Ok(
                                 heimdall::cardano::blockfrost_chain::FaultEnforcement::ContractsDiffer(
                                     why,
+                                )
+                                | heimdall::cardano::blockfrost_chain::FaultEnforcement::Unavailable(
+                                    why,
                                 ),
                             ) => {
                                 warn!("DKG fault-ban flow: {why}");
@@ -3415,6 +3440,44 @@ async fn run_spo(
             return;
         }
     };
+    // A migration submitted at startup has not confirmed yet, and the roster is
+    // read from the live registry list — which is exactly where this pool is not
+    // until it does. Resolving our own seat now would find nothing and end the
+    // process with a success status that no supervisor restarts: the node that
+    // was meant to carry itself across would simply stop. So wait for it, a few
+    // blocks' worth. If it still has not landed, exit with a FAILURE status, so
+    // the service is restarted and the startup migration runs again.
+    let roster = match (&configured_keypair, &registry_migration) {
+        (Some(kp), Some(migration)) if migration.pending.is_some() => {
+            let own_pk = kp.x_only_public_key().0.serialize();
+            let mut roster = roster;
+            let mut waited = 0u32;
+            while roster.own_participant(&own_pk).is_none() {
+                if waited >= 30 {
+                    error!(
+                        "Error: this pool's registry migration has not landed after ten minutes, \
+                         and the node cannot take its seat without it. Exiting with a failure \
+                         status so the service restarts and tries the migration again; \
+                         `heimdall migrate-registration` does it by hand"
+                    );
+                    std::process::exit(1);
+                }
+                if waited == 0 {
+                    info!(
+                        "waiting for this pool's registry migration to confirm before taking its \
+                         seat in the roster"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                waited += 1;
+                if let Ok(fresh) = chain.query_roster(epoch).await {
+                    roster = fresh;
+                }
+            }
+            roster
+        }
+        _ => roster,
+    };
 
     let (id, me, keypair) = match configured_keypair {
         // A [bifrost].skey_path was configured: locate ourselves by that key.
@@ -3469,6 +3532,18 @@ async fn run_spo(
                         // fatal (not registered / banned / URL-excluded). Fall
                         // back to --index ONLY for the legacy fixture demo.
                         let Some(ix) = index else {
+                            // Still under the previous registry, with auto-migration
+                            // off: say so rather than the generic "not registered".
+                            if registry_migration.is_some() {
+                                error!(
+                                    "Error: this pool is still registered under the previous \
+                                     registry and has no seat in the current one. Carry it \
+                                     across with `heimdall migrate-registration` (no cold key; \
+                                     anyone may run it), or start the node without \
+                                     --no-auto-migrate"
+                                );
+                                return;
+                            }
                             error!(
                                 "Error: this node's bifrost_id_pk ({}) is in neither the eligible \
                                  roster for epoch {epoch} (not registered / banned / URL-excluded) \
@@ -3634,10 +3709,29 @@ async fn run_spo(
                 if watching.load(std::sync::atomic::Ordering::Relaxed) {
                     continue;
                 }
-                let Some(migration) =
-                    auto_migrate_registration(&recheck_cfg, no_auto_migrate).await
-                else {
-                    continue;
+                let migration = match check_migration(&recheck_cfg, no_auto_migrate).await {
+                    // No migration in progress: nothing for the line to say.
+                    MigrationCheck::NoWindow => {
+                        recheck_health.update(|h| h.registry_migration = None);
+                        continue;
+                    }
+                    // In a window, with nothing to do: a line saying this
+                    // node migrated is still true and stays; anything else —
+                    // a failed check, a migration that had not landed — is
+                    // stale now, and goes.
+                    MigrationCheck::NothingToDo => {
+                        recheck_health.update(|h| {
+                            if !h
+                                .registry_migration
+                                .as_deref()
+                                .is_some_and(|l| l.starts_with("migrated "))
+                            {
+                                h.registry_migration = None;
+                            }
+                        });
+                        continue;
+                    }
+                    MigrationCheck::Report(m) => m,
                 };
                 recheck_health.update(|h| h.registry_migration = Some(migration.state.clone()));
                 if let Some(pending) = migration.pending {
@@ -7403,7 +7497,6 @@ impl MigrationContext {
     fn window(
         &self,
         current: &heimdall::cardano::registry::RegistryList,
-        previous: &heimdall::cardano::registry::RegistryList,
     ) -> Result<heimdall::cardano::migrate_registration::IdentityWindow, String> {
         let root = heimdall::cardano::treasury_spend::find_treasury_state(
             &self.treasury_utxos,
@@ -7412,16 +7505,16 @@ impl MigrationContext {
         )
         .map(|s| s.datum.bifrost_identity_root)
         .map_err(|e| format!("read the Treasury state: {e}"))?;
-        heimdall::cardano::migrate_registration::explain_identity_root(
-            &current.identity_pairs(),
-            Some(&previous.identity_pairs()),
+        heimdall::cardano::migrate_registration::read_identity_window(
+            current,
+            Some((
+                self.previous_policy_hex.as_str(),
+                self.previous_registry_utxos.as_slice(),
+            )),
             root,
         )
-        .ok_or_else(|| {
-            "the two registry lists do not explain the Treasury state's identity root — a torn \
-             read, or more pools both departed and still to cross than any node can account for"
-                .to_string()
-        })
+        .map(|(_, window)| window)
+        .map_err(|e| e.to_string())
     }
 
     /// Build one pool's migration transaction. Pure and synchronous — no chain
@@ -7644,7 +7737,7 @@ fn run_migrate_registration(cfg: &HeimdallConfig, all: bool, submit: bool) -> Re
     // the governance Update: it makes the new list complete regardless of when
     // operators upgrade, so the next boundary snapshot equals the old roster
     // instead of whatever subset had restarted in time.
-    let window = ctx.window(&current, &previous)?;
+    let window = ctx.window(&current)?;
     let targets: Vec<Vec<u8>> = if all {
         // Not the pools that migrated and then left: their binding is gone from
         // the Treasury state, so there is no membership to prove and a build
@@ -7711,6 +7804,20 @@ fn run_migrate_registration(cfg: &HeimdallConfig, all: bool, submit: bool) -> Re
     let mut done = 0usize;
     for pool_id in &targets {
         let mut submitted = false;
+        // Already across — by its own node, which migrates itself at startup
+        // and every half hour, or by anyone else since the list was read. That
+        // is the outcome this command exists for, not a failure.
+        if ctx
+            .lists()
+            .is_ok_and(|(current, _)| current.get(pool_id).is_some())
+        {
+            println!(
+                "  {} → already in the current registry",
+                hex::encode(pool_id)
+            );
+            done += 1;
+            continue;
+        }
         match ctx.migrate(&rt, cfg, pool_id, submit) {
             Ok(MigrationOutcome::Migrated { tx_hash }) => {
                 println!("  {} → submitted {tx_hash}", hex::encode(pool_id));
@@ -7728,6 +7835,12 @@ fn run_migrate_registration(cfg: &HeimdallConfig, all: bool, submit: bool) -> Re
             Err(e) => {
                 failures += 1;
                 println!("  {} → FAILED: {e}", hex::encode(pool_id));
+                // Most likely the anchor moved under this one — another pool's
+                // migration landed. Planning the next target against the same
+                // read would lose the same race, so read the chain again.
+                if let Ok(Some(fresh)) = rt.block_on(migration_context(cfg, false)) {
+                    ctx = fresh;
+                }
             }
         }
         // Wait only for a transaction that was actually SENT. A build that
@@ -7916,26 +8029,17 @@ async fn watch_migration(
          may run it for anyone"
     );
     watch_health.update(|h| {
-        h.registry_migration =
-            Some("migration not landed after 6 attempts — still watching; see the log".to_string());
+        h.registry_migration = Some(
+            "migration not landed after 6 attempts — tried again at the next half-hourly check"
+                .to_string(),
+        );
     });
-    // Keep watching, quietly and slowly. The federation's `--all`
-    // pass or another operator can land this pool at any time, and
-    // a watcher that exited would leave the line above standing for
-    // the life of the process — indistinguishable from a pool that
-    // never migrated at all.
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        if watch.landed(&pool_id).await {
-            info!(
-                pool_id = %hex::encode(&pool_id),
-                "registry migration landed after all — this node is in the current \
-                 registry"
-            );
-            watch_health.update(|h| h.registry_migration = Some(settled.clone()));
-            return;
-        }
-    }
+    // Stop here, and let the periodic re-check take over. It classifies the
+    // pool afresh every half hour: migrated by then (the federation's `--all`
+    // or anyone else), it clears this line; still under the previous registry,
+    // it submits a new migration and starts a new watcher. A watcher that kept
+    // polling instead held the re-check off for the life of the process, and
+    // nothing ever tried the migration again.
 }
 
 /// The auto-migration `run-spo` performs at startup ([MIG-1], §SPO Registration
@@ -7954,10 +8058,29 @@ async fn auto_migrate_registration(
     cfg: &HeimdallConfig,
     disabled: bool,
 ) -> Option<MigrationHealth> {
+    match check_migration(cfg, disabled).await {
+        MigrationCheck::Report(m) => Some(m),
+        MigrationCheck::NoWindow | MigrationCheck::NothingToDo => None,
+    }
+}
+
+/// What one migration check found — kept apart so the periodic re-check can
+/// tell "no migration in progress" (the `/health` line goes) from "this node
+/// has nothing to do in one" (a "migrated" line stays) from a report.
+enum MigrationCheck {
+    /// No Config, or Config #13 unset: no migration in progress.
+    NoWindow,
+    /// A migration is in progress, and this node is current or not registered.
+    NothingToDo,
+    Report(MigrationHealth),
+}
+
+/// [`auto_migrate_registration`], returning which of those it was.
+async fn check_migration(cfg: &HeimdallConfig, disabled: bool) -> MigrationCheck {
     use heimdall::cardano::migrate_registration::{MembershipState, classify_against_root};
 
     let ctx = match migration_context(cfg, true).await {
-        Ok(None) => return None,
+        Ok(None) => return MigrationCheck::NoWindow,
         Ok(Some(ctx)) => ctx,
         Err(e) => {
             warn!("registry migration check: {e}");
@@ -7965,7 +8088,7 @@ async fn auto_migrate_registration(
             // a node that could not tell must not be reported as a node with
             // nothing to do. The rationale for never being fatal here is that
             // /health keeps saying so — which only works if it says something.
-            return Some(MigrationHealth::settled(format!(
+            return MigrationCheck::Report(MigrationHealth::settled(format!(
                 "unknown — the migration check failed ({e})"
             )));
         }
@@ -7974,7 +8097,7 @@ async fn auto_migrate_registration(
         Ok(v) => v,
         Err(e) => {
             warn!("registry migration check: {e}");
-            return Some(MigrationHealth::settled(format!(
+            return MigrationCheck::Report(MigrationHealth::settled(format!(
                 "unknown — the registry lists could not be read ({e})"
             )));
         }
@@ -7986,7 +8109,7 @@ async fn auto_migrate_registration(
             // Silence here would be indistinguishable from "no migration in
             // progress", and the two want opposite responses.
             warn!("registry migration check: no bifrost identity key ({e})");
-            return Some(MigrationHealth::settled(
+            return MigrationCheck::Report(MigrationHealth::settled(
                 "unknown — no bifrost identity key to classify this node".to_string(),
             ));
         }
@@ -7995,14 +8118,16 @@ async fn auto_migrate_registration(
     // Without a window the classification falls back to the safe guess: a
     // migration that should not happen is refused by the builder, where a
     // missed one leaves this pool out of the roster.
-    let window = ctx.window(&current, &previous).ok();
+    let window = ctx.window(&current).ok();
     let pool_id = match classify_against_root(&pk, &current, Some(&previous), window.as_ref()) {
-        MembershipState::Current | MembershipState::NotRegistered => return None,
+        MembershipState::Current | MembershipState::NotRegistered => {
+            return MigrationCheck::NothingToDo;
+        }
         // Gone by choice. Reporting it as migratable would warn and fail a
         // build at every restart until Config #13 is cleared, about a pool that
         // is exactly where its operator put it.
         MembershipState::AlreadyLeft => {
-            return Some(MigrationHealth::settled(
+            return MigrationCheck::Report(MigrationHealth::settled(
                 "left the bridge under the current registry; the previous list still \
                  holds an inert node"
                     .to_string(),
@@ -8020,7 +8145,7 @@ async fn auto_migrate_registration(
              --no-auto-migrate is set. Run `heimdall migrate-registration` to carry it across; \
              until then this node is outside the roster"
         );
-        return Some(MigrationHealth::settled(format!(
+        return MigrationCheck::Report(MigrationHealth::settled(format!(
             "migratable {from} -> {to} (auto-migrate off)"
         )));
     }
@@ -8039,7 +8164,7 @@ async fn auto_migrate_registration(
             // Watched: the line must not still say "migrating" an hour after
             // it landed, and the "migrated" state this reports is otherwise one
             // no code path ever produces.
-            Some(MigrationHealth::in_flight(
+            MigrationCheck::Report(MigrationHealth::in_flight(
                 format!("migrating {from} -> {to}"),
                 format!("migrated {from} -> {to}"),
                 pool_id.clone(),
@@ -8058,7 +8183,7 @@ async fn auto_migrate_registration(
                  it lands this node is outside the roster; `heimdall migrate-registration` \
                  does it by hand, and anyone may run it"
             );
-            Some(MigrationHealth::in_flight(
+            MigrationCheck::Report(MigrationHealth::in_flight(
                 format!("migrating {from} -> {to} (first attempt failed, retrying)"),
                 format!("migrated {from} -> {to}"),
                 pool_id.clone(),
@@ -8144,6 +8269,13 @@ fn resolve_nonce(
     // round trip, where the nonce is not this run's to choose.
     returning_signature: bool,
     submit_reservation: bool,
+    // Whether a `--nonce-utxo` should be RECORDED: only when a signature bound to
+    // it outlives this run — a request being written, or a returning signature
+    // being submitted (so a lost race can be retried). A dry run, or the
+    // one-machine flow that signs and submits together, would otherwise leave a
+    // record that nothing clears, holding the UTxO back from every fee and
+    // collateral selection and blocking the opposite command.
+    record_override: bool,
 ) -> Result<heimdall::cardano::tx_common::NonceOutpoint, String> {
     use heimdall::cardano::bf_http;
     use heimdall::cardano::nonce_reservation::{NonceReservation, still_unspent};
@@ -8244,6 +8376,10 @@ fn resolve_nonce(
             },
         )?;
         match state_dir {
+            Some(_) if !record_override => {
+                println!("nonce utxo:        {nonce} (from --nonce-utxo; used by this run only)");
+                return Ok(nonce);
+            }
             // Already on chain — the caller named a UTxO the wallet holds — so
             // it is recorded as submitted.
             Some(dir) => NonceReservation::new(nonce, action, now_secs(), true).save(dir)?,
@@ -8595,6 +8731,15 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     // and the point of step 1 is that nothing is spent until the command has
     // said the trip to the safe is worth making. Here, on the return leg, the
     // reservation already exists and this only reads it back.
+    //
+    // The Bifrost half can be a round trip too: `--bifrost-id-pk` now, the
+    // BIP340 signature over the printed digest later, with `--bifrost-sig`. The
+    // digest commits to the nonce, so the first run must reserve and RECORD one
+    // — the fee input would be a different UTxO by the second run — and the run
+    // bringing the signature back must find that same nonce.
+    let bifrost_away = bifrost_keypair.is_none();
+    let bifrost_first_leg = bifrost_away && args.bifrost_sig.is_none();
+    let returning_signature = cold_skey.is_none() || (bifrost_away && args.bifrost_sig.is_some());
     let nonce = if request_mode {
         None
     } else {
@@ -8608,13 +8753,14 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
             &wallet_utxos,
             args.nonce_utxo.as_deref(),
             heimdall::cardano::airgap::Action::Register,
-            false,
-            // A signature brought back from another machine — `--signed` or
-            // `--cold-sig` — names a nonce this run did not choose. A LOCAL cold
-            // key signs below, after the nonce is settled, so the one-machine
-            // flow is free to use the fee input.
-            cold_skey.is_none(),
+            bifrost_first_leg,
+            // A signature brought back from another machine — `--signed`,
+            // `--cold-sig` or `--bifrost-sig` — names a nonce this run did not
+            // choose. With BOTH keys local, the signatures are made below, after
+            // the nonce is settled, so the one-machine flow uses the fee input.
+            returning_signature,
             !args.no_submit_reservation,
+            bifrost_first_leg || (returning_signature && args.submit),
         )?)
     };
 
@@ -8882,6 +9028,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
             true,
             false,
             !args.no_submit_reservation,
+            true,
         )?;
         let request = SigningRequest::register(
             &network_label(cfg),
@@ -8928,7 +9075,10 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
             return Err(format!(
                 "no --bifrost-skey/--bifrost-sig. Air-gapped: BIP340-sign this 32-byte digest \
                  with the bifrost identity key and re-run with --bifrost-sig:\n  \
-                 sha2_256(message): {}",
+                 sha2_256(message): {}\n\
+                 It is bound to the nonce UTxO {nonce}, which is reserved for it, so the re-run \
+                 builds the same message. If the reservation record is lost, pass \
+                 --nonce-utxo {nonce} with the signature",
                 hex::encode(digest)
             ));
         }
@@ -9313,6 +9463,7 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         // did not choose; a LOCAL cold key signs after the nonce is settled.
         !request_mode && cold_skey.is_none(),
         !args.no_submit_reservation,
+        request_mode || (cold_skey.is_none() && args.submit),
     )?;
 
     // ── air-gapped step 1 ──
@@ -9710,6 +9861,9 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     // Config where the bridge publishes them; the derived policy is then checked
     // against #8.
     let bridge_config = config_view(&rt, cfg)?;
+    if let Some(view) = &bridge_config {
+        refuse_ban_before_revision(view, "apply-ban")?;
+    }
     let params = BanPolicyParams::resolve(&cfg.cardano, bridge_config.as_ref().map(|v| &v.params))
         .map_err(|e| e.to_string())?;
     let derive_bans =
@@ -9933,6 +10087,14 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
         build_fault_proof_mint_tx,
     };
 
+    // A fault proof minted against a rev-5.5 ban list can never be applied by
+    // this heimdall's ApplyBan — refuse before the fee rather than after.
+    {
+        let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+        if let Some(view) = config_view(&rt, cfg)? {
+            refuse_ban_before_revision(&view, "fault-proof-mint")?;
+        }
+    }
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
 

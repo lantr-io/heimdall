@@ -110,6 +110,11 @@ pub enum FaultEnforcement {
     /// and exiting would take a signing node off the roster over a feature
     /// that only decides whether cheating costs anything.
     ContractsDiffer(String),
+    /// Configured, but the chain read that locates a revised ban list failed —
+    /// a provider outage or rate limit at startup. Enforcement is optional, so
+    /// that is a reason to run without it until the next restart, never a reason
+    /// to take a signing node off the roster.
+    Unavailable(String),
 }
 
 impl DkgFaultBanFlow {
@@ -151,6 +156,20 @@ impl DkgFaultBanFlow {
         ];
         if enforcement_keys.iter().all(|k| k.is_none()) {
             return Ok(FaultEnforcement::NotConfigured);
+        }
+        // A registry still on rev 5.5 has a rev-5.5 ban list, whose ApplyBan
+        // this heimdall does not build: it would mint a fault proof, pay for it,
+        // and then fail every ban. Off, with the reason, until the revision.
+        if config.is_some_and(|c| {
+            c.registry.contracts_release == crate::cardano::blueprint::ContractsRelease::Rev55
+        }) {
+            return Ok(FaultEnforcement::ContractsDiffer(
+                "the bridge's registry still runs the rev-5.5 contracts, whose ban list takes a \
+                 different ApplyBan than this heimdall builds. Fault proofs are published again \
+                 after the bridge's registry revision (restart the node then); until it, a cheat \
+                 is still detected and excluded"
+                    .to_string(),
+            ));
         }
         let Some(one_shot) = cardano.federation_one_shot.as_deref() else {
             return Err(
@@ -295,7 +314,7 @@ impl DkgFaultBanFlow {
                 )?;
                 let base_url =
                     crate::cardano::bf_http::base_url(pid, cardano.blockfrost_url.as_deref());
-                let found = crate::cardano::revision::one_shot_for(
+                let found = match crate::cardano::revision::one_shot_for(
                     &base_url,
                     pid,
                     ban_bootstrap,
@@ -303,7 +322,17 @@ impl DkgFaultBanFlow {
                     crate::cardano::ban_list::BAN_ROOT_KEY,
                     |o| derive_bans(o).map(|s| s.hash),
                 )
-                .await?;
+                .await
+                {
+                    Ok(found) => found,
+                    Err(e) => {
+                        return Ok(FaultEnforcement::Unavailable(format!(
+                            "could not read the chain to locate the ban list Config #8 names \
+                             ({e}). Fault proofs are not published until the node is restarted; \
+                             a cheat is still detected and excluded"
+                        )));
+                    }
+                };
                 // No outpoint this build can compile derives #8. The schedule
                 // and the fault policies both came from the Config, so what
                 // differs is the contracts release: an ApplyBan built here
@@ -333,12 +362,21 @@ impl DkgFaultBanFlow {
         let wallet = crate::cardano::wallet::resolve_wallet(cardano).map(|w| w.address);
         let wallet_address = wallet.as_deref();
 
+        // Where to look for the reference scripts: the wallet that spent the ban
+        // list's own one-shot, then the one that spent Config #12. After a
+        // registry revision those differ — the revision's ban list and fault
+        // verifiers were deployed by whoever ran it, not by genesis — and the
+        // verifiers are new scripts too, so looking only at genesis's wallet
+        // found nothing and stopped the node at startup.
+        let deployers: Vec<&str> = if ban_bootstrap == one_shot {
+            vec![one_shot]
+        } else {
+            vec![ban_bootstrap.as_str(), one_shot]
+        };
         let spo_bans_ref = resolve_script_ref(
             cardano,
             wallet_address,
-            // The ban list's own one-shot: whoever spent it deployed this ban
-            // list, and parked its reference script beside it.
-            &ban_bootstrap,
+            &deployers,
             &cardano.spo_bans_ref,
             &spo_bans,
             "spo_bans",
@@ -347,7 +385,7 @@ impl DkgFaultBanFlow {
         let round1_fault_ref = resolve_script_ref(
             cardano,
             wallet_address,
-            one_shot,
+            &deployers,
             &cardano.fault_verifier_round1_ref,
             &round1_fault,
             "fault_verifier_round1",
@@ -356,7 +394,7 @@ impl DkgFaultBanFlow {
         let round2_fault_ref = resolve_script_ref(
             cardano,
             wallet_address,
-            one_shot,
+            &deployers,
             &cardano.fault_verifier_round2_ref,
             &round2_fault,
             "fault_verifier_round2",
@@ -365,7 +403,7 @@ impl DkgFaultBanFlow {
         let equivocation_fault_ref = resolve_script_ref(
             cardano,
             wallet_address,
-            one_shot,
+            &deployers,
             &cardano.fault_verifier_equivocation_ref,
             &equivocation_fault,
             "fault_verifier_equivocation",
@@ -405,6 +443,18 @@ impl DkgFaultBanFlow {
     }
 }
 
+/// The outpoints a signed transaction spends, to hold back from this process's
+/// other wallet reads until it confirms (`nonce_reservation::note_in_flight`).
+///
+/// Every daemon submit records them, not only a migration's: the epoch loop and
+/// the background migration both take the richest UTxO for a fee, and Blockfrost
+/// lists a spent one as unspent until the block, so either can pick what the
+/// other just spent. Script inputs are recorded too, harmlessly — they are not in
+/// the wallet set this is consulted against.
+fn spent_wallet_inputs(cbor: &[u8]) -> Vec<crate::cardano::tx_common::NonceOutpoint> {
+    crate::cardano::tx_common::spent_outpoints(&hex::encode(cbor)).unwrap_or_default()
+}
+
 fn req_fault_config<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {
     value.as_deref().ok_or_else(|| {
         format!(
@@ -433,7 +483,7 @@ fn req_fault_config<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str
 async fn resolve_script_ref(
     cardano: &crate::config::CardanoConfig,
     wallet_address: Result<&str, &String>,
-    one_shot: &str,
+    deployers: &[&str],
     configured: &Option<String>,
     script: &crate::cardano::blueprint::ParameterizedScript,
     what: &str,
@@ -453,15 +503,22 @@ async fn resolve_script_ref(
         )
     })?;
     let hash = script.hash_hex();
-    let found = crate::cardano::ref_script::find_ref_script_anywhere(
-        &base_url,
-        pid,
-        &wallet,
-        Some(one_shot),
-        &hash,
-    )
-    .await
-    .map_err(|e| format!("{what} reference-script lookup: {e}"))?;
+    // This wallet first, then each deployer in turn (see the caller).
+    let mut found = None;
+    for deployer in deployers {
+        found = crate::cardano::ref_script::find_ref_script_anywhere(
+            &base_url,
+            pid,
+            &wallet,
+            Some(deployer),
+            &hash,
+        )
+        .await
+        .map_err(|e| format!("{what} reference-script lookup: {e}"))?;
+        if found.is_some() {
+            break;
+        }
+    }
     let (found, origin) = found.ok_or_else(|| {
         format!(
             "no reference script for {what} ({hash}), at this wallet or at the wallet this \
@@ -2215,11 +2272,13 @@ impl BlockfrostCardanoChain {
             "[fault-ban] submitting {label} tx ({} bytes CBOR) via Blockfrost",
             cbor.len()
         );
+        let held = spent_wallet_inputs(&cbor);
         let tx_hash = self
             .api
             .transactions_submit(cbor)
             .await
             .map_err(|e| EpochError::Chain(format!("{label} blockfrost tx submit: {e}")))?;
+        crate::cardano::nonce_reservation::note_in_flight(held);
         info!("[fault-ban] submitted {label}: tx_hash={tx_hash}");
         Ok(tx_hash)
     }
@@ -3169,11 +3228,13 @@ impl CardanoChain for BlockfrostCardanoChain {
 
         let cbor = hex::decode(&built.signed_tx_hex)
             .map_err(|e| EpochError::Chain(format!("update-y tx hex: {e}")))?;
+        let held = spent_wallet_inputs(&cbor);
         let tx_id = self
             .api
             .transactions_submit(cbor)
             .await
             .map_err(|e| EpochError::Chain(format!("update-y blockfrost tx submit: {e}")))?;
+        crate::cardano::nonce_reservation::note_in_flight(held);
         info!(
             "[update-y] rotated treasury_info {} -> {} (cardano tx {tx_id})",
             hex::encode(plan.current_key.serialize()),
@@ -3667,11 +3728,13 @@ impl CardanoChain for BlockfrostCardanoChain {
 
         self.arm_in_flight_guard(tx_bytes);
 
+        let held = spent_wallet_inputs(&cardano_tx_cbor);
         let tx_hash = self
             .api
             .transactions_submit(cardano_tx_cbor)
             .await
             .map_err(|e| EpochError::Chain(format!("blockfrost tx submit: {e}")))?;
+        crate::cardano::nonce_reservation::note_in_flight(held);
 
         info!("[submit] Cardano oracle-update submitted: tx_hash={tx_hash}");
 
