@@ -1313,6 +1313,12 @@ node at a time. Either differs, and you must agree a commit and an epoch boundar
 operators and restart every node before it — upgrading one node ahead of the roster removes it
 from the roster.
 
+A release that carries the previous contracts alongside new ones does not force that. The rev-5.6
+release is one. It reports the digest of the contracts the bridge **currently** runs, read from the
+Config, not of the newest ones it carries. So it reports the same digest as the previous release
+until the governance Update moves the registry, and then every upgraded node reports the new one
+at its next Config read. Upgrade one node at a time, before the Update.
+
 `/health` also carries the roster each node READ for the current ceremony — `roster_digest`,
 `roster_size` and `threshold`, tagged with `dkg_threshold_epoch`. Those must match across the
 roster for one epoch; when they do not, the `EXCLUDING` lines say whether it is a read that will
@@ -1343,9 +1349,14 @@ summary, and the two are deliberately separate so a scraper keying on the first 
 collapse them.
 
 You may also find yourself already migrated: the federation carries every pool that has not moved
-shortly after the governance update, so the roster is complete regardless of when each operator
-restarts. A node that upgrades a week late simply finds itself registered. Either way the effect
-reaches the roster at the next epoch boundary, like every other registry change.
+shortly after the governance update, so the registry is complete regardless of when each node looks.
+Either way the effect reaches the roster at the next epoch boundary, like every other registry
+change.
+
+**Upgrade before the Update, not after.** A node still on the previous release after the Update
+finds its pool carried across by the federation, but it is out of the ceremonies until it
+upgrades. It cannot read the roster while pools are still crossing, and once they have, the other
+nodes report the new contracts and it reports the old ones.
 
 Two things worth knowing rather than doing:
 
@@ -1720,8 +1731,8 @@ bridge's.
 ## Appendix: carrying a bridge across a registry revision
 
 **This is not part of running a node.** An SPO's whole part in a revision is in
-[Upgrades](#upgrades): install the package after the governance Update, restart, and the node
-carries itself across. This appendix is for the people who run the bridge, the ones holding the
+[Upgrades](#upgrades): install the package before the governance Update. The node runs the
+unrevised bridge unchanged, and carries itself across when the Update lands. This appendix is for the people who run the bridge, the ones holding the
 Config's update key and the federation wallet. It is the order in which the rest happens.
 
 A registry revision is a new `spos-registry.ak`, so a new membership-token policy, and with it a
