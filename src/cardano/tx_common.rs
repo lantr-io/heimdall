@@ -51,6 +51,47 @@ pub fn token_change_floor(tokens: usize) -> u64 {
     }
 }
 
+/// Conway `minFeeA` / `minFeeB`, identical on preprod and mainnet.
+const MIN_FEE_A: u64 = 44;
+const MIN_FEE_B: u64 = 155_381;
+
+/// The ledger's minimum fee for a serialized transaction of `size` bytes.
+///
+/// Needed because whisky prices a transaction from a mock body assembled
+/// BEFORE the multi-asset change output exists, so the policy ids and asset
+/// names the change inherits are never charged for. The fee it sets does not
+/// move with the token load at all: on one measured builder, an ada-only change
+/// left 1,496 lovelace of surplus, one token turned that into a 396 lovelace
+/// shortfall, and two into 3,300. The ledger's answer, `FeeTooSmallUTxO`,
+/// names no asset and points nowhere near the cause.
+#[must_use]
+pub fn min_fee_for(tx_size_bytes: usize) -> u64 {
+    MIN_FEE_B + MIN_FEE_A * tx_size_bytes as u64
+}
+
+/// The policy whose assets the transaction builder would silently strip off
+/// this UTxO, or `None` when it is sound to spend.
+///
+/// `whisky-pallas` converts each input's asset list on its own, and
+/// `MultiassetPositiveCoin::new` inserts per policy id instead of merging, so
+/// when ONE UTxO carries two asset names under one policy every name but the
+/// last is dropped before the builder ever sees it. The change it then computes
+/// is short that asset, the lovelace balances exactly, and the ledger is the
+/// first thing to notice — `ValueNotConservedUTxO`, naming a value the node
+/// never mentioned. Summing two already-converted values merges correctly, so
+/// the same two names on SEPARATE UTxOs are fine, and this is per UTxO.
+///
+/// Reported as of `whisky-pallas` 1.0.25 (and 1.0.28-beta.1, unchanged).
+#[must_use]
+pub fn dropped_policy(u: &WalletUtxo) -> Option<String> {
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    u.tokens
+        .keys()
+        .filter_map(|unit| unit.get(..56))
+        .find(|policy| !seen.insert(policy))
+        .map(ToString::to_string)
+}
+
 /// The wallet's usable collateral candidates: ada-only, no reference script,
 /// and fat enough to post.
 pub fn collateral_candidates(wallet_utxos: &[WalletUtxo]) -> Vec<&WalletUtxo> {
@@ -111,11 +152,26 @@ pub fn build_collateral_top_up(
         } else {
             COLLATERAL_UTXOS_WANTED - had
         };
+        // Soundness outranks size: a UTxO the builder would strip is not a
+        // bigger input, it is a transaction the ledger refuses. spo4's wallet
+        // on 2026-09-24 had the stripper as its fattest UTxO and a sound one
+        // right behind it, and picking by lovelace alone chose the stripper.
         let mut pool: Vec<&WalletUtxo> = wallet_utxos
             .iter()
-            .filter(|u| !u.has_ref_script && (spend_candidates || !is_candidate(u)))
+            .filter(|u| {
+                !u.has_ref_script
+                    && dropped_policy(u).is_none()
+                    && (spend_candidates || !is_candidate(u))
+            })
             .collect();
-        pool.sort_by_key(|u| std::cmp::Reverse(u.lovelace));
+        // Ada-only first, largest within each group. The change output inherits
+        // whatever the inputs carry, and whisky prices the transaction before
+        // that change exists — so a token-bearing input underpays the fee and
+        // the ledger answers `FeeTooSmallUTxO`. Spending dust rather than one
+        // fat token-bearing UTxO costs a few extra input bytes and keeps the
+        // change clean. It matters most HERE: this is the transaction that digs
+        // a wallet out of having no ada-only UTxOs at all.
+        pool.sort_by_key(|u| (!u.pure_ada(), std::cmp::Reverse(u.lovelace)));
 
         let mut picked: Vec<&WalletUtxo> = Vec::new();
         let mut sum = 0u64;
@@ -137,6 +193,23 @@ pub fn build_collateral_top_up(
     }
 
     let Some((created, picked)) = plan else {
+        // Distinguish "no money" from "the money is on a UTxO this builder
+        // cannot spend soundly". The second reads as the first otherwise, and
+        // sends an operator to fund a wallet that is not short.
+        if let Some((u, policy)) = wallet_utxos
+            .iter()
+            .filter(|u| !u.has_ref_script)
+            .find_map(|u| dropped_policy(u).map(|p| (u, p)))
+        {
+            return Err(format!(
+                "wallet UTxO {}#{} holds more than one asset name under policy {policy}, and \
+                 the transaction builder keeps only the last of them — spending it would \
+                 produce a transaction the ledger refuses as ValueNotConserved. No other UTxO \
+                 can fund the split. Move one of those assets to its own UTxO, or fund the \
+                 wallet with plain ADA",
+                u.tx_hash, u.output_index
+            ));
+        }
         let total: u64 = wallet_utxos
             .iter()
             .filter(|u| !u.has_ref_script)
@@ -150,7 +223,7 @@ pub fn build_collateral_top_up(
         ));
     };
 
-    let body = TxBuilderBody {
+    let body_with_fee = |fee: Option<u64>| TxBuilderBody {
         inputs: picked
             .iter()
             .map(|u| {
@@ -186,7 +259,7 @@ pub fn build_collateral_top_up(
         mints: vec![],
         certificates: vec![],
         votes: vec![],
-        fee: None,
+        fee: fee.map(|f| f.to_string()),
         change_datum: None,
         metadata: vec![],
         validity_range: ValidityRange {
@@ -197,12 +270,47 @@ pub fn build_collateral_top_up(
         collateral_return_address: None,
     };
 
-    let mut pallas = WhiskyPallas::new(None);
-    pallas.tx_builder_body = body;
-    let unsigned_hex = pallas
-        .serialize_tx_body()
-        .map_err(|e| format!("whisky tx build: {e:?}"))?;
-    let signed_tx_hex = sign_built_tx(&unsigned_hex, key)?;
+    let build = |fee: Option<u64>| -> Result<String, String> {
+        let mut pallas = WhiskyPallas::new(None);
+        pallas.tx_builder_body = body_with_fee(fee);
+        let unsigned_hex = pallas
+            .serialize_tx_body()
+            .map_err(|e| format!("whisky tx build: {e:?}"))?;
+        sign_built_tx(&unsigned_hex, key)
+    };
+
+    // Build, then CHECK the fee against the bytes that actually go out, and
+    // build once more with an explicit fee if it falls short. whisky prices a
+    // mock body assembled before the change output carries its tokens, so a
+    // token-bearing input underpays — see `min_fee_for`. Measuring the signed
+    // transaction is the only estimate that cannot drift from what is
+    // submitted, and it costs one extra build on the rare path that needs it.
+    let signed_tx_hex = build(None)?;
+    let short = |hex: &str| -> Result<Option<u64>, String> {
+        let bytes = hex::decode(hex).map_err(|e| format!("built tx is not hex: {e}"))?;
+        let tx: pallas_primitives::conway::Tx =
+            minicbor::decode(&bytes).map_err(|e| format!("built tx is not valid CBOR: {e}"))?;
+        let need = min_fee_for(bytes.len());
+        Ok((tx.transaction_body.fee < need).then_some(need))
+    };
+    let signed_tx_hex = match short(&signed_tx_hex)? {
+        None => signed_tx_hex,
+        Some(need) => {
+            // Re-pricing moves lovelace from the change output to the fee, which
+            // cannot grow the body: both are already at their CBOR width here.
+            // Re-checked anyway, because a fee this code cannot justify is worth
+            // refusing to sign.
+            let repriced = build(Some(need))?;
+            if let Some(still) = short(&repriced)? {
+                return Err(format!(
+                    "could not price the collateral split: set {need} lovelace and the ledger \
+                     still wants {still} for the {} bytes it produced",
+                    repriced.len() / 2
+                ));
+            }
+            repriced
+        }
+    };
 
     Ok(Some(CollateralTopUp {
         signed_tx_hex,
@@ -294,11 +402,49 @@ pub fn select_fee(
     wallet_utxos: &[WalletUtxo],
     min_fee_lovelace: u64,
 ) -> Result<&WalletUtxo, String> {
+    // `dropped_policy`: a UTxO the builder would strip is not a fee input at
+    // all, however fat. Skipping it here is what keeps the largest-first rule
+    // from choosing a transaction the ledger will refuse.
+    let usable = |u: &&WalletUtxo| !u.has_ref_script && dropped_policy(u).is_none();
+    // ADA-ONLY FIRST, and only then the largest of what remains. whisky prices
+    // a transaction before the multi-asset change output exists, so the ~110
+    // bytes of policy ids and asset names the change inherits are never
+    // charged for: an ada-only change leaves ~1,500 lovelace of surplus, one
+    // token turns that into a ~400 lovelace shortfall, and two into ~3,300.
+    // The ledger answers `FeeTooSmallUTxO`, which names no asset and points
+    // nowhere near the cause. A token-bearing input is still allowed when no
+    // ada-only one can cover the outputs — `ensure-collateral` has to spend
+    // what the wallet actually holds — so this is a preference, not a rule.
+    let affordable = |u: &&WalletUtxo| {
+        u.lovelace >= min_fee_lovelace.saturating_add(token_change_floor(u.tokens.len()))
+    };
     let fee = wallet_utxos
         .iter()
-        .filter(|u| !u.has_ref_script)
+        .filter(|u| usable(u) && u.pure_ada() && affordable(u))
         .max_by_key(|u| u.lovelace)
-        .ok_or_else(|| "no wallet UTxO available for the fee input".to_string())?;
+        .or_else(|| {
+            wallet_utxos
+                .iter()
+                .filter(usable)
+                .max_by_key(|u| u.lovelace)
+        })
+        .ok_or_else(|| {
+            match wallet_utxos
+                .iter()
+                .filter(|u| !u.has_ref_script)
+                .find_map(|u| dropped_policy(u).map(|p| (u, p)))
+            {
+                Some((u, policy)) => format!(
+                    "the only wallet UTxO that could pay the fee ({}#{}) holds more than one \
+                     asset name under policy {policy}, and the transaction builder keeps only \
+                     the last of them — spending it would produce a transaction the ledger \
+                     refuses as ValueNotConserved. Move one of those assets to its own UTxO, \
+                     or fund the wallet with plain ADA",
+                    u.tx_hash, u.output_index
+                ),
+                None => "no wallet UTxO available for the fee input".to_string(),
+            }
+        })?;
     // A token-bearing fee input means the change output carries those tokens,
     // and its min-UTxO is higher than the bare one every caller's margin was
     // sized against. Charge for it here, once, rather than in six call sites.
@@ -635,6 +781,11 @@ mod tests {
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const FSAT: &str = "d8c06b705b0089b8da32e1a17550bc0d3a4fea7999508e3e95669d1066534154";
 
+    /// Two peg-request NFTs under ONE policy, as spo4's wallet holds them.
+    const NFT_POLICY: &str = "665b33b752eceeae9b5fa77efcaba1341e847dfe2941a8f384264b87";
+    const NFT_A: &str = "460e60cdb65905cfc667ee3606849104c119e5f8aa3a55db86e5f5dff41c1d39";
+    const NFT_B: &str = "8e7beff1a0a1058b9e3ea38e10096103ec16f1ebdf847e62fb61edab7fcc98be";
+
     fn utxo(ix: u32, lovelace: u64, tokens: &[(&str, &str)]) -> WalletUtxo {
         WalletUtxo {
             tx_hash: format!("{ix:064x}"),
@@ -779,6 +930,129 @@ mod tests {
         );
     }
 
+    /// Every `tx_hash:index` the built body spends.
+    fn input_refs(signed_tx_hex: &str) -> std::collections::BTreeSet<String> {
+        use pallas_primitives::conway::Tx;
+        let bytes = hex::decode(signed_tx_hex).expect("hex");
+        let tx: Tx = minicbor::decode(&bytes).expect("cbor");
+        tx.transaction_body
+            .inputs
+            .iter()
+            .map(|i| format!("{}:{}", hex::encode(i.transaction_id), i.index))
+            .collect()
+    }
+
+    /// Every `policy ++ name` unit the built outputs carry, so a test can name
+    /// the asset that went missing instead of reporting a count that is one low.
+    fn output_units(signed_tx_hex: &str) -> std::collections::BTreeSet<String> {
+        use pallas_primitives::conway::{PseudoTransactionOutput, Tx, Value};
+        let bytes = hex::decode(signed_tx_hex).expect("hex");
+        let tx: Tx = minicbor::decode(&bytes).expect("cbor");
+        let mut units = std::collections::BTreeSet::new();
+        for o in tx.transaction_body.outputs.iter() {
+            let PseudoTransactionOutput::PostAlonzo(o) = o else {
+                panic!("unexpected legacy output")
+            };
+            if let Value::Multiasset(_, assets) = &o.value {
+                for (policy, names) in assets.iter() {
+                    for (name, _) in names.iter() {
+                        units.insert(format!("{}{}", hex::encode(policy), hex::encode(&**name)));
+                    }
+                }
+            }
+        }
+        units
+    }
+
+    /// Two names of one policy on ONE UTxO is the shape the builder cannot
+    /// spend; the same two names on SEPARATE UTxOs are fine.
+    ///
+    /// `whisky-pallas` converts each input's asset list on its own
+    /// (`convert_value`), and `MultiassetPositiveCoin::new` inserts per policy
+    /// instead of merging — so all but the last name of a policy is lost. Adding
+    /// two already-converted values (`Value::add`) merges correctly, which is
+    /// why the limit is per input and not per transaction.
+    #[test]
+    fn the_builder_loses_a_policys_assets_only_when_one_utxo_holds_two() {
+        let unit_a = format!("{NFT_POLICY}{NFT_A}");
+        let unit_b = format!("{NFT_POLICY}{NFT_B}");
+
+        let together = utxo(0, 11_000_000_000, &[(&unit_a, "1"), (&unit_b, "1")]);
+        assert_eq!(
+            dropped_policy(&together),
+            Some(NFT_POLICY.to_string()),
+            "one UTxO, two names of a policy: the builder would strip one"
+        );
+
+        // Sized so neither covers the split alone and BOTH are spent — one
+        // input would prove nothing about how two of them combine.
+        let apart_a = utxo(1, 8_000_000, &[(&unit_a, "1")]);
+        let apart_b = utxo(2, 8_000_000, &[(&unit_b, "1")]);
+        assert_eq!(dropped_policy(&apart_a), None);
+        assert_eq!(dropped_policy(&apart_b), None);
+
+        let (key, addr) = signer();
+        let built = build_collateral_top_up(&[apart_a, apart_b], &addr, &key, &None)
+            .expect("builds")
+            .expect("something to do");
+        let units = output_units(&built.signed_tx_hex);
+        for want in [unit_a.as_str(), unit_b.as_str()] {
+            assert!(
+                units.contains(want),
+                "separate UTxOs keep {want}: {units:?}"
+            );
+        }
+    }
+
+    /// The spo4 wallet of 2026-09-24: the fattest UTxO is one the builder would
+    /// silently strip, and a smaller sound one sits right behind it.
+    ///
+    /// Picking by lovelace alone chose the stripper and produced a transaction
+    /// the ledger refused with `ValueNotConservedUTxO` — which is what took
+    /// Update-Y down on bridge epochs 1556 and 1557. Soundness outranks size.
+    #[test]
+    fn a_utxo_the_builder_would_strip_is_passed_over_for_a_sound_one() {
+        let unit_a = format!("{NFT_POLICY}{NFT_A}");
+        let unit_b = format!("{NFT_POLICY}{NFT_B}");
+        let stripper = utxo(
+            0,
+            11_127_488_159,
+            &[(FSAT, "949544"), (&unit_a, "1"), (&unit_b, "1")],
+        );
+        let sound = utxo(1, 7_319_838_867, &[(FSAT, "42")]);
+        let wallet = vec![stripper, sound];
+
+        let (key, addr) = signer();
+        let built = build_collateral_top_up(&wallet, &addr, &key, &None)
+            .expect("builds")
+            .expect("something to do");
+
+        assert!(
+            !input_refs(&built.signed_tx_hex).contains(&format!("{:064x}:0", 0)),
+            "the stripper must be left alone while a sound UTxO can fund the split"
+        );
+        let units = output_units(&built.signed_tx_hex);
+        assert!(units.contains(FSAT), "the sound UTxO's token rides through");
+    }
+
+    /// A wallet with nothing BUT a UTxO the builder would strip is told so, with
+    /// the policy named — rather than handed a transaction that balances on
+    /// lovelace and is refused by the ledger for a value it never mentions.
+    #[test]
+    fn a_wallet_with_only_a_stripping_utxo_is_refused_by_name() {
+        let unit_a = format!("{NFT_POLICY}{NFT_A}");
+        let unit_b = format!("{NFT_POLICY}{NFT_B}");
+        let wallet = vec![utxo(0, 11_000_000_000, &[(&unit_a, "1"), (&unit_b, "1")])];
+
+        let (key, addr) = signer();
+        let err = build_collateral_top_up(&wallet, &addr, &key, &None)
+            .expect_err("cannot be built soundly");
+        assert!(
+            err.contains(NFT_POLICY),
+            "the error names the policy that would be stripped: {err}"
+        );
+    }
+
     /// Only the shortfall is minted. Consuming an existing candidate to
     /// re-create it would be pure loss, and demanding the full set turns a
     /// workable top-up into "fund the wallet".
@@ -821,6 +1095,136 @@ mod tests {
         let err = select_fee(&tokened, 2_000_000).expect_err("not enough for the change output");
         assert!(err.contains("min-UTxO"), "{err}");
         assert!(select_fee(&[utxo(0, 9_000_000, &[(FSAT, "42")])], 2_000_000).is_ok());
+    }
+
+    /// The fee input is chosen the same way, and for the same reason: this is
+    /// the path Update-Y, register-spo and the ban posts take.
+    ///
+    /// spo4's fattest UTxO was the stripper, so every script transaction it
+    /// built on bridge epochs 1556 and 1557 was refused before the roster's
+    /// FROST signature could do anything.
+    #[test]
+    fn the_fee_input_passes_over_a_utxo_the_builder_would_strip() {
+        let unit_a = format!("{NFT_POLICY}{NFT_A}");
+        let unit_b = format!("{NFT_POLICY}{NFT_B}");
+        let stripper = utxo(
+            0,
+            11_127_488_159,
+            &[(FSAT, "949544"), (&unit_a, "1"), (&unit_b, "1")],
+        );
+        let sound = utxo(1, 7_319_838_867, &[(FSAT, "42")]);
+
+        let both = [stripper.clone(), sound.clone()];
+        let picked = select_fee(&both, 2_000_000).expect("the sound UTxO can pay the fee");
+        assert_eq!(picked.output_index, 1, "the fatter UTxO is the stripper");
+
+        let err = select_fee(&[stripper], 2_000_000).expect_err("nothing sound to spend");
+        assert!(err.contains(NFT_POLICY), "the policy is named: {err}");
+    }
+
+    /// A wallet with NOTHING but token-bearing UTxOs still gets a transaction
+    /// whose fee the ledger will accept.
+    ///
+    /// The preference above cannot help here: there is no ada-only input to
+    /// prefer, so the change must carry tokens and whisky's own estimate falls
+    /// short. This is the wallet `build_collateral_top_up` exists for, so the
+    /// fee has to be right without any help from the caller.
+    #[test]
+    fn a_split_forced_to_carry_tokens_in_its_change_still_pays_the_ledgers_fee() {
+        use pallas_primitives::conway::Tx;
+        let unit_b = format!("{NFT_POLICY}{NFT_B}");
+        let wallet = vec![utxo(0, 11_000_000_000, &[(FSAT, "949544"), (&unit_b, "1")])];
+
+        let (key, addr) = signer();
+        let built = build_collateral_top_up(&wallet, &addr, &key, &None)
+            .expect("builds")
+            .expect("no candidates, so there is work");
+
+        let bytes = hex::decode(&built.signed_tx_hex).expect("hex");
+        let tx: Tx = minicbor::decode(&bytes).expect("cbor");
+        let need = min_fee_for(bytes.len());
+        assert!(
+            tx.transaction_body.fee >= need,
+            "fee {} is below the ledger's minimum {need} for {} bytes",
+            tx.transaction_body.fee,
+            bytes.len()
+        );
+        assert!(
+            !output_units(&built.signed_tx_hex).is_empty(),
+            "this case is only meaningful while the change does carry tokens"
+        );
+    }
+
+    /// `ensure-collateral` spends ada-only dust in preference to one fat
+    /// token-bearing UTxO, so the change it returns carries no assets.
+    ///
+    /// Same reason as the fee input: a change output with tokens is underpriced
+    /// by the builder. Here it matters most, because this is the transaction
+    /// that digs a wallet out of having no ada-only UTxOs — if IT cannot be
+    /// posted, nothing else can be either.
+    #[test]
+    fn the_collateral_split_spends_ada_only_dust_before_a_fat_token_utxo() {
+        let mut wallet = vec![utxo(0, 11_000_000_000, &[(FSAT, "949544")])];
+        wallet.extend((1..=9).map(|i| utxo(i, 1_400_000, &[])));
+
+        let (key, addr) = signer();
+        let built = build_collateral_top_up(&wallet, &addr, &key, &None)
+            .expect("builds")
+            .expect("no candidates yet, so there is work");
+
+        assert!(
+            !input_refs(&built.signed_tx_hex).contains(&format!("{:064x}:0", 0)),
+            "the dust covers it, so the token-bearing UTxO stays unspent"
+        );
+        assert!(
+            output_units(&built.signed_tx_hex).is_empty(),
+            "every output is ada-only, so the fee the builder set is correct"
+        );
+    }
+
+    /// An ada-only fee input is preferred over a fatter token-bearing one,
+    /// because the change inherits the tokens and whisky does not charge for
+    /// them.
+    ///
+    /// Measured on `build_collateral_top_up`, same amounts, only the token load
+    /// varying: the fee whisky sets never moves, so the surplus an ada-only
+    /// change enjoys turns into a shortfall as soon as the change carries
+    /// assets.
+    ///
+    /// | change output | tx size | fee set | minFee | result |
+    /// |---|---|---|---|---|
+    /// | ada-only | 402 | 174,565 | 173,069 | +1,496 |
+    /// | 1 token | 445 | 174,565 | 174,961 | -396 |
+    /// | 2 tokens, 2 policies | 511 | 174,565 | 177,865 | -3,300 |
+    ///
+    /// spo4 hit the third row on 2026-09-24 and every script transaction it
+    /// built was refused with `FeeTooSmallUTxO`.
+    #[test]
+    fn an_ada_only_fee_input_is_preferred_over_a_fatter_token_bearing_one() {
+        let wallet = vec![
+            utxo(0, 11_000_000_000, &[(FSAT, "949544")]),
+            utxo(1, 9_000_000_000, &[]),
+        ];
+        let fee = select_fee(&wallet, 2_000_000).expect("the ada-only UTxO can pay");
+        assert_eq!(
+            fee.output_index, 1,
+            "ada-only wins even though it holds 2,000 ADA less"
+        );
+    }
+
+    /// The preference is not a requirement: a wallet whose ada-only UTxOs are
+    /// all too small still pays from a token-bearing one rather than refusing.
+    ///
+    /// That is what lets `ensure-collateral` dig a wallet out of the hole in
+    /// the first place — it has to spend what is there.
+    #[test]
+    fn a_token_bearing_fee_input_is_still_used_when_no_ada_only_one_will_do() {
+        let wallet = vec![
+            utxo(0, 11_000_000_000, &[(FSAT, "949544")]),
+            utxo(1, 1_400_000, &[]),
+        ];
+        let fee = select_fee(&wallet, 2_000_000).expect("falls back to the token-bearing UTxO");
+        assert_eq!(fee.output_index, 0, "dust cannot cover it, so tokens it is");
     }
 
     /// An empty wallet is a funding problem, and says so rather than failing
