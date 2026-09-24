@@ -593,7 +593,9 @@ fn bifrost_fault_scripts(kind: FaultVerifierKind) -> BifrostFaultScripts {
     };
     let spo_bans = blueprint::spo_bans_script(
         &blueprint_json,
-        // spec [PRE-5]: the Config NFT policy, not the registry hash.
+        // rev 5.5 reads the registry policy, rev 5.6 the Config NFT policy
+        // ([PRE-5]); the blueprint picks which one it takes.
+        &registry.hash,
         &BENCH_CONFIG_POLICY_ID,
         &policy_ids,
         ban_params.base_ban_duration_ms,
