@@ -541,8 +541,6 @@ impl MockCardanoChain {
         }
     }
 
-    /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning the
-    /// ceremony window grid on for this mock chain.
     /// Reject the next `n` Update-Y submissions with a chain error, before the
     /// signature is even looked at.
     #[must_use]
@@ -558,6 +556,8 @@ impl MockCardanoChain {
         self
     }
 
+    /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning the
+    /// ceremony window grid on for this mock chain.
     pub fn with_schedule_anchor_ms(mut self, anchor_ms: i64) -> Self {
         self.schedule_anchor_ms = Some(anchor_ms);
         self

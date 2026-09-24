@@ -499,7 +499,9 @@ async fn frost_sign_message(
     // single pair of deadlines against `update_y_deadline`, so a second go would
     // have to run past the moment the Update-Y was meant to exist by. A rotation
     // that does not land is spec behaviour — the old key carries over, "no halt,
-    // no special state" — and `machine`'s `rotation_spent` gate already says so.
+    // no special state" — and `machine`'s `HandoffRound` already says so: a
+    // spent round is never walked again, and a signature it produced is
+    // re-posted rather than re-signed.
     let ns = SignNamespace::new(epoch, 0, 0, UPDATE_Y_SESSION, *msg);
 
     // Never `rng.rng(..)`: the context would be `update-y:epoch={epoch}`, constant
