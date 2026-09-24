@@ -1259,8 +1259,18 @@ async fn reconcile_tries(
             .update(|h| h.tries_repair_failed = Some(why.clone()));
         return Err(EpochError::TriesBehind { why });
     };
-    match repairer.repair(dir, &status, &why, treasury.outpoint).await {
-        Ok(reason) => {
+    match repairer.repair(dir, &status, treasury.outpoint).await {
+        Ok(repaired) => {
+            // Under this node's prefix like every other event it writes, so a
+            // channel several nodes post to can place it; the prefix carries
+            // the epoch, the text the batch.
+            let at = batch.map_or_else(String::new, |i| format!("B_{i}: "));
+            crate::epoch_event_warn!(
+                config.identity.identifier,
+                epoch,
+                "{at}{}",
+                repaired.describe(treasury.outpoint, &why)
+            );
             let position = batch.map_or_else(
                 || format!("epoch {epoch}"),
                 |i| format!("epoch {epoch} B_{i}"),
@@ -1268,7 +1278,7 @@ async fn reconcile_tries(
             config.health.update(|h| {
                 h.tries_repair_failed = None;
                 h.tries_rebuilt_at_runtime
-                    .push(format!("{position}: {reason}"));
+                    .push(format!("{position}: {why}"));
                 if h.tries_rebuilt_at_runtime.len() > 8 {
                     h.tries_rebuilt_at_runtime.remove(0);
                 }

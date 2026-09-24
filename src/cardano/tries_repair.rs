@@ -35,15 +35,56 @@ impl std::fmt::Display for RepairError {
 
 impl std::error::Error for RepairError {}
 
+/// What a repair installed.
+///
+/// The event line is the CALLER's to write, not the repairer's: the runtime
+/// caller knows the node and the epoch, and writes it under the same
+/// `[epoch=…]` prefix as every other event of that node; the startup caller
+/// has neither yet. [`Self::describe`] keeps the two wordings one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repaired {
+    /// The rebuilt roots — already held against the singleton by
+    /// `reconstruct_both`, which refuses a pair the singleton does not attest.
+    pub cpo_root: [u8; 32],
+    pub spi_root: [u8; 32],
+    /// Why `pending-tm.json` is still there when the repair meant to remove it.
+    /// Not a failure of the repair — see [`drop_pending_record`].
+    pub pending_kept: Option<String>,
+}
+
+impl Repaired {
+    /// The event text: the outcome first, then what the tries were before.
+    ///
+    /// `before` is labelled because it is the state the rebuild REPLACED: after
+    /// "tries rebuilt", a bare "spi root X != the chain's Y" reads as the
+    /// rebuild's outcome.
+    #[must_use]
+    pub fn describe(&self, head: bitcoin::OutPoint, before: &str) -> String {
+        let mut out = format!(
+            "tries rebuilt from chain history at treasury head {head}; they now match the \
+             bridge-state singleton (cpo root {}, spi root {}). Before the rebuild: {before}",
+            hex::encode(self.cpo_root),
+            hex::encode(self.spi_root)
+        );
+        if let Some(e) = &self.pending_kept {
+            out.push_str(&format!(
+                ". The pending-movement record could not be removed ({e}) and stays; a fold \
+                 must still reproduce the roots its movement committed, so it cannot move \
+                 these tries anywhere the chain has not"
+            ));
+        }
+        out
+    }
+}
+
 #[async_trait]
 pub trait TriesRepairer: Send + Sync + std::fmt::Debug {
     async fn repair(
         &self,
         state_dir: &Path,
         status: &TriesStatus,
-        why: &str,
         head: bitcoin::OutPoint,
-    ) -> Result<String, RepairError>;
+    ) -> Result<Repaired, RepairError>;
 }
 
 pub struct ChainTriesRepairer {
@@ -147,15 +188,33 @@ fn install_pair(
     Ok(())
 }
 
+/// Remove the pending-movement record once the rebuilt pair is installed —
+/// returning why it could not be, never failing on it.
+///
+/// By now the rebuilt tries are on disk and match the singleton, so raising
+/// here would report a rebuild that SUCCEEDED as failed: the startup event
+/// would say FAILED over tries that step 10 then passes, and a runtime batch
+/// would stop on `TriesBehind` with its tries in sync. A record left behind is
+/// harmless: a fold writes nothing unless it reproduces the two roots its
+/// movement committed, so the record either folds correctly or is refused and
+/// set aside.
+///
+/// The unlink needs only the directory write access `install_pair` has just
+/// used, so this fails only on a state directory already in trouble: the file
+/// made immutable, a directory where the file should be, or the filesystem
+/// remounted read-only after an I/O error in between.
+fn drop_pending_record(state_dir: &Path) -> Option<String> {
+    PendingTm::clear(state_dir).err()
+}
+
 #[async_trait]
 impl TriesRepairer for ChainTriesRepairer {
     async fn repair(
         &self,
         state_dir: &Path,
         status: &TriesStatus,
-        why: &str,
         head: bitcoin::OutPoint,
-    ) -> Result<String, RepairError> {
+    ) -> Result<Repaired, RepairError> {
         if matches!(
             status,
             TriesStatus::Diverged { .. } | TriesStatus::Unreadable { .. }
@@ -176,20 +235,82 @@ impl TriesRepairer for ChainTriesRepairer {
             });
         }
         install_pair(state_dir, &rebuilt.cpo, &rebuilt.spi).map_err(RepairError::Failed)?;
-        if !matches!(status, TriesStatus::Unreadable { .. }) {
-            PendingTm::clear(state_dir).map_err(RepairError::Failed)?;
-        }
-        // `why` is the state BEFORE the rebuild, so it is labelled as such: after
-        // "tries rebuilt", a bare "spi root X != the chain's Y" reads as the
-        // rebuild's outcome. The roots named are the rebuilt ones, which
-        // `reconstruct_both` has already held against the singleton.
-        tracing::warn!(
-            target: "heimdall::event",
-            "tries rebuilt from chain history at treasury head {head}; they now match the \
-             bridge-state singleton (cpo root {}, spi root {}). Before the rebuild: {why}",
-            hex::encode(rebuilt.cpo.root()),
-            hex::encode(rebuilt.spi.root())
+        let pending_kept = if matches!(status, TriesStatus::Unreadable { .. }) {
+            None
+        } else {
+            drop_pending_record(state_dir)
+        };
+        Ok(Repaired {
+            cpo_root: rebuilt.cpo.root(),
+            spi_root: rebuilt.spi.root(),
+            pending_kept,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outpoint() -> bitcoin::OutPoint {
+        "26b974ecda8c0a03c3d202d1236baacbf74bd630b75fa2694ebaefe15f19f1f6:0"
+            .parse()
+            .unwrap()
+    }
+
+    /// A record that cannot be removed is reported, not raised: a directory
+    /// where the file should be is the failure a test can build portably.
+    #[test]
+    fn a_pending_record_that_cannot_be_removed_is_reported_not_raised() {
+        let dir =
+            std::env::temp_dir().join(format!("heimdall-tries-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = PendingTm::state_path(&dir);
+        std::fs::create_dir(&record).unwrap();
+        let kept = drop_pending_record(&dir).expect("reported");
+        assert!(kept.contains("pending-tm.json"), "{kept}");
+        assert!(record.exists());
+
+        std::fs::remove_dir(&record).unwrap();
+        std::fs::write(&record, b"{}").unwrap();
+        assert_eq!(drop_pending_record(&dir), None);
+        assert!(!record.exists());
+        // Absent is the common case, and not a failure either.
+        assert_eq!(drop_pending_record(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_event_leads_with_the_outcome_and_labels_the_old_state() {
+        let mut repaired = Repaired {
+            cpo_root: [0xe6; 32],
+            spi_root: [0x82; 32],
+            pending_kept: None,
+        };
+        let line = repaired.describe(outpoint(), "spi root 49bb != the chain's 8216");
+        assert_eq!(
+            line,
+            format!(
+                "tries rebuilt from chain history at treasury head {}; they now match the \
+                 bridge-state singleton (cpo root {}, spi root {}). Before the rebuild: spi root \
+                 49bb != the chain's 8216",
+                outpoint(),
+                "e6".repeat(32),
+                "82".repeat(32)
+            )
         );
-        Ok(why.to_string())
+
+        repaired.pending_kept = Some("remove /s/pending-tm.json: Read-only file system".into());
+        let line = repaired.describe(outpoint(), "never seeded (cpo, spi absent)");
+        assert!(
+            line.ends_with(
+                "Before the rebuild: never seeded (cpo, spi absent). The pending-movement record \
+                 could not be removed (remove /s/pending-tm.json: Read-only file system) and \
+                 stays; a fold must still reproduce the roots its movement committed, so it \
+                 cannot move these tries anywhere the chain has not"
+            ),
+            "{line}"
+        );
     }
 }

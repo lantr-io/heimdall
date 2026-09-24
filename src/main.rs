@@ -1283,19 +1283,26 @@ fn catch_up_tries(cfg: &HeimdallConfig) -> Option<String> {
         history,
         heimdall::cardano::cpo_trie::ReconstructConfig::for_bridge(&bridge),
     );
-    if let Err(e) = rt.block_on(repairer.repair(dir, &status, &what, chain.treasury_outpoint())) {
-        warn!(
-            target: "heimdall::event",
-            "rebuilding the tries from chain history FAILED: {e}. Startup checks below \
-             decide whether this node can run"
-        );
-        return Some(format!("{what} — rebuild FAILED: {e}"));
-    }
+    let head = chain.treasury_outpoint();
+    let repaired = match rt.block_on(repairer.repair(dir, &status, head)) {
+        Ok(repaired) => repaired,
+        Err(e) => {
+            warn!(
+                target: "heimdall::event",
+                "rebuilding the tries from chain history FAILED: {e}. Startup checks below \
+                 decide whether this node can run"
+            );
+            return Some(format!("{what} — rebuild FAILED: {e}"));
+        }
+    };
 
+    // One line, not the repairer's and then this one: no node identity or
+    // epoch exists yet at this point, so there is no prefix to wait for.
     warn!(
         target: "heimdall::event",
-        "tries rebuilt from chain history; the startup checks below confirm them. If this \
-         happens at every start, this node is losing its state directory between runs"
+        "{}. If this happens at every start, this node is losing its state directory \
+         between runs",
+        repaired.describe(head, &what)
     );
     Some(what)
 }
