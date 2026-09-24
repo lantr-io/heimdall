@@ -73,6 +73,9 @@ follower — and every federation member, which has no cascade at all — can be
 rejected as a conflicting spend for a rotation that is landing. A rejection means
 nothing on its own, so `Update-Y FAILED` is raised where the node has stopped
 expecting a rotation at all: once per epoch, after the handoff retries are spent.
+A node that took part in signing the rotation does not stop expecting it there —
+its peers' posts can still land it — so instead of the event it logs a `warn` and
+watches `treasury_info` until the handoff lands or the epoch ends.
 `Update-Y DID NOT TAKE` likewise comes only from the node whose own rotation it
 was; on the federation path every member watches the same one and logs it at
 `warn` instead.
