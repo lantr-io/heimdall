@@ -282,19 +282,22 @@ async fn drive_to_movement(
     // achieving nothing and spending an API quota to do it. At the capped backoff
     // this spans roughly two minutes, which is far past any transient outage and
     // far short of an epoch.
+    //
+    // Counted in `HandoffRound`, which is scoped to one epoch: a budget spent
+    // giving up on one epoch's handoff must not leave the next epoch's with none.
     const HANDOFF_RETRIES: u32 = 6;
-    let mut handoff_retries = 0u32;
     // Consecutive movements the 51% mode could not sign (WI-Y3JJK). Counted
     // because the answer to a treasury the roster cannot move is a FEDERATION
     // spend, which no daemon performs — see the warning below — so the only thing
     // standing between a stuck treasury and an operator reaching for it is this
     // number being visible.
     let mut unsigned_movements = 0u32;
-    // The epoch whose rotation round this node has already SPENT (published a
-    // commitment into and then failed). Set on the first such failure, which
-    // re-enters `PublishKeys` once — with the ceremony disabled — purely to see
-    // whether the rotation landed without this node.
-    let mut rotation_spent: Option<u64> = None;
+    // What this node has already done about the epoch's handoff: the rounds it
+    // spent or signed, its retry budget, its watch — see `HandoffRound`.
+    let mut handoff = HandoffRound::default();
+    // The last error written out whole, so that a failure repeating on the
+    // backoff ramp is written out once rather than on every retry.
+    let mut last_full_error: Option<String> = None;
     loop {
         // DEBUG, not INFO (spec [PR-12]). A phase transition is the machine's
         // own bookkeeping; what an operator needs from it — a batch opening, a
@@ -306,36 +309,21 @@ async fn drive_to_movement(
         // `Submit` phase carries a whole `TreasuryMovement`), and only these two
         // variants are ones we would ever want to re-enter.
         match &phase {
+            // Every failed `PublishKeys` offers itself for re-entry. Whether the
+            // retry budget still allows it is decided in the error arm, AFTER the
+            // attempt: that attempt may be the one that signs, and what a node out
+            // of retries does next depends on whether it took part in the round.
             EpochPhase::PublishKeys {
                 epoch,
                 roster,
                 group_keys,
-            } if handoff_retries < HANDOFF_RETRIES => {
+            } => {
+                handoff.enter(*epoch);
                 resume = Some(EpochPhase::PublishKeys {
                     epoch: *epoch,
                     roster: roster.clone(),
                     group_keys: group_keys.clone(),
                 });
-            }
-            // Out of attempts: stop offering `PublishKeys` as a re-entry, so the
-            // next failure falls through to `Idle` and the node waits for a
-            // boundary that re-derives everything from chain.
-            EpochPhase::PublishKeys { epoch, .. } => {
-                // The counterpart to `Update-Y posted`, and the only place that
-                // can honestly raise one. A rejected submission means nothing on
-                // its own — peers are posting the same rotation and all but one
-                // are rejected by design — so the event belongs where the node has
-                // stopped expecting a rotation at all, which happens once per
-                // epoch rather than once per attempt.
-                crate::epoch_event_warn!(
-                    me,
-                    *epoch,
-                    "Update-Y FAILED: the key handoff has failed {HANDOFF_RETRIES} retries \
-                     running this epoch — treating it as non-transient and parking until the \
-                     next boundary. The treasury stays under the OUTGOING key, so this node \
-                     signs no movement for this epoch"
-                );
-                resume = None;
             }
             // The watch is its own re-entry: a chain read that fails mid-watch
             // must resume the WATCH, not the handoff. Without this arm `resume`
@@ -349,6 +337,7 @@ async fn drive_to_movement(
                 roster,
                 group_keys,
             } => {
+                handoff.enter(*epoch);
                 resume = Some(EpochPhase::AwaitRotation {
                     epoch: *epoch,
                     roster: roster.clone(),
@@ -368,7 +357,6 @@ async fn drive_to_movement(
             }
             _ => {}
         }
-        let spent_here = rotation_spent == Some(current_epoch(&phase));
         // Captured before the phase is moved into the step, so both arms below can
         // say which phase the outcome belongs to.
         let stepped = phase.name();
@@ -392,15 +380,17 @@ async fn drive_to_movement(
             rng,
             config,
             built,
-            spent_here,
+            &mut handoff,
         )
         .await
         {
             Ok(Step::Next(next)) => {
-                // The handoff got through, so its budget is spent and reset: a
-                // later epoch on the same call must start from a full one.
-                if matches!(next, EpochPhase::CollectPegins { .. }) {
-                    handoff_retries = 0;
+                // A step that answers `Idle` has ended this epoch's work, so
+                // there is nothing of it left to re-enter: a later failure in
+                // `Idle` or the next epoch's DKG must not resume, or report the
+                // end of, a phase that is over.
+                if matches!(next, EpochPhase::Idle) {
+                    resume = None;
                 }
                 // A signature exists, so the 51% mode is working. Reset here
                 // rather than at `RecordMovement`: what the count is about is
@@ -418,6 +408,9 @@ async fn drive_to_movement(
                 if step_clears_ramp(failed_in, stepped) {
                     backoff = RETRY_BACKOFF_MIN;
                     failed_in = None;
+                    // And the full-error dedupe with it: the same error coming
+                    // back after a recovery is news, and is written out again.
+                    last_full_error = None;
                 }
             }
             Ok(Step::Done(tm, resume)) => return Ok((tm, resume)),
@@ -446,6 +439,10 @@ async fn drive_to_movement(
             // validation and must fail before the loop is entered — not here,
             // where the only correct answer is to keep trying.
             Err(e) => {
+                // What `PublishKeys` already decided about this failure, if it
+                // logged one — taken now, so that a stale one never outlives the
+                // failure it was about.
+                let verdict = handoff.verdict.take();
                 // A failure in a DIFFERENT phase is a different problem, and starts
                 // its own ramp. `failed_in` spans a whole call to this function —
                 // `Idle`, a boundary wait, a DKG, the next epoch's `PublishKeys` —
@@ -555,40 +552,104 @@ async fn drive_to_movement(
                 }
                 let round_spent = e.round_is_spent();
                 if round_spent && matches!(resume, Some(EpochPhase::PublishKeys { .. })) {
+                    // The round is spent for THIS node, but the threshold subset
+                    // WI-047 exists to allow may well aggregate and post without
+                    // it — in which case the treasury comes to name the key this
+                    // node holds a share of. Dropping to `Idle` here would throw
+                    // away the whole epoch's grid over a rotation that SUCCEEDED
+                    // (machine.rs's own rule, above). So re-enter with the
+                    // ceremony disabled: `PublishKeys` walks through if the
+                    // handoff has landed, and hands over to the watch if it has
+                    // not.
+                    //
+                    // A single look is not enough, and it used to be all there
+                    // was. The peer posting the rotation needs a block, and a
+                    // spent round is found within seconds — on preprod epoch 1557
+                    // spo4 looked 5 s after failing, found the old key, and sat
+                    // out the epoch; the peer's Update-Y confirmed 100 s later.
+                    //
+                    // `publish_keys_phase` has already recorded the round as spent,
+                    // against the message it signs: only it holds the plan.
                     let ep = resume.as_ref().map_or(0, current_epoch);
-                    if rotation_spent == Some(ep) {
-                        // Second time round: the phase re-entered, found the
-                        // treasury still naming the old key, and refused to walk
-                        // the spent round again. Nothing more this node can do
-                        // until the boundary re-derives everything.
-                        crate::epoch_warn!(
-                            me,
-                            ep,
-                            "Update-Y: {e} — the rotation did not land and this node's round is \
-                             spent, so the epoch's handoff is over. The treasury keeps the \
-                             current key and the outgoing roster carries over."
-                        );
-                        resume = None;
-                    } else {
-                        // First time: the round is spent for THIS node, but the
-                        // threshold subset WI-047 exists to allow may well have
-                        // aggregated and posted without it — in which case the
-                        // treasury already names the key this node holds a share
-                        // of, `plan_update_y` returns None, and the phase walks
-                        // straight through to the batch loop. Dropping to `Idle`
-                        // here would throw away the whole epoch's grid over a
-                        // rotation that SUCCEEDED (machine.rs's own rule, above).
-                        // So re-enter once to look, with the ceremony disabled.
-                        crate::epoch_warn!(
-                            me,
-                            ep,
-                            "Update-Y: {e} — this node's round is spent. Re-reading the treasury \
-                             once in case the rotation landed without it; not re-running the \
-                             ceremony."
-                        );
-                        rotation_spent = Some(ep);
-                    }
+                    crate::epoch_warn!(
+                        me,
+                        ep,
+                        "Update-Y: {} — this node's round is spent, so it will not run the \
+                         ceremony again. Its peers can still land the handoff without it; \
+                         checking whether they have.",
+                        crate::epoch::log::one_line(&e)
+                    );
                 }
+                // The handoff's retry budget, judged HERE: after the attempt that
+                // spent it, so that attempt still counts for what happens next, and
+                // before the retry line below, so that line names where the node
+                // really goes. Judging it before the attempt parked a node whose
+                // first signature came on its last retry and whose post then failed
+                // — the preprod epoch-1557 failure, on the last retry.
+                resume = match resume.take() {
+                    Some(EpochPhase::PublishKeys {
+                        epoch,
+                        roster,
+                        group_keys,
+                    }) => {
+                        handoff.retries += 1;
+                        // Once the handoff has landed, nothing is left to fail but
+                        // the phase's tail: retried like any phase's, and never a
+                        // reason to report the handoff failed.
+                        if handoff.retries <= HANDOFF_RETRIES || handoff.landed {
+                            Some(EpochPhase::PublishKeys {
+                                epoch,
+                                roster,
+                                group_keys,
+                            })
+                        } else if handoff.took_part(epoch) {
+                            // This node took part in the rotation, so the Update-Y
+                            // can still land — from a peer's post, or from its own
+                            // signature, which the watch hands back to post again at
+                            // each look (one attempt each, the budget being spent).
+                            // That is not a failed handoff yet, and parking here
+                            // threw the epoch's whole grid away over a rotation a
+                            // block away. Said once an epoch, not at every look.
+                            if !std::mem::replace(&mut handoff.watching_reported, true) {
+                                crate::epoch_warn!(
+                                    me,
+                                    epoch,
+                                    "Update-Y: this node could not post the key handoff in \
+                                     {HANDOFF_RETRIES} retries, but it took part in the signing \
+                                     round, so the handoff can still land — watching \
+                                     treasury_info until it does or the epoch ends{}",
+                                    if handoff.signed(epoch) {
+                                        ", and posting the signature it holds again meanwhile"
+                                    } else {
+                                        ""
+                                    }
+                                );
+                            }
+                            Some(EpochPhase::AwaitRotation {
+                                epoch,
+                                roster,
+                                group_keys,
+                            })
+                        } else {
+                            // A rejected submission means nothing on its own — peers
+                            // are posting the same rotation and all but one are
+                            // rejected by design — so the failure is reported where
+                            // the node stops expecting a rotation at all, which
+                            // happens once per epoch rather than once per attempt.
+                            handoff.report_failed(
+                                me,
+                                epoch,
+                                &format!(
+                                    "the key handoff has failed {HANDOFF_RETRIES} retries \
+                                     running this epoch — treating it as non-transient and \
+                                     parking until the next boundary"
+                                ),
+                            );
+                            None
+                        }
+                    }
+                    other => other,
+                };
                 // Post-ban recovery (chain-view reconcile): if this failure came
                 // with a detected chain-view disagreement on which we are the
                 // STALE side (older blockchain read-time), a blind fast retry
@@ -598,6 +659,9 @@ async fn drive_to_movement(
                 // re-read lands AFTER the disagreeing event settles into our
                 // view; the fresher-read nodes don't wait. Otherwise the ordinary
                 // capped exponential.
+                // The level of the retry line below: the full error that completes
+                // it is written at the same one.
+                let mut warned = true;
                 let wait = if peers.is_view_stale().await {
                     crate::epoch_warn!(
                         me,
@@ -633,9 +697,7 @@ async fn drive_to_movement(
                     backoff = (backoff * 2).min(config.retry_backoff_max);
                     w
                 } else {
-                    crate::epoch_warn!(
-                        me,
-                        stepped_epoch,
+                    let line = format!(
                         "{stepped} failed: {}. Retrying in {}s, from {}",
                         crate::epoch::log::one_line(&e),
                         backoff.as_secs().max(1),
@@ -643,10 +705,39 @@ async fn drive_to_movement(
                             .as_ref()
                             .map_or(EpochPhase::Idle.name(), EpochPhase::name)
                     );
+                    // A node watching for its handoff hands back to `PublishKeys`
+                    // at every look, and the same refusal coming back is the
+                    // expected outcome until the handoff lands — INFO, or the
+                    // channel gets the same warning every thirty seconds. Anything
+                    // new still warns: see `worth_a_warning`.
+                    let error = e.to_string();
+                    warned = match verdict {
+                        Some((judged, verdict)) if judged == error => verdict,
+                        _ => {
+                            !matches!(resume, Some(EpochPhase::AwaitRotation { .. }))
+                                || handoff.worth_a_warning(&error)
+                        }
+                    };
+                    crate::epoch::log::log_at(me, stepped_epoch, warned, &line);
                     let w = backoff;
                     backoff = (backoff * 2).min(config.retry_backoff_max);
                     w
                 };
+                // Every failed step lands here, including the ones whose own line
+                // already reported the error cut to `one_line` (a rejected
+                // Update-Y, a movement post, a fault ban) — so this is the one
+                // place that can put the whole of it in the log. Right after the
+                // warnings it completes, not after the backoff below, which can
+                // be a minute; at their level; and once per distinct error, so
+                // that a failure repeating on the ramp is not written out again
+                // at every retry.
+                crate::epoch::log::log_full_error_if_cut(
+                    me,
+                    stepped_epoch,
+                    &e,
+                    warned,
+                    &mut last_full_error,
+                );
                 tokio::time::sleep(wait).await;
                 // A failed attempt must not consume its batch opportunity — but
                 // only when the attempt was THIS call's. A failure while waiting
@@ -695,17 +786,54 @@ async fn drive_to_movement(
                 // two ceremony-bearing phases set it, so `Some(PublishKeys)` here
                 // means the failure WAS the handoff: nothing else runs between it
                 // and `CollectPegins`, which overwrites it.
-                if matches!(resume, Some(EpochPhase::PublishKeys { .. })) {
-                    handoff_retries += 1;
-                }
-                phase = match resume.take() {
-                    Some(p)
-                        if chain
-                            .current_epoch()
-                            .await
-                            .map_or(true, |now| now == current_epoch(&p)) =>
+                // Read only when there is a phase to resume: nothing else here
+                // needs it, and it is a chain read on every failure otherwise.
+                let now = match resume {
+                    Some(_) => Some(chain.current_epoch().await),
+                    None => None,
+                };
+                phase = match (resume.take(), now) {
+                    // An unreadable epoch counts as unchanged: see above. And for
+                    // the handoff, so does an EARLIER one: a provider whose
+                    // backends disagree answers with the epoch before just after a
+                    // boundary, and dropping the ceremony in hand over a lagging
+                    // read parked the node for the epoch without a word. (The
+                    // batch loop's phases keep the stricter rule for now.)
+                    (Some(p), Some(now))
+                        if now.as_ref().map_or(true, |now| {
+                            *now == current_epoch(&p)
+                                || (*now < current_epoch(&p)
+                                    && matches!(
+                                        p,
+                                        EpochPhase::PublishKeys { .. }
+                                            | EpochPhase::AwaitRotation { .. }
+                                    ))
+                        }) =>
                     {
                         p
+                    }
+                    // The epoch ended while this node was retrying its handoff or
+                    // about to watch for it. The watch would have said so at the
+                    // boundary, and now never runs — so it is said here.
+                    (
+                        Some(
+                            EpochPhase::PublishKeys {
+                                epoch: ep,
+                                group_keys,
+                                ..
+                            }
+                            | EpochPhase::AwaitRotation {
+                                epoch: ep,
+                                group_keys,
+                                ..
+                            },
+                        ),
+                        Some(Ok(now)),
+                    ) if now > ep => {
+                        if let Ok(group) = group_xonly(&group_keys.verifying_key) {
+                            report_epoch_ended(&mut handoff, chain, me, ep, now, group.xonly).await;
+                        }
+                        EpochPhase::Idle
                     }
                     _ => EpochPhase::Idle,
                 };
@@ -777,9 +905,8 @@ async fn step_phase(
     rng: &Arc<dyn RngSource>,
     config: &EpochConfig,
     built: &mut BuiltBatch,
-    // This epoch's rotation round is already spent (WI-048): re-enter to see
-    // whether it landed without us, but do NOT run the ceremony again.
-    rotation_spent: bool,
+    // What this node has already done in the epoch's rotation round (WI-048).
+    handoff: &mut HandoffRound,
 ) -> EpochResult<Step> {
     let next = match phase {
         EpochPhase::Idle => idle_phase(chain).await?,
@@ -821,15 +948,7 @@ async fn step_phase(
             group_keys,
         } => {
             publish_keys_phase(
-                chain,
-                peers,
-                clock,
-                rng,
-                config,
-                epoch,
-                roster,
-                group_keys,
-                rotation_spent,
+                chain, peers, clock, rng, config, epoch, roster, group_keys, handoff,
             )
             .await?
         }
@@ -838,7 +957,7 @@ async fn step_phase(
             epoch,
             roster,
             group_keys,
-        } => await_rotation_phase(chain, config, epoch, roster, group_keys).await?,
+        } => await_rotation_phase(chain, config, epoch, roster, group_keys, handoff).await?,
 
         EpochPhase::CollectPegins {
             epoch,
@@ -1289,6 +1408,19 @@ async fn idle_phase(chain: &Arc<dyn CardanoChain>) -> EpochResult<EpochPhase> {
     Ok(EpochPhase::EpochStart { epoch: event.epoch })
 }
 
+/// How often the watch looks for a handoff this node took part in, while that
+/// is likely to land. Its peers' post of the same Update-Y is a block or two
+/// away, so the watch's usual `batch_poll_ceiling` would have the node rejoin
+/// the batch grid up to five minutes after them — late for the first batch's
+/// round-1 window.
+const HANDOFF_WATCH_FAST: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the watch keeps [`HANDOFF_WATCH_FAST`] before falling back to
+/// `batch_poll_ceiling`. A post that has not landed in this long is not a block
+/// away, and thirty-second reads for the rest of an epoch spend the quota the
+/// ceiling protects.
+const HANDOFF_WATCH_FAST_FOR: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// Wait for a handoff this node planned but cannot authorize, until it lands or
 /// the epoch ends (WI-114).
 ///
@@ -1313,76 +1445,149 @@ async fn idle_phase(chain: &Arc<dyn CardanoChain>) -> EpochResult<EpochPhase> {
 /// of five-second reads is the API-quota problem the retry budget was introduced
 /// to avoid, and this is the machine's established cadence for waiting on a
 /// chain event that is hours away — the batch loop's own heartbeat.
+///
+/// It is also where a node that TOOK PART in the rotation waits once it can do
+/// no more itself: its round is spent, or its own posts have used up the retry
+/// budget. That wait is different in kind — a post of the rotation it signed,
+/// usually a block away — so it looks every [`HANDOFF_WATCH_FAST`] for a while,
+/// hands back to `PublishKeys` at each look while there is something it can do
+/// (a signature to post again, a moved plan to sign), and raises
+/// `Update-Y FAILED` itself if the epoch ends first.
 async fn await_rotation_phase(
     chain: &Arc<dyn CardanoChain>,
     config: &EpochConfig,
     epoch: u64,
     roster: Roster,
     group_keys: GroupKeys,
+    // What this node did about the epoch's handoff. A node that took part is
+    // waiting on a post of a rotation it signed, usually a block away rather
+    // than hours: it looks sooner, hands back to `PublishKeys` while the handoff
+    // is outstanding, and reports the failure itself if the epoch ends first.
+    handoff: &mut HandoffRound,
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
     let y_51 = group_xonly(&group_keys.verifying_key)
         .map_err(EpochError::Frost)?
         .xonly;
+    handoff.enter(epoch);
+    let took_part = handoff.took_part(epoch);
+    // Kept across re-entries, so that a watch interrupted by a transient chain
+    // error does not restart its fast window every time it comes back.
+    let since = *handoff
+        .watching_since
+        .get_or_insert_with(std::time::Instant::now);
+    let fast = || took_part && since.elapsed() < HANDOFF_WATCH_FAST_FOR;
+    let cadence = || {
+        if fast() {
+            HANDOFF_WATCH_FAST.min(config.batch_poll_ceiling)
+        } else {
+            config.batch_poll_ceiling
+        }
+    };
+    config.health.update(|h| {
+        h.epoch = Some(epoch);
+        h.activity = "waiting for another party to post the Update-Y".into();
+    });
     loop {
-        // Asked BEFORE the first sleep, for the same reason the cascade asks
-        // before its own: the rotation may well have landed while this node was
-        // discovering it could not post it.
-        if chain.plan_update_y(epoch, y_51).await?.is_none() {
-            crate::epoch_log!(
-                me,
-                epoch,
-                "AwaitRotation: the handoff landed — treasury_info now names {}, so this \
-                 roster's key is in charge and the batch loop can start",
-                hex::encode(y_51.serialize())
-            );
-            config.health.update(|h| {
-                h.epoch = Some(epoch);
-                h.activity = "handoff landed".into();
-            });
-            // Back into the phase this came from, NOT forward into the batch
-            // loop. `plan_update_y` now answers `None`, so `PublishKeys` takes
-            // its "no Update-Y needed" branch and runs its own tail — the
-            // `dkg_qualified` health update and `publish_group_key`, which is
-            // what tells `query_treasury` which Taproot tree the head is locked
-            // under. Returning `CollectPegins` here would skip both and reach
-            // `BuildTm` on a stale view of the treasury.
-            //
-            // Not `EpochStart` either (which is where WI-113's post-handoff fix
-            // goes): that re-derives the ceremony, and on a node with no
-            // `state_dir` it re-RUNS the DKG and lands on a fresh Y_51 that the
-            // treasury does not name. Nothing here needs re-deriving — the key
-            // just installed is the one already in hand.
-            return Ok(EpochPhase::PublishKeys {
-                epoch,
-                roster,
-                group_keys,
-            });
-        }
-        // The only bound the watch needs. A boundary re-derives everything from
-        // chain, and `await_epoch_boundary` returns at once for an epoch it has
-        // not yet run, so `Idle` here costs nothing.
-        let now = chain.current_epoch().await?;
-        if now != epoch {
-            crate::epoch_warn!(
-                me,
-                epoch,
-                "AwaitRotation: epoch {now} began before the handoff landed — the treasury keeps \
-                 the outgoing key and this roster carries over unrotated"
-            );
-            return Ok(EpochPhase::Idle);
-        }
-        config.health.update(|h| {
-            h.epoch = Some(epoch);
-            h.activity = "waiting for another party to post the Update-Y".into();
-        });
+        // Nap FIRST. Every way in has only just read the plan — `PublishKeys`
+        // found it outstanding, or a retry backed off before coming back — so an
+        // immediate look adds a read and nothing else. Worse, against providers
+        // whose backends disagree about `treasury_info` it let the two phases
+        // hand the node back and forth with no pause at all.
+        let nap = cadence();
         crate::epoch_log!(
             me,
             epoch,
             "AwaitRotation: treasury_info still names the outgoing key; re-reading in {}s",
-            config.batch_poll_ceiling.as_secs()
+            nap.as_secs()
         );
-        tokio::time::sleep(config.batch_poll_ceiling).await;
+        tokio::time::sleep(nap).await;
+
+        // The epoch BEFORE the plan. Nothing below may act for an epoch that has
+        // ended: a handoff posted after the boundary rotates the treasury under
+        // the next epoch's ceremony. A boundary re-derives everything from chain,
+        // and `await_epoch_boundary` returns at once for an epoch it has not yet
+        // run, so `Idle` here costs nothing.
+        //
+        // `>`, not `!=`: a lagging read from a provider whose backends disagree
+        // answers with the epoch before this one, and that has not ended.
+        let now = chain.current_epoch().await?;
+        if now > epoch {
+            report_epoch_ended(handoff, chain, me, epoch, now, y_51).await;
+            return Ok(EpochPhase::Idle);
+        }
+
+        match chain.plan_update_y(epoch, y_51).await? {
+            None => {
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "AwaitRotation: the handoff landed — treasury_info now names {}, so this \
+                     roster's key is in charge and the batch loop can start",
+                    hex::encode(y_51.serialize())
+                );
+                config.health.update(|h| {
+                    h.epoch = Some(epoch);
+                    h.activity = "handoff landed".into();
+                });
+                // Back into the phase this came from, NOT forward into the batch
+                // loop. `plan_update_y` now answers `None`, so `PublishKeys` takes
+                // its "no Update-Y needed" branch and runs its own tail — the
+                // `dkg_qualified` health update and `publish_group_key`, which is
+                // what tells `query_treasury` which Taproot tree the head is locked
+                // under. Returning `CollectPegins` here would skip both and reach
+                // `BuildTm` on a stale view of the treasury.
+                //
+                // Not `EpochStart` either (which is where WI-113's post-handoff fix
+                // goes): that re-derives the ceremony, and on a node with no
+                // `state_dir` it re-RUNS the DKG and lands on a fresh Y_51 that the
+                // treasury does not name. Nothing here needs re-deriving — the key
+                // just installed is the one already in hand.
+                //
+                // Marked landed, so that what is left — the phase's tail — is
+                // retried like any phase and never reported as a failed handoff.
+                // Otherwise the retries spent on posting carried over, and a few
+                // 502s in the tail parked a node that never took part, raising
+                // `Update-Y FAILED` over a handoff that had landed.
+                handoff.landed = true;
+                return Ok(EpochPhase::PublishKeys {
+                    epoch,
+                    roster,
+                    group_keys,
+                });
+            }
+            // Still outstanding, and there is something for this node to do about
+            // it: a plan that has MOVED to a message it has not reached, or a
+            // signature it holds to post again. Both are `PublishKeys`' job: it
+            // signs a new message in its own namespace, and re-posts a held
+            // signature through the cascade and waits for the datum. So the watch
+            // hands back rather than keeping a second, diverging way to post. A
+            // round it spent, or one that was not its to sign, leaves it only
+            // watching — see `can_act_on`.
+            //
+            // Watching alone assumed some peer would post, and nothing guarantees
+            // one: if every signer's own submissions failed past its retry budget,
+            // each would sit here holding a good signature that nobody used.
+            Some(plan) if took_part && handoff.can_act_on(&plan) => {
+                crate::epoch_log!(
+                    me,
+                    epoch,
+                    "AwaitRotation: the handoff is still outstanding and this node can act on \
+                     it — {}",
+                    if handoff.held_for(&plan).is_some() {
+                        "posting the signature it holds again"
+                    } else {
+                        "the plan has moved, so signing the new one"
+                    }
+                );
+                return Ok(EpochPhase::PublishKeys {
+                    epoch,
+                    roster,
+                    group_keys,
+                });
+            }
+            Some(_) => {}
+        }
     }
 }
 
@@ -1699,8 +1904,8 @@ async fn phase1_fallback(
             // peers do not re-run, so aggregation dies on their old shares — after
             // which the handoff reports "nothing posted", the wait is skipped
             // entirely, and the movement it exists to prevent gets built anyway.
-            // Nothing bounds that loop: `handoff_retries` and `rotation_spent` key
-            // only off `PublishKeys`.
+            // Nothing bounds that loop: the handoff's retry budget and its
+            // `HandoffRound` key only off `PublishKeys`.
             //
             // So: make no movement this epoch. The next boundary re-derives
             // everything, and the treasury is not at risk in the meantime — it
@@ -2021,6 +2226,22 @@ async fn try_succession_handoff(
     // built a movement against the pre-rotation datum would pay the treasury back
     // to the federation. `min_signers` losers is enough to do it without the
     // winner.
+    //
+    // Not once the epoch has ended, though: a handoff lands inside its own epoch
+    // or not at all, and `submit_update_y` would refuse it anyway — asked here so
+    // that the answer is "no rotation", not "the rotation is still expected"
+    // followed by a ten-minute wait for one that cannot land.
+    if let Ok(now) = chain.current_epoch().await
+        && now > epoch
+    {
+        crate::epoch_warn!(
+            log_id,
+            epoch,
+            "handoff: epoch {now} began before the federation posted it — not posting a handoff \
+             for an epoch that has ended"
+        );
+        return None;
+    }
     match chain.submit_update_y(&plan, &signature).await {
         Ok(tx) => {
             crate::epoch_log!(
@@ -2532,6 +2753,265 @@ fn try_resume_dkg(
 // publish_keys
 // ---------------------------------------------------------------------------
 
+/// What this node has already done about an epoch's key handoff, kept across
+/// re-entries of `PublishKeys` and the watch so that no retry runs a ceremony
+/// twice (WI-048). Scoped to ONE epoch: [`Self::enter`] starts it afresh when the
+/// epoch changes, so nothing — the rounds, the retry budget, the watch's clock —
+/// carries from one epoch's handoff into the next.
+///
+/// A round's namespace is fixed by the epoch and the MESSAGE, and peers keep
+/// serving the commitments and shares they published into it. Once this node
+/// has published there too, whether the ceremony then failed or succeeded,
+/// walking it again can only pair a fresh commitment of ours with their first
+/// ones. So a failure after the ceremony re-submits the signature it produced,
+/// and a failure inside it leaves the node watching for its peers' post.
+///
+/// Every round is kept, not only the latest. A plan with a new message —
+/// `treasury_info` spent by a registration between signing and posting, say —
+/// is a new round in a namespace nobody has published into, and is signed
+/// normally; but a lagging provider can hand back the OLD plan afterwards, and
+/// its round must still read as used.
+#[derive(Debug, Default)]
+struct HandoffRound {
+    /// The epoch the records below belong to.
+    epoch: Option<u64>,
+    /// Every round of that epoch this node reached, by message.
+    rounds: BTreeMap<[u8; 32], Round>,
+    /// Failed attempts at this epoch's handoff: the retry budget.
+    retries: u32,
+    /// When this node's latest part in a round began its watch — the start of
+    /// the watch's fast window, restarted by each new round it takes part in.
+    watching_since: Option<std::time::Instant>,
+    /// Whether it has said it is watching — once an epoch, not once per look.
+    watching_reported: bool,
+    /// The failures it has logged while watching, by full text: a REPEAT of one
+    /// is routine and goes to INFO, anything new still warns. A set, not the
+    /// last one, so that two failures alternating look by look — a 502 in the
+    /// watch, a refusal in the hand-back — are not each "new" every time.
+    watch_errors: std::collections::BTreeSet<String>,
+    /// The verdict `PublishKeys` reached on the failure it is returning, taken by
+    /// the loop so that one failure is judged once: judging it again would
+    /// always find it a repeat of itself.
+    verdict: Option<(String, bool)>,
+    /// The handoff has landed. What is left of `PublishKeys` is its tail, whose
+    /// failures are retried like any other phase's and are never reported as a
+    /// failed handoff.
+    landed: bool,
+    /// The epoch's end has been reported — once, whichever of the watch and the
+    /// retry loop notices it first.
+    ended_reported: bool,
+    /// Whether `Update-Y FAILED` has gone out for this epoch.
+    failure_reported: bool,
+    /// Whether the epoch's group key and treasury address have been announced.
+    group_key_reported: bool,
+}
+
+/// How a round of the handoff went for this node.
+#[derive(Debug, Clone)]
+enum Round {
+    /// It published into the round, and the round failed: never walk it again.
+    Spent,
+    /// The round produced this signature: post it again, never re-sign.
+    Signed(SignedHandoff),
+    /// The plan's outgoing key is one this node holds no share of, so it has
+    /// nothing to contribute to this round and published nothing into it.
+    Declined,
+}
+
+/// An Update-Y signature this node produced, and who authorized it.
+#[derive(Debug, Clone)]
+struct SignedHandoff {
+    signature: [u8; 64],
+    authority: rotation::UpdateYAuthority,
+}
+
+impl HandoffRound {
+    /// Make this the record of `epoch`'s handoff, dropping the previous epoch's.
+    ///
+    /// The loop calls it for every handoff phase before stepping it, which is
+    /// what establishes the record. The writers below call it as well, so that a
+    /// phase driven on its own — as the tests drive them — still writes into the
+    /// epoch it is about. It is idempotent.
+    fn enter(&mut self, epoch: u64) {
+        if self.epoch != Some(epoch) {
+            *self = Self {
+                epoch: Some(epoch),
+                ..Self::default()
+            };
+        }
+    }
+
+    fn round(&self, plan: &crate::epoch::traits::UpdateYPlan) -> Option<&Round> {
+        (self.epoch == Some(plan.epoch))
+            .then(|| self.rounds.get(&plan.sig_msg))
+            .flatten()
+    }
+
+    /// The signature this node already holds for `plan`, if any.
+    fn held_for(&self, plan: &crate::epoch::traits::UpdateYPlan) -> Option<&SignedHandoff> {
+        match self.round(plan) {
+            Some(Round::Signed(signed)) => Some(signed),
+            _ => None,
+        }
+    }
+
+    /// Whether `plan`'s round failed after this node published into it.
+    fn spent_for(&self, plan: &crate::epoch::traits::UpdateYPlan) -> bool {
+        matches!(self.round(plan), Some(Round::Spent))
+    }
+
+    /// Whether the watch should hand `plan` back to `PublishKeys`: it is a round
+    /// this node has not reached yet (a plan that MOVED), or one whose signature
+    /// it holds. A held signature is handed back at every look, for as long as
+    /// the epoch lasts: once every signer's own posts have failed, those
+    /// signatures are the only way the handoff lands, and the failure may clear
+    /// — a quota that resets, a wallet an operator refunds — long after the
+    /// fast window. The watch's cadence, not a cut-off, is what keeps that
+    /// affordable: one post per `batch_poll_ceiling` once the window is over.
+    fn can_act_on(&self, plan: &crate::epoch::traits::UpdateYPlan) -> bool {
+        match self.round(plan) {
+            None | Some(Round::Signed(_)) => true,
+            Some(Round::Spent | Round::Declined) => false,
+        }
+    }
+
+    fn record(&mut self, plan: &crate::epoch::traits::UpdateYPlan, round: Round) {
+        self.enter(plan.epoch);
+        // A new part in a round is a new wait for its post: the fast window
+        // starts again from it.
+        if !matches!(round, Round::Declined) {
+            self.watching_since = None;
+        }
+        self.rounds.insert(plan.sig_msg, round);
+    }
+
+    /// Whether this node has published into any of `epoch`'s rounds, however it
+    /// ended — so that a post of it, its own or a peer's, may still land.
+    fn took_part(&self, epoch: u64) -> bool {
+        self.epoch == Some(epoch)
+            && self
+                .rounds
+                .values()
+                .any(|r| matches!(r, Round::Spent | Round::Signed(_)))
+    }
+
+    /// Whether it holds a signature from any of them.
+    fn signed(&self, epoch: u64) -> bool {
+        self.epoch == Some(epoch) && self.rounds.values().any(|r| matches!(r, Round::Signed(_)))
+    }
+
+    /// Whether a failure is worth a WARN: always, until this node has said it
+    /// is watching; after that, only one it has not logged before this epoch.
+    /// A watching node hands back to `PublishKeys` at every look and a refusal
+    /// there is the expected outcome, so the same one again is INFO — but a
+    /// NEW failure (a quota error, a misbehaving peer in a moved plan's round)
+    /// still reaches the channel. Compared on the FULL text: two ledger
+    /// rejections can differ only past the point a one-line version cuts them.
+    fn worth_a_warning(&mut self, error: &str) -> bool {
+        if !self.watching_reported {
+            return true;
+        }
+        // Bounded: errors that embed a txid or a slot are all distinct, and a
+        // node watching for days must not accumulate them.
+        if self.watch_errors.len() >= 32 {
+            self.watch_errors.clear();
+        }
+        self.watch_errors.insert(error.to_string())
+    }
+
+    /// [`Self::worth_a_warning`], with the verdict left for the loop to reuse.
+    fn judge(&mut self, error: &str) -> bool {
+        let verdict = self.worth_a_warning(error);
+        self.verdict = Some((error.to_string(), verdict));
+        verdict
+    }
+
+    /// `Update-Y FAILED`, at most once an epoch — see [`report_handoff_failed`].
+    fn report_failed(&mut self, me: frost::Identifier, epoch: u64, why: &str) {
+        if self.epoch != Some(epoch) || !std::mem::replace(&mut self.failure_reported, true) {
+            report_handoff_failed(me, epoch, why);
+        }
+    }
+}
+
+/// Whether `epoch`'s handoff to `y_51` has landed — asked before reporting it
+/// failed at a boundary. An unreadable plan counts as not landed: the failure
+/// is then reported, which is an answer an operator can check, where staying
+/// silent is not.
+async fn handoff_landed(
+    chain: &Arc<dyn CardanoChain>,
+    epoch: u64,
+    y_51: bitcoin::key::UntweakedPublicKey,
+) -> bool {
+    matches!(chain.plan_update_y(epoch, y_51).await, Ok(None))
+}
+
+/// Say that `epoch` ended before its handoff landed — once an epoch, whichever
+/// of the watch, the retry loop and `PublishKeys` notices it first, and not at
+/// all if the handoff did land. A node that took part raises `Update-Y FAILED`;
+/// one that did not says the roster carries over.
+async fn report_epoch_ended(
+    handoff: &mut HandoffRound,
+    chain: &Arc<dyn CardanoChain>,
+    me: frost::Identifier,
+    epoch: u64,
+    now: u64,
+    y_51: bitcoin::key::UntweakedPublicKey,
+) {
+    if handoff.epoch == Some(epoch) && std::mem::replace(&mut handoff.ended_reported, true) {
+        return;
+    }
+    if handoff_landed(chain, epoch, y_51).await {
+        crate::epoch_log!(me, epoch, "the key handoff landed before epoch {now} began");
+    } else if handoff.took_part(epoch) {
+        handoff.report_failed(
+            me,
+            epoch,
+            &format!(
+                "epoch {now} began before the key handoff landed — this node took part in \
+                 signing it, but no post of it was accepted in time"
+            ),
+        );
+    } else {
+        crate::epoch_warn!(
+            me,
+            epoch,
+            "epoch {now} began before the key handoff landed — the treasury keeps the outgoing \
+             key and this roster carries over unrotated"
+        );
+    }
+}
+
+/// `key handoff posted`.
+fn report_handoff_posted(
+    me: frost::Identifier,
+    epoch: u64,
+    tx_id: &str,
+    plan: &crate::epoch::traits::UpdateYPlan,
+) {
+    crate::epoch_debug!(me, epoch, "key handoff submitted: Cardano tx {tx_id}");
+    crate::epoch_event!(
+        me,
+        epoch,
+        "key handoff posted: Cardano tx {tx_id} — the treasury key becomes {}, was {}",
+        hex::encode(plan.new_key.serialize()),
+        hex::encode(plan.current_key.serialize())
+    );
+}
+
+/// `Update-Y FAILED` — the counterpart to `key handoff posted`, raised where
+/// this node stops expecting a rotation this epoch: out of retries without
+/// having taken part, or at the boundary if it did. The one call site of the
+/// event; [`HandoffRound::report_failed`] keeps it to one per epoch.
+fn report_handoff_failed(me: frost::Identifier, epoch: u64, why: &str) {
+    crate::epoch_event_warn!(
+        me,
+        epoch,
+        "Update-Y FAILED: {why}. The treasury stays under the OUTGOING key, so this node signs \
+         no movement for this epoch"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn publish_keys_phase(
     chain: &Arc<dyn CardanoChain>,
@@ -2542,16 +3022,18 @@ async fn publish_keys_phase(
     epoch: u64,
     roster: Roster,
     group_keys: GroupKeys,
-    // This node already published a commitment for this epoch's rotation and
-    // the round failed (WI-048). Re-entering is worth it only to LOOK: if the
-    // threshold subset landed the Update-Y without us, `plan_update_y` returns
-    // None and this phase walks through to the batch loop. If it did not, the
-    // ceremony must not run a second time in the same namespace.
-    rotation_spent: bool,
+    // What this node has already done in this epoch's rotation round (WI-048).
+    // Once it has published into the round, the ceremony must not run a second
+    // time in the same namespace: a held signature is re-submitted, and a spent
+    // round only LOOKS — if the threshold subset landed the Update-Y without us,
+    // `plan_update_y` returns None and this phase walks through to the batch
+    // loop; if not, it hands over to the watch.
+    handoff: &mut HandoffRound,
 ) -> EpochResult<EpochPhase> {
     let me = *group_keys.key_package.identifier();
     let group = group_xonly(&group_keys.verifying_key).map_err(EpochError::Frost)?;
     let y_51 = group.xonly;
+    handoff.enter(epoch);
 
     // The parity byte and the x-only convention are BIP-340 detail that never
     // told an operator anything; the key itself belongs on the one event below,
@@ -2578,33 +3060,44 @@ async fn publish_keys_phase(
     // hard error there (never sign an unmatched tip), but here it is only an
     // address preview — so treat a failure as non-fatal and continue to the actual
     // handoff, where `build_tm_phase` re-queries with the published key.
-    match chain.query_treasury().await {
-        Ok(treasury) => {
-            let secp = Secp256k1::new();
-            let new_spend =
-                treasury_spend_info(&secp, y_51, treasury.y_fed, treasury.federation_csv_blocks);
-            let new_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(new_spend.output_key());
-            crate::epoch_debug!(
-                me,
-                epoch,
-                "new treasury output_key={} scriptPubKey={}",
-                hex::encode(new_spend.output_key().to_x_only_public_key().serialize()),
-                hex::encode(new_spk.as_bytes())
-            );
-            crate::epoch_event!(
-                me,
-                epoch,
-                "group key for bridge epoch {epoch}: {}; the treasury address it produces is {}, \
+    //
+    // Once an epoch, whatever the read answers: the handoff watch hands back to
+    // this phase at every look while the handoff is outstanding, and an
+    // operator event plus a treasury read at every look is noise and quota, not
+    // information. A preview that failed is not worth retrying at that price.
+    if !std::mem::replace(&mut handoff.group_key_reported, true) {
+        match chain.query_treasury().await {
+            Ok(treasury) => {
+                let secp = Secp256k1::new();
+                let new_spend = treasury_spend_info(
+                    &secp,
+                    y_51,
+                    treasury.y_fed,
+                    treasury.federation_csv_blocks,
+                );
+                let new_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(new_spend.output_key());
+                crate::epoch_debug!(
+                    me,
+                    epoch,
+                    "new treasury output_key={} scriptPubKey={}",
+                    hex::encode(new_spend.output_key().to_x_only_public_key().serialize()),
+                    hex::encode(new_spk.as_bytes())
+                );
+                crate::epoch_event!(
+                    me,
+                    epoch,
+                    "group key for bridge epoch {epoch}: {}; the treasury address it produces is {}, \
                  and this epoch's key handoff pays the treasury there",
-                hex::encode(y_51.serialize()),
-                treasury_address(&new_spk, config.bitcoin_network),
-            );
+                    hex::encode(y_51.serialize()),
+                    treasury_address(&new_spk, config.bitcoin_network),
+                );
+            }
+            Err(e) => crate::epoch_debug!(
+                me,
+                epoch,
+                "  (new treasury address preview unavailable pre-handoff: {e})"
+            ),
         }
-        Err(e) => crate::epoch_debug!(
-            me,
-            epoch,
-            "  (new treasury address preview unavailable pre-handoff: {e})"
-        ),
     }
 
     // N10c/N-b: actually hand the treasury over. Deriving Y_51 changes nothing
@@ -2618,18 +3111,47 @@ async fn publish_keys_phase(
     // the datum already names this key (a re-run, or an unchanged roster
     // re-deriving) and when the backend has no treasury_info state at all.
     match chain.plan_update_y(epoch, y_51).await? {
-        None => crate::epoch_log!(
-            me,
-            epoch,
-            "no key handoff needed: the treasury_info UTxO already names this group key"
-        ),
-        Some(_) if rotation_spent => {
-            return Err(EpochError::RoundSpent {
-                round: 1,
-                cause: Box::new(EpochError::Chain(format!(
-                    "the epoch-{epoch} rotation round is spent and treasury_info still names \
-                     the old key, so the threshold subset did not land it either"
-                ))),
+        None => {
+            handoff.landed = true;
+            crate::epoch_log!(
+                me,
+                epoch,
+                "no key handoff needed: the treasury_info UTxO already names this group key"
+            );
+        }
+        // This node's round for THIS plan is spent: it published into it, the
+        // ceremony failed, and walking it again cannot converge. Its peers can
+        // still land the handoff, and on a live chain they need a block to do
+        // it, so a single look this soon usually sees the old key. Watch until
+        // it lands or the epoch ends. Returning an error here instead is what
+        // parked spo4 for the whole of preprod epoch 1557.
+        Some(plan) if handoff.spent_for(&plan) => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "key handoff: this node's round is spent and treasury_info still names the \
+                 outgoing key {} — watching it until a peer's handoff lands or the epoch ends",
+                hex::encode(plan.current_key.serialize())
+            );
+            return Ok(EpochPhase::AwaitRotation {
+                epoch,
+                roster,
+                group_keys,
+            });
+        }
+        // Already found not to be this node's to authorize: asking again cannot
+        // change the answer, and warning again at every look of the watch only
+        // repeats it.
+        Some(plan) if matches!(handoff.round(&plan), Some(Round::Declined)) => {
+            crate::epoch_log!(
+                me,
+                epoch,
+                "key handoff: still not this node's to authorize — watching treasury_info"
+            );
+            return Ok(EpochPhase::AwaitRotation {
+                epoch,
+                roster,
+                group_keys,
             });
         }
         Some(plan) => {
@@ -2646,16 +3168,38 @@ async fn publish_keys_phase(
             // starts. Read once, before the ceremony, so the deadline is fixed
             // before any nonce is published rather than after.
             let snapshot = chain.query_batch_snapshot().await?;
-            let authorized = rotation::authorize_update_y(
-                peers,
-                clock,
-                rng,
-                config,
-                me,
-                &plan,
-                rotation_window(clock, &snapshot),
-            )
-            .await;
+            // A signature this node already holds for this exact plan is
+            // SUBMITTED again, never re-signed. The ceremony that produced it has
+            // spent its namespace — peers keep serving the commitments and shares
+            // they published into it — so a second ceremony pairs a fresh
+            // commitment of ours with their first ones and fails as "Invalid
+            // signature share". That is what a rejected submission used to set
+            // off, and it spent a round that had already succeeded.
+            let held = handoff.held_for(&plan).cloned();
+            let authorized = match &held {
+                Some(held) => {
+                    crate::epoch_log!(
+                        me,
+                        epoch,
+                        "key handoff: submitting again the signature {} already produced — \
+                         the ceremony does not run twice",
+                        held.authority
+                    );
+                    Ok((held.signature, held.authority.clone()))
+                }
+                None => {
+                    rotation::authorize_update_y(
+                        peers,
+                        clock,
+                        rng,
+                        config,
+                        me,
+                        &plan,
+                        rotation_window(clock, &snapshot),
+                    )
+                    .await
+                }
+            };
             // WI-114. "Not mine to authorize" is an ANSWER, and a stable one:
             // the treasury names a key this node holds no share of, so no
             // retry can change it and no ceremony here can produce the
@@ -2669,6 +3213,7 @@ async fn publish_keys_phase(
             let (signature, authority) = match authorized {
                 Ok(v) => v,
                 Err(e) if matches!(e.cause(), EpochError::NotOursToAuthorize(_)) => {
+                    handoff.record(&plan, Round::Declined);
                     crate::epoch_warn!(
                         me,
                         epoch,
@@ -2682,9 +3227,25 @@ async fn publish_keys_phase(
                         group_keys,
                     });
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Recorded here rather than by the loop, because only this
+                    // phase holds the plan, and the round is the plan's message.
+                    if e.round_is_spent() {
+                        handoff.record(&plan, Round::Spent);
+                    }
+                    return Err(e);
+                }
             };
-            crate::epoch_log!(me, epoch, "Update-Y authorized by {authority}");
+            if held.is_none() {
+                crate::epoch_log!(me, epoch, "Update-Y authorized by {authority}");
+                handoff.record(
+                    &plan,
+                    Round::Signed(SignedHandoff {
+                        signature,
+                        authority: authority.clone(),
+                    }),
+                );
+            }
 
             // WI-099: the cascade runs over the roster that PRODUCED the
             // signature, which is the outgoing one — only its members hold a
@@ -2766,6 +3327,23 @@ async fn publish_keys_phase(
                     });
                 }
             }
+            // Never post an epoch's handoff once that epoch has ended. The
+            // transaction is valid until the end of whatever epoch it is
+            // SUBMITTED in, so a post that arrives after the boundary — a cascade
+            // hop that slept across it, a retry that re-entered late — would
+            // rotate the treasury to this epoch's key underneath the next
+            // epoch's ceremony. Handoffs must be atomic with the epoch.
+            //
+            // `>`, not `!=`: a provider whose backends disagree can answer with
+            // the epoch BEFORE this one just after a boundary, and that is a
+            // lagging read, not an ended epoch. `submit_update_y` bounds the
+            // transaction itself to this epoch as well; this is the early answer
+            // that also reports it.
+            let now = chain.current_epoch().await?;
+            if now > epoch {
+                report_epoch_ended(handoff, chain, me, epoch, now, y_51).await;
+                return Ok(EpochPhase::Idle);
+            }
             let tx_id = match chain.submit_update_y(&plan, &signature).await {
                 Ok(t) => t,
                 Err(e) => {
@@ -2779,24 +3357,19 @@ async fn publish_keys_phase(
                     // this. A rejection here simply does not mean the rotation
                     // failed, and the node that CONCLUDES it did raises the event
                     // instead, after HANDOFF_RETRIES (see `drive_to_movement`).
-                    crate::epoch_warn!(
-                        me,
-                        epoch,
+                    let line = format!(
                         "Update-Y: this node's submission was not accepted ({}) — a peer's \
                          may have been, so the rotation is still expected",
                         crate::epoch::log::one_line(&e)
                     );
+                    // Routine once the node is watching and the same refusal
+                    // comes back at each look — see `worth_a_warning`.
+                    let warn = handoff.judge(&e.to_string());
+                    crate::epoch::log::log_at(me, epoch, warn, &line);
                     return Err(e);
                 }
             };
-            crate::epoch_debug!(me, epoch, "key handoff submitted: Cardano tx {tx_id}");
-            crate::epoch_event!(
-                me,
-                epoch,
-                "key handoff posted: Cardano tx {tx_id} — the treasury key becomes {}, was {}",
-                hex::encode(plan.new_key.serialize()),
-                hex::encode(plan.current_key.serialize())
-            );
+            report_handoff_posted(me, epoch, &tx_id, &plan);
             // Wait for it to appear before letting the batch loop read the datum.
             // `submit_update_y` returns on ACCEPTANCE, and the next thing
             // `build_tm_phase` does is pay the entire treasury to whatever
@@ -6048,7 +6621,7 @@ mod tests {
             roster.epoch,
             roster,
             group_keys,
-            false,
+            &mut HandoffRound::default(),
         )
         .await
         .expect("the seed authorizes its own succession");
@@ -9229,7 +9802,14 @@ mod tests {
 
         let held = tokio::time::timeout(
             Duration::from_millis(300),
-            await_rotation_phase(&chain, &config, epoch, roster_of(2, 2), keys[&me].clone()),
+            await_rotation_phase(
+                &chain,
+                &config,
+                epoch,
+                roster_of(2, 2),
+                keys[&me].clone(),
+                &mut HandoffRound::default(),
+            ),
         )
         .await;
         assert!(
@@ -9258,15 +9838,30 @@ mod tests {
             Arc::new(MockCardanoChain::new(fixture).with_treasury_info(treasury_info));
         let config = fast_config(me);
 
-        let next = await_rotation_phase(&chain, &config, epoch, roster_of(2, 2), keys[&me].clone())
-            .await
-            .unwrap();
+        let next = await_rotation_phase(
+            &chain,
+            &config,
+            epoch,
+            roster_of(2, 2),
+            keys[&me].clone(),
+            &mut HandoffRound::default(),
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(next, EpochPhase::PublishKeys { .. }),
             "expected PublishKeys, got {}",
             next.name()
         );
         assert_eq!(current_epoch(&next), epoch);
+    }
+
+    /// A handoff record for `epoch` holding one round, on `sig_msg`.
+    fn handoff_with(epoch: u64, sig_msg: [u8; 32], round: Round) -> HandoffRound {
+        let mut handoff = HandoffRound::default();
+        handoff.enter(epoch);
+        handoff.rounds.insert(sig_msg, round);
+        handoff
     }
 
     /// A dealt `t`-of-`n` key set plus the group's x-only key, for phase tests
@@ -9332,8 +9927,9 @@ mod tests {
     /// round throws all of that away for ~5 days over a rotation that SUCCEEDED,
     /// which is what `resume = None` alone did.
     ///
-    /// So a spent rotation re-enters exactly once with the ceremony DISABLED:
-    /// `plan_update_y` answering `None` is the proof it landed.
+    /// So a spent rotation re-enters with the ceremony DISABLED: `plan_update_y`
+    /// answering `None` is the proof it landed, and anything else hands the node
+    /// to the watch (the test below).
     #[tokio::test]
     async fn a_spent_rotation_that_landed_elsewhere_walks_through_to_the_batch_loop() {
         let (keys, outgoing) = dealt_group_keys(2, 2);
@@ -9359,7 +9955,9 @@ mod tests {
             7,
             roster_of(2, 2),
             keys.get(&me).unwrap().clone(),
-            true, // the round is spent
+            // Spent on the rotation to this very key; the plan read below finds
+            // it already landed.
+            &mut handoff_with(7, [0u8; 32], Round::Spent),
         )
         .await
         .expect("a spent rotation whose handoff already landed must not fail");
@@ -9370,16 +9968,19 @@ mod tests {
         );
     }
 
-    /// The other half: a spent rotation whose handoff did NOT land must refuse to
-    /// walk the round again, and say which of the two it is.
+    /// The other half: a spent rotation whose handoff has NOT landed yet must not
+    /// walk the round again — and must not give up on the epoch either.
     ///
     /// Re-running the ceremony in the same namespace cannot converge — peers keep
     /// serving their first commitment and `poll_sign_round` never re-fetches a
-    /// peer it already has — so the honest answer is to stop and let the boundary
-    /// re-derive everything.
+    /// peer it already has. But "not landed yet" is not "will not land": the
+    /// peers that completed the round are posting it, and a post needs a block.
+    /// This used to end in `Idle` for the rest of the epoch; on preprod epoch
+    /// 1557 that parked spo4 about 100 s before its peers' Update-Y confirmed.
+    /// So it watches.
     #[tokio::test]
-    async fn a_spent_rotation_that_did_not_land_refuses_to_walk_the_round_again() {
-        let (keys, _outgoing) = dealt_group_keys(2, 2);
+    async fn a_spent_rotation_that_has_not_landed_watches_instead_of_walking_the_round_again() {
+        let (keys, incoming) = dealt_group_keys(2, 2);
         let me = Identifier::try_from(1u16).unwrap();
         // A DIFFERENT key: the treasury still names the outgoing roster, so the
         // rotation is still outstanding.
@@ -9394,7 +9995,7 @@ mod tests {
         let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
         let config = fast_config(me);
 
-        let err = publish_keys_phase(
+        let next = publish_keys_phase(
             &chain,
             &peers,
             &clock,
@@ -9403,14 +10004,792 @@ mod tests {
             7,
             roster_of(2, 2),
             keys.get(&me).unwrap().clone(),
-            true,
+            // Spent on exactly the rotation the chain still asks for.
+            &mut handoff_with(
+                7,
+                crate::cardano::treasury_info::update_y_sig_msg(
+                    &[0xe7u8; 32],
+                    0,
+                    7,
+                    &incoming.serialize(),
+                ),
+                Round::Spent,
+            ),
         )
         .await
-        .expect_err("a spent rotation with the handoff still outstanding must not re-run it");
+        .expect("a spent rotation with the handoff still outstanding is not a failure");
         assert!(
-            err.round_is_spent(),
-            "the loop reads this to park instead of re-entering a third time: {err:?}"
+            matches!(next, EpochPhase::AwaitRotation { .. }),
+            "it must watch for its peers' post rather than run the ceremony or park; got {}",
+            next.name()
         );
+    }
+
+    /// A rejected submission is retried with the signature the round already
+    /// produced — never with a second ceremony.
+    ///
+    /// This is how spo4 lost preprod epoch 1557. Its ceremony succeeded, Cardano
+    /// refused its own post, and the retry ran the ceremony again in the
+    /// namespace the first one had used. Its peers were still serving their
+    /// first commitments and shares, so aggregation failed as "Invalid signature
+    /// share" and the round was spent, over a signature that had been good all
+    /// along.
+    ///
+    /// The retry runs with the federation seed REMOVED, so this node can no longer
+    /// produce the signature at all: it can land the rotation only with the one
+    /// it kept.
+    #[tokio::test]
+    async fn a_rejected_submission_is_retried_with_the_signature_already_held() {
+        let seed = [0x43u8; 32];
+        let secp = Secp256k1::new();
+        let fed_xonly = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&seed).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        // Trimmed to this node, so it is hop 0 of the cascade and posts at once.
+        let (mut roster, group_keys) = group_for(0xb1, 2, 3);
+        let me = *group_keys.key_package.identifier();
+        roster.participants.retain(|id, _| *id == me);
+        roster.min_signers = 1;
+        roster.max_signers = 1;
+
+        let mut fixture = demo_static_fixture(1, 1, 19_410);
+        fixture.roster = roster.clone();
+        fixture.y_51 = fed_xonly;
+        fixture.y_fed = fed_xonly;
+        let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, [0xc4; 32]);
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(fed_xonly)
+                .with_config_y_fed(fed_xonly)
+                .with_treasury_info(Arc::clone(&treasury_info))
+                .reject_next_update_y_submits(1),
+        );
+        let peers = fallback_peers();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let mut config = fast_config(me);
+        config.y_fed_seed = Some(seed);
+        let mut handoff = HandoffRound::default();
+
+        let err = publish_keys_phase(
+            &chain,
+            &peers,
+            &clock,
+            &rng,
+            &config,
+            roster.epoch,
+            roster.clone(),
+            group_keys.clone(),
+            &mut handoff,
+        )
+        .await
+        .expect_err("the first post is rejected");
+        assert!(
+            !err.round_is_spent(),
+            "a rejected post spends nothing — the signature is still good: {err:?}"
+        );
+        let held = handoff
+            .rounds
+            .values()
+            .find_map(|r| match r {
+                Round::Signed(signed) => Some(signed.clone()),
+                _ => None,
+            })
+            .expect("the signature must outlive the rejected post");
+
+        config.y_fed_seed = None;
+        let next = publish_keys_phase(
+            &chain,
+            &peers,
+            &clock,
+            &rng,
+            &config,
+            roster.epoch,
+            roster,
+            group_keys,
+            &mut handoff,
+        )
+        .await
+        .expect("the retry posts the signature it kept");
+        assert!(
+            matches!(next, EpochPhase::CollectPegins { .. }),
+            "expected CollectPegins, got {}",
+            next.name()
+        );
+        let rotations = treasury_info.lock().unwrap().rotations.clone();
+        assert_eq!(rotations.len(), 1, "exactly one rotation lands");
+        assert_eq!(
+            rotations[0].2, held.signature,
+            "the rotation must land with the signature the first attempt produced"
+        );
+    }
+
+    /// The other side of keeping a signature: one kept for a plan that has since
+    /// MOVED is not a reason to stop signing.
+    ///
+    /// Registering or deregistering a pool spends `treasury_info` too, so a
+    /// registration landing between the ceremony and the post leaves every signer
+    /// holding a signature pinned to a UTxO that no longer exists. Each re-plans
+    /// onto the new one, which is a new message and so a namespace nobody has
+    /// published into. Refusing it because the epoch already had a round would
+    /// leave the handoff with no signer at all.
+    #[tokio::test]
+    async fn a_plan_that_moved_under_a_held_signature_is_signed_afresh() {
+        let seed = [0x45u8; 32];
+        let secp = Secp256k1::new();
+        let fed_xonly = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&seed).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        let (mut roster, group_keys) = group_for(0xb2, 2, 3);
+        let me = *group_keys.key_package.identifier();
+        roster.participants.retain(|id, _| *id == me);
+        roster.min_signers = 1;
+        roster.max_signers = 1;
+
+        let mut fixture = demo_static_fixture(1, 1, 19_420);
+        fixture.roster = roster.clone();
+        fixture.y_51 = fed_xonly;
+        fixture.y_fed = fed_xonly;
+        let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, [0xc5; 32]);
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_head_key(fed_xonly)
+                .with_config_y_fed(fed_xonly)
+                .with_treasury_info(Arc::clone(&treasury_info))
+                .reject_next_update_y_submits(1),
+        );
+        let peers = fallback_peers();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+        let mut config = fast_config(me);
+        config.y_fed_seed = Some(seed);
+        let mut handoff = HandoffRound::default();
+
+        publish_keys_phase(
+            &chain,
+            &peers,
+            &clock,
+            &rng,
+            &config,
+            roster.epoch,
+            roster.clone(),
+            group_keys.clone(),
+            &mut handoff,
+        )
+        .await
+        .expect_err("the first post is rejected");
+        let stale = handoff
+            .rounds
+            .values()
+            .find_map(|r| match r {
+                Round::Signed(signed) => Some(signed.clone()),
+                _ => None,
+            })
+            .expect("the first plan was signed");
+
+        // A registration spends `treasury_info` before the retry.
+        treasury_info.lock().unwrap().txid = [0xc6; 32];
+
+        let next = publish_keys_phase(
+            &chain,
+            &peers,
+            &clock,
+            &rng,
+            &config,
+            roster.epoch,
+            roster,
+            group_keys,
+            &mut handoff,
+        )
+        .await
+        .expect("the moved plan is signed and posted");
+        assert!(
+            matches!(next, EpochPhase::CollectPegins { .. }),
+            "expected CollectPegins, got {}",
+            next.name()
+        );
+        let rotations = treasury_info.lock().unwrap().rotations.clone();
+        assert_eq!(rotations.len(), 1, "exactly one rotation lands");
+        assert_ne!(
+            rotations[0].2, stale.signature,
+            "the signature pinned to the spent UTxO authorizes nothing; the one that lands is new"
+        );
+    }
+
+    /// The watch puts the signature this node holds to use, rather than only
+    /// waiting for someone else's post.
+    ///
+    /// Watching alone assumes a peer will post, and nothing guarantees one: if
+    /// every signer's own submissions failed for longer than its retry budget,
+    /// each would sit in the watch holding a good signature that nobody used. The
+    /// watch hands back to `PublishKeys`, which posts it — and must post THAT
+    /// signature, since this node's round is spent for any other.
+    #[tokio::test]
+    async fn the_watch_hands_a_held_signature_back_to_be_posted() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let (keys, incoming) = dealt_group_keys(2, 2);
+        let secp = Secp256k1::new();
+        let outgoing = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&[0x7eu8; 32]).unwrap(),
+        );
+        let treasury_info =
+            MockCardanoChain::treasury_info_state(outgoing.x_only_public_key().0, [0x4eu8; 32]);
+        let fixture = demo_static_fixture(2, 2, 19_903);
+        let epoch = fixture.roster.epoch;
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(fixture).with_treasury_info(Arc::clone(&treasury_info)));
+        let config = fast_config(me);
+
+        let sig_msg = crate::cardano::treasury_info::update_y_sig_msg(
+            &[0x4eu8; 32],
+            0,
+            epoch,
+            &incoming.serialize(),
+        );
+        let signature = secp
+            .sign_schnorr_no_aux_rand(
+                &bitcoin::secp256k1::Message::from_digest(sig_msg),
+                &outgoing,
+            )
+            .serialize();
+        let mut handoff = handoff_with(
+            epoch,
+            sig_msg,
+            Round::Signed(SignedHandoff {
+                signature,
+                authority: rotation::UpdateYAuthority::Federation,
+            }),
+        );
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            await_rotation_phase(
+                &chain,
+                &config,
+                epoch,
+                roster_of(2, 2),
+                keys[&me].clone(),
+                &mut handoff,
+            ),
+        )
+        .await
+        .expect("the watch must hand a held signature back, not wait for a post nobody makes")
+        .unwrap();
+        let EpochPhase::PublishKeys {
+            epoch,
+            roster,
+            group_keys,
+        } = next
+        else {
+            panic!("expected PublishKeys, got {}", next.name());
+        };
+        assert!(
+            treasury_info.lock().unwrap().rotations.is_empty(),
+            "the watch itself posts nothing — the handoff has one way to post"
+        );
+
+        let next = publish_keys_phase(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            epoch,
+            roster,
+            group_keys,
+            &mut handoff,
+        )
+        .await
+        .expect("the held signature is posted");
+        assert!(
+            matches!(next, EpochPhase::CollectPegins { .. }),
+            "expected CollectPegins, got {}",
+            next.name()
+        );
+        let rotations = treasury_info.lock().unwrap().rotations.clone();
+        assert_eq!(rotations.len(), 1);
+        assert_eq!(
+            rotations[0].2, signature,
+            "landed with the signature the node held"
+        );
+    }
+
+    /// A node already WATCHING when the plan moves still signs the new one.
+    ///
+    /// Its round for the old message is spent, but the new message is a new
+    /// round its peers are opening, and they need its share to reach the
+    /// threshold. A watch that waited only for a landing or for a signature it
+    /// held sat this out.
+    #[tokio::test]
+    async fn the_watch_hands_back_a_plan_that_moved_since_its_round() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let (keys, _) = dealt_group_keys(2, 2);
+        let outgoing = dealt_group_keys(2, 2).1;
+        let treasury_info = MockCardanoChain::treasury_info_state(outgoing, [0x5eu8; 32]);
+        let fixture = demo_static_fixture(2, 2, 19_904);
+        let epoch = fixture.roster.epoch;
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(fixture).with_treasury_info(treasury_info));
+        let config = fast_config(me);
+        // Spent on a message the chain no longer asks for.
+        let mut handoff = handoff_with(epoch, [0x11u8; 32], Round::Spent);
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            await_rotation_phase(
+                &chain,
+                &config,
+                epoch,
+                roster_of(2, 2),
+                keys[&me].clone(),
+                &mut handoff,
+            ),
+        )
+        .await
+        .expect("a moved plan must be handed back to be signed, not watched")
+        .unwrap();
+        assert!(
+            matches!(next, EpochPhase::PublishKeys { .. }),
+            "expected PublishKeys, got {}",
+            next.name()
+        );
+    }
+
+    /// No handoff is posted for an epoch that has ended — by the watch or by
+    /// `PublishKeys` — even with a good signature in hand.
+    ///
+    /// The transaction is valid until the end of whatever epoch it is submitted
+    /// in, so a post that arrives after the boundary would rotate the treasury to
+    /// the old epoch's key underneath the new epoch's ceremony. Handoffs are
+    /// atomic with the epoch; a node that took part reports the failure instead.
+    #[tokio::test]
+    async fn no_handoff_is_posted_once_its_epoch_has_ended() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let (keys, incoming) = dealt_group_keys(2, 2);
+        let secp = Secp256k1::new();
+        let outgoing = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&[0x7fu8; 32]).unwrap(),
+        );
+        let treasury_info =
+            MockCardanoChain::treasury_info_state(outgoing.x_only_public_key().0, [0x6eu8; 32]);
+        let mut fixture = demo_static_fixture(2, 2, 19_905);
+        fixture.roster.epoch = 5;
+        // The chain is already one epoch past the handoff being held.
+        let ended = 4;
+        let chain: Arc<dyn CardanoChain> =
+            Arc::new(MockCardanoChain::new(fixture).with_treasury_info(Arc::clone(&treasury_info)));
+        let config = fast_config(me);
+        let sig_msg = crate::cardano::treasury_info::update_y_sig_msg(
+            &[0x6eu8; 32],
+            0,
+            ended,
+            &incoming.serialize(),
+        );
+        let signature = secp
+            .sign_schnorr_no_aux_rand(
+                &bitcoin::secp256k1::Message::from_digest(sig_msg),
+                &outgoing,
+            )
+            .serialize();
+        let held = || {
+            handoff_with(
+                ended,
+                sig_msg,
+                Round::Signed(SignedHandoff {
+                    signature,
+                    authority: rotation::UpdateYAuthority::Federation,
+                }),
+            )
+        };
+
+        let mut handoff = held();
+        let next = await_rotation_phase(
+            &chain,
+            &config,
+            ended,
+            roster_of(2, 2),
+            keys[&me].clone(),
+            &mut handoff,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(next, EpochPhase::Idle),
+            "the watch must see the epoch is over before handing anything back; got {}",
+            next.name()
+        );
+        assert!(handoff.failure_reported, "and report the handoff failed");
+
+        let mut handoff = held();
+        let next = publish_keys_phase(
+            &chain,
+            &fallback_peers(),
+            &(Arc::new(SystemClock) as Arc<dyn Clock>),
+            &(Arc::new(OsRngSource) as Arc<dyn RngSource>),
+            &config,
+            ended,
+            roster_of(2, 2),
+            keys[&me].clone(),
+            &mut handoff,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(next, EpochPhase::Idle),
+            "PublishKeys must not post for an ended epoch either; got {}",
+            next.name()
+        );
+        assert!(handoff.failure_reported);
+        assert!(
+            treasury_info.lock().unwrap().rotations.is_empty(),
+            "nothing was posted"
+        );
+    }
+
+    /// A watch over a handoff this node took part in, on a chain at `chain_epoch`
+    /// whose `treasury_info` names `named`, for tests of what the watch hands
+    /// back. Returns the watch's answer within 300 ms, or `None` if it is still
+    /// watching.
+    async fn watch_once(
+        chain_epoch: u64,
+        watch_epoch: u64,
+        named: bitcoin::key::UntweakedPublicKey,
+        keys: &GroupKeys,
+        handoff: &mut HandoffRound,
+    ) -> Option<EpochPhase> {
+        let mut fixture = demo_static_fixture(2, 2, 19_906);
+        fixture.roster.epoch = chain_epoch;
+        let chain: Arc<dyn CardanoChain> = Arc::new(
+            MockCardanoChain::new(fixture)
+                .with_treasury_info(MockCardanoChain::treasury_info_state(named, [0x7au8; 32])),
+        );
+        let config = fast_config(*keys.key_package.identifier());
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            await_rotation_phase(
+                &chain,
+                &config,
+                watch_epoch,
+                roster_of(2, 2),
+                keys.clone(),
+                handoff,
+            ),
+        )
+        .await
+        .ok()
+        .map(Result::unwrap)
+    }
+
+    /// What the watch hands back, and what it does not: a round this node was
+    /// found to have no share of stays watched — handing it back would repeat a
+    /// whole refusal at every look — while a signature it holds is handed back
+    /// even after the fast window, because once every signer's own posts have
+    /// failed those signatures are the only way the handoff can still land.
+    #[tokio::test]
+    async fn the_watch_hands_back_only_what_it_can_act_on() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let (keys, incoming) = dealt_group_keys(2, 2);
+        let outgoing = dealt_group_keys(2, 2).1;
+        let plan_msg = crate::cardano::treasury_info::update_y_sig_msg(
+            &[0x7au8; 32],
+            0,
+            5,
+            &incoming.serialize(),
+        );
+
+        // Took part in an earlier round; this plan's round was not its to sign.
+        let mut declined = handoff_with(5, [0x22u8; 32], Round::Spent);
+        declined.rounds.insert(plan_msg, Round::Declined);
+        assert!(
+            watch_once(5, 5, outgoing, &keys[&me], &mut declined)
+                .await
+                .is_none(),
+            "a declined round leaves the node watching"
+        );
+
+        // Holds a signature for this plan, and has been watching for longer than
+        // the fast window: still handed back, at the slower cadence.
+        let mut late = handoff_with(
+            5,
+            plan_msg,
+            Round::Signed(SignedHandoff {
+                signature: [0u8; 64],
+                authority: rotation::UpdateYAuthority::Federation,
+            }),
+        );
+        late.watching_since =
+            Some(std::time::Instant::now() - HANDOFF_WATCH_FAST_FOR - Duration::from_secs(1));
+        assert!(
+            matches!(
+                watch_once(5, 5, outgoing, &keys[&me], &mut late).await,
+                Some(EpochPhase::PublishKeys { .. })
+            ),
+            "a held signature is handed back to be posted for as long as the epoch lasts"
+        );
+    }
+
+    /// The boundary, three ways: a lagging epoch read is not an ended epoch; a
+    /// handoff that landed before the boundary is not a failure; and once it has
+    /// landed, the tail is known to be only a tail.
+    #[tokio::test]
+    async fn the_watch_reads_the_boundary_and_a_landing_correctly() {
+        let me = Identifier::try_from(1u16).unwrap();
+        let (keys, incoming) = dealt_group_keys(2, 2);
+        let outgoing = dealt_group_keys(2, 2).1;
+
+        // The chain answers with the epoch BEFORE the watched one. This node's
+        // round for the plan is spent, so there is nothing to hand back either.
+        let msg_of = |epoch: u64| {
+            crate::cardano::treasury_info::update_y_sig_msg(
+                &[0x7au8; 32],
+                0,
+                epoch,
+                &incoming.serialize(),
+            )
+        };
+        let mut lagging = handoff_with(6, msg_of(6), Round::Spent);
+        assert!(
+            watch_once(5, 6, outgoing, &keys[&me], &mut lagging)
+                .await
+                .is_none(),
+            "a lagging read must not end the watch"
+        );
+        assert!(!lagging.failure_reported);
+
+        // The epoch has passed, but the handoff landed before it did.
+        let mut landed = handoff_with(4, [0x33u8; 32], Round::Spent);
+        let next = watch_once(5, 4, incoming, &keys[&me], &mut landed).await;
+        assert!(matches!(next, Some(EpochPhase::Idle)));
+        assert!(
+            !landed.failure_reported,
+            "a handoff that landed is not reported as failed"
+        );
+
+        // Landed within the epoch: back to `PublishKeys`, marked landed so that
+        // the tail is never reported as a failed handoff.
+        let mut spent_budget = handoff_with(5, [0x33u8; 32], Round::Spent);
+        spent_budget.retries = 7;
+        let next = watch_once(5, 5, incoming, &keys[&me], &mut spent_budget).await;
+        assert!(matches!(next, Some(EpochPhase::PublishKeys { .. })));
+        assert!(spent_budget.landed, "the tail knows the handoff landed");
+    }
+
+    /// While watching, a failure warns once: its repeats are INFO, two that
+    /// alternate are each still repeats, and one judged by `PublishKeys` keeps
+    /// that verdict for the loop instead of being judged a repeat of itself.
+    #[test]
+    fn a_watching_node_warns_once_per_distinct_failure() {
+        let mut handoff = HandoffRound::default();
+        handoff.enter(5);
+        assert!(
+            handoff.worth_a_warning("a"),
+            "not watching yet: always warn"
+        );
+        assert!(handoff.worth_a_warning("a"));
+
+        handoff.watching_reported = true;
+        assert!(
+            handoff.worth_a_warning("a"),
+            "the first time while watching"
+        );
+        assert!(!handoff.worth_a_warning("a"), "a repeat");
+        assert!(handoff.worth_a_warning("b"));
+        assert!(
+            !handoff.worth_a_warning("a") && !handoff.worth_a_warning("b"),
+            "alternating failures are repeats too"
+        );
+
+        assert!(handoff.judge("c"));
+        assert_eq!(
+            handoff.verdict.take(),
+            Some(("c".to_string(), true)),
+            "the loop reuses the verdict rather than judging the same failure again"
+        );
+    }
+
+    /// Every round of the epoch stays recorded, not only the latest: a lagging
+    /// provider can hand back an OLD plan after a newer round was spent, and its
+    /// round must still read as used.
+    #[test]
+    fn a_handoff_record_keeps_every_round_of_its_epoch_and_only_that_epoch() {
+        let key = dealt_group_keys(2, 2).1;
+        let plan = |epoch: u64, msg: u8| crate::epoch::traits::UpdateYPlan {
+            epoch,
+            current_key: key,
+            new_key: key,
+            sig_msg: [msg; 32],
+            state_outpoint: String::new(),
+        };
+        let mut handoff = HandoffRound::default();
+        handoff.record(&plan(7, 0xa), Round::Spent);
+        handoff.record(&plan(7, 0xb), Round::Spent);
+        assert!(
+            handoff.spent_for(&plan(7, 0xa)),
+            "the first round is still spent"
+        );
+        assert!(handoff.spent_for(&plan(7, 0xb)));
+        assert!(
+            !handoff.spent_for(&plan(7, 0xc)),
+            "a new message is a new round"
+        );
+        assert!(handoff.took_part(7) && !handoff.signed(7));
+
+        handoff.retries = 7;
+        handoff.enter(8);
+        assert!(
+            !handoff.took_part(8) && !handoff.spent_for(&plan(8, 0xa)),
+            "a new epoch starts its record afresh"
+        );
+        assert_eq!(handoff.retries, 0, "and with a full retry budget");
+    }
+
+    /// Two nodes on the federation-seed path whose every Update-Y post is
+    /// rejected, each failing its first `plan_failures` plan reads first.
+    fn spawn_rejected_handoff_roster(
+        seed: [u8; 32],
+        treasury_info: &Arc<std::sync::Mutex<crate::epoch::mocks::MockTreasuryInfo>>,
+        port: u16,
+        plan_failures: u32,
+    ) -> (
+        Vec<tokio::task::JoinHandle<EpochResult<TreasuryMovement>>>,
+        Vec<crate::health::HealthHandle>,
+    ) {
+        let fixture = movable_fixture(2, 2, port, 1);
+        let hub = MockPeerHub::new();
+        let mut handles = Vec::new();
+        let mut healths = Vec::new();
+        for i in 1..=2u16 {
+            let id = Identifier::try_from(i).unwrap();
+            let chain: Arc<dyn CardanoChain> = Arc::new(
+                MockCardanoChain::new(fixture.clone())
+                    .with_cpo_root(empty_cpo_root())
+                    .with_treasury_info(treasury_info.clone())
+                    .reject_next_update_y_submits(u32::MAX)
+                    .fail_next_update_y_plans(
+                        Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                        plan_failures,
+                    ),
+            );
+            let pegin: Arc<dyn CardanoPegInSource> = Arc::new(MockCardanoPegInSource::new());
+            let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id, hub.clone()));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let rng: Arc<dyn RngSource> = Arc::new(OsRngSource);
+            let mut config = fast_config(id);
+            config.y_fed_seed = Some(seed);
+            healths.push(config.health.clone());
+            handles.push(tokio::spawn(async move {
+                run_epoch_loop(chain, pegin, peers, clock, rng, &config).await
+            }));
+        }
+        (handles, healths)
+    }
+
+    /// Wait, up to a bound, for every node to be in the handoff watch — polled
+    /// rather than slept for, because getting there takes a DKG and a whole retry
+    /// ramp, and a loaded runner stretches both.
+    async fn until_every_node_watches(healths: &[crate::health::HealthHandle]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !healths
+            .iter()
+            .all(|h| h.snapshot().activity == "waiting for another party to post the Update-Y")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a node that signed the handoff but could not post it must end up WATCHING for \
+                 it, not parked until the next boundary: {:?}",
+                healths
+                    .iter()
+                    .map(|h| h.snapshot().activity)
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Land the rotation from outside and require every node to pick it up and
+    /// complete a movement.
+    async fn land_externally_and_finish(
+        treasury_info: &Arc<std::sync::Mutex<crate::epoch::mocks::MockTreasuryInfo>>,
+        handles: Vec<tokio::task::JoinHandle<EpochResult<TreasuryMovement>>>,
+    ) {
+        assert!(
+            handles.iter().all(|h| !h.is_finished()),
+            "no movement is possible while the treasury is under the outgoing key"
+        );
+        treasury_info.lock().unwrap().external_post = true;
+        for h in handles {
+            let tm = tokio::time::timeout(Duration::from_secs(20), h)
+                .await
+                .expect("the watch must pick the handoff up, not wait for the boundary")
+                .unwrap()
+                .expect("epoch cycle completes once the treasury is under this roster's key");
+            assert!(
+                !tm.sighashes.is_empty(),
+                "a real movement, not an empty one"
+            );
+        }
+        assert!(
+            treasury_info.lock().unwrap().rotations.is_empty(),
+            "every post from this roster was rejected, so the rotation came from outside"
+        );
+    }
+
+    /// And a node that cannot post the handoff at all must keep watching for a
+    /// post that can, not park once its retries are spent.
+    ///
+    /// Every submission from this roster is rejected, for far longer than the
+    /// handoff retry budget. Each node holds a good signature, so the rotation
+    /// can still land from elsewhere — here it lands from outside, as a peer's
+    /// post would. Under the old policy both nodes had parked in `Idle` until
+    /// the next boundary by then, and this test hung at the final await.
+    #[tokio::test]
+    async fn a_node_whose_own_posts_fail_still_picks_up_a_handoff_that_lands() {
+        let seed = [0x44u8; 32];
+        let fed_xonly = bitcoin::secp256k1::Keypair::from_secret_key(
+            &Secp256k1::new(),
+            &bitcoin::secp256k1::SecretKey::from_slice(&seed).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, [0x4du8; 32]);
+        let (handles, healths) = spawn_rejected_handoff_roster(seed, &treasury_info, 19_910, 0);
+        until_every_node_watches(&healths).await;
+        land_externally_and_finish(&treasury_info, handles).await;
+    }
+
+    /// The retry budget is judged AFTER the attempt that spends it.
+    ///
+    /// Six plan reads fail first, so the attempt that signs is the last one the
+    /// budget allows, and its post is rejected like every other. Judging the
+    /// budget before that attempt — as the loop used to — raised `Update-Y
+    /// FAILED` and parked the node while it was still about to sign, and the
+    /// signature it then produced counted for nothing.
+    #[tokio::test]
+    async fn a_node_that_first_signs_on_its_last_retry_still_watches() {
+        let seed = [0x46u8; 32];
+        let fed_xonly = bitcoin::secp256k1::Keypair::from_secret_key(
+            &Secp256k1::new(),
+            &bitcoin::secp256k1::SecretKey::from_slice(&seed).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        let treasury_info = MockCardanoChain::treasury_info_state(fed_xonly, [0x4fu8; 32]);
+        let (handles, healths) = spawn_rejected_handoff_roster(
+            seed,
+            &treasury_info,
+            19_920,
+            6, // HANDOFF_RETRIES: the seventh attempt is the last the budget allows
+        );
+        until_every_node_watches(&healths).await;
+        land_externally_and_finish(&treasury_info, handles).await;
     }
 
     /// WI-108: a peer that answers with an ERROR during the DKG is EXCLUDED from

@@ -240,6 +240,10 @@ pub struct MockCardanoChain {
     /// lives in. Shared, so every node in a test fails the same rounds and they
     /// stay in lockstep, exactly as a real chain outage would leave them.
     update_y_failures: Arc<std::sync::atomic::AtomicU32>,
+    /// How many further Update-Y SUBMISSIONS are rejected before the mock
+    /// applies one — a node whose own post Cardano refuses while the signature
+    /// it carries is sound, as spo4's was on preprod in epoch 1557.
+    update_y_rejections: Arc<std::sync::atomic::AtomicU32>,
     /// When set, the SECOND `plan_update_y` call adopts the requested key and
     /// answers `None` from then on — the mock of "the threshold subset landed the
     /// Update-Y while this node was failing its own round" (WI-048). Shared, so
@@ -336,6 +340,7 @@ impl MockCardanoChain {
             treasury_busy: Arc::new(AtomicBool::new(false)),
             snapshot_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             update_y_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            update_y_rejections: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             external_rotation: None,
             bridge_roots: None,
             roots_read_at: None,
@@ -536,8 +541,14 @@ impl MockCardanoChain {
         }
     }
 
-    /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning the
-    /// ceremony window grid on for this mock chain.
+    /// Reject the next `n` Update-Y submissions with a chain error, before the
+    /// signature is even looked at.
+    #[must_use]
+    pub fn reject_next_update_y_submits(self, n: u32) -> Self {
+        self.update_y_rejections.store(n, Ordering::Release);
+        self
+    }
+
     /// See [`MockCardanoChain::external_rotation`].
     #[must_use]
     pub fn with_external_rotation(mut self, plans: Arc<std::sync::atomic::AtomicU32>) -> Self {
@@ -545,6 +556,8 @@ impl MockCardanoChain {
         self
     }
 
+    /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning the
+    /// ceremony window grid on for this mock chain.
     pub fn with_schedule_anchor_ms(mut self, anchor_ms: i64) -> Self {
         self.schedule_anchor_ms = Some(anchor_ms);
         self
@@ -801,6 +814,15 @@ impl CardanoChain for MockCardanoChain {
         plan: &UpdateYPlan,
         signature: &[u8; 64],
     ) -> EpochResult<String> {
+        if self
+            .update_y_rejections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(EpochError::Chain(
+                "mock: injected Update-Y submission rejection".into(),
+            ));
+        }
         let state = self
             .treasury_info
             .as_ref()

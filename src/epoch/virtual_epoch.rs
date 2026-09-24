@@ -174,6 +174,21 @@ impl EpochScheme {
         self.divisor().map(|slots| tip_slot / slots)
     }
 
+    /// The last slot of ceremony epoch `epoch` — one before the next cycle's
+    /// first — or `None` on real epochs, where the chain's own epoch end is the
+    /// answer. As an `invalid_hereafter` it is exclusive, the same convention as
+    /// the Cardano window's `epoch_end_slot`: a transaction bounded by it can
+    /// land up to the slot before, and never in the next cycle.
+    #[must_use]
+    pub fn last_slot_of(self, epoch: u64) -> Option<u64> {
+        self.divisor().map(|slots| {
+            epoch
+                .saturating_add(1)
+                .saturating_mul(slots)
+                .saturating_sub(1)
+        })
+    }
+
     /// The slot the current cycle began at, or `None` on real epochs.
     #[must_use]
     pub fn start_slot(self, tip_slot: u64) -> Option<u64> {
@@ -297,6 +312,17 @@ impl EpochScheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last slot a key handoff may land in is one before the next cycle
+    /// starts — the slot `epoch_at` still maps to the same ceremony epoch.
+    #[test]
+    fn a_cycles_last_slot_is_still_inside_it() {
+        let scheme = EpochScheme::Virtual { slots: 86_400 };
+        let last = scheme.last_slot_of(1557).unwrap();
+        assert_eq!(scheme.epoch_at(last), Some(1557));
+        assert_eq!(scheme.epoch_at(last + 1), Some(1558));
+        assert_eq!(EpochScheme::Cardano.last_slot_of(1557), None);
+    }
 
     /// The published preprod schedule, as the fixtures carry it.
     pub(super) fn schedule() -> ScheduleParams {

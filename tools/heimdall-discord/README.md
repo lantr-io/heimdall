@@ -37,7 +37,7 @@ keeps it under `--no-events --min-level warn`:
 | `⚠️ FAULT BAN FAILED: a <kind> by pool … could not be published (…)` | a misbehaving SPO stays in the roster and enters the next ceremony |
 | `group key for bridge epoch E: …; the treasury address it produces is tb1p…` | where this epoch's handoff pays the treasury |
 | `key handoff posted: Cardano tx … — the treasury key becomes …, was …` | the rotation is on Cardano (also the federation-handoff form) |
-| `⚠️ Update-Y FAILED: the key handoff has failed N retries running this epoch — parking until the next boundary` | this node has stopped expecting a rotation; the epoch's whole batch grid goes with it |
+| `⚠️ Update-Y FAILED: the key handoff has failed N retries running this epoch — parking until the next boundary` (or `… epoch N began before the key handoff landed — this node signed it, …`) | this node has stopped expecting a rotation; the epoch's whole batch grid goes with it |
 | `⚠️ Update-Y DID NOT TAKE: the rotation to … was accepted by Cardano but …` | posted and accepted, but the datum never caught up |
 | `treasury movement built: txid …; sweeps 2 deposits, pays 1 peg-out, 2 outputs. Signing starts` | a treasury movement is assembled |
 | `⚠️ treasury movement NOT SIGNED: the SPO roster could not sign it (…) — N in a row` | the roster could not sign what it built; no daemon resolves this |
@@ -73,13 +73,20 @@ follower — and every federation member, which has no cascade at all — can be
 rejected as a conflicting spend for a rotation that is landing. A rejection means
 nothing on its own, so `Update-Y FAILED` is raised where the node has stopped
 expecting a rotation at all: once per epoch, after the handoff retries are spent.
+A node that took part in signing the rotation does not stop expecting it there —
+its peers' posts can still land it — so it logs a `warn`, watches `treasury_info`
+and re-posts its signature, and raises `Update-Y FAILED` only if the epoch ends
+before the handoff lands.
 `Update-Y DID NOT TAKE` likewise comes only from the node whose own rotation it
 was; on the federation path every member watches the same one and logs it at
 `warn` instead.
 
 plus every line at `--min-level` or above (`warn` by default), whatever it
 says: a peer dropped from a round, a provider rate-limiting the node, a
-movement that could not be posted. `--min-level error` keeps only failures;
+movement that could not be posted. A warning whose error was cut short to fit
+one message is followed by `the full error, which the line for it cut short:
+…` — the whole of it, on one line, which past 2000 bytes arrives in pieces. It
+is written once per distinct error, not again at every retry of the same one. `--min-level error` keeps only failures;
 `--min-level off` keeps only the events; `--no-events` keeps only the levels.
 
 heimdall keeps `heimdall::event` at `info` under any bare `--log-level` /

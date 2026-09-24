@@ -2960,6 +2960,17 @@ impl CardanoChain for BlockfrostCardanoChain {
             .as_deref()
             .ok_or_else(|| EpochError::Chain("no wallet base address".into()))?;
 
+        // First, because it decides whether anything else is worth reading: a
+        // handoff for an epoch that has ended is refused on this one read rather
+        // than after the state, wallet and cost-model reads below.
+        let window =
+            crate::cardano::bf_http::fetch_epoch_window(&self.bf_base_url, &self.bf_project_id)
+                .await
+                .map_err(|e| EpochError::Chain(format!("epoch window: {e}")))?;
+        let handoff_end =
+            crate::cardano::update_y::handoff_validity_end(self.epoch_scheme, &window, plan.epoch)
+                .map_err(EpochError::Chain)?;
+
         // Re-locate the state: between planning and here the datum could have
         // been spent (a peer's rotation, a registration). The signature is
         // pinned to the outpoint it was made for, so a moved state must fail
@@ -2986,11 +2997,6 @@ impl CardanoChain for BlockfrostCardanoChain {
             crate::cardano::bf_http::fetch_cost_models(&self.bf_base_url, &self.bf_project_id)
                 .await
                 .map_err(|e| EpochError::Chain(format!("fetch cost models: {e}")))?;
-        let window =
-            crate::cardano::bf_http::fetch_epoch_window(&self.bf_base_url, &self.bf_project_id)
-                .await
-                .map_err(|e| EpochError::Chain(format!("epoch window: {e}")))?;
-
         let epoch_i64 = i64::try_from(plan.epoch)
             .map_err(|_| EpochError::Chain("epoch too large for Plutus Int".into()))?;
         // Spending the state UTxO needs the compiled script, not just the policy
@@ -3030,7 +3036,7 @@ impl CardanoChain for BlockfrostCardanoChain {
                 wallet_utxos: &wallet_utxos,
                 key,
                 invalid_before: Some(window.current_slot),
-                invalid_hereafter: Some(window.epoch_end_slot),
+                invalid_hereafter: Some(handoff_end),
                 cost_models: Some(cost_models),
             },
         )

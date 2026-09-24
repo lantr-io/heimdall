@@ -127,6 +127,68 @@ impl UpdateYAuthorizer {
     }
 }
 
+/// The `invalid_hereafter` for an Update-Y that hands over bridge epoch `epoch`,
+/// or why it can no longer (or not yet) be posted.
+///
+/// A handoff lands inside its own epoch or not at all: one that arrives after the
+/// boundary rotates the treasury underneath the next epoch's ceremony. So the
+/// TRANSACTION is bounded to the epoch, which makes the ledger enforce what a
+/// check in the node could only race. Every path that builds an Update-Y — the
+/// daemon's key handoff, the Phase-1 succession, the `update-y` CLI — takes its
+/// bound from here.
+///
+/// On a virtual cycle the bound is the cycle's end, well inside the Cardano epoch
+/// `window` reports. On real epochs it is the window's own end, which is right
+/// only when the window IS `epoch`: a later one means the epoch has ended, and an
+/// earlier one is a read that lags (or a handoff for an epoch not begun), and
+/// neither can produce a transaction bounded to `epoch`.
+///
+/// `invalid_hereafter` is exclusive, so a tip AT the bound already leaves an
+/// empty validity interval — that too is refused here, with the reason, rather
+/// than left for the ledger to answer with `OutsideValidityIntervalUTxO`.
+pub fn handoff_validity_end(
+    scheme: crate::epoch::virtual_epoch::EpochScheme,
+    window: &crate::cardano::bf_http::EpochWindow,
+    epoch: u64,
+) -> Result<u64, String> {
+    let end = match scheme.last_slot_of(epoch) {
+        Some(cycle_end) => {
+            if let Some(now) = scheme.epoch_at(window.current_slot)
+                && now < epoch
+            {
+                return Err(format!(
+                    "the tip is in bridge epoch {now}, before epoch {epoch} — a lagging read, \
+                     or a handoff for an epoch that has not begun"
+                ));
+            }
+            cycle_end.min(window.epoch_end_slot)
+        }
+        None if window.epoch == epoch => window.epoch_end_slot,
+        None if window.epoch > epoch => {
+            return Err(format!(
+                "Cardano epoch {} has begun, so the epoch-{epoch} key handoff can no longer be \
+                 posted — a handoff lands inside its own epoch or not at all",
+                window.epoch
+            ));
+        }
+        None => {
+            return Err(format!(
+                "the chain reports Cardano epoch {}, before epoch {epoch} — a lagging read, or \
+                 a handoff for an epoch that has not begun",
+                window.epoch
+            ));
+        }
+    };
+    if window.current_slot >= end {
+        return Err(format!(
+            "bridge epoch {epoch} ends at slot {end} and the tip is at {}, so its key handoff \
+             can no longer be posted — a handoff lands inside its own epoch or not at all",
+            window.current_slot
+        ));
+    }
+    Ok(end)
+}
+
 /// Inputs to [`build_update_y_tx`]. The treasury state UTxO must already be
 /// located (so the caller could compute + sign the message it commits to).
 pub struct UpdateYRequest<'a> {
@@ -453,6 +515,47 @@ mod tests {
             inline_datum: None,
             reference_script_hash: None,
         }
+    }
+
+    fn window(
+        current_slot: u64,
+        epoch: u64,
+        epoch_end_slot: u64,
+    ) -> crate::cardano::bf_http::EpochWindow {
+        crate::cardano::bf_http::EpochWindow {
+            current_slot,
+            epoch,
+            epoch_end_slot,
+            block_time_ms: 0,
+        }
+    }
+
+    /// A handoff is bounded to its own bridge epoch: on a virtual cycle by the
+    /// cycle's end, on real epochs by the window's — and refused, with the
+    /// reason, once that has passed, before it has begun, or when the tip sits
+    /// on the (exclusive) bound itself.
+    #[test]
+    fn a_handoff_is_bounded_to_its_own_epoch() {
+        use crate::epoch::virtual_epoch::EpochScheme;
+        let virt = EpochScheme::Virtual { slots: 86_400 };
+        let end_of_1557 = virt.last_slot_of(1557).unwrap();
+        // Inside the cycle: bounded by the cycle, not by the Cardano epoch.
+        let w = window(1557 * 86_400 + 100, 300, 1560 * 86_400);
+        assert_eq!(handoff_validity_end(virt, &w, 1557), Ok(end_of_1557));
+        // At the bound, and past it.
+        assert!(handoff_validity_end(virt, &window(end_of_1557, 300, u64::MAX), 1557).is_err());
+        assert!(handoff_validity_end(virt, &window(end_of_1557 + 5, 300, u64::MAX), 1557).is_err());
+        // A tip in the cycle before: lagging, not ended — still refused.
+        assert!(handoff_validity_end(virt, &window(1556 * 86_400, 300, u64::MAX), 1557).is_err());
+
+        let real = EpochScheme::Cardano;
+        assert_eq!(
+            handoff_validity_end(real, &window(10, 300, 500), 300),
+            Ok(500)
+        );
+        assert!(handoff_validity_end(real, &window(10, 301, 500), 300).is_err());
+        assert!(handoff_validity_end(real, &window(10, 299, 500), 300).is_err());
+        assert!(handoff_validity_end(real, &window(500, 300, 500), 300).is_err());
     }
 
     // Assemble the Update-Y tx offline and prove it survives into the wire
