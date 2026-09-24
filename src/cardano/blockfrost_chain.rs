@@ -2991,6 +2991,32 @@ impl CardanoChain for BlockfrostCardanoChain {
                 .await
                 .map_err(|e| EpochError::Chain(format!("epoch window: {e}")))?;
 
+        // The handoff may only land inside the bridge epoch it hands over, so
+        // the TRANSACTION is bounded to it, and the ledger enforces what a check
+        // in the node could only race: a post that arrives after the boundary
+        // would rotate the treasury underneath the next epoch's ceremony. On a
+        // virtual cycle that end is the cycle's, well inside the Cardano epoch
+        // the window reports; on real epochs it is the window's own end, which
+        // is right only if the window IS the plan's epoch.
+        let handoff_end = match self.epoch_scheme.last_slot_of(plan.epoch) {
+            Some(cycle_end) => cycle_end.min(window.epoch_end_slot),
+            None if window.epoch == plan.epoch => window.epoch_end_slot,
+            None => {
+                return Err(EpochError::Chain(format!(
+                    "Cardano epoch {} has begun, so the epoch-{} key handoff can no longer be \
+                     posted — a handoff lands inside its own epoch or not at all",
+                    window.epoch, plan.epoch
+                )));
+            }
+        };
+        if window.current_slot > handoff_end {
+            return Err(EpochError::Chain(format!(
+                "bridge epoch {} ended at slot {handoff_end} (the tip is at {}), so its key \
+                 handoff can no longer be posted — a handoff lands inside its own epoch or not \
+                 at all",
+                plan.epoch, window.current_slot
+            )));
+        }
         let epoch_i64 = i64::try_from(plan.epoch)
             .map_err(|_| EpochError::Chain("epoch too large for Plutus Int".into()))?;
         // Spending the state UTxO needs the compiled script, not just the policy
@@ -3030,7 +3056,7 @@ impl CardanoChain for BlockfrostCardanoChain {
                 wallet_utxos: &wallet_utxos,
                 key,
                 invalid_before: Some(window.current_slot),
-                invalid_hereafter: Some(window.epoch_end_slot),
+                invalid_hereafter: Some(handoff_end),
                 cost_models: Some(cost_models),
             },
         )

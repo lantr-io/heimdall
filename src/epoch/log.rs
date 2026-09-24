@@ -329,7 +329,7 @@ pub fn full_text_if_cut(e: &impl std::fmt::Display) -> Option<String> {
     (joined.len() > ONE_LINE_BUDGET).then_some(joined)
 }
 
-/// Log the whole of `e`, at WARN, when [`one_line`] cuts it short — which is what
+/// Log the whole of `e` when [`one_line`] cuts it short — which is what
 /// makes its "full error in this node's log" true.
 ///
 /// Nothing wrote it there before. Every line reporting a failed step goes through
@@ -339,12 +339,14 @@ pub fn full_text_if_cut(e: &impl std::fmt::Display) -> Option<String> {
 /// on a key handoff, cut off before its `expected` half — the half that says what
 /// the transaction got wrong.
 ///
-/// WARN, the level of the warning it completes, so that it is written wherever
-/// that warning is: a node run at `--log-level warn` keeps it too, and the note
-/// is true there as well. The relay forwards it with the warning, and past its
-/// 2000-byte cut a long one arrives in pieces — the price of the whole error
-/// being on record on every node. One line, so it carries the `[epoch=E]`
-/// prefix the journal is grepped by.
+/// At the level of the line it completes (`warn`): WARN for a warning, so that
+/// it is written wherever that warning is — a node run at `--log-level warn`
+/// keeps it too, and the note is true there as well. The relay forwards it with
+/// the warning, and past its 2000-byte cut a long one arrives in pieces — the
+/// price of the whole error being on record on every node. INFO for a line that
+/// went to INFO, so that a routine repeat does not arrive in the channel as a
+/// dump with no warning in front of it. One line, so it carries the
+/// `[epoch=E]` prefix the journal is grepped by.
 ///
 /// Once per distinct error: `last_logged` holds the text last written out, and
 /// the same text again is skipped. A failure that repeats on the backoff ramp
@@ -353,18 +355,29 @@ pub fn log_full_error_if_cut(
     me: Identifier,
     epoch: u64,
     e: &impl std::fmt::Display,
+    warn: bool,
     last_logged: &mut Option<String>,
 ) {
-    if let Some(full) = full_text_if_cut(e)
-        && last_logged.as_deref() != Some(full.as_str())
-    {
+    let Some(full) = full_text_if_cut(e) else {
+        return;
+    };
+    if last_logged.as_deref() == Some(full.as_str()) {
+        return;
+    }
+    if warn {
         crate::epoch_warn!(
             me,
             epoch,
             "the full error, which the warning for it cut short: {full}"
         );
-        *last_logged = Some(full);
+    } else {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "the full error, which the line for it cut short: {full}"
+        );
     }
+    *last_logged = Some(full);
 }
 
 /// Whitespace collapsed to single spaces — see [`one_line`].

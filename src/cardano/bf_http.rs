@@ -713,6 +713,9 @@ pub struct EpochWindow {
     /// a Plutus tx with `invalid_hereafter` exactly there is rejected with
     /// `TimeTranslationPastHorizon` when the script context is built.
     pub epoch_end_slot: u64,
+    /// The Cardano epoch `epoch_end_slot` ends — the one current when the
+    /// window was read.
+    pub epoch: u64,
     /// POSIX time (ms) of `current_slot` (the latest block's wall time). With
     /// 1-second post-Shelley slots, `posix_ms(slot) = block_time_ms + (slot -
     /// current_slot) * 1000`. ApplyBan uses `posix_ms(invalid_hereafter) - 1`
@@ -758,9 +761,11 @@ pub async fn fetch_epoch_window(base_url: &str, project_id: &str) -> Result<Epoc
     let current_slot = field(&block, "slot", "blocks/latest")?;
     let block_time = field(&block, "time", "blocks/latest")?;
     let end_time = field(&epoch, "end_time", "epochs/latest")?;
+    let epoch_no = field(&epoch, "epoch", "epochs/latest")?;
     let remaining = end_time.saturating_sub(block_time);
     Ok(EpochWindow {
         current_slot,
+        epoch: epoch_no,
         epoch_end_slot: (current_slot + remaining).saturating_sub(1),
         block_time_ms: (block_time as i64) * 1000,
     })
