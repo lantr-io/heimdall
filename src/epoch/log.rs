@@ -364,20 +364,24 @@ pub fn log_full_error_if_cut(
     if last_logged.as_deref() == Some(full.as_str()) {
         return;
     }
-    if warn {
-        crate::epoch_warn!(
-            me,
-            epoch,
-            "the full error, which the warning for it cut short: {full}"
-        );
-    } else {
-        crate::epoch_log!(
-            me,
-            epoch,
-            "the full error, which the line for it cut short: {full}"
-        );
-    }
+    log_at(
+        me,
+        epoch,
+        warn,
+        &format!("the full error, which the line for it cut short: {full}"),
+    );
     *last_logged = Some(full);
+}
+
+/// `line` at WARN or at INFO, as `warn` says — for a line whose level is decided
+/// at run time (a failure that is routine when it repeats). The one place that
+/// choice is made, so the two levels cannot come to be routed differently.
+pub fn log_at(me: Identifier, epoch: u64, warn: bool, line: &str) {
+    if warn {
+        crate::epoch_warn!(me, epoch, "{line}");
+    } else {
+        crate::epoch_log!(me, epoch, "{line}");
+    }
 }
 
 /// Whitespace collapsed to single spaces — see [`one_line`].

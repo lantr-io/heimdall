@@ -174,9 +174,11 @@ impl EpochScheme {
         self.divisor().map(|slots| tip_slot / slots)
     }
 
-    /// The last slot a transaction may be valid in and still land inside
-    /// ceremony epoch `epoch` — one before the next cycle's first slot — or
-    /// `None` on real epochs, where the chain's own epoch end is the answer.
+    /// The last slot of ceremony epoch `epoch` — one before the next cycle's
+    /// first — or `None` on real epochs, where the chain's own epoch end is the
+    /// answer. As an `invalid_hereafter` it is exclusive, the same convention as
+    /// the Cardano window's `epoch_end_slot`: a transaction bounded by it can
+    /// land up to the slot before, and never in the next cycle.
     #[must_use]
     pub fn last_slot_of(self, epoch: u64) -> Option<u64> {
         self.divisor().map(|slots| {

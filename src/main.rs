@@ -7598,6 +7598,15 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     let window = rt
         .block_on(bf_http::fetch_epoch_window(&base_url, pid))
         .map_err(|e| format!("epoch window: {e}"))?;
+    // Bounded to --epoch, as every Update-Y is: a handoff posted by hand lands
+    // inside its own bridge epoch or not at all, on the cycle this deployment
+    // runs (`cardano.demo_virtual_epoch_slots`).
+    let scheme = heimdall::epoch::virtual_epoch::EpochScheme::from_slots(
+        cfg.cardano.demo_virtual_epoch_slots,
+    )
+    .map_err(|e| format!("cardano.demo_virtual_epoch_slots: {e}"))?;
+    let handoff_end =
+        heimdall::cardano::update_y::handoff_validity_end(scheme, &window, args.epoch)?;
 
     let state = find_treasury_state(
         &treasury_utxos,
@@ -7689,7 +7698,7 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
         wallet_utxos: &wallet_utxos,
         key: &key,
         invalid_before: Some(window.current_slot),
-        invalid_hereafter: Some(window.epoch_end_slot),
+        invalid_hereafter: Some(handoff_end),
         cost_models: Some(cost_models),
     };
     let built = build_update_y_tx(&req).map_err(|e| format!("build update-y tx: {e}"))?;

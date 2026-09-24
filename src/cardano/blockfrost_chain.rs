@@ -2960,6 +2960,17 @@ impl CardanoChain for BlockfrostCardanoChain {
             .as_deref()
             .ok_or_else(|| EpochError::Chain("no wallet base address".into()))?;
 
+        // First, because it decides whether anything else is worth reading: a
+        // handoff for an epoch that has ended is refused on this one read rather
+        // than after the state, wallet and cost-model reads below.
+        let window =
+            crate::cardano::bf_http::fetch_epoch_window(&self.bf_base_url, &self.bf_project_id)
+                .await
+                .map_err(|e| EpochError::Chain(format!("epoch window: {e}")))?;
+        let handoff_end =
+            crate::cardano::update_y::handoff_validity_end(self.epoch_scheme, &window, plan.epoch)
+                .map_err(EpochError::Chain)?;
+
         // Re-locate the state: between planning and here the datum could have
         // been spent (a peer's rotation, a registration). The signature is
         // pinned to the outpoint it was made for, so a moved state must fail
@@ -2986,37 +2997,6 @@ impl CardanoChain for BlockfrostCardanoChain {
             crate::cardano::bf_http::fetch_cost_models(&self.bf_base_url, &self.bf_project_id)
                 .await
                 .map_err(|e| EpochError::Chain(format!("fetch cost models: {e}")))?;
-        let window =
-            crate::cardano::bf_http::fetch_epoch_window(&self.bf_base_url, &self.bf_project_id)
-                .await
-                .map_err(|e| EpochError::Chain(format!("epoch window: {e}")))?;
-
-        // The handoff may only land inside the bridge epoch it hands over, so
-        // the TRANSACTION is bounded to it, and the ledger enforces what a check
-        // in the node could only race: a post that arrives after the boundary
-        // would rotate the treasury underneath the next epoch's ceremony. On a
-        // virtual cycle that end is the cycle's, well inside the Cardano epoch
-        // the window reports; on real epochs it is the window's own end, which
-        // is right only if the window IS the plan's epoch.
-        let handoff_end = match self.epoch_scheme.last_slot_of(plan.epoch) {
-            Some(cycle_end) => cycle_end.min(window.epoch_end_slot),
-            None if window.epoch == plan.epoch => window.epoch_end_slot,
-            None => {
-                return Err(EpochError::Chain(format!(
-                    "Cardano epoch {} has begun, so the epoch-{} key handoff can no longer be \
-                     posted — a handoff lands inside its own epoch or not at all",
-                    window.epoch, plan.epoch
-                )));
-            }
-        };
-        if window.current_slot > handoff_end {
-            return Err(EpochError::Chain(format!(
-                "bridge epoch {} ended at slot {handoff_end} (the tip is at {}), so its key \
-                 handoff can no longer be posted — a handoff lands inside its own epoch or not \
-                 at all",
-                plan.epoch, window.current_slot
-            )));
-        }
         let epoch_i64 = i64::try_from(plan.epoch)
             .map_err(|_| EpochError::Chain("epoch too large for Plutus Int".into()))?;
         // Spending the state UTxO needs the compiled script, not just the policy
