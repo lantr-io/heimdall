@@ -179,7 +179,17 @@ impl TriesRepairer for ChainTriesRepairer {
         if !matches!(status, TriesStatus::Unreadable { .. }) {
             PendingTm::clear(state_dir).map_err(RepairError::Failed)?;
         }
-        tracing::warn!(target: "heimdall::event", "tries rebuilt from chain history at treasury head {head}: {why}");
+        // `why` is the state BEFORE the rebuild, so it is labelled as such: after
+        // "tries rebuilt", a bare "spi root X != the chain's Y" reads as the
+        // rebuild's outcome. The roots named are the rebuilt ones, which
+        // `reconstruct_both` has already held against the singleton.
+        tracing::warn!(
+            target: "heimdall::event",
+            "tries rebuilt from chain history at treasury head {head}; they now match the \
+             bridge-state singleton (cpo root {}, spi root {}). Before the rebuild: {why}",
+            hex::encode(rebuilt.cpo.root()),
+            hex::encode(rebuilt.spi.root())
+        );
         Ok(why.to_string())
     }
 }

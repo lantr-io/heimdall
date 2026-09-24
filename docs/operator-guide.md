@@ -684,7 +684,11 @@ and runs the checks again:
   Cardano history before starting; this node could neither build nor co-sign until they match
   [cpo] reconstructed root matches the bridge state singleton's cpo_root (c88736be…)
   [spi] reconstructed root matches the bridge state singleton's spi_root (265fdb3f…)
-⚠ tries rebuilt from chain history and now match the bridge-state singleton
+⚠ tries rebuilt from chain history at treasury head 26b974ec…:0; they now match the
+  bridge-state singleton (cpo root c88736be…, spi root 265fdb3f…). Before the rebuild:
+  never seeded (cpo, spi absent)
+⚠ tries rebuilt from chain history; the startup checks below confirm them. If this happens
+  at every start, this node is losing its state directory between runs
 [10/11] local tries   PASS  cpo and spi match the bridge-state singleton
 ```
 
