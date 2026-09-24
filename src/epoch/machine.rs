@@ -469,6 +469,11 @@ async fn drive_to_movement(
             // validation and must fail before the loop is entered — not here,
             // where the only correct answer is to keep trying.
             Err(e) => {
+                // Every failed step lands here, including the ones whose own line
+                // already reported the error cut to `one_line` (a rejected
+                // Update-Y, a movement post, a fault ban) — so this is the one
+                // place that can put the whole of it in the log.
+                crate::epoch::log::log_full_error_if_cut(me, stepped_epoch, &e);
                 // A failure in a DIFFERENT phase is a different problem, and starts
                 // its own ramp. `failed_in` spans a whole call to this function —
                 // `Idle`, a boundary wait, a DKG, the next epoch's `PublishKeys` —

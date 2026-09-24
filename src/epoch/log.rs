@@ -314,11 +314,50 @@ macro_rules! epoch_event_warn {
 /// unparseable JSON error body, which is indented, and the indentation is not
 /// worth carrying into a chat line.
 pub fn one_line(e: &impl std::fmt::Display) -> String {
-    /// Room for ONE interpolated cause on a line, with the event's own text
-    /// around it. An event that interpolates two must divide the line between
-    /// them with [`one_line_within`] — two of these do not fit together.
-    const DEFAULT: usize = 900;
-    one_line_within(e, DEFAULT)
+    one_line_within(e, ONE_LINE_BUDGET)
+}
+
+/// Room for ONE interpolated cause on a line, with the event's own text around
+/// it. An event that interpolates two must divide the line between them with
+/// [`one_line_within`] — two of these do not fit together.
+const ONE_LINE_BUDGET: usize = 900;
+
+/// `e` on one line, whole, when [`one_line`] would cut it short — and `None`
+/// when it would not, because then the line reporting it already said all of it.
+pub fn full_text_if_cut(e: &impl std::fmt::Display) -> Option<String> {
+    let joined = collapse(e);
+    (joined.len() > ONE_LINE_BUDGET).then_some(joined)
+}
+
+/// Log the whole of `e`, at INFO, when [`one_line`] cuts it short — which is what
+/// makes its "full error in this node's log" true.
+///
+/// Nothing wrote it there before. Every line reporting a failed step goes through
+/// `one_line`, so a Blockfrost rejection whose cause runs past the budget reached
+/// the log cut off everywhere it appeared, and the note sent the operator looking
+/// for a line that did not exist. On preprod that was a `ValueNotConservedUTxO`
+/// on a key handoff, cut off before its `expected` half — the half that says what
+/// the transaction got wrong.
+///
+/// INFO, not WARN: the journal keeps it, while the relay's `warn` floor leaves it
+/// out of the channel, which keeps the one-line version. One line, so it carries
+/// the `[epoch=E]` prefix the journal is grepped by.
+pub fn log_full_error_if_cut(me: Identifier, epoch: u64, e: &impl std::fmt::Display) {
+    if let Some(full) = full_text_if_cut(e) {
+        crate::epoch_log!(
+            me,
+            epoch,
+            "the full error, which the warning for it cut short: {full}"
+        );
+    }
+}
+
+/// Whitespace collapsed to single spaces — see [`one_line`].
+fn collapse(e: &impl std::fmt::Display) -> String {
+    e.to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// [`one_line`] with the byte budget stated, for an event that interpolates more
@@ -330,11 +369,7 @@ pub fn one_line(e: &impl std::fmt::Display) -> String {
 /// prevent — so a cap in characters would leave a multi-byte error body splitting
 /// anyway.
 pub fn one_line_within(e: &impl std::fmt::Display, max_bytes: usize) -> String {
-    let joined = e
-        .to_string()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let joined = collapse(e);
     if joined.len() <= max_bytes {
         return joined;
     }
@@ -945,6 +980,30 @@ mod tests {
         assert!(multibyte.len() < 1_000, "{}", multibyte.len());
         assert!(multibyte.starts_with("はは"), "{multibyte}");
         assert!(multibyte.contains("[truncated;"));
+    }
+
+    /// What the truncation note points to has to exist: an error `one_line` cuts
+    /// is logged whole, tail included, and one it does not cut is not logged
+    /// twice.
+    #[test]
+    fn an_error_cut_short_is_available_whole() {
+        let ledger = format!(
+            "Status code: 400\n  Message: {{ \"supplied\": {} }},\n  expected: MaryValue (Coin 7)",
+            "x".repeat(2_000)
+        );
+        assert!(one_line(&ledger).contains("[truncated;"));
+        let full = full_text_if_cut(&ledger).expect("a cut error has a full text");
+        assert!(
+            full.ends_with("expected: MaryValue (Coin 7)"),
+            "the tail the one-line version dropped must be there: …{}",
+            &full[full.len() - 60..]
+        );
+        assert!(
+            !full.contains('\n') && !full.contains("[truncated;"),
+            "{full}"
+        );
+
+        assert_eq!(full_text_if_cut(&"Status code: 502 Bad Gateway"), None);
     }
 
     #[test]
