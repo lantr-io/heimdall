@@ -46,7 +46,101 @@ pub const EMBEDDED_BLUEPRINT: &str = include_str!("../../assets/plutus.json");
 /// The upstream commit `EMBEDDED_BLUEPRINT` was taken from, for `--version` and
 /// for the startup report — so a node can say which contracts it speaks without
 /// anyone diffing a 400 kB file.
-pub const EMBEDDED_BLUEPRINT_COMMIT: &str = "4d5516e149d76893280d06d184250f57d3c43175";
+pub const EMBEDDED_BLUEPRINT_COMMIT: &str = "096f76c22e7e6143ec2ae26603061fc3aa32208f";
+
+/// The rev-5.5 blueprint: the file heimdall embedded before rev 5.6, byte for
+/// byte, from ft-bifrost-bridge `4d5516e`.
+///
+/// Carried so a heimdall of this version runs a bridge whose registry has not
+/// been revised yet exactly as the previous release did — and, byte for byte,
+/// because the pre-ceremony handshake compares a digest of the WHOLE file
+/// (`http::compat`): with any other bytes a node on this version and one on the
+/// previous would refuse each other, and a roster could not upgrade one node at
+/// a time.
+pub const EMBEDDED_BLUEPRINT_REV55: &str = include_str!("../../assets/plutus-rev5.5.json");
+
+/// The upstream commit [`EMBEDDED_BLUEPRINT_REV55`] was taken from.
+pub const EMBEDDED_BLUEPRINT_REV55_COMMIT: &str = "4d5516e149d76893280d06d184250f57d3c43175";
+
+/// The ft-bifrost-bridge contracts release a bridge's REGISTRY runs.
+///
+/// Read from the Config rather than configured: rev 5.6 appended field #13
+/// (`previous_spos_registry_policy_id`), a rev-5.6 genesis writes it empty, and
+/// the governance Update that revises a rev-5.5 registry appends it. So a Config
+/// with #13 names a rev-5.6 registry and one without names a rev-5.5 registry —
+/// the one fact every node reads identically, with nothing to agree on.
+///
+/// What differs, for what heimdall derives: `spos_registry` takes the Config NFT
+/// policy as a fourth parameter in rev 5.6, and `spo_bans` takes the Config NFT
+/// policy where rev 5.5 took the registry policy. Both are applied BY PARAMETER
+/// TITLE from the blueprint itself ([`spos_registry_script`], [`spo_bans_script`]),
+/// so choosing the release is choosing the blueprint and nothing else. And the
+/// registration and exit messages: rev 5.6 binds them to a nonce outpoint, which
+/// this heimdall's builders produce and a rev-5.5 registry does not accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractsRelease {
+    Rev55,
+    Rev56,
+}
+
+impl ContractsRelease {
+    /// The newest release this heimdall carries — what a registry revision it
+    /// prepares is compiled from.
+    pub const LATEST: Self = Self::Rev56;
+
+    /// The embedded blueprint of this release.
+    #[must_use]
+    pub fn embedded(self) -> &'static str {
+        match self {
+            Self::Rev55 => EMBEDDED_BLUEPRINT_REV55,
+            Self::Rev56 => EMBEDDED_BLUEPRINT,
+        }
+    }
+
+    /// The upstream commit that blueprint was taken from.
+    #[must_use]
+    pub fn commit(self) -> &'static str {
+        match self {
+            Self::Rev55 => EMBEDDED_BLUEPRINT_REV55_COMMIT,
+            Self::Rev56 => EMBEDDED_BLUEPRINT_COMMIT,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rev55 => "rev5.5",
+            Self::Rev56 => "rev5.6",
+        }
+    }
+}
+
+/// The release the bridge this PROCESS reads runs, as its last Config read
+/// said. Process-wide because the peer handshake reports it
+/// (`http::compat::own_blueprint_digest`), and the handshake is answered from
+/// shared state that has no Config of its own.
+static RELEASE_IN_EFFECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// Record the release the bridge's Config names. Called wherever the daemon
+/// reads the Config, so the handshake follows a registry revision without a
+/// restart.
+pub fn set_release_in_effect(release: ContractsRelease) {
+    let v = match release {
+        ContractsRelease::Rev55 => 0,
+        ContractsRelease::Rev56 => 1,
+    };
+    RELEASE_IN_EFFECT.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The release [`set_release_in_effect`] last recorded — [`ContractsRelease::LATEST`]
+/// before any Config has been read.
+#[must_use]
+pub fn release_in_effect() -> ContractsRelease {
+    match RELEASE_IN_EFFECT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => ContractsRelease::Rev55,
+        _ => ContractsRelease::Rev56,
+    }
+}
 
 /// The blueprint to derive scripts from: the operator's file when one is named,
 /// the embedded copy otherwise.
@@ -55,8 +149,17 @@ pub const EMBEDDED_BLUEPRINT_COMMIT: &str = "4d5516e149d76893280d06d184250f57d3c
 /// a contracts release this heimdall predates. It is no longer the normal path,
 /// and nothing requires it.
 pub fn load_blueprint(path: Option<&str>) -> Result<std::borrow::Cow<'static, str>, String> {
+    load_blueprint_for(ContractsRelease::LATEST, path)
+}
+
+/// [`load_blueprint`] for a given release: the operator's file when one is
+/// named, the embedded blueprint of `release` otherwise.
+pub fn load_blueprint_for(
+    release: ContractsRelease,
+    path: Option<&str>,
+) -> Result<std::borrow::Cow<'static, str>, String> {
     match path.map(str::trim).filter(|p| !p.is_empty()) {
-        None => Ok(std::borrow::Cow::Borrowed(EMBEDDED_BLUEPRINT)),
+        None => Ok(std::borrow::Cow::Borrowed(release.embedded())),
         Some(p) => std::fs::read_to_string(p)
             .map(std::borrow::Cow::Owned)
             .map_err(|e| format!("read blueprint {p}: {e}")),
@@ -204,6 +307,70 @@ pub fn script_enterprise_address(hash: &[u8; 28], network: Network) -> String {
         .expect("bech32 encode script address")
 }
 
+/// The parameter titles the blueprint declares for `title`, in order — or
+/// `None` when it declares none (a hand-trimmed blueprint), in which case the
+/// caller falls back to the newest release's order.
+fn validator_parameter_titles(
+    blueprint_json: &str,
+    title: &str,
+) -> Result<Option<Vec<String>>, BlueprintError> {
+    let bp: serde_json::Value = serde_json::from_str(blueprint_json)
+        .map_err(|e| BlueprintError::BadBlueprint(e.to_string()))?;
+    let validator = bp["validators"]
+        .as_array()
+        .and_then(|vs| vs.iter().find(|v| v["title"].as_str() == Some(title)))
+        .ok_or_else(|| BlueprintError::ValidatorNotFound(title.into()))?;
+    let Some(params) = validator["parameters"].as_array() else {
+        return Ok(None);
+    };
+    params
+        .iter()
+        .map(|p| {
+            p["title"].as_str().map(str::to_owned).ok_or_else(|| {
+                BlueprintError::BadBlueprint(format!("{title}: a parameter without a title"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Apply `title`'s parameters by NAME: each declared parameter is looked up in
+/// `by_name`, in the order the blueprint declares them.
+///
+/// This is what lets one derivation serve two contracts releases whose
+/// parameter lists differ — the blueprint says what it takes, and a parameter
+/// this code has no value for is an error rather than a silent shift of every
+/// value after it. `fallback` is the order used when the blueprint declares no
+/// parameters at all.
+fn apply_params_by_title(
+    blueprint_json: &str,
+    title: &str,
+    by_name: &[(&str, PlutusData)],
+    fallback: &[&str],
+) -> Result<ParameterizedScript, BlueprintError> {
+    let code = validator_compiled_code(blueprint_json, title)?;
+    let titles: Vec<String> = match validator_parameter_titles(blueprint_json, title)? {
+        Some(t) => t,
+        None => fallback.iter().map(|s| (*s).to_string()).collect(),
+    };
+    let params = titles
+        .iter()
+        .map(|t| {
+            by_name
+                .iter()
+                .find(|(name, _)| name == t)
+                .map(|(_, v)| v.clone())
+                .ok_or_else(|| {
+                    BlueprintError::BadBlueprint(format!(
+                        "{title}: parameter `{t}` is one this heimdall has no value for — a \
+                         contracts release it does not know"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    apply_params(&code, &params)
+}
+
 /// `compiledCode` (hex) of the validator titled `title`.
 pub fn validator_compiled_code(
     blueprint_json: &str,
@@ -275,19 +442,36 @@ pub fn apply_params(
 /// and the dependency a cycle. [PRE-4] broke that by reading the registry policy
 /// from the Config datum instead, so the build order is now a chain — Config
 /// identity, then treasury, then registry.
+///
+/// Rev 5.6 appends `config_policy_id` ([PRE-3]): the `Migrate` branch reads
+/// Config #13 to learn which policy a registration is being carried across
+/// FROM, and the Config NFT policy id is the one identity safe to bake in,
+/// since it depends only on its own one-shot outpoint. A rev-5.5 blueprint does
+/// not declare it, and then it is not applied ([`ContractsRelease`]).
 pub fn spos_registry_script(
     blueprint_json: &str,
     bootstrap_tx_id: &[u8; 32],
     bootstrap_output_index: u64,
     treasury_policy_id: &[u8; 28],
+    config_policy_id: &[u8; 28],
 ) -> Result<ParameterizedScript, BlueprintError> {
-    let code = validator_compiled_code(blueprint_json, SPOS_REGISTRY_TITLE)?;
-    apply_params(
-        &code,
+    apply_params_by_title(
+        blueprint_json,
+        SPOS_REGISTRY_TITLE,
         &[
-            bytes(bootstrap_tx_id),
-            int_from_u64(bootstrap_output_index),
-            bytes(treasury_policy_id),
+            ("bootstrap_tx_id", bytes(bootstrap_tx_id)),
+            (
+                "bootstrap_output_index",
+                int_from_u64(bootstrap_output_index),
+            ),
+            ("treasury_policy_id", bytes(treasury_policy_id)),
+            ("config_policy_id", bytes(config_policy_id)),
+        ],
+        &[
+            "bootstrap_tx_id",
+            "bootstrap_output_index",
+            "treasury_policy_id",
+            "config_policy_id",
         ],
     )
 }
@@ -347,6 +531,7 @@ pub fn registry_policy_from_bootstraps(
         registry_bootstrap.0,
         registry_bootstrap.1,
         &treasury.hash,
+        config_policy_id,
     )
 }
 
@@ -420,8 +605,17 @@ pub fn fault_verifier_equivocation_script(
 /// `spo_bans` parameterized by its full upstream parameter list (7 params, in
 /// the order the compiled validator declares them):
 ///
-/// 1. `registration_script_hash` — the registry policy id (the registered-pool
-///    reference input is checked against it).
+/// 1. `config_policy_id` — the Config NFT policy id. REPLACED
+///    `registration_script_hash` in rev 5.6 ([PRE-5]): the validator now reads
+///    the registry policy from Config #9 at run time, which removes the DIRECT
+///    dependency of this hash on the registry's.
+///
+///    Not the transitive one. Parameter 2 below is the fault-verifier policies,
+///    and each of those takes the registry policy as its own compile parameter
+///    — so this hash is still a function of the registry hash by way of them,
+///    and a later registry revision will still move the ban policy, strand live
+///    bans and need a Config #8 move. Ending that means the fault verifiers
+///    reading #9 from the Config too.
 /// 2. `fault_proof_policy_ids` — the authorized fault-verifier policies. The
 ///    contract's `ban_config_ok` requires **exactly 3, all distinct**, and the
 ///    hash is order-sensitive, so pass them in the exact deployment order.
@@ -436,10 +630,16 @@ pub fn fault_verifier_equivocation_script(
 /// NOTE: this matches upstream FluidTokens `main` (WI-018). The earlier
 /// 4-parameter form (single fault policy, no ban-schedule params) predated the
 /// evidence-bound rework and derived the wrong hash/address.
+///
+/// Its first parameter is how the ban list learns the registry: the registry
+/// policy itself in rev 5.5 (`registration_script_hash`), the Config NFT policy
+/// in rev 5.6 (`config_policy_id`, [PRE-5]). Both are supplied, and the
+/// blueprint's own parameter list picks ([`ContractsRelease`]).
 #[allow(clippy::too_many_arguments)]
 pub fn spo_bans_script(
     blueprint_json: &str,
-    registration_script_hash: &[u8; 28],
+    registry_policy_id: &[u8; 28],
+    config_policy_id: &[u8; 28],
     fault_proof_policy_ids: &[[u8; 28]],
     base_ban_duration_ms: i64,
     max_faults_before_permanent: i64,
@@ -447,17 +647,36 @@ pub fn spo_bans_script(
     bootstrap_tx_id: &[u8; 32],
     bootstrap_output_index: u64,
 ) -> Result<ParameterizedScript, BlueprintError> {
-    let code = validator_compiled_code(blueprint_json, SPO_BANS_TITLE)?;
-    apply_params(
-        &code,
+    apply_params_by_title(
+        blueprint_json,
+        SPO_BANS_TITLE,
         &[
-            bytes(registration_script_hash),
-            array(fault_proof_policy_ids.iter().map(|p| bytes(p)).collect()),
-            int(base_ban_duration_ms),
-            int(max_faults_before_permanent),
-            int(max_validity_window_ms),
-            bytes(bootstrap_tx_id),
-            int_from_u64(bootstrap_output_index),
+            ("registration_script_hash", bytes(registry_policy_id)),
+            ("config_policy_id", bytes(config_policy_id)),
+            (
+                "fault_proof_policy_ids",
+                array(fault_proof_policy_ids.iter().map(|p| bytes(p)).collect()),
+            ),
+            ("base_ban_duration_ms", int(base_ban_duration_ms)),
+            (
+                "max_faults_before_permanent",
+                int(max_faults_before_permanent),
+            ),
+            ("max_validity_window_ms", int(max_validity_window_ms)),
+            ("bootstrap_tx_id", bytes(bootstrap_tx_id)),
+            (
+                "bootstrap_output_index",
+                int_from_u64(bootstrap_output_index),
+            ),
+        ],
+        &[
+            "config_policy_id",
+            "fault_proof_policy_ids",
+            "base_ban_duration_ms",
+            "max_faults_before_permanent",
+            "max_validity_window_ms",
+            "bootstrap_tx_id",
+            "bootstrap_output_index",
         ],
     )
 }
@@ -505,7 +724,20 @@ mod tests {
 
     // `bitcoin/spo_bans.spo_bans` unapplied compiledCode + the hash
     // `aiken blueprint apply` (v1.1.21) produces for the 7-param application in
-    // the test below. This pins the new bit — the `List<PolicyId>` param — which
+    // the test below.
+    //
+    // FROZEN on purpose, and NOT refreshed when `assets/plutus.json` is: what it
+    // pins is that `apply_params` reproduces `aiken blueprint apply` byte for
+    // byte, and a vector is only ground truth while both halves stay the ones
+    // aiken actually produced together. Refreshing the code without re-running
+    // aiken for the hash turns the assertion into "our encoder agrees with
+    // itself". The CURRENT blueprint's derived ids are pinned separately, by
+    // `the_embedded_blueprint_derives_pinned_policy_ids`.
+    //
+    // Rev 5.6 renamed this script's first parameter from
+    // `registration_script_hash` to `config_policy_id` ([PRE-5]). Both are
+    // 28-byte hashes, so the applied bytes — and therefore this vector — are
+    // unaffected; only what the value MEANS changed. This pins the new bit — the `List<PolicyId>` param — which
     // must be encoded as a canonical INDEFINITE-length CBOR array (`9f..ff`, what
     // `plutus::array` emits and what the on-chain ban datum already uses). aiken
     // is NOT length-form agnostic: a definite array (`83..`) hashes differently,
@@ -520,13 +752,14 @@ mod tests {
         );
         let script = spo_bans_script(
             &blueprint,
-            &[0x11; 28],                           // registration_script_hash
+            &[0x99; 28], // registry policy: not declared by this trimmed blueprint, so unused
+            &[0x11; 28], // config_policy_id (rev 5.6, the fallback order)
             &[[0x21; 28], [0x22; 28], [0x23; 28]], // fault_proof_policy_ids (3 distinct)
-            86_400_000,                            // base_ban_duration_ms
-            3,                                     // max_faults_before_permanent
-            600_000,                               // max_validity_window_ms
-            &[0xbb; 32],                           // bootstrap_tx_id
-            2,                                     // bootstrap_output_index
+            86_400_000,  // base_ban_duration_ms
+            3,           // max_faults_before_permanent
+            600_000,     // max_validity_window_ms
+            &[0xbb; 32], // bootstrap_tx_id
+            2,           // bootstrap_output_index
         )
         .unwrap();
         // Equal hashes ⇒ byte-identical applied program ⇒ our List<PolicyId>
@@ -664,24 +897,33 @@ mod tests {
         let path = std::env::var("BIFROST_PLUTUS_JSON")
             .expect("set BIFROST_PLUTUS_JSON to the upstream plutus.json");
         let blueprint = std::fs::read_to_string(path).unwrap();
-        let registry = spos_registry_script(&blueprint, &[0xaa; 32], 1, &[0x77; 28]).unwrap();
-        // N10b: spos_registry references TreasuryDatum, whose shape changed (federation
-        // fields + last_reset_tm_txid), so its compiled code — and this hash — moved.
+        let registry =
+            spos_registry_script(&blueprint, &[0xaa; 32], 1, &[0x77; 28], &[0x88; 28]).unwrap();
+        // Re-pinned for rev 5.6: the nonce, the Migrate branch and the element
+        // bound grew spos_registry's compiled code, and the fourth parameter
+        // ([PRE-3], config_policy_id) is applied above.
+        //
+        // This test is #[ignore]d, so CI cannot tell you the pin went stale —
+        // and the blueprint bump that stales it is exactly the change it exists
+        // to validate. Re-pin it in the same commit that touches
+        // `assets/plutus.json`, next to the four in
+        // `the_embedded_blueprint_derives_pinned_policy_ids`.
         assert_eq!(
             registry.hash_hex(),
-            "37df878dca019a2806def25f6befb7b0bfba6de84e192bbf68ad60ba"
+            "3ab8e80ab06527d85cc6be309869d9530a8f3cee710f374df61b2852"
         );
-        // spec [PRE-1]: treasury_info is single-param (registry_policy_id).
-        // Because the blueprint is aiken's own output and apply_params matches
-        // `aiken blueprint apply` byte-for-byte, the pinned hash is aiken's
-        // single-param application. NOTE: pinned against the pre-[PRE-1]
-        // upstream blueprint (whose treasury_info compiledCode still declares
-        // the vestigial tm_nft_policy_id parameter after it); re-pin when the
-        // bridge-track treasury.ak change regenerates plutus.json.
+        // Both pins above and below are against the blueprint in
+        // `assets/plutus.json`, which is what this test is pointed at in
+        // practice even though the env var lets it read an upstream checkout.
+        //
+        // They had BOTH gone stale on main before rev 5.6 — the test is
+        // `#[ignore]`d, so nothing runs it and nothing says so. If you refresh
+        // the blueprint, refresh these in the same commit, next to the four in
+        // `the_embedded_blueprint_derives_pinned_policy_ids`.
         let treasury = treasury_info_script(&blueprint, &[0x66; 32], 0, &[0x77; 28]).unwrap();
         assert_eq!(
             treasury.hash_hex(),
-            "691f2dd908d5e5dd18d7c8ed526caea8465757011ae20d7e6c308a21"
+            "0a6b96f164ed40308251e66c01f07ff20218644ba3b139c3c250dd50"
         );
     }
 }
@@ -709,7 +951,8 @@ mod embedded_blueprint_tests {
     fn the_embedded_blueprint_derives_pinned_policy_ids() {
         let bp = EMBEDDED_BLUEPRINT;
         let treasury = treasury_info_script(bp, &BOOTSTRAP_TX, 0, &CONFIG_POLICY).unwrap();
-        let registry = spos_registry_script(bp, &BOOTSTRAP_TX, 0, &treasury.hash).unwrap();
+        let registry =
+            spos_registry_script(bp, &BOOTSTRAP_TX, 0, &treasury.hash, &CONFIG_POLICY).unwrap();
         let r1 = fault_verifier_round1_script(bp, &registry.hash).unwrap();
         let r2 = fault_verifier_round2_script(bp, &registry.hash).unwrap();
         let eq = fault_verifier_equivocation_script(bp, &registry.hash).unwrap();
@@ -721,28 +964,113 @@ mod embedded_blueprint_tests {
         );
         assert_eq!(
             registry.hash_hex(),
-            "739da7b8bb0974fd54ec353f126018e7830f18bbc0516c5c3b2f0f3b",
+            "2910c959951a87646ca55735d907ec4943de34194ca508e7c1aa5980",
             "spos_registry"
         );
         assert_eq!(
             r1.hash_hex(),
-            "c8d0bbd6f6c06bcf03afd953c63af4cd3a01e4c41a7a04fa8a96867b",
+            "54bfa34054fb9bbba4b75c95d714c87d19af3ca55d310aa9cf1a0474",
             "fault_verifier round1"
         );
         assert_eq!(
             r2.hash_hex(),
-            "6e20809f597c883e9c59752964f51efa320db278f69f91284ec7a929",
+            "f657801501521f7e0fef9c5abf544a88da6033554bf0cf63dcc8d143",
             "fault_verifier round2"
         );
         assert_eq!(
             eq.hash_hex(),
-            "66cc08531fa362a08ced184141dae0f2f8b58bfad5adc218de72b6b9",
+            "c6d20d41007783fdfa903665f56f55cf748425c3142cad5d3de7f539",
             "fault_verifier equivocation"
         );
     }
 
     /// The provenance recorded beside the file is what lets an operator answer
     /// "which contracts does this binary speak?" without diffing 400 kB.
+    /// Both releases, derived from the same inputs, against the ids binocular's
+    /// independently written Scala derives from the same bytes
+    /// (`FederationContractsTest`). The two implementations can only agree by
+    /// applying the same parameters in the same order — which, across two
+    /// releases whose parameter lists differ, is what applying them by title
+    /// has to get right.
+    #[test]
+    fn both_releases_derive_the_ids_binocular_derives() {
+        let one_shot = [0xbbu8; 32];
+        let config = [0x77u8; 28];
+        let derive = |release: ContractsRelease| {
+            let bp = release.embedded();
+            let t = treasury_info_script(bp, &one_shot, 2, &config).unwrap();
+            let r = spos_registry_script(bp, &one_shot, 2, &t.hash, &config).unwrap();
+            let f = [
+                fault_verifier_round1_script(bp, &r.hash).unwrap().hash,
+                fault_verifier_round2_script(bp, &r.hash).unwrap().hash,
+                fault_verifier_equivocation_script(bp, &r.hash)
+                    .unwrap()
+                    .hash,
+            ];
+            let b = spo_bans_script(
+                bp, &r.hash, &config, &f, 600_000, 3, 3_600_000, &one_shot, 2,
+            )
+            .unwrap();
+            (t.hash_hex(), r.hash_hex(), f.map(hex::encode), b.hash_hex())
+        };
+        let (t, r, f, b) = derive(ContractsRelease::Rev55);
+        assert_eq!(
+            t,
+            "935993611500f483c71ef16964698ebfc4f4f2ae5f92719331418db5"
+        );
+        assert_eq!(
+            r,
+            "b208953ab15d79539e36ea4362216af379dfeb00de73a918f2460740"
+        );
+        assert_eq!(
+            f,
+            [
+                "f30a8f540b0f8e808186b63fab3d5da57149448addbdbccdb3298769",
+                "a16e1d3b5859825d40e08c93d0d0465d907487fade7b5b1519ccc184",
+                "c437d0fdf2790631761e7cda563e90e3063bfa5c7d81521ffd9c249f",
+            ]
+        );
+        assert_eq!(
+            b,
+            "73980c165a6643d22daffa4f851352b8540d22112d26e7cff1234b4a"
+        );
+
+        let (t, r, f, b) = derive(ContractsRelease::Rev56);
+        // treasury_info did not change between the releases.
+        assert_eq!(
+            t,
+            "935993611500f483c71ef16964698ebfc4f4f2ae5f92719331418db5"
+        );
+        assert_eq!(
+            r,
+            "90bbf858a6d699e5a82b3b5c7e2f7ac8960c1908743cfde129496d12"
+        );
+        assert_eq!(
+            f,
+            [
+                "4fecea15ff61fb722fb3f084444d671e45c7d07c8931bb6e14fce1da",
+                "ae0e4fa378bf2f027dc2a146ec067e9c5c76e8431e31d4cd1d03020e",
+                "84f9bac4cc2c8fc0d63fe1ea564f3c28bc49d95c06e2563efe88dae2",
+            ]
+        );
+        assert_eq!(
+            b,
+            "6abf2d55cc123885a09c6c3bdcddd801f8822e827db164af736a72e0"
+        );
+    }
+
+    /// The rev-5.5 blueprint must be the previous release's file byte for byte:
+    /// the pre-ceremony handshake compares a digest of the whole file, and this
+    /// is the digest the previous release reports. Anything else and a roster
+    /// cannot upgrade one node at a time.
+    #[test]
+    fn the_rev55_blueprint_is_the_previous_release_byte_for_byte() {
+        let digest = blake2b_simd::Params::new()
+            .hash_length(32)
+            .hash(EMBEDDED_BLUEPRINT_REV55.as_bytes());
+        assert_eq!(hex::encode(&digest.as_bytes()[..8]), "e8987f35bc2e577f");
+    }
+
     #[test]
     fn the_embedded_blueprint_is_parseable_and_attributed() {
         assert_eq!(EMBEDDED_BLUEPRINT_COMMIT.len(), 40, "a full git sha");

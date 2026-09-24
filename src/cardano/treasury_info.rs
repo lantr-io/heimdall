@@ -219,10 +219,12 @@ pub fn update_y_sig_msg(
 ) -> [u8; 32] {
     use bitcoin::hashes::{Hash as _, sha256};
     let tag = b"bifrost-update-y";
-    let mut pre = Vec::with_capacity(tag.len() + 32 + 4 + 8 + new_spos_frost_key.len());
+    let mut pre = Vec::with_capacity(tag.len() + 36 + 8 + new_spos_frost_key.len());
     pre.extend_from_slice(tag);
-    pre.extend_from_slice(spent_txid);
-    pre.extend_from_slice(&spent_vout.to_le_bytes());
+    // The shared encoding, also used by the registration and revocation nonces.
+    pre.extend_from_slice(&crate::cardano::tx_common::serialise_outpoint(
+        spent_txid, spent_vout,
+    ));
     pre.extend_from_slice(&epoch.to_be_bytes());
     pre.extend_from_slice(new_spos_frost_key);
     sha256::Hash::hash(&pre).to_byte_array()

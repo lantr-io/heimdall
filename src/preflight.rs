@@ -544,6 +544,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             (9, "post a movement"),
             (TRIES_STEP, "local tries"),
             (11, "wallet collateral"),
+            (12, "nonce reservation"),
         ] {
             b.push(n, title, Status::Skipped, "needs a Cardano provider");
         }
@@ -763,12 +764,21 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                     config.as_ref().map(|v| &v.params),
                 )
                 .await;
+                use crate::cardano::blockfrost_chain::FaultEnforcement;
                 let (status, enforcement_note) = match &enforcement {
-                    Ok(Some(_)) => (Status::Pass, "fault enforcement configured".to_string()),
-                    Ok(None) => (
+                    Ok(FaultEnforcement::Enabled(_)) => {
+                        (Status::Pass, "fault enforcement configured".to_string())
+                    }
+                    Ok(FaultEnforcement::NotConfigured) => (
                         Status::Pass,
                         "detection only — faults excluded, not published".to_string(),
                     ),
+                    // Warn: the daemon starts, and the right fix is usually
+                    // the bridge's governance Update catching up, not a config
+                    // edit.
+                    Ok(
+                        FaultEnforcement::ContractsDiffer(why) | FaultEnforcement::Unavailable(why),
+                    ) => (Status::Warn, format!("fault enforcement OFF — {why}")),
                     Err(e) => (
                         Status::Fail,
                         format!("fault enforcement half-configured: {e}"),
@@ -865,6 +875,61 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         _ => None,
     };
 
+    // spec [CFG-10], [MIG-1]: is this pool merely on the WRONG SIDE of a registry
+    // migration?
+    //
+    // Step 6 asks whether this node's identity key is in the list Config #9
+    // names, and answers Fail when it is not — which is right, and is what tells
+    // a fresh install to register. But an unmigrated pool is absent from that
+    // list too, and a Fail here is not a report: `run-spo` exits(1) on the first
+    // one. So the node the migration exists to carry across would die at the
+    // gate, before the startup migration it is meant to perform, and the fix
+    // text would send its operator to `register-spo` — which cannot work, since
+    // the binding it would have to prove absent is already in the identity trie.
+    //
+    // Looking in the previous list turns that into a Warn: the node is about to
+    // fix this by itself, and nothing an operator does would make it happen
+    // sooner.
+    // `Ok(None)` is "checked, and this pool is not in the previous list".
+    // `Err` is "could not check" — and the two must not be conflated, because
+    // falling through to the NOT-REGISTERED Fail exits the daemon. One 429 from
+    // the provider would then stop an un-migrated node at the gate with the
+    // exact advice this whole change exists to stop giving.
+    let migratable_pool_id: Result<Option<Vec<u8>>, String> =
+        match (&registry, &snapshot, bifrost_pk) {
+            (Ok(Some(src)), Some(Ok(snap)), Some(pk))
+                if !snap.spos.iter().any(|s| s.bifrost_id_pk == pk) =>
+            {
+                match &src.previous_registry {
+                    None => Ok(None),
+                    Some((address, policy_hex)) => {
+                        match bf_http::fetch_address_utxos(&base_url, &project_id, address).await {
+                            Err(e) => Err(format!("previous registry UTxO query: {e}")),
+                            Ok(utxos) => crate::cardano::register_spo::registry_list_from_utxos(
+                                &utxos, policy_hex,
+                            )
+                            .map_err(|e| format!("previous registry list: {e}"))
+                            .map(|list| {
+                                // In the previous list is not enough: a pool that
+                                // migrated and then LEFT is there too, inert, and
+                                // telling it that it is about to carry itself
+                                // across is the opposite of what `run-spo` will
+                                // do. The root says which, and the snapshot's own
+                                // check already read it: its exit deleted the
+                                // binding. Such a pool is simply not registered.
+                                let left = snap.departed.contains(pk.as_slice());
+                                list.iter()
+                                    .find(|(_, data)| data.bifrost_id_pk == pk)
+                                    .filter(|_| !left)
+                                    .map(|(pool_id, _)| pool_id.to_vec())
+                            }),
+                        }
+                    }
+                }
+            }
+            _ => Ok(None),
+        };
+
     match (&snapshot, bifrost_pk) {
         (None, _) => b.push(
             6,
@@ -900,13 +965,10 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                         ),
                     );
                 } else if let Some(y_fed) = federation_y_fed.as_deref() {
-                    // WI-098. Registration is still the path to a roster seat,
-                    // and step 6 still fails for a node that is neither
-                    // registered nor a federation member. But this node is not a
-                    // pool at all: it holds a share of the bridge's y_federation,
-                    // and refusing to start it would idle the only party that can
-                    // move a treasury still locked under that key, on the grounds
-                    // that it had not joined a roster it was never eligible for.
+                    // Checked BEFORE the migration arms. A Phase-1 federation
+                    // member is not a pool and never registers, so telling it
+                    // the previous registry could not be read is advice that
+                    // does not apply to it.
                     b.push(
                         6,
                         "registration status",
@@ -921,7 +983,47 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             snapshot.spos.len()
                         ),
                     );
+                } else if let Err(e) = &migratable_pool_id {
+                    // Could not tell whether this pool is merely on the wrong
+                    // side of a migration. Warn, not Fail: a provider blip must
+                    // not stop a node that may be perfectly registered, and the
+                    // main registry read is retried where this one is not.
+                    b.push(
+                        6,
+                        "registration status",
+                        Status::Warn,
+                        format!(
+                            "not in the current registry, and the PREVIOUS one could not be \
+                             read to tell whether a migration is in progress ({e}). If this \
+                             pool has never registered, run `register-spo`; if a registry \
+                             migration is under way, starting the node carries it across"
+                        ),
+                    );
+                } else if let Ok(Some(pool_id)) = &migratable_pool_id {
+                    // Registered, under the previous registry, and on its way
+                    // across. Warn rather than Fail so the daemon starts and
+                    // does it: this is the one state in which starting is the
+                    // remedy.
+                    b.push(
+                        6,
+                        "registration status",
+                        Status::Warn,
+                        format!(
+                            "registered as pool {} under the PREVIOUS registry, and not yet \
+                             in the current one — a registry migration is in progress \
+                             (Config #13). This node carries itself across at startup, with \
+                             no cold key; until it lands it is outside the roster. \
+                             `heimdall migrate-registration` does it by hand, and anyone \
+                             may run it for anyone",
+                            hex::encode(pool_id)
+                        ),
+                    );
                 } else {
+                    // WI-098 note, for the arm above: a federation member is not
+                    // a pool at all, and refusing to start it would idle the only
+                    // party that can move a treasury still locked under
+                    // y_federation, on the grounds that it had not joined a
+                    // roster it was never eligible for.
                     // Not a misconfiguration, and the message must not read like
                     // one: this is the state EVERY node is in until its operator
                     // registers it, and registering is a deliberate one-time act
@@ -1204,6 +1306,11 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         }
     }
 
+    // The set step 11 fetches, kept for step 12: one wallet read serves both,
+    // and a reservation check that fetched again could disagree with the
+    // collateral figures printed above it.
+    let mut wallet_utxos_for_nonce: Option<Vec<crate::cardano::publish::WalletUtxo>> = None;
+
     // 11. The wallet can still post a script transaction.
     //
     // Two ada-only UTxOs, because a UTxO cannot be both the fee input and the
@@ -1214,7 +1321,14 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
     // offer. spo4 met exactly that at midnight, with no prior warning — its ADA
     // was all behind legacy fSAT. `ensure-collateral` splits the wallet out of
     // it, and needs no collateral itself to do so (WI-20260910-5DRP6).
-    match wallet_collateral_utxos(&wallet_addr, &base_url, &project_id).await {
+    match wallet_collateral_utxos(
+        &wallet_addr,
+        &base_url,
+        &project_id,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )
+    .await
+    {
         Err(e) => b.push(
             11,
             "wallet collateral",
@@ -1222,6 +1336,7 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
             format!("could not read the wallet's UTxOs to count collateral ({e})"),
         ),
         Ok(utxos) => {
+            wallet_utxos_for_nonce = Some(utxos.clone());
             let candidates = crate::cardano::tx_common::collateral_candidates(&utxos).len();
             let with_tokens = utxos.iter().filter(|u| !u.tokens.is_empty()).count();
             if candidates >= crate::cardano::tx_common::COLLATERAL_UTXOS_WANTED {
@@ -1255,6 +1370,175 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 );
             }
         }
+    }
+
+    // ── 12. the nonce a pending registration or exit signature is bound to ──
+    //
+    // spec [REG-10], [DRG-6]. The reservation exists so that nothing else in
+    // this wallet spends that UTxO while the signature is at an air-gapped
+    // machine. If it has been spent anyway, the file waiting at the cold key is
+    // dead, and the operator needs to hear that HERE rather than when they come
+    // back and the build fails — the trip has to be made again either way, and
+    // this is the surface that runs before it.
+    match crate::cardano::nonce_reservation::NonceReservation::load_or_none(
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    ) {
+        // Warn, not Fail — reversing an earlier call, on the grounds that the
+        // two failures are not the same size. `run-spo`'s gate exits on a Fail,
+        // so a Fail here takes a correctly-configured SIGNING node off the
+        // roster over a file that belongs to a registration flow: no DKG, no
+        // round-1 commitment, no co-signed movement, and a fault for the epoch.
+        // The thing it would protect is one operator's 2 ADA nonce.
+        //
+        // It is not silent: `wallet_set_lenient` warns on every daemon read
+        // that finds the record unreadable, and this line says the same on
+        // every `doctor`. And nothing in the tree cleans up an abandoned
+        // reservation, so a bumped `RESERVATION_STATE_VERSION` would otherwise
+        // stop every node that ever ran `register-spo` and changed its mind.
+        Err(e) => b.push_fix(
+            12,
+            "nonce reservation",
+            Status::Warn,
+            format!(
+                "could not read the nonce reservation ({e}) — no wallet UTxO is being held \
+                 back, so a signature at a cold key right now is unprotected"
+            ),
+            "the file records which wallet UTxO a pending registration or exit signature is \
+             bound to, and a record this build cannot read is one it cannot protect. If no \
+             signature is in flight, delete `nonce-reservation.json` from the state dir. If \
+             one is, read its `nonce_outpoint` out of the signed file and pass it as \
+             `--nonce-utxo` instead — the register and exit commands tolerate an unreadable \
+             record on that path precisely so this is possible.",
+        ),
+        Ok(None) => b.push(
+            12,
+            "nonce reservation",
+            Status::Pass,
+            "none — no registration or exit signature is in flight".to_string(),
+        ),
+        Ok(Some(rec)) => match (rec.nonce(), wallet_utxos_for_nonce.as_ref()) {
+            (Err(e), _) => b.push(12, "nonce reservation", Status::Warn, e),
+            (Ok(_), None) => b.push(
+                12,
+                "nonce reservation",
+                Status::Warn,
+                format!(
+                    "{} reserved for a pending {}, but the wallet's UTxOs could not be read to \
+                     check it is still unspent",
+                    rec.outpoint, rec.action
+                ),
+            ),
+            (Ok(nonce), Some(utxos)) => {
+                if crate::cardano::nonce_reservation::still_unspent(utxos, nonce) {
+                    b.push(
+                        12,
+                        "nonce reservation",
+                        Status::Pass,
+                        format!(
+                            "{} reserved for a pending {} and still unspent — fee and \
+                             collateral selection skip it",
+                            rec.outpoint, rec.action
+                        ),
+                    );
+                } else {
+                    // Missing from a confirmed-only UTxO query is three states,
+                    // not one, and only the third means a dead signature.
+                    // Telling an operator to delete a live reservation is how a
+                    // good signature gets thrown away.
+                    use crate::cardano::nonce_reservation::MissingNonce;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    match rec.why_missing(now) {
+                        MissingNonce::NeverSubmitted => b.push_fix(
+                            12,
+                            "nonce reservation",
+                            Status::Warn,
+                            format!(
+                                "{} is reserved for a pending {} but does not exist yet — its \
+                                 transaction was never broadcast (--no-submit-reservation, or a \
+                                 broadcast that failed)",
+                                rec.outpoint, rec.action
+                            ),
+                            "Run the request command again without --no-submit-reservation: it \
+                             sends the transaction the record kept. The signature is bound to \
+                             this outpoint and verifies once the UTxO exists; nothing needs \
+                             re-signing.",
+                        ),
+                        MissingNonce::NotConfirmedYet => b.push(
+                            12,
+                            "nonce reservation",
+                            Status::Warn,
+                            format!(
+                                "{} is reserved for a pending {} and has not confirmed yet \
+                                 ({}s ago) — a UTxO query reports confirmed outputs only. \
+                                 Nothing to do but wait for a block",
+                                rec.outpoint,
+                                rec.action,
+                                now.saturating_sub(rec.created_at)
+                            ),
+                        ),
+                        // A spent nonce has two very different meanings, and
+                        // step 6 has already worked out which: if this pool is
+                        // now in the state the reservation was FOR, the
+                        // transaction it belonged to landed — after the
+                        // command's own five-minute wait gave up — and the
+                        // record is stale bookkeeping, not a dead signature.
+                        // Telling that operator to re-register would send them
+                        // into AlreadyRegistered, or back to the safe for a
+                        // signature nobody needs.
+                        MissingNonce::Spent => {
+                            let registered = bifrost_pk.is_some_and(|pk| {
+                                snapshot.as_ref().is_some_and(|s| {
+                                    s.as_ref().is_ok_and(|snap| {
+                                        snap.spos.iter().any(|x| x.bifrost_id_pk == pk)
+                                    })
+                                })
+                            });
+                            let done = match rec.action {
+                                crate::cardano::airgap::Action::Register => registered,
+                                crate::cardano::airgap::Action::Deregister => !registered,
+                            };
+                            if done {
+                                b.push_fix(
+                                    12,
+                                    "nonce reservation",
+                                    Status::Warn,
+                                    format!(
+                                        "{} is a leftover: its {} landed (step 6 agrees), and \
+                                         the transaction spent the nonce. Nothing is wrong \
+                                         with this node",
+                                        rec.outpoint, rec.action
+                                    ),
+                                    "Delete `nonce-reservation.json` from the state dir. The \
+                                     command's confirmation wait timed out before the \
+                                     transaction landed, so the record was never cleared.",
+                                );
+                            } else {
+                                b.push_fix(
+                                    12,
+                                    "nonce reservation",
+                                    Status::Warn,
+                                    format!(
+                                        "{} is reserved for a pending {} but is no longer an \
+                                         unspent UTxO of this wallet, and step 6 does not show \
+                                         that {} as done. Any signature made against it is \
+                                         used up: the outpoint is what makes it single-use \
+                                         ([REG-10], [DRG-6])",
+                                        rec.outpoint, rec.action, rec.action
+                                    ),
+                                    "Delete `nonce-reservation.json` from the state dir and \
+                                     run `heimdall register-spo` (or `deregister-spo`) again: \
+                                     it reserves a fresh UTxO and writes a new request. The \
+                                     file already at the cold key cannot be used — take the \
+                                     new one.",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        },
     }
 
     Report { steps: b.steps }
@@ -1335,15 +1619,23 @@ async fn wallet_collateral_utxos(
     addr: &Result<String, String>,
     base_url: &str,
     project_id: &str,
+    state_dir: Option<&std::path::Path>,
 ) -> Result<Vec<crate::cardano::publish::WalletUtxo>, String> {
     let addr = addr.as_deref().map_err(String::clone)?;
     let raw = bf_http::fetch_address_utxos(base_url, project_id, addr)
         .await
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    Ok(raw
-        .iter()
-        .map(crate::cardano::publish::WalletUtxo::from_bf)
-        .collect())
+    // Marked, because the doc above is a promise: `collateral_candidates` skips
+    // a reserved nonce, so a step that counted candidates on an UNMARKED set
+    // would apply a looser rule than the builders it reports on — and pass a
+    // wallet whose next script transaction cannot find collateral.
+    //
+    // Leniently, as the daemon's own builders read it: an unreadable record is
+    // step 12's finding, and failing THIS step over it reported "could not read
+    // the wallet's UTxOs" — true of nothing, and hiding the real cause.
+    Ok(crate::cardano::nonce_reservation::wallet_set_lenient(
+        &raw, state_dir,
+    ))
 }
 
 /// Look for the registry reference script at the operator's own wallet address —
@@ -1640,10 +1932,10 @@ mod tests {
         );
         let report = preflight(&cfg).await;
         let numbers: Vec<u8> = report.steps.iter().map(|s| s.n).collect();
-        assert_eq!(numbers, (1..=11).collect::<Vec<u8>>(), "{numbers:?}");
+        assert_eq!(numbers, (1..=12).collect::<Vec<u8>>(), "{numbers:?}");
         // Every rendered line's step number is within the total it prints.
         let total = report.steps.len();
-        assert_eq!(total, 11);
+        assert_eq!(total, 12);
         for s in &report.steps {
             assert!(usize::from(s.n) <= total, "step {} of {total}", s.n);
         }

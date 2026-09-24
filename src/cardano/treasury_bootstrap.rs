@@ -204,9 +204,19 @@ pub fn build_treasury_bootstrap_tx(
     let datum_hex = hex::encode(datum.to_cbor());
 
     // Collateral: ada-only, >= 5 ADA (may be the same UTxO as the fee input).
+    // `!u.reserved` as every other selector has it, and here it is collateral,
+    // not a fee: a phase-2 failure FORFEITS the collateral input, so offering
+    // the nonce a cold signature is bound to would destroy both the UTxO and
+    // the signature already carried to the safe ([REG-10], [DRG-6]). This one
+    // was open-coded rather than going through `tx_common::select_collateral`,
+    // which is how it escaped the sweep that added the flag everywhere else.
     let coll_utxo = wallet_utxos
         .iter()
-        .find(|u| u.lovelace >= crate::cardano::tx_common::COLLATERAL_LOVELACE && u.pure_ada())
+        .find(|u| {
+            u.lovelace >= crate::cardano::tx_common::COLLATERAL_LOVELACE
+                && u.pure_ada()
+                && !u.reserved
+        })
         .ok_or_else(|| {
             EpochError::Chain(
                 "no ada-only wallet UTxO with >= 5 ADA for collateral — run \
@@ -445,6 +455,7 @@ mod tests {
             lovelace: 50_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         }];
         let built = build_treasury_bootstrap_tx(
             &test_script(),
@@ -500,6 +511,7 @@ mod tests {
                 lovelace: 8_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
             WalletUtxo {
                 tx_hash: one_shot_hash.clone(),
@@ -507,6 +519,7 @@ mod tests {
                 lovelace: 50_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
         ];
         let datum = bootstrap_datum(vec![0xAB; 32], mpf::NULL_HASH);

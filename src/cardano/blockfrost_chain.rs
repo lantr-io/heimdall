@@ -77,7 +77,9 @@ pub struct DkgFaultScriptRef {
 #[derive(Debug, Clone)]
 pub struct DkgFaultBanFlow {
     blueprint_path: String,
-    registry: crate::cardano::blueprint::ParameterizedScript,
+    /// The registry policy the fault verifiers are parameterized by and the
+    /// accused pool's node is found under. Only its hash is ever needed.
+    registry_policy: [u8; 28],
     round1_fault: crate::cardano::blueprint::ParameterizedScript,
     round2_fault: crate::cardano::blueprint::ParameterizedScript,
     equivocation_fault: crate::cardano::blueprint::ParameterizedScript,
@@ -88,6 +90,31 @@ pub struct DkgFaultBanFlow {
     round2_fault_ref: DkgFaultScriptRef,
     equivocation_fault_ref: DkgFaultScriptRef,
     srs_path: PathBuf,
+}
+
+/// What a node's fault-enforcement keys amount to on the bridge it reads.
+#[derive(Debug)]
+pub enum FaultEnforcement {
+    /// Configured and consistent with the bridge: a proven cheat is published.
+    Enabled(Box<DkgFaultBanFlow>),
+    /// No enforcement key is set. Detection still excludes a cheat.
+    NotConfigured,
+    /// Configured, but this build's contracts do not produce the ban list
+    /// Config #8 names — a package installed ahead of, or behind, the
+    /// governance Update that moves it. Nothing is published until the two
+    /// agree; detection still excludes a cheat. The string says which policy
+    /// the Config names.
+    ///
+    /// Not an error, because it is not a misconfiguration: an operator who
+    /// upgrades the evening before a registry revision has done nothing wrong,
+    /// and exiting would take a signing node off the roster over a feature
+    /// that only decides whether cheating costs anything.
+    ContractsDiffer(String),
+    /// Configured, but the chain read that locates a revised ban list failed —
+    /// a provider outage or rate limit at startup. Enforcement is optional, so
+    /// that is a reason to run without it until the next restart, never a reason
+    /// to take a signing node off the roster.
+    Unavailable(String),
 }
 
 impl DkgFaultBanFlow {
@@ -102,10 +129,12 @@ impl DkgFaultBanFlow {
     /// commitments, so a bad round 1 package is dropped and the offender
     /// excluded whether or not this flow exists.
     ///
-    /// So: absent the whole enforcement key set, this returns `None` and the
-    /// node still filters its roster. Present *any* of it, every field is
-    /// required — a half-configured publish path must fail at startup, not
-    /// after a fault is detected.
+    /// So: absent the whole enforcement key set, this returns `NotConfigured`
+    /// and the node still filters its roster. Present *any* of it, every field
+    /// is required — a half-configured publish path must fail at startup, not
+    /// after a fault is detected. The one exception is a contracts version that
+    /// differs from the bridge's (`ContractsDiffer`), which is a rollout state,
+    /// not a configuration.
     ///
     /// `config` is the decoded bridge Config: it supplies the ban schedule
     /// (params[4..6]) when the bridge publishes one, and its ban policy id (#8) is
@@ -117,7 +146,7 @@ impl DkgFaultBanFlow {
     pub async fn from_config(
         cardano: &crate::config::CardanoConfig,
         config: Option<&crate::cardano::config_params::ConfigParams>,
-    ) -> Result<Option<Self>, String> {
+    ) -> Result<FaultEnforcement, String> {
         let enforcement_keys = [
             &cardano.fault_proof_srs_path,
             &cardano.spo_bans_ref,
@@ -126,7 +155,21 @@ impl DkgFaultBanFlow {
             &cardano.fault_verifier_equivocation_ref,
         ];
         if enforcement_keys.iter().all(|k| k.is_none()) {
-            return Ok(None);
+            return Ok(FaultEnforcement::NotConfigured);
+        }
+        // A registry still on rev 5.5 has a rev-5.5 ban list, whose ApplyBan
+        // this heimdall does not build: it would mint a fault proof, pay for it,
+        // and then fail every ban. Off, with the reason, until the revision.
+        if config.is_some_and(|c| {
+            c.registry.contracts_release == crate::cardano::blueprint::ContractsRelease::Rev55
+        }) {
+            return Ok(FaultEnforcement::ContractsDiffer(
+                "the bridge's registry still runs the rev-5.5 contracts, whose ban list takes a \
+                 different ApplyBan than this heimdall builds. Fault proofs are published again \
+                 after the bridge's registry revision (restart the node then); until it, a cheat \
+                 is still detected and excluded"
+                    .to_string(),
+            ));
         }
         let Some(one_shot) = cardano.federation_one_shot.as_deref() else {
             return Err(
@@ -140,7 +183,18 @@ impl DkgFaultBanFlow {
         // One outpoint parameterizes the registry, the ban list and the three
         // fault verifiers alike — see `CardanoConfig::federation_one_shot`.
         let (ban_bootstrap, registry_bootstrap) = (one_shot, one_shot);
-        let blueprint_path = req_fault_config(&cardano.registry_blueprint, "registry_blueprint")?;
+        // The blueprint: an operator's file when one is configured, otherwise the
+        // one embedded for the release the bridge's registry runs. It used to
+        // be a required file, which a registry revision would have made stale on
+        // every node — a manual step in an upgrade that is otherwise install and
+        // restart.
+        let release = config
+            .map(|c| c.registry.contracts_release)
+            .unwrap_or(crate::cardano::blueprint::ContractsRelease::LATEST);
+        let blueprint_path = cardano
+            .registry_blueprint
+            .clone()
+            .unwrap_or_else(|| format!("embedded {} blueprint", release.label()));
         let srs_path = PathBuf::from(req_fault_config(
             &cardano.fault_proof_srs_path,
             "fault_proof_srs_path",
@@ -159,38 +213,50 @@ impl DkgFaultBanFlow {
             mainnet,
         )?;
 
-        let blueprint_json = std::fs::read_to_string(blueprint_path)
-            .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+        let blueprint_json = crate::cardano::blueprint::load_blueprint_for(
+            release,
+            cardano.registry_blueprint.as_deref(),
+        )?
+        .into_owned();
         let (reg_tx_id, reg_index) = crate::cardano::roster::parse_outref(registry_bootstrap)
             .map_err(|e| format!("registry bootstrap outref: {e}"))?;
-        let (ban_tx_id, ban_index) = crate::cardano::roster::parse_outref(ban_bootstrap)
-            .map_err(|e| format!("ban bootstrap outref: {e}"))?;
         // Rev 5.5: the registry policy is downstream of the treasury policy, which
         // is downstream of the Config identity.
         let (treasury_bootstrap, config_policy_id) =
             crate::cardano::roster::treasury_derivation_inputs(cardano)?;
         let (tsy_tx_id, tsy_index) = crate::cardano::roster::parse_outref(&treasury_bootstrap)
             .map_err(|e| format!("treasury bootstrap outref: {e}"))?;
-        let registry = crate::cardano::blueprint::registry_policy_from_bootstraps(
-            &blueprint_json,
-            (&reg_tx_id, u64::from(reg_index)),
-            (&tsy_tx_id, u64::from(tsy_index)),
-            &config_policy_id,
-        )
-        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+        // The registry the Config names at #9, when there is a Config. Only its
+        // hash parameterizes the fault verifiers, and after a registry revision
+        // the one Config #12 compiles to is the registry the bridge LEFT: fault
+        // proofs minted under verifiers derived from it are ones the ban policy
+        // does not accept, and the check below would stop this node at startup.
+        let registry_policy = match config {
+            Some(c) => c.registry.spos_registry_policy_id,
+            None => {
+                crate::cardano::blueprint::registry_policy_from_bootstraps(
+                    &blueprint_json,
+                    (&reg_tx_id, u64::from(reg_index)),
+                    (&tsy_tx_id, u64::from(tsy_index)),
+                    &config_policy_id,
+                )
+                .map_err(|e| format!("parameterize spos_registry: {e}"))?
+                .hash
+            }
+        };
         let round1_fault = crate::cardano::blueprint::fault_verifier_round1_script(
             &blueprint_json,
-            &registry.hash,
+            &registry_policy,
         )
         .map_err(|e| format!("parameterize fault_verifier_round1: {e}"))?;
         let round2_fault = crate::cardano::blueprint::fault_verifier_round2_script(
             &blueprint_json,
-            &registry.hash,
+            &registry_policy,
         )
         .map_err(|e| format!("parameterize fault_verifier_round2: {e}"))?;
         let equivocation_fault = crate::cardano::blueprint::fault_verifier_equivocation_script(
             &blueprint_json,
-            &registry.hash,
+            &registry_policy,
         )
         .map_err(|e| format!("parameterize fault_verifier_equivocation: {e}"))?;
         let ban_params = crate::cardano::ban_list::BanPolicyParams::resolve(cardano, config)
@@ -212,35 +278,78 @@ impl DkgFaultBanFlow {
                 hex::encode(own_fault_policies[2])
             ));
         }
-        let spo_bans = crate::cardano::blueprint::spo_bans_script(
-            &blueprint_json,
-            &registry.hash,
-            &ban_params.fault_proof_policies,
-            ban_params.base_ban_duration_ms,
-            ban_params.max_faults_before_permanent,
-            ban_params.max_validity_window_ms,
-            &ban_tx_id,
-            u64::from(ban_index),
-        )
-        .map_err(|e| format!("parameterize spo_bans: {e}"))?;
-
-        // The enforcement half derives the policy from seven local parameters,
-        // so it can land on an address the bridge does not use — an ApplyBan
-        // that confirms into a list nobody reads. Where the Config publishes the
-        // policy id there is a right answer to compare against, so compare.
-        if let Some(published) = config.map(|c| &c.bans)
-            && published.spo_bans_policy_id != spo_bans.hash
-        {
-            return Err(format!(
-                "the fault-enforcement keys derive spo_bans policy {} but the bridge Config \
-                 publishes {} (field #8) — an ApplyBan built here would confirm into a ban \
-                 list no other SPO reads. Check cardano.ban_bootstrap, \
-                 cardano.fault_proof_policies against this bridge — the schedule half comes \
-                 from the Config itself (params[4..6]), so it cannot be what disagrees",
-                spo_bans.hash_hex(),
-                hex::encode(published.spo_bans_policy_id),
-            ));
-        }
+        let derive_bans =
+            |outref: &str| -> Result<crate::cardano::blueprint::ParameterizedScript, String> {
+                let (tx_id, index) = crate::cardano::roster::parse_outref(outref)
+                    .map_err(|e| format!("ban bootstrap outref: {e}"))?;
+                crate::cardano::blueprint::spo_bans_script(
+                    &blueprint_json,
+                    // The registry policy (rev 5.5) and the Config NFT policy (rev
+                    // 5.6, [PRE-5]): the blueprint's parameter list picks.
+                    &registry_policy,
+                    &config_policy_id,
+                    &ban_params.fault_proof_policies,
+                    ban_params.base_ban_duration_ms,
+                    ban_params.max_faults_before_permanent,
+                    ban_params.max_validity_window_ms,
+                    &tx_id,
+                    u64::from(index),
+                )
+                .map_err(|e| format!("parameterize spo_bans: {e}"))
+            };
+        // The ban list's own one-shot: Config #12 until the ban list is
+        // revised, and after that the outpoint its ban-root mint spent — found
+        // on chain and accepted only if it derives the policy #8 names
+        // (`cardano::revision`). Deriving from #12 regardless made every node
+        // with enforcement keys exit at startup once #8 moved.
+        let ban_bootstrap = match config.map(|c| c.bans.spo_bans_policy_id) {
+            None => ban_bootstrap.to_string(),
+            Some(published) if derive_bans(ban_bootstrap)?.hash == published => {
+                ban_bootstrap.to_string()
+            }
+            Some(published) => {
+                let pid = cardano.blockfrost_project_id.as_deref().ok_or(
+                    "the ban list was bootstrapped from an outpoint other than Config #12, and \
+                     finding it needs a chain: set cardano.blockfrost_project_id",
+                )?;
+                let base_url =
+                    crate::cardano::bf_http::base_url(pid, cardano.blockfrost_url.as_deref());
+                let found = match crate::cardano::revision::one_shot_for(
+                    &base_url,
+                    pid,
+                    ban_bootstrap,
+                    &published,
+                    crate::cardano::ban_list::BAN_ROOT_KEY,
+                    |o| derive_bans(o).map(|s| s.hash),
+                )
+                .await
+                {
+                    Ok(found) => found,
+                    Err(e) => {
+                        return Ok(FaultEnforcement::Unavailable(format!(
+                            "could not read the chain to locate the ban list Config #8 names \
+                             ({e}). Fault proofs are not published until the node is restarted; \
+                             a cheat is still detected and excluded"
+                        )));
+                    }
+                };
+                // No outpoint this build can compile derives #8. The schedule
+                // and the fault policies both came from the Config, so what
+                // differs is the contracts release: an ApplyBan built here
+                // would confirm into a ban list no other SPO reads.
+                let Some(found) = found else {
+                    return Ok(FaultEnforcement::ContractsDiffer(format!(
+                        "this build's contracts do not produce the ban list the bridge Config \
+                         names ({}, field #8) — the package is newer or older than the bridge's \
+                         last governance Update. Fault proofs are not published until the two \
+                         agree; a cheat is still detected and excluded",
+                        hex::encode(published),
+                    )));
+                };
+                found
+            }
+        };
+        let spo_bans = derive_bans(&ban_bootstrap)?;
 
         // Locations, resolved last because discovery needs the script HASHES the
         // derivation above produces. A configured value still wins; unset means
@@ -253,10 +362,21 @@ impl DkgFaultBanFlow {
         let wallet = crate::cardano::wallet::resolve_wallet(cardano).map(|w| w.address);
         let wallet_address = wallet.as_deref();
 
+        // Where to look for the reference scripts: the wallet that spent the ban
+        // list's own one-shot, then the one that spent Config #12. After a
+        // registry revision those differ — the revision's ban list and fault
+        // verifiers were deployed by whoever ran it, not by genesis — and the
+        // verifiers are new scripts too, so looking only at genesis's wallet
+        // found nothing and stopped the node at startup.
+        let deployers: Vec<&str> = if ban_bootstrap == one_shot {
+            vec![one_shot]
+        } else {
+            vec![ban_bootstrap.as_str(), one_shot]
+        };
         let spo_bans_ref = resolve_script_ref(
             cardano,
             wallet_address,
-            one_shot,
+            &deployers,
             &cardano.spo_bans_ref,
             &spo_bans,
             "spo_bans",
@@ -265,7 +385,7 @@ impl DkgFaultBanFlow {
         let round1_fault_ref = resolve_script_ref(
             cardano,
             wallet_address,
-            one_shot,
+            &deployers,
             &cardano.fault_verifier_round1_ref,
             &round1_fault,
             "fault_verifier_round1",
@@ -274,7 +394,7 @@ impl DkgFaultBanFlow {
         let round2_fault_ref = resolve_script_ref(
             cardano,
             wallet_address,
-            one_shot,
+            &deployers,
             &cardano.fault_verifier_round2_ref,
             &round2_fault,
             "fault_verifier_round2",
@@ -283,16 +403,16 @@ impl DkgFaultBanFlow {
         let equivocation_fault_ref = resolve_script_ref(
             cardano,
             wallet_address,
-            one_shot,
+            &deployers,
             &cardano.fault_verifier_equivocation_ref,
             &equivocation_fault,
             "fault_verifier_equivocation",
         )
         .await?;
 
-        Ok(Some(Self {
-            blueprint_path: blueprint_path.to_string(),
-            registry,
+        Ok(FaultEnforcement::Enabled(Box::new(Self {
+            blueprint_path,
+            registry_policy,
             round1_fault,
             round2_fault,
             equivocation_fault,
@@ -303,7 +423,7 @@ impl DkgFaultBanFlow {
             round2_fault_ref,
             equivocation_fault_ref,
             srs_path,
-        }))
+        })))
     }
 
     fn fault_script(
@@ -321,6 +441,18 @@ impl DkgFaultBanFlow {
             }
         }
     }
+}
+
+/// The outpoints a signed transaction spends, to hold back from this process's
+/// other wallet reads until it confirms (`nonce_reservation::note_in_flight`).
+///
+/// Every daemon submit records them, not only a migration's: the epoch loop and
+/// the background migration both take the richest UTxO for a fee, and Blockfrost
+/// lists a spent one as unspent until the block, so either can pick what the
+/// other just spent. Script inputs are recorded too, harmlessly — they are not in
+/// the wallet set this is consulted against.
+fn spent_wallet_inputs(cbor: &[u8]) -> Vec<crate::cardano::tx_common::NonceOutpoint> {
+    crate::cardano::tx_common::spent_outpoints(&hex::encode(cbor)).unwrap_or_default()
 }
 
 fn req_fault_config<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {
@@ -351,7 +483,7 @@ fn req_fault_config<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str
 async fn resolve_script_ref(
     cardano: &crate::config::CardanoConfig,
     wallet_address: Result<&str, &String>,
-    one_shot: &str,
+    deployers: &[&str],
     configured: &Option<String>,
     script: &crate::cardano::blueprint::ParameterizedScript,
     what: &str,
@@ -371,15 +503,22 @@ async fn resolve_script_ref(
         )
     })?;
     let hash = script.hash_hex();
-    let found = crate::cardano::ref_script::find_ref_script_anywhere(
-        &base_url,
-        pid,
-        &wallet,
-        Some(one_shot),
-        &hash,
-    )
-    .await
-    .map_err(|e| format!("{what} reference-script lookup: {e}"))?;
+    // This wallet first, then each deployer in turn (see the caller).
+    let mut found = None;
+    for deployer in deployers {
+        found = crate::cardano::ref_script::find_ref_script_anywhere(
+            &base_url,
+            pid,
+            &wallet,
+            Some(deployer),
+            &hash,
+        )
+        .await
+        .map_err(|e| format!("{what} reference-script lookup: {e}"))?;
+        if found.is_some() {
+            break;
+        }
+    }
     let (found, origin) = found.ok_or_else(|| {
         format!(
             "no reference script for {what} ({hash}), at this wallet or at the wallet this \
@@ -1661,6 +1800,9 @@ impl BlockfrostCardanoChain {
                 "bridge Config (federation identity #8/#9-#10): {e}"
             ))
         })?;
+        // The contracts release the registry runs, as this read says — which is
+        // what the peer handshake reports (`http::compat::own_blueprint_digest`).
+        crate::cardano::blueprint::set_release_in_effect(view.params.registry.contracts_release);
 
         let registry =
             crate::cardano::roster::RegistryRosterSource::resolve(cardano, Some(&view.params))
@@ -2111,7 +2253,16 @@ impl BlockfrostCardanoChain {
         // though its value is declared on the input and comes back in the change; the effect was
         // that a wallet whose ADA all sat behind tokens looked empty (WI-20260910-5DRP6).
         // Collateral still has to be ada-only, and `select_collateral` is where that is decided.
-        Ok(utxos.iter().map(WalletUtxo::from_bf).collect())
+        //
+        // The reserved nonce is flagged out here, once, for every builder that
+        // goes through this accessor: an operator's registration or exit
+        // signature may be at a cold key right now, and the daemon posting
+        // movements and bans from the same wallet must not spend the outpoint it
+        // names ([REG-10], [DRG-6]).
+        Ok(crate::cardano::nonce_reservation::wallet_set_lenient(
+            &utxos,
+            self.state_dir.as_deref(),
+        ))
     }
 
     async fn submit_cardano_tx(&self, label: &str, signed_tx_hex: &str) -> EpochResult<String> {
@@ -2121,11 +2272,13 @@ impl BlockfrostCardanoChain {
             "[fault-ban] submitting {label} tx ({} bytes CBOR) via Blockfrost",
             cbor.len()
         );
+        let held = spent_wallet_inputs(&cbor);
         let tx_hash = self
             .api
             .transactions_submit(cbor)
             .await
             .map_err(|e| EpochError::Chain(format!("{label} blockfrost tx submit: {e}")))?;
+        crate::cardano::nonce_reservation::note_in_flight(held);
         info!("[fault-ban] submitted {label}: tx_hash={tx_hash}");
         Ok(tx_hash)
     }
@@ -2206,7 +2359,8 @@ impl BlockfrostCardanoChain {
             PreparedDkgFault::Equivocation { .. } => Vec::new(),
         };
 
-        let registry_addr = flow.registry.enterprise_address(network);
+        let registry_addr =
+            crate::cardano::blueprint::script_enterprise_address(&flow.registry_policy, network);
         let registry_raw = crate::cardano::bf_http::fetch_address_utxos(
             &self.bf_base_url,
             &self.bf_project_id,
@@ -2216,7 +2370,7 @@ impl BlockfrostCardanoChain {
         .map_err(|e| EpochError::Chain(format!("registry UTxO query: {e}")))?;
         let reg_unit = format!(
             "{}{}",
-            flow.registry.hash_hex(),
+            hex::encode(flow.registry_policy),
             hex::encode(accused_pool_id)
         );
         let reg_node = registry_raw
@@ -2343,10 +2497,40 @@ impl BlockfrostCardanoChain {
         let invalid_before = window.current_slot;
         let invalid_hereafter = window.current_slot + w;
         let start_time_ms = window.block_time_ms + (w as i64) * 1000 - 1;
-        let wallet_utxos_after_mint: Vec<WalletUtxo> = wallet_raw_after_mint
-            .iter()
-            .map(WalletUtxo::from_bf)
-            .collect();
+        // Marked, like every other spending path: this posts a ban from the
+        // same wallet an operator's registration or exit signature may be bound
+        // to right now ([REG-10], [DRG-6]).
+        let wallet_utxos_after_mint = crate::cardano::nonce_reservation::wallet_set_lenient(
+            &wallet_raw_after_mint,
+            self.state_dir.as_deref(),
+        );
+        // spec [PRE-5]: `spo-bans.ak` reads the registry policy from Config #9
+        // at run time now, so the ban transaction must reference the Config
+        // UTxO. Read fresh rather than from the cache: the redeemer names an
+        // index into THIS transaction's reference set, so it has to be the UTxO
+        // that exists as this transaction is built.
+        let config_ref = {
+            let (Some(addr), Some(unit)) = (
+                self.config_address.as_deref(),
+                self.config_nft_unit.as_deref(),
+            ) else {
+                return Err(EpochError::Chain(
+                    "applying a ban needs the bridge Config UTxO (spo-bans.ak reads the \
+                     registry policy from field #9 since rev 5.6); set cardano.config_address \
+                     and cardano.config_nft_policy_id"
+                        .to_string(),
+                ));
+            };
+            crate::cardano::config_params::fetch_config(
+                &self.bf_base_url,
+                &self.bf_project_id,
+                addr,
+                unit,
+            )
+            .await
+            .map_err(|e| EpochError::Chain(format!("bridge Config for the ban: {e}")))?
+            .utxo
+        };
         let apply = crate::cardano::apply_ban::build_apply_ban_tx(
             &crate::cardano::apply_ban::ApplyBanRequest {
                 spo_bans_script: &flow.spo_bans,
@@ -2358,6 +2542,7 @@ impl BlockfrostCardanoChain {
                 ban_utxos: &ban_raw,
                 fault_utxo: &fault_utxo,
                 registration_ref: (reg_node.tx_hash.clone(), reg_node.output_index),
+                config_ref: (config_ref.tx_hash.clone(), config_ref.index),
                 spo_bans_ref: (
                     flow.spo_bans_ref.tx_hash.clone(),
                     flow.spo_bans_ref.output_index,
@@ -2981,7 +3166,12 @@ impl CardanoChain for BlockfrostCardanoChain {
         )
         .await
         .map_err(|e| EpochError::Chain(format!("wallet UTxO query: {e}")))?;
-        let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+        // The Update-Y key handoff, from the same wallet, with the same reason
+        // to leave a reserved nonce alone.
+        let wallet_utxos = crate::cardano::nonce_reservation::wallet_set_lenient(
+            &wallet_raw,
+            self.state_dir.as_deref(),
+        );
         let cost_models =
             crate::cardano::bf_http::fetch_cost_models(&self.bf_base_url, &self.bf_project_id)
                 .await
@@ -3038,11 +3228,13 @@ impl CardanoChain for BlockfrostCardanoChain {
 
         let cbor = hex::decode(&built.signed_tx_hex)
             .map_err(|e| EpochError::Chain(format!("update-y tx hex: {e}")))?;
+        let held = spent_wallet_inputs(&cbor);
         let tx_id = self
             .api
             .transactions_submit(cbor)
             .await
             .map_err(|e| EpochError::Chain(format!("update-y blockfrost tx submit: {e}")))?;
+        crate::cardano::nonce_reservation::note_in_flight(held);
         info!(
             "[update-y] rotated treasury_info {} -> {} (cardano tx {tx_id})",
             hex::encode(plan.current_key.serialize()),
@@ -3068,6 +3260,22 @@ impl CardanoChain for BlockfrostCardanoChain {
                 hex::encode(evidence.accused_pool_id())
             )));
         };
+        // The flow is derived once, at startup, and a governance Update can move
+        // the ban list under it — a registry revision always does. Publishing
+        // into the list the bridge LEFT would be a ban nobody reads, so check
+        // the one the Config names now, and say what fixes it.
+        if let (_, Some(current)) = self.current_federation().await?
+            && current.ban_policy_hex != flow.spo_bans.hash_hex()
+        {
+            return Err(EpochError::Chain(format!(
+                "not publishing the fault by pool {}: the bridge Config now names ban list {}, \
+                 and this node's enforcement was set up for {} at startup. Restart the node to \
+                 re-derive it; the cheat is still excluded from this ceremony",
+                hex::encode(evidence.accused_pool_id()),
+                current.ban_policy_hex,
+                flow.spo_bans.hash_hex(),
+            )));
+        }
         self.publish_dkg_fault_and_apply_ban_live(&flow, evidence)
             .await
     }
@@ -3520,11 +3728,13 @@ impl CardanoChain for BlockfrostCardanoChain {
 
         self.arm_in_flight_guard(tx_bytes);
 
+        let held = spent_wallet_inputs(&cardano_tx_cbor);
         let tx_hash = self
             .api
             .transactions_submit(cardano_tx_cbor)
             .await
             .map_err(|e| EpochError::Chain(format!("blockfrost tx submit: {e}")))?;
+        crate::cardano::nonce_reservation::note_in_flight(held);
 
         info!("[submit] Cardano oracle-update submitted: tx_hash={tx_hash}");
 
@@ -4453,12 +4663,12 @@ mod tests {
             registry_blueprint: Some("plutus.json".to_string()),
             ..Default::default()
         };
-        assert!(
+        assert!(matches!(
             DkgFaultBanFlow::from_config(&cardano, None)
                 .await
-                .expect("no enforcement keys is a valid configuration")
-                .is_none()
-        );
+                .expect("no enforcement keys is a valid configuration"),
+            super::FaultEnforcement::NotConfigured
+        ));
 
         // One enforcement key present → the path is on, and the rest must
         // resolve. The four *_ref keys are no longer among the things that MUST

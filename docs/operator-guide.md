@@ -7,8 +7,9 @@ epoch's distributed key generation and co-signs Treasury Movements with FROST th
 This guide goes from a clean machine to a registered, running, monitored daemon. Follow it top to
 bottom — the order matters, and **registration is not part of starting**: a node that is installed,
 configured and enabled but never registered will run quietly forever and contribute nothing. The
-two appendices at the end are off that path: one for standing a bridge up rather than joining one,
-one for running a test bridge on a shorter cycle.
+three appendices at the end are off that path: one for standing a bridge up rather than joining one,
+one for carrying a running bridge across a registry revision, and one for running a test bridge on a
+shorter cycle.
 
 Done this before? The [Quick path](#quick-path) is the whole join on one screen, every block
 copy-pastable, each step linking to the section that explains it.
@@ -134,10 +135,10 @@ printf 'HEIMDALL_MNEMONIC=%s\n' "$HEIMDALL_MNEMONIC" | sudo tee -a /etc/default/
 ```
 
 Copy the exact bytes of `config_address` and `config_nft_policy_id` – never retype them. One
-wrong character passes the TOML parser and fails at `[3/11]`.
+wrong character passes the TOML parser and fails at `[3/12]`.
 
 **4. Check** – [§4](#4-check-it-before-going-further). On a bridge that already has history a new
-node reports `[10/11] local tries FAIL`; that is expected and `run-spo` clears it itself at
+node reports `[10/12] local tries FAIL`; that is expected and `run-spo` clears it itself at
 startup — see [The node seeds its own state](#the-node-seeds-its-own-state). The mnemonic has to
 be in *this* command's
 environment: `/etc/default/heimdall` is read by the unit, not by your shell.
@@ -147,8 +148,8 @@ sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
     heimdall doctor --config /etc/heimdall/heimdall.toml
 ```
 
-Expect: `PASS` on every line except `[6/11] registration status  FAIL  NOT REGISTERED YET`, which
-is correct before step 6. A `WARN` on `[4/11] reference script` is normal.
+Expect: `PASS` on every line except `[6/12] registration status  FAIL  NOT REGISTERED YET`, which
+is correct before step 6. A `WARN` on `[4/12] reference script` is normal.
 
 **5. Open the port** – [§5](#5-make-your-endpoint-reachable). The port inside `$MY_URL` is the
 one the daemon binds. Open it in your firewall now; the test is in step 7, from another machine.
@@ -194,7 +195,7 @@ sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
 ```
 
 Expect: `submitted: tx_hash=…`. A minute later, `heimdall show-roster` lists your pool and
-`$MY_URL`, and the step-4 check reports `[6/11] registration status  PASS  registered as …`.
+`$MY_URL`, and the step-4 check reports `[6/12] registration status  PASS  registered as …`.
 
 **7. Start** – [§7](#7-start-it).
 
@@ -250,12 +251,20 @@ placeholder on purpose, so the commands stay correct after the next one; substit
   make the trip rather than after. Leaving needs it even less: a leaving pool is already in the
   registry, so the node finds its own pool ID there by the Bifrost key it runs on, and reports any
   ban record before writing the request.
-- **The file that authorises an exit is treated as the bearer instrument it is.** Its signature
-  commits to your pool ID and nothing else, so it never expires and anyone holding it can post
-  your exit and collect the freed deposit. It is written `0600`, and `deregister-spo --signed`
-  deletes it after a successful submit unless you pass `--keep`. A durable fix — binding the
-  signature to a deadline and to one wallet — needs an on-chain change and waits for the next
-  contract revision.
+- **The file that authorises an exit is usable once, by this wallet.** Both cold-signed messages
+  now end with the outpoint of a UTxO the transaction must spend, which the node reserves for you
+  when it writes the request. An outpoint is spendable once, so the signature fits one
+  transaction; spending it needs your wallet's payment key, so a file that leaks is worth nothing
+  to anyone else; and a failed attempt spends nothing, so you retry with the same file rather than
+  making a second trip to the safe. This replaces the bearer instrument the exit file used to be —
+  its signature committed to your pool ID and nothing else, so it never expired and anyone holding
+  it could post your exit from their own wallet and collect the freed deposit. It is still written
+  `0600` and still deleted after a successful submit unless you pass `--keep`, but that is now
+  tidiness rather than damage control.
+- **Files signed before this release no longer work.** The message the chain checks changed, so a
+  version 1 request or response is refused by name — "sign again: the message format changed" —
+  rather than accepted and left to fail as an invalid signature after a fee is spent. Re-run the
+  request command and take the new file to the cold key.
 - **`doctor` no longer prints flags you do not need.** Its unregistered-node and
   reference-script advice used to include `--registry-bootstrap <txid:ix>` and a `--blueprint`
   path, which sent operators hunting for an outref the command reads from Config #12 by itself.
@@ -617,17 +626,18 @@ other direction, if you would rather not type a second command name. When someth
 later, `heimdall doctor` is the first output to capture.
 
 ```
-[1/11]  local preflight           PASS  wallet key from cardano.payment_skey_path, address addr_test1q…; bifrost identity key loaded
-[2/11]  cardano connectivity      PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
-[3/11]  resolve the Config        PASS  2dce4027…#0 (12 fields, fee_rate 1 sat/vB); peg-in requests at addr_test1…
-[4/11]  reference script          …
-[5/11]  ban list                  PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (detection only)
-[6/11]  registration status       …
-[7/11]  key handoff (Update-Y)    …
-[8/11]  federation identity       PASS  Y_fed 37b381ac…, csv 144 blocks — published in the Config datum
-[9/11]  post a movement           PASS  TM validator f691433e… on chain, 4032 bytes, verified against Config #5
-[10/11] local tries               PASS  cpo and spi match the bridge-state singleton (cpo_root c88736be…)
-[11/11] wallet collateral         PASS  2 ada-only UTxO(s) of >= 5000000 lovelace across 3 UTxO(s)
+[1/12]  local preflight           PASS  wallet key from cardano.payment_skey_path, address addr_test1q…; bifrost identity key loaded
+[2/12]  cardano connectivity      PASS  https://cardano-preprod.blockfrost.io/api/v0 answering, epoch 306
+[3/12]  resolve the Config        PASS  2dce4027…#0 (13 fields, fee_rate 1 sat/vB); peg-in requests at addr_test1…
+[4/12]  reference script          …
+[5/12]  ban list                  PASS  roster is ban-filtered against addr_test1… — published by the bridge Config (detection only)
+[6/12]  registration status       …
+[7/12]  key handoff (Update-Y)    …
+[8/12]  federation identity       PASS  Y_fed 37b381ac…, csv 144 blocks — published in the Config datum
+[9/12]  post a movement           PASS  TM validator f691433e… on chain, 4032 bytes, verified against Config #5
+[10/12] local tries               PASS  cpo and spi match the bridge-state singleton (cpo_root c88736be…)
+[11/12] wallet collateral         PASS  2 ada-only UTxO(s) of >= 5000000 lovelace across 3 UTxO(s)
+[12/12] nonce reservation         PASS  none — no registration or exit signature is in flight
 ```
 
 Step 3's field count is the datum's, and **more than twelve is normal** — the Config grows by
@@ -685,7 +695,7 @@ and runs the checks again:
   [cpo] reconstructed root matches the bridge state singleton's cpo_root (c88736be…)
   [spi] reconstructed root matches the bridge state singleton's spi_root (265fdb3f…)
 ⚠ tries rebuilt from chain history and now match the bridge-state singleton
-[10/11] local tries   PASS  cpo and spi match the bridge-state singleton
+[10/12] local tries   PASS  cpo and spi match the bridge-state singleton
 ```
 
 Every movement is on chain, so nothing here needs you. The walk refuses to persist a root the
@@ -722,7 +732,7 @@ run to see what a start *would* do must not change the state directory first —
 they report the `FAIL` rather than clearing it:
 
 ```
-[10/11] local tries  FAIL  no cpo-trie.json, no spi-trie.json, and the bridge has history
+[10/12] local tries  FAIL  no cpo-trie.json, no spi-trie.json, and the bridge has history
                            (cpo_root c88736be…)
         -> EXPECTED on a node that has not run before … Run `heimdall reconstruct-tries`
 ```
@@ -1021,7 +1031,7 @@ sudo -u heimdall heimdall show-roster --config /etc/heimdall/heimdall.toml
 ```
 
 Read-only. Your pool id and `bifrost_url` should appear. Re-running the step-4 check now should
-show `[6/11] registration status` satisfied.
+show `[6/12] registration status` satisfied.
 
 Before you register, that step FAILS and the daemon refuses to start. That is expected, not a
 misconfiguration: an unregistered node is in no roster and would contribute nothing, so it says so
@@ -1303,6 +1313,12 @@ node at a time. Either differs, and you must agree a commit and an epoch boundar
 operators and restart every node before it — upgrading one node ahead of the roster removes it
 from the roster.
 
+A release that carries the previous contracts alongside new ones does not force that. The rev-5.6
+release is one. It reports the digest of the contracts the bridge **currently** runs, read from the
+Config, not of the newest ones it carries. So it reports the same digest as the previous release
+until the governance Update moves the registry, and then every upgraded node reports the new one
+at its next Config read. Upgrade one node at a time, before the Update.
+
 `/health` also carries the roster each node READ for the current ceremony — `roster_digest`,
 `roster_size` and `threshold`, tagged with `dkg_threshold_epoch`. Those must match across the
 roster for one epoch; when they do not, the `EXCLUDING` lines say whether it is a read that will
@@ -1313,6 +1329,61 @@ stops the daemon. A new release can add a check that a node has been quietly fai
 step 10 (`local tries`) did exactly that — so a node that ran yesterday can refuse to start
 today. Finding that out while the old binary is still serving gives you a working node to fix it
 from.
+
+**A contracts release that revises the registry costs you nothing but this upgrade, and you
+choose when.** Install it whenever suits you, before the bridge's governance Update. Until that
+Update the new package runs the bridge exactly as the previous release does. It uses the same
+contracts, and it reports the same blueprint digest in the pre-ceremony handshake, so it holds
+ceremonies with nodes that have not upgraded yet. It reads which contracts the registry runs from
+the Config, the same way every node does. The one thing it will not do before the Update is
+register or leave: `register-spo` and `deregister-spo` refuse, and say so.
+
+Once the Update has moved the registry, the node notices within half an hour, with no restart,
+that its membership token still sits under the previous registry policy. It then carries the
+registration across by itself: no cold key, no trip to the safe, no `register-spo`. The transaction it posts proves your existing binding against the
+identity record the bridge already holds; it reproduces what your pool consented to and can change
+nothing else, which is why it needs no signature and why anyone may submit it for anyone. Expect
+one `warn` line naming the two policies, and a `migration  migrating <old> -> <new>` line on
+`heimdall status` until it lands. That is its own key: `registry` on the line above is the roster
+summary, and the two are deliberately separate so a scraper keying on the first column does not
+collapse them.
+
+You may also find yourself already migrated: the federation carries every pool that has not moved
+shortly after the governance update, so the registry is complete regardless of when each node looks.
+Either way the effect reaches the roster at the next epoch boundary, like every other registry
+change.
+
+**Upgrade before the Update, not after.** A node still on the previous release after the Update
+finds its pool carried across by the federation, but it is out of the ceremonies until it
+upgrades. It cannot read the roster while pools are still crossing, and once they have, the other
+nodes report the new contracts and it reports the old ones.
+
+Two things worth knowing rather than doing:
+
+- `heimdall migrate-registration` runs it by hand, and `--no-auto-migrate` on `run-spo` turns the
+  automatic version off. Neither is needed in the normal case. Until a migration lands the node is
+  outside the roster, and both surfaces say so. `heimdall status` prints a `migration` line,
+  `migrating <old> -> <new>` while it is in flight and `migrated <old> -> <new>` once it confirms;
+  `/health` is JSON and carries the same text under `registry_migration`.
+- Joining and leaving both keep working during a migration, and `doctor` step 6 reports an
+  un-migrated node as a Warn rather than a Fail so the daemon starts and fixes it. If you try to
+  leave before crossing, the command says to migrate first.
+- Leaving after you crossed works too. Your exit removes your identity from the treasury while
+  your old node stays in the frozen previous list, and every node accounts for that by working out
+  which pools left. It can do that for any number of exits once the federation's `--all` pass has
+  run. Before that pass it can handle at most two. So if a third pool tries to leave while others
+  are still waiting to cross, `deregister-spo` refuses and tells you to run
+  `heimdall migrate-registration --all` first. That command needs no key, and anyone may run it.
+- If the node's own migration does not land it keeps trying, six times over about half an hour.
+  An anchor race is the expected failure when several operators restart at once, so one attempt
+  was never enough.
+- Your old registration node stays in the old list with its min-ADA in it. Recovering that would
+  need the old cold signature, and the old registry cannot accept one any more. Treat it as spent.
+
+The other half of a revision (deploying the new registry, the governance Update, carrying the
+stragglers across and closing the window) belongs to whoever runs the bridge. It is in
+[Appendix: carrying a bridge across a registry revision](#appendix-carrying-a-bridge-across-a-registry-revision).
+
 
 ### Leaving the bridge
 
@@ -1352,12 +1423,33 @@ means for it, and the first command above prints it before writing the request, 
 You do **not** need `cardano.cold_vkey_path` for this one: a leaving pool is already in the
 registry, so the node finds your pool ID there by the Bifrost key it runs on.
 
-**Guard that `signed.json` like the cold key itself, and delete it after.** The exit signature
-commits to your pool ID and nothing else: it never expires, and anyone who picks the file up can
-post your exit from *their* wallet and collect the freed deposit (see "the deposit comes back to
-whoever pays", below). `sign-with-pool-key` writes it `0600` and says so; `deregister-spo --signed`
-deletes it after a successful submit unless you pass `--keep`. Between those two moments it is a
-bearer instrument.
+**That `signed.json` is usable once, by this wallet.** The exit signature ends with the outpoint of
+a UTxO the transaction must spend — the node reserves a dedicated 2 ADA UTxO for it when it writes
+the request, and records it so nothing else in this wallet touches it while you are at the safe.
+An outpoint is spendable once, so the file authorises exactly one transaction; and since spending
+it needs this wallet's payment key, a copy that leaks cannot be posted from anywhere else. If the
+attempt fails, reuse the same file: no second trip is needed until that UTxO is spent.
+
+`sign-with-pool-key` still writes it `0600`, and `deregister-spo --signed` still deletes it after a
+successful submit unless you pass `--keep`. Keep treating it as private — it names your pool and
+your intent — but it is no longer the bearer instrument it was before this release, when the
+signature committed to your pool ID alone and anyone holding the file could post your exit from
+their own wallet.
+
+`deregister-spo --submit` now waits for the exit to confirm before it releases either. Blockfrost
+accepting a transaction is not the chain taking it — the anchor or the treasury state can be spent
+out from under it — and until that settles the nonce is still unspent and the signature is still
+good. If it does not confirm inside five minutes the command says so and keeps both, so you can
+re-run with the same file.
+
+If `doctor` reports the reserved UTxO as spent, the file at the cold key is dead: run the request
+command again to reserve a fresh one, and take the NEW request. Nothing else recovers it — being
+single-use is the point.
+
+If instead the *state directory* lost the reservation while the file was away — a rebuilt machine,
+a restored backup — the signature is fine. Open the signed file, read its `nonce_outpoint`, and
+pass it as `--nonce-utxo <txid>#<index>`. The signature still verifies as long as that UTxO is
+unspent, which it will be unless something else on this wallet took it.
 
 **2. Keep the node running until the next epoch boundary.** The roster for the current epoch was
 frozen before your exit and this transaction does not reach back into it: you still owe that
@@ -1420,12 +1512,17 @@ authorization to leave that anyone holding it can post: `sign-with-pool-key` wri
 | the service will not start | `journalctl -u heimdall -p err`, then re-run the step-4 check — it names the failing check and what to fix |
 | starts, then nothing happens for days | expected; see *Quiet is normal* |
 | peers seem not to see you | first step 5 — is the registered port open and reachable *from outside*? If it is, compare `demo_live_stake` and `demo_virtual_epoch_slots` against the rest of the roster (§3): they are consensus inputs, so a node that differs is registered, reachable, and deliberately never talked to. Both sides log `EXCLUDING`, so the roster sees it too |
-| `[3/11] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
-| `[6/11] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command, including the `--signed` form for a cold key that is not on this machine. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
+| `[3/12] resolve the Config FAIL` | the node cannot read the bridge Config — check `config_address`, `config_nft_policy_id` and your provider |
+| `[12/12] nonce reservation WARN` naming a spent UTxO | the UTxO a pending registration or exit signature is bound to has been spent, so the file waiting at the cold key can no longer be used. Delete `nonce-reservation.json` from the state dir, run the request command again, and take the NEW request to the safe. |
+| `[12/12] nonce reservation WARN … has not confirmed yet` | nothing is wrong. A UTxO query reports confirmed outputs only, so a reservation made in the last few minutes is simply not visible yet. Wait for a block. **Do not delete it** — the signature is bound to that outpoint and is fine. |
+| `[12/12] nonce reservation WARN … does not exist yet` | the transaction that creates it was never broadcast — you passed `--no-submit-reservation`, or the broadcast failed. Run the request command again without that flag: it sends the transaction the record kept. Nothing needs re-signing. |
+| `[12/12] nonce reservation WARN could not read the nonce reservation` | the record exists but this build cannot read it. `run-spo` still starts — this is a Warn so a signing node is not taken off the roster over a registration file — but no wallet UTxO is held back. If no signature is in flight, delete the file. If one is, read its `nonce_outpoint` out of the signed file and pass it as `--nonce-utxo` instead. |
+| `[6/12] registration status WARN … under the PREVIOUS registry` | a registry migration is in progress and this node has not crossed yet. Starting the node is the fix: it carries itself across. `heimdall migrate-registration` does it by hand. |
+| `[6/12] registration status FAIL` on a fresh install | expected, and not a misconfiguration — you have not registered yet. Step 6 prints the `register-spo` command, including the `--signed` form for a cold key that is not on this machine. (If you *have* registered, `[bifrost].skey_path` points at a different key than the one you registered.) |
 | `no reference script for the registry` right after `deploy-registry-ref` succeeded | the provider's address listing has not shown the script yet – pass the outpoint the deploy printed, `--registry-ref <tx_hash>:0` (step 6) |
 | `N of M candidates excluded at the pre-ceremony handshake` at every epoch start | the rest of the line names each cause with its count. *Incompatible build* (version, blueprint, security threshold): both sides report the other, so compare `/health` across the roster and upgrade the odd one out – see *Upgrades*. *Different consensus settings*: match the setting the `EXCLUDING` lines name. *Different roster read*: nothing to change – typically this node registered after the roster read the registry for this epoch, and it clears at the next epoch; if it is still there after an epoch boundary it is not that, so compare `roster_digest`, `roster_size`, `threshold` and `dkg_threshold_epoch` in `/health` across the roster. *Different FROST threshold from an older build*: upgrade the nodes whose `/health` has no `roster_digest`. `/health` shows the roster each node READ; the threshold it actually runs with after exclusions is in its `candidate set reduced` log line. When the line says *every peer was excluded*, the node that differs is this one |
-| `[9/11] post a movement FAIL` | this bridge has never published its treasury-movement validator on chain, so no SPO can post — `binocular deploy-script-refs`, re-run, publishes it and skips what already exists. Not something one operator's config can fix |
-| `[11/11] wallet collateral WARN`, or `no ada-only wallet UTxO with >= 5 ADA for collateral` when a tx is built | the wallet cannot post a script transaction, which is **not** a balance problem — it can hold thousands of ADA and still fail, if every UTxO carries a native token. A script tx needs one UTxO to pay the fee and a DISTINCT ada-only one for collateral. `heimdall ensure-collateral --submit` splits clean UTxOs off whatever the wallet holds; it runs no script, so it needs no collateral itself and works even when every lovelace is behind a token |
+| `[9/12] post a movement FAIL` | this bridge has never published its treasury-movement validator on chain, so no SPO can post — `binocular deploy-script-refs`, re-run, publishes it and skips what already exists. Not something one operator's config can fix |
+| `[11/12] wallet collateral WARN`, or `no ada-only wallet UTxO with >= 5 ADA for collateral` when a tx is built | the wallet cannot post a script transaction, which is **not** a balance problem — it can hold thousands of ADA and still fail, if every UTxO carries a native token. A script tx needs one UTxO to pay the fee and a DISTINCT ada-only one for collateral. `heimdall ensure-collateral --submit` splits clean UTxOs off whatever the wallet holds; it runs no script, so it needs no collateral itself and works even when every lovelace is behind a token |
 | a key you set is `refused` at load | it names a value the Config publishes; delete it, and `show-config-params` prints what the chain says |
 | `trie diverged` or `trie is out of sync with the chain` | the node reconciles itself at the next batch opportunity; if `tries_repair_failed` is set, run `reconstruct-tries --dry-run` to see why |
 | `roots were read at treasury head …, but this movement spends …` | two reads of the bridge state saw different chain states, usually the Kupo at `cardano.kupo_url` lagging the Blockfrost-compatible API. This is not yet a verdict on your tries: the node retries by itself and compares them once both reads agree. If the message keeps repeating, the lagging backend is stuck: check that it is synced |
@@ -1628,6 +1725,157 @@ with it, but say plainly what it means: **whoever holds that seed can sweep the 
 alone once the CSV delay passes.** A node holding both a seed and a ceremony share is refused —
 they are different keys locking different treasuries, and nothing can tell which one is this
 bridge's.
+
+---
+
+## Appendix: carrying a bridge across a registry revision
+
+**This is not part of running a node.** An SPO's whole part in a revision is in
+[Upgrades](#upgrades): install the package before the governance Update. The node runs the
+unrevised bridge unchanged, and carries itself across when the Update lands. This appendix is for the people who run the bridge, the ones holding the
+Config's update key and the federation wallet. It is the order in which the rest happens.
+
+A registry revision is a new `spos-registry.ak`, so a new membership-token policy, and with it a
+new `spo-bans.ak`. The three fault verifiers are compiled from the registry hash and the ban policy
+from theirs, so the ban list moves whenever the registry does. **Nothing else is redeployed.** The
+Config NFT, the treasury, the bridge state, the peg scripts and the TM chain stay where they are,
+and the Treasury state's identity record carries over untouched. So binocular's configuration for
+the bridge does not change either: its own scripts (`config.ak`, the peg and TM validators) are the
+ones this bridge was deployed with, and they remain that version after the revision.
+
+**No cold key is needed at any step.** `Migrate` proves each pool's existing binding against the
+Treasury state's identity record and copies its registration across verbatim. Because it can only
+reproduce what the pool already signed, the contract accepts it with no signature, from anyone.
+A pool's cold key is next needed only to join or to leave, and then in the new request format:
+the signature is bound to one wallet UTxO. An exit file signed before the upgrade is refused
+("sign again: the message format changed"). Tell operators who are holding one.
+
+### Before you start
+
+- **Two unspent wallet UTxOs** at the wallet that will deploy, called `R` and `B` below. Each new
+  script is compiled from the outpoint its first transaction spends, so they must stay unspent
+  until steps 1 and 2 have used them. The bridge's original one-shot, Config #12, cannot be reused:
+  it was spent at genesis. It stays the treasury's.
+- **The roster on the new heimdall.** Operators upgrade first, at their own pace. The new version
+  runs the unrevised bridge exactly as the previous one does, so a roster that is half upgraded
+  keeps holding ceremonies. Do step 3 once every node runs it. A node still on the previous
+  release cannot read the roster while pools are crossing: it checks the identity record against
+  the new list alone, and it will not hold a ceremony with the upgraded nodes, because the
+  contracts it reports differ from theirs. The deploying machine also needs a binocular whose
+  `update-config` has `--migrate-registry-to`.
+- **A quiet stretch before an epoch boundary.** The roster is a snapshot of the list Config #9
+  names, taken at the boundary. Steps 3 and 4 should both be done before the next one, or the
+  pools that have not crossed yet are missing from that epoch's roster.
+- **A decision on every active ban.** The new ban list starts empty, and after step 3 the old one
+  is no longer read. A ban that must survive is re-applied in step 5.
+
+### Step 1 — deploy the new registry
+
+```bash
+heimdall bootstrap-registry  --config heimdall.toml --registry-bootstrap R --submit
+heimdall deploy-registry-ref --config heimdall.toml --registry-bootstrap R --submit
+```
+
+`--registry-bootstrap` names the registry's own one-shot. While the Config is readable it does
+not touch the treasury, whose one-shot stays #12, so the new registry is compiled against the
+treasury that already exists. Note the registry policy `bootstrap-registry` prints: it is the
+value for #9.
+
+### Step 2 — deploy its ban list
+
+```bash
+heimdall bootstrap-ban-list  --config heimdall.toml --registry-bootstrap R --ban-bootstrap B --submit
+heimdall deploy-fault-ref    --config heimdall.toml --registry-bootstrap R --kind round1 --submit
+heimdall deploy-fault-ref    --config heimdall.toml --registry-bootstrap R --kind round2 --submit
+heimdall deploy-fault-ref    --config heimdall.toml --registry-bootstrap R --kind equivocation --submit
+heimdall deploy-spo-bans-ref --config heimdall.toml --registry-bootstrap R --ban-bootstrap B \
+    --base-ban-duration-ms <…> --max-faults-before-permanent <…> --max-validity-window-ms <…> --submit
+heimdall init-scripts        --config heimdall.toml --registry-bootstrap R --ban-bootstrap B \
+    --base-ban-duration-ms <…> --max-faults-before-permanent <…> --max-validity-window-ms <…> --submit
+```
+
+`--registry-bootstrap R` makes `bootstrap-ban-list` take the fault-verifier policies from the new
+registry, and accept that #8 still names the old ban list. It prints the new ban policy, which is
+the value for #8. The three schedule values are the ones the Config already publishes;
+`heimdall show-config-params` prints them. `init-scripts` registers the new ban policy's withdraw
+credential, which every ban needs.
+
+Until step 3, none of this is read by anyone: the Config still names the old registry and ban list.
+
+### Step 3 — the governance Update
+
+One Update moves #9 and #8 and records where the pools are crossing from:
+
+```bash
+binocular update-config --migrate-registry-to <policy from step 1> \
+    --spo-bans-policy <policy from step 2> --dry-run
+```
+
+Read the dry run: it prints every field it changes. Expect exactly #9 (the new registry), #8 (the
+new ban list) and #13 (`previous_spos_registry_policy_id`, the registry #9 held until now). Then
+run it without `--dry-run`. #13 is taken from the datum rather than typed, so it cannot name the
+wrong list. The command refuses a registry move without `--spo-bans-policy`, and refuses to start a
+migration while another is still recorded.
+
+From this Update on, the bridge is in a **migration window**. Registrations and exits keep working,
+under the new registry, and every node checks the Treasury state's identity record against both
+lists.
+
+### Step 4 — carry every pool across
+
+```bash
+heimdall migrate-registration --config heimdall.toml --all --submit
+```
+
+This carries every pool still in the previous list, one transaction each, waiting for each to
+confirm: early in a migration they all insert at the same point of the new list, so submitting them
+together would land one and lose the rest. It needs no key and pays each new node's min-ADA. It is
+what makes the next roster complete whatever the operators do. A node that restarts on the new
+package first finds itself already registered; one that upgraded before this ran has carried itself
+across.
+
+Nodes already on the new heimdall carry themselves across within half an hour whether or not this
+has run. If this command reports failures, run it again. Each migration is
+independent, and it skips what has already landed.
+
+### Step 5 — re-apply the bans that must survive
+
+Bans do not carry over. The old ban list is no longer read after step 3, and a ban on the new one
+needs a fault proof minted under the new fault verifiers. Re-apply the ones decided on before you
+started, with `heimdall fault-proof-mint` and `heimdall apply-ban`.
+
+### Step 6 — check that the roster came through whole
+
+- `heimdall show-roster` lists every pool under the new registry.
+- On each node, `heimdall status` shows `migrated <old> -> <new>` (or nothing, for a node another
+  pass carried across), and `doctor` step 6 passes.
+- At the next boundary, `roster_size` and `threshold` on `/health` match the epoch before the
+  revision. Then the roster hands the treasury over with Update-Y as usual.
+
+### Step 7 — close the window
+
+Once `migrate-registration --all` reports nothing left to migrate, end the window:
+
+```bash
+binocular update-config --end-registry-migration
+```
+
+This empties #13, and every node goes back to checking the identity record against the current
+list alone. The old list stays on chain, inert, holding its nodes' min-ADA. Nothing reads it any
+more.
+
+### If something goes wrong
+
+- **A node logs that the two lists do not explain the identity record.** Usually a provider
+  returned the lists from two different blocks. It clears on the next read. If it persists, run
+  step 4 again: the check can account for any number of departures once nobody is left to cross,
+  but only two while many are.
+- **`deregister-spo` refuses an exit during the window.** It does that only when the exit would
+  push the record beyond what nodes can reconstruct (a third departure while more than two pools
+  are still to cross). Step 4 is the remedy, and anyone may run it.
+- **`register-spo` refuses a pool as still under the previous registry.** It must be carried
+  across, not registered again: a second registration would leave an identity binding nothing can
+  ever remove. Step 4, or `migrate-registration` for that pool.
 
 ---
 

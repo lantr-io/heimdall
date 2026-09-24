@@ -24,6 +24,7 @@
 //!
 //! ```text
 //! SpoBansWithdrawRedeemer = ApplyBan Constr(0, [ fault_input_index, registration_ref_input_index,
+//!                                                config_ref_input_index,
 //!                                                accused_pool_id, evidence_hash,
 //!                                                ban_anchor_input_index, ban_anchor_output_index,
 //!                                                existing_ban_input_index: Option<Int>,
@@ -71,8 +72,9 @@ pub fn option_int(v: Option<i64>) -> PlutusData {
     option(v.map(int))
 }
 
-/// `SpoBansWithdrawRedeemer::ApplyBan` — constructor 0, the 8 fields in the
-/// order `spo_bans.ak` declares them. The index fields point into the built
+/// `SpoBansWithdrawRedeemer::ApplyBan` — constructor 0, the 9 fields in the
+/// order `spo_bans.ak` declares them (9 since rev 5.6, which appended
+/// `config_ref_input_index` — see [PRE-5]). The index fields point into the built
 /// tx's (ledger-sorted) input / reference-input / output lists; the builder
 /// computes them.
 #[must_use]
@@ -80,6 +82,7 @@ pub fn option_int(v: Option<i64>) -> PlutusData {
 pub fn apply_ban_redeemer(
     fault_input_index: i64,
     registration_ref_input_index: i64,
+    config_ref_input_index: i64,
     accused_pool_id: &[u8],
     evidence_hash: &[u8],
     ban_anchor_input_index: i64,
@@ -92,6 +95,12 @@ pub fn apply_ban_redeemer(
         vec![
             int(fault_input_index),
             int(registration_ref_input_index),
+            // spec [PRE-5], rev 5.6: the Config reference whose #9 names the
+            // registry the accused pool's node must sit under. Appended after
+            // the reference index it qualifies; every field below keeps the
+            // position it had, because this constructor is built positionally
+            // on both sides with no schema in between.
+            int(config_ref_input_index),
             bytes(accused_pool_id),
             bytes(evidence_hash),
             int(ban_anchor_input_index),
@@ -200,6 +209,11 @@ pub struct ApplyBanRequest<'a> {
     /// `(tx_hash, index)` of the accused pool's registry node UTxO — the
     /// read-only reference input the validator checks against.
     pub registration_ref: (String, u32),
+    /// `(tx_hash, index)` of the Config UTxO. spec [PRE-5], rev 5.6:
+    /// `spo-bans.ak` reads `spos_registry_policy_id` (#9) from it at run time
+    /// instead of taking the registry hash as a compile parameter, so the
+    /// transaction must REFERENCE it and the redeemer must name its index.
+    pub config_ref: (String, u32),
     /// `(tx_hash, index)` of a UTxO carrying the `spo_bans` script as a
     /// reference script. REQUIRED: the ~5.5 KB script is used 3× (withdraw +
     /// anchor spend + node mint) and would not fit embedded.
@@ -562,8 +576,9 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
         tx_id_bytes(&req.registration_ref.0)?,
         req.registration_ref.1,
     );
+    let cfg_ref = (tx_id_bytes(&req.config_ref.0)?, req.config_ref.1);
     let spo_ref = (tx_id_bytes(&req.spo_bans_ref.0)?, req.spo_bans_ref.1);
-    let mut ref_sorted = vec![reg_ref, spo_ref];
+    let mut ref_sorted = vec![reg_ref, cfg_ref, spo_ref];
     if let Some((tx_hash, output_index)) = &req.fault_verifier_ref {
         ref_sorted.push((tx_id_bytes(tx_hash)?, *output_index));
     }
@@ -571,6 +586,7 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
     ref_sorted.dedup();
     let registration_ref_input_index =
         ref_sorted.iter().position(|x| *x == reg_ref).unwrap() as i64;
+    let config_ref_input_index = ref_sorted.iter().position(|x| *x == cfg_ref).unwrap() as i64;
 
     let existing_ban_input_index = if is_first {
         None
@@ -583,6 +599,7 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
     let apply_redeemer = apply_ban_redeemer(
         fault_input_index,
         registration_ref_input_index,
+        config_ref_input_index,
         &req.accused_pool_id,
         &req.evidence_hash,
         ban_anchor_input_index,
@@ -708,11 +725,19 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
         change_address: req.wallet_address.to_string(),
         signing_key: vec![],
         network: Some(whisky_network(&req.cost_models)),
-        reference_inputs: vec![RefTxIn {
-            tx_hash: req.registration_ref.0.clone(),
-            tx_index: req.registration_ref.1,
-            script_size: None,
-        }],
+        reference_inputs: vec![
+            RefTxIn {
+                tx_hash: req.registration_ref.0.clone(),
+                tx_index: req.registration_ref.1,
+                script_size: None,
+            },
+            // spec [PRE-5]: the Config, read for the registry policy at run time.
+            RefTxIn {
+                tx_hash: req.config_ref.0.clone(),
+                tx_index: req.config_ref.1,
+                script_size: None,
+            },
+        ],
         withdrawals: vec![withdrawal],
         mints,
         certificates: vec![],
@@ -770,16 +795,24 @@ pub fn build_apply_ban_tx(req: &ApplyBanRequest) -> Result<ApplyBanTx, ApplyBanE
                 .as_ref()
                 .map(|s| s.iter().collect())
                 .unwrap_or_default();
-            let got = refs
-                .get(registration_ref_input_index as usize)
-                .ok_or_else(|| {
-                    ApplyBanError::Build("registration ref input index out of range".into())
-                })?;
-            if got.transaction_id.as_slice() != reg_ref.0 || got.index != u64::from(reg_ref.1) {
-                return Err(ApplyBanError::Build(
-                    "registry node not at redeemer ref index — ref ordering changed".into(),
-                ));
-            }
+            let at_ref =
+                |i: i64, want: &([u8; 32], u32), what: &str| -> Result<(), ApplyBanError> {
+                    let got = refs.get(i as usize).ok_or_else(|| {
+                        ApplyBanError::Build(format!("{what} ref input index {i} out of range"))
+                    })?;
+                    if got.transaction_id.as_slice() != want.0 || got.index != u64::from(want.1) {
+                        return Err(ApplyBanError::Build(format!(
+                            "{what} not at redeemer ref index {i} — ref ordering changed"
+                        )));
+                    }
+                    Ok(())
+                };
+            at_ref(registration_ref_input_index, &reg_ref, "registry node")?;
+            // spec [PRE-5]: checked for the same reason the registry node is.
+            // whisky appends a reference input per script use and the fixup
+            // above re-sorts the set, so an index computed before the build is a
+            // prediction until it is compared against what was built.
+            at_ref(config_ref_input_index, &cfg_ref, "Config")?;
         }
         hex::encode(
             minicbor::to_vec(&tx).map_err(|e| ApplyBanError::Build(format!("re-encode: {e}")))?,
@@ -812,24 +845,27 @@ mod tests {
         // first ban: existing_ban_input_index = None.
         let pool = [0x11u8; 28];
         let ev = [0x22u8; 32];
-        let r = apply_ban_redeemer(1, 0, &pool, &ev, 2, 0, None, 1);
+        // Nine fields since rev 5.6: config_ref_input_index went in at 2, after
+        // the reference index it qualifies ([PRE-5]).
+        let r = apply_ban_redeemer(1, 0, 2, &pool, &ev, 2, 0, None, 1);
         let f = plutus::constr_fields(&r, 0).unwrap();
-        assert_eq!(f.len(), 8);
+        assert_eq!(f.len(), 9);
         assert_eq!(plutus::field_int(f, 0).unwrap(), 1); // fault_input_index
         assert_eq!(plutus::field_int(f, 1).unwrap(), 0); // registration_ref_input_index
-        assert_eq!(plutus::field_bytes(f, 2).unwrap(), pool);
-        assert_eq!(plutus::field_bytes(f, 3).unwrap(), ev);
-        assert_eq!(plutus::field_int(f, 4).unwrap(), 2); // ban_anchor_input_index
-        assert_eq!(plutus::field_int(f, 5).unwrap(), 0); // ban_anchor_output_index
+        assert_eq!(plutus::field_int(f, 2).unwrap(), 2); // config_ref_input_index
+        assert_eq!(plutus::field_bytes(f, 3).unwrap(), pool);
+        assert_eq!(plutus::field_bytes(f, 4).unwrap(), ev);
+        assert_eq!(plutus::field_int(f, 5).unwrap(), 2); // ban_anchor_input_index
+        assert_eq!(plutus::field_int(f, 6).unwrap(), 0); // ban_anchor_output_index
         // existing_ban_input_index = None = Constr(1, []).
-        let (oc, of) = as_constr(&f[6]).unwrap();
+        let (oc, of) = as_constr(&f[7]).unwrap();
         assert_eq!((oc, of.len()), (1, 0));
-        assert_eq!(plutus::field_int(f, 7).unwrap(), 1); // ban_node_output_index
+        assert_eq!(plutus::field_int(f, 8).unwrap(), 1); // ban_node_output_index
 
         // reban: existing_ban_input_index = Some(3) = Constr(0, [3]).
-        let r2 = apply_ban_redeemer(1, 0, &pool, &ev, 0, 0, Some(3), 2);
+        let r2 = apply_ban_redeemer(1, 0, 2, &pool, &ev, 0, 0, Some(3), 2);
         let f2 = plutus::constr_fields(&r2, 0).unwrap();
-        let (sc, sf) = as_constr(&f2[6]).unwrap();
+        let (sc, sf) = as_constr(&f2[7]).unwrap();
         assert_eq!(sc, 0);
         assert_eq!(plutus::field_int(sf, 0).unwrap(), 3);
     }
@@ -898,6 +934,7 @@ mod tests {
                 lovelace: 50_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
             WalletUtxo {
                 tx_hash: "bb".repeat(32),
@@ -905,6 +942,7 @@ mod tests {
                 lovelace: 6_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
         ]
     }
@@ -1024,6 +1062,8 @@ mod tests {
             ban_utxos,
             fault_utxo,
             registration_ref: ("dd".repeat(32), 0),
+            // spec [PRE-5]: the Config the validator reads #9 from.
+            config_ref: ("ce".repeat(32), 0),
             spo_bans_ref: ("ee".repeat(32), 1),
             mainnet: false,
             start_time_ms: 1_700_000_000_000,

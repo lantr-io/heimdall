@@ -77,6 +77,11 @@ const BENCH_POOL_ID: [u8; 28] = [0x51; 28];
 const BENCH_EPOCH: u64 = 7;
 const BENCH_THRESHOLD: u64 = 51;
 const BENCH_ATTEMPT: u64 = 0;
+/// The Config NFT policy the bench's `spo_bans` is parameterized by ([PRE-5]).
+/// Named rather than repeated, because the fixture Config UTxO must carry the
+/// NFT under exactly this policy or the validator's authentication fails.
+const BENCH_CONFIG_POLICY_ID: [u8; 28] = [0x88; 28];
+
 const BENCH_BASE_BAN_DURATION_MS: i64 = 86_400_000;
 const BENCH_MAX_FAULTS_BEFORE_PERMANENT: i64 = 3;
 const BENCH_MAX_VALIDITY_WINDOW_MS: i64 = 600_000;
@@ -554,8 +559,9 @@ struct BifrostFaultScripts {
 
 fn bifrost_fault_scripts(kind: FaultVerifierKind) -> BifrostFaultScripts {
     let blueprint_json = fetch_bifrost_plutus_json();
-    let registry = blueprint::spos_registry_script(&blueprint_json, &[0xC0; 32], 0, &[0x77; 28])
-        .expect("parameterize benchmark spos_registry");
+    let registry =
+        blueprint::spos_registry_script(&blueprint_json, &[0xC0; 32], 0, &[0x77; 28], &[0x88; 28])
+            .expect("parameterize benchmark spos_registry");
     let round1_fault = blueprint::fault_verifier_script(
         &blueprint_json,
         FaultVerifierKind::Round1,
@@ -587,7 +593,10 @@ fn bifrost_fault_scripts(kind: FaultVerifierKind) -> BifrostFaultScripts {
     };
     let spo_bans = blueprint::spo_bans_script(
         &blueprint_json,
+        // rev 5.5 reads the registry policy, rev 5.6 the Config NFT policy
+        // ([PRE-5]); the blueprint picks which one it takes.
         &registry.hash,
+        &BENCH_CONFIG_POLICY_ID,
         &policy_ids,
         ban_params.base_ban_duration_ms,
         ban_params.max_faults_before_permanent,
@@ -606,34 +615,33 @@ fn bifrost_fault_scripts(kind: FaultVerifierKind) -> BifrostFaultScripts {
         fault_verifier,
         spo_bans,
         ban_params,
-        blueprint_source: bifrost_plutus_json_url().to_string(),
+        blueprint_source: bifrost_plutus_json_url(),
     }
 }
 
-fn bifrost_plutus_json_url() -> &'static str {
-    "https://raw.githubusercontent.com/FluidTokens/ft-bifrost-bridge/4785169751c297618966fcd085b8d2612df7cb27/onchain/plutus.json"
+/// Which contracts these budgets are measured against.
+///
+/// The EMBEDDED blueprint, not a pinned upstream URL. It used to fetch
+/// `FluidTokens/ft-bifrost-bridge@4785169` over HTTP, and that pin went stale
+/// the way every pin in a file CI does not run goes stale: rev 5.6 added a
+/// field to the `ApplyBan` redeemer, and the benchmark went on evaluating the
+/// new nine-field redeemer against the old eight-field validator — which fails
+/// as a deserialisation error several layers from the cause.
+///
+/// `assets/plutus.json` is the contracts release this binary speaks; it is what
+/// `EMBEDDED_BLUEPRINT_COMMIT` names, what every command derives its scripts
+/// from, and what the pinned-policy-id test keeps honest. Measuring the ex-unit
+/// budgets against anything else answers a question nobody asked, and needs a
+/// network.
+fn bifrost_plutus_json_url() -> String {
+    format!(
+        "embedded assets/plutus.json (ft-bifrost-bridge @ {})",
+        blueprint::EMBEDDED_BLUEPRINT_COMMIT
+    )
 }
 
 fn fetch_bifrost_plutus_json() -> String {
-    let url = bifrost_plutus_json_url();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("create benchmark HTTP runtime");
-    runtime.block_on(async {
-        let response = reqwest::get(url)
-            .await
-            .unwrap_or_else(|err| panic!("fetch Bifrost plutus.json from {url}: {err}"));
-        let status = response.status();
-        assert!(
-            status.is_success(),
-            "fetch Bifrost plutus.json from {url}: HTTP {status}"
-        );
-        response
-            .text()
-            .await
-            .unwrap_or_else(|err| panic!("read Bifrost plutus.json from {url}: {err}"))
-    })
+    blueprint::EMBEDDED_BLUEPRINT.to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -658,6 +666,7 @@ fn run_apply_ban_full_tx_benchmark(
         mint.token_name,
         fault_token_name(&accused_pool_id, &evidence_hash)
     );
+    let config_tx_hash = tx_hash_hex(0xCE);
     let ban_root_tx_hash = tx_hash_hex(0xC4);
     let ban_root_output_index = 0;
     let ban_root_bf = ban_root_bfutxo(&scripts.spo_bans, &ban_root_tx_hash, ban_root_output_index);
@@ -692,6 +701,7 @@ fn run_apply_ban_full_tx_benchmark(
         ban_utxos: &[ban_root_bf],
         fault_utxo: &fault_utxo,
         registration_ref: (registration_tx_hash.to_string(), registration_output_index),
+        config_ref: (config_tx_hash.clone(), 0),
         spo_bans_ref: (spo_bans_ref_tx_hash, spo_bans_ref_output_index),
         mainnet: false,
         start_time_ms,
@@ -720,6 +730,13 @@ fn run_apply_ban_full_tx_benchmark(
         wallet_address,
         &[
             registration_utxo,
+            // spec [PRE-5]: referenced since rev 5.6, so it has to resolve.
+            config_utxo(
+                &BENCH_CONFIG_POLICY_ID,
+                &scripts.registry,
+                &config_tx_hash,
+                0,
+            ),
             fault_ref_utxo,
             ban_root_utxo,
             spo_bans_ref_utxo,
@@ -888,6 +905,7 @@ fn bench_wallet_utxos() -> Vec<WalletUtxo> {
             lovelace: 50_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         },
         WalletUtxo {
             tx_hash: tx_hash_hex(0xA2),
@@ -895,6 +913,7 @@ fn bench_wallet_utxos() -> Vec<WalletUtxo> {
             lovelace: 6_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         },
     ]
 }
@@ -923,6 +942,104 @@ fn wallet_resolved_utxo(utxo: &WalletUtxo, address: &str) -> UTxO {
             amount: vec![Asset::new_from_str("lovelace", &utxo.lovelace.to_string())],
             data_hash: None,
             plutus_data: None,
+            script_ref: None,
+            script_hash: None,
+        },
+    }
+}
+
+/// The Config UTxO the rev-5.6 `spo_bans` validator reads `spos_registry_policy_id`
+/// (#9) out of at run time ([PRE-5]).
+///
+/// Before that change the ban script took the registry hash as a compile
+/// parameter and this transaction referenced no Config at all. Adding
+/// `config_ref` to the request without adding the UTxO it names left the only
+/// phase-2 evaluation of an ApplyBan in the repo resolving an input that does
+/// not exist — and because it lives in `benches/`, `cargo test` never ran it
+/// and CI said nothing while the ex-unit budget assertions stopped running.
+///
+/// Only #9 is read on chain; the rest of the record is filled so the datum has
+/// the arity and field types a real Config has, because `get_config_as_data_list`
+/// decodes positionally and would otherwise read a short list.
+fn config_utxo(
+    config_policy_id: &[u8; 28],
+    registry: &ParameterizedScript,
+    tx_hash: &str,
+    output_index: u32,
+) -> UTxO {
+    use heimdall::cardano::plutus::{array, bytes, constr, int};
+    let schedule = constr(
+        0,
+        vec![
+            int(3600),
+            int(7200),
+            int(10800),
+            int(21600),
+            int(1800),
+            int(1800),
+            int(600),
+            int(129_600),
+            int(345_600),
+            int(129_600),
+        ],
+    );
+    let params = constr(
+        0,
+        vec![
+            schedule,
+            int(1),
+            int(1000),
+            int(10000),
+            int(BENCH_BASE_BAN_DURATION_MS),
+            int(BENCH_MAX_FAULTS_BEFORE_PERMANENT),
+            int(BENCH_MAX_VALIDITY_WINDOW_MS),
+            int(144),
+            int(720),
+        ],
+    );
+    let datum = constr(
+        0,
+        vec![
+            constr(1, vec![]),                           // #0 update_auth = None
+            params,                                      // #1
+            bytes(&[0xa2; 28]),                          // #2 bridged_token_policy
+            bytes(&[0xa3; 28]),                          // #3 completed_peg_ins_policy
+            bytes(&[0xa4; 28]),                          // #4 bridge_state_policy
+            bytes(&[0xa5; 28]),                          // #5 tm_script_hash
+            bytes(&[0xa6; 28]),                          // #6 peg_in_script_hash
+            bytes(&[0xa7; 28]),                          // #7 peg_out_script_hash
+            bytes(&[0xa8; 28]),                          // #8 spo_bans_policy_id
+            bytes(&registry.hash), // #9 spos_registry_policy_id — the one read
+            bytes(&[0xaa; 28]),    // #10 treasury_info_policy_id
+            bytes(&[0xab; 32]),    // #11 y_federation
+            constr(0, vec![bytes(&[0xac; 32]), int(0)]), // #12 federation_one_shot
+            bytes(&[]),            // #13 previous_spos_registry_policy_id: none
+        ],
+    );
+    let _ = array(vec![]);
+    let unit = format!(
+        "{}{}",
+        hex::encode(config_policy_id),
+        hex::encode(heimdall::cardano::config_params::CONFIG_NFT_ASSET_NAME)
+    );
+    UTxO {
+        input: UtxoInput {
+            tx_hash: tx_hash.to_string(),
+            output_index,
+        },
+        output: UtxoOutput {
+            address: blueprint::script_enterprise_address(
+                config_policy_id,
+                pallas_addresses::Network::Testnet,
+            ),
+            amount: vec![
+                Asset::new_from_str("lovelace", "2000000"),
+                Asset::new_from_str(&unit, "1"),
+            ],
+            data_hash: None,
+            plutus_data: Some(hex::encode(
+                pallas_codec::minicbor::to_vec(&datum).expect("config datum CBOR"),
+            )),
             script_ref: None,
             script_hash: None,
         },

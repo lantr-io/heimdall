@@ -226,6 +226,27 @@ pub struct RegistryParams {
     /// The state NFT's asset name is NOT a field any more: it is the [CFG-4]
     /// constant [`TREASURY_INFO_ASSET_NAME`].
     pub treasury_info_policy_id: [u8; 28],
+    /// #13, appended in rev 5.6 ([CFG-10]). The registry policy a migration is
+    /// FROM — `None` when the field is zero-length, which is the normal state.
+    ///
+    /// This is the whole of how a node learns that a registry revision has
+    /// happened. Absent from the list #9 names and present in the list this one
+    /// names means MIGRATABLE, and `run-spo` carries itself across ([MIG-1]).
+    /// Absent from both, with this unset, means simply not registered — the
+    /// distinction the node must never guess at, because guessing wrong either
+    /// leaves a registered pool out of the roster or tells an unregistered
+    /// operator to wait for a migration that is not coming.
+    pub previous_spos_registry_policy_id: Option<[u8; 28]>,
+    /// The contracts release the registry #9 names runs — rev 5.6 when the
+    /// datum carries #13 at all, empty or not, rev 5.5 when it predates it.
+    ///
+    /// Read from the arity rather than from a derivation because the arity is
+    /// what the two releases' Config writers differ in, and every node reads it
+    /// identically: a rev-5.6 genesis writes #13 empty, and the governance
+    /// Update that revises a rev-5.5 registry appends it. The distinction
+    /// `previous_spos_registry_policy_id` collapses (absent vs empty) is exactly
+    /// the one this keeps.
+    pub contracts_release: crate::cardano::blueprint::ContractsRelease,
 }
 
 /// Config #1–#6 — the bridge's contract identifiers.
@@ -603,9 +624,37 @@ pub fn parse_config_datum(datum: &PlutusData) -> Result<ConfigParams, String> {
     let bans = BanParams {
         spo_bans_policy_id: field_hash28(fields, 8, "spo_bans_policy_id")?,
     };
+    // #13, appended in rev 5.6 ([CFG-10]). Read leniently for the reason
+    // [CFG-5] exists: a Config written before the append simply has no slot 13,
+    // and that must read as "no migration in progress", not as a parse failure
+    // that stops every node. A present-but-empty field means the same.
+    let previous_spos_registry_policy_id = match fields.get(13) {
+        None => None,
+        Some(_) => {
+            let raw = plutus::field_bytes(fields, 13)
+                .map_err(|e| format!("config #13 (previous_spos_registry_policy_id): {e}"))?;
+            if raw.is_empty() {
+                None
+            } else {
+                Some(<[u8; 28]>::try_from(raw.as_slice()).map_err(|_| {
+                    format!(
+                        "config #13 (previous_spos_registry_policy_id) must be a 28-byte policy \
+                         id or empty, got {} bytes",
+                        raw.len()
+                    )
+                })?)
+            }
+        }
+    };
     let registry = RegistryParams {
         spos_registry_policy_id: field_hash28(fields, 9, "spos_registry_policy_id")?,
         treasury_info_policy_id: field_hash28(fields, 10, "treasury_info_policy_id")?,
+        previous_spos_registry_policy_id,
+        contracts_release: if fields.get(13).is_some() {
+            crate::cardano::blueprint::ContractsRelease::Rev56
+        } else {
+            crate::cardano::blueprint::ContractsRelease::Rev55
+        },
     };
 
     // #11, the federation leaf key (WI-069). It moved here from the
@@ -764,6 +813,8 @@ pub(crate) fn test_config_params() -> ConfigParams {
         registry: RegistryParams {
             spos_registry_policy_id: [0; 28],
             treasury_info_policy_id: [0; 28],
+            previous_spos_registry_policy_id: None,
+            contracts_release: crate::cardano::blueprint::ContractsRelease::Rev56,
         },
         y_federation: [0xf9; 32],
         federation_one_shot: format!("{}:0", "c3".repeat(32)),
@@ -1552,14 +1603,79 @@ mod tests {
     }
 
     /// Appending is the legal evolution: unknown trailing fields are ignored.
+    ///
+    /// Index 13 is `previous_spos_registry_policy_id` since rev 5.6, so the
+    /// first UNKNOWN field is now 14 — and a reader from before that append
+    /// must still read this datum, which is what [`CONFIG_FIELDS`] staying 13
+    /// expresses.
     #[test]
     fn a_config_grown_past_15_fields_still_decodes() {
         let full = config_datum(7, 1_000, 100_000);
         let mut fields = plutus::constr_fields(&full, 0).unwrap().to_vec();
+        fields.push(bytes(&[]));
         fields.push(int(99));
         let p = parse_config_datum(&constr(0, fields)).unwrap();
-        assert_eq!(p.field_count, CONFIG_FIELDS + 1);
+        assert_eq!(p.field_count, CONFIG_FIELDS + 2);
         assert_eq!(p.tunables.fee_rate_sat_per_vb, 7);
+    }
+
+    // ---- #13, the registry-migration marker ([CFG-10]) --------------------
+
+    /// The deployed shape today: thirteen fields, no #13. That must read as "no
+    /// migration in progress", not as a parse failure — every node on every
+    /// running bridge has this datum, and a reader that refused it would stop
+    /// the network to announce an append that has not happened.
+    #[test]
+    fn a_config_without_the_append_means_no_migration() {
+        let p = parse_config_datum(&config_datum(7, 1_000, 100_000)).unwrap();
+        assert_eq!(p.registry.previous_spos_registry_policy_id, None);
+        // No #13 at all: the registry is the rev-5.5 one.
+        assert_eq!(
+            p.registry.contracts_release,
+            crate::cardano::blueprint::ContractsRelease::Rev55
+        );
+    }
+
+    /// A present but zero-length #13 means the same: the field exists and says
+    /// no migration is in progress.
+    #[test]
+    fn an_empty_field_13_means_no_migration() {
+        let full = config_datum(7, 1_000, 100_000);
+        let mut fields = plutus::constr_fields(&full, 0).unwrap().to_vec();
+        fields.push(bytes(&[]));
+        let p = parse_config_datum(&constr(0, fields)).unwrap();
+        assert_eq!(p.registry.previous_spos_registry_policy_id, None);
+        // Present, even empty: a rev-5.6 registry — a rev-5.6 genesis writes it
+        // empty, and a closed migration window leaves it empty.
+        assert_eq!(
+            p.registry.contracts_release,
+            crate::cardano::blueprint::ContractsRelease::Rev56
+        );
+    }
+
+    /// Set, it names the policy a migration comes FROM ([MIG-1]).
+    #[test]
+    fn a_set_field_13_names_the_previous_registry() {
+        let full = config_datum(7, 1_000, 100_000);
+        let mut fields = plutus::constr_fields(&full, 0).unwrap().to_vec();
+        fields.push(bytes(&[0xb2; 28]));
+        let p = parse_config_datum(&constr(0, fields)).unwrap();
+        assert_eq!(
+            p.registry.previous_spos_registry_policy_id,
+            Some([0xb2; 28])
+        );
+    }
+
+    /// A policy id is 28 bytes. Anything else is a governance Update that wrote
+    /// the wrong thing, and reading it as a truncated hash would send every node
+    /// looking for a registry at an address nobody wrote to.
+    #[test]
+    fn a_wrong_length_field_13_is_refused() {
+        let full = config_datum(7, 1_000, 100_000);
+        let mut fields = plutus::constr_fields(&full, 0).unwrap().to_vec();
+        fields.push(bytes(&[0xb2; 20]));
+        let err = parse_config_datum(&constr(0, fields)).unwrap_err();
+        assert!(err.contains("28-byte policy id"), "{err}");
     }
 
     /// A shorter datum is an OLDER layout, not a version this reader guesses at.

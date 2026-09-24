@@ -66,9 +66,9 @@ use crate::cardano::treasury_info::{
 };
 use crate::cardano::treasury_spend::{TreasurySpendError, find_treasury_state, treasury_spend_leg};
 use crate::cardano::tx_common::{
-    BootstrapError, OneShotBootstrapParams, build_oneshot_bootstrap_tx, element_lovelace,
-    network_from_address, select_collateral, select_fee, sign_built_tx as common_sign_built_tx,
-    wallet_input_amount, whisky_network,
+    BootstrapError, NonceOutpoint, OneShotBootstrapParams, build_oneshot_bootstrap_tx,
+    element_lovelace, network_from_address, select_collateral, select_fee,
+    sign_built_tx as common_sign_built_tx, wallet_input_amount, whisky_network,
 };
 use crate::cardano::wallet::pub_key_hash_hex;
 
@@ -159,23 +159,50 @@ pub fn pool_id_from_cold_vkey(cold_vkey: &[u8; 32]) -> [u8; 28] {
 }
 
 /// `registration_message` in `spos_registry.ak`:
-/// `"bifrost-spo" || pool_id || bifrost_id_pk || bifrost_url`.
+/// `"bifrost-spo" || pool_id || bifrost_id_pk || bifrost_url || nonce_outpoint`.
+///
+/// The trailing 36-byte nonce is what makes the signatures single-use ([REG-10],
+/// rev 5.6). Everything before it is the same for every registration of a pool
+/// — the domain separator, a pool id derived from a cold key that does not
+/// change, and the identity the operator declares — and both signatures travel
+/// in the redeemer, so they are public from the first transaction that carries
+/// them. Before the nonce, a published registration signature could put a pool
+/// that had left back into the registry with its old key and URL, where the
+/// roster faults it and the ban list records that against the real pool.
+///
+/// Its fixed length also keeps the message unambiguous: it follows a
+/// variable-length URL, and a suffix of known length is the only thing that
+/// stops the two being re-split.
 #[must_use]
-pub fn registration_message(pool_id: &[u8], bifrost_id_pk: &[u8], bifrost_url: &[u8]) -> Vec<u8> {
+pub fn registration_message(
+    pool_id: &[u8],
+    bifrost_id_pk: &[u8],
+    bifrost_url: &[u8],
+    nonce: &NonceOutpoint,
+) -> Vec<u8> {
+    let nonce_bytes = nonce.to_message_bytes();
     let mut m = Vec::with_capacity(
         REGISTRATION_DOMAIN_SEPARATOR.len()
             + pool_id.len()
             + bifrost_id_pk.len()
-            + bifrost_url.len(),
+            + bifrost_url.len()
+            + nonce_bytes.len(),
     );
     m.extend_from_slice(REGISTRATION_DOMAIN_SEPARATOR);
     m.extend_from_slice(pool_id);
     m.extend_from_slice(bifrost_id_pk);
     m.extend_from_slice(bifrost_url);
+    m.extend_from_slice(&nonce_bytes);
     m
 }
 
-/// The two registration signatures plus the cold verification key they bind.
+/// The two registration signatures, the cold verification key they bind, and
+/// the outpoint they are bound TO.
+///
+/// The nonce travels with the signatures because it is part of what they mean:
+/// a pair of signatures without it names no transaction, and a builder that
+/// paired them with a different outpoint would produce a transaction the chain
+/// rejects with nothing but "signature invalid" to go on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistrationSignatures {
     pub cold_vkey: [u8; 32],
@@ -183,6 +210,9 @@ pub struct RegistrationSignatures {
     pub cold_sig: [u8; 64],
     /// BIP340 Schnorr over `sha2_256(registration message)`.
     pub bifrost_sig: [u8; 64],
+    /// spec [REG-10]: the UTxO the transaction must spend for these signatures
+    /// to verify. Chosen among the registrant's own UTxOs.
+    pub nonce: NonceOutpoint,
 }
 
 /// Produce both registration signatures locally (non-air-gapped flow).
@@ -192,11 +222,12 @@ pub fn sign_registration(
     cold_skey: &ed25519::SecretKey,
     bifrost_keypair: &Keypair,
     bifrost_url: &[u8],
+    nonce: NonceOutpoint,
 ) -> RegistrationSignatures {
     let cold_vkey: [u8; 32] = cold_skey.public_key().into();
     let pool_id = pool_id_from_cold_vkey(&cold_vkey);
     let bifrost_id_pk = bifrost_keypair.x_only_public_key().0.serialize();
-    let message = registration_message(&pool_id, &bifrost_id_pk, bifrost_url);
+    let message = registration_message(&pool_id, &bifrost_id_pk, bifrost_url, &nonce);
 
     let cold_sig: [u8; 64] = cold_skey
         .sign(&message)
@@ -216,6 +247,7 @@ pub fn sign_registration(
         cold_vkey,
         cold_sig,
         bifrost_sig,
+        nonce,
     }
 }
 
@@ -232,7 +264,7 @@ pub fn verify_registration(
         .map_err(|e| RegisterSpoError::BadBifrostKey(e.to_string()))?;
 
     let pool_id = pool_id_from_cold_vkey(&sigs.cold_vkey);
-    let message = registration_message(&pool_id, bifrost_id_pk, bifrost_url);
+    let message = registration_message(&pool_id, bifrost_id_pk, bifrost_url, &sigs.nonce);
 
     let vkey = ed25519::PublicKey::from(sigs.cold_vkey);
     if !vkey.verify(&message, &ed25519::Signature::from(sigs.cold_sig)) {
@@ -255,12 +287,19 @@ pub fn verify_registration(
 
 /// `SposRegistryMintRedeemer::Register` — constructor 1, field order pinned by
 /// `bifrost/types/spos_registry.ak`:
-/// `{cold_vkey, cold_sig, bifrost_sig, registration_anchor_input_index,
-/// registration_anchor_output_index, treasury_input_index,
-/// treasury_output_index, bifrost_identity_absence_proof}`.
+/// `{cold_vkey, cold_sig, bifrost_sig, nonce_input_index,
+/// registration_anchor_input_index, registration_anchor_output_index,
+/// treasury_input_index, treasury_output_index, bifrost_identity_absence_proof}`.
+///
+/// `nonce_input_index` sits directly after the signatures it makes single-use
+/// (rev 5.6, [REG-10]); every index after it keeps the position it had. There is
+/// no schema between this function and the Aiken constructor — the fields are
+/// positional on both sides — so the order here is a contract, not a
+/// convenience.
 #[must_use]
 pub fn register_mint_redeemer(
     sigs: &RegistrationSignatures,
+    nonce_input_index: i64,
     anchor_input_index: i64,
     anchor_output_index: i64,
     treasury_input_index: i64,
@@ -273,6 +312,7 @@ pub fn register_mint_redeemer(
             bytes(&sigs.cold_vkey),
             bytes(&sigs.cold_sig),
             bytes(&sigs.bifrost_sig),
+            int(nonce_input_index),
             int(anchor_input_index),
             int(anchor_output_index),
             int(treasury_input_index),
@@ -357,6 +397,17 @@ pub struct RegisterSpoRequest<'a> {
     pub registry_utxos: &'a [BfUtxo],
     /// UTxOs at the treasury script address.
     pub treasury_utxos: &'a [BfUtxo],
+    /// `(policy hex, UTxOs)` of the registry a migration is coming FROM —
+    /// Config #13, `None` when no migration is in progress ([CFG-10]).
+    ///
+    /// Needed for the identity trie, not for the transaction. `Migrate` does
+    /// not move the Treasury state's `bifrost_identity_root` ([MIG-3]), so
+    /// while pools are crossing, the root commits to the bindings of BOTH
+    /// lists. A registration that rebuilt the trie from the current list alone
+    /// would compute a different root, and `apply_registration` would refuse
+    /// before building anything — which is to say joining the bridge would be
+    /// impossible for the length of the migration.
+    pub previous_registry: Option<(&'a str, &'a [BfUtxo])>,
     pub wallet_address: &'a str,
     pub wallet_utxos: &'a [WalletUtxo],
     /// Wallet payment key (fees/collateral) — NOT the cold key.
@@ -399,6 +450,136 @@ pub struct RegisterSpoTx {
     pub new_bifrost_identity_root: mpf::Hash,
 }
 
+/// One `bifrost_id_pk -> pool_id` binding, as the MPF trie stores it.
+pub type IdentityPair = (Vec<u8>, Vec<u8>);
+
+/// Parse the registry list held at `utxos` under `policy_hex`.
+///
+/// The one copy of "find the elements, then link them into a list" — it was
+/// written out wherever a list was needed, and a fix to one copy (a torn read, a
+/// stricter shape check) left the others as they were.
+pub fn registry_list_from_utxos(
+    utxos: &[BfUtxo],
+    policy_hex: &str,
+) -> Result<RegistryList, RegisterSpoError> {
+    let elements = find_registry_utxos(utxos, policy_hex)?;
+    Ok(RegistryList::from_elements(
+        elements
+            .iter()
+            .map(|u| (u.asset_name.clone(), u.element.clone())),
+    )?)
+}
+
+/// Whether `pool_id` is in the registry list at `utxos`, or `None` when the
+/// list cannot be read — which is not an answer, and a caller polling for a
+/// confirmation must keep polling.
+#[must_use]
+pub fn pool_in_registry(utxos: &[BfUtxo], policy_hex: &str, pool_id: &[u8]) -> Option<bool> {
+    registry_list_from_utxos(utxos, policy_hex)
+        .ok()
+        .map(|list| list.get(pool_id).is_some())
+}
+
+/// The identity trie a proof against the Treasury state's root must be built
+/// from.
+///
+/// Outside a migration window: the current list, exactly as always — a
+/// mismatch surfaces from `apply_registration` / `apply_deregistration` as the
+/// root mismatch it is. Inside one: the bindings
+/// [`crate::cardano::migrate_registration::explain_identity_root`] finds the
+/// root commits to, which is the one rule the roster read and all three
+/// builders share. `check` sees the window before the trie is built, for the
+/// refusals that only a window can motivate.
+pub fn identity_trie_for(
+    current: &RegistryList,
+    previous_registry: Option<(&str, &[BfUtxo])>,
+    root: mpf::Hash,
+    check: impl FnOnce(
+        Option<&RegistryList>,
+        &crate::cardano::migrate_registration::IdentityWindow,
+    ) -> Result<(), RegisterSpoError>,
+) -> Result<mpf::Trie, RegisterSpoError> {
+    if previous_registry.is_none() {
+        return Ok(mpf::Trie::from_pairs(current.identity_pairs()).map_err(TreasuryInfoError::Mpf)?);
+    }
+    let (previous, window) = crate::cardano::migrate_registration::read_identity_window(
+        current,
+        previous_registry,
+        root,
+    )?;
+    check(previous.as_ref(), &window)?;
+    Ok(window.trie().map_err(TreasuryInfoError::Mpf)?)
+}
+
+/// Refuse a registration that would put a SECOND binding for a pool into the
+/// identity root.
+///
+/// The trie is keyed by `bifrost_id_pk`, so the absence proof [REG-5] asks for
+/// says nothing about `pool_id`. Outside a migration window the list's own
+/// uniqueness covers that. Inside one, a pool still registered under the
+/// previous registry is in the root but not in the list a registration inserts
+/// into, so it could register again under a new key — and then carry two
+/// bindings no transaction can remove: its old one cannot be migrated (the pool
+/// is in the current list) and cannot be exited (the old `Deregister` no longer
+/// passes [TSY-13]). Once Config #13 is cleared the current list alone no
+/// longer rebuilds the root, and every roster read on the bridge fails.
+///
+/// A pool that migrated and then LEFT is free to register again: its old
+/// binding is already gone from the root.
+fn refuse_second_binding(
+    previous: Option<&RegistryList>,
+    window: &crate::cardano::migrate_registration::IdentityWindow,
+    pool_id: &[u8],
+) -> Result<(), RegisterSpoError> {
+    let Some(old) = previous.and_then(|prev| prev.get(pool_id)) else {
+        return Ok(());
+    };
+    if window.departed.contains(&old.bifrost_id_pk) {
+        return Ok(());
+    }
+    Err(RegisterSpoError::Build(format!(
+        "pool {} is still registered under the previous registry (bifrost key {}), and a \
+         migration is in progress. Carry it across instead of registering again — `run-spo` \
+         does it at startup, and `heimdall migrate-registration` does it by hand, with no cold \
+         key. Registering afresh would leave its old binding in the Treasury state where no \
+         transaction can ever remove it",
+        hex::encode(pool_id),
+        hex::encode(&old.bifrost_id_pk),
+    )))
+}
+
+/// [`refuse_second_binding`] from raw chain reads, for a caller that wants the
+/// answer before it asks a cold key for anything.
+pub fn check_register_allowed(
+    registry_policy_hex: &str,
+    registry_utxos: &[BfUtxo],
+    treasury_policy_hex: &str,
+    treasury_utxos: &[BfUtxo],
+    previous_registry: Option<(&str, &[BfUtxo])>,
+    pool_id: &[u8],
+) -> Result<(), RegisterSpoError> {
+    if previous_registry.is_none() {
+        return Ok(());
+    }
+    let list = registry_list_from_utxos(registry_utxos, registry_policy_hex)?;
+    if list.get(pool_id).is_some() {
+        return Err(RegisterSpoError::Registry(
+            crate::cardano::registry::RegistryError::AlreadyRegistered,
+        ));
+    }
+    let state = find_treasury_state(
+        treasury_utxos,
+        treasury_policy_hex,
+        &hex::encode(crate::cardano::config_params::TREASURY_INFO_ASSET_NAME),
+    )?;
+    let (previous, window) = crate::cardano::migrate_registration::read_identity_window(
+        &list,
+        previous_registry,
+        state.datum.bifrost_identity_root,
+    )?;
+    refuse_second_binding(previous.as_ref(), &window, pool_id)
+}
+
 /// Decode `tx_hash` hex into the 32-byte id whisky sorts inputs by.
 fn tx_id_bytes(tx_hash: &str) -> Result<[u8; 32], RegisterSpoError> {
     hex::decode(tx_hash)
@@ -411,14 +592,22 @@ fn tx_id_bytes(tx_hash: &str) -> Result<[u8; 32], RegisterSpoError> {
 /// They differ: the fee input may carry native tokens (declared on the input,
 /// returned in the change), collateral may not. Neither may carry a reference
 /// script — that spend incurs the Conway per-byte fee the builder doesn't price.
-fn select_fee_and_collateral(
-    wallet_utxos: &[WalletUtxo],
+fn select_fee_and_collateral<'a>(
+    wallet_utxos: &'a [WalletUtxo],
     min_fee_lovelace: u64,
-) -> Result<(&WalletUtxo, &WalletUtxo), RegisterSpoError> {
+    nonce_utxo: &WalletUtxo,
+) -> Result<(&'a WalletUtxo, &'a WalletUtxo), RegisterSpoError> {
     let fee_utxo = select_fee(wallet_utxos, min_fee_lovelace).map_err(RegisterSpoError::Wallet)?;
-    // Collateral must be ada-only and DISTINCT from the fee input.
-    let coll_utxo =
-        select_collateral(wallet_utxos, &[fee_utxo]).map_err(RegisterSpoError::Wallet)?;
+    // Collateral must be ada-only and DISTINCT from every SPENT input — which
+    // since rev 5.6 is two, not one: the nonce is a second pubkey input.
+    //
+    // The `reserved` flag usually excludes it, but not always: on the
+    // documented recovery path the operator names the outpoint with
+    // `--nonce-utxo` after the state dir lost the record, so nothing is
+    // flagged. Passing it explicitly is what makes the invariant hold in that
+    // case too, rather than by luck.
+    let coll_utxo = select_collateral(wallet_utxos, &[fee_utxo, nonce_utxo])
+        .map_err(RegisterSpoError::Wallet)?;
     Ok((fee_utxo, coll_utxo))
 }
 
@@ -456,12 +645,16 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
 
     // Treasury leg: rebuild the identity trie from the (pre-insert) list and
     // derive the post-registration datum + absence proof.
-    let identity_trie =
-        mpf::Trie::from_pairs(list.identity_pairs()).map_err(TreasuryInfoError::Mpf)?;
     let state = find_treasury_state(
         req.treasury_utxos,
         &req.treasury_script.hash_hex(),
         req.treasury_asset_name_hex,
+    )?;
+    let identity_trie = identity_trie_for(
+        &list,
+        req.previous_registry,
+        state.datum.bifrost_identity_root,
+        |previous, window| refuse_second_binding(previous, window, &pool_id),
     )?;
     let (new_treasury_datum, absence_proof) =
         apply_registration(&state.datum, &identity_trie, &req.bifrost_id_pk, &pool_id)?;
@@ -485,19 +678,11 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
             script_size: None,
         });
     }
-    let config_ref_index = {
-        let mut keys: Vec<(Vec<u8>, u32)> = reference_inputs
-            .iter()
-            .map(|r| (hex::decode(&r.tx_hash).unwrap_or_default(), r.tx_index))
-            .collect();
-        keys.sort();
-        keys.dedup();
-        let want = (
-            hex::decode(&req.config_ref.0).unwrap_or_default(),
-            req.config_ref.1,
-        );
-        u64::try_from(keys.iter().position(|k| *k == want).unwrap_or(0)).unwrap_or(0)
-    };
+    let config_ref_index = crate::cardano::tx_common::reference_input_index(
+        &reference_inputs,
+        &req.config_ref.0,
+        req.config_ref.1,
+    );
 
     let (treasury_in, treasury_out) = treasury_spend_leg(
         &state,
@@ -511,23 +696,57 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
     let new_node_datum_cbor = plan.new_node.to_cbor();
     let node_lovelace = element_lovelace(new_node_datum_cbor.len());
 
+    // spec [REG-10]: the transaction MUST spend the UTxO the signatures name, or
+    // the message the validator rebuilds is not the message that was signed.
+    // Locate it in the wallet first: gone from the set means already spent, and
+    // saying so here is worth more than the chain's "signature invalid".
+    let nonce = req.sigs.nonce;
+    let nonce_utxo: &WalletUtxo = req
+        .wallet_utxos
+        .iter()
+        .find(|u| u.outpoint() == Some(nonce))
+        .ok_or_else(|| {
+            RegisterSpoError::Build(format!(
+                "the nonce UTxO {nonce} these signatures are bound to is not in the wallet. \
+                 Either it has been spent — in which case the signatures are used up and the \
+                 cold key must sign again — or this is the wrong wallet",
+            ))
+        })?;
+
     let (fee_utxo, coll_utxo) =
-        select_fee_and_collateral(req.wallet_utxos, node_lovelace + 1_000_000)?;
+        select_fee_and_collateral(req.wallet_utxos, node_lovelace + 1_000_000, nonce_utxo)?;
 
     // The ledger orders tx inputs lexicographically by (tx_id, index); the
     // redeemer indices must point into that order.
     let fee_ref = (tx_id_bytes(&fee_utxo.tx_hash)?, fee_utxo.output_index);
+    let nonce_ref = (nonce.tx_hash, nonce.index);
     let anchor_ref = (tx_id_bytes(&anchor.tx_hash)?, anchor.output_index);
     let treasury_ref = (tx_id_bytes(&state.tx_hash)?, state.output_index);
-    if fee_ref == anchor_ref || fee_ref == treasury_ref || anchor_ref == treasury_ref {
+    // The nonce MAY be the fee input — that is the one-machine flow, where the
+    // request and the submission happen in the same command and nothing can
+    // spend it in between. Everywhere else it is its own input, reserved in the
+    // state dir so fee selection skips it.
+    let nonce_is_fee = nonce_ref == fee_ref;
+    let mut sorted = vec![fee_ref, anchor_ref, treasury_ref];
+    if !nonce_is_fee {
+        sorted.push(nonce_ref);
+    }
+    let distinct = {
+        let mut d = sorted.clone();
+        d.sort();
+        d.dedup();
+        d.len()
+    };
+    if distinct != sorted.len() {
         return Err(RegisterSpoError::Build(
-            "fee/anchor/treasury inputs must be distinct outpoints".into(),
+            "fee/nonce/anchor/treasury inputs must be distinct outpoints".into(),
         ));
     }
-    let mut sorted = [fee_ref, anchor_ref, treasury_ref];
     sorted.sort();
-    let anchor_input_index = sorted.iter().position(|r| *r == anchor_ref).unwrap() as i64;
-    let treasury_input_index = sorted.iter().position(|r| *r == treasury_ref).unwrap() as i64;
+    let index_of = |r: &([u8; 32], u32)| sorted.iter().position(|s| s == r).unwrap() as i64;
+    let anchor_input_index = index_of(&anchor_ref);
+    let treasury_input_index = index_of(&treasury_ref);
+    let nonce_input_index = index_of(&nonce_ref);
     // Outputs are ours to order: [0] continued anchor, [1] new node,
     // [2] continued treasury (whisky appends the change output after).
     let (anchor_output_index, treasury_output_index) = (0i64, 2i64);
@@ -610,6 +829,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
 
     let mint_redeemer = register_mint_redeemer(
         req.sigs,
+        nonce_input_index,
         anchor_input_index,
         anchor_output_index,
         treasury_input_index,
@@ -619,19 +839,29 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
     let mint_redeemer_hex =
         hex::encode(minicbor::to_vec(&mint_redeemer).expect("redeemer CBOR encode"));
 
+    let mut inputs = vec![TxIn::PubKeyTxIn(PubKeyTxIn {
+        tx_in: TxInParameter {
+            tx_hash: fee_utxo.tx_hash.clone(),
+            tx_index: fee_utxo.output_index,
+            amount: Some(wallet_input_amount(fee_utxo)),
+            address: Some(req.wallet_address.to_string()),
+        },
+    })];
+    if !nonce_is_fee {
+        inputs.push(TxIn::PubKeyTxIn(PubKeyTxIn {
+            tx_in: TxInParameter {
+                tx_hash: nonce_utxo.tx_hash.clone(),
+                tx_index: nonce_utxo.output_index,
+                amount: Some(wallet_input_amount(nonce_utxo)),
+                address: Some(req.wallet_address.to_string()),
+            },
+        }));
+    }
+    inputs.push(anchor_in);
+    inputs.push(treasury_in);
+
     let body = TxBuilderBody {
-        inputs: vec![
-            TxIn::PubKeyTxIn(PubKeyTxIn {
-                tx_in: TxInParameter {
-                    tx_hash: fee_utxo.tx_hash.clone(),
-                    tx_index: fee_utxo.output_index,
-                    amount: Some(wallet_input_amount(fee_utxo)),
-                    address: Some(req.wallet_address.to_string()),
-                },
-            }),
-            anchor_in,
-            treasury_in,
-        ],
+        inputs,
         outputs: vec![continued_anchor_out, new_node_out, treasury_out],
         collaterals: vec![PubKeyTxIn {
             tx_in: TxInParameter {
@@ -717,6 +947,22 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
             };
             at(anchor_input_index, &anchor_ref, "anchor")?;
             at(treasury_input_index, &treasury_ref, "treasury")?;
+            // spec [REG-10]. The one index whose drift the chain reports as
+            // nothing but a bad signature, so it is worth naming here.
+            at(nonce_input_index, &nonce_ref, "nonce")?;
+            // And the one REFERENCE index this transaction carries. Computed
+            // before the build like every other, so it is a prediction until
+            // something compares it; `migrate_registration` and `apply_ban`
+            // check theirs, and an unchecked one would surface only as a
+            // phase-2 failure with nothing to point at.
+            crate::cardano::tx_common::check_reference_at(
+                &tx,
+                config_ref_index,
+                &req.config_ref.0,
+                req.config_ref.1,
+                "Config",
+            )
+            .map_err(RegisterSpoError::Build)?;
         }
 
         hex::encode(
@@ -929,8 +1175,18 @@ mod tests {
 
     const URL: &[u8] = b"https://spo.example:18500";
 
+    /// The nonce the fixture signatures are bound to ([REG-10]).
+    fn test_nonce() -> NonceOutpoint {
+        NonceOutpoint::new([0x7a; 32], 3)
+    }
+
+    /// A different one, for the replay negatives.
+    fn other_nonce() -> NonceOutpoint {
+        NonceOutpoint::new([0x5c; 32], 1)
+    }
+
     fn test_sigs() -> RegistrationSignatures {
-        sign_registration(&cold_skey(), &bifrost_keypair(), URL)
+        sign_registration(&cold_skey(), &bifrost_keypair(), URL, test_nonce())
     }
 
     fn test_pool_id() -> [u8; 28] {
@@ -939,8 +1195,79 @@ mod tests {
 
     #[test]
     fn message_is_domain_separated_concatenation() {
-        let m = registration_message(b"POOL", b"PK", b"URL");
-        assert_eq!(m, b"bifrost-spoPOOLPKURL");
+        let m = registration_message(b"POOL", b"PK", b"URL", &test_nonce());
+        let mut want = b"bifrost-spoPOOLPKURL".to_vec();
+        want.extend_from_slice(&[0x7a; 32]);
+        want.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(m, want);
+    }
+
+    /// The golden bytes, pinned against the SAME fixture the Aiken suite uses
+    /// (`register_happy` in `spos-registry.ak`): cold seed [42; 32], bifrost
+    /// seckey [7; 32], this URL, this outpoint. Two suites, one message format —
+    /// a change to either concatenation breaks both, which is the point.
+    #[test]
+    fn the_registration_message_matches_the_on_chain_golden_bytes() {
+        let cold: [u8; 32] = cold_skey().public_key().into();
+        let pool_id = pool_id_from_cold_vkey(&cold);
+        let m = registration_message(
+            &pool_id,
+            &bifrost_pk(),
+            b"https://spo.example/bifrost",
+            &test_nonce(),
+        );
+        assert_eq!(
+            hex::encode(&m),
+            "626966726f73742d73706f1dfb74a8cbcda254c65b5dd5d95df89f60b28b11de4da2ded3bc1f9b989c0b\
+             76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f68747470733a2f2f73706f2e65\
+             78616d706c652f626966726f73747a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a\
+             7a7a7a7a03000000"
+                .replace(['\n', ' '], "")
+        );
+        // The outpoint is the LAST 36 bytes, after the variable-length URL, and
+        // that fixed width is what keeps the message unambiguous.
+        assert_eq!(&m[m.len() - 36..][..32], &[0x7a; 32]);
+        assert_eq!(&m[m.len() - 4..], &3u32.to_le_bytes());
+    }
+
+    /// Every field is covered, INCLUDING the nonce: change any one of them and
+    /// the signatures the cold key made stop verifying.
+    #[test]
+    fn verification_rejects_a_tamper_in_any_field() {
+        let sigs = test_sigs();
+        assert!(verify_registration(&sigs, &bifrost_pk(), URL).is_ok());
+
+        let mut moved_nonce = sigs.clone();
+        moved_nonce.nonce = other_nonce();
+        assert!(
+            verify_registration(&moved_nonce, &bifrost_pk(), URL).is_err(),
+            "a different nonce outpoint must invalidate both signatures ([REG-10])"
+        );
+
+        assert!(
+            verify_registration(&sigs, &bifrost_pk(), b"https://attacker.example").is_err(),
+            "a different URL must invalidate the signatures"
+        );
+
+        let mut other_key = sigs.clone();
+        other_key.cold_vkey = ed25519::SecretKey::from([43u8; 32]).public_key().into();
+        assert!(
+            verify_registration(&other_key, &bifrost_pk(), URL).is_err(),
+            "a different cold key must invalidate the signatures"
+        );
+
+        let mut flipped = sigs.clone();
+        flipped.cold_sig[0] ^= 0xff;
+        assert!(verify_registration(&flipped, &bifrost_pk(), URL).is_err());
+    }
+
+    /// Sign / verify round trip, which is what the one-machine flow does.
+    #[test]
+    fn signing_and_verifying_round_trip() {
+        let sigs = test_sigs();
+        let pool_id = verify_registration(&sigs, &bifrost_pk(), URL).expect("verify");
+        assert_eq!(pool_id, test_pool_id());
+        assert_eq!(sigs.nonce, test_nonce());
     }
 
     // Pinned externally (python hashlib.blake2b(b'\x11'*32, digest_size=28)):
@@ -1002,7 +1329,7 @@ mod tests {
     fn bifrost_sig_is_bip340_over_sha256_of_message() {
         let sigs = test_sigs();
         let pool_id = pool_id_from_cold_vkey(&sigs.cold_vkey);
-        let message = registration_message(&pool_id, &bifrost_pk(), URL);
+        let message = registration_message(&pool_id, &bifrost_pk(), URL, &sigs.nonce);
         let digest = sha256::Hash::hash(&message).to_byte_array();
         let secp = Secp256k1::verification_only();
         secp.verify_schnorr(
@@ -1029,7 +1356,10 @@ mod tests {
         // canonically (indefinite-length) encoded.
         let sigs = test_sigs();
         let proof: mpf::Proof = vec![];
-        let r = register_mint_redeemer(&sigs, 1, 0, 2, 2, &proof);
+        // nonce_input_index goes FIRST of the indices, directly after the
+        // signatures it makes single-use — the position the Aiken constructor
+        // pins ([REG-10]).
+        let r = register_mint_redeemer(&sigs, 0, 2, 0, 3, 2, &proof);
         let cbor = minicbor::to_vec(&r).unwrap();
         let hex_str = hex::encode(&cbor);
         assert!(hex_str.starts_with("d87a9f"), "{hex_str}");
@@ -1040,11 +1370,13 @@ mod tests {
         };
         assert_eq!(c.tag, 122);
         let fields: Vec<_> = c.fields.iter().collect();
-        assert_eq!(fields.len(), 8);
+        assert_eq!(fields.len(), 9);
         assert!(matches!(fields[0], PlutusData::BoundedBytes(b) if **b == sigs.cold_vkey));
         assert!(matches!(fields[1], PlutusData::BoundedBytes(b) if **b == sigs.cold_sig));
         assert!(matches!(fields[2], PlutusData::BoundedBytes(b) if **b == sigs.bifrost_sig));
-        assert!(matches!(fields[7], PlutusData::Array(_)));
+        // The nonce index, then the four it used to be followed by.
+        assert!(matches!(fields[3], PlutusData::BigInt(_)));
+        assert!(matches!(fields[8], PlutusData::Array(_)));
     }
 
     // ---- fixtures for the snapshot/build tests --------------------------
@@ -1152,6 +1484,152 @@ mod tests {
         registry_elements: Vec<BfUtxo>,
         identity_pairs: &[(Vec<u8>, Vec<u8>)],
     ) -> (RegisterSpoTx, Tx, ParameterizedScript, ParameterizedScript) {
+        build_against_treasury_at(registry_elements, identity_pairs, "dd")
+    }
+
+    /// As [`build_against`], with a caller-chosen wallet set.
+    fn build_against_wallet(
+        registry_elements: Vec<BfUtxo>,
+        identity_pairs: &[(Vec<u8>, Vec<u8>)],
+        wallet_utxos: Vec<WalletUtxo>,
+    ) -> Result<RegisterSpoTx, RegisterSpoError> {
+        let registry = registry_script();
+        let treasury = treasury_script(&registry.hash);
+        let trie = mpf::Trie::from_pairs(identity_pairs.iter().map(|(k, v)| (k, v))).unwrap();
+        let treasury_datum = TreasuryInfoDatum {
+            bifrost_identity_root: trie.root_hash(),
+            current_spos_frost_key: vec![0xAB; 32],
+        };
+        let nft_name = "ee".repeat(32);
+        let treasury_utxos = vec![BfUtxo {
+            tx_hash: "dd".repeat(32),
+            output_index: 0,
+            amount: vec![
+                BfAmount {
+                    unit: "lovelace".into(),
+                    quantity: "3104330".into(),
+                },
+                BfAmount {
+                    unit: format!("{}{nft_name}", treasury.hash_hex()),
+                    quantity: "1".into(),
+                },
+            ],
+            inline_datum: Some(hex::encode(treasury_datum.to_cbor())),
+            reference_script_hash: None,
+        }];
+        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
+        let sigs = test_sigs();
+        build_register_spo_tx(&RegisterSpoRequest {
+            registry_script: &registry,
+            treasury_script: &treasury,
+            treasury_asset_name_hex: &nft_name,
+            registry_utxos: &registry_elements,
+            treasury_utxos: &treasury_utxos,
+            previous_registry: None,
+            wallet_address: &wallet_addr,
+            wallet_utxos: &wallet_utxos,
+            key: &key,
+            sigs: &sigs,
+            bifrost_id_pk: bifrost_pk(),
+            bifrost_url: URL.to_vec(),
+            invalid_before: None,
+            invalid_hereafter: None,
+            registry_ref: None,
+            config_ref: ("cc".repeat(32), 0),
+            cost_models: None,
+        })
+    }
+
+    /// As [`build_against`], but fallible and told about a migration window.
+    fn build_with_previous(
+        registry_elements: Vec<BfUtxo>,
+        identity_pairs: &[(Vec<u8>, Vec<u8>)],
+        previous: Option<(&str, &[BfUtxo])>,
+    ) -> Result<RegisterSpoTx, RegisterSpoError> {
+        let registry = registry_script();
+        let treasury = treasury_script(&registry.hash);
+        let trie = mpf::Trie::from_pairs(identity_pairs.iter().map(|(k, v)| (k, v))).unwrap();
+        let treasury_datum = TreasuryInfoDatum {
+            bifrost_identity_root: trie.root_hash(),
+            current_spos_frost_key: vec![0xAB; 32],
+        };
+        let nft_name = "ee".repeat(32);
+        let treasury_utxos = vec![BfUtxo {
+            tx_hash: "dd".repeat(32),
+            output_index: 0,
+            amount: vec![
+                BfAmount {
+                    unit: "lovelace".into(),
+                    quantity: "3104330".into(),
+                },
+                BfAmount {
+                    unit: format!("{}{nft_name}", treasury.hash_hex()),
+                    quantity: "1".into(),
+                },
+            ],
+            inline_datum: Some(hex::encode(treasury_datum.to_cbor())),
+            reference_script_hash: None,
+        }];
+        let key = derive_payment_key(TEST_MNEMONIC).unwrap();
+        let wallet_addr =
+            crate::cardano::wallet::wallet_address(&key, pallas_addresses::Network::Testnet);
+        let wallet_utxos = vec![
+            WalletUtxo {
+                tx_hash: "aa".repeat(32),
+                output_index: 0,
+                lovelace: 50_000_000,
+                tokens: Default::default(),
+                has_ref_script: false,
+                reserved: false,
+            },
+            WalletUtxo {
+                tx_hash: "bb".repeat(32),
+                output_index: 1,
+                lovelace: 6_000_000,
+                tokens: Default::default(),
+                has_ref_script: false,
+                reserved: false,
+            },
+            WalletUtxo {
+                tx_hash: "7a".repeat(32),
+                output_index: 3,
+                lovelace: 2_000_000,
+                tokens: Default::default(),
+                has_ref_script: false,
+                reserved: true,
+            },
+        ];
+        let sigs = test_sigs();
+        build_register_spo_tx(&RegisterSpoRequest {
+            registry_script: &registry,
+            treasury_script: &treasury,
+            treasury_asset_name_hex: &nft_name,
+            registry_utxos: &registry_elements,
+            treasury_utxos: &treasury_utxos,
+            previous_registry: previous,
+            wallet_address: &wallet_addr,
+            wallet_utxos: &wallet_utxos,
+            key: &key,
+            sigs: &sigs,
+            bifrost_id_pk: bifrost_pk(),
+            bifrost_url: URL.to_vec(),
+            invalid_before: None,
+            invalid_hereafter: None,
+            registry_ref: None,
+            config_ref: ("cc".repeat(32), 0),
+            cost_models: None,
+        })
+    }
+
+    /// As [`build_against`], with the Treasury state UTxO at a caller-chosen
+    /// outpoint — for the lost-race test below.
+    fn build_against_treasury_at(
+        registry_elements: Vec<BfUtxo>,
+        identity_pairs: &[(Vec<u8>, Vec<u8>)],
+        treasury_tx_byte: &str,
+    ) -> (RegisterSpoTx, Tx, ParameterizedScript, ParameterizedScript) {
         let registry = registry_script();
         let treasury = treasury_script(&registry.hash);
 
@@ -1162,7 +1640,7 @@ mod tests {
         };
         let nft_name = "ee".repeat(32);
         let treasury_utxos = vec![BfUtxo {
-            tx_hash: "dd".repeat(32),
+            tx_hash: treasury_tx_byte.repeat(32),
             output_index: 0,
             amount: vec![
                 BfAmount {
@@ -1188,6 +1666,7 @@ mod tests {
                 lovelace: 50_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
             // Distinct pure-ADA collateral — the fee input can't double as collateral.
             WalletUtxo {
@@ -1196,6 +1675,18 @@ mod tests {
                 lovelace: 6_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
+            },
+            // The reserved nonce UTxO the signatures are bound to ([REG-10]).
+            // Flagged `reserved`, so fee and collateral selection leave it to
+            // the one input that is allowed to spend it.
+            WalletUtxo {
+                tx_hash: "7a".repeat(32),
+                output_index: 3,
+                lovelace: 2_000_000,
+                tokens: Default::default(),
+                has_ref_script: false,
+                reserved: true,
             },
         ];
 
@@ -1206,6 +1697,7 @@ mod tests {
             treasury_asset_name_hex: &nft_name,
             registry_utxos: &registry_elements,
             treasury_utxos: &treasury_utxos,
+            previous_registry: None,
             wallet_address: &wallet_addr,
             wallet_utxos: &wallet_utxos,
             key: &key,
@@ -1223,7 +1715,9 @@ mod tests {
         (built, tx, registry, treasury)
     }
 
-    fn decoded_register_redeemer(tx: &Tx) -> (i64, i64, i64, i64) {
+    /// `(nonce_in, anchor_in, anchor_out, treasury_in, treasury_out)` from the
+    /// built transaction's mint redeemer.
+    fn decoded_register_redeemer(tx: &Tx) -> (i64, i64, i64, i64, i64) {
         let redeemers = tx.transaction_witness_set.redeemer.as_ref().unwrap();
         let all: Vec<pallas_primitives::conway::Redeemer> = match redeemers {
             pallas_primitives::conway::Redeemers::List(rs) => rs.iter().cloned().collect(),
@@ -1246,14 +1740,293 @@ mod tests {
         };
         assert_eq!(c.tag, 122, "Register is constructor 1");
         let f: Vec<_> = c.fields.iter().collect();
-        assert_eq!(f.len(), 8);
+        assert_eq!(f.len(), 9);
         let as_int = |pd: &PlutusData| -> i64 {
             let PlutusData::BigInt(pallas_primitives::BigInt::Int(i)) = pd else {
                 panic!("expected int field");
             };
             i128::from(*i) as i64
         };
-        (as_int(f[3]), as_int(f[4]), as_int(f[5]), as_int(f[6]))
+        (
+            as_int(f[3]),
+            as_int(f[4]),
+            as_int(f[5]),
+            as_int(f[6]),
+            as_int(f[7]),
+        )
+    }
+
+    /// Joining the bridge must still work while a registry migration is running
+    /// ([CFG-10], [MIG-3]).
+    ///
+    /// `Migrate` carries a registration across without moving the Treasury
+    /// state's identity root, so during a window the root commits to the
+    /// bindings of BOTH lists. A registration that rebuilt the trie from the
+    /// current list alone would compute a different root and `apply_registration`
+    /// would refuse — which is to say nobody could join, and nobody could leave,
+    /// for the length of the rollout. And a rollout is exactly when an operator
+    /// is most likely to be doing one of the two.
+    #[test]
+    fn registering_works_while_a_migration_is_in_progress() {
+        let registry = registry_script();
+        let policy = registry.hash_hex();
+        // The previous registry still holds a pool that has not migrated. Its
+        // binding is in the treasury root and in neither the current list nor
+        // this registrant's own.
+        let previous_policy = "b2".repeat(28);
+        let stranded_pool = [0x99u8; 28];
+        let stranded_pk = b"pk-not-yet-migrated".to_vec();
+        let previous = vec![
+            element_utxo(
+                &previous_policy,
+                &"77".repeat(32),
+                0,
+                2_600_000,
+                REGISTRATION_ROOT_KEY,
+                &root_element(Some(&stranded_pool)),
+            ),
+            element_utxo(
+                &previous_policy,
+                &"88".repeat(32),
+                0,
+                2_600_000,
+                &stranded_pool,
+                &node_element(&stranded_pk, None),
+            ),
+        ];
+        let elements = vec![element_utxo(
+            &policy,
+            &"11".repeat(32),
+            0,
+            2_600_000,
+            REGISTRATION_ROOT_KEY,
+            &root_element(None),
+        )];
+
+        // The treasury root is the UNION — here, just the stranded pool, since
+        // the current list is empty.
+        let pairs = vec![(stranded_pk.clone(), stranded_pool.to_vec())];
+        let built = build_with_previous(
+            elements,
+            &pairs,
+            Some((previous_policy.as_str(), previous.as_slice())),
+        )
+        .expect("a registration during a migration window must build");
+        assert_eq!(built.pool_id, test_pool_id());
+
+        // Without the previous list the same registration cannot be built: the
+        // trie rebuilt from the current list alone is a different trie.
+        let elements = vec![element_utxo(
+            &policy,
+            &"11".repeat(32),
+            0,
+            2_600_000,
+            REGISTRATION_ROOT_KEY,
+            &root_element(None),
+        )];
+        let err = build_with_previous(elements, &pairs, None)
+            .expect_err("the current list alone cannot rebuild the root");
+        assert!(
+            format!("{err}").to_lowercase().contains("root"),
+            "expected a root mismatch, got {err}"
+        );
+    }
+
+    /// A pool still registered under the previous registry must be carried
+    /// across, not registered afresh under a new key. The identity trie is keyed
+    /// by `bifrost_id_pk`, so the absence proof says nothing about `pool_id`:
+    /// built, this would leave the pool with two bindings in the root, the old
+    /// one beyond any transaction's reach — and once Config #13 is cleared,
+    /// every roster read on the bridge fails.
+    ///
+    /// A pool that migrated and then LEFT is different: its old binding is gone
+    /// from the root, and it is free to join again.
+    #[test]
+    fn a_pool_still_under_the_previous_registry_cannot_register_afresh() {
+        let registry = registry_script();
+        let policy = registry.hash_hex();
+        let previous_policy = "b2".repeat(28);
+        let old_pk = b"this-pools-old-bifrost-key".to_vec();
+        let previous = vec![
+            element_utxo(
+                &previous_policy,
+                &"77".repeat(32),
+                0,
+                2_600_000,
+                REGISTRATION_ROOT_KEY,
+                &root_element(Some(&test_pool_id())),
+            ),
+            element_utxo(
+                &previous_policy,
+                &"88".repeat(32),
+                0,
+                2_600_000,
+                &test_pool_id(),
+                &node_element(&old_pk, None),
+            ),
+        ];
+        let empty_current = || {
+            vec![element_utxo(
+                &policy,
+                &"11".repeat(32),
+                0,
+                2_600_000,
+                REGISTRATION_ROOT_KEY,
+                &root_element(None),
+            )]
+        };
+
+        // Not carried across yet: its old binding is in the root.
+        let unmigrated = vec![(old_pk.clone(), test_pool_id().to_vec())];
+        let err = build_with_previous(
+            empty_current(),
+            &unmigrated,
+            Some((previous_policy.as_str(), previous.as_slice())),
+        )
+        .expect_err("must refuse a second binding for the same pool");
+        assert!(
+            format!("{err}").contains("still registered under the previous registry"),
+            "{err}"
+        );
+
+        // Migrated and then left: the root no longer holds it.
+        build_with_previous(
+            empty_current(),
+            &[],
+            Some((previous_policy.as_str(), previous.as_slice())),
+        )
+        .expect("a pool that left may register again");
+    }
+
+    /// The collateral input must be distinct from EVERY spent input, and since
+    /// rev 5.6 there are two pubkey inputs, not one.
+    ///
+    /// The `reserved` flag usually keeps the nonce out of selection, but not on
+    /// the documented recovery path: an operator who lost the state dir names
+    /// the outpoint with `--nonce-utxo`, and nothing is flagged. Without the
+    /// explicit exclusion the same outpoint appears in `inputs` and in
+    /// `collaterals`.
+    #[test]
+    fn collateral_is_never_the_nonce_even_when_it_is_not_flagged() {
+        let registry = registry_script();
+        let policy = registry.hash_hex();
+        let elements = vec![element_utxo(
+            &policy,
+            &"11".repeat(32),
+            0,
+            2_600_000,
+            REGISTRATION_ROOT_KEY,
+            &root_element(None),
+        )];
+        // Two pure-ada UTxOs and the nonce, with the flag NOT set — the
+        // recovery shape. The nonce is the second-richest, which is what
+        // `select_collateral` would otherwise return.
+        let built = build_against_wallet(
+            elements,
+            &[],
+            vec![
+                WalletUtxo {
+                    tx_hash: "aa".repeat(32),
+                    output_index: 0,
+                    lovelace: 50_000_000,
+                    tokens: Default::default(),
+                    has_ref_script: false,
+                    reserved: false,
+                },
+                WalletUtxo {
+                    tx_hash: "7a".repeat(32),
+                    output_index: 3,
+                    lovelace: 9_000_000,
+                    tokens: Default::default(),
+                    has_ref_script: false,
+                    reserved: false,
+                },
+                WalletUtxo {
+                    tx_hash: "bb".repeat(32),
+                    output_index: 1,
+                    lovelace: 6_000_000,
+                    tokens: Default::default(),
+                    has_ref_script: false,
+                    reserved: false,
+                },
+            ],
+        )
+        .expect("builds");
+        let tx: Tx = minicbor::decode(&hex::decode(&built.signed_tx_hex).unwrap()).unwrap();
+        let collateral: Vec<_> = tx
+            .transaction_body
+            .collateral
+            .as_ref()
+            .expect("collateral present")
+            .iter()
+            .map(|c| c.transaction_id.to_vec())
+            .collect();
+        assert!(
+            !collateral.contains(&[0x7a; 32].to_vec()),
+            "the nonce is a spent input; it must not also be the collateral"
+        );
+        let inputs: Vec<_> = tx
+            .transaction_body
+            .inputs
+            .iter()
+            .map(|i| i.transaction_id.to_vec())
+            .collect();
+        assert!(inputs.contains(&[0x7a; 32].to_vec()), "and it IS spent");
+    }
+
+    /// The retry the nonce is designed to survive ([REG-10]).
+    ///
+    /// The Treasury state UTxO is spent by every pool's registration, exit and
+    /// key rotation, so a registration racing for it loses routinely. The nonce
+    /// is deliberately NOT that outpoint: it is one under the registrant's own
+    /// key, which nobody else can consume. So the same signatures, made once on
+    /// an air-gapped machine, build a valid transaction against a Treasury state
+    /// that has since moved — no second trip to the cold key.
+    ///
+    /// Binding to the Treasury state instead, as Update-Y does, would have made
+    /// this case fatal: the roster re-signs Update-Y online, seconds before
+    /// submitting, and a cold key on an air-gapped machine cannot.
+    #[test]
+    fn the_same_signatures_still_build_after_the_treasury_state_moves() {
+        let registry = registry_script();
+        let policy = registry.hash_hex();
+        let elements = || {
+            vec![element_utxo(
+                &policy,
+                &"11".repeat(32),
+                0,
+                2_600_000,
+                REGISTRATION_ROOT_KEY,
+                &root_element(None),
+            )]
+        };
+
+        // The first attempt loses the race for the Treasury state at dd…#0.
+        let (first, _, _, _) = build_against_treasury_at(elements(), &[], "dd");
+        // It is now at c1…#0. The signatures are unchanged — the same
+        // `test_sigs()` both times — and the transaction still builds.
+        // (Not cc…: that is this fixture's Config reference outpoint, and an
+        // outpoint cannot be both a spent input and a reference input.)
+        let (retry, tx, _, _) = build_against_treasury_at(elements(), &[], "c1");
+
+        assert_eq!(first.pool_id, retry.pool_id);
+        assert_ne!(
+            first.signed_tx_hex, retry.signed_tx_hex,
+            "a different treasury outpoint is a different transaction"
+        );
+        let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
+        assert!(
+            inputs
+                .iter()
+                .any(|i| i.transaction_id.as_slice() == [0xc1; 32]),
+            "the retry spends the treasury state where it now is"
+        );
+        let (nonce_in, ..) = decoded_register_redeemer(&tx);
+        assert_eq!(
+            inputs[nonce_in as usize].transaction_id.as_slice(),
+            [0x7a; 32],
+            "and the nonce it is bound to has not moved"
+        );
     }
 
     /// End-to-end against an EMPTY list: the anchor is the root, the identity
@@ -1276,11 +2049,21 @@ mod tests {
         assert_eq!(built.pool_id, pool_id);
         assert_eq!(built.anchor_asset_name, REGISTRATION_ROOT_KEY);
 
-        // Inputs are sorted (fee aa…:0, anchor 11…:0, treasury dd…:0 →
-        // 11 < aa < dd) and the redeemer indices point at the right ones.
+        // Inputs are sorted (anchor 11…:0, fee aa…:0, nonce 7a…:3, treasury
+        // dd…:0 → 11 < 7a < aa < dd) and the redeemer indices point at the
+        // right ones. Four inputs since rev 5.6: the nonce UTxO the signatures
+        // are bound to is spent here, which is what makes them single-use
+        // ([REG-10]).
         let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
-        assert_eq!(inputs.len(), 3);
-        let (anchor_in, anchor_out, treasury_in, treasury_out) = decoded_register_redeemer(&tx);
+        assert_eq!(inputs.len(), 4);
+        let (nonce_in, anchor_in, anchor_out, treasury_in, treasury_out) =
+            decoded_register_redeemer(&tx);
+        assert_eq!(
+            inputs[nonce_in as usize].transaction_id.as_slice(),
+            [0x7a; 32],
+            "the redeemer's nonce_input_index must name the signed outpoint"
+        );
+        assert_eq!(inputs[nonce_in as usize].index, 3);
         assert_eq!(
             inputs[anchor_in as usize].transaction_id.as_slice(),
             [0x11; 32]
@@ -1405,8 +2188,13 @@ mod tests {
 
         // The anchor is the low node, not the root.
         assert_eq!(built.anchor_asset_name, lo);
-        let (anchor_in, _, treasury_in, _) = decoded_register_redeemer(&tx);
+        let (nonce_in, anchor_in, _, treasury_in, _) = decoded_register_redeemer(&tx);
         let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
+        assert_eq!(
+            inputs[nonce_in as usize].transaction_id.as_slice(),
+            [0x7a; 32],
+            "the nonce index holds through a node anchor too"
+        );
         assert_eq!(
             (
                 inputs[anchor_in as usize].transaction_id.as_slice(),
@@ -1458,6 +2246,7 @@ mod tests {
                 lovelace: 50_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
             },
             // Distinct pure-ADA collateral — the fee input can't double as collateral.
             WalletUtxo {
@@ -1466,6 +2255,18 @@ mod tests {
                 lovelace: 6_000_000,
                 tokens: Default::default(),
                 has_ref_script: false,
+                reserved: false,
+            },
+            // The reserved nonce UTxO the signatures are bound to ([REG-10]).
+            // Flagged `reserved`, so fee and collateral selection leave it to
+            // the one input that is allowed to spend it.
+            WalletUtxo {
+                tx_hash: "7a".repeat(32),
+                output_index: 3,
+                lovelace: 2_000_000,
+                tokens: Default::default(),
+                has_ref_script: false,
+                reserved: true,
             },
         ];
         let sigs = test_sigs();
@@ -1495,6 +2296,7 @@ mod tests {
             treasury_asset_name_hex: &"ee".repeat(32),
             registry_utxos: &elements,
             treasury_utxos: &[],
+            previous_registry: None,
             wallet_address: &wallet_addr,
             wallet_utxos: &wallet_utxos,
             key: &key,
@@ -1544,6 +2346,7 @@ mod tests {
         let req = RegisterSpoRequest {
             registry_utxos: &elements,
             treasury_utxos: &treasury_utxos,
+            previous_registry: None,
             ..req
         };
         assert!(matches!(
@@ -1585,6 +2388,7 @@ mod tests {
             lovelace: 50_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         };
         // A distinct pure-ADA UTxO for collateral — collateral cannot reuse the
         // one-shot (a UTxO can't be both a spent input and collateral).
@@ -1594,6 +2398,7 @@ mod tests {
             lovelace: 6_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         };
         let utxos = vec![one_shot, collateral_utxo];
 
@@ -1677,6 +2482,7 @@ mod tests {
             lovelace: 50_000_000,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         }];
         let err = build_registry_bootstrap_tx(
             &registry,

@@ -241,6 +241,7 @@ mod tests {
             lovelace,
             tokens: Default::default(),
             has_ref_script: false,
+            reserved: false,
         }
     }
 

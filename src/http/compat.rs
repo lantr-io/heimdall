@@ -93,14 +93,22 @@ pub fn own_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// First 16 hex chars of `blake2b_256` over the embedded CIP-57 blueprint.
+/// First 16 hex chars of `blake2b_256` over the embedded CIP-57 blueprint of
+/// the contracts release the bridge's registry runs.
 ///
 /// Truncated because it is an equality check between peers, not a commitment
 /// anybody signs: 64 bits is far past what a misconfiguration collides on, and a
 /// short digest is one an operator can compare by eye in two log lines.
+///
+/// The release IN EFFECT, not the newest this binary carries: this heimdall
+/// runs a bridge whose registry has not been revised exactly as the previous
+/// release does, with the previous release's blueprint, and reports that
+/// blueprint's digest — so a roster can upgrade one node at a time and keep
+/// holding ceremonies. When the Config moves the registry, every node's report
+/// moves with it at its next Config read.
 #[must_use]
 pub fn own_blueprint_digest() -> String {
-    blueprint_digest(crate::cardano::blueprint::EMBEDDED_BLUEPRINT)
+    blueprint_digest(crate::cardano::blueprint::release_in_effect().embedded())
 }
 
 /// The stake percentage a threshold subset must exceed — this build's

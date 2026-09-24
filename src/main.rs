@@ -101,6 +101,15 @@ enum Commands {
         /// `equivocate-round1`. Never set in production.
         #[arg(long)]
         inject_fault: Option<String>,
+        /// Do not carry this pool's registration across a registry revision by
+        /// itself (spec [MIG-1]).
+        ///
+        /// The default is to do it: an operator installs the new package,
+        /// restarts, and the node puts itself back in the registry with no cold
+        /// key. Set this to run `heimdall migrate-registration` by hand instead;
+        /// until it runs, this node is outside the roster, and `/health` says so.
+        #[arg(long)]
+        no_auto_migrate: bool,
         /// Blockfrost project ID (e.g. `preprodXXXXXX`). Network is
         /// auto-detected from the key prefix. If set, UTxOs are
         /// queried from Blockfrost instead of a local node.
@@ -434,8 +443,11 @@ enum Commands {
         #[arg(long)]
         blueprint: Option<String>,
         /// The spos_registry one-shot bootstrap output ref, as
-        /// <cardano_tx_hash>:<index>. Must still be an unspent wallet UTxO,
-        /// and the same value that parameterized bootstrap-treasury-info.
+        /// <cardano_tx_hash>:<index>. Must still be an unspent wallet UTxO. At
+        /// genesis it is the same value that parameterized
+        /// bootstrap-treasury-info. For a registry REVISION it is a fresh
+        /// outpoint — #12 was spent at genesis — and the treasury stays on #12,
+        /// read from the Config.
         #[arg(long)]
         registry_bootstrap: Option<String>,
         /// Actually submit via Blockfrost (default: build + print only).
@@ -601,12 +613,13 @@ enum Commands {
         /// predates; the embedded copy is the normal path.
         #[arg(long)]
         blueprint: Option<String>,
-        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
-        /// that parameterizes the registry policy (and through it treasury_info).
-        /// OPTIONAL, and normally left off: the bridge publishes it at Config #12
-        /// and this command reads it from there. Pass it only to build against a
-        /// bridge whose Config this node is not reading. An operator who goes
-        /// looking for this value has been sent somewhere they did not need to go.
+        /// The registry's own one-shot output ref (<tx_hash>:<index>) — the one
+        /// its policy is compiled from. OPTIONAL, and normally left off: this
+        /// command builds against the registry Config #9 names, found from
+        /// Config #12 or, after a registry revision, from the outpoint that
+        /// registry's root mint spent. The treasury is never moved by this flag
+        /// while a Config is readable. An operator who goes looking for this
+        /// value has been sent somewhere they did not need to go.
         #[arg(long)]
         registry_bootstrap: Option<String>,
         /// Pool cold signing key: 32-byte hex, or a path to a file holding that
@@ -653,6 +666,24 @@ enum Commands {
         /// an address that is not this wallet.
         #[arg(long)]
         registry_ref: Option<String>,
+        /// The wallet UTxO (<tx_hash>#<index>) this signature is bound to
+        /// ([REG-10], [DRG-6]). Normally left off: the command reserves a fresh
+        /// 2 ADA UTxO and records it, so fee selection leaves it alone while the
+        /// file is at the cold key.
+        ///
+        /// Two reasons to pass it. You are signing the printed `message` with
+        /// your own Ed25519 tool and want to choose which UTxO to tie up. Or the
+        /// state dir lost the reservation while a signed file was away — name
+        /// the outpoint the file's `nonce_outpoint` field carries, and the
+        /// signature is usable again as long as that UTxO is still unspent.
+        #[arg(long)]
+        nonce_utxo: Option<String>,
+        /// Do not submit the nonce reservation transaction; print it instead.
+        /// The reservation is still recorded, so the signature will be bound to
+        /// that outpoint — submit the printed transaction before the signed file
+        /// comes back, or the registration has nothing to spend.
+        #[arg(long)]
+        no_submit_reservation: bool,
         /// Actually submit via Blockfrost (requires passing the min-stake gate).
         #[arg(long)]
         submit: bool,
@@ -676,12 +707,13 @@ enum Commands {
         /// Override the embedded contract blueprint with a `plutus.json` file.
         #[arg(long)]
         blueprint: Option<String>,
-        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
-        /// that parameterizes the registry policy (and through it treasury_info).
-        /// OPTIONAL, and normally left off: the bridge publishes it at Config #12
-        /// and this command reads it from there. Pass it only to build against a
-        /// bridge whose Config this node is not reading. An operator who goes
-        /// looking for this value has been sent somewhere they did not need to go.
+        /// The registry's own one-shot output ref (<tx_hash>:<index>) — the one
+        /// its policy is compiled from. OPTIONAL, and normally left off: this
+        /// command builds against the registry Config #9 names, found from
+        /// Config #12 or, after a registry revision, from the outpoint that
+        /// registry's root mint spent. The treasury is never moved by this flag
+        /// while a Config is readable. An operator who goes looking for this
+        /// value has been sent somewhere they did not need to go.
         #[arg(long)]
         registry_bootstrap: Option<String>,
         /// Pool cold signing key: 32-byte hex, or a path to a file holding that
@@ -716,7 +748,48 @@ enum Commands {
         /// Discovered automatically otherwise, as for register-spo.
         #[arg(long)]
         registry_ref: Option<String>,
+        /// The wallet UTxO (<tx_hash>#<index>) this signature is bound to
+        /// ([REG-10], [DRG-6]). Normally left off: the command reserves a fresh
+        /// 2 ADA UTxO and records it, so fee selection leaves it alone while the
+        /// file is at the cold key.
+        ///
+        /// Two reasons to pass it. You are signing the printed `message` with
+        /// your own Ed25519 tool and want to choose which UTxO to tie up. Or the
+        /// state dir lost the reservation while a signed file was away — name
+        /// the outpoint the file's `nonce_outpoint` field carries, and the
+        /// signature is usable again as long as that UTxO is still unspent.
+        #[arg(long)]
+        nonce_utxo: Option<String>,
+        /// Do not submit the nonce reservation transaction; print it instead.
+        /// The reservation is still recorded, so the signature will be bound to
+        /// that outpoint — submit the printed transaction before the signed file
+        /// comes back, or the registration has nothing to spend.
+        #[arg(long)]
+        no_submit_reservation: bool,
         /// Actually submit via Blockfrost (default: print the tx only).
+        #[arg(long)]
+        submit: bool,
+    },
+    /// Carry a registration across a registry revision: mint the membership
+    /// token under the CURRENT registry against a membership proof in the
+    /// identity trie the Treasury state already commits to (spec [MIG-1] to
+    /// [MIG-6]).
+    ///
+    /// No cold key and no bifrost key: the transaction reproduces state the pool
+    /// already consented to, so anyone may submit it for anyone. `run-spo` does
+    /// this for its own pool at startup, so an operator normally never runs it.
+    MigrateRegistration {
+        #[arg(long)]
+        config: Option<String>,
+        /// Migrate EVERY pool in the previous list that is not yet in the
+        /// current one, paying each new node's min ADA.
+        ///
+        /// The federation's step right after the governance Update: it makes the
+        /// new list complete regardless of when operators upgrade, so the next
+        /// boundary snapshot of it equals the pre-migration roster.
+        #[arg(long)]
+        all: bool,
+        /// Actually submit via Blockfrost (default: build only).
         #[arg(long)]
         submit: bool,
     },
@@ -736,8 +809,10 @@ enum Commands {
         /// predates; the embedded copy is the normal path.
         #[arg(long)]
         blueprint: Option<String>,
-        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
-        /// that parameterizes the registry policy (and through it treasury_info).
+        /// The federation one-shot output ref (<tx_hash>:<index>) the treasury
+        /// is compiled from. Only for a bridge whose Config this node cannot
+        /// read: with a readable Config the treasury's one-shot is Config #12,
+        /// which no registry revision moves.
         #[arg(long)]
         registry_bootstrap: Option<String>,
         /// The incoming roster's x-only Y_51' (32-byte hex) — the new key.
@@ -1424,6 +1499,256 @@ fn resolve_one_shot(cfg: &HeimdallConfig, arg: Option<&str>) -> Result<String, S
     Ok(view.params.federation_one_shot)
 }
 
+/// The treasury and registry scripts of the bridge a command builds against.
+struct RegistryScripts {
+    treasury: heimdall::cardano::blueprint::ParameterizedScript,
+    registry: heimdall::cardano::blueprint::ParameterizedScript,
+    /// The one-shot the registry was compiled from: Config #12 until the
+    /// registry is revised, a fresh outpoint after (`cardano::revision`).
+    registry_bootstrap: String,
+    /// The Config NFT policy — the root of every federation script hash.
+    config_policy_id: [u8; 28],
+    /// The blueprint these were compiled from, for the command's further
+    /// derivations: it must be the SAME release, or a ban list or fault
+    /// verifier derived next to this registry belongs to another bridge.
+    blueprint: std::borrow::Cow<'static, str>,
+}
+
+/// The treasury script, its genesis one-shot, and the Config NFT policy.
+///
+/// The treasury's one-shot is Config #12 whenever a Config is readable: the
+/// treasury is never redeployed on a running bridge, so no override moves it.
+/// With no Config — genesis — `registry_override` is the one outpoint every
+/// federation script is compiled from, as #12 will then say.
+fn treasury_script(
+    cfg: &HeimdallConfig,
+    blueprint_json: &str,
+    view: Option<&heimdall::cardano::config_params::ConfigView>,
+    registry_override: Option<&str>,
+) -> Result<
+    (
+        heimdall::cardano::blueprint::ParameterizedScript,
+        String,
+        [u8; 28],
+    ),
+    String,
+> {
+    let genesis = match (view, registry_override) {
+        (Some(v), _) => v.params.federation_one_shot.clone(),
+        (None, Some(o)) => o.to_string(),
+        (None, None) => {
+            return Err(
+                "--registry-bootstrap was not given and there is no bridge Config to read it \
+                 from. It is Config #12 since WI-090: set cardano.config_address and \
+                 cardano.config_nft_policy_id, or pass the outpoint explicitly — which is what a \
+                 genesis command does, since it runs before the Config exists"
+                    .into(),
+            );
+        }
+    };
+    let (treasury_bootstrap, config_policy_id) =
+        heimdall::cardano::roster::treasury_derivation_inputs(
+            &cfg.cardano.with_one_shot(&genesis),
+        )?;
+    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
+    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
+    let treasury = heimdall::cardano::blueprint::treasury_info_script(
+        blueprint_json,
+        &tsy_tx_id,
+        u64::from(tsy_index),
+        &config_policy_id,
+    )
+    .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+    Ok((treasury, genesis, config_policy_id))
+}
+
+/// Compile the treasury and registry scripts from `blueprint_json`.
+///
+/// The treasury's one-shot is Config #12, always: the treasury is never
+/// redeployed on a running bridge. The registry's is #12 only until the
+/// registry is revised — a revision's `Bootstrap` cannot spend #12 a second
+/// time — so without an override it is looked up on chain and accepted only if
+/// it derives the policy Config #9 names (`revision::one_shot_for`). Deriving
+/// from #12 regardless, as every caller of this once did, builds against the
+/// registry the bridge left behind.
+///
+/// `registry_override` is `--registry-bootstrap`. With a readable Config it
+/// names the REGISTRY's one-shot and nothing else, which is what lets a
+/// revision's `bootstrap-registry` compile the new registry against the
+/// treasury that exists; overriding both compiles it against a treasury nobody
+/// deployed. With no Config — genesis — it is the one outpoint for both, as #12
+/// will then say.
+async fn registry_scripts(
+    cfg: &HeimdallConfig,
+    blueprint_path: Option<&str>,
+    view: Option<&heimdall::cardano::config_params::ConfigView>,
+    registry_override: Option<&str>,
+    deploys: bool,
+) -> Result<RegistryScripts, String> {
+    use heimdall::cardano::blueprint::{ContractsRelease, spos_registry_script};
+
+    let registry_override = registry_override.map(str::trim).filter(|s| !s.is_empty());
+    // Which contracts release to compile with. The one the bridge's registry
+    // runs, as the Config says — except for a command that DEPLOYS a registry
+    // revision (`--registry-bootstrap` naming a new one-shot while the Config
+    // still names the old registry), which compiles the newest release this
+    // heimdall carries; and at genesis, where there is no Config yet.
+    //
+    // A revision is an override naming an outpoint OTHER than Config #12. The
+    // flag's older help told operators to pass the bridge's own one-shot, and
+    // #12 is what the current registry was compiled from — taking that as a
+    // revision compiled the newest release against it and, for
+    // `bootstrap-ban-list`, minted a ban root under a policy no bridge uses.
+    let names_genesis = |o: &str, v: &heimdall::cardano::config_params::ConfigView| {
+        parse_cardano_outref(o).ok() == parse_cardano_outref(&v.params.federation_one_shot).ok()
+    };
+    let release = match view {
+        None => ContractsRelease::LATEST,
+        Some(v) if deploys && registry_override.is_some_and(|o| !names_genesis(o, v)) => {
+            ContractsRelease::LATEST
+        }
+        Some(v) => v.params.registry.contracts_release,
+    };
+    let blueprint = heimdall::cardano::blueprint::load_blueprint_for(release, blueprint_path)?;
+    let blueprint_json: &str = &blueprint;
+    let (treasury, genesis, config_policy_id) =
+        treasury_script(cfg, blueprint_json, view, registry_override)?;
+    let derive =
+        |one_shot: &str| -> Result<heimdall::cardano::blueprint::ParameterizedScript, String> {
+            let (tx_id, index) = parse_cardano_outref(one_shot)?;
+            spos_registry_script(
+                blueprint_json,
+                &tx_id,
+                u64::from(index),
+                &treasury.hash,
+                &config_policy_id,
+            )
+            .map_err(|e| format!("parameterize spos_registry: {e}"))
+        };
+    let registry_bootstrap = match (registry_override, view) {
+        (Some(o), _) => o.to_string(),
+        (None, Some(v)) => {
+            let published = v.params.registry.spos_registry_policy_id;
+            let (base_url, project_id) = migration_endpoints(cfg)?;
+            heimdall::cardano::revision::one_shot_for(
+                &base_url,
+                &project_id,
+                &genesis,
+                &published,
+                heimdall::cardano::registry::REGISTRATION_ROOT_KEY,
+                |o| derive(o).map(|s| s.hash),
+            )
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "this heimdall cannot compile the registry Config #9 names ({}) from its \
+                     embedded contracts — neither the federation one-shot (#12) nor the outpoint \
+                     that registry's reg-root mint spent derives it. Either this package is newer \
+                     than the governance Update that moves #9 — wait for it — or it is older \
+                     than the deployed registry, in which case upgrade",
+                    hex::encode(published),
+                )
+            })?
+        }
+        (None, None) => genesis,
+    };
+    let registry = derive(&registry_bootstrap)?;
+    Ok(RegistryScripts {
+        treasury,
+        registry,
+        registry_bootstrap,
+        config_policy_id,
+        blueprint,
+    })
+}
+
+/// [`registry_scripts`] for a blocking command, reading the Config itself.
+fn registry_scripts_blocking(
+    cfg: &HeimdallConfig,
+    blueprint_path: Option<&str>,
+    registry_override: Option<&str>,
+    deploys: bool,
+) -> Result<RegistryScripts, String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    let view = config_view(&rt, cfg)?;
+    rt.block_on(registry_scripts(
+        cfg,
+        blueprint_path,
+        view.as_ref(),
+        registry_override,
+        deploys,
+    ))
+}
+
+/// Registering and leaving with this heimdall need a rev-5.6 registry.
+///
+/// Its registration and exit messages are bound to a nonce outpoint ([REG-10],
+/// [DRG-6]); a rev-5.5 registry verifies the unbound kind and would reject them
+/// on chain, after the fee and after a trip to the cold key. So until the
+/// bridge's registry revision this heimdall refuses, and says what to do,
+/// rather than build a transaction that cannot land. It still RUNS a rev-5.5
+/// bridge — roster, ceremonies, signing — exactly as the previous release did.
+fn refuse_before_revision(
+    view: &heimdall::cardano::config_params::ConfigView,
+    what: &str,
+) -> Result<(), String> {
+    if view.params.registry.contracts_release
+        == heimdall::cardano::blueprint::ContractsRelease::Rev55
+    {
+        return Err(format!(
+            "{what}: this bridge's registry still runs the rev-5.5 contracts, whose registration \
+             and exit signatures are not bound to a nonce. This heimdall builds only the bound \
+             kind, which that registry rejects. Join or leave after the bridge's registry \
+             revision (the governance Update that appends Config #13), or with the previous \
+             heimdall release"
+        ));
+    }
+    Ok(())
+}
+
+/// Fault proofs and bans with this heimdall need a rev-5.6 ban list.
+///
+/// Its `ApplyBan` carries a Config reference index that a rev-5.5 ban list does
+/// not expect, so on a bridge whose registry is still rev 5.5 the transaction
+/// fails — after a fault proof has been minted and paid for. Refused up front,
+/// like registering and leaving ([`refuse_before_revision`]).
+fn refuse_ban_before_revision(
+    view: &heimdall::cardano::config_params::ConfigView,
+    what: &str,
+) -> Result<(), String> {
+    if view.params.registry.contracts_release
+        == heimdall::cardano::blueprint::ContractsRelease::Rev55
+    {
+        return Err(format!(
+            "{what}: this bridge's registry still runs the rev-5.5 contracts, whose ban list \
+             takes a different ApplyBan than this heimdall builds. Publish faults and bans after \
+             the bridge's registry revision, or with the previous heimdall release"
+        ));
+    }
+    Ok(())
+}
+
+/// spec [PRE-4]: the registry a command compiled must be the one Config #9
+/// names. Without an override [`registry_scripts`] guarantees it; with one,
+/// this is what names the version skew instead of a list parser's "missing
+/// root" at an address nothing was deployed to.
+fn check_published_registry(
+    registry: &heimdall::cardano::blueprint::ParameterizedScript,
+    view: &heimdall::cardano::config_params::ConfigView,
+) -> Result<(), String> {
+    let published = view.params.registry.spos_registry_policy_id;
+    if registry.hash == published {
+        return Ok(());
+    }
+    Err(format!(
+        "this heimdall compiled registry policy {} but the bridge Config names {} at #9. Check \
+         --registry-bootstrap: it names the registry's own one-shot, which after a registry \
+         revision is not Config #12",
+        registry.hash_hex(),
+        hex::encode(published),
+    ))
+}
+
 /// `sign-with-pool-key`: the air-gapped half of `register-spo` and
 /// `deregister-spo`, as one command that runs where the cold key lives.
 ///
@@ -1470,11 +1795,30 @@ fn run_sign_with_pool_key(
         println!("  bifrost pk:   {pk}");
     }
     println!("  registry:     {}", req.registry_policy);
-    if req.action == Action::Deregister {
-        println!();
-        println!("  This authorization commits to the pool id and NOTHING ELSE: it never");
-        println!("  expires, and whoever holds the file can post this exit from their own");
-        println!("  wallet and collect the freed deposit. Treat it like the cold key.");
+    // spec [REG-10], [DRG-6]. This line is what the exit warning used to be, and
+    // it says the opposite: the signature is bound to one outpoint, so it
+    // authorizes one transaction, and that transaction has to spend a UTxO the
+    // requesting wallet holds. A file that leaks is worth nothing to anyone
+    // without that wallet's payment key.
+    match req.nonce_outpoint.as_deref() {
+        Some(outpoint) => {
+            println!("  nonce utxo:   {outpoint}");
+            println!();
+            println!("  Usable ONCE, by the wallet that holds {outpoint}.");
+            println!("  The signature covers that outpoint, the transaction must spend it, and");
+            println!("  an outpoint is spendable once — so this file authorizes exactly one");
+            println!("  transaction and no later one. If the attempt fails, the same file is");
+            println!("  retried; no second trip here is needed until the UTxO is spent.");
+        }
+        // A request with no nonce cannot be signed at all — `sign` refuses it
+        // below. Say why here, where the operator is standing, rather than let
+        // it read as a malformed file.
+        None => {
+            println!();
+            println!("  This request carries no nonce outpoint, so it is not a version 2");
+            println!("  request. It cannot be signed: since spec rev 5.6 the message the");
+            println!("  chain checks ends with the outpoint of a UTxO the transaction spends.");
+        }
     }
     println!();
     confirm("Sign with the pool cold key?", yes)?;
@@ -1484,7 +1828,8 @@ fn run_sign_with_pool_key(
     write_json(&signed, out, secret)?;
     if secret && out.is_some() {
         println!("Delete this file once the exit is on chain. `deregister-spo --signed` does");
-        println!("it for you unless you pass --keep.");
+        println!("it for you unless you pass --keep. It is used up at that point either way:");
+        println!("the transaction spends the nonce UTxO the signature names.");
     }
     Ok(())
 }
@@ -1554,6 +1899,7 @@ fn find_own_pool_id(
     registry_utxos: &[heimdall::cardano::bf_http::BfUtxo],
     treasury_policy_hex: &str,
     treasury_utxos: &[heimdall::cardano::bf_http::BfUtxo],
+    previous_registry: Option<(&str, &[heimdall::cardano::bf_http::BfUtxo])>,
 ) -> Result<[u8; 28], String> {
     use bitcoin::key::Secp256k1;
 
@@ -1566,12 +1912,19 @@ fn find_own_pool_id(
     })?;
     let our_pk = keypair.x_only_public_key().0.serialize();
 
-    let snapshot = heimdall::cardano::roster::registry_snapshot(
+    // Migration-aware, and it has to be. The identity root commits to both
+    // lists while pools are crossing ([MIG-3]), so the strict read fails — and
+    // it would fail HERE, before the previous list the caller already fetched
+    // is ever used, making an exit impossible for the whole window.
+    let snapshot = heimdall::cardano::roster::registry_snapshot_during_migration(
         registry_utxos,
         registry_policy_hex,
         treasury_utxos,
         treasury_policy_hex,
         &hex::encode(heimdall::cardano::config_params::TREASURY_INFO_ASSET_NAME),
+        previous_registry.map(
+            |(policy_hex, utxos)| heimdall::cardano::roster::PreviousRegistry { policy_hex, utxos },
+        ),
     )
     .map_err(|e| format!("read the registry: {e}"))?;
 
@@ -1580,12 +1933,46 @@ fn find_own_pool_id(
         .iter()
         .find(|s| s.bifrost_id_pk == our_pk)
         .ok_or_else(|| {
-            format!(
-                "no registry entry for this node's bifrost key ({}). There is nothing to \
-                 leave — either this pool never registered, or [bifrost].skey_path points at \
-                 a different key than the one it registered with",
-                hex::encode(our_pk)
-            )
+            // Absent from the CURRENT list. During a migration window that has
+            // two more meanings — not carried across yet, or carried across and
+            // then left — and the difference decides what the operator should
+            // do next, so say which one it is. The snapshot's root is what tells
+            // them apart: an exit deleted the binding, a pending migration did
+            // not.
+            let in_previous = previous_registry.and_then(|(policy_hex, utxos)| {
+                heimdall::cardano::register_spo::registry_list_from_utxos(utxos, policy_hex)
+                    .ok()
+                    .map(|prev| prev.identity_pairs())
+            });
+            // The snapshot's own check already worked out which pools left.
+            let departed = snapshot.departed.contains(our_pk.as_slice());
+            let unmigrated = !departed
+                && in_previous
+                    .as_deref()
+                    .is_some_and(|prev| prev.iter().any(|(pk, _)| pk.as_slice() == our_pk));
+            if departed {
+                format!(
+                    "this pool already left: it was carried across to the current registry and \
+                     then exited, so there is nothing to leave. Its node in the previous list is \
+                     inert. bifrost key {}",
+                    hex::encode(our_pk)
+                )
+            } else if unmigrated {
+                format!(
+                    "this pool is registered under the PREVIOUS registry and has not been \
+                     carried across yet, so there is no entry in the current one to leave \
+                     from. Run `heimdall migrate-registration` (it needs no cold key, and \
+                     anyone may run it), then exit. bifrost key {}",
+                    hex::encode(our_pk)
+                )
+            } else {
+                format!(
+                    "no registry entry for this node's bifrost key ({}). There is nothing to \
+                     leave — either this pool never registered, or [bifrost].skey_path points \
+                     at a different key than the one it registered with",
+                    hex::encode(our_pk)
+                )
+            }
         })?;
     mine.pool_id
         .as_slice()
@@ -1737,6 +2124,7 @@ fn main() {
             base_port,
             deterministic,
             inject_fault,
+            no_auto_migrate,
             blockfrost_project_id,
             cardano_socket,
             cardano_magic,
@@ -1846,6 +2234,7 @@ fn main() {
                 deterministic,
                 inject_fault,
                 tries_rebuilt,
+                no_auto_migrate,
             ));
         }
         Commands::BootstrapTreasury {
@@ -2134,6 +2523,8 @@ fn main() {
             out,
             signed,
             registry_ref,
+            nonce_utxo,
+            no_submit_reservation,
             submit,
         } => {
             let cfg = load_config(config.as_deref());
@@ -2150,6 +2541,8 @@ fn main() {
                 out,
                 signed,
                 registry_ref,
+                nonce_utxo,
+                no_submit_reservation,
                 submit,
             };
             if let Err(e) = run_register_spo(&cfg, &args) {
@@ -2168,6 +2561,8 @@ fn main() {
             signed,
             keep,
             registry_ref,
+            nonce_utxo,
+            no_submit_reservation,
             submit,
         } => {
             let cfg = load_config(config.as_deref());
@@ -2181,9 +2576,22 @@ fn main() {
                 signed,
                 keep,
                 registry_ref,
+                nonce_utxo,
+                no_submit_reservation,
                 submit,
             };
             if let Err(e) = run_deregister_spo(&cfg, &args) {
+                error!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::MigrateRegistration {
+            config,
+            all,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_migrate_registration(&cfg, all, submit) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -2522,6 +2930,7 @@ async fn apply_tm_policy(
     Ok(chain.with_tm_policy(&cbor))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_spo(
     cfg: HeimdallConfig,
     index: Option<u16>,
@@ -2530,6 +2939,7 @@ async fn run_spo(
     // Why the startup catch-up rebuilt this node's tries, for the health
     // surface — see `heimdall::health::NodeState::tries_rebuilt_at_startup`.
     tries_rebuilt: Option<String>,
+    no_auto_migrate: bool,
 ) {
     // The startup block (spec [ST-1]).
     //
@@ -2580,6 +2990,35 @@ async fn run_spo(
             std::process::exit(1);
         }
     };
+    // The contracts release the bridge's registry runs. Recorded before the peer
+    // listener starts, because the handshake reports it: a node that answered
+    // with the newest release it carries would be refused by every peer still on
+    // the previous heimdall, and a roster could not upgrade one node at a time.
+    if let Some(view) = &bridge_config {
+        let release = view.params.registry.contracts_release;
+        heimdall::cardano::blueprint::set_release_in_effect(release);
+        info!(
+            "contracts: the bridge's registry runs {} (blueprint {})",
+            release.label(),
+            &release.commit()[..7]
+        );
+    }
+    // ── the entry an operator never runs (spec [MIG-1], §SPO Registration
+    // section 8) ──
+    //
+    // If a registry revision has happened and this pool's membership token is
+    // still under the previous policy, carry it across now, before the roster is
+    // read. No cold key: `Migrate` reproduces state the pool already consented
+    // to, so it needs no signature at all. An operator's whole upgrade is
+    // installing the package and restarting.
+    //
+    // At startup, and then every half hour while the node runs (below): a node
+    // already running on this version when Config #13 moves carries itself
+    // across at its next look, as does one restarted onto it. Every route —
+    // this, `heimdall migrate-registration`, the federation's `--all` — ends in
+    // the same place, and the chain, not this process, is what remembers.
+    let registry_migration = auto_migrate_registration(&cfg, no_auto_migrate).await;
+
     let contracts = match bridge_config.as_ref() {
         None => None,
         Some(v) => {
@@ -2808,20 +3247,38 @@ async fn run_spo(
                         )
                         .await
                         {
-                            Ok(Some(flow)) => {
+                            Ok(heimdall::cardano::blockfrost_chain::FaultEnforcement::Enabled(
+                                flow,
+                            )) => {
                                 startup.push(
                                     "automatic fault banning enabled: a proven cheat is published \
                                      on chain"
                                         .to_string(),
                                 );
-                                bf_chain = bf_chain.with_dkg_fault_ban_flow(flow);
+                                bf_chain = bf_chain.with_dkg_fault_ban_flow(*flow);
+                            }
+                            // A package ahead of (or behind) the governance
+                            // Update that moved the ban list. Not a reason to
+                            // leave the roster: say so, and run without
+                            // publishing until the two agree — a restart after
+                            // the Update picks enforcement back up.
+                            Ok(
+                                heimdall::cardano::blockfrost_chain::FaultEnforcement::ContractsDiffer(
+                                    why,
+                                )
+                                | heimdall::cardano::blockfrost_chain::FaultEnforcement::Unavailable(
+                                    why,
+                                ),
+                            ) => {
+                                warn!("DKG fault-ban flow: {why}");
+                                startup.push(format!("automatic fault banning OFF: {why}"));
                             }
                             // Reading the ban list and enforcing faults are
                             // separate (WI-060): the roster is filtered either
                             // way, and detection already excludes a cheater
                             // from the ceremony. Without the enforcement keys
                             // the cheating simply costs nothing on chain.
-                            Ok(None) => startup.push(
+                            Ok(heimdall::cardano::blockfrost_chain::FaultEnforcement::NotConfigured) => startup.push(
                                 "automatic fault banning disabled (no fault-enforcement keys); \
                                  the roster is still ban-filtered, and a cheat is detected and \
                                  excluded but not published on chain"
@@ -2983,6 +3440,44 @@ async fn run_spo(
             return;
         }
     };
+    // A migration submitted at startup has not confirmed yet, and the roster is
+    // read from the live registry list — which is exactly where this pool is not
+    // until it does. Resolving our own seat now would find nothing and end the
+    // process with a success status that no supervisor restarts: the node that
+    // was meant to carry itself across would simply stop. So wait for it, a few
+    // blocks' worth. If it still has not landed, exit with a FAILURE status, so
+    // the service is restarted and the startup migration runs again.
+    let roster = match (&configured_keypair, &registry_migration) {
+        (Some(kp), Some(migration)) if migration.pending.is_some() => {
+            let own_pk = kp.x_only_public_key().0.serialize();
+            let mut roster = roster;
+            let mut waited = 0u32;
+            while roster.own_participant(&own_pk).is_none() {
+                if waited >= 30 {
+                    error!(
+                        "Error: this pool's registry migration has not landed after ten minutes, \
+                         and the node cannot take its seat without it. Exiting with a failure \
+                         status so the service restarts and tries the migration again; \
+                         `heimdall migrate-registration` does it by hand"
+                    );
+                    std::process::exit(1);
+                }
+                if waited == 0 {
+                    info!(
+                        "waiting for this pool's registry migration to confirm before taking its \
+                         seat in the roster"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                waited += 1;
+                if let Ok(fresh) = chain.query_roster(epoch).await {
+                    roster = fresh;
+                }
+            }
+            roster
+        }
+        _ => roster,
+    };
 
     let (id, me, keypair) = match configured_keypair {
         // A [bifrost].skey_path was configured: locate ourselves by that key.
@@ -3037,6 +3532,18 @@ async fn run_spo(
                         // fatal (not registered / banned / URL-excluded). Fall
                         // back to --index ONLY for the legacy fixture demo.
                         let Some(ix) = index else {
+                            // Still under the previous registry, with auto-migration
+                            // off: say so rather than the generic "not registered".
+                            if registry_migration.is_some() {
+                                error!(
+                                    "Error: this pool is still registered under the previous \
+                                     registry and has no seat in the current one. Carry it \
+                                     across with `heimdall migrate-registration` (no cold key; \
+                                     anyone may run it), or start the node without \
+                                     --no-auto-migrate"
+                                );
+                                return;
+                            }
                             error!(
                                 "Error: this node's bifrost_id_pk ({}) is in neither the eligible \
                                  roster for epoch {epoch} (not registered / banned / URL-excluded) \
@@ -3167,6 +3674,77 @@ async fn run_spo(
     let health = heimdall::health::HealthHandle::new();
     if let Some(why) = tries_rebuilt {
         health.update(|h| h.tries_rebuilt_at_startup = Some(why));
+    }
+    // Whether a migration watcher is running, so the periodic re-check below
+    // does not start a second one for the same pool.
+    let migration_watching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(migration) = registry_migration {
+        health.update(|h| h.registry_migration = Some(migration.state.clone()));
+        // A migration in flight is reported provisionally, so something has to
+        // finish the sentence. Without this the line reads "migrating" for the
+        // life of the process — including long after it landed — and the
+        // "migrated" state the operator guide describes is never reached.
+        if let Some(pending) = migration.pending {
+            migration_watching.store(true, std::sync::atomic::Ordering::Relaxed);
+            let done = migration_watching.clone();
+            let (watch_health, watch_cfg) = (health.clone(), cfg.clone());
+            tokio::spawn(async move {
+                watch_migration(watch_health, watch_cfg, pending).await;
+                done.store(false, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+    }
+    // A registry revision does not wait for restarts: the governance Update
+    // can land while this node runs, and one that only looked at startup would
+    // sit outside the new registry until an operator restarted it or the
+    // federation's `--all` pass reached it. So look again, every half hour —
+    // one Config read when no migration is in progress — and carry this pool
+    // across, or, with --no-auto-migrate, report it ready to migrate.
+    {
+        let (recheck_health, recheck_cfg) = (health.clone(), cfg.clone());
+        let watching = migration_watching.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+                if watching.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let migration = match check_migration(&recheck_cfg, no_auto_migrate).await {
+                    // No migration in progress: nothing for the line to say.
+                    MigrationCheck::NoWindow => {
+                        recheck_health.update(|h| h.registry_migration = None);
+                        continue;
+                    }
+                    // In a window, with nothing to do: a line saying this
+                    // node migrated is still true and stays; anything else —
+                    // a failed check, a migration that had not landed — is
+                    // stale now, and goes.
+                    MigrationCheck::NothingToDo => {
+                        recheck_health.update(|h| {
+                            if !h
+                                .registry_migration
+                                .as_deref()
+                                .is_some_and(|l| l.starts_with("migrated "))
+                            {
+                                h.registry_migration = None;
+                            }
+                        });
+                        continue;
+                    }
+                    MigrationCheck::Report(m) => m,
+                };
+                recheck_health.update(|h| h.registry_migration = Some(migration.state.clone()));
+                if let Some(pending) = migration.pending {
+                    watching.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let done = watching.clone();
+                    let (h, c) = (recheck_health.clone(), recheck_cfg.clone());
+                    tokio::spawn(async move {
+                        watch_migration(h, c, pending).await;
+                        done.store(false, std::sync::atomic::Ordering::Relaxed);
+                    });
+                }
+            }
+        });
     }
     if cfg.health.enabled {
         tokio::spawn(heimdall::health::serve(
@@ -5321,6 +5899,7 @@ fn run_bootstrap_treasury_info(
         &reg_tx_id,
         u64::from(reg_index),
         &treasury.hash,
+        &config_policy_id,
     )
     .map_err(|e| format!("parameterize spos_registry: {e}"))?;
     println!("registry policy id:   {}", registry.hash_hex());
@@ -5359,11 +5938,13 @@ fn run_bootstrap_treasury_info(
     // spend path requires a registry-policy mint — the state UTxO created here
     // would be frozen at bootstrap forever.
     let reg_tx_hash_hex = hex::encode(reg_tx_id);
-    let wallet_utxos: Vec<WalletUtxo> = raw
-        .iter()
-        .map(WalletUtxo::from_bf)
-        .filter(|u| !(u.tx_hash == reg_tx_hash_hex && u.output_index == reg_index))
-        .collect();
+    let wallet_utxos: Vec<WalletUtxo> = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?
+    .into_iter()
+    .filter(|u| !(u.tx_hash == reg_tx_hash_hex && u.output_index == reg_index))
+    .collect();
     if wallet_utxos.is_empty() {
         return Err(format!(
             "wallet has no spendable UTxOs besides the registry bootstrap outref — \
@@ -5498,29 +6079,11 @@ fn run_bootstrap_registry(
     submit: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::spos_registry_script;
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::register_spo::build_registry_bootstrap_tx;
 
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
-
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
-    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(registry_bootstrap),
-        )?;
-    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
-    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
-    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
-        &blueprint_json,
-        (&reg_tx_id, u64::from(reg_index)),
-        (&tsy_tx_id, u64::from(tsy_index)),
-        &config_policy_id,
-    )
-    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
 
     let pid = cfg
         .cardano
@@ -5529,10 +6092,32 @@ fn run_bootstrap_registry(
         .ok_or("cardano.blockfrost_project_id required")?;
     let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    // With a readable Config, `--registry-bootstrap` names the REGISTRY's
+    // one-shot and the treasury stays on #12 — which is what a registry
+    // revision's deploy needs: the new registry, compiled against the treasury
+    // that exists, from the newest contracts release. At genesis there is no
+    // Config and it is the one outpoint for both (`registry_scripts`).
+    let bridge_config = config_view(&rt, cfg)?;
+    let RegistryScripts {
+        registry,
+        registry_bootstrap,
+        ..
+    } = rt.block_on(registry_scripts(
+        cfg,
+        blueprint_path,
+        bridge_config.as_ref(),
+        registry_bootstrap,
+        true,
+    ))?;
+    let registry_bootstrap = &registry_bootstrap;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
@@ -5588,48 +6173,33 @@ fn run_bootstrap_ban_list(
     use heimdall::cardano::apply_ban::build_ban_bootstrap_tx;
     use heimdall::cardano::ban_list::BanPolicyParams;
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::{spo_bans_script, spos_registry_script};
-    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::blueprint::spo_bans_script;
 
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
-
-    // The ban policy is parameterized by the registry hash + the fault-policy
-    // set + ban schedule + its own one-shot outref. Everything but the outref is
-    // config-pinned (shared with apply-ban) so the derived policy id matches.
-    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(registry_bootstrap),
-        )?;
-    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
-    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
-    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
-        &blueprint_json,
-        (&reg_tx_id, u64::from(reg_index)),
-        (&tsy_tx_id, u64::from(tsy_index)),
-        &config_policy_id,
-    )
-    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    // The ban policy is parameterized by the CONFIG NFT policy + the
+    // fault-policy set + ban schedule + its own one-shot outref. Everything but
+    // the outref is config-pinned (shared with apply-ban) so the derived policy
+    // id matches.
+    //
+    // It used to take the registry hash directly. Rev 5.6 replaced that with
+    // the Config NFT policy and a run-time read of Config #9 ([PRE-5]) — but
+    // the three fault verifiers are still compiled from the registry hash, and
+    // the ban policy from theirs, so a registry revision still moves #8.
+    //
+    // The registry this ban list is FOR. Normally the one Config #9 names; with
+    // `--registry-bootstrap`, the one that outpoint compiles — which, when it is
+    // not #9, is a registry revision being prepared, and the ban list that goes
+    // with it (rollout step c1). The ban list does not name the registry
+    // ([PRE-5]), but its fault verifiers do, and it is parameterized by theirs.
+    let RegistryScripts {
+        registry: target_registry,
+        config_policy_id,
+        blueprint: blueprint_json,
+        ..
+    } = registry_scripts_blocking(cfg, blueprint_path, registry_bootstrap, true)?;
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
-    // apply-ban derives the ban policy id from the one-shot the Config publishes
-    // at #12. If a different outref is bootstrapped here, `ban-root` is minted
-    // under a policy apply-ban never queries — fail loudly instead of silently
-    // bootstrapping an unreachable list.
-    if let Some(cfg_ban) = cfg.cardano.federation_one_shot.as_deref() {
-        let (cfg_tx_id, cfg_index) = parse_cardano_outref(cfg_ban)?;
-        if (cfg_tx_id, cfg_index) != (ban_tx_id, ban_index) {
-            return Err(format!(
-                "--ban-bootstrap ({ban_bootstrap}) does not match the bridge Config's \
-                 federation one-shot ({cfg_ban}); apply-ban derives the ban policy from the \
-                 published value, so bootstrapping a different outref would mint ban-root \
-                 under an unreachable policy"
-            ));
-        }
-    }
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     // The ban schedule is a property of the deployment, not of this operator, so
     // take it from the bridge Config whenever there IS one (params[4..6]).
@@ -5654,7 +6224,29 @@ fn run_bootstrap_ban_list(
                      derive a ban policy id no deployment has"
                     .to_string());
             }
-            BanPolicyParams::resolve(&cfg.cardano, Some(published)).map_err(|e| e.to_string())?
+            let mut params = BanPolicyParams::resolve(&cfg.cardano, Some(published))
+                .map_err(|e| e.to_string())?;
+            // A revision's ban list authorizes the fault verifiers of the
+            // registry it is for, not of the one #9 still names.
+            if target_registry.hash != published.registry.spos_registry_policy_id {
+                let fault = |f: fn(
+                    &str,
+                    &[u8; 28],
+                ) -> Result<
+                    heimdall::cardano::blueprint::ParameterizedScript,
+                    heimdall::cardano::blueprint::BlueprintError,
+                >| {
+                    f(&blueprint_json, &target_registry.hash)
+                        .map(|s| s.hash)
+                        .map_err(|e| format!("parameterize a fault verifier: {e}"))
+                };
+                params.fault_proof_policies = vec![
+                    fault(heimdall::cardano::blueprint::fault_verifier_round1_script)?,
+                    fault(heimdall::cardano::blueprint::fault_verifier_round2_script)?,
+                    fault(heimdall::cardano::blueprint::fault_verifier_equivocation_script)?,
+                ];
+            }
+            params
         }
         None => {
             let (Some(base), Some(faults), Some(window)) = (flag_base, flag_faults, flag_window)
@@ -5675,7 +6267,10 @@ fn run_bootstrap_ban_list(
     };
     let spo_bans = spo_bans_script(
         &blueprint_json,
-        &registry.hash,
+        // The registry policy (rev 5.5's first parameter) and the Config NFT
+        // policy (rev 5.6's, [PRE-5]): the blueprint's parameter list picks.
+        &target_registry.hash,
+        &config_policy_id,
         &params.fault_proof_policies,
         params.base_ban_duration_ms,
         params.max_faults_before_permanent,
@@ -5686,8 +6281,25 @@ fn run_bootstrap_ban_list(
     .map_err(|e| format!("parameterize spo_bans: {e}"))?;
     // A bridge whose Config already names a ban policy already HAS a ban list.
     // Minting ban-root under a different policy would create a second list at an
-    // address no SPO reads, so refuse rather than produce it.
-    if let Some(published) = bridge_config.as_ref().map(|v| &v.params.bans)
+    // address no SPO reads, so refuse rather than produce it — unless this is
+    // the ban list of a registry revision, which #8 is about to name in the same
+    // governance Update that moves #9.
+    let revision = bridge_config
+        .as_ref()
+        .is_some_and(|v| target_registry.hash != v.params.registry.spos_registry_policy_id);
+    if revision {
+        println!(
+            "registry revision: this ban list is for registry {}, not the {} Config #9 names \
+             now. Config #8 must move to its policy in the same governance Update as #9",
+            target_registry.hash_hex(),
+            bridge_config
+                .as_ref()
+                .map(|v| hex::encode(v.params.registry.spos_registry_policy_id))
+                .unwrap_or_default(),
+        );
+    }
+    if !revision
+        && let Some(published) = bridge_config.as_ref().map(|v| &v.params.bans)
         && published.spo_bans_policy_id != spo_bans.hash
     {
         return Err(format!(
@@ -5708,7 +6320,10 @@ fn run_bootstrap_ban_list(
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
@@ -5751,7 +6366,7 @@ fn run_bootstrap_ban_list(
 /// stuck, if every UTxO carries a native token. See WI-20260910-5DRP6.
 fn run_ensure_collateral(cfg: &HeimdallConfig, submit: bool) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::tx_common::{
         COLLATERAL_LOVELACE, COLLATERAL_UTXOS_WANTED, build_collateral_top_up,
         collateral_candidates,
@@ -5770,7 +6385,13 @@ fn run_ensure_collateral(cfg: &HeimdallConfig, submit: bool) -> Result<(), Strin
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    // Flag the reserved nonce, if any. This command consolidates SMALL UTxOs,
+    // so without it a 2 ADA reservation is the first thing it would spend —
+    // killing a cold signature already on its way to a safe ([REG-10]).
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
 
     let total: u64 = wallet_utxos.iter().map(|u| u.lovelace).sum();
     let with_tokens = wallet_utxos.iter().filter(|u| !u.tokens.is_empty()).count();
@@ -5817,29 +6438,11 @@ fn run_deploy_registry_ref(
     force: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::spos_registry_script;
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
 
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
-
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
-    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(registry_bootstrap),
-        )?;
-    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
-    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
-    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
-        &blueprint_json,
-        (&reg_tx_id, u64::from(reg_index)),
-        (&tsy_tx_id, u64::from(tsy_index)),
-        &config_policy_id,
-    )
-    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
 
     let pid = cfg
         .cardano
@@ -5848,10 +6451,26 @@ fn run_deploy_registry_ref(
         .ok_or("cardano.blockfrost_project_id required")?;
     let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    // With a readable Config, `--registry-bootstrap` names the REGISTRY's
+    // one-shot and the treasury stays on #12 — which is what a registry
+    // revision's deploy needs: the new registry, compiled against the treasury
+    // that exists, from the newest contracts release. At genesis there is no
+    // Config and it is the one outpoint for both (`registry_scripts`).
+    let bridge_config = config_view(&rt, cfg)?;
+    let RegistryScripts { registry, .. } = rt.block_on(registry_scripts(
+        cfg,
+        blueprint_path,
+        bridge_config.as_ref(),
+        registry_bootstrap,
+        true,
+    ))?;
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     if ref_script_already_deployed(&raw, &registry.hash_hex(), "registry", force) {
         return Ok(());
     }
@@ -5907,27 +6526,20 @@ fn run_deploy_fault_ref(
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{
         fault_verifier_equivocation_script, fault_verifier_round1_script,
-        fault_verifier_round2_script, spos_registry_script,
+        fault_verifier_round2_script,
     };
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
-    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(registry_bootstrap),
-        )?;
-    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
-    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
-    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
-        &blueprint_json,
-        (&reg_tx_id, u64::from(reg_index)),
-        (&tsy_tx_id, u64::from(tsy_index)),
-        &config_policy_id,
-    )
-    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    // The registry the bridge names at #9 — not necessarily the one Config
+    // #12 compiles to, which after a registry revision is the registry the
+    // bridge left (`registry_scripts`). With --registry-bootstrap, the one that
+    // outpoint compiles, which is how a revision's next registry is named.
+    let RegistryScripts {
+        registry,
+        blueprint: blueprint_json,
+        ..
+    } = registry_scripts_blocking(cfg, blueprint_path, registry_bootstrap, true)?;
     let verifier = match kind {
         "round1" => fault_verifier_round1_script(&blueprint_json, &registry.hash),
         "round2" => fault_verifier_round2_script(&blueprint_json, &registry.hash),
@@ -5962,7 +6574,10 @@ fn run_deploy_fault_ref(
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     if ref_script_already_deployed(&raw, &verifier.hash_hex(), "fault_verifier", force) {
         return Ok(());
     }
@@ -6005,27 +6620,21 @@ fn run_deploy_spo_bans_ref(
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blueprint::{
         fault_verifier_equivocation_script, fault_verifier_round1_script,
-        fault_verifier_round2_script, spo_bans_script, spos_registry_script,
+        fault_verifier_round2_script, spo_bans_script,
     };
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
-    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(registry_bootstrap),
-        )?;
-    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
-    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
-    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
-        &blueprint_json,
-        (&reg_tx_id, u64::from(reg_index)),
-        (&tsy_tx_id, u64::from(tsy_index)),
-        &config_policy_id,
-    )
-    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    // The registry the bridge names at #9 — not necessarily the one Config
+    // #12 compiles to, which after a registry revision is the registry the
+    // bridge left (`registry_scripts`). With --registry-bootstrap, the one that
+    // outpoint compiles, which is how a revision's next registry is named.
+    let RegistryScripts {
+        registry,
+        config_policy_id,
+        blueprint: blueprint_json,
+        ..
+    } = registry_scripts_blocking(cfg, blueprint_path, registry_bootstrap, true)?;
     let r1 = fault_verifier_round1_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("fault_verifier_round1: {e}"))?;
     let r2 = fault_verifier_round2_script(&blueprint_json, &registry.hash)
@@ -6036,7 +6645,10 @@ fn run_deploy_spo_bans_ref(
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
     let spo_bans = spo_bans_script(
         &blueprint_json,
+        // The registry policy (rev 5.5's first parameter) and the Config NFT
+        // policy (rev 5.6's, [PRE-5]): the blueprint's parameter list picks.
         &registry.hash,
+        &config_policy_id,
         &policies,
         base_ban_duration_ms,
         max_faults_before_permanent,
@@ -6074,7 +6686,10 @@ fn run_deploy_spo_bans_ref(
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     if ref_script_already_deployed(&raw, &spo_bans.hash_hex(), "spo_bans", force) {
         return Ok(());
     }
@@ -6118,34 +6733,29 @@ fn run_init_scripts(
     use heimdall::cardano::bf_http::{self, RegistrationState};
     use heimdall::cardano::blueprint::{
         fault_verifier_equivocation_script, fault_verifier_round1_script,
-        fault_verifier_round2_script, spo_bans_script, spos_registry_script,
+        fault_verifier_round2_script, spo_bans_script,
     };
     use heimdall::cardano::init_scripts::{
         WithdrawScript, build_init_scripts_tx, is_already_registered_error,
     };
     use heimdall::cardano::publish::WalletUtxo;
-    use heimdall::cardano::tx_common::is_testnet_address;
 
     // Derive spo_bans exactly as deploy-spo-bans-ref and
     // DkgFaultBanFlow::from_config do — recomputing the fault-verifier policy
     // ids from the blueprint rather than reading cfg.fault_proof_policies, so
     // the credential we register cannot drift from the one ApplyBan withdraws.
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(blueprint_path)?;
-    let registry_bootstrap = &resolve_one_shot(cfg, registry_bootstrap)?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(registry_bootstrap),
-        )?;
-    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
-    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
-    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
-        &blueprint_json,
-        (&reg_tx_id, u64::from(reg_index)),
-        (&tsy_tx_id, u64::from(tsy_index)),
-        &config_policy_id,
-    )
-    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    // The registry the bridge names at #9 — not necessarily the one Config
+    // #12 compiles to, which after a registry revision is the registry the
+    // bridge left (`registry_scripts`). With --registry-bootstrap, the one that
+    // outpoint compiles, which is how a revision's next registry is named.
+    let RegistryScripts {
+        registry,
+        config_policy_id,
+        registry_bootstrap,
+        blueprint: blueprint_json,
+        ..
+    } = registry_scripts_blocking(cfg, blueprint_path, registry_bootstrap, true)?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
     let r1 = fault_verifier_round1_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("fault_verifier_round1: {e}"))?;
     let r2 = fault_verifier_round2_script(&blueprint_json, &registry.hash)
@@ -6155,7 +6765,10 @@ fn run_init_scripts(
     let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
     let spo_bans = spo_bans_script(
         &blueprint_json,
+        // The registry policy (rev 5.5's first parameter) and the Config NFT
+        // policy (rev 5.6's, [PRE-5]): the blueprint's parameter list picks.
         &registry.hash,
+        &config_policy_id,
         &[r1.hash, r2.hash, eq.hash],
         base_ban_duration_ms,
         max_faults_before_permanent,
@@ -6244,14 +6857,16 @@ fn run_init_scripts(
     // registry outref for the same reason.
     let reg_outref = (hex::encode(reg_tx_id), reg_index);
     let ban_outref = (hex::encode(ban_tx_id), ban_index);
-    let wallet_utxos: Vec<WalletUtxo> = raw
-        .iter()
-        .map(WalletUtxo::from_bf)
-        .filter(|u| {
-            let this = (u.tx_hash.clone(), u.output_index);
-            this != reg_outref && this != ban_outref
-        })
-        .collect();
+    let wallet_utxos: Vec<WalletUtxo> = heimdall::cardano::nonce_reservation::wallet_set(
+        &raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?
+    .into_iter()
+    .filter(|u| {
+        let this = (u.tx_hash.clone(), u.output_index);
+        this != reg_outref && this != ban_outref
+    })
+    .collect();
     if wallet_utxos.is_empty() {
         return Err(format!(
             "wallet has no spendable UTxOs besides the bootstrap one-shot outrefs — \
@@ -6307,6 +6922,8 @@ struct RegisterSpoArgs {
     out: Option<String>,
     signed: Option<String>,
     registry_ref: Option<String>,
+    nonce_utxo: Option<String>,
+    no_submit_reservation: bool,
     submit: bool,
 }
 
@@ -6321,6 +6938,8 @@ struct DeregisterSpoArgs {
     signed: Option<String>,
     keep: bool,
     registry_ref: Option<String>,
+    nonce_utxo: Option<String>,
+    no_submit_reservation: bool,
     submit: bool,
 }
 
@@ -6704,6 +7323,1253 @@ impl EvidenceFile {
 /// Bech32 (`pool1…`) form of the 28-byte pool key hash, as Blockfrost expects.
 use heimdall::cardano::hash::pool_id_bech32;
 
+// ---------------------------------------------------------------------------
+// Registry migration (spec [MIG-1] to [MIG-6], §SPO Registration section 8)
+// ---------------------------------------------------------------------------
+
+/// What one migration attempt did, for the caller to report.
+///
+/// Only the two BUILT outcomes are here: whether a pool needs migrating at all
+/// is [`classify`](heimdall::cardano::migrate_registration::classify)'s answer,
+/// decided before a transaction is built, and the callers act on that directly.
+enum MigrationOutcome {
+    /// Built and submitted.
+    Migrated { tx_hash: String },
+    /// Built but not submitted (dry run).
+    Built,
+}
+
+/// Everything a migration needs from the chain, read once.
+struct MigrationContext {
+    registry: heimdall::cardano::blueprint::ParameterizedScript,
+    previous_policy_hex: String,
+    treasury_policy_hex: String,
+    registry_utxos: Vec<heimdall::cardano::bf_http::BfUtxo>,
+    previous_registry_utxos: Vec<heimdall::cardano::bf_http::BfUtxo>,
+    treasury_utxos: Vec<heimdall::cardano::bf_http::BfUtxo>,
+    wallet_utxos: Vec<heimdall::cardano::publish::WalletUtxo>,
+    wallet_address: String,
+    key: pallas_wallet::PrivateKey,
+    config_ref: (String, u32),
+    registry_ref: Option<(String, u32)>,
+    cost_models: Vec<Vec<i64>>,
+    project_id: String,
+}
+
+/// Read everything a migration needs, or `None` when Config #13 says no
+/// migration is in progress.
+///
+/// Returning `None` rather than an error is the point: this runs at every node's
+/// startup, and "no registry revision is happening" is the normal answer. So is
+/// "there is no bridge Config" — the mock chain and every node without
+/// `cardano.config_address` — because #13, the only thing that can declare a
+/// migration, lives in the Config.
+///
+/// `daemon` picks the lenient wallet read. `run-spo`'s startup migration and
+/// its background retries must not stop over a nonce-reservation file that
+/// belongs to a registration flow — the same rule every other daemon wallet
+/// read follows (`wallet_set_lenient`). The `migrate-registration` command is
+/// strict, as the registration commands are.
+async fn migration_context(
+    cfg: &HeimdallConfig,
+    daemon: bool,
+) -> Result<Option<MigrationContext>, String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::script_enterprise_address;
+
+    use heimdall::cardano::ref_script::find_ref_script_anywhere;
+
+    let Some(view) = config_view_async(cfg).await? else {
+        return Ok(None);
+    };
+    let Some(previous) = view.params.registry.previous_spos_registry_policy_id else {
+        return Ok(None);
+    };
+
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
+    let (key, wallet_address) = (wallet.key, wallet.address);
+    let mainnet = cfg.cardano.is_mainnet()?;
+    let network = if mainnet {
+        pallas_addresses::Network::Mainnet
+    } else {
+        pallas_addresses::Network::Testnet
+    };
+
+    // The registry Config #9 names — during a migration, by definition, NOT
+    // the one Config #12 compiles to (`registry_scripts`). Not
+    // `resolve_one_shot` either: that helper builds its own tokio runtime and
+    // blocks on it, which panics on `run-spo`'s async startup path.
+    let RegistryScripts {
+        treasury,
+        registry,
+        registry_bootstrap,
+        ..
+    } = registry_scripts(cfg, None, Some(&view), None, false).await?;
+
+    let project_id = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required for a registry migration")?
+        .to_string();
+    let base_url = bf_http::base_url(&project_id, cfg.cardano.blockfrost_url.as_deref());
+
+    let registry_addr = registry.enterprise_address(network);
+    let previous_addr = script_enterprise_address(&previous, network);
+    let treasury_addr = treasury.enterprise_address(network);
+
+    let registry_utxos = bf_http::fetch_address_utxos(&base_url, &project_id, &registry_addr)
+        .await
+        .map_err(|e| format!("registry UTxO query: {e}"))?;
+    let previous_registry_utxos =
+        bf_http::fetch_address_utxos(&base_url, &project_id, &previous_addr)
+            .await
+            .map_err(|e| format!("previous registry UTxO query: {e}"))?;
+    let treasury_utxos = bf_http::fetch_address_utxos(&base_url, &project_id, &treasury_addr)
+        .await
+        .map_err(|e| format!("treasury UTxO query: {e}"))?;
+    let wallet_raw = bf_http::fetch_address_utxos(&base_url, &project_id, &wallet_address)
+        .await
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    // Marked either way: a pending registration or exit signature may be bound
+    // to one of these, and a migration must not spend it out from under the
+    // operator ([REG-10]).
+    let state_dir = cfg.protocol.state_dir.as_deref().map(std::path::Path::new);
+    let wallet_utxos = if daemon {
+        heimdall::cardano::nonce_reservation::wallet_set_lenient(&wallet_raw, state_dir)
+    } else {
+        heimdall::cardano::nonce_reservation::wallet_set(&wallet_raw, state_dir)?
+    };
+    let cost_models = bf_http::fetch_cost_models(&base_url, &project_id)
+        .await
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let registry_ref = find_ref_script_anywhere(
+        &base_url,
+        &project_id,
+        &wallet_address,
+        Some(&registry_bootstrap),
+        &registry.hash_hex(),
+    )
+    .await
+    .map_err(|e| format!("reference-script lookup: {e}"))?
+    .map(|(found, _)| found.outref());
+
+    Ok(Some(MigrationContext {
+        registry,
+        previous_policy_hex: hex::encode(previous),
+        treasury_policy_hex: hex::encode(view.params.registry.treasury_info_policy_id),
+        registry_utxos,
+        previous_registry_utxos,
+        treasury_utxos,
+        wallet_utxos,
+        wallet_address,
+        key,
+        config_ref: (view.utxo.tx_hash.clone(), view.utxo.index),
+        registry_ref,
+        cost_models,
+        project_id,
+    }))
+}
+
+impl MigrationContext {
+    /// Both lists, parsed.
+    fn lists(
+        &self,
+    ) -> Result<
+        (
+            heimdall::cardano::registry::RegistryList,
+            heimdall::cardano::registry::RegistryList,
+        ),
+        String,
+    > {
+        use heimdall::cardano::register_spo::registry_list_from_utxos;
+        let current = registry_list_from_utxos(&self.registry_utxos, &self.registry.hash_hex())
+            .map_err(|e| format!("the current registry list: {e}"))?;
+        let previous =
+            registry_list_from_utxos(&self.previous_registry_utxos, &self.previous_policy_hex)
+                .map_err(|e| format!("the previous registry list: {e}"))?;
+        Ok((current, previous))
+    }
+
+    /// The window the Treasury state's identity root explains — through the one
+    /// function every builder and the roster read use.
+    fn window(
+        &self,
+        current: &heimdall::cardano::registry::RegistryList,
+    ) -> Result<heimdall::cardano::migrate_registration::IdentityWindow, String> {
+        let root = heimdall::cardano::treasury_spend::find_treasury_state(
+            &self.treasury_utxos,
+            &self.treasury_policy_hex,
+            &hex::encode(heimdall::cardano::config_params::TREASURY_INFO_ASSET_NAME),
+        )
+        .map(|s| s.datum.bifrost_identity_root)
+        .map_err(|e| format!("read the Treasury state: {e}"))?;
+        heimdall::cardano::migrate_registration::read_identity_window(
+            current,
+            Some((
+                self.previous_policy_hex.as_str(),
+                self.previous_registry_utxos.as_slice(),
+            )),
+            root,
+        )
+        .map(|(_, window)| window)
+        .map_err(|e| e.to_string())
+    }
+
+    /// Build one pool's migration transaction. Pure and synchronous — no chain
+    /// access, so it is safe to call from either an async or a blocking caller.
+    fn build(
+        &self,
+        pool_id: &[u8],
+    ) -> Result<heimdall::cardano::migrate_registration::MigrateRegistrationTx, String> {
+        use heimdall::cardano::migrate_registration::{
+            MigrateRegistrationRequest, build_migrate_registration_tx,
+        };
+        let req = MigrateRegistrationRequest {
+            registry_script: &self.registry,
+            previous_registry_policy_hex: &self.previous_policy_hex,
+            treasury_policy_hex: &self.treasury_policy_hex,
+            treasury_asset_name_hex: &hex::encode(
+                heimdall::cardano::config_params::TREASURY_INFO_ASSET_NAME,
+            ),
+            pool_id,
+            registry_utxos: &self.registry_utxos,
+            previous_registry_utxos: &self.previous_registry_utxos,
+            treasury_utxos: &self.treasury_utxos,
+            wallet_address: &self.wallet_address,
+            wallet_utxos: &self.wallet_utxos,
+            key: &self.key,
+            config_ref: self.config_ref.clone(),
+            registry_ref: self.registry_ref.clone(),
+            cost_models: Some(self.cost_models.clone()),
+        };
+        build_migrate_registration_tx(&req)
+            .map_err(|e| format!("build migrate_spo tx for {}: {e}", hex::encode(pool_id)))
+    }
+
+    /// Build and, with `submit`, broadcast — for the blocking CLI caller.
+    fn migrate(
+        &self,
+        rt: &tokio::runtime::Runtime,
+        cfg: &HeimdallConfig,
+        pool_id: &[u8],
+        submit: bool,
+    ) -> Result<MigrationOutcome, String> {
+        let built = self.build(pool_id)?;
+        if !submit {
+            return Ok(MigrationOutcome::Built);
+        }
+        let tx_hash = submit_tx_blockfrost(cfg, &self.project_id, &built.signed_tx_hex, rt)?;
+        hold_spent_inputs(&built.signed_tx_hex);
+        Ok(MigrationOutcome::Migrated { tx_hash })
+    }
+
+    /// The same, for an async caller. Submits through the Blockfrost client
+    /// directly rather than through a nested runtime.
+    async fn migrate_async(&self, cfg: &HeimdallConfig, pool_id: &[u8]) -> Result<String, String> {
+        let built = self.build(pool_id)?;
+        let cbor = hex::decode(&built.signed_tx_hex).map_err(|e| e.to_string())?;
+        let mut settings = blockfrost::BlockFrostSettings::new();
+        if let Some(url) = cfg.cardano.blockfrost_url.as_deref() {
+            settings.base_url = Some(url.to_string());
+        }
+        let tx_hash = blockfrost::BlockfrostAPI::new(&self.project_id, settings)
+            .transactions_submit(cbor)
+            .await
+            .map_err(|e| format!("blockfrost submit: {e}"))?;
+        hold_spent_inputs(&built.signed_tx_hex);
+        Ok(tx_hash)
+    }
+}
+
+/// Keep the wallet inputs a just-submitted migration spent out of every other
+/// wallet read in this process until it confirms — the epoch loop's above all,
+/// which would otherwise pick the same fee UTxO from a provider that has not
+/// seen it spent yet (`nonce_reservation::note_in_flight`).
+fn hold_spent_inputs(signed_tx_hex: &str) {
+    match heimdall::cardano::tx_common::spent_outpoints(signed_tx_hex) {
+        Ok(spent) => heimdall::cardano::nonce_reservation::note_in_flight(spent),
+        Err(e) => warn!("could not read the inputs of a submitted migration ({e})"),
+    }
+}
+
+/// The one registry address a confirmation poll watches — for a migration, a
+/// registration or an exit — and how to reach it.
+///
+/// For a migration it is taken from a `MigrationContext` that has already been
+/// built, NOT re-derived.
+/// Re-deriving it needs the federation one-shot, and `cardano.federation_one_shot`
+/// is `#[serde(skip)]` — it exists only on the clone `with_one_shot` returns, so
+/// on the config a command actually holds it is always `None`. A poll that
+/// re-derived would fail on its first call, every time, and the only path that
+/// reaches it is `--all` with more than one pool.
+#[derive(Clone)]
+struct MigrationWatch {
+    registry_address: String,
+    registry_policy_hex: String,
+    base_url: String,
+    project_id: String,
+}
+
+impl MigrationContext {
+    fn watch(&self, cfg: &HeimdallConfig) -> Result<MigrationWatch, String> {
+        let network = if cfg.cardano.is_mainnet()? {
+            pallas_addresses::Network::Mainnet
+        } else {
+            pallas_addresses::Network::Testnet
+        };
+        let (base_url, project_id) = migration_endpoints(cfg)?;
+        Ok(MigrationWatch {
+            registry_address: self.registry.enterprise_address(network),
+            registry_policy_hex: self.registry.hash_hex(),
+            base_url,
+            project_id,
+        })
+    }
+}
+
+impl MigrationWatch {
+    /// Has `pool_id` appeared in the current registry list?
+    ///
+    /// A read failure is not an answer — say "not yet" and let the caller try
+    /// again — and this deliberately does NOT consult Config #13, so clearing
+    /// the migration marker mid-poll cannot make the answer unobtainable.
+    async fn landed(&self, pool_id: &[u8]) -> bool {
+        self.presence(pool_id).await == Some(true)
+    }
+
+    /// Whether `pool_id` is in the registry list now, or `None` when the read
+    /// failed. One address query.
+    async fn presence(&self, pool_id: &[u8]) -> Option<bool> {
+        let utxos = heimdall::cardano::bf_http::fetch_address_utxos(
+            &self.base_url,
+            &self.project_id,
+            &self.registry_address,
+        )
+        .await
+        .ok()?;
+        heimdall::cardano::register_spo::pool_in_registry(
+            &utxos,
+            &self.registry_policy_hex,
+            pool_id,
+        )
+    }
+}
+
+/// `(base_url, project_id)` for the Blockfrost reads a migration makes.
+fn migration_endpoints(cfg: &HeimdallConfig) -> Result<(String, String), String> {
+    let project_id = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?
+        .to_string();
+    let base_url =
+        heimdall::cardano::bf_http::base_url(&project_id, cfg.cardano.blockfrost_url.as_deref());
+    Ok((base_url, project_id))
+}
+
+/// Wait for `pool_id`'s migration to confirm, then re-read the chain.
+///
+/// The next pool's insert is planned against the anchor this one just rewrote,
+/// so building it against a pre-confirmation read would plan against an
+/// outpoint that no longer exists. Blockfrost reports confirmed UTxOs only,
+/// which is exactly why the wait is needed and exactly what makes it
+/// observable: when the pool's node shows up in the current list, its
+/// transaction is on chain.
+///
+/// `Ok(None)` means the window closed under us — Config #13 was cleared — which
+/// is a reason to stop rather than an error.
+async fn await_migration(
+    cfg: &HeimdallConfig,
+    watch: &MigrationWatch,
+    pool_id: &[u8],
+) -> Result<Option<MigrationContext>, String> {
+    // Preprod blocks are ~20 s; sixty tries at five seconds is five minutes,
+    // which is generous for one block and short enough that a stuck rollout is
+    // noticed rather than waited out.
+    const TRIES: usize = 60;
+    const DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // Poll the ONE address that answers the question — the current registry —
+    // rather than rebuilding the whole context each time. A context rebuild is
+    // four address queries, a cost-model fetch, a reference-script search and
+    // two parses of the embedded blueprint; sixty of those per pool, for twenty
+    // pools, is minutes of avoidable work and a great deal of Blockfrost quota.
+    // The full re-read happens ONCE, after the answer is yes.
+    for attempt in 0..TRIES {
+        tokio::time::sleep(DELAY).await;
+        if watch.landed(pool_id).await {
+            return migration_context(cfg, false).await;
+        }
+        if attempt == TRIES / 2 {
+            println!("  (still waiting for {} to confirm)", hex::encode(pool_id));
+        }
+    }
+    Err(format!(
+        "{} did not appear in the current registry within {} seconds of its transaction being \
+         submitted",
+        hex::encode(pool_id),
+        TRIES * DELAY.as_secs() as usize,
+    ))
+}
+
+/// `heimdall migrate-registration [--all]`.
+fn run_migrate_registration(cfg: &HeimdallConfig, all: bool, submit: bool) -> Result<(), String> {
+    use heimdall::cardano::migrate_registration::{MembershipState, classify_against_root};
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let Some(ctx) = rt.block_on(migration_context(cfg, false))? else {
+        println!("No registry migration is in progress: Config #13 is unset ([CFG-10]).");
+        return Ok(());
+    };
+    let (current, previous) = ctx.lists()?;
+    println!("current registry:  {}", ctx.registry.hash_hex());
+    println!("previous registry: {}", ctx.previous_policy_hex);
+    println!(
+        "lists:             {} node(s) current, {} previous",
+        current.len(),
+        previous.len()
+    );
+
+    // Which pools to carry across. `--all` is the federation's step right after
+    // the governance Update: it makes the new list complete regardless of when
+    // operators upgrade, so the next boundary snapshot equals the old roster
+    // instead of whatever subset had restarted in time.
+    let window = ctx.window(&current)?;
+    let targets: Vec<Vec<u8>> = if all {
+        // Not the pools that migrated and then left: their binding is gone from
+        // the Treasury state, so there is no membership to prove and a build
+        // would fail for each of them, every run.
+        previous
+            .iter()
+            .filter(|(pool_id, data)| {
+                current.get(pool_id).is_none() && !window.departed.contains(&data.bifrost_id_pk)
+            })
+            .map(|(pool_id, _)| pool_id.to_vec())
+            .collect()
+    } else {
+        let secp = bitcoin::key::Secp256k1::new();
+        let keypair = cfg
+            .load_bifrost_keypair(&secp)
+            .map_err(|e| format!("this node's own bifrost key: {e}"))?;
+        let pk = keypair.x_only_public_key().0.serialize();
+        match classify_against_root(&pk, &current, Some(&previous), Some(&window)) {
+            MembershipState::Current => {
+                println!("this pool:         already in the current registry — nothing to do");
+                return Ok(());
+            }
+            MembershipState::NotRegistered => {
+                println!(
+                    "this pool:         in neither list. Nothing to migrate — run \
+                     `heimdall register-spo`"
+                );
+                return Ok(());
+            }
+            MembershipState::AlreadyLeft => {
+                println!(
+                    "this pool:         left the bridge. Its node is still in the previous \
+                     list, which is frozen, but the treasury no longer holds its identity — \
+                     so there is nothing to migrate. Run `register-spo` to join again"
+                );
+                return Ok(());
+            }
+            MembershipState::Migratable { pool_id } => vec![pool_id],
+        }
+    };
+
+    if targets.is_empty() {
+        println!("nothing to migrate: every previous-list pool is already in the current list");
+        return Ok(());
+    }
+    println!("to migrate:        {}", targets.len());
+
+    // Each migration is its own transaction and spends the anchor its insert
+    // was planned against, so two in a row race for it — and early in a
+    // migration every pool plans against the SAME anchor, the list root, since
+    // the new list is empty. Submitting them back to back would land one and
+    // have the chain reject the rest.
+    //
+    // So each one waits for its predecessor to confirm before the next is
+    // built. Blockfrost's UTxO endpoint is confirmed-only, which is what makes
+    // the wait necessary and also what makes it observable: the pool's node
+    // appearing in the current list IS the confirmation. Slow — a block each —
+    // and that is the right trade for a federation step run once per rollout,
+    // against a command that otherwise reports 19 failures out of 20 and
+    // migrates one pool.
+    let watch = ctx.watch(cfg)?;
+    let mut ctx = ctx;
+    let mut failures = 0usize;
+    let mut done = 0usize;
+    for pool_id in &targets {
+        let mut submitted = false;
+        // Already across — by its own node, which migrates itself at startup
+        // and every half hour, or by anyone else since the list was read. That
+        // is the outcome this command exists for, not a failure.
+        if ctx
+            .lists()
+            .is_ok_and(|(current, _)| current.get(pool_id).is_some())
+        {
+            println!(
+                "  {} → already in the current registry",
+                hex::encode(pool_id)
+            );
+            done += 1;
+            continue;
+        }
+        match ctx.migrate(&rt, cfg, pool_id, submit) {
+            Ok(MigrationOutcome::Migrated { tx_hash }) => {
+                println!("  {} → submitted {tx_hash}", hex::encode(pool_id));
+                done += 1;
+                submitted = true;
+            }
+            Ok(MigrationOutcome::Built) => {
+                println!(
+                    "  {} → built (dry run — pass --submit; every pool here is planned \
+                     against the SAME anchor, so only one of them could land)",
+                    hex::encode(pool_id)
+                );
+                done += 1;
+            }
+            Err(e) => {
+                failures += 1;
+                println!("  {} → FAILED: {e}", hex::encode(pool_id));
+                // Most likely the anchor moved under this one — another pool's
+                // migration landed. Planning the next target against the same
+                // read would lose the same race, so read the chain again.
+                if let Ok(Some(fresh)) = rt.block_on(migration_context(cfg, false)) {
+                    ctx = fresh;
+                }
+            }
+        }
+        // Wait only for a transaction that was actually SENT. A build that
+        // failed sent nothing, so waiting would poll five minutes for a
+        // confirmation that can never arrive and then abandon every pool after
+        // it — and an anchor race is the expected failure here, not a rare one.
+        // Nothing to wait for after the last target either.
+        if !submitted || done + failures >= targets.len() {
+            continue;
+        }
+        match rt.block_on(await_migration(cfg, &watch, pool_id)) {
+            Ok(Some(fresh)) => ctx = fresh,
+            Ok(None) => {
+                println!("  (the migration window closed — Config #13 is no longer set)");
+                break;
+            }
+            Err(e) => {
+                println!(
+                    "  (stopping: {e}. Each migration is independent, so what landed is landed \
+                     — re-run for the rest)"
+                );
+                failures += targets.len() - done - failures;
+                break;
+            }
+        }
+    }
+    if failures > 0 {
+        return Err(format!(
+            "{failures} of {} migration(s) failed — see above. Each is independent, so the \
+             rest landed and this can be re-run for the remainder",
+            targets.len()
+        ));
+    }
+    Ok(())
+}
+
+/// What `run-spo` should report about a registry migration, and whether that
+/// report is final.
+struct MigrationHealth {
+    /// What `/health` and `heimdall status` say now.
+    state: String,
+    /// Set when `state` is PROVISIONAL: a migration is in flight and a watcher
+    /// will replace the line once it lands.
+    ///
+    /// One field, not three Options. The previous shape let a failed
+    /// `MigrationWatch` construction be silently dropped by a tuple pattern,
+    /// which left `/health` advertising "migrating, retrying" for the life of
+    /// the process with nothing retrying and nothing able to replace the
+    /// string. A single `Option` makes that a case the constructor has to
+    /// answer.
+    pending: Option<PendingMigration>,
+}
+
+/// A migration in flight, and everything needed to finish reporting it.
+struct PendingMigration {
+    pool_id: Vec<u8>,
+    /// What to say once it lands.
+    settled: String,
+    /// The one address the watcher polls. Carried rather than re-derived, and
+    /// so the poll costs one query instead of a full context rebuild — 360 of
+    /// those, at 7-9 requests each, would be thousands of provider calls per
+    /// node start.
+    watch: MigrationWatch,
+}
+
+impl MigrationHealth {
+    /// A report that will not change without a restart.
+    fn settled(state: String) -> Self {
+        Self {
+            state,
+            pending: None,
+        }
+    }
+
+    /// A migration in flight — or, when the watch could not be built, a settled
+    /// report that says so instead of a provisional one nothing will finish.
+    fn in_flight(
+        state: String,
+        settled: String,
+        pool_id: Vec<u8>,
+        watch: Result<MigrationWatch, String>,
+    ) -> Self {
+        match watch {
+            Ok(watch) => Self {
+                state,
+                pending: Some(PendingMigration {
+                    pool_id,
+                    settled,
+                    watch,
+                }),
+            },
+            Err(e) => {
+                warn!("registry migration: cannot watch for confirmation ({e})");
+                Self::settled(format!("{state}; not watched ({e})"))
+            }
+        }
+    }
+}
+
+/// Watch a submitted migration until it lands, retrying it, and finish the
+/// `/health` line it started. Shared by the startup migration and the periodic
+/// re-check, which both hand over the same `PendingMigration`.
+async fn watch_migration(
+    watch_health: heimdall::health::HealthHandle,
+    watch_cfg: HeimdallConfig,
+    pending: PendingMigration,
+) {
+    let PendingMigration {
+        pool_id,
+        settled,
+        watch,
+    } = pending;
+    // Watch, and RETRY. One attempt was not enough: an anchor race
+    // is the expected failure when several nodes restart together
+    // after the same governance Update, and a transaction that
+    // Blockfrost accepted can still lose that race and be dropped.
+    // Either way the node is outside the roster, and the previous
+    // behaviour left it there until a human ran the command.
+    //
+    // Six attempts over roughly half an hour. Each poll is ONE
+    // address query, deliberately not a `migration_context`
+    // rebuild — that is 7-9 provider calls, and it returns `None`
+    // the moment Config #13 is cleared, which is the normal end of
+    // a rollout and would make the landing unobservable.
+    const ATTEMPTS: u32 = 6;
+    const POLLS_PER_ATTEMPT: u32 = 60;
+    for attempt in 1..=ATTEMPTS {
+        for _ in 0..POLLS_PER_ATTEMPT {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if watch.landed(&pool_id).await {
+                info!(
+                    pool_id = %hex::encode(&pool_id),
+                    "registry migration confirmed; this node is in the current \
+                     registry"
+                );
+                watch_health.update(|h| h.registry_migration = Some(settled.clone()));
+                return;
+            }
+        }
+        if attempt == ATTEMPTS {
+            break;
+        }
+        // Not there after five minutes. Build a fresh context — the
+        // anchor has moved if somebody else's migration landed — and
+        // try again.
+        warn!(
+            pool_id = %hex::encode(&pool_id),
+            "registry migration has not landed after attempt {attempt} of \
+             {ATTEMPTS}; retrying"
+        );
+        match migration_context(&watch_cfg, true).await {
+            // Config #13 cleared under us. Whether this pool made it
+            // across is now answered by the list alone, and the poll
+            // above is what answers it — keep polling, stop retrying.
+            Ok(None) => continue,
+            Ok(Some(ctx)) => {
+                if let Err(e) = ctx.migrate_async(&watch_cfg, &pool_id).await {
+                    warn!(
+                        pool_id = %hex::encode(&pool_id),
+                        "registry migration retry {attempt} did not submit ({e})"
+                    );
+                }
+            }
+            Err(e) => warn!("registry migration retry {attempt}: {e}"),
+        }
+    }
+    // One last look before declaring anything. `landed` returns
+    // false on ANY read failure, so a provider outage across the
+    // whole window looks identical to a migration that never
+    // happened — and overwriting the line on that basis would
+    // report a pool that IS registered as one that is not, which is
+    // the confusion this watcher exists to remove.
+    if watch.landed(&pool_id).await {
+        info!(
+            pool_id = %hex::encode(&pool_id),
+            "registry migration confirmed on the final check"
+        );
+        watch_health.update(|h| h.registry_migration = Some(settled.clone()));
+        return;
+    }
+    warn!(
+        pool_id = %hex::encode(&pool_id),
+        "registry migration still has not landed after {ATTEMPTS} attempts. This \
+         node is outside the roster until it does — run `heimdall \
+         migrate-registration`, or wait for the federation's --all pass; anyone \
+         may run it for anyone"
+    );
+    watch_health.update(|h| {
+        h.registry_migration = Some(
+            "migration not landed after 6 attempts — tried again at the next half-hourly check"
+                .to_string(),
+        );
+    });
+    // Stop here, and let the periodic re-check take over. It classifies the
+    // pool afresh every half hour: migrated by then (the federation's `--all`
+    // or anyone else), it clears this line; still under the previous registry,
+    // it submits a new migration and starts a new watcher. A watcher that kept
+    // polling instead held the re-check off for the life of the process, and
+    // nothing ever tried the migration again.
+}
+
+/// The auto-migration `run-spo` performs at startup ([MIG-1], §SPO Registration
+/// section 8).
+///
+/// This is the entry an operator never runs: they install the new package,
+/// restart, and the node puts itself back in the registry. There is no cold key
+/// in the loop, because `Migrate` needs no signature — it reproduces state the
+/// pool already consented to.
+///
+/// Never fatal. A node that cannot migrate itself is a node that is out of the
+/// roster until somebody migrates it, which is exactly the state it was already
+/// in; killing the daemon over it would take away the `/health` surface that
+/// says so.
+async fn auto_migrate_registration(
+    cfg: &HeimdallConfig,
+    disabled: bool,
+) -> Option<MigrationHealth> {
+    match check_migration(cfg, disabled).await {
+        MigrationCheck::Report(m) => Some(m),
+        MigrationCheck::NoWindow | MigrationCheck::NothingToDo => None,
+    }
+}
+
+/// What one migration check found — kept apart so the periodic re-check can
+/// tell "no migration in progress" (the `/health` line goes) from "this node
+/// has nothing to do in one" (a "migrated" line stays) from a report.
+enum MigrationCheck {
+    /// No Config, or Config #13 unset: no migration in progress.
+    NoWindow,
+    /// A migration is in progress, and this node is current or not registered.
+    NothingToDo,
+    Report(MigrationHealth),
+}
+
+/// [`auto_migrate_registration`], returning which of those it was.
+async fn check_migration(cfg: &HeimdallConfig, disabled: bool) -> MigrationCheck {
+    use heimdall::cardano::migrate_registration::{MembershipState, classify_against_root};
+
+    let ctx = match migration_context(cfg, true).await {
+        Ok(None) => return MigrationCheck::NoWindow,
+        Ok(Some(ctx)) => ctx,
+        Err(e) => {
+            warn!("registry migration check: {e}");
+            // NOT None: None is what "no migration in progress" looks like, and
+            // a node that could not tell must not be reported as a node with
+            // nothing to do. The rationale for never being fatal here is that
+            // /health keeps saying so — which only works if it says something.
+            return MigrationCheck::Report(MigrationHealth::settled(format!(
+                "unknown — the migration check failed ({e})"
+            )));
+        }
+    };
+    let (current, previous) = match ctx.lists() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("registry migration check: {e}");
+            return MigrationCheck::Report(MigrationHealth::settled(format!(
+                "unknown — the registry lists could not be read ({e})"
+            )));
+        }
+    };
+    let secp = bitcoin::key::Secp256k1::new();
+    let keypair = match cfg.load_bifrost_keypair(&secp) {
+        Ok(kp) => kp,
+        Err(e) => {
+            // Silence here would be indistinguishable from "no migration in
+            // progress", and the two want opposite responses.
+            warn!("registry migration check: no bifrost identity key ({e})");
+            return MigrationCheck::Report(MigrationHealth::settled(
+                "unknown — no bifrost identity key to classify this node".to_string(),
+            ));
+        }
+    };
+    let pk = keypair.x_only_public_key().0.serialize();
+    // Without a window the classification falls back to the safe guess: a
+    // migration that should not happen is refused by the builder, where a
+    // missed one leaves this pool out of the roster.
+    let window = ctx.window(&current).ok();
+    let pool_id = match classify_against_root(&pk, &current, Some(&previous), window.as_ref()) {
+        MembershipState::Current | MembershipState::NotRegistered => {
+            return MigrationCheck::NothingToDo;
+        }
+        // Gone by choice. Reporting it as migratable would warn and fail a
+        // build at every restart until Config #13 is cleared, about a pool that
+        // is exactly where its operator put it.
+        MembershipState::AlreadyLeft => {
+            return MigrationCheck::Report(MigrationHealth::settled(
+                "left the bridge under the current registry; the previous list still \
+                 holds an inert node"
+                    .to_string(),
+            ));
+        }
+        MembershipState::Migratable { pool_id } => pool_id,
+    };
+
+    let from = &ctx.previous_policy_hex;
+    let to = ctx.registry.hash_hex();
+    if disabled {
+        warn!(
+            pool_id = %hex::encode(&pool_id),
+            "this pool's registration is still under the previous registry ({from}), and \
+             --no-auto-migrate is set. Run `heimdall migrate-registration` to carry it across; \
+             until then this node is outside the roster"
+        );
+        return MigrationCheck::Report(MigrationHealth::settled(format!(
+            "migratable {from} -> {to} (auto-migrate off)"
+        )));
+    }
+    warn!(
+        pool_id = %hex::encode(&pool_id),
+        "a registry migration is in progress and this pool is still under the previous \
+         registry ({from}). Carrying it across to {to} — no cold key is needed"
+    );
+    match ctx.migrate_async(cfg, &pool_id).await {
+        Ok(tx_hash) => {
+            info!(
+                pool_id = %hex::encode(&pool_id),
+                "registry migration submitted: {tx_hash}. It takes effect for the roster at the \
+                 next epoch boundary snapshot"
+            );
+            // Watched: the line must not still say "migrating" an hour after
+            // it landed, and the "migrated" state this reports is otherwise one
+            // no code path ever produces.
+            MigrationCheck::Report(MigrationHealth::in_flight(
+                format!("migrating {from} -> {to}"),
+                format!("migrated {from} -> {to}"),
+                pool_id.clone(),
+                ctx.watch(cfg),
+            ))
+        }
+        Err(e) => {
+            // An anchor race is the expected failure when several pools migrate
+            // at once, including the federation's `--all` pass — so this is a
+            // retry, not an end state. Handing the watcher the same `pending`
+            // is what makes the node try again instead of sitting outside the
+            // roster until a human notices.
+            warn!(
+                pool_id = %hex::encode(&pool_id),
+                "registry migration did not submit ({e}) — retrying in the background. Until \
+                 it lands this node is outside the roster; `heimdall migrate-registration` \
+                 does it by hand, and anyone may run it"
+            );
+            MigrationCheck::Report(MigrationHealth::in_flight(
+                format!("migrating {from} -> {to} (first attempt failed, retrying)"),
+                format!("migrated {from} -> {to}"),
+                pool_id.clone(),
+                ctx.watch(cfg),
+            ))
+        }
+    }
+}
+
+/// The previous registry's address and UTxOs, while a migration is in progress
+/// ([CFG-10]).
+///
+/// `register-spo` and `deregister-spo` both need it, and for the same reason
+/// they did not need it before rev 5.6: the Treasury state's identity root
+/// commits to the bindings of BOTH lists while pools are crossing, because
+/// `Migrate` carries one across without moving the root. A proof built from the
+/// current list alone is rejected, so without this, joining and leaving would
+/// both be impossible for the length of a migration — and a migration is
+/// exactly when an operator is most likely to be doing one of them.
+///
+/// `None` when Config #13 is unset, which is every day that is not a rollout.
+async fn previous_registry_utxos(
+    params: &heimdall::cardano::config_params::ConfigParams,
+    base_url: &str,
+    project_id: &str,
+    mainnet: bool,
+) -> Result<Option<(String, Vec<heimdall::cardano::bf_http::BfUtxo>)>, String> {
+    let Some(previous) = params.registry.previous_spos_registry_policy_id else {
+        return Ok(None);
+    };
+    let network = if mainnet {
+        pallas_addresses::Network::Mainnet
+    } else {
+        pallas_addresses::Network::Testnet
+    };
+    let address = heimdall::cardano::blueprint::script_enterprise_address(&previous, network);
+    let utxos = heimdall::cardano::bf_http::fetch_address_utxos(base_url, project_id, &address)
+        .await
+        .map_err(|e| format!("previous registry UTxO query: {e}"))?;
+    println!(
+        "migration:         in progress from {} ({} node(s) still there)",
+        hex::encode(previous),
+        utxos.len().saturating_sub(1)
+    );
+    Ok(Some((hex::encode(previous), utxos)))
+}
+
+/// Resolve the nonce outpoint a registration or exit signature will be bound to
+/// ([REG-10], [DRG-6]), reserving it so nothing else spends it.
+///
+/// Four ways in, in order:
+///
+/// 1. `--nonce-utxo`, for an operator signing the printed `message` with their
+///    own Ed25519 tool and choosing which UTxO to tie up.
+/// 2. An existing reservation that is still unspent. This is what makes the
+///    second run of `register-spo --signed` agree with the first run's request:
+///    the nonce is part of the signed message, so the two runs must name the
+///    same outpoint or nothing verifies.
+/// 3. The one-machine flow: the fee input itself. Signing and submitting happen
+///    in the same command, so nothing can spend it in between and there is
+///    nothing to reserve.
+/// 4. A fresh 2 ADA UTxO, created and submitted here, for the air-gapped flow.
+///    Its outpoint is known before it confirms, and the registration that
+///    spends it is a trip to a safe away.
+///
+/// A reservation that has been SPENT is reported rather than silently replaced:
+/// if a signed file is already in flight against it, a new nonce would make that
+/// file unusable, and the operator should hear that from here rather than from
+/// a signature that does not verify.
+#[allow(clippy::too_many_arguments)]
+fn resolve_nonce(
+    cfg: &HeimdallConfig,
+    rt: &tokio::runtime::Runtime,
+    base_url: &str,
+    project_id: &str,
+    wallet_address: &str,
+    key: &pallas_wallet::PrivateKey,
+    wallet_utxos: &[heimdall::cardano::publish::WalletUtxo],
+    override_utxo: Option<&str>,
+    action: heimdall::cardano::airgap::Action,
+    request_mode: bool,
+    // A cold signature is already in hand — the return leg of an air-gapped
+    // round trip, where the nonce is not this run's to choose.
+    returning_signature: bool,
+    submit_reservation: bool,
+    // Whether a `--nonce-utxo` should be RECORDED: only when a signature bound to
+    // it outlives this run — a request being written, or a returning signature
+    // being submitted (so a lost race can be retried). A dry run, or the
+    // one-machine flow that signs and submits together, would otherwise leave a
+    // record that nothing clears, holding the UTxO back from every fee and
+    // collateral selection and blocking the opposite command.
+    record_override: bool,
+) -> Result<heimdall::cardano::tx_common::NonceOutpoint, String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::nonce_reservation::{NonceReservation, still_unspent};
+    use heimdall::cardano::tx_common::{NonceOutpoint, build_nonce_reservation_tx};
+
+    let state_dir = cfg.protocol.state_dir.as_deref().map(std::path::Path::new);
+
+    // Loaded leniently: an unreadable record must not block `--nonce-utxo`,
+    // which is the documented way out of exactly that. Every OTHER path still
+    // sees the error, because `wallet_set` above was strict for them.
+    let existing = match NonceReservation::load_or_none(state_dir) {
+        Ok(rec) => rec,
+        Err(e) if override_utxo.is_some() => {
+            println!("nonce record:      unreadable ({e}) — proceeding on --nonce-utxo alone.");
+            println!("                   Delete it once no signature is in flight.");
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    let record_path = || {
+        state_dir
+            .map(|d| {
+                heimdall::cardano::nonce_reservation::state_path(d)
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "the reservation record".to_string())
+    };
+
+    // Checked before EITHER branch, because an outpoint is spendable once and
+    // one record cannot bind two signatures. The override path used to skip
+    // this whenever the named outpoint happened to match the recorded one, and
+    // then rewrote `action` — producing two signed files naming the same
+    // outpoint, of which only one can ever land, while the winner deletes the
+    // record the operator believes is protecting the other.
+    if let Some(rec) = &existing
+        && rec.action != action
+    {
+        // A spent outpoint reserves nothing, so blocking the opposite command
+        // over it is an explanation that is not true — and the remedy it
+        // suggests ("finish the register first") is a command that now fails
+        // with AlreadyRegistered. Say what is actually wrong.
+        if let Ok(held) = rec.nonce()
+            && !still_unspent(wallet_utxos, held)
+            && rec.why_missing(now_secs())
+                == heimdall::cardano::nonce_reservation::MissingNonce::Spent
+        {
+            return Err(format!(
+                "{} still records {held} for a pending {}, but that outpoint has been spent, so \
+                 it reserves nothing and no signature bound to it can be used. Delete {} and \
+                 run this {action} again",
+                record_path(),
+                rec.action,
+                record_path(),
+            ));
+        }
+        return Err(format!(
+            "{} reserves {} for a pending {}, and you are running a {action}. An outpoint is \
+             spendable once, so one reservation cannot bind two signatures: whichever \
+             transaction landed first would silently kill the other. Finish or abandon the {} \
+             first — if it is abandoned, delete {}",
+            record_path(),
+            rec.outpoint,
+            rec.action,
+            rec.action,
+            record_path(),
+        ));
+    }
+
+    if let Some(raw) = override_utxo {
+        let nonce = NonceOutpoint::parse(raw).map_err(|e| format!("--nonce-utxo: {e}"))?;
+        // Refusing to clobber is the promise this function's doc makes, and it
+        // has to be checked BEFORE the override is honoured: a signature may
+        // already be in flight against the recorded outpoint, and replacing the
+        // record un-reserves it — the daemon spends it, and a completed trip to
+        // a safe is wasted.
+        if let Some(rec) = &existing {
+            let held = rec.nonce()?;
+            if held != nonce {
+                return Err(format!(
+                    "--nonce-utxo names {nonce}, but {} already reserves {held} for a pending \
+                     {}. Replacing it would stop {held} being held back, so a signature already \
+                     made against it would die when something else spends it. If that \
+                     reservation is finished, delete {}; if you are recovering a signed file, \
+                     pass the outpoint the FILE names",
+                    record_path(),
+                    rec.action,
+                    record_path(),
+                ));
+            }
+        }
+        heimdall::cardano::nonce_reservation::usable_as_nonce(wallet_utxos, nonce).map_err(
+            |e| {
+                format!(
+                    "--nonce-utxo: {e} ({wallet_address}). The transaction must spend it for \
+                     the signature to verify ([REG-10], [DRG-6])"
+                )
+            },
+        )?;
+        match state_dir {
+            Some(_) if !record_override => {
+                println!("nonce utxo:        {nonce} (from --nonce-utxo; used by this run only)");
+                return Ok(nonce);
+            }
+            // Already on chain — the caller named a UTxO the wallet holds — so
+            // it is recorded as submitted.
+            Some(dir) => NonceReservation::new(nonce, action, now_secs(), true).save(dir)?,
+            // Nothing to record in, so nothing holds this UTxO back. Silence
+            // here would be the reservation's whole purpose quietly absent.
+            None => {
+                println!("nonce utxo:        {nonce} (from --nonce-utxo)");
+                println!(
+                    "                   NOT RESERVED: protocol.state_dir is unset, so nothing"
+                );
+                println!(
+                    "                   stops this node spending {nonce} while the signature is"
+                );
+                println!("                   away. Set protocol.state_dir, or submit promptly.");
+                return Ok(nonce);
+            }
+        }
+        println!("nonce utxo:        {nonce} (from --nonce-utxo)");
+        return Ok(nonce);
+    }
+
+    if let Some(mut existing) = existing {
+        let nonce = existing.nonce()?;
+        // The action guard ran above, before either branch.
+        if still_unspent(wallet_utxos, nonce) {
+            // Seen, so it WAS broadcast — whoever did it. Recorded, because a
+            // record left at "never submitted" would, once this nonce is spent,
+            // go on telling the operator to submit a transaction instead of
+            // that the signature is used up.
+            if existing.seen_on_chain()
+                && let Some(dir) = state_dir
+                && let Err(e) = existing.save(dir)
+            {
+                println!("note: could not update {} ({e})", record_path());
+            }
+            println!("nonce utxo:        {nonce} (reserved earlier, still unspent)");
+            return Ok(nonce);
+        }
+        // Missing from a CONFIRMED-ONLY UTxO query means one of three things,
+        // and only the last is a dead signature. Saying "spent" for the other
+        // two sends an operator to delete a live reservation.
+        use heimdall::cardano::nonce_reservation::MissingNonce;
+        let why = existing.why_missing(now_secs());
+        // Never broadcast, and this is the command that makes reservations:
+        // send the transaction the record kept. A failed first broadcast then
+        // costs a re-run, not a second reservation or a lost outpoint.
+        if why == MissingNonce::NeverSubmitted
+            && request_mode
+            && submit_reservation
+            && let (Some(tx), Some(dir)) = (existing.reservation_tx.clone(), state_dir)
+        {
+            println!(
+                "nonce utxo:        {nonce} (reserved earlier, never broadcast — sending it now)"
+            );
+            return match submit_tx_blockfrost(cfg, project_id, &tx, rt) {
+                Ok(tx_id) => {
+                    println!("nonce reserve tx:  {tx_id} submitted");
+                    existing.broadcast_at(now_secs());
+                    existing.save(dir)?;
+                    Ok(nonce)
+                }
+                Err(e) => Err(format!(
+                    "the reservation transaction for {nonce} could not be broadcast ({e}). If an \
+                     earlier attempt was in fact accepted, it spends the same inputs — wait for a \
+                     block and run this again. If its inputs were spent by something else it can \
+                     never land: delete {} and run this again for a fresh reservation. No request \
+                     naming {nonce} was written unless an earlier run said so",
+                    record_path(),
+                )),
+            };
+        }
+        return Err(match why {
+            MissingNonce::NeverSubmitted => format!(
+                "the reserved nonce UTxO {nonce} does not exist yet: its transaction was never \
+                 broadcast (--no-submit-reservation, or a broadcast that failed). Run the request \
+                 command again without --no-submit-reservation and it sends the transaction {} \
+                 kept{}. Nothing is lost — the signature is bound to {nonce} and will verify once \
+                 the UTxO exists",
+                record_path(),
+                existing
+                    .reservation_tx
+                    .as_deref()
+                    .map(|tx| format!(", or submit it yourself:\n{tx}\n"))
+                    .unwrap_or_default(),
+            ),
+            MissingNonce::NotConfirmedYet => format!(
+                "the reserved nonce UTxO {nonce} has not confirmed yet — it was created {} \
+                 seconds ago, and a UTxO query reports confirmed outputs only. Wait for a block \
+                 and run this again. Do NOT delete the reservation: the signature is bound to \
+                 {nonce} and is fine",
+                now_secs().saturating_sub(existing.created_at),
+            ),
+            MissingNonce::Spent => format!(
+                "the reserved nonce UTxO {nonce} has been spent. Any signature already made \
+                 against it is used up — the outpoint is what makes it single-use ([REG-10], \
+                 [DRG-6]) — so a file waiting at the cold key cannot be submitted. Delete {} \
+                 and run this again to reserve a fresh one, then take the NEW request to the \
+                 cold key",
+                record_path(),
+            ),
+        });
+    }
+
+    if !request_mode {
+        // The one-machine flow — and ONLY that. A cold signature already in
+        // hand means the return leg of an air-gapped round trip, where the
+        // nonce was chosen when the request was written and is recorded. If the
+        // record is gone, adopting the wallet's richest UTxO here would build a
+        // transaction against an outpoint the signature does not name: with
+        // `--signed` that surfaces as a field-drift error that never mentions
+        // the remedy, and with `--cold-sig` as "cold signature invalid", which
+        // sends the operator back to the safe over a key that was never wrong.
+        if returning_signature {
+            return Err(format!(
+                "this run has a cold signature in hand but no record of the nonce it is bound \
+                 to — {} holds nothing. The signature names one outpoint and no other \
+                 transaction can carry it. Read `nonce_outpoint` out of the signed file and \
+                 pass it as `--nonce-utxo <txid>#<index>`",
+                record_path(),
+            ));
+        }
+        let fee = heimdall::cardano::tx_common::select_fee(wallet_utxos, 3_000_000)?;
+        let nonce = fee
+            .outpoint()
+            .ok_or("the wallet's fee UTxO has an unreadable tx hash")?;
+        println!("nonce utxo:        {nonce} (the fee input; signed and submitted together)");
+        return Ok(nonce);
+    }
+
+    let state_dir = state_dir.ok_or(
+        "the air-gapped flow needs protocol.state_dir: the nonce this signature will be bound \
+         to is reserved there, so the daemon does not spend it while you are at the safe",
+    )?;
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(base_url, project_id))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+    let built = build_nonce_reservation_tx(wallet_address, wallet_utxos, key, &Some(cost_models))?;
+    println!("nonce utxo:        {} (new, 2 ADA)", built.outpoint);
+    // Recorded BEFORE the broadcast, as not-yet-submitted and WITH the signed
+    // transaction, and flipped after.
+    //
+    // The other order loses money and time on an ordinary network fault: the
+    // node accepts the transaction, the HTTP response is lost, `?` propagates,
+    // and no record is written — so the operator never learns the outpoint, the
+    // re-run creates a SECOND 2 ADA output, and the first is invisible to every
+    // selector and to `doctor`. Each flaky submit leaks another. And the
+    // transaction itself is kept, so a broadcast that failed is repaired by
+    // running the command again rather than by finding a hex string that was
+    // never printed.
+    let mut record = NonceReservation::new(built.outpoint, action, now_secs(), false)
+        .with_tx(built.signed_tx_hex.clone());
+    record.save(state_dir)?;
+    if submit_reservation {
+        // This is a chain write, and it happens on a command that has no
+        // --submit (the request path forbids it). Say so before doing it, not
+        // only after: an operator who expected a dry run should be able to read
+        // what was spent and why from this output alone.
+        println!("                   creating it costs one ordinary transaction and its fee;");
+        println!("                   pass --no-submit-reservation to broadcast it yourself.");
+        let tx_id =
+            submit_tx_blockfrost(cfg, project_id, &built.signed_tx_hex, rt).map_err(|e| {
+                format!(
+                    "the nonce reservation transaction could not be broadcast ({e}). It is kept in \
+                 {}, and running this command again sends it — do that rather than deleting \
+                 the record: if this attempt was in fact accepted, a fresh reservation would \
+                 leave this one's 2 ADA unaccounted for",
+                    record_path(),
+                )
+            })?;
+        println!("nonce reserve tx:  {tx_id} submitted");
+        record.broadcast_at(now_secs());
+        record.save(state_dir)?;
+    } else {
+        println!("nonce reserve tx:  NOT submitted (--no-submit-reservation)");
+        println!("                   SUBMIT THIS before the signed file comes back — it is the");
+        println!("                   only copy, and the signature is bound to an outpoint that");
+        println!("                   does not exist until it lands:");
+        println!("                   {}", built.signed_tx_hex);
+    }
+    Ok(built.outpoint)
+}
+
+/// Seconds since the Unix epoch, for the reservation's `created_at`.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Build (and with `--submit`, broadcast) the register_spo tx. Identities come
 /// from local secret keys or from the air-gapped (vkey + signature) flow; the
 /// R2 min-stake gate must pass before anything is submitted.
@@ -6713,9 +8579,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     use bitcoin::secp256k1::{Keypair, Message};
     use heimdall::cardano::airgap::{SignedResponse, SigningRequest};
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
-    use heimdall::cardano::publish::WalletUtxo;
-    use heimdall::cardano::ref_script::find_ref_script;
+
     use heimdall::cardano::ref_script::{RefScriptOrigin, find_ref_script_anywhere};
     use heimdall::cardano::register_spo::{
         RegisterSpoRequest, RegistrationSignatures, build_register_spo_tx, pool_id_from_cold_vkey,
@@ -6728,29 +8592,35 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
-    let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
-    let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(&registry_bootstrap),
-        )?;
-    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
-    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
-    let treasury = treasury_info_script(
-        &blueprint_json,
-        &tsy_tx_id,
-        u64::from(tsy_index),
-        &config_policy_id,
-    )
-    .map_err(|e| format!("parameterize treasury_info: {e}"))?;
-    let registry = spos_registry_script(
-        &blueprint_json,
-        &reg_tx_id,
-        u64::from(reg_index),
-        &treasury.hash,
-    )
-    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    // Rev 5.5: treasury.ak's RegistryUpdate branch reads the registry policy from
+    // the Config datum ([TSY-12]), so the tx must reference the Config UTxO — and
+    // it names the registry to build against (#9), which after a revision is not
+    // the one Config #12 compiles to.
+    let config_view = rt
+        .block_on(config_view_async(cfg))?
+        .ok_or("register-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
+    refuse_before_revision(&config_view, "register-spo")?;
+    let RegistryScripts {
+        treasury,
+        registry,
+        registry_bootstrap,
+        ..
+    } = rt.block_on(registry_scripts(
+        cfg,
+        args.blueprint.as_deref(),
+        Some(&config_view),
+        args.registry_bootstrap.as_deref(),
+        false,
+    ))?;
+    check_published_registry(&registry, &config_view)?;
 
     // ── identities: local secret keys, or the air-gapped halves ──
     //
@@ -6838,17 +8708,76 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
 
     let bifrost_url = resolve_bifrost_url(cfg, args.bifrost_url.as_deref())?;
 
+    // ── the wallet, read before the request: the request names the nonce UTxO
+    // this signature will be bound to ([REG-10]), and choosing one needs to see
+    // what the wallet holds. Any existing reservation is flagged here so fee and
+    // collateral selection skip it for the rest of this run.
+    let wallet_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    // Strict normally — an operator about to make an air-gapped round trip
+    // should not be told the state dir is fine when it is not. Lenient when
+    // `--nonce-utxo` is given, because that flag IS the way out of an
+    // unreadable record, and aborting on the file the operator is working
+    // around would make the documented remedy unreachable.
+    let state_dir = cfg.protocol.state_dir.as_deref().map(std::path::Path::new);
+    let wallet_utxos = if args.nonce_utxo.is_some() {
+        heimdall::cardano::nonce_reservation::wallet_set_lenient(&wallet_raw, state_dir)
+    } else {
+        heimdall::cardano::nonce_reservation::wallet_set(&wallet_raw, state_dir)?
+    };
+    // In request mode the nonce is resolved at step 1 instead, AFTER every
+    // read-only check: resolving it there can submit a reservation transaction,
+    // and the point of step 1 is that nothing is spent until the command has
+    // said the trip to the safe is worth making. Here, on the return leg, the
+    // reservation already exists and this only reads it back.
+    //
+    // The Bifrost half can be a round trip too: `--bifrost-id-pk` now, the
+    // BIP340 signature over the printed digest later, with `--bifrost-sig`. The
+    // digest commits to the nonce, so the first run must reserve and RECORD one
+    // — the fee input would be a different UTxO by the second run — and the run
+    // bringing the signature back must find that same nonce.
+    let bifrost_away = bifrost_keypair.is_none();
+    let bifrost_first_leg = bifrost_away && args.bifrost_sig.is_none();
+    let returning_signature = cold_skey.is_none() || (bifrost_away && args.bifrost_sig.is_some());
+    let nonce = if request_mode {
+        None
+    } else {
+        Some(resolve_nonce(
+            cfg,
+            &rt,
+            &base_url,
+            pid,
+            &wallet_addr,
+            &key,
+            &wallet_utxos,
+            args.nonce_utxo.as_deref(),
+            heimdall::cardano::airgap::Action::Register,
+            bifrost_first_leg,
+            // A signature brought back from another machine — `--signed`,
+            // `--cold-sig` or `--bifrost-sig` — names a nonce this run did not
+            // choose. With BOTH keys local, the signatures are made below, after
+            // the nonce is settled, so the one-machine flow uses the fee input.
+            returning_signature,
+            !args.no_submit_reservation,
+            bifrost_first_leg || (returning_signature && args.submit),
+        )?)
+    };
+
     // What this node is asking the cold key to authorize, and what a returning
     // file is checked against. It carries a pool id only when this machine can
     // derive one: a registering pool is in no registry, so `cold_vkey_path` is
     // the only source, and without it the message is completed on the other side.
-    let request = SigningRequest::register(
-        &network_label(cfg),
-        &registry.hash_hex(),
-        &bifrost_url,
-        &bifrost_id_pk,
-        cold_vkey_local.map(|vk| pool_id_from_cold_vkey(&vk)),
-    );
+    let request = nonce.map(|nonce| {
+        SigningRequest::register(
+            &network_label(cfg),
+            &registry.hash_hex(),
+            &bifrost_url,
+            &bifrost_id_pk,
+            cold_vkey_local.map(|vk| pool_id_from_cold_vkey(&vk)),
+            nonce,
+        )
+    });
     // Air-gapped step 3. The checks are in `SignedResponse::check`, and they name
     // what moved — a URL that changed between the two machines is reported as
     // that, not as a signature that does not verify.
@@ -6856,7 +8785,12 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         .signed
         .as_deref()
         .map(|p| -> Result<_, String> {
-            read_json::<SignedResponse>(p, "--signed")?.check(&request, cold_vkey_local)
+            // `--signed` clears request_mode, so the nonce and the request are
+            // both present here.
+            let request = request
+                .as_ref()
+                .expect("--signed implies a resolved nonce and a request to check against");
+            read_json::<SignedResponse>(p, "--signed")?.check(request, cold_vkey_local)
         })
         .transpose()?;
 
@@ -6875,14 +8809,6 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     println!("bifrost_url:       {bifrost_url}");
     println!("registry policy:   {}", registry.hash_hex());
     println!("treasury policy:   {}", treasury.hash_hex());
-
-    let pid = cfg
-        .cardano
-        .blockfrost_project_id
-        .as_deref()
-        .ok_or("cardano.blockfrost_project_id required")?;
-    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
-    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
     // ── R2 min-stake gate: gates submission; a dry run only warns ──
     //
@@ -6963,16 +8889,37 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     let network = network_of(&wallet_addr);
     let registry_addr = registry.enterprise_address(network);
     let treasury_addr = treasury.enterprise_address(network);
-    let wallet_raw = rt
-        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
-        .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
     let registry_utxos = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
         .map_err(|e| format!("registry UTxO query: {e}"))?;
     let treasury_utxos = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &treasury_addr))
         .map_err(|e| format!("treasury UTxO query: {e}"))?;
+    // spec [CFG-10]: while a registry migration is in progress the identity root
+    // commits to BOTH lists, so the absence proof has to be built against both.
+    let previous_registry = rt.block_on(previous_registry_utxos(
+        &config_view.params,
+        &base_url,
+        pid,
+        network == pallas_addresses::Network::Mainnet,
+    ))?;
+    // A pool still registered under the previous registry must be carried
+    // across, not registered afresh. Checked here, before the request is written
+    // and a nonce reserved, when this machine knows the pool id; the builder
+    // checks again for the case where only the returning file does.
+    if let Some(pool_id) = &pool_id {
+        heimdall::cardano::register_spo::check_register_allowed(
+            &registry.hash_hex(),
+            &registry_utxos,
+            &treasury.hash_hex(),
+            &treasury_utxos,
+            previous_registry
+                .as_ref()
+                .map(|(p, u)| (p.as_str(), u.as_slice())),
+            pool_id,
+        )
+        .map_err(|e| format!("register_spo: {e}"))?;
+    }
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
@@ -7066,6 +9013,31 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         println!();
         println!("then come back and run this again with --signed signed.json --submit.");
         println!();
+        // Reserve the nonce now, not earlier: this can submit a transaction,
+        // and every check above it is read-only.
+        let nonce = resolve_nonce(
+            cfg,
+            &rt,
+            &base_url,
+            pid,
+            &wallet_addr,
+            &key,
+            &wallet_utxos,
+            args.nonce_utxo.as_deref(),
+            heimdall::cardano::airgap::Action::Register,
+            true,
+            false,
+            !args.no_submit_reservation,
+            true,
+        )?;
+        let request = SigningRequest::register(
+            &network_label(cfg),
+            &registry.hash_hex(),
+            &bifrost_url,
+            &bifrost_id_pk,
+            cold_vkey_local.map(|vk| pool_id_from_cold_vkey(&vk)),
+            nonce,
+        );
         write_json(&request, args.out.as_deref(), false)?;
         return Ok(());
     }
@@ -7081,7 +9053,8 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
                 is for. `--signed` carries both and needs neither",
     )?;
     let pool_id = pool_id_from_cold_vkey(&cold_vkey);
-    let message = registration_message(&pool_id, &bifrost_id_pk, bifrost_url.as_bytes());
+    let nonce = nonce.expect("request_mode returned above, so the nonce is resolved");
+    let message = registration_message(&pool_id, &bifrost_id_pk, bifrost_url.as_bytes(), &nonce);
     let digest = sha256::Hash::hash(&message).to_byte_array();
     let cold_sig: [u8; 64] = match (&cold_skey, from_file, args.cold_sig.as_deref()) {
         (Some(sk), _, _) => sk
@@ -7102,7 +9075,10 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
             return Err(format!(
                 "no --bifrost-skey/--bifrost-sig. Air-gapped: BIP340-sign this 32-byte digest \
                  with the bifrost identity key and re-run with --bifrost-sig:\n  \
-                 sha2_256(message): {}",
+                 sha2_256(message): {}\n\
+                 It is bound to the nonce UTxO {nonce}, which is reserved for it, so the re-run \
+                 builds the same message. If the reservation record is lost, pass \
+                 --nonce-utxo {nonce} with the signature",
                 hex::encode(digest)
             ));
         }
@@ -7111,15 +9087,10 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         cold_vkey,
         cold_sig,
         bifrost_sig,
+        nonce,
     };
     verify_registration(&sigs, &bifrost_id_pk, bifrost_url.as_bytes())
         .map_err(|e| format!("registration signatures: {e}"))?;
-
-    // Rev 5.5: treasury.ak's RegistryUpdate branch reads the registry policy from
-    // the Config datum ([TSY-12]), so the tx must reference the Config UTxO.
-    let config_view = rt
-        .block_on(config_view_async(cfg))?
-        .ok_or("register-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
 
     let req = RegisterSpoRequest {
         registry_script: &registry,
@@ -7133,6 +9104,9 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         config_ref: (config_view.utxo.tx_hash.clone(), config_view.utxo.index),
         registry_utxos: &registry_utxos,
         treasury_utxos: &treasury_utxos,
+        previous_registry: previous_registry
+            .as_ref()
+            .map(|(p, u)| (p.as_str(), u.as_slice())),
         wallet_address: &wallet_addr,
         wallet_utxos: &wallet_utxos,
         key: &key,
@@ -7163,7 +9137,77 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
-    finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex)
+    let out = finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex);
+    if out.is_ok() && args.submit {
+        // Cleared on CONFIRMATION, not on acceptance. Until the transaction
+        // lands, the nonce UTxO is still unspent and still the only thing these
+        // signatures name — so if this one loses the anchor or the Treasury
+        // state, the reservation is what lets it be retried ([REG-10]).
+        println!();
+        println!("waiting for the registration to confirm before releasing the nonce…");
+        let watch = MigrationWatch {
+            registry_address: registry.enterprise_address(network),
+            registry_policy_hex: registry.hash_hex(),
+            base_url: base_url.clone(),
+            project_id: pid.to_string(),
+        };
+        if rt.block_on(await_registry_change(&watch, &built.pool_id, true)) {
+            println!("confirmed — this pool is in the registry.");
+            clear_nonce_reservation(cfg);
+        } else {
+            println!(
+                "not confirmed yet. The nonce reservation is KEPT, so the same signatures can \
+                 be retried by re-running this command; `heimdall doctor` step 12 reports it."
+            );
+        }
+    }
+    out
+}
+
+/// Wait for a registration or exit to CONFIRM, by watching the one thing that
+/// changes: whether this pool has a node in the registry list.
+///
+/// `want_present` is true after a registration, false after an exit.
+///
+/// Why a wait at all. Blockfrost accepting a transaction is not the chain
+/// taking it: the anchor or the Treasury state can be spent out from under it,
+/// and the transaction is then dropped. Until that is settled the nonce UTxO is
+/// still unspent and still the only thing the cold signature names, so the
+/// reservation has to hold and, on an exit, the signed file has to stay on
+/// disk. Clearing either on acceptance is clearing it on a maybe.
+///
+/// `Ok(false)` is a timeout, not a failure: the transaction may still land. The
+/// caller keeps everything and says so.
+async fn await_registry_change(watch: &MigrationWatch, pool_id: &[u8], want_present: bool) -> bool {
+    // Five minutes at five seconds. Preprod blocks are ~20 s, so this is many
+    // blocks; past it an operator is better served by being told to check than
+    // by a command that hangs.
+    const TRIES: usize = 60;
+    for _ in 0..TRIES {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if watch.presence(pool_id).await == Some(want_present) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Drop the nonce reservation, best-effort.
+///
+/// Called after a register or exit transaction is submitted. Deliberately not a
+/// `Result`: the transaction is already away, and failing the command over the
+/// bookkeeping would tell an operator their registration did not happen when it
+/// did. A record left behind holds 2 ADA out of coin selection and is named by
+/// `doctor`, which is the right size of consequence.
+fn clear_nonce_reservation(cfg: &HeimdallConfig) {
+    let Some(dir) = cfg.protocol.state_dir.as_deref() else {
+        return;
+    };
+    if let Err(e) = heimdall::cardano::nonce_reservation::clear(std::path::Path::new(dir)) {
+        println!(
+            "note: could not clear the nonce reservation ({e}) — `heimdall doctor` will name it"
+        );
+    }
 }
 
 /// Build (and with `--submit`, broadcast) the deregister_spo tx: burn the
@@ -7178,12 +9222,11 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
 fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<(), String> {
     use heimdall::cardano::airgap::{SignedResponse, SigningRequest};
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
     use heimdall::cardano::deregister_spo::{
         DeregisterSpoRequest, RevocationSignature, build_deregister_spo_tx, revocation_message,
         verify_revocation,
     };
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::ref_script::{RefScriptOrigin, find_ref_script_anywhere};
     use heimdall::cardano::register_spo::pool_id_from_cold_vkey;
     use heimdall::cardano::registry::REGISTRATION_ROOT_KEY;
@@ -7192,29 +9235,34 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
-    let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
-    let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(&registry_bootstrap),
-        )?;
-    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
-    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
-    let treasury = treasury_info_script(
-        &blueprint_json,
-        &tsy_tx_id,
-        u64::from(tsy_index),
-        &config_policy_id,
-    )
-    .map_err(|e| format!("parameterize treasury_info: {e}"))?;
-    let registry = spos_registry_script(
-        &blueprint_json,
-        &reg_tx_id,
-        u64::from(reg_index),
-        &treasury.hash,
-    )
-    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    // Rev 5.5 [DRG-5]: the treasury's RegistryUpdate branch reads the registry
+    // policy from the Config datum, so the tx must reference the Config UTxO —
+    // and #9 is what names the registry to leave.
+    let config_view = rt
+        .block_on(config_view_async(cfg))?
+        .ok_or("deregister-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
+    refuse_before_revision(&config_view, "deregister-spo")?;
+    let RegistryScripts {
+        treasury,
+        registry,
+        registry_bootstrap,
+        ..
+    } = rt.block_on(registry_scripts(
+        cfg,
+        args.blueprint.as_deref(),
+        Some(&config_view),
+        args.registry_bootstrap.as_deref(),
+        false,
+    ))?;
+    check_published_registry(&registry, &config_view)?;
 
     // ── the cold identity: a local secret key, or the air-gapped halves ──
     let cold_skey_src = args
@@ -7267,14 +9315,6 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
     println!("registry policy:   {}", registry.hash_hex());
     println!("treasury policy:   {}", treasury.hash_hex());
 
-    let pid = cfg
-        .cardano
-        .blockfrost_project_id
-        .as_deref()
-        .ok_or("cardano.blockfrost_project_id required")?;
-    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
-    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-
     // ── chain state ──
     let network = network_of(&wallet_addr);
     let registry_addr = registry.enterprise_address(network);
@@ -7282,7 +9322,17 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
     let wallet_raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    // Strict normally — an operator about to make an air-gapped round trip
+    // should not be told the state dir is fine when it is not. Lenient when
+    // `--nonce-utxo` is given, because that flag IS the way out of an
+    // unreadable record, and aborting on the file the operator is working
+    // around would make the documented remedy unreachable.
+    let state_dir = cfg.protocol.state_dir.as_deref().map(std::path::Path::new);
+    let wallet_utxos = if args.nonce_utxo.is_some() {
+        heimdall::cardano::nonce_reservation::wallet_set_lenient(&wallet_raw, state_dir)
+    } else {
+        heimdall::cardano::nonce_reservation::wallet_set(&wallet_raw, state_dir)?
+    };
     let registry_utxos = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
         .map_err(|e| format!("registry UTxO query: {e}"))?;
@@ -7343,11 +9393,14 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         }
     };
 
-    // Rev 5.5 [DRG-5]: the treasury's RegistryUpdate branch reads the registry
-    // policy from the Config datum, so the tx must reference the Config UTxO.
-    let config_view = rt
-        .block_on(config_view_async(cfg))?
-        .ok_or("deregister-spo needs the Config UTxO (treasury.ak reads the registry policy from it); set cardano.config_address and cardano.config_nft_policy_id")?;
+    // spec [CFG-10]: as for register-spo — the identity root commits to both
+    // lists while a migration is in progress, so the removal proof needs both.
+    let previous_registry = rt.block_on(previous_registry_utxos(
+        &config_view.params,
+        &base_url,
+        pid,
+        network == pallas_addresses::Network::Mainnet,
+    ))?;
 
     // A leaving pool is already in the registry, so its id can always be found
     // here — by the bifrost key this node runs on, the same lookup `doctor`
@@ -7360,6 +9413,9 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
             &registry_utxos,
             &treasury.hash_hex(),
             &treasury_utxos,
+            previous_registry
+                .as_ref()
+                .map(|(p, u)| (p.as_str(), u.as_slice())),
         )?,
     };
     let ban_policy = config_view.params.bans.spo_bans_policy_id;
@@ -7372,6 +9428,43 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         &hex::encode(ban_policy),
         &pool_id,
     );
+
+    // Everything the builder would refuse, refused NOW — before a reservation
+    // is paid for and the operator is sent to the cold key for an exit that
+    // cannot be built when they come back.
+    heimdall::cardano::deregister_spo::check_exit_allowed(
+        &registry.hash_hex(),
+        &registry_utxos,
+        &treasury.hash_hex(),
+        &treasury_utxos,
+        previous_registry
+            .as_ref()
+            .map(|(p, u)| (p.as_str(), u.as_slice())),
+        &pool_id,
+    )
+    .map_err(|e| format!("deregister_spo: {e}"))?;
+
+    // spec [DRG-6]: the outpoint this exit signature will be bound to. Resolved
+    // here, after the ban record has been read and printed — in request mode
+    // this can submit a 2 ADA reservation transaction, and nothing should be
+    // spent before the command has said the trip to the safe is worth making.
+    let nonce = resolve_nonce(
+        cfg,
+        &rt,
+        &base_url,
+        pid,
+        &wallet_addr,
+        &key,
+        &wallet_utxos,
+        args.nonce_utxo.as_deref(),
+        heimdall::cardano::airgap::Action::Deregister,
+        request_mode,
+        // A signature brought back from another machine names a nonce this run
+        // did not choose; a LOCAL cold key signs after the nonce is settled.
+        !request_mode && cold_skey.is_none(),
+        !args.no_submit_reservation,
+        request_mode || (cold_skey.is_none() && args.submit),
+    )?;
 
     // ── air-gapped step 1 ──
     if request_mode {
@@ -7386,13 +9479,14 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         println!("and run this again with --signed signed.json --submit.");
         println!();
         let request =
-            SigningRequest::deregister(&network_label(cfg), &registry.hash_hex(), &pool_id);
+            SigningRequest::deregister(&network_label(cfg), &registry.hash_hex(), &pool_id, nonce);
         write_json(&request, args.out.as_deref(), false)?;
         return Ok(());
     }
 
     // ── the cold signature: local, or the one that came back in the file ──
-    let now = SigningRequest::deregister(&network_label(cfg), &registry.hash_hex(), &pool_id);
+    let now =
+        SigningRequest::deregister(&network_label(cfg), &registry.hash_hex(), &pool_id, nonce);
     let from_file: Option<([u8; 32], [u8; 64])> = args
         .signed
         .as_deref()
@@ -7400,7 +9494,7 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
             read_json::<SignedResponse>(p, "--signed")?.check(&now, cold_vkey_local)
         })
         .transpose()?;
-    let message = revocation_message(&pool_id);
+    let message = revocation_message(&pool_id, &nonce);
     let sig = match (&cold_skey, from_file, args.cold_sig.as_deref()) {
         (Some(sk), _, _) => RevocationSignature {
             cold_vkey: sk.public_key().into(),
@@ -7409,15 +9503,18 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
                 .as_ref()
                 .try_into()
                 .expect("ed25519 signature is 64 bytes"),
+            nonce,
         },
         (None, Some((cold_vkey, cold_sig)), _) => RevocationSignature {
             cold_vkey,
             cold_sig,
+            nonce,
         },
         (None, None, Some(s)) => RevocationSignature {
             cold_vkey: cold_vkey_local
                 .ok_or("--cold-sig needs --cold-vkey (or cardano.cold_vkey_path)")?,
             cold_sig: parse_hex_n(s, "--cold-sig")?,
+            nonce,
         },
         (None, None, None) => unreachable!("request_mode covers this"),
     };
@@ -7433,6 +9530,9 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
         config_ref: (config_view.utxo.tx_hash.clone(), config_view.utxo.index),
         registry_utxos: &registry_utxos,
         treasury_utxos: &treasury_utxos,
+        previous_registry: previous_registry
+            .as_ref()
+            .map(|(p, u)| (p.as_str(), u.as_slice())),
         wallet_address: &wallet_addr,
         wallet_utxos: &wallet_utxos,
         key: &key,
@@ -7485,21 +9585,46 @@ fn run_deregister_spo(cfg: &HeimdallConfig, args: &DeregisterSpoArgs) -> Result<
 
     let out = finish_tx(cfg, pid, &rt, args.submit, &built.signed_tx_hex);
     if out.is_ok() && args.submit {
-        // The exit authorization commits to the pool id and nothing else, so it
-        // never expires: whoever holds the file can post this exit from their own
-        // wallet and collect the freed deposit. It has now done its one job.
-        // (The durable fix is a deadline in the signed message and belongs to the
-        // next spos-registry revision — see the air-gapped design doc.)
-        if let (Some(path), false) = (args.signed.as_deref(), args.keep)
-            && path != "-"
-        {
-            match std::fs::remove_file(path) {
-                Ok(()) => println!("removed {path} — it was a standing authorization to leave."),
-                Err(e) => println!(
-                    "could not remove {path} ({e}) — delete it yourself: it stays a valid \
-                     authorization to leave, for anyone who has it."
-                ),
+        // Both the reservation and the signed file are released on CONFIRMATION,
+        // not on acceptance. An exit that is accepted and then dropped — the
+        // anchor or the Treasury state spent under it — leaves the nonce unspent
+        // and the signature still good; deleting the file at that moment would
+        // throw away the only copy of an authorization that still works, and
+        // buy the operator another trip to the safe ([DRG-6]).
+        println!();
+        println!("waiting for the exit to confirm before releasing the nonce and the file…");
+        let watch = MigrationWatch {
+            registry_address: registry.enterprise_address(network),
+            registry_policy_hex: registry.hash_hex(),
+            base_url: base_url.clone(),
+            project_id: pid.to_string(),
+        };
+        let confirmed = rt.block_on(await_registry_change(&watch, &built.pool_id, false));
+        if confirmed {
+            println!("confirmed — this pool is out of the registry.");
+            clear_nonce_reservation(cfg);
+            // The signature is bound to a nonce outpoint this transaction spent,
+            // so the file is used up rather than a standing authorization anyone
+            // could post. Removing it is now tidiness, not damage control.
+            if let (Some(path), false) = (args.signed.as_deref(), args.keep)
+                && path != "-"
+            {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {
+                        println!("removed {path} — its nonce UTxO is spent, so it is used up.");
+                    }
+                    Err(e) => println!(
+                        "could not remove {path} ({e}) — it is spent and no longer authorizes \
+                         anything, but delete it anyway."
+                    ),
+                }
             }
+        } else {
+            println!(
+                "not confirmed yet. The nonce reservation and the signed file are both KEPT, \
+                 so this exit can be retried by re-running with --signed; `heimdall doctor` \
+                 step 12 reports the reservation."
+            );
         }
         // The one thing an exiting operator can still get wrong, and it is not
         // in the transaction: the roster for the CURRENT epoch was frozen at its
@@ -7538,8 +9663,7 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     use bitcoin::key::Secp256k1;
     use bitcoin::secp256k1::{Keypair, Message};
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
-    use heimdall::cardano::publish::WalletUtxo;
+
     use heimdall::cardano::treasury_info::update_y_sig_msg;
     use heimdall::cardano::treasury_spend::find_treasury_state;
     use heimdall::cardano::update_y::{UpdateYAuthorizer, UpdateYRequest, build_update_y_tx};
@@ -7548,28 +9672,21 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     let (key, wallet_addr) = (wallet.key, wallet.address);
 
     let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
-    let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
-    let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(&registry_bootstrap),
-        )?;
-    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
-    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
-    let treasury = treasury_info_script(
-        &blueprint_json,
-        &tsy_tx_id,
-        u64::from(tsy_index),
-        &config_policy_id,
-    )
-    .map_err(|e| format!("parameterize treasury_info: {e}"))?;
-    let registry = spos_registry_script(
-        &blueprint_json,
-        &reg_tx_id,
-        u64::from(reg_index),
-        &treasury.hash,
-    )
-    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    // Only the treasury is spent here, and its one-shot is Config #12 whenever
+    // a Config is readable — a registry revision does not move it.
+    let (treasury, _, _) = {
+        let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+        let view = config_view(&rt, cfg)?;
+        treasury_script(
+            cfg,
+            &blueprint_json,
+            view.as_ref(),
+            args.registry_bootstrap
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        )?
+    };
 
     let new_key = parse_hex_n::<32>(&args.new_key, "--new-key")?;
     let epoch_i64 =
@@ -7588,7 +9705,10 @@ fn run_update_y(cfg: &HeimdallConfig, args: &UpdateYArgs) -> Result<(), String> 
     let wallet_raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &wallet_raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     let treasury_utxos = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &treasury_addr))
         .map_err(|e| format!("treasury UTxO query: {e}"))?;
@@ -7710,42 +9830,30 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     use heimdall::cardano::apply_ban::{ApplyBanRequest, FaultProofUtxo, build_apply_ban_tx};
     use heimdall::cardano::ban_list::{BanPolicyParams, fault_token_name};
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::{
-        fault_verifier_script, spo_bans_script, spos_registry_script,
-    };
-    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::blueprint::{fault_verifier_script, spo_bans_script};
 
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
-    let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
-    let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(&registry_bootstrap),
-        )?;
-    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
-    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
-    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
-        &blueprint_json,
-        (&reg_tx_id, u64::from(reg_index)),
-        (&tsy_tx_id, u64::from(tsy_index)),
-        &config_policy_id,
-    )
-    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    // The registry the bridge names at #9 — not necessarily the one Config
+    // #12 compiles to, which after a registry revision is the registry the
+    // bridge left (`registry_scripts`). With --registry-bootstrap, the one that
+    // outpoint compiles, which is how a revision's next registry is named.
+    let RegistryScripts {
+        registry,
+        config_policy_id,
+        blueprint: blueprint_json,
+        ..
+    } = registry_scripts_blocking(
+        cfg,
+        args.blueprint.as_deref(),
+        args.registry_bootstrap.as_deref(),
+        false,
+    )?;
     let fault_kind = parse_fault_verifier_kind(&args.fault_kind)?;
     let fault = fault_verifier_script(&blueprint_json, fault_kind, &registry.hash)
         .map_err(|e| format!("parameterize fault_verifier: {e}"))?;
 
-    // The ban policy is chain-pinned: the one-shot from Config #12, plus the
-    // fault-policy set and the schedule the Config also publishes.
-    let ban_bootstrap = cfg
-        .cardano
-        .federation_one_shot
-        .as_deref()
-        .ok_or("the federation one-shot (Config #12) has not been resolved from the chain")?;
-    let (ban_tx_id, ban_index) = parse_cardano_outref(ban_bootstrap)?;
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     // The ban a tx applies is computed from the SCHEDULE — its end time from
     // params[4]/params[5] and the validity interval from params[6] — so those
@@ -7753,30 +9861,68 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     // Config where the bridge publishes them; the derived policy is then checked
     // against #8.
     let bridge_config = config_view(&rt, cfg)?;
+    if let Some(view) = &bridge_config {
+        refuse_ban_before_revision(view, "apply-ban")?;
+    }
     let params = BanPolicyParams::resolve(&cfg.cardano, bridge_config.as_ref().map(|v| &v.params))
         .map_err(|e| e.to_string())?;
-    let spo_bans = spo_bans_script(
-        &blueprint_json,
-        &registry.hash,
-        &params.fault_proof_policies,
-        params.base_ban_duration_ms,
-        params.max_faults_before_permanent,
-        params.max_validity_window_ms,
-        &ban_tx_id,
-        u64::from(ban_index),
-    )
-    .map_err(|e| format!("parameterize spo_bans: {e}"))?;
-    if let Some(published) = bridge_config.as_ref().map(|v| &v.params.bans)
-        && published.spo_bans_policy_id != spo_bans.hash
-    {
-        return Err(format!(
-            "this ban would be applied to policy {} but the bridge Config publishes {} \
-             (field #8) — it would confirm into a ban list no other SPO reads. Check \
-             cardano.ban_bootstrap and cardano.fault_proof_policies against this bridge",
-            spo_bans.hash_hex(),
-            hex::encode(published.spo_bans_policy_id),
-        ));
-    }
+    let derive_bans =
+        |outref: &str| -> Result<heimdall::cardano::blueprint::ParameterizedScript, String> {
+            let (tx_id, index) = parse_cardano_outref(outref)?;
+            spo_bans_script(
+                &blueprint_json,
+                // The registry policy (rev 5.5) and the Config NFT policy (rev 5.6,
+                // [PRE-5]): the blueprint's parameter list picks.
+                &registry.hash,
+                &config_policy_id,
+                &params.fault_proof_policies,
+                params.base_ban_duration_ms,
+                params.max_faults_before_permanent,
+                params.max_validity_window_ms,
+                &tx_id,
+                u64::from(index),
+            )
+            .map_err(|e| format!("parameterize spo_bans: {e}"))
+        };
+    // The ban list's own one-shot: Config #12 until the ban list is revised,
+    // the outpoint its ban-root mint spent after (`cardano::revision`) — and
+    // accepted only if it derives the policy #8 names. This read
+    // `cardano.federation_one_shot`, which is never set on a command's config,
+    // so the command could not run at all.
+    let spo_bans = match bridge_config.as_ref() {
+        Some(v) => {
+            let published = v.params.bans.spo_bans_policy_id;
+            let (base_url, project_id) = migration_endpoints(cfg)?;
+            let ban_bootstrap = rt
+                .block_on(heimdall::cardano::revision::one_shot_for(
+                    &base_url,
+                    &project_id,
+                    &v.params.federation_one_shot,
+                    &published,
+                    heimdall::cardano::ban_list::BAN_ROOT_KEY,
+                    |o| derive_bans(o).map(|s| s.hash),
+                ))?
+                .ok_or_else(|| {
+                    format!(
+                        "no ban one-shot derives the policy the bridge Config publishes ({}, \
+                         field #8) with these parameters — a ban applied here would confirm \
+                         into a ban list no other SPO reads. Check cardano.fault_proof_policies \
+                         against this bridge",
+                        hex::encode(published),
+                    )
+                })?;
+            derive_bans(&ban_bootstrap)?
+        }
+        // No Config to name the ban list: the genesis one-shot, as the flag
+        // gives it.
+        None => {
+            let genesis = args
+                .registry_bootstrap
+                .as_deref()
+                .ok_or("apply-ban needs the bridge Config, or --registry-bootstrap")?;
+            derive_bans(genesis)?
+        }
+    };
 
     let accused_pool_id: [u8; 28] = parse_hex_n(&args.accused_pool_id, "--accused-pool-id")?;
     let evidence_hash: [u8; 32] = parse_hex_n(&args.evidence_hash, "--evidence-hash")?;
@@ -7867,7 +10013,17 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
     let invalid_hereafter = window.current_slot + w;
     let start_time_ms = window.block_time_ms + (w as i64) * 1000 - 1;
 
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &wallet_raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
+    // spec [PRE-5]: since rev 5.6 `spo-bans.ak` reads the registry policy from
+    // Config #9 at run time, so the transaction must reference the Config UTxO
+    // and the redeemer must name its index.
+    let config_utxo = bridge_config
+        .as_ref()
+        .map(|v| v.utxo.clone())
+        .ok_or("apply-ban needs the bridge Config UTxO (spo-bans.ak reads the registry policy from field #9); set cardano.config_address and cardano.config_nft_policy_id")?;
     let req = ApplyBanRequest {
         spo_bans_script: &spo_bans,
         fault_verifier_script: &fault,
@@ -7878,6 +10034,7 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
         ban_utxos: &ban_raw,
         fault_utxo: &fault_utxo,
         registration_ref: (reg_node.tx_hash.clone(), reg_node.output_index),
+        config_ref: (config_utxo.tx_hash.clone(), config_utxo.index),
         spo_bans_ref: (hex::encode(sb_tx), sb_ix),
         mainnet,
         start_time_ms,
@@ -7923,33 +10080,38 @@ fn run_apply_ban(cfg: &HeimdallConfig, args: &ApplyBanArgs) -> Result<(), String
 /// park it at the wallet. A later `apply-ban` consumes + burns it.
 fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Result<(), String> {
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::blueprint::{fault_verifier_script, spos_registry_script};
+    use heimdall::cardano::blueprint::fault_verifier_script;
     use heimdall::cardano::fault_proof::{
         EquivocationEvidence as OnchainEquivocationEvidence, FaultProofEvidence,
         FaultProofMintRequest, Round1InvalidPayloadEvidence, Round2InvalidPayloadEvidence,
         build_fault_proof_mint_tx,
     };
-    use heimdall::cardano::publish::WalletUtxo;
 
+    // A fault proof minted against a rev-5.5 ban list can never be applied by
+    // this heimdall's ApplyBan — refuse before the fee rather than after.
+    {
+        let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+        if let Some(view) = config_view(&rt, cfg)? {
+            refuse_ban_before_revision(&view, "fault-proof-mint")?;
+        }
+    }
     let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)?;
     let (key, wallet_addr) = (wallet.key, wallet.address);
 
-    let blueprint_json = heimdall::cardano::blueprint::load_blueprint(args.blueprint.as_deref())?;
-    let registry_bootstrap = resolve_one_shot(cfg, args.registry_bootstrap.as_deref())?;
-    let (reg_tx_id, reg_index) = parse_cardano_outref(&registry_bootstrap)?;
-    let (treasury_bootstrap, config_policy_id) =
-        heimdall::cardano::roster::treasury_derivation_inputs(
-            &cfg.cardano.with_one_shot(&registry_bootstrap),
-        )?;
-    let (tsy_tx_id, tsy_index) = parse_cardano_outref(&treasury_bootstrap)?;
-    // Rev 5.5: Config → treasury → registry ([PRE-3], [PRE-4]).
-    let registry = heimdall::cardano::blueprint::registry_policy_from_bootstraps(
-        &blueprint_json,
-        (&reg_tx_id, u64::from(reg_index)),
-        (&tsy_tx_id, u64::from(tsy_index)),
-        &config_policy_id,
-    )
-    .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    // The registry the bridge names at #9 — not necessarily the one Config
+    // #12 compiles to, which after a registry revision is the registry the
+    // bridge left (`registry_scripts`). With --registry-bootstrap, the one that
+    // outpoint compiles, which is how a revision's next registry is named.
+    let RegistryScripts {
+        registry,
+        blueprint: blueprint_json,
+        ..
+    } = registry_scripts_blocking(
+        cfg,
+        args.blueprint.as_deref(),
+        args.registry_bootstrap.as_deref(),
+        false,
+    )?;
     let json = std::fs::read_to_string(&args.evidence_file)
         .map_err(|e| format!("read evidence file {}: {e}", args.evidence_file))?;
     let ev: EvidenceFile = serde_json::from_str(&json)
@@ -7972,7 +10134,10 @@ fn run_fault_proof_mint(cfg: &HeimdallConfig, args: &FaultProofMintArgs) -> Resu
     let wallet_raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
-    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let wallet_utxos = heimdall::cardano::nonce_reservation::wallet_set(
+        &wallet_raw,
+        cfg.protocol.state_dir.as_deref().map(std::path::Path::new),
+    )?;
     let cost_models = rt
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
@@ -9099,7 +11264,7 @@ fn run_sweep_pegins(
     };
     use heimdall::cardano::bf_http;
     use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
-    use heimdall::cardano::btc_rpc::broadcast_btc_tx;
+
     use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
     use heimdall::cardano::pegin_datum::parse_pegin_request;
     use heimdall::cardano::pegin_source::CardanoPegInSource;
@@ -9725,6 +11890,16 @@ fn run_sweep_pegins(
         // transaction; with nothing able to broadcast, the guard has no subject.
         chain = chain.with_submit_config(cfg.cardano.submit_oracle);
         chain = chain.with_validity_window(cfg.cardano.tm_validity_window_secs.unwrap_or(1800));
+        // The daemon's construction chains this and this one did not, so every
+        // wallet read here marked nothing — and unlike a collateral pick,
+        // `select_fee` SPENDS what it picks. A reserved nonce that happened to
+        // be the richest UTxO would have gone straight into a sweep.
+        chain = chain.with_state_dir(
+            cfg.protocol
+                .state_dir
+                .as_ref()
+                .map(std::path::PathBuf::from),
+        );
         let chain = rt.block_on(apply_tm_policy(chain, cfg, &bridge.tm_policy_id))?;
         // The data-availability hint describes the peg-outs of the tx being posted.
         // Under --existing-tm-hex the posted bytes are somebody ELSE'S transaction:
@@ -10058,10 +12233,11 @@ mod tests {
     /// the operator actually depends on: signatures made for one url do not
     /// verify for another, which is why the guide says byte-identical.
     #[test]
-    fn air_gapped_signatures_verify_and_are_bound_to_the_url() {
+    fn air_gapped_signatures_verify_and_are_bound_to_the_url_and_the_nonce() {
         use bitcoin::key::Secp256k1;
         use bitcoin::secp256k1::Keypair;
         use heimdall::cardano::register_spo::{sign_registration, verify_registration};
+        use heimdall::cardano::tx_common::NonceOutpoint;
         use pallas_crypto::key::ed25519;
 
         let secp = Secp256k1::new();
@@ -10069,8 +12245,9 @@ mod tests {
         let bifrost = Keypair::from_seckey_slice(&secp, &[0x22u8; 32]).unwrap();
         let id_pk = bifrost.x_only_public_key().0.serialize();
         let url = b"http://spo1.example.com:18500";
+        let nonce = NonceOutpoint::new([0x7a; 32], 3);
 
-        let sigs = sign_registration(&cold, &bifrost, url);
+        let sigs = sign_registration(&cold, &bifrost, url, nonce);
         assert!(verify_registration(&sigs, &id_pk, url).is_ok());
 
         // A trailing slash is a different url, and therefore a different message.
@@ -10078,6 +12255,17 @@ mod tests {
         assert!(
             verify_registration(&sigs, &id_pk, slashed).is_err(),
             "signatures must not carry over to a different --bifrost-url"
+        );
+
+        // spec [REG-10]: and a different nonce outpoint is a different message
+        // too, which is what stops the same file being posted twice.
+        let moved = heimdall::cardano::register_spo::RegistrationSignatures {
+            nonce: NonceOutpoint::new([0x5c; 32], 1),
+            ..sigs
+        };
+        assert!(
+            verify_registration(&moved, &id_pk, url).is_err(),
+            "signatures must not carry over to a different nonce UTxO"
         );
     }
 

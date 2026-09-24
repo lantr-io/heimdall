@@ -362,6 +362,82 @@ pub async fn fetch_tx_output_address(
         })
 }
 
+/// The transaction that first minted `unit` (`policy ‖ asset name`, hex), from
+/// `/assets/{unit}`. `Ok(None)` when the provider has never seen the asset.
+///
+/// Used to find the one-shot a REVISED federation script was bootstrapped from:
+/// its root token is minted by its `Bootstrap`, and that transaction spent the
+/// one-shot. See `cardano::revision`.
+pub async fn fetch_asset_initial_mint_tx(
+    base_url: &str,
+    project_id: &str,
+    unit: &str,
+) -> Result<Option<String>, String> {
+    let url = format!("{base_url}/assets/{unit}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("assets/{unit} request: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(backend_error(
+            &format!("assets/{unit}"),
+            resp.status(),
+            &resp.text().await.unwrap_or_default(),
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("assets/{unit} json: {e}"))?;
+    v.get("initial_mint_tx_hash")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| Some(s.to_string()))
+        .ok_or_else(|| format!("assets/{unit}: no `initial_mint_tx_hash`"))
+}
+
+/// The outpoints `tx_hash` SPENT, from `/txs/{hash}/utxos` — reference inputs
+/// and collateral left out, since neither is consumed by a transaction that
+/// succeeds.
+pub async fn fetch_tx_spent_inputs(
+    base_url: &str,
+    project_id: &str,
+    tx_hash: &str,
+) -> Result<Vec<(String, u32)>, String> {
+    let url = format!("{base_url}/txs/{tx_hash}/utxos");
+    let v = get_json(&url, project_id, &format!("txs/{tx_hash}/utxos")).await?;
+    let inputs = v
+        .get("inputs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("txs/{tx_hash}/utxos: no `inputs` array"))?;
+    let flag = |i: &serde_json::Value, k: &str| {
+        i.get(k)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    inputs
+        .iter()
+        .filter(|i| !flag(i, "reference") && !flag(i, "collateral"))
+        .map(|i| {
+            let hash = i.get("tx_hash").and_then(serde_json::Value::as_str);
+            let index = i
+                .get("output_index")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok());
+            match (hash, index) {
+                (Some(h), Some(ix)) => Ok((h.to_string(), ix)),
+                _ => Err(format!(
+                    "txs/{tx_hash}/utxos: an input without tx_hash/output_index"
+                )),
+            }
+        })
+        .collect()
+}
+
 /// The POSIX block-time (seconds) of the Cardano tx `tx_hash`, from `/txs/{hash}`.
 /// The age of an Unconfirmed TM UTxO = chain-now − this.
 pub async fn fetch_tx_block_time(

@@ -210,6 +210,12 @@ pub struct RegistrySnapshot {
     pub identity_root: mpf::Hash,
     /// The `treasury_info` state UTxO the root was checked against.
     pub treasury_state: TreasuryStateUtxo,
+    /// Identity keys the previous registry still lists whose binding the
+    /// root no longer holds — pools that migrated and then left. Empty outside a
+    /// migration window. Carried so a caller that needs it (finding its own
+    /// pool, doctor step 6) reads the answer the check already computed rather
+    /// than searching again.
+    pub departed: BTreeSet<Vec<u8>>,
 }
 
 /// Build a verified registry snapshot from caller-fetched UTxO sets.
@@ -220,6 +226,52 @@ pub fn registry_snapshot(
     treasury_policy_hex: &str,
     treasury_asset_name_hex: &str,
 ) -> Result<RegistrySnapshot, RosterError> {
+    registry_snapshot_during_migration(
+        registry_utxos,
+        registry_policy_hex,
+        treasury_utxos,
+        treasury_policy_hex,
+        treasury_asset_name_hex,
+        None,
+    )
+}
+
+/// The previous registry's list, while a migration is in progress ([CFG-10]).
+pub struct PreviousRegistry<'a> {
+    pub policy_hex: &'a str,
+    pub utxos: &'a [BfUtxo],
+}
+
+/// [`registry_snapshot`], told about a registry migration in progress.
+///
+/// The identity-root check needs this, and would otherwise fail on every node
+/// for the length of the window. `Migrate` deliberately does NOT move
+/// `bifrost_identity_root` ([MIG-3], [MIG-6]) — the binding is already the
+/// treasury's truth — so while pools are crossing, the root commits to the OLD
+/// list's bindings while Config #9 names the new one. Rebuilt from the new list
+/// alone, the root simply does not match, and a node that treated that as
+/// corruption would refuse to read a roster for the whole rollout.
+///
+/// So the trie is rebuilt from the UNION of the two lists, keyed by
+/// `bifrost_id_pk`, minus the pools that migrated and then exited: an exit
+/// deletes the binding, but the pool's node in the old list stays, because the
+/// old list froze when Config #9 moved. Which pools those are is found by
+/// searching for the set the root is consistent with
+/// ([`crate::cardano::migrate_registration::explain_identity_root`]), and a
+/// root nothing explains is refused exactly as outside a window.
+///
+/// What the check cannot establish inside a window is which pools have
+/// crossed: `Migrate` leaves the root alone by design, so the root commits to a
+/// migrated pool and an unmigrated one alike. Outside a window the check is
+/// exactly as strict as it always was.
+pub fn registry_snapshot_during_migration(
+    registry_utxos: &[BfUtxo],
+    registry_policy_hex: &str,
+    treasury_utxos: &[BfUtxo],
+    treasury_policy_hex: &str,
+    treasury_asset_name_hex: &str,
+    previous: Option<PreviousRegistry<'_>>,
+) -> Result<RegistrySnapshot, RosterError> {
     let elements = find_registry_utxos(registry_utxos, registry_policy_hex)?;
     let list = RegistryList::from_elements(
         elements
@@ -229,6 +281,10 @@ pub fn registry_snapshot(
     let treasury_state =
         find_treasury_state(treasury_utxos, treasury_policy_hex, treasury_asset_name_hex)?;
 
+    // The duplicate check stays on the CURRENT list alone: two live entries
+    // sharing an identity key is the invariant [REG-5] enforces, and a pool
+    // that appears in both lists during a migration is one registration seen
+    // twice, not two.
     let pairs = list.identity_pairs();
     let mut seen = BTreeSet::new();
     for (pk, _) in &pairs {
@@ -236,13 +292,61 @@ pub fn registry_snapshot(
             return Err(RosterError::DuplicateIdPk(pk.clone()));
         }
     }
-    let trie = mpf::Trie::from_pairs(pairs).map_err(RosterError::Mpf)?;
-    let computed = trie.root_hash();
-    if computed != treasury_state.datum.bifrost_identity_root {
+    // During a migration window the root commits to the union of the two
+    // lists, minus the pools that migrated and then left — found by the SAME
+    // function the three transaction builders use. What the identity root
+    // commits to is one rule, and a second copy of it here would be a copy that
+    // can disagree with the builders about which proof is valid.
+    //
+    // An unreadable PREVIOUS list degrades to the strict check on the current
+    // one; it must not halt the node. Config #13 naming an address with no root
+    // element — a typo in a governance Update, a moved root NFT, an empty page
+    // from the provider — would otherwise abort every roster read on the bridge
+    // until a second Update fixed it. If the migration is in fact complete, the
+    // strict check passes and nothing is lost; if it is not, the mismatch below
+    // reports it honestly.
+    let previous_pairs =
+        previous.as_ref().and_then(
+            |p| match crate::cardano::register_spo::registry_list_from_utxos(p.utxos, p.policy_hex)
+            {
+                Ok(prev) => Some(prev.identity_pairs()),
+                Err(e) => {
+                    tracing::warn!(
+                        "a registry migration is in progress but the previous registry list could \
+                     not be read ({e}), so the identity root is checked against the current \
+                     list alone. If pools are still crossing, that check will not match and the \
+                     roster read fails — fix Config #13 or the provider"
+                    );
+                    None
+                }
+            },
+        );
+    // Still a HARD check inside a window — the only off-chain evidence that a
+    // provider's list is the one the Treasury state vouches for. The first
+    // version of the window warned and returned the list anyway, which would
+    // have admitted a fabricated element straight into the DKG candidate set.
+    let root = treasury_state.datum.bifrost_identity_root;
+    let Some(window) = crate::cardano::migrate_registration::explain_identity_root(
+        &pairs,
+        previous_pairs.as_deref(),
+        root,
+    ) else {
+        let computed = mpf::Trie::from_pairs(pairs.clone())
+            .map_err(RosterError::Mpf)?
+            .root_hash();
         return Err(RosterError::RootMismatch {
-            datum: treasury_state.datum.bifrost_identity_root,
+            datum: root,
             computed,
         });
+    };
+    if !window.departed.is_empty() {
+        tracing::info!(
+            departed = window.departed.len(),
+            "a registry migration is in progress and {} pool(s) migrated and then left, which \
+             is what the identity root and the two lists differ by. The list is accounted for; \
+             the roster is taken from the list Config #9 names, as always",
+            window.departed.len(),
+        );
     }
 
     let spos = list
@@ -263,9 +367,13 @@ pub fn registry_snapshot(
         .collect();
 
     Ok(RegistrySnapshot {
+        // The TREASURY's root, not the recomputed one. Outside a migration
+        // window the two are equal by the check above; inside one the treasury's
+        // is the value every builder must prove against.
+        identity_root: treasury_state.datum.bifrost_identity_root,
         spos,
-        identity_root: computed,
         treasury_state,
+        departed: window.departed,
     })
 }
 
@@ -382,6 +490,7 @@ pub fn roster_from_snapshot(
 /// API and build the verified snapshot. Single attempt — callers that can
 /// tolerate latency should go through [`RegistryRosterSource::fetch_snapshot`],
 /// which retries transient failures.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_registry_snapshot(
     base_url: &str,
     project_id: &str,
@@ -390,6 +499,7 @@ pub async fn fetch_registry_snapshot(
     treasury_address: &str,
     treasury_policy_hex: &str,
     treasury_asset_name_hex: &str,
+    previous: Option<(&str, &str)>,
 ) -> Result<RegistrySnapshot, RosterError> {
     // Concurrent: also narrows the window in which a confirming register_spo
     // (which updates BOTH addresses in one tx) can tear the read.
@@ -398,12 +508,25 @@ pub async fn fetch_registry_snapshot(
         bf_http::fetch_address_utxos(base_url, project_id, treasury_address),
     )
     .map_err(RosterError::Fetch)?;
-    registry_snapshot(
+    // A third address, only while Config #13 is set. The cost of the extra read
+    // is the cost of not halting every node for the length of a migration.
+    let previous_utxos = match previous {
+        None => None,
+        Some((address, _)) => Some(
+            bf_http::fetch_address_utxos(base_url, project_id, address)
+                .await
+                .map_err(RosterError::Fetch)?,
+        ),
+    };
+    registry_snapshot_during_migration(
         &registry_utxos,
         registry_policy_hex,
         &treasury_utxos,
         treasury_policy_hex,
         treasury_asset_name_hex,
+        previous
+            .zip(previous_utxos.as_ref())
+            .map(|((_, policy_hex), utxos)| PreviousRegistry { policy_hex, utxos }),
     )
 }
 
@@ -436,6 +559,17 @@ pub struct RegistryRosterSource {
     pub treasury_info_asset_name_hex: String,
     /// `Roster::min_signers` override until WI-012's stake-weighted threshold.
     pub min_signers: Option<u16>,
+    /// `(address, policy hex)` of the registry a migration is FROM — Config #13,
+    /// `None` when no migration is in progress ([CFG-10]).
+    ///
+    /// Load-bearing for the length of the window, and only then. `Migrate` does
+    /// not move the Treasury state's `bifrost_identity_root` ([MIG-3],
+    /// [MIG-6]), so while pools are crossing, the root commits to the OLD list's
+    /// bindings while Config #9 names the new one — and a roster read that
+    /// rebuilt the trie from the new list alone would find a root that does not
+    /// match and refuse to read a roster at all. See
+    /// [`registry_snapshot_during_migration`].
+    pub previous_registry: Option<(String, String)>,
 }
 
 /// Parse `<cardano_tx_hash>:<index>` (the one-shot bootstrap outref form
@@ -510,6 +644,7 @@ impl RegistryRosterSource {
             &reg_tx_id,
             u64::from(reg_index),
             &treasury.hash,
+            config_policy_id,
         )
         .map_err(|e| err("spos_registry", e))?;
         let network = if mainnet {
@@ -527,6 +662,7 @@ impl RegistryRosterSource {
                 crate::cardano::config_params::TREASURY_INFO_ASSET_NAME,
             ),
             min_signers: None,
+            previous_registry: None,
         })
     }
 
@@ -569,7 +705,32 @@ impl RegistryRosterSource {
             treasury_info_script: None,
             treasury_info_asset_name_hex: hex::encode(treasury_info_asset_name),
             min_signers: None,
+            previous_registry: None,
         }
+    }
+
+    /// Name the registry a migration is coming FROM ([CFG-10]).
+    ///
+    /// Chained onto a published source by the caller that read Config #13, so
+    /// the roster read can tolerate a window in which the two lists disagree.
+    #[must_use]
+    pub fn with_previous_registry(
+        mut self,
+        previous_policy_id: Option<&[u8; 28]>,
+        mainnet: bool,
+    ) -> Self {
+        let network = if mainnet {
+            pallas_addresses::Network::Mainnet
+        } else {
+            pallas_addresses::Network::Testnet
+        };
+        self.previous_registry = previous_policy_id.map(|p| {
+            (
+                blueprint::script_enterprise_address(p, network),
+                hex::encode(p),
+            )
+        });
+        self
     }
 
     /// Attach the compiled `treasury_info` script to a published source, so the
@@ -704,7 +865,13 @@ impl RegistryRosterSource {
             &published.treasury_info_policy_id,
             crate::cardano::config_params::TREASURY_INFO_ASSET_NAME,
             mainnet,
-        );
+        )
+        // spec [CFG-10]: #13 names the registry a migration is coming from,
+        // and is unset except during one. Attached here, on the published
+        // route, because that is the route every running node reads its roster
+        // through — and during a migration this is what stops the identity-root
+        // check failing on all of them at once.
+        .with_previous_registry(published.previous_spos_registry_policy_id.as_ref(), mainnet);
         // The blueprint is embedded (WI-066), so every node can compile the
         // treasury_info script and perform the Update-Y handoff — this used to
         // require an operator-supplied file, which meant the handoff silently
@@ -778,6 +945,9 @@ impl RegistryRosterSource {
                     &self.treasury_info_address,
                     &self.treasury_info_policy_hex,
                     &self.treasury_info_asset_name_hex,
+                    self.previous_registry
+                        .as_ref()
+                        .map(|(a, p)| (a.as_str(), p.as_str())),
                 )
             },
         )
@@ -1191,6 +1361,8 @@ mod tests {
         c.registry = RegistryParams {
             spos_registry_policy_id: [0xc1; 28],
             treasury_info_policy_id: [0xc2; 28],
+            previous_spos_registry_policy_id: None,
+            contracts_release: crate::cardano::blueprint::ContractsRelease::Rev56,
         };
         // #12 is what the local derivations in these tests compile against since
         // WI-090: `resolve` takes the one-shot from the Config, not from
@@ -1467,5 +1639,215 @@ mod embedded_blueprint_roster_tests {
             source.can_hand_off_key(),
             "the embedded blueprint compiles treasury_info, so the handoff is available"
         );
+    }
+}
+
+#[cfg(test)]
+mod migration_window_tests {
+    use super::*;
+    use crate::cardano::bf_http::{BfAmount, BfUtxo};
+    use crate::cardano::registry::{ElementData, RegistryElement};
+    use crate::cardano::treasury_info::TreasuryInfoDatum;
+
+    const CURRENT: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+    const PREVIOUS: &str = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+    const TREASURY: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn element(policy: &str, tx: &str, name: &[u8], e: &RegistryElement) -> BfUtxo {
+        BfUtxo {
+            tx_hash: tx.repeat(32),
+            output_index: 0,
+            amount: vec![
+                BfAmount {
+                    unit: "lovelace".into(),
+                    quantity: "2600000".into(),
+                },
+                BfAmount {
+                    unit: format!("{policy}{}", hex::encode(name)),
+                    quantity: "1".into(),
+                },
+            ],
+            inline_datum: Some(hex::encode(e.to_cbor())),
+            reference_script_hash: None,
+        }
+    }
+
+    fn node(pk: &[u8]) -> RegistryElement {
+        RegistryElement {
+            data: ElementData::Node(crate::cardano::registry::RegistrationNodeData {
+                bifrost_id_pk: pk.to_vec(),
+                bifrost_url: b"https://spo.example".to_vec(),
+            }),
+            link: None,
+        }
+    }
+
+    fn root(link: Option<&[u8]>) -> RegistryElement {
+        RegistryElement {
+            data: ElementData::Root,
+            link: link.map(<[u8]>::to_vec),
+        }
+    }
+
+    fn treasury(root_hash: crate::cardano::mpf::Hash) -> Vec<BfUtxo> {
+        let datum = TreasuryInfoDatum {
+            bifrost_identity_root: root_hash,
+            current_spos_frost_key: vec![0xAB; 32],
+        };
+        vec![BfUtxo {
+            tx_hash: "dd".repeat(32),
+            output_index: 0,
+            amount: vec![
+                BfAmount {
+                    unit: "lovelace".into(),
+                    quantity: "3104330".into(),
+                },
+                BfAmount {
+                    unit: format!(
+                        "{TREASURY}{}",
+                        hex::encode(crate::cardano::config_params::TREASURY_INFO_ASSET_NAME)
+                    ),
+                    quantity: "1".into(),
+                },
+            ],
+            inline_datum: Some(hex::encode(datum.to_cbor())),
+            reference_script_hash: None,
+        }]
+    }
+
+    fn root_of(pairs: &[(&[u8], &[u8])]) -> crate::cardano::mpf::Hash {
+        crate::cardano::mpf::Trie::from_pairs(pairs.iter().map(|(k, v)| (*k, *v)))
+            .unwrap()
+            .root_hash()
+    }
+
+    const POOL_A: &[u8] = &[0xa1; 28];
+    const POOL_B: &[u8] = &[0xb2; 28];
+    const PK_A: &[u8] = &[0x0a; 32];
+    const PK_B: &[u8] = &[0x0b; 32];
+
+    /// The window's defining shape: pool A has migrated, pool B has not. The
+    /// Treasury state's root still commits to BOTH — `Migrate` does not move it
+    /// ([MIG-3]) — so a read that rebuilt the trie from the new list alone would
+    /// find a root that does not match and refuse to produce a roster.
+    ///
+    /// Before this existed, setting Config #13 would have stopped every node on
+    /// the bridge at once.
+    #[test]
+    fn a_partly_migrated_pair_of_lists_still_reads() {
+        let current = vec![
+            element(
+                CURRENT,
+                "11",
+                crate::cardano::registry::REGISTRATION_ROOT_KEY,
+                &root(Some(POOL_A)),
+            ),
+            element(CURRENT, "22", POOL_A, &node(PK_A)),
+        ];
+        let previous = vec![
+            element(
+                PREVIOUS,
+                "33",
+                crate::cardano::registry::REGISTRATION_ROOT_KEY,
+                &root(Some(POOL_A)),
+            ),
+            element(PREVIOUS, "44", POOL_A, &{
+                let mut e = node(PK_A);
+                e.link = Some(POOL_B.to_vec());
+                e
+            }),
+            element(PREVIOUS, "55", POOL_B, &node(PK_B)),
+        ];
+        let asset = hex::encode(crate::cardano::config_params::TREASURY_INFO_ASSET_NAME);
+        // The root the treasury still carries: both bindings.
+        let tsy = treasury(root_of(&[(PK_A, POOL_A), (PK_B, POOL_B)]));
+
+        // Without the window, the read fails.
+        let strict = registry_snapshot(&current, CURRENT, &tsy, TREASURY, &asset);
+        assert!(
+            matches!(strict, Err(RosterError::RootMismatch { .. })),
+            "the new list alone cannot rebuild the root mid-migration"
+        );
+
+        // With it, the read succeeds and the ROSTER is the new list — the list
+        // Config #9 names, which is what the boundary snapshot uses.
+        let snap = registry_snapshot_during_migration(
+            &current,
+            CURRENT,
+            &tsy,
+            TREASURY,
+            &asset,
+            Some(PreviousRegistry {
+                policy_hex: PREVIOUS,
+                utxos: &previous,
+            }),
+        )
+        .expect("the union rebuilds the root");
+        assert_eq!(snap.spos.len(), 1, "the roster is the CURRENT list");
+        assert_eq!(snap.spos[0].pool_id, POOL_A);
+        assert_eq!(
+            snap.identity_root,
+            root_of(&[(PK_A, POOL_A), (PK_B, POOL_B)]),
+            "and the reported root is the treasury's, not the recomputed one"
+        );
+    }
+
+    /// Outside a window the check is exactly as strict as it always was: a list
+    /// that does not rebuild the root is corruption, not a migration.
+    #[test]
+    fn with_no_window_a_root_mismatch_is_still_fatal() {
+        let current = vec![
+            element(
+                CURRENT,
+                "11",
+                crate::cardano::registry::REGISTRATION_ROOT_KEY,
+                &root(Some(POOL_A)),
+            ),
+            element(CURRENT, "22", POOL_A, &node(PK_A)),
+        ];
+        let asset = hex::encode(crate::cardano::config_params::TREASURY_INFO_ASSET_NAME);
+        let wrong = treasury(root_of(&[(PK_B, POOL_B)]));
+        assert!(matches!(
+            registry_snapshot_during_migration(&current, CURRENT, &wrong, TREASURY, &asset, None),
+            Err(RosterError::RootMismatch { .. })
+        ));
+    }
+
+    /// A completed migration — both lists identical — reads exactly as it would
+    /// with no window at all, which is the state the bridge settles into before
+    /// anyone clears Config #13.
+    #[test]
+    fn a_completed_migration_reads_the_same_either_way() {
+        let make = |policy: &str, a: &str, b: &str| {
+            vec![
+                element(
+                    policy,
+                    a,
+                    crate::cardano::registry::REGISTRATION_ROOT_KEY,
+                    &root(Some(POOL_A)),
+                ),
+                element(policy, b, POOL_A, &node(PK_A)),
+            ]
+        };
+        let current = make(CURRENT, "11", "22");
+        let previous = make(PREVIOUS, "33", "44");
+        let asset = hex::encode(crate::cardano::config_params::TREASURY_INFO_ASSET_NAME);
+        let tsy = treasury(root_of(&[(PK_A, POOL_A)]));
+
+        let without = registry_snapshot(&current, CURRENT, &tsy, TREASURY, &asset).unwrap();
+        let with = registry_snapshot_during_migration(
+            &current,
+            CURRENT,
+            &tsy,
+            TREASURY,
+            &asset,
+            Some(PreviousRegistry {
+                policy_hex: PREVIOUS,
+                utxos: &previous,
+            }),
+        )
+        .unwrap();
+        assert_eq!(without.identity_root, with.identity_root);
+        assert_eq!(without.spos.len(), with.spos.len());
     }
 }
