@@ -85,7 +85,8 @@ plus every line at `--min-level` or above (`warn` by default), whatever it
 says: a peer dropped from a round, a provider rate-limiting the node, a
 movement that could not be posted. A warning whose error was cut short to fit
 one message is followed by `the full error, which the warning for it cut short:
-…` — the whole of it, on one line, which past 2000 bytes arrives in pieces. `--min-level error` keeps only failures;
+…` — the whole of it, on one line, which past 2000 bytes arrives in pieces. It
+is written once per distinct error, not again at every retry of the same one. `--min-level error` keeps only failures;
 `--min-level off` keeps only the events; `--no-events` keeps only the levels.
 
 heimdall keeps `heimdall::event` at `info` under any bare `--log-level` /

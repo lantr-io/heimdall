@@ -345,13 +345,25 @@ pub fn full_text_if_cut(e: &impl std::fmt::Display) -> Option<String> {
 /// 2000-byte cut a long one arrives in pieces — the price of the whole error
 /// being on record on every node. One line, so it carries the `[epoch=E]`
 /// prefix the journal is grepped by.
-pub fn log_full_error_if_cut(me: Identifier, epoch: u64, e: &impl std::fmt::Display) {
-    if let Some(full) = full_text_if_cut(e) {
+///
+/// Once per distinct error: `last_logged` holds the text last written out, and
+/// the same text again is skipped. A failure that repeats on the backoff ramp
+/// would otherwise post the same kilobytes to the channel at every retry.
+pub fn log_full_error_if_cut(
+    me: Identifier,
+    epoch: u64,
+    e: &impl std::fmt::Display,
+    last_logged: &mut Option<String>,
+) {
+    if let Some(full) = full_text_if_cut(e)
+        && last_logged.as_deref() != Some(full.as_str())
+    {
         crate::epoch_warn!(
             me,
             epoch,
             "the full error, which the warning for it cut short: {full}"
         );
+        *last_logged = Some(full);
     }
 }
 
