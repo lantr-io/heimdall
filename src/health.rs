@@ -108,6 +108,18 @@ pub struct NodeState {
     /// `/health` is the right home for exactly this: "a warn line scrolls away,
     /// and by the time anyone looks the log is gone".
     pub stranded_pegins: BTreeSet<String>,
+    /// The x-only key the treasury head is LOCKED under, as this node last read
+    /// it (`TreasuryUtxo::y_51`): the key movements are signed with. Hex.
+    ///
+    /// Published because nothing else can say it cheaply. The chain names the
+    /// key it AUTHORIZES; which key the head is locked under takes a
+    /// reconstruction of the head's script from Cardano history, which this
+    /// node does on every treasury read and `show-roster` cannot.
+    pub treasury_key: Option<String>,
+    /// The key `treasury_info` AUTHORIZES (`TreasuryUtxo::authorized_key`). It
+    /// differs from [`Self::treasury_key`] only while a handoff is in flight:
+    /// the datum has rotated, the BTC has not moved yet. Hex.
+    pub authorized_key: Option<String>,
     /// Peers excluded from the ceremony by the pre-ceremony handshake (WI-067),
     /// as `"spo=<short id>: <reason>"`.
     ///
@@ -228,6 +240,14 @@ pub fn render(state: &NodeState) -> String {
     }
     if !state.registry.is_empty() {
         out.push_str(&format!("registry        {}\n", state.registry));
+    }
+    match (&state.treasury_key, &state.authorized_key) {
+        (Some(locked), Some(authorized)) if locked != authorized => out.push_str(&format!(
+            "treasury        locked under {locked}; treasury_info already authorizes \
+             {authorized} — a handoff is in flight\n"
+        )),
+        (Some(locked), _) => out.push_str(&format!("treasury        locked under {locked}\n")),
+        (None, _) => {}
     }
     if let Some(why) = &state.tries_rebuilt_at_startup {
         out.push_str(&format!("tries           REBUILT at startup — {why}\n"));
@@ -500,8 +520,45 @@ mod tests {
             unsigned_movements: 2,
             last_progress_ms: Some(1_700_000_000_000),
             activity: "waiting".into(),
+            // Set, and different: `show-roster` reads both over the wire to tell
+            // the key the treasury is locked under from the one it is moving to.
+            treasury_key: Some("aa".repeat(32)),
+            authorized_key: Some("bb".repeat(32)),
         };
         let json = serde_json::to_string(&state).unwrap();
         assert_eq!(serde_json::from_str::<NodeState>(&json).unwrap(), state);
+    }
+
+    /// A daemon older than the treasury fields still answers `status` and
+    /// `show-roster`: the fields are simply absent, and read as `None`.
+    #[test]
+    fn a_state_without_the_treasury_keys_still_parses() {
+        let mut old = serde_json::to_value(NodeState::default()).unwrap();
+        let map = old.as_object_mut().unwrap();
+        map.remove("treasury_key");
+        map.remove("authorized_key");
+        let state: NodeState = serde_json::from_value(old).unwrap();
+        assert_eq!((state.treasury_key, state.authorized_key), (None, None));
+    }
+
+    /// `heimdall status` says which key the treasury is locked under, and names
+    /// a handoff in flight when the datum has already moved on.
+    #[test]
+    fn the_treasury_line_names_a_handoff_in_flight() {
+        let mut state = NodeState {
+            treasury_key: Some("aa".into()),
+            authorized_key: Some("aa".into()),
+            ..NodeState::default()
+        };
+        assert!(render(&state).contains("treasury        locked under aa\n"));
+        state.authorized_key = Some("bb".into());
+        assert!(
+            render(&state).contains(
+                "treasury        locked under aa; treasury_info already authorizes bb — a \
+                 handoff is in flight"
+            ),
+            "{}",
+            render(&state)
+        );
     }
 }
