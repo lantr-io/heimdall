@@ -53,10 +53,11 @@ Out of scope:
    | Batch grid | Config schedule (`GridParams`) and the current slot |
    | `prev_tm_txid` | txid of the treasury outpoint the chain names now |
    | Health | one probe per roster member |
+   | Current key | `treasury_info.current_spos_frost_key`, and the saved ceremony whose public group key matches it (`persist::saved_ceremony_for_key`) |
 
    | Output | Form |
    |---|---|
-   | Header | 3 lines, see [SR-1]..[SR-4] |
+   | Header | the epoch, then the current key ([SR-17]..[SR-19]), then the next TM and the next-ceremony lines, see [SR-1]..[SR-4], [SR-20] |
    | Pool blocks | one per roster member, see [SR-5]..[SR-14] |
    | Excluded list | see [SR-15] |
    | Details | only with `--verbose`, see [SR-16] |
@@ -66,23 +67,45 @@ Out of scope:
 
 ### Header
 
-- `show-roster` MUST print the current epoch, the stake source, and the threshold as `t of n`. `[SR-1]`
+- `show-roster` MUST print the current epoch and the stake source on the first line, and the next ceremony's threshold as `t of n` on its own line, see [SR-20]. `[SR-1]`
 - On a virtual-epoch deployment, `show-roster` MUST print the bridge epoch after the Cardano epoch, as `epoch 315 (bridge epoch 1558)`. `[SR-1a]`
 - `show-roster` MUST print the stake source as `epoch snapshot` or `live_stake (TEST RUN)`. `[SR-2]`
 - `show-roster` MUST print the total roster stake in ADA and the count of active bans. `[SR-3]`
-- `show-roster` MUST print the next TM line: batch index, UTC time of `B_i`, `prev_tm_txid`, and the cascade as SPO indices. `[SR-4]`
+- `show-roster` MUST print the next TM line: batch index, UTC time of `B_i`, `prev_tm_txid`, and the cascade. `[SR-4]`
+- When the current key's roster is known ([SR-17]), the cascade MUST be elected over THAT roster — the one this epoch's movements are posted by — and named by pool, since a member's registry index may be gone or different. Otherwise it is elected over the next-ceremony roster and named by SPO index, as before. `[SR-4b]`
 - `show-roster` MUST print `no batch left this epoch` when `GridParams::next` returns `None`. `[SR-4a]`
 
 *Example, illustrative.*
 
 ```
-epoch 315 (bridge epoch 1558) · stake: live_stake (TEST RUN) · threshold 6 of 7 (20% security threshold)
-total stake 2,347,561.96 ADA · bans: 0 active
-next TM: batch B_3 at 09:00 UTC, spends 0067141b…7f27 · cascade #5 → #1 → #7 → #2 → #3 → #6 → #4
+epoch 315 (bridge epoch 1558) · stake: live_stake (TEST RUN)
+current key: 46f4e530…2349 (authorized on chain) — made in bridge epoch 1558, threshold 6 of 6
+    pool1s7wet…z2sj (http://heimdal.adanorthpool.com:18500)  NO LONGER REGISTERED
+    pool1az5dm…w4kh (http://139.59.140.78:18501)  in the next roster
+    …
+    handoff: signed from the next epoch's roster, so it needs 6 of these 6 there, and only 4 are. It cannot complete unless …
+next TM: batch B_6 at 18:00:00 UTC, spends cefb913d…270a · cascade pool10vn6n…mj9t → pool1s7wet…z2sj → …
+next ceremony, from the registry as it reads now: threshold 2 of 5 (20% security threshold)
+total stake 68,877.46 ADA · bans: 0 active
 ```
 
 **Why:** the stake source changes who clears the threshold. A test run that
 looks like a snapshot run misleads the reader about the security of the roster.
+
+### Current key
+
+- `show-roster` MUST print, after the first line, the key `treasury_info` authorizes now, marked `(authorized on chain)`. When a ceremony saved on this node made it, the line MUST add that ceremony's bridge epoch and its threshold as `t of n`; when none did, it MUST say its members are not known here; when the datum cannot be read, it MUST say the current key is unknown and why. `[SR-17]`
+- For a known key, `show-roster` MUST print one line per member with where it stands in the registry now: `in the next roster`, `registered, NOT eligible: <reason>`, or `NO LONGER REGISTERED`. `[SR-18]`
+- For a known key, `show-roster` MUST print a handoff line: the handoff is signed from the next epoch's roster (`epoch::rotation`, WI-078), so it names how many members are in that roster against the threshold, and — when too few — the members that must be back in the eligible set before the boundary. `[SR-19]`
+- `show-roster` MUST label the threshold it derives from the registry as the next ceremony's: `next ceremony, from the registry as it reads now: threshold t of n`. `[SR-20]`
+
+**Why:** the rest of the report is a projection from the registry as it reads
+now. While the registry holds still that IS the current roster; once a pool
+leaves or is banned mid-epoch it is not, and a report showing only the
+projection read as if the epoch's key had changed — "threshold 2 of 5" over an
+epoch whose key was 6-of-6, with the handoff about to fail for want of two
+members nobody had named. The key's members come from the node's own saved
+ceremony, matched by its public group key: the secret share is never read.
 
 ### Pool blocks
 
@@ -135,6 +158,7 @@ failure reason, so `down` carries none. Adding one is a change to the gate.
 - `show-roster` MUST compute the cascade with `Roster::cascade(prev_tm_txid, TmSequence::Tm(i))`, where `i` is the next batch index. `[SR-14]`
 - The cascade line MUST read `leader` for the elected member, and `hop N (+N×leader_slot_t slots)` for the others. `[SR-14a]`
 - The cascade line MUST NOT print an absolute slot. `[SR-14b]`
+- When the cascade is the current key's ([SR-4b]), a block's position MUST be found by its bifrost key among the key's members, and a pool the key does not hold MUST read `- (not in the current key)`. `[SR-14c]`
 
 **Why:** the eligible slot is `signing_complete_slot + hops × leader_slot_t`.
 `signing_complete_slot` does not exist until signing ends, so an absolute slot
@@ -162,5 +186,6 @@ needs them. An operator who checks liveness does not.
 ## Testing
 
 - Unit tests on the formatter, with a fixed roster, fixed probe results and a known `prev_tm_txid`. They cover [SR-2], [SR-6], [SR-7], [SR-9], [SR-12a]..[SR-12e] and [SR-14a].
+- Unit tests on the current-key section with a known, an unknown and an unread key. They cover [SR-4b], [SR-14c] and [SR-17]..[SR-20]; `persist::saved_ceremony_for_key` has its own.
 - A unit test in which one peer is `down` and the command still renders every block. It covers [SR-13].
 - A manual run on fed1 against preprod before merge.

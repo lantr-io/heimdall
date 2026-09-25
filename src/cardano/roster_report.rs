@@ -46,6 +46,53 @@ pub struct Excluded {
     pub reason: String,
 }
 
+/// The key the treasury is authorized under NOW (spec [SR-17]).
+///
+/// Distinct from the roster the rest of the report derives, which is what the
+/// NEXT ceremony would run over if it ran now. The two are the same set while
+/// the registry holds still; once a pool leaves or is banned mid-epoch they are
+/// not, and a report that shows only the second reads as if this epoch's key
+/// had already changed — "threshold 2 of 5" on an epoch whose key is 6-of-6.
+#[derive(Debug, Clone)]
+pub enum CurrentKey {
+    /// The `treasury_info` datum could not be read, or this bridge has none.
+    Unread(String),
+    /// Authorized on chain, but no ceremony saved on this node made it, so its
+    /// members are not known here. `why` when the state could not be looked at.
+    NotHeld { key: String, why: Option<String> },
+    /// Authorized on chain, and made by a ceremony saved on this node.
+    Held {
+        key: String,
+        /// The bridge epoch whose ceremony made it.
+        made_in: u64,
+        threshold: u16,
+        members: Vec<KeyMember>,
+    },
+}
+
+/// One member of the current key.
+#[derive(Debug, Clone)]
+pub struct KeyMember {
+    /// Its FROST index IN THE KEY — the one the cascade and every signing
+    /// session of this epoch use, whatever index the registry would give it now.
+    pub identifier: frost_secp256k1_tr::Identifier,
+    pub pool_id: Vec<u8>,
+    pub bifrost_id_pk: Vec<u8>,
+    pub bifrost_url: String,
+    pub standing: Standing,
+}
+
+/// Where a member of the current key stands in the registry as it reads now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Standing {
+    /// In the roster the next ceremony would run over.
+    NextRoster,
+    /// Registered, but not eligible: the reason the roster derivation gives.
+    NotEligible(String),
+    /// Not in the registry at all.
+    NotRegistered,
+}
+
 #[derive(Debug, Clone)]
 pub struct RosterReport<'a> {
     /// The Cardano epoch.
@@ -65,26 +112,54 @@ pub struct RosterReport<'a> {
     /// This node's own build, the reference for the ✓/✗ marks.
     pub own: &'a PeerBuild,
     pub excluded: &'a [Excluded],
+    /// The key in force now, reported before the next-ceremony projection.
+    pub current: &'a CurrentKey,
 }
 
 /// The whole report, as printed.
 #[must_use]
 pub fn render(r: &RosterReport<'_>) -> String {
+    // The next TM of THIS epoch is posted by the roster of the key it is
+    // signed under, so the cascade is elected over that roster when it is
+    // known (spec [SR-4b]) — over the registry's only when it is not.
+    let key_members = match r.current {
+        CurrentKey::Held { members, .. } => Some(members.as_slice()),
+        CurrentKey::Unread(_) | CurrentKey::NotHeld { .. } => None,
+    };
     let cascade = match &r.next_tm {
-        NextTm::Batch { index, spends, .. } => Cascade::elect(
-            r.participants
-                .iter()
-                .map(|p| (p.identifier, p.pool_id.as_slice())),
-            &spends.to_byte_array(),
-            TmSequence::Tm(*index),
-        ),
+        NextTm::Batch { index, spends, .. } => {
+            let roster: Vec<(frost_secp256k1_tr::Identifier, &[u8])> = match key_members {
+                Some(members) => members
+                    .iter()
+                    .map(|m| (m.identifier, m.pool_id.as_slice()))
+                    .collect(),
+                None => r
+                    .participants
+                    .iter()
+                    .map(|p| (p.identifier, p.pool_id.as_slice()))
+                    .collect(),
+            };
+            Cascade::elect(roster, &spends.to_byte_array(), TmSequence::Tm(*index))
+        }
         NextTm::NoneLeft | NextTm::Unavailable(_) => None,
     };
-    let index_of = |id| {
-        r.participants
+    // How a cascade position is named: by the key's own members when the
+    // cascade is theirs (their registry index may be gone or different), by
+    // registry index otherwise, as before.
+    let name_of = |id| match key_members {
+        Some(members) => members
             .iter()
-            .find(|p| p.identifier == id)
-            .map_or(0, |p| p.index)
+            .find(|m| m.identifier == id)
+            .map_or_else(String::new, |m| {
+                crate::epoch::log::pool_short(&m.pool_id, crate::epoch::log::id_short(id))
+            }),
+        None => format!(
+            "#{}",
+            r.participants
+                .iter()
+                .find(|p| p.identifier == id)
+                .map_or(0, |p| p.index)
+        ),
     };
 
     let mut out = String::new();
@@ -98,21 +173,9 @@ pub fn render(r: &RosterReport<'_>) -> String {
     let bridge = r
         .bridge_epoch
         .map_or_else(String::new, |e| format!(" (bridge epoch {e})"));
-    let _ = writeln!(
-        out,
-        "epoch {}{bridge} · stake: {source} · threshold {} of {} ({}% security threshold)",
-        r.epoch,
-        r.threshold,
-        r.participants.len(),
-        r.threshold_percent
-    );
-    // spec [SR-3]
-    let _ = writeln!(
-        out,
-        "total stake {} ADA · bans: {} active",
-        ada(r.total_stake),
-        r.active_bans
-    );
+    let _ = writeln!(out, "epoch {}{bridge} · stake: {source}", r.epoch);
+    // spec [SR-17]..[SR-19]
+    render_current(&mut out, r.current);
     // spec [SR-4], [SR-4a]
     match (&r.next_tm, &cascade) {
         (
@@ -123,11 +186,7 @@ pub fn render(r: &RosterReport<'_>) -> String {
             },
             Some(c),
         ) => {
-            let chain = c
-                .sequence()
-                .map(|id| format!("#{}", index_of(id)))
-                .collect::<Vec<_>>()
-                .join(" → ");
+            let chain = c.sequence().map(name_of).collect::<Vec<_>>().join(" → ");
             let _ = writeln!(
                 out,
                 "next TM: batch B_{index} at {}, spends {spends} · cascade {chain}",
@@ -140,6 +199,21 @@ pub fn render(r: &RosterReport<'_>) -> String {
         }
         (NextTm::Batch { .. }, None) => out.push_str("next TM: empty roster\n"),
     }
+    // spec [SR-1], [SR-3], [SR-20]: everything below is the projection.
+    let _ = writeln!(
+        out,
+        "next ceremony, from the registry as it reads now: threshold {} of {} ({}% security \
+         threshold)",
+        r.threshold,
+        r.participants.len(),
+        r.threshold_percent
+    );
+    let _ = writeln!(
+        out,
+        "total stake {} ADA · bans: {} active",
+        ada(r.total_stake),
+        r.active_bans
+    );
 
     // spec [SR-6], [SR-7]
     let mut sorted: Vec<&DkgParticipant> = r.participants.iter().collect();
@@ -171,10 +245,23 @@ pub fn render(r: &RosterReport<'_>) -> String {
             health(r.probes.get(&p.index), r.own)
         );
         // spec [SR-14a], [SR-14b]
-        let position = match cascade.as_ref().and_then(|c| c.hops_before(p.identifier)) {
-            Some(0) => "leader".to_string(),
-            Some(n) => format!("hop {n} (+{} slots)", n.saturating_mul(r.leader_slot_t)),
-            None => "-".to_string(),
+        // The cascade is the key's when the key is known: find this pool in
+        // it by bifrost key, since its index there need not be its index here.
+        let in_cascade = match key_members {
+            Some(members) => members
+                .iter()
+                .find(|m| m.bifrost_id_pk == p.bifrost_id_pk)
+                .map(|m| m.identifier),
+            None => Some(p.identifier),
+        };
+        let position = match (in_cascade, cascade.as_ref()) {
+            (None, _) => "- (not in the current key)".to_string(),
+            (Some(id), Some(c)) => match c.hops_before(id) {
+                Some(0) => "leader".to_string(),
+                Some(n) => format!("hop {n} (+{} slots)", n.saturating_mul(r.leader_slot_t)),
+                None => "-".to_string(),
+            },
+            (Some(_), None) => "-".to_string(),
         };
         let _ = writeln!(out, "    cascade: {position}");
     }
@@ -187,6 +274,84 @@ pub fn render(r: &RosterReport<'_>) -> String {
         }
     }
     out
+}
+
+/// The current key and, when its ceremony is known, its members' standing and
+/// what that means for its handoff (spec [SR-17]..[SR-19]).
+fn render_current(out: &mut String, current: &CurrentKey) {
+    match current {
+        CurrentKey::Unread(why) => {
+            let _ = writeln!(out, "current key: unknown — {why}");
+        }
+        CurrentKey::NotHeld { key, why } => {
+            let _ = writeln!(
+                out,
+                "current key: {key} (authorized on chain) — not made by a ceremony saved on this \
+                 node{}, so its members are not known here",
+                why.as_ref().map_or_else(String::new, |w| format!(" ({w})"))
+            );
+        }
+        CurrentKey::Held {
+            key,
+            made_in,
+            threshold,
+            members,
+        } => {
+            let _ = writeln!(
+                out,
+                "current key: {key} (authorized on chain) — made in bridge epoch {made_in}, \
+                 threshold {threshold} of {}",
+                members.len()
+            );
+            let name = |m: &KeyMember| {
+                format!(
+                    "{} ({})",
+                    crate::epoch::log::pool_short(
+                        &m.pool_id,
+                        crate::epoch::log::id_short(m.identifier)
+                    ),
+                    m.bifrost_url
+                )
+            };
+            for m in members {
+                let standing = match &m.standing {
+                    Standing::NextRoster => "in the next roster".to_string(),
+                    Standing::NotEligible(why) => format!("registered, NOT eligible: {why}"),
+                    Standing::NotRegistered => "NO LONGER REGISTERED".to_string(),
+                };
+                let _ = writeln!(out, "    {}  {standing}", name(m));
+            }
+            // [SR-19]: the handoff is signed from the NEXT epoch's roster
+            // (`epoch::rotation`, WI-078), so members outside it cannot sign it.
+            let staying = members
+                .iter()
+                .filter(|m| m.standing == Standing::NextRoster)
+                .count();
+            if staying >= usize::from(*threshold) {
+                let _ = writeln!(
+                    out,
+                    "    handoff: signed from the next epoch's roster — {staying} of these {} are \
+                     in it, threshold {threshold}",
+                    members.len()
+                );
+            } else {
+                let missing: Vec<String> = members
+                    .iter()
+                    .filter(|m| m.standing != Standing::NextRoster)
+                    .map(name)
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "    handoff: signed from the next epoch's roster, so it needs {threshold} of \
+                     these {} there, and only {staying} are. It cannot complete unless {} \
+                     {} back in the registry's eligible set before the next boundary",
+                    members.len(),
+                    missing.join(", "),
+                    if missing.len() == 1 { "is" } else { "are" }
+                );
+            }
+        }
+    }
 }
 
 /// spec [SR-12a]..[SR-12e]
@@ -298,8 +463,13 @@ mod tests {
             probes,
             own,
             excluded: &[],
+            current: &UNREAD,
         }
     }
+
+    /// The report before [SR-17]: no treasury_info to name the current key, so
+    /// everything keyed off it falls back to the registry, as it always did.
+    static UNREAD: CurrentKey = CurrentKey::Unread(String::new());
 
     fn batch() -> NextTm {
         NextTm::Batch {
@@ -522,6 +692,177 @@ mod tests {
             let b = block(&out, *idx);
             assert!(b.iter().any(|l| l.trim_start() == want), "#{idx}: {b:?}");
         }
+    }
+
+    /// A key member: its index in the KEY, its pool and bifrost key bytes.
+    fn member(key_index: u16, byte: u8, standing: Standing) -> KeyMember {
+        KeyMember {
+            identifier: Identifier::try_from(key_index).unwrap(),
+            pool_id: vec![byte; 28],
+            bifrost_id_pk: vec![byte; 32],
+            bifrost_url: format!("http://key{byte}.example:18500"),
+            standing,
+        }
+    }
+
+    /// spec [SR-17], [SR-18], [SR-19], [SR-20]: the key in force comes first,
+    /// each member placed against the registry now, then what that means for
+    /// the handoff — and only then the next ceremony's projection, labelled so.
+    #[test]
+    fn the_current_key_comes_first_with_its_members_and_its_handoff() {
+        let ps = [participant(1, 0x01, 10), participant(2, 0x02, 10)];
+        let (probes, own) = (BTreeMap::new(), own());
+        let current = CurrentKey::Held {
+            key: "46f4e530".into(),
+            made_in: 1558,
+            threshold: 3,
+            members: vec![
+                member(1, 0x01, Standing::NextRoster),
+                member(2, 0x07, Standing::NotRegistered),
+                member(3, 0x08, Standing::NotEligible("banned".into())),
+            ],
+        };
+        let mut r = report(&ps, &probes, &own, batch());
+        r.current = &current;
+        let out = render(&r);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("epoch 315 · stake:"), "{out}");
+        assert_eq!(
+            lines[1],
+            "current key: 46f4e530 (authorized on chain) — made in bridge epoch 1558, threshold \
+             3 of 3"
+        );
+        assert!(
+            lines[2].ends_with("(http://key1.example:18500)  in the next roster"),
+            "{out}"
+        );
+        assert!(lines[3].ends_with("  NO LONGER REGISTERED"), "{out}");
+        assert!(
+            lines[4].ends_with("  registered, NOT eligible: banned"),
+            "{out}"
+        );
+        assert!(
+            lines[5].contains("needs 3 of these 3 there, and only 1 are")
+                && lines[5].contains("key7.example")
+                && lines[5].contains("key8.example")
+                && lines[5]
+                    .ends_with("are back in the registry's eligible set before the next boundary"),
+            "{out}"
+        );
+        assert!(lines[6].starts_with("next TM: batch B_3"), "{out}");
+        assert_eq!(
+            lines[7],
+            "next ceremony, from the registry as it reads now: threshold 2 of 2 (20% security \
+             threshold)"
+        );
+
+        // Enough members staying: the handoff line says so, and names nobody.
+        let enough = CurrentKey::Held {
+            key: "46f4e530".into(),
+            made_in: 1558,
+            threshold: 1,
+            members: vec![
+                member(1, 0x01, Standing::NextRoster),
+                member(2, 0x07, Standing::NotRegistered),
+            ],
+        };
+        r.current = &enough;
+        let out = render(&r);
+        assert!(
+            out.contains(
+                "handoff: signed from the next epoch's roster — 1 of these 2 are in it, \
+                 threshold 1"
+            ),
+            "{out}"
+        );
+    }
+
+    /// spec [SR-4b], [SR-14c]: with the key known, this epoch's cascade is the
+    /// key's roster's — named by pool, since a key member's registry index may
+    /// be gone — and a pool the key does not hold has no place in it.
+    #[test]
+    fn with_the_key_known_the_cascade_is_the_keys() {
+        // Next roster: pool 0x01 (also in the key, at key index 2) and 0x02 (not).
+        let ps = [participant(1, 0x01, 10), participant(2, 0x02, 10)];
+        let (probes, own) = (BTreeMap::new(), own());
+        let members = vec![
+            member(1, 0x09, Standing::NotRegistered),
+            member(2, 0x01, Standing::NextRoster),
+        ];
+        let current = CurrentKey::Held {
+            key: "k".into(),
+            made_in: 1558,
+            threshold: 2,
+            members: members.clone(),
+        };
+        // participant() gives 0x01 the bifrost key [1;32]; member() gives [byte;32].
+        let mut r = report(&ps, &probes, &own, batch());
+        r.current = &current;
+        let out = render(&r);
+
+        let txid = Txid::from_str(TXID).unwrap().to_byte_array();
+        let cascade = Cascade::elect(
+            members.iter().map(|m| (m.identifier, m.pool_id.as_slice())),
+            &txid,
+            TmSequence::Tm(3),
+        )
+        .unwrap();
+        let chain: Vec<String> = cascade
+            .sequence()
+            .map(|id| {
+                let m = members.iter().find(|m| m.identifier == id).unwrap();
+                crate::epoch::log::pool_short(&m.pool_id, crate::epoch::log::id_short(id))
+            })
+            .collect();
+        let tm = out.lines().find(|l| l.starts_with("next TM:")).unwrap();
+        assert!(
+            tm.ends_with(&format!("cascade {}", chain.join(" → "))),
+            "{tm}"
+        );
+
+        let hops = cascade
+            .hops_before(Identifier::try_from(2u16).unwrap())
+            .unwrap();
+        let want = if hops == 0 {
+            "cascade: leader".to_string()
+        } else {
+            format!("cascade: hop {hops} (+{} slots)", hops * 600)
+        };
+        assert!(
+            block(&out, 1).iter().any(|l| l.trim_start() == want),
+            "{out}"
+        );
+        assert!(
+            block(&out, 2)
+                .iter()
+                .any(|l| l.trim_start() == "cascade: - (not in the current key)"),
+            "{out}"
+        );
+    }
+
+    /// spec [SR-17]: a key that cannot be read, or whose ceremony is not saved
+    /// here, is said to be so — and everything keyed off it falls back.
+    #[test]
+    fn a_current_key_not_known_here_is_said_so() {
+        let ps = [participant(1, 0x01, 10), participant(2, 0x02, 10)];
+        let (probes, own) = (BTreeMap::new(), own());
+        let mut r = report(&ps, &probes, &own, batch());
+        let unread = CurrentKey::Unread("no treasury_info".into());
+        r.current = &unread;
+        assert_eq!(
+            render(&r).lines().nth(1).unwrap(),
+            "current key: unknown — no treasury_info"
+        );
+        let not_held = CurrentKey::NotHeld {
+            key: "46f4e530".into(),
+            why: None,
+        };
+        r.current = &not_held;
+        assert_eq!(
+            render(&r).lines().nth(1).unwrap(),
+            "current key: 46f4e530 (authorized on chain) — not made by a ceremony saved on this \
+             node, so its members are not known here"
+        );
     }
 
     #[test]

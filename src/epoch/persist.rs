@@ -326,6 +326,32 @@ pub fn read_dkg_group_key(
     Ok(Some(*pkp.verifying_key()))
 }
 
+/// The saved ceremony that produced the group key `key`, searched newest first,
+/// matching on each file's PUBLIC key package alone ([`read_dkg_group_key`]).
+///
+/// For a report that has to say whose key the treasury is under: the chain
+/// names the key, and only the ceremony that made it knows its members and its
+/// threshold. `Ok(None)` when no saved ceremony made it — this node did not
+/// take part, or the file has since been set aside. A file that cannot be read
+/// is skipped rather than fatal: it cannot be the answer, and the next may be.
+pub fn saved_ceremony_for_key(
+    state_dir: &Path,
+    key: &bitcoin::key::UntweakedPublicKey,
+) -> EpochResult<Option<PersistedDkg>> {
+    for epoch in persisted_dkg_epochs(state_dir)? {
+        let Ok(Some(vk)) = read_dkg_group_key(state_dir, epoch) else {
+            continue;
+        };
+        let Ok(group) = crate::frost::xonly::group_xonly(&vk) else {
+            continue;
+        };
+        if group.xonly == *key {
+            return read_dkg_state(state_dir, epoch);
+        }
+    }
+    Ok(None)
+}
+
 /// Read the persisted DKG state for `epoch`, if any. A missing file → `Ok(None)`
 /// (no prior run). A present-but-wrong-epoch file is an error, not a silent
 /// mismatch.
@@ -583,6 +609,43 @@ mod tests {
             Some(12),
             "searched past 13"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ceremony behind a key is found by the key alone, newest first, and a
+    /// key no saved ceremony made is simply not found.
+    #[test]
+    fn the_saved_ceremony_for_a_key_is_found_by_its_group_key() {
+        let (keys, roster) = sample_output();
+        let dir = std::env::temp_dir().join(format!(
+            "persist-ceremony-for-key-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = crate::frost::xonly::group_xonly(&keys.verifying_key)
+            .unwrap()
+            .xonly;
+        assert!(
+            saved_ceremony_for_key(&dir, &key).unwrap().is_none(),
+            "no files"
+        );
+
+        write_dkg_state(
+            &dir,
+            &PersistedDkg::from_output(11, 0, &roster, &keys).unwrap(),
+        )
+        .unwrap();
+        let found = saved_ceremony_for_key(&dir, &key)
+            .unwrap()
+            .expect("its ceremony");
+        assert_eq!((found.epoch, found.roster), (11, roster));
+
+        let (other, _) = sample_output();
+        let elsewhere = crate::frost::xonly::group_xonly(&other.verifying_key)
+            .unwrap()
+            .xonly;
+        assert!(saved_ceremony_for_key(&dir, &elsewhere).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

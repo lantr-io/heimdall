@@ -8390,6 +8390,7 @@ fn run_show_roster(
                             ),
                             ..Default::default()
                         });
+                    let current = current_key_for_report(&rt, cfg, &snapshot, &ctx);
                     print!(
                         "{}",
                         render(&RosterReport {
@@ -8406,6 +8407,7 @@ fn run_show_roster(
                             probes: &probes,
                             own: &own,
                             excluded: &excluded,
+                            current: &current,
                         })
                     );
                 }
@@ -8482,6 +8484,89 @@ fn next_tm_for_report(
 /// The ceremony epoch the daemon runs under `cardano.demo_virtual_epoch_slots`
 /// (spec [SR-1a]); `None` on real epochs, or when the tip cannot be read — the
 /// Cardano epoch beside it is still correct.
+/// The key the treasury is authorized under now, with the roster of the
+/// ceremony that made it when this node saved one (spec [SR-17], [SR-18]).
+///
+/// The key comes from the chain (`treasury_info`), the members from this
+/// node's state directory, matched by the public key package alone — the
+/// secret share is never read. Every member is then placed against the
+/// registry as `snapshot` and `next` read it: in the next roster, registered
+/// but not eligible, or gone.
+fn current_key_for_report(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+    snapshot: &heimdall::cardano::roster::RegistrySnapshot,
+    next: &heimdall::cardano::dkg_roster::DkgContext,
+) -> heimdall::cardano::roster_report::CurrentKey {
+    use heimdall::cardano::roster_report::{CurrentKey, KeyMember, Standing};
+    let key = match treasury_authorized_key(rt, cfg, "show-roster") {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return CurrentKey::Unread("this bridge publishes no readable treasury_info".into());
+        }
+        Err(e) => return CurrentKey::Unread(e),
+    };
+    let hex_key = key.to_string();
+    let Some(dir) = cfg.protocol.state_dir.as_deref() else {
+        return CurrentKey::NotHeld {
+            key: hex_key,
+            why: Some("no protocol.state_dir".into()),
+        };
+    };
+    let saved =
+        match heimdall::epoch::persist::saved_ceremony_for_key(std::path::Path::new(dir), &key) {
+            Ok(Some(saved)) => saved,
+            Ok(None) => {
+                return CurrentKey::NotHeld {
+                    key: hex_key,
+                    why: None,
+                };
+            }
+            Err(e) => {
+                return CurrentKey::NotHeld {
+                    key: hex_key,
+                    why: Some(format!("{e}; run as the heimdall user")),
+                };
+            }
+        };
+    let members = saved
+        .roster
+        .participants
+        .values()
+        .map(|p| KeyMember {
+            identifier: p.identifier,
+            pool_id: p.pool_id.clone(),
+            bifrost_id_pk: p.bifrost_id_pk.clone(),
+            bifrost_url: p.bifrost_url.clone(),
+            standing: if next.own_participant(&p.bifrost_id_pk).is_some() {
+                Standing::NextRoster
+            } else if snapshot
+                .spos
+                .iter()
+                .any(|s| s.bifrost_id_pk == p.bifrost_id_pk)
+            {
+                Standing::NotEligible(
+                    next.excluded
+                        .iter()
+                        .find(|x| x.bifrost_id_pk == p.bifrost_id_pk)
+                        .map_or_else(
+                            || "not in the eligible set".to_string(),
+                            |x| x.reason.to_string(),
+                        ),
+                )
+            } else {
+                Standing::NotRegistered
+            },
+        })
+        .collect();
+    CurrentKey::Held {
+        key: hex_key,
+        made_in: saved.epoch,
+        threshold: saved.roster.min_signers,
+        members,
+    }
+}
+
 fn bridge_epoch_for_report(
     rt: &tokio::runtime::Runtime,
     cfg: &HeimdallConfig,
