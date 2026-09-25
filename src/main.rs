@@ -3043,11 +3043,37 @@ async fn run_spo(
                             bifrost_id_pk: m.bifrost_id_pk.to_vec(),
                         };
                         (m.identifier, info, kp)
+                    } else if let Some((id, info)) =
+                        cfg.protocol.state_dir.as_deref().and_then(|dir| {
+                            heimdall::epoch::persist::saved_seat(
+                                std::path::Path::new(dir),
+                                epoch,
+                                &bifrost_id_pk,
+                            )
+                        })
+                    {
+                        // Left the registry after this epoch's ceremony —
+                        // deregistered, banned, URL-excluded — but still holding
+                        // a share of the key it made. The treasury is under that
+                        // key until the handoff, and an N-of-N key cannot sign
+                        // without this node, so a restart must not be what takes
+                        // it out. The epoch machine resumes the share by the same
+                        // test; the next ceremony, read from the registry, will
+                        // not include this node.
+                        warn!(
+                            "this node's bifrost_id_pk ({}) is no longer in the eligible roster \
+                             for epoch {epoch}, but it holds a share of that epoch's key on disk \
+                             — starting on it, so the key keeps its signer until the handoff. The \
+                             next ceremony will not include this node",
+                            hex::encode(bifrost_id_pk)
+                        );
+                        (id, info, kp)
                     } else {
-                        // Not in the roster by bifrost key, and not a federation
-                        // member either. Against a real registry roster this is
-                        // fatal (not registered / banned / URL-excluded). Fall
-                        // back to --index ONLY for the legacy fixture demo.
+                        // Not in the roster by bifrost key, not a federation
+                        // member, and holding no share of this epoch's key.
+                        // Against a real registry roster this is fatal (not
+                        // registered / banned / URL-excluded). Fall back to
+                        // --index ONLY for the legacy fixture demo.
                         let Some(ix) = index else {
                             error!(
                                 "Error: this node's bifrost_id_pk ({}) is in neither the eligible \

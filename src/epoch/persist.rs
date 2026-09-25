@@ -146,6 +146,44 @@ pub fn persisted_dkg_epochs(state_dir: &Path) -> EpochResult<Vec<u64>> {
     Ok(epochs)
 }
 
+/// This node's seat in the key saved for `epoch`: the index the saved roster
+/// gives `bifrost_id_pk`, with its entry, provided the share in the file was
+/// made for that index. `None` for no file, an unreadable one, an empty key, or
+/// a file that is not this node's.
+///
+/// For a node the registry no longer names — deregistered or banned after the
+/// ceremony — this is its only claim to a place in the epoch, and a real one:
+/// the key the treasury is under still needs its share until the handoff. The
+/// epoch machine makes the same check before resuming ([`read_dkg_state`] plus
+/// the key package's identifier); this is the startup's copy of it.
+#[must_use]
+pub fn saved_seat(
+    state_dir: &Path,
+    epoch: u64,
+    bifrost_id_pk: &[u8],
+) -> Option<(frost::Identifier, crate::epoch::state::SpoInfo)> {
+    if bifrost_id_pk.is_empty() {
+        return None;
+    }
+    let saved = read_dkg_state(state_dir, epoch).ok().flatten()?;
+    let (id, info) = saved.roster.own_participant(bifrost_id_pk)?;
+    let held = *saved.to_group_keys().ok()?.key_package.identifier();
+    (held == id).then(|| (id, info.clone()))
+}
+
+/// The newest epoch whose saved key gives `bifrost_id_pk` a seat, per
+/// [`saved_seat`].
+///
+/// For preflight, which knows the Cardano epoch but not the bridge epoch the
+/// files are named by: it can say "this node holds a share of epoch E's key",
+/// and leave to the startup — which does know the bridge epoch — whether E is
+/// the one running now.
+#[must_use]
+pub fn newest_saved_seat(state_dir: &Path, bifrost_id_pk: &[u8]) -> Option<u64> {
+    let newest = *persisted_dkg_epochs(state_dir).ok()?.first()?;
+    saved_seat(state_dir, newest, bifrost_id_pk).map(|_| newest)
+}
+
 /// Atomically persist the DKG state: the dir is created `0700`, the file is
 /// written `0600` to a sibling `.tmp` and renamed into place so a crash mid-
 /// write never leaves a torn file.
@@ -432,6 +470,56 @@ mod tests {
             ceremony_generation(&dir) > before,
             "a reader that samples the generation must be able to see that a ceremony landed"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A seat is the saved roster's index for the key AND the share in the file
+    /// made for that index — the second half is what refuses a node whose key
+    /// is in the roster but whose file holds another member's share.
+    #[test]
+    fn a_saved_seat_needs_the_key_in_the_roster_and_the_share_at_its_index() {
+        let (keys, roster) = sample_output(); // share held by index 1 = key [1;32]
+        let dir = std::env::temp_dir().join(format!(
+            "persist-saved-seat-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(saved_seat(&dir, 11, &[1; 32]), None, "no file, no seat");
+        assert_eq!(newest_saved_seat(&dir, &[1; 32]), None);
+
+        write_dkg_state(
+            &dir,
+            &PersistedDkg::from_output(11, 0, &roster, &keys).unwrap(),
+        )
+        .unwrap();
+        let id1 = Identifier::try_from(1u16).unwrap();
+        let (id, info) = saved_seat(&dir, 11, &[1; 32]).expect("the holder's seat");
+        assert_eq!((id, info.bifrost_id_pk.as_slice()), (id1, &[1u8; 32][..]));
+        assert_eq!(
+            saved_seat(&dir, 11, &[2; 32]),
+            None,
+            "in the roster, not the share's index"
+        );
+        assert_eq!(saved_seat(&dir, 11, &[9; 32]), None, "not in the roster");
+        assert_eq!(
+            saved_seat(&dir, 11, &[]),
+            None,
+            "an empty key matches nothing"
+        );
+        assert_eq!(saved_seat(&dir, 12, &[1; 32]), None, "another epoch's file");
+
+        write_dkg_state(
+            &dir,
+            &PersistedDkg::from_output(12, 0, &roster, &keys).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            newest_saved_seat(&dir, &[1; 32]),
+            Some(12),
+            "the newest file decides"
+        );
+        assert_eq!(newest_saved_seat(&dir, &[2; 32]), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

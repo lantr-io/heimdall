@@ -184,6 +184,9 @@ pub struct MockCardanoChain {
     /// context, enabling the ceremony window grid (N21) in tests. `None` (the
     /// default) keeps the mock on relative per-round timeouts.
     schedule_anchor_ms: Option<i64>,
+    /// When set, `query_dkg_context` fails with this — a registry read that
+    /// cannot be made, for the paths that must not depend on one.
+    dkg_context_error: Option<String>,
     /// The roots the mock reports as the on-chain bridge state singleton's.
     /// `None` (the default) is the unconfigured chain: `BuildTm` skips the
     /// cross-check instead of treating it as the empty tries.
@@ -333,6 +336,7 @@ impl MockCardanoChain {
             btc_rpc: None,
             dkg_faults: Arc::new(Mutex::new(Vec::new())),
             schedule_anchor_ms: None,
+            dkg_context_error: None,
             batch: Arc::new(Mutex::new(crate::epoch::batch::BatchWindow::NoGrid)),
             slots_past_batch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             advance_batch_on_submit: false,
@@ -558,6 +562,12 @@ impl MockCardanoChain {
 
     /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning the
     /// ceremony window grid on for this mock chain.
+    /// Fail every `query_dkg_context` with `why`.
+    pub fn with_dkg_context_error(mut self, why: &str) -> Self {
+        self.dkg_context_error = Some(why.to_string());
+        self
+    }
+
     pub fn with_schedule_anchor_ms(mut self, anchor_ms: i64) -> Self {
         self.schedule_anchor_ms = Some(anchor_ms);
         self
@@ -654,6 +664,9 @@ impl CardanoChain for MockCardanoChain {
         epoch: u64,
         attempt: u32,
     ) -> EpochResult<crate::cardano::dkg_roster::DkgContext> {
+        if let Some(why) = &self.dkg_context_error {
+            return Err(EpochError::Chain(why.clone()));
+        }
         let mut ctx = crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(
             &self.fixture.roster,
             epoch,
