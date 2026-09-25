@@ -926,25 +926,28 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 }) {
                     // Left the registry after a ceremony it took part in. Not a
                     // FAIL: the key that ceremony made may be the one the
-                    // treasury is under, and an N-of-N key cannot sign without
-                    // this node — refusing to start it is how a deregistration
-                    // strands the treasury until the handoff. `run-spo` decides
-                    // with the bridge epoch this step cannot see whether epoch E
-                    // is the running one, and stops the node if it is not.
-                    b.push(
+                    // treasury is under, and an N-of-N key signs nothing without
+                    // this node. `run-spo` decides, with the bridge epoch this
+                    // step cannot see, whether epoch E is the running one, and
+                    // stops the node if it is not. The registration fix stays
+                    // attached: the handoff of E's key is signed from the next
+                    // epoch's roster (`epoch::rotation`, WI-078), so for a key
+                    // that needs this node, re-registering is the way through.
+                    b.push_fix(
                         6,
                         "registration status",
                         Status::Warn,
                         format!(
                             "NOT REGISTERED any more — this node's bifrost_id_pk {} is not one of \
                              the {} in the registry, but it holds a share of the key saved for \
-                             bridge epoch {e}. It may start, so that key keeps its signer until the \
-                             handoff; the next ceremony will not include it. Once that key has \
-                             been handed off this node has nothing left to sign: register it \
-                             again, or stop it",
+                             bridge epoch {e}. It may start and sign under that key while epoch \
+                             {e} runs; it cannot sign that key's handoff at the next boundary, \
+                             which is signed from the next epoch's roster, and the next ceremony \
+                             will not include it",
                             hex::encode(pk),
                             snapshot.spos.len()
                         ),
+                        NOT_REGISTERED_FIX,
                     );
                 } else {
                     // Not a misconfiguration, and the message must not read like

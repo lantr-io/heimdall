@@ -153,26 +153,39 @@ pub fn persisted_dkg_epochs(state_dir: &Path) -> EpochResult<Vec<u64>> {
 ///
 /// For a node the registry no longer names — deregistered or banned after the
 /// ceremony — this is its only claim to a place in the epoch, and a real one:
-/// the key the treasury is under still needs its share until the handoff. The
-/// epoch machine makes the same check before resuming ([`read_dkg_state`] plus
-/// the key package's identifier); this is the startup's copy of it.
+/// the key the treasury is under needs its share to sign anything this epoch.
+/// It is NOT a claim on that key's handoff, which is signed from the next
+/// epoch's roster (see `epoch::rotation`, WI-078).
 #[must_use]
 pub fn saved_seat(
     state_dir: &Path,
     epoch: u64,
     bifrost_id_pk: &[u8],
 ) -> Option<(frost::Identifier, crate::epoch::state::SpoInfo)> {
+    let saved = own_saved_dkg(state_dir, epoch, bifrost_id_pk)?;
+    let (id, info) = saved.roster.own_participant(bifrost_id_pk)?;
+    Some((id, info.clone()))
+}
+
+/// The saved DKG for `epoch`, if it is `bifrost_id_pk`'s: its roster gives the
+/// key an index, and the share in the file was made for that index.
+///
+/// The one statement of that rule for the startup and preflight; the epoch
+/// machine applies the same test with the key package it goes on to use.
+#[must_use]
+pub fn own_saved_dkg(state_dir: &Path, epoch: u64, bifrost_id_pk: &[u8]) -> Option<PersistedDkg> {
     if bifrost_id_pk.is_empty() {
         return None;
     }
     let saved = read_dkg_state(state_dir, epoch).ok().flatten()?;
-    let (id, info) = saved.roster.own_participant(bifrost_id_pk)?;
+    let (id, _) = saved.roster.own_participant(bifrost_id_pk)?;
     let held = *saved.to_group_keys().ok()?.key_package.identifier();
-    (held == id).then(|| (id, info.clone()))
+    (held == id).then_some(saved)
 }
 
 /// The newest epoch whose saved key gives `bifrost_id_pk` a seat, per
-/// [`saved_seat`].
+/// [`saved_seat`] — searching past newer files that do not, since a torn or
+/// foreign newest file says nothing about an older one of this node's.
 ///
 /// For preflight, which knows the Cardano epoch but not the bridge epoch the
 /// files are named by: it can say "this node holds a share of epoch E's key",
@@ -180,8 +193,36 @@ pub fn saved_seat(
 /// the one running now.
 #[must_use]
 pub fn newest_saved_seat(state_dir: &Path, bifrost_id_pk: &[u8]) -> Option<u64> {
-    let newest = *persisted_dkg_epochs(state_dir).ok()?.first()?;
-    saved_seat(state_dir, newest, bifrost_id_pk).map(|_| newest)
+    persisted_dkg_epochs(state_dir)
+        .ok()?
+        .into_iter()
+        .find(|&epoch| saved_seat(state_dir, epoch, bifrost_id_pk).is_some())
+}
+
+/// Move `epoch`'s DKG file out of the way, as
+/// `dkg-epoch-<epoch>.json.superseded-<unix secs>`, and return where it went.
+///
+/// For a file this node cannot use — unparseable, key material that does not
+/// decode, another key's share. It must not simply be read past: a fresh
+/// ceremony for the epoch writes the same name, and these files authorize a
+/// treasury handoff, so one that only LOOKS unusable is not ours to destroy.
+/// The new name is outside [`persisted_dkg_epochs`]'s pattern, so nothing
+/// reads it again; it waits for a person.
+pub fn set_dkg_state_aside(state_dir: &Path, epoch: u64) -> EpochResult<PathBuf> {
+    let from = dkg_state_path(state_dir, epoch);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let to = from.with_file_name(format!(
+        "{DKG_STATE_PREFIX}{epoch}{DKG_STATE_SUFFIX}.superseded-{stamp}"
+    ));
+    std::fs::rename(&from, &to).map_err(|e| {
+        EpochError::Chain(format!(
+            "set aside unusable DKG state {}: {e}",
+            from.display()
+        ))
+    })?;
+    Ok(to)
 }
 
 /// Atomically persist the DKG state: the dir is created `0700`, the file is
@@ -517,9 +558,64 @@ mod tests {
         assert_eq!(
             newest_saved_seat(&dir, &[1; 32]),
             Some(12),
-            "the newest file decides"
+            "the newest of this node's files"
         );
         assert_eq!(newest_saved_seat(&dir, &[2; 32]), None);
+
+        // A newer file that is not this node's — here the roster gives [1;32]
+        // index 2, while the share is index 1's — says nothing about epoch 12.
+        let mut swapped = roster.clone();
+        for p in swapped.participants.values_mut() {
+            p.bifrost_id_pk = if p.bifrost_id_pk == vec![1; 32] {
+                vec![2; 32]
+            } else {
+                vec![1; 32]
+            };
+        }
+        write_dkg_state(
+            &dir,
+            &PersistedDkg::from_output(13, 0, &swapped, &keys).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved_seat(&dir, 13, &[1; 32]), None);
+        assert_eq!(
+            newest_saved_seat(&dir, &[1; 32]),
+            Some(12),
+            "searched past 13"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unusable file is moved, not deleted, and out of every reader's way:
+    /// the ceremony's own name is free, and the enumeration no longer lists it.
+    #[test]
+    fn a_dkg_file_set_aside_is_kept_and_no_longer_read() {
+        let (keys, roster) = sample_output();
+        let dir = std::env::temp_dir().join(format!(
+            "persist-set-aside-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_dkg_state(
+            &dir,
+            &PersistedDkg::from_output(11, 0, &roster, &keys).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(dkg_state_path(&dir, 11)).unwrap();
+
+        let moved = set_dkg_state_aside(&dir, 11).unwrap();
+        assert!(!dkg_state_path(&dir, 11).exists());
+        assert_eq!(std::fs::read(&moved).unwrap(), before, "byte for byte");
+        assert!(
+            persisted_dkg_epochs(&dir).unwrap().is_empty(),
+            "no longer enumerated"
+        );
+        assert!(read_dkg_state(&dir, 11).unwrap().is_none());
+        assert!(
+            set_dkg_state_aside(&dir, 11).is_err(),
+            "nothing left to move"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

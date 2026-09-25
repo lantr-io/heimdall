@@ -2299,42 +2299,21 @@ async fn epoch_start_phase(
     // share on a restart (2026-09-25) and walked out of a 6-of-6 key. The saved
     // roster is the one the key was generated over, so it — not the registry —
     // says which index is ours; a node the registry no longer names still holds
-    // a share the key needs until the handoff; and a registry too thin to run a
-    // ceremony now says nothing about a key that already exists.
-    let saved = load_saved_share(config, epoch);
+    // a share the key needs to sign anything this epoch; and a registry too thin
+    // to run a ceremony now says nothing about a key that already exists. (What
+    // such a node cannot do is sign the key's handoff: that runs from the NEXT
+    // epoch's roster — `epoch::rotation`, WI-078.)
+    let saved = load_saved_share(config, epoch)?;
 
     // Build the stake-aware DKG context for attempt 0. A failed attempt reruns
     // over a reduced candidate set with a bumped attempt inside `dkg_phase`
     // (DkgContext::reduced_to), so the chain is queried once per ceremony
     // entry (which also refreshes the roster after an aborted window).
     let live = chain.query_dkg_context(epoch, 0).await;
-    let unreadable = match saved {
-        Ok(Some(share)) => return Ok(resume_saved_share(peers, config, epoch, share, live).await),
-        Ok(None) => None,
-        Err(e) => Some(e),
-    };
-    let ctx = live?;
-    if let Some(e) = unreadable {
-        // A state file for this epoch that cannot even be parsed. A node with a
-        // seat keeps the hard error it always had: running a fresh ceremony
-        // would overwrite the file, and a share that only LOOKS corrupt is not
-        // ours to destroy. A node the registry does not name has no ceremony to
-        // run, so the file can wait for a person while the node takes the
-        // no-seat path below — for a federation member, its Phase-1 fallback.
-        let seat = config.identity.bifrost_id_pk.is_empty()
-            || ctx
-                .own_participant(&config.identity.bifrost_id_pk)
-                .is_some();
-        if seat {
-            return Err(e);
-        }
-        crate::epoch_warn!(
-            config.identity.identifier,
-            epoch,
-            "persisted DKG for epoch {epoch} could not be read ({e}). It is left in place; this \
-             node has no seat in the registry, so it carries on without it"
-        );
+    if let Some(share) = saved {
+        return Ok(resume_saved_share(peers, config, epoch, share, live).await);
     }
+    let ctx = live?;
 
     // Every line from here on names this node by its pool id, so the table the
     // labels come from is replaced BEFORE anything of this epoch is logged
@@ -2363,8 +2342,8 @@ async fn epoch_start_phase(
     // gate. `/health` is un-namespaced, which is what lets this reach a peer
     // whose epoch scheme differs — the one mismatch no DKG payload can ever
     // carry, because the two nodes address namespaces that never meet. The
-    // resume path publishes it too, or every peer entering a later attempt
-    // would read a gap where the value should be.
+    // resume path publishes it too whenever its read succeeds, or every peer
+    // entering a later attempt would read a gap where the value should be.
     peers.set_node_facts(own_node_facts(config, &ctx)).await;
 
     // Re-derive THIS node's index from the CURRENT context, every epoch. The
@@ -2716,11 +2695,12 @@ struct SavedShare {
 
 /// This node's persisted share for `epoch`, if there is one and it is ours.
 ///
-/// `Ok(None)` for no file, for a file whose key material does not parse (the
-/// fresh ceremony it leads to is what it always led to), and for another
-/// node's file. `Err` only when the file itself cannot be read or parsed — the
-/// caller decides what that means, because it depends on whether this node has
-/// a seat to run a fresh ceremony in.
+/// `Ok(None)` for no file, and for a file this node cannot use — one that does
+/// not parse, key material that does not decode, or another key's share. Such a
+/// file is SET ASIDE first ([`crate::epoch::persist::set_dkg_state_aside`]):
+/// the epoch then proceeds as if there were none, and whatever ceremony it runs
+/// writes a fresh file without destroying the old one. `Err` only when that
+/// move fails, since carrying on would put a ceremony's write over it.
 ///
 /// "Ours" is decided by the SAVED roster, never by the registry as it reads
 /// now: the key package's identifier must be the index that roster — the one
@@ -2729,43 +2709,41 @@ fn load_saved_share(config: &EpochConfig, epoch: u64) -> EpochResult<Option<Save
     let Some(dir) = &config.state_dir else {
         return Ok(None);
     };
-    let Some(saved) = crate::epoch::persist::read_dkg_state(dir, epoch)? else {
-        return Ok(None);
+    let unusable = match crate::epoch::persist::read_dkg_state(dir, epoch) {
+        Ok(None) => return Ok(None),
+        Ok(Some(saved)) => match saved.to_group_keys() {
+            Ok(group_keys) => {
+                let held = *group_keys.key_package.identifier();
+                let ours = if config.identity.bifrost_id_pk.is_empty() {
+                    // Fixture / --index demo: no on-chain key to look up, so
+                    // the configured index is the only identity there is.
+                    held == config.identity.identifier
+                } else {
+                    saved
+                        .roster
+                        .own_participant(&config.identity.bifrost_id_pk)
+                        .is_some_and(|(id, _)| id == held)
+                };
+                if ours {
+                    return Ok(Some(SavedShare { saved, group_keys }));
+                }
+                "it holds another node's share: its roster does not give this node's bifrost \
+                 key the index the share was made for"
+                    .to_string()
+            }
+            Err(e) => format!("its key material does not decode ({e})"),
+        },
+        Err(e) => format!("it cannot be read ({e})"),
     };
-    let log_id = config.identity.identifier;
-    let group_keys = match saved.to_group_keys() {
-        Ok(group_keys) => group_keys,
-        Err(e) => {
-            crate::epoch_warn!(
-                log_id,
-                epoch,
-                "persisted DKG for epoch {epoch} is unreadable ({e}) — running a fresh ceremony"
-            );
-            return Ok(None);
-        }
-    };
-    let held = *group_keys.key_package.identifier();
-    let ours = if config.identity.bifrost_id_pk.is_empty() {
-        // Fixture / --index demo: no on-chain key to look up, so the
-        // configured index is the only identity there is.
-        held == config.identity.identifier
-    } else {
-        saved
-            .roster
-            .own_participant(&config.identity.bifrost_id_pk)
-            .is_some_and(|(id, _)| id == held)
-    };
-    if !ours {
-        crate::epoch_warn!(
-            log_id,
-            epoch,
-            "persisted DKG for epoch {epoch} holds another node's share — its roster does not \
-             give this node's bifrost key the index the share was made for — ignoring, running a \
-             fresh ceremony"
-        );
-        return Ok(None);
-    }
-    Ok(Some(SavedShare { saved, group_keys }))
+    let moved = crate::epoch::persist::set_dkg_state_aside(dir, epoch)?;
+    crate::epoch_warn!(
+        config.identity.identifier,
+        epoch,
+        "persisted DKG for epoch {epoch} is not usable here — {unusable}. Set aside as {}, so no \
+         ceremony can overwrite it; this epoch proceeds as if there were none",
+        moved.display()
+    );
+    Ok(None)
 }
 
 /// Resume this epoch on a saved share: PublishKeys over the roster the key was
@@ -2810,20 +2788,42 @@ async fn resume_saved_share(
                 );
             }
             if let Some(why) = seat_lost(config, &ctx) {
+                // Said at warn, and said in full, because the limit is not
+                // obvious: the share still signs this epoch's movements, but
+                // the key's HANDOFF is signed from the next epoch's roster
+                // (`epoch::rotation`, WI-078), which this node will not be in.
+                // A key that cannot reach its threshold without it can then
+                // never be handed off — only re-registering before the boundary
+                // puts it back where the handoff is signed.
                 crate::epoch_warn!(
                     held,
                     epoch,
                     "this node has no seat in the registry's eligible set any more ({why}). It \
-                     keeps co-signing epoch {epoch}'s key with the share it holds, which that key \
-                     needs until the handoff, but the next ceremony will not include it"
+                     keeps co-signing under epoch {epoch}'s key while the epoch runs, but it \
+                     cannot sign that key's handoff at the next boundary, which is signed from \
+                     the next epoch's roster. If the key cannot reach its threshold of {} without \
+                     this node, register it again before the boundary",
+                    saved.roster.min_signers
                 );
             }
         }
+        // Read fine, but too thin to run a ceremony now. Not a connectivity
+        // problem, and not one that touches a key that already exists.
+        Err(e @ EpochError::DkgAborted { .. }) => crate::epoch_warn!(
+            held,
+            epoch,
+            "the registry as it reads now could not form a roster ({}) — resuming on the saved \
+             key regardless: it, not the registry, is this epoch's roster",
+            crate::epoch::log::one_line(&e)
+        ),
+        // Node facts are built from the read, so they wait for the next one:
+        // until then a peer's handshake sees a gap, not a wrong value.
         Err(e) => crate::epoch_warn!(
             held,
             epoch,
             "the registry could not be read ({}) — resuming on the saved key regardless: it, \
-             not the registry, is this epoch's roster",
+             not the registry, is this epoch's roster. This node's settings are not published \
+             to peers until a read succeeds",
             crate::epoch::log::one_line(&e)
         ),
     }
@@ -2945,13 +2945,13 @@ fn registry_drift(
     let mut parts = Vec::new();
     if !gone.is_empty() {
         parts.push(format!(
-            "in the key but not in the registry now: {}",
+            "in the key but not in the registry's eligible set now: {}",
             crate::epoch::log::describe_peers(&gone)
         ));
     }
     if !extra.is_empty() {
         parts.push(format!(
-            "in the registry now but not in the key: {}",
+            "in the registry's eligible set now but not in the key: {}",
             crate::epoch::log::describe_peers(&extra)
         ));
     }
@@ -9557,11 +9557,13 @@ mod tests {
         let live = moved.query_dkg_context(0, 0).await.unwrap();
         let drift = registry_drift(&key_roster, &live).expect("the registry moved");
         assert!(
-            drift.contains("in the key but not in the registry now") && drift.contains(":18801"),
+            drift.contains("in the key but not in the registry's eligible set now")
+                && drift.contains(":18801"),
             "{drift}"
         );
         assert!(
-            drift.contains("in the registry now but not in the key") && drift.contains(":18803"),
+            drift.contains("in the registry's eligible set now but not in the key")
+                && drift.contains(":18803"),
             "{drift}"
         );
         let unchanged =
@@ -9583,6 +9585,25 @@ mod tests {
             Some("this key is not in the registry")
         );
 
+        // Refusals. Each moves the file aside rather than leaving it for a
+        // fresh ceremony to overwrite, so it is written back before the next.
+        let file = crate::epoch::persist::dkg_state_path(&dir.0, 0);
+        let rewrite = || {
+            crate::epoch::persist::write_dkg_state(
+                &dir.0,
+                &crate::epoch::persist::PersistedDkg::from_output(0, 0, &key_roster, &group_keys)
+                    .unwrap(),
+            )
+            .unwrap();
+        };
+        let set_aside = || {
+            std::fs::read_dir(&dir.0)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains(".superseded-"))
+                .count()
+        };
+
         // A's key IS in the saved roster, but the share there is B's (index 2):
         // not A's to resume, whatever the roster says about A.
         config.identity.bifrost_id_pk = vec![a; 32];
@@ -9590,55 +9611,72 @@ mod tests {
             epoch_start_phase(&moved, &peers, &config, 0).await,
             Err(EpochError::NotInEligibleSet { .. })
         ));
+        assert!(
+            !file.exists(),
+            "refused, and not left where a ceremony writes"
+        );
+        assert_eq!(set_aside(), 1, "kept, under a name nothing reads");
 
         // C's key is not in the saved roster at all.
+        rewrite();
         config.identity.bifrost_id_pk = vec![c; 32];
         let without_c: Arc<dyn CardanoChain> = Arc::new(chain_of([(id1, a), (id2, b)]));
         assert!(matches!(
             epoch_start_phase(&without_c, &peers, &config, 0).await,
             Err(EpochError::NotInEligibleSet { .. })
         ));
+        assert!(!file.exists());
+        assert!(set_aside() >= 1);
     }
 
-    /// A state file that cannot be parsed stops only a node that could run a
-    /// fresh ceremony over it — which would overwrite it. A node the registry
-    /// does not name carries on to the no-seat path, which for a federation
-    /// member is its Phase-1 fallback.
+    /// A state file this node cannot use is moved aside — never deleted, never
+    /// left for a fresh ceremony to overwrite (these files authorize handoffs).
+    /// Then the epoch proceeds as if there were none: a node with a seat runs
+    /// its ceremony, and one without takes the no-seat path, which for a
+    /// federation member is its Phase-1 fallback.
     #[tokio::test]
-    async fn an_unreadable_saved_share_blocks_only_a_node_with_a_seat() {
-        let dir = TempState::new("resume-unreadable");
-        std::fs::create_dir_all(&dir.0).unwrap();
-        std::fs::write(
-            crate::epoch::persist::dkg_state_path(&dir.0, 0),
-            b"{ not json",
-        )
-        .unwrap();
+    async fn an_unusable_saved_share_is_set_aside_never_overwritten() {
         let id1 = Identifier::try_from(1u16).unwrap();
         let fixture = demo_static_fixture(2, 2, 18_900);
         let registered = fixture.roster.participants[&id1].bifrost_id_pk.clone();
         let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture));
         let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id1, MockPeerHub::new()));
-        let mut config = fast_config(id1);
-        config.state_dir = Some(dir.0.clone());
 
-        config.identity.bifrost_id_pk = vec![0xEE; 32];
-        assert!(matches!(
-            epoch_start_phase(&chain, &peers, &config, 0).await,
-            Err(EpochError::NotInEligibleSet { .. })
-        ));
+        for (pk, seat) in [(vec![0xEE; 32], false), (registered, true)] {
+            let dir = TempState::new(if seat {
+                "unusable-seat"
+            } else {
+                "unusable-no-seat"
+            });
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let file = crate::epoch::persist::dkg_state_path(&dir.0, 0);
+            std::fs::write(&file, b"{ not json").unwrap();
+            let mut config = fast_config(id1);
+            config.state_dir = Some(dir.0.clone());
+            config.identity.bifrost_id_pk = pk;
 
-        config.identity.bifrost_id_pk = registered;
-        match epoch_start_phase(&chain, &peers, &config, 0).await {
-            Err(e) => assert!(e.to_string().contains("parse DKG state"), "{e}"),
-            Ok(phase) => panic!(
-                "a seat must not run over an unreadable share: {}",
-                phase.name()
-            ),
+            let phase = epoch_start_phase(&chain, &peers, &config, 0).await;
+            if seat {
+                assert!(
+                    matches!(phase, Ok(EpochPhase::Dkg { .. })),
+                    "a seat runs its ceremony"
+                );
+            } else {
+                assert!(matches!(phase, Err(EpochError::NotInEligibleSet { .. })));
+            }
+            assert!(!file.exists(), "moved out of the ceremony's way");
+            let kept: Vec<_> = std::fs::read_dir(&dir.0)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains(".superseded-"))
+                .collect();
+            assert_eq!(kept.len(), 1);
+            assert_eq!(
+                std::fs::read(kept[0].path()).unwrap(),
+                b"{ not json",
+                "byte for byte"
+            );
         }
-        assert!(
-            crate::epoch::persist::dkg_state_path(&dir.0, 0).exists(),
-            "the file is left for a person"
-        );
     }
 
     #[tokio::test]

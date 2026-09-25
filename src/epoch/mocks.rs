@@ -560,14 +560,14 @@ impl MockCardanoChain {
         self
     }
 
-    /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning the
-    /// ceremony window grid on for this mock chain.
     /// Fail every `query_dkg_context` with `why`.
     pub fn with_dkg_context_error(mut self, why: &str) -> Self {
         self.dkg_context_error = Some(why.to_string());
         self
     }
 
+    /// Anchor the DKG schedule to `anchor_ms` (Unix wall-clock ms), turning the
+    /// ceremony window grid on for this mock chain.
     pub fn with_schedule_anchor_ms(mut self, anchor_ms: i64) -> Self {
         self.schedule_anchor_ms = Some(anchor_ms);
         self

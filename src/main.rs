@@ -2971,9 +2971,33 @@ async fn run_spo(
     //
     // Any other error is still fatal: a node that cannot READ the registry must
     // not proceed as though it were empty.
-    let roster = match chain.query_roster(epoch).await {
-        Ok(r) => r,
-        Err(e) if matches!(e, heimdall::epoch::state::EpochError::DkgAborted { .. }) => {
+    //
+    // Except for a node holding a share of the RUNNING epoch's key: that key
+    // exists whatever the registry reads now, and its roster is this epoch's.
+    // Loaded once, here, for both uses below — the too-thin registry, and the
+    // seat of a node the registry no longer names.
+    let saved_dkg = configured_keypair
+        .as_ref()
+        .zip(cfg.protocol.state_dir.as_deref())
+        .and_then(|(kp, dir)| {
+            heimdall::epoch::persist::own_saved_dkg(
+                std::path::Path::new(dir),
+                epoch,
+                &kp.x_only_public_key().0.serialize(),
+            )
+        });
+    let roster = match (chain.query_roster(epoch).await, saved_dkg.as_ref()) {
+        (Ok(r), _) => r,
+        (Err(e), Some(saved))
+            if matches!(e, heimdall::epoch::state::EpochError::DkgAborted { .. }) =>
+        {
+            warn!(
+                "the registry cannot form a roster now ({e}), but this node holds a share of \
+                 epoch {epoch}'s key — starting on that key's roster"
+            );
+            saved.roster.clone()
+        }
+        (Err(e), None) if matches!(e, heimdall::epoch::state::EpochError::DkgAborted { .. }) => {
             let fed = federation_roster(&cfg).unwrap_or_else(|fe| {
                 panic!(
                     "{e}\n\nand no federation to fall back on: {fe}. A bridge whose registry \
@@ -2990,7 +3014,7 @@ async fn run_spo(
             );
             fed.to_epoch_roster(epoch)
         }
-        Err(e) => {
+        (Err(e), _) => {
             error!("Error: cannot query the initial roster: {e}");
             return;
         }
@@ -3025,11 +3049,39 @@ async fn run_spo(
                     // Config #11 and that this node holds a share of THAT key.
                     // Once SPOs register and the first Update-Y lands, the branch
                     // above matches and this one stops being taken.
+                    //
+                    // A saved share of the running epoch's key comes FIRST. A
+                    // node that left the registry after this epoch's ceremony —
+                    // deregistered, banned, URL-excluded — still holds a share of
+                    // the key it made, and an N-of-N key signs nothing this epoch
+                    // without it, so a restart must not be what takes it out.
+                    // Ahead of the federation seat because it decides the node's
+                    // pool id and URL: the key's peers fetch and verify this
+                    // node's payloads under its REGISTRY identity, and a member
+                    // of both started as the federation would publish under the
+                    // wrong one. It cannot sign the key's handoff, which runs
+                    // from the next epoch's roster (`epoch::rotation`, WI-078).
+                    let saved_seat = saved_dkg.as_ref().and_then(|s| {
+                        s.roster
+                            .own_participant(&bifrost_id_pk)
+                            .map(|(id, info)| (id, info.clone()))
+                    });
                     let fed_seat = federation_roster(&cfg).ok().and_then(|f| {
                         let m = f.own(&bifrost_id_pk)?.clone();
                         Some((f.min_signers, f.members.len(), m))
                     });
-                    if let Some((min_signers, n, m)) = fed_seat {
+                    if let Some((id, info)) = saved_seat {
+                        warn!(
+                            "this node's bifrost_id_pk ({}) is no longer in the eligible roster \
+                             for epoch {epoch}, but it holds a share of that epoch's key on disk \
+                             — starting on it, so the key keeps this signer while the epoch runs. \
+                             It cannot sign that key's handoff at the next boundary, which is \
+                             signed from the next epoch's roster: if the key cannot reach its \
+                             threshold without this node, register it again before then",
+                            hex::encode(bifrost_id_pk)
+                        );
+                        (id, info, kp)
+                    } else if let Some((min_signers, n, m)) = fed_seat {
                         info!(
                             "no registry entry for this node – taking the Phase-1 FEDERATION \
                              seat {} ({min_signers}-of-{n}). Treasury movements are the \
@@ -3043,31 +3095,6 @@ async fn run_spo(
                             bifrost_id_pk: m.bifrost_id_pk.to_vec(),
                         };
                         (m.identifier, info, kp)
-                    } else if let Some((id, info)) =
-                        cfg.protocol.state_dir.as_deref().and_then(|dir| {
-                            heimdall::epoch::persist::saved_seat(
-                                std::path::Path::new(dir),
-                                epoch,
-                                &bifrost_id_pk,
-                            )
-                        })
-                    {
-                        // Left the registry after this epoch's ceremony —
-                        // deregistered, banned, URL-excluded — but still holding
-                        // a share of the key it made. The treasury is under that
-                        // key until the handoff, and an N-of-N key cannot sign
-                        // without this node, so a restart must not be what takes
-                        // it out. The epoch machine resumes the share by the same
-                        // test; the next ceremony, read from the registry, will
-                        // not include this node.
-                        warn!(
-                            "this node's bifrost_id_pk ({}) is no longer in the eligible roster \
-                             for epoch {epoch}, but it holds a share of that epoch's key on disk \
-                             — starting on it, so the key keeps its signer until the handoff. The \
-                             next ceremony will not include this node",
-                            hex::encode(bifrost_id_pk)
-                        );
-                        (id, info, kp)
                     } else {
                         // Not in the roster by bifrost key, not a federation
                         // member, and holding no share of this epoch's key.
@@ -3078,7 +3105,10 @@ async fn run_spo(
                             error!(
                                 "Error: this node's bifrost_id_pk ({}) is in neither the eligible \
                                  roster for epoch {epoch} (not registered / banned / URL-excluded) \
-                                 nor [federation].members; pass --index only for the legacy fixture demo",
+                                 nor [federation].members, and it holds no share of epoch {epoch}'s \
+                                 key. Register it (`heimdall register-spo`), or check its ban \
+                                 record with `heimdall show-roster`; --index is only for the \
+                                 legacy fixture demo",
                                 hex::encode(bifrost_id_pk)
                             );
                             return;
