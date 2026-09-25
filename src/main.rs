@@ -900,6 +900,10 @@ enum Commands {
         /// left out; this is the peer set as the registry states it.
         #[arg(long)]
         urls: bool,
+        /// Also print the registry contracts, the identity-root check and the
+        /// ban-list entries the roster was derived from.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Scan binocular's on-chain peg-in requests over N2C, then build → sign →
     /// (optionally) broadcast the Treasury Movement sweeping the treasury + all
@@ -2298,9 +2302,10 @@ fn main() {
             blueprint,
             registry_bootstrap,
             urls,
+            verbose,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) = run_show_roster(&cfg, blueprint, registry_bootstrap, urls) {
+            if let Err(e) = run_show_roster(&cfg, blueprint, registry_bootstrap, urls, verbose) {
                 error!("Error: {e}");
                 std::process::exit(1);
             }
@@ -8095,6 +8100,7 @@ fn run_show_roster(
     blueprint: Option<String>,
     registry_bootstrap: Option<String>,
     urls_only: bool,
+    verbose: bool,
 ) -> Result<(), String> {
     use heimdall::cardano::bf_http;
     use heimdall::cardano::roster::RegistryRosterSource;
@@ -8130,8 +8136,10 @@ fn run_show_roster(
         )?;
     // `--urls` is a pipe, not a report: every line it prints has to be a URL, so
     // the provenance header is suppressed rather than reordered. It stays on
-    // stdout with nothing on stderr, so a caller can read it directly.
-    if !urls_only {
+    // stdout with nothing on stderr, so a caller can read it directly. Without
+    // `--verbose` it is left out too (spec [SR-16]): it proves which contracts
+    // the roster came from, which an auditor needs and a liveness check does not.
+    if verbose && !urls_only {
         println!("registry policy:   {}", source.registry_policy_hex);
         println!("registry address:  {}", source.registry_address);
         println!("treasury_info:     {}", source.treasury_info_address);
@@ -8171,25 +8179,12 @@ fn run_show_roster(
         return Ok(());
     }
 
-    println!("current epoch:     {epoch}");
-    println!(
-        "identity root:     {} (verified against treasury_info)",
-        hex::encode(snapshot.identity_root)
-    );
-    println!("registered SPOs:   {}", snapshot.spos.len());
-    for spo in &snapshot.spos {
-        let pool: [u8; 28] = spo
-            .pool_id
-            .as_slice()
-            .try_into()
-            .map_err(|_| format!("pool_id not 28 bytes: {}", hex::encode(&spo.pool_id)))?;
-        println!("  pool {} ({})", hex::encode(pool), pool_id_bech32(&pool));
-        println!("    bifrost_id_pk: {}", hex::encode(&spo.bifrost_id_pk));
+    if verbose {
         println!(
-            "    bifrost_url:   {}",
-            String::from_utf8_lossy(&spo.bifrost_url)
+            "identity root:     {} (verified against treasury_info)",
+            hex::encode(snapshot.identity_root)
         );
-        println!("    element UTxO:  {}:{}", spo.tx_hash, spo.output_index);
+        println!("registered SPOs:   {}", snapshot.spos.len());
     }
 
     // ── ban list (WI-011) ── list entries AND capture the active-ban set the
@@ -8209,9 +8204,11 @@ fn run_show_roster(
         // the registry half above it — which is the half an operator ran this for.
         Err(e) => println!("ban list:          UNRESOLVABLE — {e}"),
         Ok(Some(source)) => {
-            println!("ban policy source: {}", source.origin);
-            println!("ban policy:        {}", source.ban_policy_hex);
-            println!("ban address:       {}", source.ban_address);
+            if verbose {
+                println!("ban policy source: {}", source.origin);
+                println!("ban policy:        {}", source.ban_policy_hex);
+                println!("ban address:       {}", source.ban_address);
+            }
             // Ban activity is evaluated at the epoch boundary (chain-derived),
             // the same deterministic time the live roster path uses.
             let epoch_start_ms =
@@ -8223,6 +8220,8 @@ fn run_show_roster(
             // legitimate. Otherwise the eligible roster printed below would be
             // the unfiltered one, presented as if it were the real one.
             match &read {
+                // The header carries the active count; the entries are detail.
+                Ok(_) if !verbose => {}
                 Ok(bans) => {
                     println!(
                         "ban entries:       {} ({} active at epoch {epoch} boundary)",
@@ -8270,9 +8269,6 @@ fn run_show_roster(
     // sends an operator to when they want to know where they stand, so it must not
     // answer from a different rule than the node they are asking about.
     let live_stake = cfg.cardano.demo_live_stake;
-    if live_stake {
-        println!("(TEST RUN: weighted by live_stake, not the epoch snapshot)");
-    }
     match rt.block_on(fetch_eligible_stakes(
         &base_url,
         pid,
@@ -8295,32 +8291,60 @@ fn run_show_roster(
             }
             match derive_dkg_context(&snapshot, &bans, &stakes, epoch, 0) {
                 Ok(ctx) => {
-                    println!(
-                        "DKG roster (epoch {epoch}; threshold {} of {}, total stake {}):",
-                        ctx.threshold,
-                        ctx.participants.len(),
-                        ctx.total_stake
+                    use heimdall::cardano::roster_report::{Excluded, RosterReport, render};
+                    let excluded: Vec<Excluded> = ctx
+                        .excluded
+                        .iter()
+                        .map(|ex| Excluded {
+                            pool: <[u8; 28]>::try_from(ex.pool_id.as_slice()).map_or_else(
+                                |_| hex::encode(&ex.pool_id),
+                                |id| pool_id_bech32(&id),
+                            ),
+                            // `demo_exclude_unstaked` excludes no-stake pools by adding them
+                            // to the ban set, so `ex.reason` would read "banned" — relabel
+                            // those accurately (they were NOT banned/slashed, just have no
+                            // resolvable Cardano stake).
+                            reason: if exclude_unstaked && !active_bans.contains(&ex.pool_id) {
+                                "no active stake (excluded via demo_exclude_unstaked)".to_string()
+                            } else {
+                                ex.reason.to_string()
+                            },
+                        })
+                        .collect();
+                    let (next_tm, leader_slot_t) = next_tm_for_report(&rt, cfg);
+                    let probes = rt.block_on(probe_roster(&ctx.participants));
+                    // The digest the daemon advertises for this read (dkg_roster.rs,
+                    // `fetch_dkg_context`), so a ✓ means "reads the roster I read".
+                    let own =
+                        heimdall::http::compat::PeerBuild::own(heimdall::http::compat::NodeFacts {
+                            roster_digest: Some(
+                                heimdall::cardano::dkg_roster::RosterRead::of(
+                                    &ctx.participants,
+                                    ctx.threshold,
+                                    !live_stake,
+                                )
+                                .digest,
+                            ),
+                            ..Default::default()
+                        });
+                    print!(
+                        "{}",
+                        render(&RosterReport {
+                            epoch,
+                            bridge_epoch: bridge_epoch_for_report(&rt, cfg, &base_url, pid),
+                            live_stake,
+                            threshold: ctx.threshold,
+                            threshold_percent: heimdall::http::compat::own_threshold_percent(),
+                            total_stake: ctx.total_stake,
+                            active_bans: active_bans.len(),
+                            participants: &ctx.participants,
+                            next_tm,
+                            leader_slot_t,
+                            probes: &probes,
+                            own: &own,
+                            excluded: &excluded,
+                        })
                     );
-                    for p in &ctx.participants {
-                        println!(
-                            "  #{:<3} pk {}  stake={} {}",
-                            p.index,
-                            hex::encode(&p.bifrost_id_pk),
-                            p.active_stake,
-                            p.bifrost_url
-                        );
-                    }
-                    for ex in &ctx.excluded {
-                        // `demo_exclude_unstaked` excludes no-stake pools by adding them to the
-                        // ban set, so `ex.reason` would read "banned" — relabel those accurately
-                        // (they were NOT banned/slashed, just have no resolvable Cardano stake).
-                        let reason = if exclude_unstaked && !active_bans.contains(&ex.pool_id) {
-                            "no active stake (excluded via demo_exclude_unstaked)".to_string()
-                        } else {
-                            ex.reason.to_string()
-                        };
-                        println!("  excluded pool {}: {}", hex::encode(&ex.pool_id), reason);
-                    }
                 }
                 Err(e) => println!("DKG roster:        cannot derive ({e})"),
             }
@@ -8335,6 +8359,112 @@ fn run_show_roster(
         ),
     }
     Ok(())
+}
+
+/// The next Treasury Movement `show-roster` elects a cascade for, and the cascade
+/// hop `leader_slot_t` (spec [SR-4], [SR-14]). Read the way `batch_params` reads
+/// it, so the report names the batch the daemon will build. A read failure is a
+/// line in the report, never an abort: the roster above it is still the answer.
+fn next_tm_for_report(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+) -> (heimdall::cardano::roster_report::NextTm, u64) {
+    use heimdall::cardano::roster_report::NextTm;
+    let read = || -> Result<(NextTm, u64), String> {
+        let loc = config_locator(cfg).ok_or("no Config locator in [cardano]")?;
+        let snapshot = rt.block_on(heimdall::cardano::config_params::fetch_param_snapshot(
+            &loc.base_url,
+            &loc.project_id,
+            &loc.address,
+            &loc.nft_unit,
+        ))?;
+        let scheme = heimdall::epoch::virtual_epoch::EpochScheme::from_slots(
+            cfg.cardano.demo_virtual_epoch_slots,
+        )
+        .map_err(|e| format!("cardano.demo_virtual_epoch_slots: {e}"))?;
+        let schedule = scheme
+            .schedule(
+                &snapshot.config.params.tunables.schedule,
+                cfg.protocol.ceremony_floor_slots(),
+            )
+            .map_err(|e| format!("the virtual epoch cannot hold this bridge's schedule: {e}"))?;
+        let leader_slot_t = u64::try_from(schedule.leader_slot_t).unwrap_or(0);
+        let window = rt.block_on(heimdall::cardano::config_params::batch_at(
+            &loc.base_url,
+            &loc.project_id,
+            &snapshot,
+            scheme,
+            &schedule,
+            None,
+        ));
+        if matches!(window, heimdall::epoch::batch::BatchWindow::NoGrid) {
+            return Err("no batch grid".into());
+        }
+        let Some(b) = window.next() else {
+            return Ok((NextTm::NoneLeft, leader_slot_t));
+        };
+        let tip = singleton_chain_tip(rt, cfg, None)?;
+        Ok((
+            NextTm::Batch {
+                index: b.index,
+                at_ms: heimdall::epoch::log::slot_time_ms(snapshot.time_ms, snapshot.slot, b.slot),
+                spends: tip.outpoint.txid,
+            },
+            leader_slot_t,
+        ))
+    };
+    read().unwrap_or_else(|e| (NextTm::Unavailable(e), 0))
+}
+
+/// The ceremony epoch the daemon runs under `cardano.demo_virtual_epoch_slots`
+/// (spec [SR-1a]); `None` on real epochs, or when the tip cannot be read — the
+/// Cardano epoch beside it is still correct.
+fn bridge_epoch_for_report(
+    rt: &tokio::runtime::Runtime,
+    cfg: &HeimdallConfig,
+    base_url: &str,
+    pid: &str,
+) -> Option<u64> {
+    let scheme = heimdall::epoch::virtual_epoch::EpochScheme::from_slots(
+        cfg.cardano.demo_virtual_epoch_slots,
+    )
+    .ok()?;
+    scheme.virtual_slots()?;
+    let (slot, _) = rt
+        .block_on(heimdall::cardano::bf_http::fetch_latest_block_slot_time(
+            base_url, pid,
+        ))
+        .ok()?;
+    scheme.epoch_at(slot)
+}
+
+/// One `/health` probe per roster member, all at once (spec [SR-12]), keyed by
+/// SPO index. Through `probe_health`, so a peer the pre-ceremony gate would call
+/// unreachable is `down` here too.
+async fn probe_roster(
+    participants: &[heimdall::cardano::dkg_roster::DkgParticipant],
+) -> std::collections::BTreeMap<u16, heimdall::cardano::roster_report::Probe> {
+    let client = reqwest::Client::new();
+    let mut set = tokio::task::JoinSet::new();
+    for p in participants {
+        let (client, url, index) = (client.clone(), p.bifrost_url.clone(), p.index);
+        set.spawn(async move {
+            let start = std::time::Instant::now();
+            let health = heimdall::http::peer_network::probe_health(&client, &url).await;
+            let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            (
+                index,
+                heimdall::cardano::roster_report::Probe { health, latency_ms },
+            )
+        });
+    }
+    let mut probes = std::collections::BTreeMap::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((index, probe)) = joined {
+            probes.insert(index, probe);
+        }
+    }
+    probes
 }
 
 /// Background auto-mover loop (WI-028): periodically chain-source the treasury and

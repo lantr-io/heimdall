@@ -437,6 +437,43 @@ fn gc_dkg_blobs(
 /// allowed to, and a peer still polling round 2 of the last movement of epoch
 /// `E-1` must not be starved by this node rolling over to `E`. Two epochs is
 /// a bounded window, which is the point: the map used to have none.
+/// One `/health` probe of the peer at `bifrost_url`.
+///
+/// Free of [`HttpPeerNetwork`] so `show-roster`, which holds no signing key,
+/// judges a peer with the same probe the pre-ceremony gate does.
+pub async fn probe_health(
+    client: &reqwest::Client,
+    bifrost_url: &str,
+) -> crate::epoch::traits::PeerHealth {
+    let url = format!("{}/health", bifrost_url.trim_end_matches('/'));
+    let Ok(resp) = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    else {
+        return crate::epoch::traits::PeerHealth::unreachable();
+    };
+    if !resp.status().is_success() {
+        return crate::epoch::traits::PeerHealth::unreachable();
+    }
+    // A body we cannot read or parse leaves the BUILD unknown, not the peer
+    // unreachable: it answered. Unknown is the allowed verdict (WI-067), so
+    // a peer whose /health predates the extra fields still joins.
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_default();
+    let build =
+        serde_json::from_value::<crate::http::compat::PeerBuild>(body.clone()).unwrap_or_default();
+    let published_dkg = match (body.get("dkg_epoch"), body.get("dkg_attempt")) {
+        (Some(e), Some(a)) => e.as_u64().zip(a.as_u64()),
+        _ => None,
+    };
+    crate::epoch::traits::PeerHealth {
+        reachable: true,
+        build,
+        published_dkg,
+    }
+}
+
 fn gc_sign_blobs(
     sign: &mut std::collections::BTreeMap<crate::http::server::SignKey, String>,
     epoch: u64,
@@ -447,34 +484,7 @@ fn gc_sign_blobs(
 #[async_trait]
 impl PeerNetwork for HttpPeerNetwork {
     async fn check_health(&self, peer: &SpoInfo) -> crate::epoch::traits::PeerHealth {
-        let url = format!("{}/health", peer.bifrost_url.trim_end_matches('/'));
-        let Ok(resp) = self
-            .client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(2))
-            .send()
-            .await
-        else {
-            return crate::epoch::traits::PeerHealth::unreachable();
-        };
-        if !resp.status().is_success() {
-            return crate::epoch::traits::PeerHealth::unreachable();
-        }
-        // A body we cannot read or parse leaves the BUILD unknown, not the peer
-        // unreachable: it answered. Unknown is the allowed verdict (WI-067), so
-        // a peer whose /health predates the extra fields still joins.
-        let body = resp.json::<serde_json::Value>().await.unwrap_or_default();
-        let build = serde_json::from_value::<crate::http::compat::PeerBuild>(body.clone())
-            .unwrap_or_default();
-        let published_dkg = match (body.get("dkg_epoch"), body.get("dkg_attempt")) {
-            (Some(e), Some(a)) => e.as_u64().zip(a.as_u64()),
-            _ => None,
-        };
-        crate::epoch::traits::PeerHealth {
-            reachable: true,
-            build,
-            published_dkg,
-        }
+        probe_health(&self.client, &peer.bifrost_url).await
     }
 
     async fn set_chain_view(&self, view: ChainView) {

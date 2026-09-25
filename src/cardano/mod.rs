@@ -47,6 +47,7 @@ pub mod register_spo;
 pub mod registry;
 pub mod retry;
 pub mod roster;
+pub mod roster_report;
 pub mod spi_trie;
 pub mod stake;
 pub mod state_file;
