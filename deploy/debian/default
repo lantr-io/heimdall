@@ -18,13 +18,9 @@
 #
 #   * there is no --broadcast. That is a `run-mover` flag too. A configured,
 #     registered node participates from its first start; the way to watch an
-#     install before enabling it is the dry run below, which joins nothing. It
-#     reads THIS file the way the unit does — `sudo -u heimdall heimdall …` would
-#     not, and would report "no wallet key" for a mnemonic set here:
+#     install before enabling it is the dry run below, which joins nothing.
 #
-#       sudo systemd-run --pipe --wait --quiet --collect -p User=heimdall \
-#           -p EnvironmentFile=/etc/default/heimdall \
-#           /usr/bin/heimdall run-spo --config /etc/heimdall/heimdall.toml --check
+#       sudo -u heimdall heimdall run-spo --config /etc/heimdall/heimdall.toml --check
 #
 # What DOES belong here, if anything: --log-level / --log-format. Prefer $RUST_LOG
 # at the bottom of this file for verbosity — it is finer-grained and needs no
@@ -41,10 +37,6 @@ HEIMDALL_ARGS=""
 # alternatives, and setting both is refused at startup — the daemon will not run.
 # So if you migrate to a key file, CLEAR this variable; leaving it set is the one
 # mistake that stops the node rather than being quietly ignored.
-#
-# This is systemd's syntax, not the shell's: `export HEIMDALL_MNEMONIC=…` is
-# skipped with only a journal line ("Ignoring invalid environment assignment"),
-# and a variable exported in your shell never reaches the unit at all.
 #HEIMDALL_MNEMONIC="word word word ..."
 
 # Log verbosity, overriding [log].level in /etc/heimdall/heimdall.toml. This is

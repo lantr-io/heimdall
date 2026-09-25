@@ -67,7 +67,7 @@ heimdall is installed but NOT enabled — it needs a bridge configuration first.
 
   1. edit  /etc/heimdall/heimdall.toml   (bridge identifiers, Blockfrost id)
   2. edit  /etc/default/heimdall         (wallet mnemonic)
-  3. dry run, as the service user and with the unit's environment — the config
+  3. dry run, as the service user and with the unit's environment file — the config
      is 0640 root:heimdall, and the mnemonic is in /etc/default/heimdall, which
      `sudo -u heimdall heimdall …` would not read:
        sudo systemd-run --pipe --wait --quiet --collect -p User=heimdall \

@@ -143,7 +143,7 @@ be in *this* command's
 environment: `/etc/default/heimdall` is read by the unit, not by your shell.
 
 ```bash
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall doctor --config /etc/heimdall/heimdall.toml
 ```
 
@@ -158,13 +158,13 @@ on your air-gapped machine. Three commands, one trip:
 
 ```bash
 # on the node — runs its checks, then writes the request instead of a transaction
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall register-spo --config /etc/heimdall/heimdall.toml --out /media/usb/request.json
 # beside cold.skey, on a machine with no network
 heimdall sign-with-pool-key /media/usb/request.json \
     --cold-skey cold.skey --out /media/usb/signed.json
 # back on the node
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall register-spo --config /etc/heimdall/heimdall.toml \
     --signed /media/usb/signed.json --submit
 ```
@@ -177,7 +177,7 @@ set `cardano.cold_skey_path` to it (`0600`, owned by `heimdall`) and it is one c
 Dry run first, then add `--submit`:
 
 ```bash
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall register-spo --config /etc/heimdall/heimdall.toml
 ```
 
@@ -185,10 +185,10 @@ If it stops with `no reference script for the registry` instead, deploy one, the
 the outpoint it prints:
 
 ```bash
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall deploy-registry-ref --config /etc/heimdall/heimdall.toml --submit
 #   registry ref UTxO:    <tx_hash>#0
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall register-spo --config /etc/heimdall/heimdall.toml \
     --registry-ref <tx_hash>:0 --submit
 ```
@@ -596,26 +596,40 @@ after the change and read every line.
 ## 4. Check it before going further
 
 ```bash
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall doctor --config /etc/heimdall/heimdall.toml
 ```
 
 Run it as the `heimdall` user: the config is `0640 root:heimdall` so you cannot read it as
 yourself, and running as root would leave root-owned files in the state directory.
 
-The `env HEIMDALL_MNEMONIC=…` is not decoration, here or in any command below that pays a fee:
-`sudo` clears the environment, so a variable exported in your shell does not reach heimdall, and
-`/etc/default/heimdall` is read by the systemd unit, not by your shell. Leave it out and step 1
-reports `no wallet key … which is not set in this process's environment`, and step 4 cannot look
-for the reference script. If the mnemonic lives only in `/etc/default/heimdall`, have systemd read
-that file for you — the same parser the unit uses, so an `export` line or a commented-out one
-shows up here rather than at the first start:
+`--preserve-env=HEIMDALL_MNEMONIC` is not decoration, here or in any command below that pays a
+fee: `sudo` clears the environment, so without it a variable exported in your shell does not reach
+heimdall, and `/etc/default/heimdall` is read by the systemd unit, not by your shell. Leave it out
+and step 1 reports `no wallet key … which is not set in this process's environment`, and step 4
+cannot look for the reference script. Do **not** write it as `sudo -u heimdall env
+HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" …`: that expands the phrase onto sudo's command line, which
+sudo writes to its log and `ps` shows every local user for as long as the command runs.
+
+That is for a wallet that is a mnemonic. With `cardano.payment_skey_path` instead, drop the flag and
+do not export the variable at all — a key file and a mnemonic together are refused as two wallet
+keys, which is exactly what a leftover export would pass through.
+
+If the mnemonic lives only in `/etc/default/heimdall`, have systemd read that file for you, with
+the same parser the unit uses — so a commented-out line shows up here rather than at the first
+start:
 
 ```bash
 sudo systemd-run --pipe --wait --quiet --collect -p User=heimdall \
     -p EnvironmentFile=/etc/default/heimdall \
     /usr/bin/heimdall doctor --config /etc/heimdall/heimdall.toml
 ```
+
+Write that line the way systemd reads it — `HEIMDALL_MNEMONIC="word word …"`, uncommented, and
+**without `export`**. systemd skips an `export` line, and it does so by logging it, value included,
+to the journal (`Ignoring invalid environment assignment 'export HEIMDALL_MNEMONIC=…'`). If your
+file ever had one and the unit or this check ran, the phrase is in the journal: treat the wallet as
+exposed and move its funds to a new one.
 
 This runs eleven startup checks and prints all of them with the exact command that fixes each one,
 then exits non-zero if any failed. It reads the chain and **posts nothing** — a missing reference
@@ -852,7 +866,7 @@ whole bridge, and finding it means you deploy nothing and lock no ADA. It prints
 Run this command only if it reports finding neither.
 
 ```bash
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall deploy-registry-ref \
     --config /etc/heimdall/heimdall.toml \
     --submit
@@ -907,7 +921,7 @@ would run anyway (wallet, registry reference script, the min-stake gate) and the
 transaction, writes the request the other machine answers:
 
 ```bash
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall register-spo --config /etc/heimdall/heimdall.toml \
     --out /media/usb/request.json
 ```
@@ -951,7 +965,7 @@ the command stops rather than assuming you said yes.
 **2c. Back on the node — submit.**
 
 ```bash
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall register-spo --config /etc/heimdall/heimdall.toml \
     --signed /media/usb/signed.json --submit
 ```
@@ -974,7 +988,7 @@ and the gate runs at step 2c instead. Submission is never ungated; only the earl
 deliberately — point `cardano.cold_skey_path` at it and the whole thing is one command:
 
 ```bash
-sudo -u heimdall heimdall register-spo \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall heimdall register-spo \
     --config /etc/heimdall/heimdall.toml \
     --submit
 ```
@@ -1352,13 +1366,13 @@ With the key where it belongs, off this machine, it is the same three steps as r
 
 ```bash
 # on the node — reports the ban record, then writes the request
-sudo -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml \
     --out /media/usb/request.json
 # beside cold.skey
 heimdall sign-with-pool-key /media/usb/request.json \
     --cold-skey cold.skey --out /media/usb/signed.json
 # back on the node
-sudo -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml \
     --signed /media/usb/signed.json --submit
 ```
 

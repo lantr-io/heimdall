@@ -385,9 +385,12 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         // asking it is also how the source gets reported — a second opinion
         // about that is how the two drift apart.
         let wallet = crate::cardano::wallet::resolve_wallet(&cfg.cardano);
+        // Steps 4 and 11 point back here rather than carrying the resolver's
+        // explanation: step 1 prints it once, and three copies of it in one
+        // report bury the step that actually says what to fix.
         wallet_addr = match &wallet {
             Ok(w) => Ok(w.address.clone()),
-            Err(e) => Err(e.clone()),
+            Err(_) => Err("no usable wallet (step 1 says why)".to_string()),
         };
         match &wallet {
             Ok(w) => notes.push(format!(

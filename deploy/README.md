@@ -62,7 +62,7 @@ every fresh machine. After configuring:
 # One dry-run tick, AS THE SERVICE USER: the config is 0640 root:heimdall and
 # /var/lib/heimdall is 0700 heimdall, so running this as yourself cannot read the
 # config, and running it as root would leave root-owned files in the state dir.
-# And WITH THE UNIT'S ENVIRONMENT: the mnemonic is in /etc/default/heimdall, which
+# And WITH THE UNIT'S ENVIRONMENT FILE: the mnemonic is in /etc/default/heimdall, which
 # `sudo -u heimdall heimdall …` does not read — it would report "no wallet key".
 sudo systemd-run --pipe --wait --quiet --collect -p User=heimdall \
     -p EnvironmentFile=/etc/default/heimdall \
@@ -81,7 +81,8 @@ Notes:
 - **Secrets belong in `/etc/default/heimdall`,** not in the TOML. heimdall reads
   `$HEIMDALL_MNEMONIC` only when `cardano.mnemonic` is absent from the config file, so leaving that
   key commented out is what activates the environment variable — and keeps the seed out of a file
-  dpkg tracks and diffs on upgrade.
+  dpkg tracks and diffs on upgrade. Write it as `HEIMDALL_MNEMONIC="word word …"`, **without**
+  `export`: systemd skips such a line by logging it, phrase included, to the journal.
 - **`$HEIMDALL_ARGS` ships empty, and for a normal node it stays empty.** `run-spo` has no
   cadence flag — movements fall on the bridge's on-chain batch grid, which is not a local
   setting — and no `--broadcast`: a configured, registered node participates from its first
