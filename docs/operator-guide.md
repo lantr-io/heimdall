@@ -677,16 +677,26 @@ never folded it.
 
 **`run-spo` fixes both itself, at startup.** It runs the checks, and if the tries are the fault —
 and the Config resolved, so it knows which bridge to read — it rebuilds them from Cardano history
-and runs the checks again:
+and runs the checks again (each `⚠` is one line in the log, wrapped here, with hashes shortened):
 
 ```
 ⚠ local tries behind the chain — never seeded (cpo, spi absent). Rebuilding both from
   Cardano history before starting; this node could neither build nor co-sign until they match
   [cpo] reconstructed root matches the bridge state singleton's cpo_root (c88736be…)
   [spi] reconstructed root matches the bridge state singleton's spi_root (265fdb3f…)
-⚠ tries rebuilt from chain history and now match the bridge-state singleton
+⚠ tries rebuilt from chain history at treasury head 26b974ec…:0; they now match the
+  bridge-state singleton (cpo root c88736be…, spi root 265fdb3f…). Before the rebuild:
+  never seeded (cpo, spi absent). If this happens at every start, this node is losing its
+  state directory between runs
 [10/11] local tries   PASS  cpo and spi match the bridge-state singleton
 ```
+
+A running node that finds its tries behind at a batch rebuilds the same way, and says so under
+its usual `[epoch=…]` prefix, with the batch: `B_4: tries rebuilt from chain history at treasury
+head …`. If `pending-tm.json` cannot be removed after the new tries are installed, the rebuild
+still counts as done and the line says the record stays: a fold writes nothing unless it
+reproduces the roots its movement committed, so a leftover record cannot move the tries anywhere
+the chain has not.
 
 Every movement is on chain, so nothing here needs you. The walk refuses to persist a root the
 singleton does not attest, so it cannot invent state either, and a node already in sync does no

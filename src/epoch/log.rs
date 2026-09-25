@@ -964,10 +964,12 @@ mod tests {
             "the set of SUCCESS events changed — does each one still have a failure counterpart?"
         );
         // DKG aborted, fault ban failed, Update-Y failed, Update-Y did not take,
-        // TM not signed, TM post failed.
+        // TM not signed, TM post failed — plus tries rebuilt at runtime, which is
+        // no pair's other half: a node whose tries are in sync has nothing to
+        // say, so it has no success twin to lose.
         assert_eq!(
             count(&failure),
-            6,
+            7,
             "the set of FAILURE events changed — does each success event still have one?"
         );
     }
