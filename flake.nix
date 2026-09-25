@@ -29,6 +29,8 @@
             pkg-config
             openssl
           ];
+          # nixpkgs rustc has no rust-src; rust-analyzer needs std sources.
+          RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
       })
     );
