@@ -74,12 +74,13 @@ pub fn resolve_wallet(cfg: &CardanoConfig) -> Result<Wallet, String> {
 /// and "no wallet key … or $HEIMDALL_MNEMONIC" alone reads as a heimdall bug
 /// to someone who can `echo` it.
 ///
-/// `Debug` is written by hand, as [`Wallet`]'s is: [`Self::Set`] holds the
-/// seed phrase.
-#[derive(Clone, PartialEq, Eq)]
+/// [`Self::Set`] holds the seed phrase, so: `Debug` is written by hand, as
+/// [`Wallet`]'s is; the value is `Zeroizing`, as the skey path's buffers are,
+/// because `resolve_wallet` runs several times in a long-lived daemon and each
+/// run would otherwise leave a copy in freed heap; and nothing derives `Clone`.
 pub enum EnvMnemonic {
     Unset,
-    Set(String),
+    Set(Zeroizing<String>),
     /// Set, but not valid UTF-8, so it cannot be a BIP-39 mnemonic.
     /// `std::env::var(..).ok()` folded this into "unset", which sent the
     /// operator looking for an assignment that was there.
@@ -100,7 +101,7 @@ impl EnvMnemonic {
     #[must_use]
     pub fn from_process() -> Self {
         match std::env::var("HEIMDALL_MNEMONIC") {
-            Ok(value) => Self::Set(value),
+            Ok(value) => Self::Set(Zeroizing::new(value)),
             Err(std::env::VarError::NotPresent) => Self::Unset,
             Err(std::env::VarError::NotUnicode(_)) => Self::NotUnicode,
         }
@@ -118,10 +119,14 @@ impl EnvMnemonic {
     /// `ps` shows it for the whole run.
     fn why_unused(&self) -> &'static str {
         match self {
+            // Both halves of the sudo case, because an operator who already
+            // passed the flag from a shell that no longer exports the variable
+            // gets this same state, and "use the flag" alone sends them round.
             Self::Unset => {
-                "which is not set in this process's environment: sudo drops it unless run as \
-                 `sudo --preserve-env=HEIMDALL_MNEMONIC …`, and a service sees only what its \
-                 unit or container passes (/etc/default/heimdall for the Debian package)"
+                "which is not set in this process's environment: export it in the shell you \
+                 run from AND pass it through sudo with `sudo --preserve-env=HEIMDALL_MNEMONIC \
+                 …`; a service sees only what its unit or container passes \
+                 (/etc/default/heimdall for the Debian package)"
             }
             Self::Set(_) => "which is set but blank in this process's environment",
             Self::NotUnicode => {
@@ -142,29 +147,27 @@ impl EnvMnemonic {
 pub fn resolve_wallet_from(cfg: &CardanoConfig, env: EnvMnemonic) -> Result<Wallet, String> {
     // The authoritative "exactly one" check. `refuse_ambiguous_wallet_key`
     // makes the same call at config load, which is where an operator wants to
-    // hear it — but the load-time check sees only the TOML, and `run-spo`
-    // injects `--cardano-mnemonic` and `$HEIMDALL_MNEMONIC` into the config
-    // AFTER it. Without this, migrating to a skey while leaving the mnemonic
-    // in /etc/default/heimdall silently resolved to the skey.
+    // hear it — but the load-time check sees only the TOML: `run-spo` injects
+    // `--cardano-mnemonic` into the config AFTER it, and `$HEIMDALL_MNEMONIC`
+    // never passes through the config at all (it arrives here, as `env`).
+    // Without this, migrating to a skey while leaving the mnemonic in
+    // /etc/default/heimdall silently resolved to the skey.
+    //
+    // A value that cannot be a mnemonic — blank, or not UTF-8 — is no second
+    // key, exactly as a blank `cardano.mnemonic` is not: the refusal exists
+    // because precedence would sign from an address the operator did not
+    // expect, and such a value derives no address at all.
     //
     // Read what the error needs from `env` before it is consumed, so the
     // phrase is moved into the resolver rather than copied.
     let env_unused = env.why_unused();
-    // Unreadable is still SET: the operator put something there, and beside
-    // a key file it is the leftover this refusal exists for, not an absence.
-    let env_unreadable = matches!(env, EnvMnemonic::NotUnicode);
     let mnemonic = mnemonic_from(cfg, env);
     let skey_path = cfg
         .payment_skey_path
         .as_deref()
         .map(str::trim)
         .filter(|p| !p.is_empty());
-    let other_key = match mnemonic.as_ref() {
-        Some((_, src)) => Some(*src),
-        None if env_unreadable => Some("$HEIMDALL_MNEMONIC (set, though not valid UTF-8)"),
-        None => None,
-    };
-    if let (Some(path), Some(src)) = (skey_path, other_key) {
+    if let (Some(path), Some((_, src))) = (skey_path, mnemonic.as_ref()) {
         return Err(format!(
             "two wallet keys: cardano.payment_skey_path ({path}) and a mnemonic from {src}. \
              They are alternatives — heimdall has one wallet, and choosing by precedence \
@@ -242,11 +245,14 @@ pub fn resolve_wallet_from(cfg: &CardanoConfig, env: EnvMnemonic) -> Result<Wall
 /// uncomment, so an operator who uncomments it and then configures a key file
 /// would otherwise be refused for setting "two wallet keys", one of which is
 /// a blank string.
-fn mnemonic_from(cfg: &CardanoConfig, env: EnvMnemonic) -> Option<(String, &'static str)> {
+fn mnemonic_from(
+    cfg: &CardanoConfig,
+    env: EnvMnemonic,
+) -> Option<(Zeroizing<String>, &'static str)> {
     if let Some(m) = cfg.mnemonic.clone()
         && !m.trim().is_empty()
     {
-        return Some((m, "cardano.mnemonic"));
+        return Some((Zeroizing::new(m), "cardano.mnemonic"));
     }
     match env {
         EnvMnemonic::Set(v) if !v.trim().is_empty() => Some((v, "$HEIMDALL_MNEMONIC")),
@@ -666,18 +672,20 @@ mod tests {
         // log and `ps`.
         assert!(!unset.contains("env HEIMDALL_MNEMONIC="), "{unset}");
 
-        let blank = resolve_wallet_from(&cfg, EnvMnemonic::Set(" \t".into())).expect_err("blank");
+        let blank = resolve_wallet_from(&cfg, EnvMnemonic::Set(" \t".to_string().into()))
+            .expect_err("blank");
         assert!(blank.contains("set but blank"), "{blank}");
 
         let bytes = resolve_wallet_from(&cfg, EnvMnemonic::NotUnicode).expect_err("not unicode");
         assert!(bytes.contains("not valid UTF-8"), "{bytes}");
     }
 
-    /// Unreadable is still set. Beside a key file it is the leftover the
-    /// two-keys refusal exists for, and treating it as absent signed from the
-    /// skey with no word about it.
+    /// A value that cannot be a mnemonic is no second key, whether blank or
+    /// not UTF-8: the refusal is about signing from an unexpected address, and
+    /// such a value derives none. Refusing it would stop a working key-file
+    /// node over a stray variable, while a blank one beside it passes.
     #[test]
-    fn an_unreadable_environment_mnemonic_beside_a_key_file_is_two_keys() {
+    fn an_unreadable_environment_mnemonic_beside_a_key_file_is_not_a_second_key() {
         let key = PrivateKey::from(pallas_crypto::key::ed25519::SecretKey::from([7u8; 32]));
         let mut cfg = cardano_cfg();
         cfg.payment_skey_path = Some(skey_file(
@@ -686,25 +694,30 @@ mod tests {
             &format!("5820{}", hex::encode([7u8; 32])),
         ));
         cfg.wallet_address = Some(wallet_address(&key, Network::Testnet));
-        let err = resolve_wallet_from(&cfg, EnvMnemonic::NotUnicode).expect_err("two keys");
-        assert!(err.contains("two wallet keys"), "{err}");
-        assert!(err.contains("not valid UTF-8"), "{err}");
-        // Unset beside the same key file is simply the key file.
-        assert!(resolve_wallet_from(&cfg, EnvMnemonic::Unset).is_ok());
+        for env in [
+            EnvMnemonic::NotUnicode,
+            EnvMnemonic::Set("  ".to_string().into()),
+            EnvMnemonic::Unset,
+        ] {
+            let shown = format!("{env:?}");
+            let w = resolve_wallet_from(&cfg, env).expect(&shown);
+            assert_eq!(w.source, "cardano.payment_skey_path", "{shown}");
+        }
     }
 
     /// `Set` holds the seed phrase; `{:?}` must not print it.
     #[test]
     fn the_environment_mnemonic_debug_is_redacted() {
-        let shown = format!("{:?}", EnvMnemonic::Set(TEST_MNEMONIC.to_string()));
+        let shown = format!("{:?}", EnvMnemonic::Set(TEST_MNEMONIC.to_string().into()));
         assert_eq!(shown, "Set(<redacted>)");
         assert!(!shown.contains(TEST_MNEMONIC.split_whitespace().next().unwrap()));
     }
 
     /// Two wallet keys is refused HERE too, not only at config load. `run-spo`
-    /// injects `--cardano-mnemonic` and `$HEIMDALL_MNEMONIC` into the config
-    /// after the loader has had its look, so the loader's check alone let a
-    /// migrated operator silently keep signing with the skey.
+    /// injects `--cardano-mnemonic` into the config after the loader has had
+    /// its look, and `$HEIMDALL_MNEMONIC` never reaches the loader at all, so
+    /// the loader's check alone let a migrated operator silently keep signing
+    /// with the skey.
     #[test]
     fn two_keys_are_refused_even_when_the_loader_never_saw_both() {
         let mut cfg = cardano_cfg();
@@ -740,12 +753,12 @@ mod tests {
     #[test]
     fn the_environment_supplies_a_mnemonic_and_is_labelled_as_such() {
         let cfg = cardano_cfg();
-        let w = resolve_wallet_from(&cfg, EnvMnemonic::Set(TEST_MNEMONIC.to_string()))
+        let w = resolve_wallet_from(&cfg, EnvMnemonic::Set(TEST_MNEMONIC.to_string().into()))
             .expect("resolves");
         assert_eq!(w.source, "$HEIMDALL_MNEMONIC");
 
         assert!(
-            resolve_wallet_from(&cfg, EnvMnemonic::Set("   ".to_string())).is_err(),
+            resolve_wallet_from(&cfg, EnvMnemonic::Set("   ".to_string().into())).is_err(),
             "blank is not a mnemonic"
         );
     }
