@@ -175,7 +175,13 @@ impl std::error::Error for RegisterPoolError {}
 /// Native tokens ride along into the change output; only reference-script
 /// UTxOs are skipped, for the unpriced Conway per-byte fee.
 fn select_inputs(wallet_utxos: &[WalletUtxo], needed: u64) -> Result<Vec<&WalletUtxo>, String> {
-    let mut pure: Vec<&WalletUtxo> = wallet_utxos.iter().filter(|u| !u.has_ref_script).collect();
+    // `dropped_policy`: a UTxO holding two asset names under one policy loses
+    // all but the last in the transaction builder, so spending it yields a body
+    // the ledger refuses as ValueNotConserved. Not an input, however fat.
+    let mut pure: Vec<&WalletUtxo> = wallet_utxos
+        .iter()
+        .filter(|u| !u.has_ref_script && crate::cardano::tx_common::dropped_policy(u).is_none())
+        .collect();
     pure.sort_by_key(|u| std::cmp::Reverse(u.lovelace));
     let mut picked = Vec::new();
     let mut sum = 0u64;
@@ -187,6 +193,20 @@ fn select_inputs(wallet_utxos: &[WalletUtxo], needed: u64) -> Result<Vec<&Wallet
         picked.push(u);
     }
     if sum < needed {
+        if let Some((u, policy)) = wallet_utxos
+            .iter()
+            .filter(|u| !u.has_ref_script)
+            .find_map(|u| crate::cardano::tx_common::dropped_policy(u).map(|p| (u, p)))
+        {
+            return Err(format!(
+                "wallet UTxO {}#{} holds more than one asset name under policy {policy}, and \
+                 the transaction builder keeps only the last of them — spending it would \
+                 produce a transaction the ledger refuses as ValueNotConserved. The remaining \
+                 UTxOs total {sum} lovelace and the registration needs >= {needed}. Move one of \
+                 those assets to its own UTxO, or fund the wallet with plain ADA",
+                u.tx_hash, u.output_index
+            ));
+        }
         return Err(format!(
             "wallet pure-ADA UTxOs total {sum} lovelace but the registration needs >= {needed} \
              (pool deposit + key deposit + delegated stake + fee) — fund or consolidate the wallet"
@@ -322,6 +342,34 @@ mod tests {
             tokens: Default::default(),
             has_ref_script: false,
         }
+    }
+
+    /// A UTxO the transaction builder would strip is not an input, however fat.
+    ///
+    /// Same defect as `tx_common::dropped_policy` guards elsewhere: two asset
+    /// names under one policy on ONE UTxO and all but the last is lost before
+    /// balancing, so the ledger refuses the result as ValueNotConserved.
+    #[test]
+    fn a_utxo_the_builder_would_strip_is_not_an_input() {
+        const POLICY: &str = "665b33b752eceeae9b5fa77efcaba1341e847dfe2941a8f384264b87";
+        let mut stripper = wallet_utxo(&"aa".repeat(32), 0, 900_000_000);
+        stripper.tokens = [
+            (format!("{POLICY}{}", "11".repeat(32)), "1".to_string()),
+            (format!("{POLICY}{}", "22".repeat(32)), "1".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let sound = wallet_utxo(&"bb".repeat(32), 0, 600_000_000);
+
+        let both = [stripper.clone(), sound.clone()];
+        let picked = select_inputs(&both, 500_000_000).expect("the sound UTxO covers it");
+        assert!(
+            picked.iter().all(|u| u.tx_hash == sound.tx_hash),
+            "the fatter UTxO is the stripper and must be passed over"
+        );
+
+        let err = select_inputs(&[stripper], 500_000_000).expect_err("nothing sound to spend");
+        assert!(err.contains(POLICY), "the policy is named: {err}");
     }
 
     // Derived identifiers are deterministic and the bech32 forms are well-formed.
