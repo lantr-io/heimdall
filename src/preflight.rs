@@ -921,6 +921,34 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                             snapshot.spos.len()
                         ),
                     );
+                } else if let Some(e) = cfg.protocol.state_dir.as_deref().and_then(|dir| {
+                    crate::epoch::persist::newest_saved_seat(std::path::Path::new(dir), &pk)
+                }) {
+                    // Left the registry after a ceremony it took part in. Not a
+                    // FAIL: the key that ceremony made may be the one the
+                    // treasury is under, and an N-of-N key signs nothing without
+                    // this node. `run-spo` decides, with the bridge epoch this
+                    // step cannot see, whether epoch E is the running one, and
+                    // stops the node if it is not. The registration fix stays
+                    // attached: the handoff of E's key is signed from the next
+                    // epoch's roster (`epoch::rotation`, WI-078), so for a key
+                    // that needs this node, re-registering is the way through.
+                    b.push_fix(
+                        6,
+                        "registration status",
+                        Status::Warn,
+                        format!(
+                            "NOT REGISTERED any more — this node's bifrost_id_pk {} is not one of \
+                             the {} in the registry, but it holds a share of the key saved for \
+                             bridge epoch {e}. It may start and sign under that key while epoch \
+                             {e} runs; it cannot sign that key's handoff at the next boundary, \
+                             which is signed from the next epoch's roster, and the next ceremony \
+                             will not include it",
+                            hex::encode(pk),
+                            snapshot.spos.len()
+                        ),
+                        NOT_REGISTERED_FIX,
+                    );
                 } else {
                     // Not a misconfiguration, and the message must not read like
                     // one: this is the state EVERY node is in until its operator

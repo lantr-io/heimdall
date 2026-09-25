@@ -2285,11 +2285,35 @@ async fn epoch_start_phase(
     config: &EpochConfig,
     epoch: u64,
 ) -> EpochResult<EpochPhase> {
+    // Restart recovery (WI-014 #5) FIRST: if this epoch's DKG already ran and
+    // was persisted, reload the share and skip straight to PublishKeys — the
+    // ceremony is multi-round and expensive, and a mid-epoch crash must not
+    // re-run it (or lose the share).
+    //
+    // Ahead of everything the live registry read decides, and not dependent on
+    // that read succeeding. The read is the registry as it is NOW, which stops
+    // being this epoch's roster the moment it moves after the ceremony: a pool
+    // that deregistered mid-epoch vanishes from it, and every node whose
+    // bifrost key sorts after that pool's gets an index one lower. Matching the
+    // saved share against that index is how spo4 threw away a valid epoch-1558
+    // share on a restart (2026-09-25) and walked out of a 6-of-6 key. The saved
+    // roster is the one the key was generated over, so it — not the registry —
+    // says which index is ours; a node the registry no longer names still holds
+    // a share the key needs to sign anything this epoch; and a registry too thin
+    // to run a ceremony now says nothing about a key that already exists. (What
+    // such a node cannot do is sign the key's handoff: that runs from the NEXT
+    // epoch's roster — `epoch::rotation`, WI-078.)
+    let saved = load_saved_share(config, epoch)?;
+
     // Build the stake-aware DKG context for attempt 0. A failed attempt reruns
     // over a reduced candidate set with a bumped attempt inside `dkg_phase`
     // (DkgContext::reduced_to), so the chain is queried once per ceremony
     // entry (which also refreshes the roster after an aborted window).
-    let ctx = chain.query_dkg_context(epoch, 0).await?;
+    let live = chain.query_dkg_context(epoch, 0).await;
+    if let Some(share) = saved {
+        return Ok(resume_saved_share(peers, config, epoch, share, live).await);
+    }
+    let ctx = live?;
 
     // Every line from here on names this node by its pool id, so the table the
     // labels come from is replaced BEFORE anything of this epoch is logged
@@ -2312,43 +2336,15 @@ async fn epoch_start_phase(
         }
     }
 
-    // Say who the registry holds, but ONLY when it changed. The table above is
-    // this node's own record; this is the EVENT, which is pushed to whoever
-    // watches the channel, and a steady roster republishing it every boundary is
-    // how a channel teaches its readers to ignore it. A pool joining, leaving,
-    // being banned, or having its stake activate is rare and is exactly what an
-    // operator wants interrupting them.
-    //
-    // The comparison is against `/health`, so it survives across epochs without
-    // threading state through the phase functions — and the same string is what
-    // `/health` serves, so the two cannot disagree about what was last seen.
-    {
-        // Uncapped for the comparison and for `/health`, capped for the event.
-        // `/health` is pulled on demand and can carry the whole set; the event is
-        // pushed to a channel with a 2,000-character message limit. The COMPARISON
-        // has to see the whole set or it stops noticing changes past the cap: one
-        // pool leaving and another joining leaves the counts and the first ten
-        // names identical.
-        let described = crate::epoch::log::describe_registry(&ctx, usize::MAX);
-        let changed = {
-            let mut changed = false;
-            config.health.update(|h| {
-                if h.registry != described {
-                    h.registry.clone_from(&described);
-                    changed = true;
-                }
-            });
-            changed
-        };
-        if changed {
-            crate::epoch_event!(
-                config.identity.identifier,
-                epoch,
-                "registry: {}",
-                crate::epoch::log::describe_registry(&ctx, crate::epoch::log::PEER_LIST_CAP)
-            );
-        }
-    }
+    note_registry(config, epoch, &ctx);
+
+    // Publish the configured settings and the roster this node READ, before the
+    // gate. `/health` is un-namespaced, which is what lets this reach a peer
+    // whose epoch scheme differs — the one mismatch no DKG payload can ever
+    // carry, because the two nodes address namespaces that never meet. The
+    // resume path publishes it too whenever its read succeeds, or every peer
+    // entering a later attempt would read a gap where the value should be.
+    peers.set_node_facts(own_node_facts(config, &ctx)).await;
 
     // Re-derive THIS node's index from the CURRENT context, every epoch. The
     // FROST index is positional — rank in the sorted eligible set — so it
@@ -2391,25 +2387,6 @@ async fn epoch_start_phase(
             }
         }
     };
-
-    // Publish the configured settings and the roster this node READ, BEFORE the
-    // resume shortcut below and before the gate. `/health` is un-namespaced, which is what lets
-    // this reach a peer whose epoch scheme differs — the one mismatch no DKG
-    // payload can ever carry, because the two nodes address namespaces that
-    // never meet. It sits above the resume because a node that restarts
-    // mid-epoch and resumes a persisted ceremony would otherwise never publish
-    // its read, and every peer entering a later attempt would read a gap where
-    // the value should be.
-    peers.set_node_facts(own_node_facts(config, &ctx)).await;
-
-    // Restart recovery (WI-014 #5): if this epoch's DKG already ran and was
-    // persisted, reload the share and skip straight to PublishKeys — the
-    // ceremony is multi-round and expensive, and a mid-epoch crash must not
-    // re-run it (or lose the share). Keyed by the re-derived `me`, so a resume
-    // matches only the share written under this epoch's actual index.
-    if let Some(resumed) = try_resume_dkg(config, me, epoch)? {
-        return Ok(resumed);
-    }
 
     let mut ctx = narrow_at_handshake(peers, ctx, config, me).await?;
 
@@ -2710,53 +2687,275 @@ async fn wait_for_roster_health(
     }
 }
 
-/// Reload a persisted DKG for `epoch` and turn it into a resume-to-PublishKeys
-/// phase, or `None` to run a fresh ceremony. Persisted state that doesn't bind
-/// this node, or is unreadable, is treated as stale (not an error) and ignored.
-fn try_resume_dkg(
-    config: &EpochConfig,
-    me: frost::Identifier,
-    epoch: u64,
-) -> EpochResult<Option<EpochPhase>> {
+/// A share of this epoch's key found on disk, bound to this node.
+struct SavedShare {
+    saved: crate::epoch::persist::PersistedDkg,
+    group_keys: GroupKeys,
+}
+
+/// This node's persisted share for `epoch`, if there is one and it is ours.
+///
+/// `Ok(None)` for no file, and for a file this node cannot use — one that does
+/// not parse, key material that does not decode, or another key's share. Such a
+/// file is SET ASIDE first ([`crate::epoch::persist::set_dkg_state_aside`]):
+/// the epoch then proceeds as if there were none, and whatever ceremony it runs
+/// writes a fresh file without destroying the old one. `Err` only when that
+/// move fails, since carrying on would put a ceremony's write over it.
+///
+/// "Ours" is decided by the SAVED roster, never by the registry as it reads
+/// now: the key package's identifier must be the index that roster — the one
+/// the key was generated over — gives this node's bifrost key.
+fn load_saved_share(config: &EpochConfig, epoch: u64) -> EpochResult<Option<SavedShare>> {
     let Some(dir) = &config.state_dir else {
         return Ok(None);
     };
-    let Some(saved) = crate::epoch::persist::read_dkg_state(dir, epoch)? else {
-        return Ok(None);
+    let unusable = match crate::epoch::persist::read_dkg_state(dir, epoch) {
+        Ok(None) => return Ok(None),
+        Ok(Some(saved)) => match saved.to_group_keys() {
+            Ok(group_keys) => {
+                let held = *group_keys.key_package.identifier();
+                let ours = if config.identity.bifrost_id_pk.is_empty() {
+                    // Fixture / --index demo: no on-chain key to look up, so
+                    // the configured index is the only identity there is.
+                    held == config.identity.identifier
+                } else {
+                    saved
+                        .roster
+                        .own_participant(&config.identity.bifrost_id_pk)
+                        .is_some_and(|(id, _)| id == held)
+                };
+                if ours {
+                    return Ok(Some(SavedShare { saved, group_keys }));
+                }
+                "it holds another node's share: its roster does not give this node's bifrost \
+                 key the index the share was made for"
+                    .to_string()
+            }
+            Err(e) => format!("its key material does not decode ({e})"),
+        },
+        Err(e) => format!("it cannot be read ({e})"),
     };
-    match saved.to_group_keys() {
-        Ok(group_keys) if *group_keys.key_package.identifier() == me => {
-            crate::epoch_log!(
-                me,
-                epoch,
-                "resuming bridge epoch {epoch} from the key generation already on disk \
-                 (attempt {}) — no new ceremony this epoch",
-                saved.attempt + 1
-            );
-            Ok(Some(EpochPhase::PublishKeys {
-                epoch,
-                roster: saved.roster,
-                group_keys,
-            }))
+    let moved = crate::epoch::persist::set_dkg_state_aside(dir, epoch)?;
+    crate::epoch_warn!(
+        config.identity.identifier,
+        epoch,
+        "persisted DKG for epoch {epoch} is not usable here — {unusable}. Set aside as {}, so no \
+         ceremony can overwrite it; this epoch proceeds as if there were none",
+        moved.display()
+    );
+    Ok(None)
+}
+
+/// Resume this epoch on a saved share: PublishKeys over the roster the key was
+/// made over, whatever the registry reads now.
+///
+/// `live` is only reported against. Its failure costs nothing but the lines
+/// that would have described it, because nothing about resuming depends on it.
+async fn resume_saved_share(
+    peers: &Arc<dyn PeerNetwork>,
+    config: &EpochConfig,
+    epoch: u64,
+    share: SavedShare,
+    live: EpochResult<crate::cardano::dkg_roster::DkgContext>,
+) -> EpochPhase {
+    let SavedShare { saved, group_keys } = share;
+    let held = *group_keys.key_package.identifier();
+    // BEFORE anything is logged ([LG-5]): this node writes under `held` from
+    // here on, and under the startup index it was launched with — which, once
+    // the registry has moved, is another pool's index in the saved roster.
+    // Both name this node's own pool, and nothing else goes in the table:
+    // labels name the line's author, never a peer ([LG-4a]).
+    crate::epoch::log::set_labels(&own_labels(config, held, &saved.roster));
+    crate::epoch_log!(
+        held,
+        epoch,
+        "resuming bridge epoch {epoch} from the key generation already on disk (attempt {}): \
+         {} members, threshold {} — no new ceremony this epoch",
+        saved.attempt + 1,
+        saved.roster.participants.len(),
+        saved.roster.min_signers
+    );
+    match live {
+        Ok(ctx) => {
+            note_registry(config, epoch, &ctx);
+            peers.set_node_facts(own_node_facts(config, &ctx)).await;
+            if let Some(drift) = registry_drift(&saved.roster, &ctx) {
+                crate::epoch_log!(
+                    held,
+                    epoch,
+                    "the registry now differs from this epoch's key — {drift}. This epoch runs on \
+                     the key's roster; the next ceremony reads the registry as it is then"
+                );
+            }
+            if let Some(why) = seat_lost(config, &ctx) {
+                // Said at warn, and said in full, because the limit is not
+                // obvious: the share still signs this epoch's movements, but
+                // the key's HANDOFF is signed from the next epoch's roster
+                // (`epoch::rotation`, WI-078), which this node will not be in.
+                // A key that cannot reach its threshold without it can then
+                // never be handed off — only re-registering before the boundary
+                // puts it back where the handoff is signed.
+                crate::epoch_warn!(
+                    held,
+                    epoch,
+                    "this node has no seat in the registry's eligible set any more ({why}). It \
+                     keeps co-signing under epoch {epoch}'s key while the epoch runs, but it \
+                     cannot sign that key's handoff at the next boundary, which is signed from \
+                     the next epoch's roster. If the key cannot reach its threshold of {} without \
+                     this node, register it again before the boundary",
+                    saved.roster.min_signers
+                );
+            }
         }
-        Ok(_) => {
-            crate::epoch_warn!(
-                me,
-                epoch,
-                "persisted DKG for epoch {epoch} is bound to a different identity — ignoring, \
-                 running a fresh ceremony"
-            );
-            Ok(None)
-        }
-        Err(e) => {
-            crate::epoch_warn!(
-                me,
-                epoch,
-                "persisted DKG for epoch {epoch} is unreadable ({e}) — running a fresh ceremony"
-            );
-            Ok(None)
-        }
+        // Read fine, but too thin to run a ceremony now. Not a connectivity
+        // problem, and not one that touches a key that already exists.
+        Err(e @ EpochError::DkgAborted { .. }) => crate::epoch_warn!(
+            held,
+            epoch,
+            "the registry as it reads now could not form a roster ({}) — resuming on the saved \
+             key regardless: it, not the registry, is this epoch's roster",
+            crate::epoch::log::one_line(&e)
+        ),
+        // Node facts are built from the read, so they wait for the next one:
+        // until then a peer's handshake sees a gap, not a wrong value.
+        Err(e) => crate::epoch_warn!(
+            held,
+            epoch,
+            "the registry could not be read ({}) — resuming on the saved key regardless: it, \
+             not the registry, is this epoch's roster. This node's settings are not published \
+             to peers until a read succeeds",
+            crate::epoch::log::one_line(&e)
+        ),
     }
+    EpochPhase::PublishKeys {
+        epoch,
+        roster: saved.roster,
+        group_keys,
+    }
+}
+
+/// The label table for a resumed epoch: this node's own entry in the key's
+/// roster, under the key's index AND under the index the process was started
+/// with. Empty when the roster has no entry at `held`, which `load_saved_share`
+/// has already ruled out.
+fn own_labels(
+    config: &EpochConfig,
+    held: frost::Identifier,
+    key: &crate::epoch::state::Roster,
+) -> BTreeMap<frost::Identifier, crate::epoch::state::SpoInfo> {
+    key.participants
+        .get(&held)
+        .map(|mine| {
+            [
+                (held, mine.clone()),
+                (config.identity.identifier, mine.clone()),
+            ]
+            .into_iter()
+            .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Why this node has no seat in `live`, or `None` when it has one (or has no
+/// on-chain key to look for). The same reason `NotInEligibleSet` carries.
+fn seat_lost(
+    config: &EpochConfig,
+    live: &crate::cardano::dkg_roster::DkgContext,
+) -> Option<String> {
+    let pk = &config.identity.bifrost_id_pk;
+    if pk.is_empty() || live.own_participant(pk).is_some() {
+        return None;
+    }
+    Some(
+        live.excluded
+            .iter()
+            .find(|x| &x.bifrost_id_pk == pk)
+            .map_or_else(
+                || "this key is not in the registry".to_string(),
+                |x| x.reason.to_string(),
+            ),
+    )
+}
+
+/// Say who the registry holds, but ONLY when it changed.
+///
+/// The roster table is this node's own record; this is the EVENT, which is
+/// pushed to whoever watches the channel, and a steady roster republishing it
+/// every boundary is how a channel teaches its readers to ignore it. A pool
+/// joining, leaving, being banned, or having its stake activate is rare and is
+/// exactly what an operator wants interrupting them.
+///
+/// The comparison is against `/health`, so it survives across epochs without
+/// threading state through the phase functions — and the same string is what
+/// `/health` serves, so the two cannot disagree about what was last seen.
+fn note_registry(config: &EpochConfig, epoch: u64, ctx: &crate::cardano::dkg_roster::DkgContext) {
+    // Uncapped for the comparison and for `/health`, capped for the event.
+    // `/health` is pulled on demand and can carry the whole set; the event is
+    // pushed to a channel with a 2,000-character message limit. The COMPARISON
+    // has to see the whole set or it stops noticing changes past the cap: one
+    // pool leaving and another joining leaves the counts and the first ten
+    // names identical.
+    let described = crate::epoch::log::describe_registry(ctx, usize::MAX);
+    let changed = {
+        let mut changed = false;
+        config.health.update(|h| {
+            if h.registry != described {
+                h.registry.clone_from(&described);
+                changed = true;
+            }
+        });
+        changed
+    };
+    if changed {
+        crate::epoch_event!(
+            config.identity.identifier,
+            epoch,
+            "registry: {}",
+            crate::epoch::log::describe_registry(ctx, crate::epoch::log::PEER_LIST_CAP)
+        );
+    }
+}
+
+/// How a key's roster and the registry as it reads now differ, by bifrost key,
+/// or `None` when they hold the same members.
+///
+/// Said as a difference, not as "who joined": the key's roster is what a
+/// ceremony LEFT, so a pool that was down for it is absent from the key without
+/// the registry having changed at all. Indices are not compared — they are what
+/// shifts — and an empty key never matches anything, the same rule
+/// `own_participant` callers keep elsewhere.
+fn registry_drift(
+    key: &crate::epoch::state::Roster,
+    live: &crate::cardano::dkg_roster::DkgContext,
+) -> Option<String> {
+    use crate::epoch::state::{Roster, SpoInfo};
+    fn only_in<'a>(a: &'a Roster, b: &Roster) -> Vec<&'a SpoInfo> {
+        a.participants
+            .values()
+            .filter(|p| {
+                !p.bifrost_id_pk.is_empty() && b.own_participant(&p.bifrost_id_pk).is_none()
+            })
+            .collect()
+    }
+    let live = live.to_roster();
+    let (gone, extra) = (only_in(key, &live), only_in(&live, key));
+    if gone.is_empty() && extra.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !gone.is_empty() {
+        parts.push(format!(
+            "in the key but not in the registry's eligible set now: {}",
+            crate::epoch::log::describe_peers(&gone)
+        ));
+    }
+    if !extra.is_empty() {
+        parts.push(format!(
+            "in the registry's eligible set now but not in the key: {}",
+            crate::epoch::log::describe_peers(&extra)
+        ));
+    }
+    Some(parts.join("; "))
 }
 
 // ---------------------------------------------------------------------------
@@ -9220,6 +9419,264 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 2-of-2 key over A (index 1) and B (index 2), held by B, saved for
+    /// epoch 0 in a fresh directory that is removed when the guard drops.
+    fn saved_key_held_by_b(
+        tag: &str,
+    ) -> (
+        GroupKeys,
+        Roster,
+        impl Fn(Identifier, u8) -> crate::epoch::state::SpoInfo,
+        TempState,
+    ) {
+        use crate::epoch::persist::{PersistedDkg, write_dkg_state};
+        use crate::frost::participant;
+
+        let id1 = Identifier::try_from(1u16).unwrap();
+        let id2 = Identifier::try_from(2u16).unwrap();
+        let mut rng = rand::thread_rng();
+        let (s1, p1) = participant::dkg_part1(id1, 2, 2, &mut rng).unwrap();
+        let (s2, p2) = participant::dkg_part1(id2, 2, 2, &mut rng).unwrap();
+        let r1_1: BTreeMap<_, _> = [(id2, p2)].into_iter().collect();
+        let r1_2: BTreeMap<_, _> = [(id1, p1)].into_iter().collect();
+        let (_, pk1) = participant::dkg_part2(s1, &r1_1).unwrap();
+        let (s2r2, _) = participant::dkg_part2(s2, &r1_2).unwrap();
+        let r2_2: BTreeMap<_, _> = [(id1, pk1.get(&id2).unwrap().clone())]
+            .into_iter()
+            .collect();
+        let (kp2, pkp2) = participant::dkg_part3(&s2r2, &r1_2, &r2_2).unwrap();
+        let group_keys = GroupKeys {
+            verifying_key: *pkp2.verifying_key(),
+            public_key_package: pkp2,
+            key_package: kp2,
+        };
+        let spo = |id: Identifier, n: u8| crate::epoch::state::SpoInfo {
+            identifier: id,
+            pool_id: vec![n; 28],
+            bifrost_url: format!("http://127.0.0.1:{}", 18_800 + u16::from(n)),
+            bifrost_id_pk: vec![n; 32],
+        };
+        let key_roster = Roster {
+            epoch: 0,
+            min_signers: 2,
+            max_signers: 2,
+            participants: [(id1, spo(id1, 1)), (id2, spo(id2, 2))]
+                .into_iter()
+                .collect(),
+        };
+        let dir = TempState::new(tag);
+        write_dkg_state(
+            &dir.0,
+            &PersistedDkg::from_output(0, 0, &key_roster, &group_keys).unwrap(),
+        )
+        .unwrap();
+        (group_keys, key_roster, spo, dir)
+    }
+
+    /// A state directory removed when it drops, so a failing assertion does not
+    /// leave one behind.
+    struct TempState(std::path::PathBuf);
+    impl TempState {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "heimdall-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+    }
+    impl Drop for TempState {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// spo4, 2026-09-25: a pool deregistered after the epoch's ceremony, and a
+    /// node whose bifrost key sorts after it restarted. The live registry gave
+    /// it an index one lower than the one its saved share was made for, the
+    /// resume matched against the live index, and the node threw away a valid
+    /// share of a 6-of-6 key to run a ceremony nobody else was in.
+    ///
+    /// The saved roster decides: it is the one the key was generated over. It
+    /// decides whatever the registry reads — moved, missing this node, or not
+    /// readable at all — and it still refuses a share that is not this node's.
+    #[tokio::test]
+    async fn a_restart_resumes_on_the_keys_roster_after_the_registry_moves() {
+        let (group_keys, key_roster, spo, dir) = saved_key_held_by_b("resume-moved-registry");
+        let id1 = Identifier::try_from(1u16).unwrap();
+        let id2 = Identifier::try_from(2u16).unwrap();
+        let (a, b, c) = (1u8, 2u8, 3u8);
+        let chain_of = |members: [(Identifier, u8); 2]| -> MockCardanoChain {
+            let mut fixture = demo_static_fixture(2, 2, 18_800);
+            fixture.roster.participants = members
+                .into_iter()
+                .map(|(id, n)| (id, spo(id, n)))
+                .collect();
+            MockCardanoChain::new(fixture)
+        };
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id1, MockPeerHub::new()));
+        // As `main` leaves it after a restart: the index the live roster gives B.
+        let mut config = fast_config(id1);
+        config.identity.bifrost_id_pk = vec![b; 32];
+        config.state_dir = Some(dir.0.clone());
+        let assert_resumed = |phase: EpochResult<EpochPhase>| match phase {
+            Ok(EpochPhase::PublishKeys {
+                group_keys: gk,
+                roster,
+                ..
+            }) => {
+                assert_eq!(gk.verifying_key, group_keys.verifying_key);
+                assert_eq!(
+                    *gk.key_package.identifier(),
+                    id2,
+                    "the key's index, not the live one"
+                );
+                assert_eq!(roster, key_roster, "the epoch runs on the key's roster");
+            }
+            Ok(other) => panic!("expected a resume to PublishKeys, got {}", other.name()),
+            Err(e) => panic!("expected a resume to PublishKeys, got {e}"),
+        };
+
+        // The registry now: A gone, C new, so B sorts FIRST — index 1, not 2.
+        let moved: Arc<dyn CardanoChain> = Arc::new(chain_of([(id1, b), (id2, c)]));
+        assert_resumed(epoch_start_phase(&moved, &peers, &config, 0).await);
+
+        // Both indices this node logs under name its own pool, and nothing else.
+        let labels = own_labels(&config, id2, &key_roster);
+        assert_eq!(labels.len(), 2);
+        assert!(
+            labels.values().all(|p| p.pool_id == vec![b; 28]),
+            "{labels:?}"
+        );
+
+        // The drift line: a difference, not a guess at who joined.
+        let live = moved.query_dkg_context(0, 0).await.unwrap();
+        let drift = registry_drift(&key_roster, &live).expect("the registry moved");
+        assert!(
+            drift.contains("in the key but not in the registry's eligible set now")
+                && drift.contains(":18801"),
+            "{drift}"
+        );
+        assert!(
+            drift.contains("in the registry's eligible set now but not in the key")
+                && drift.contains(":18803"),
+            "{drift}"
+        );
+        let unchanged =
+            crate::cardano::dkg_roster::DkgContext::from_roster_equal_stake(&key_roster, 0, 0);
+        assert_eq!(registry_drift(&key_roster, &unchanged), None);
+        assert_eq!(seat_lost(&config, &live), None, "B is still registered");
+
+        // The registry cannot be read at all: the saved key still decides.
+        let unreadable: Arc<dyn CardanoChain> =
+            Arc::new(chain_of([(id1, b), (id2, c)]).with_dkg_context_error("mock: no registry"));
+        assert_resumed(epoch_start_phase(&unreadable, &peers, &config, 0).await);
+
+        // B no longer in the registry at all: its share, resumed — and said.
+        let gone: Arc<dyn CardanoChain> = Arc::new(chain_of([(id1, a), (id2, c)]));
+        assert_resumed(epoch_start_phase(&gone, &peers, &config, 0).await);
+        let live = gone.query_dkg_context(0, 0).await.unwrap();
+        assert_eq!(
+            seat_lost(&config, &live).as_deref(),
+            Some("this key is not in the registry")
+        );
+
+        // Refusals. Each moves the file aside rather than leaving it for a
+        // fresh ceremony to overwrite, so it is written back before the next.
+        let file = crate::epoch::persist::dkg_state_path(&dir.0, 0);
+        let rewrite = || {
+            crate::epoch::persist::write_dkg_state(
+                &dir.0,
+                &crate::epoch::persist::PersistedDkg::from_output(0, 0, &key_roster, &group_keys)
+                    .unwrap(),
+            )
+            .unwrap();
+        };
+        let set_aside = || {
+            std::fs::read_dir(&dir.0)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains(".superseded-"))
+                .count()
+        };
+
+        // A's key IS in the saved roster, but the share there is B's (index 2):
+        // not A's to resume, whatever the roster says about A.
+        config.identity.bifrost_id_pk = vec![a; 32];
+        assert!(matches!(
+            epoch_start_phase(&moved, &peers, &config, 0).await,
+            Err(EpochError::NotInEligibleSet { .. })
+        ));
+        assert!(
+            !file.exists(),
+            "refused, and not left where a ceremony writes"
+        );
+        assert_eq!(set_aside(), 1, "kept, under a name nothing reads");
+
+        // C's key is not in the saved roster at all.
+        rewrite();
+        config.identity.bifrost_id_pk = vec![c; 32];
+        let without_c: Arc<dyn CardanoChain> = Arc::new(chain_of([(id1, a), (id2, b)]));
+        assert!(matches!(
+            epoch_start_phase(&without_c, &peers, &config, 0).await,
+            Err(EpochError::NotInEligibleSet { .. })
+        ));
+        assert!(!file.exists());
+        assert!(set_aside() >= 1);
+    }
+
+    /// A state file this node cannot use is moved aside — never deleted, never
+    /// left for a fresh ceremony to overwrite (these files authorize handoffs).
+    /// Then the epoch proceeds as if there were none: a node with a seat runs
+    /// its ceremony, and one without takes the no-seat path, which for a
+    /// federation member is its Phase-1 fallback.
+    #[tokio::test]
+    async fn an_unusable_saved_share_is_set_aside_never_overwritten() {
+        let id1 = Identifier::try_from(1u16).unwrap();
+        let fixture = demo_static_fixture(2, 2, 18_900);
+        let registered = fixture.roster.participants[&id1].bifrost_id_pk.clone();
+        let chain: Arc<dyn CardanoChain> = Arc::new(MockCardanoChain::new(fixture));
+        let peers: Arc<dyn PeerNetwork> = Arc::new(MockPeerNetwork::new(id1, MockPeerHub::new()));
+
+        for (pk, seat) in [(vec![0xEE; 32], false), (registered, true)] {
+            let dir = TempState::new(if seat {
+                "unusable-seat"
+            } else {
+                "unusable-no-seat"
+            });
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let file = crate::epoch::persist::dkg_state_path(&dir.0, 0);
+            std::fs::write(&file, b"{ not json").unwrap();
+            let mut config = fast_config(id1);
+            config.state_dir = Some(dir.0.clone());
+            config.identity.bifrost_id_pk = pk;
+
+            let phase = epoch_start_phase(&chain, &peers, &config, 0).await;
+            if seat {
+                assert!(
+                    matches!(phase, Ok(EpochPhase::Dkg { .. })),
+                    "a seat runs its ceremony"
+                );
+            } else {
+                assert!(matches!(phase, Err(EpochError::NotInEligibleSet { .. })));
+            }
+            assert!(!file.exists(), "moved out of the ceremony's way");
+            let kept: Vec<_> = std::fs::read_dir(&dir.0)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains(".superseded-"))
+                .collect();
+            assert_eq!(kept.len(), 1);
+            assert_eq!(
+                std::fs::read(kept[0].path()).unwrap(),
+                b"{ not json",
+                "byte for byte"
+            );
+        }
     }
 
     #[tokio::test]

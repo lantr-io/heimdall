@@ -767,6 +767,15 @@ pub fn describe_peer(info: &SpoInfo) -> String {
     )
 }
 
+/// Several peers, each per [`describe_peer`], capped at [`PEER_LIST_CAP`]
+/// ([LG-22]) — for a line that lists them rather than a round that awaits them.
+pub fn describe_peers(peers: &[&SpoInfo]) -> String {
+    cap_list(
+        peers.iter().map(|p| describe_peer(p)).collect(),
+        PEER_LIST_CAP,
+    )
+}
+
 /// The members of `peers` that are NOT in `answered`, rendered per
 /// [`describe_peer`]; `none` when every one of them answered (spec [HL-11],
 /// [PR-10a]).
