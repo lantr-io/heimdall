@@ -62,7 +62,58 @@ impl std::fmt::Debug for Wallet {
 /// static. This is where "neither" surfaces, because `$HEIMDALL_MNEMONIC` is
 /// invisible to the TOML parser and plenty of commands need no wallet at all.
 pub fn resolve_wallet(cfg: &CardanoConfig) -> Result<Wallet, String> {
-    resolve_wallet_from(cfg, std::env::var("HEIMDALL_MNEMONIC").ok())
+    resolve_wallet_from(cfg, EnvMnemonic::from_process())
+}
+
+/// `$HEIMDALL_MNEMONIC` as THIS process sees it.
+///
+/// Three states, not an `Option`, because they have different fixes and the
+/// "no wallet key" error has to say which one it met. The likeliest by far is
+/// [`Self::Unset`] on a box where the operator HAS exported it: a variable in
+/// their shell reaches neither a systemd unit nor a command run under `sudo`,
+/// and "no wallet key … or $HEIMDALL_MNEMONIC" alone reads as a heimdall bug
+/// to someone who can `echo` it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvMnemonic {
+    Unset,
+    Set(String),
+    /// Set, but not valid UTF-8, so it cannot be a BIP-39 mnemonic.
+    /// `std::env::var(..).ok()` folded this into "unset", which sent the
+    /// operator looking for an assignment that was there.
+    NotUnicode,
+}
+
+impl EnvMnemonic {
+    #[must_use]
+    pub fn from_process() -> Self {
+        match std::env::var("HEIMDALL_MNEMONIC") {
+            Ok(value) => Self::Set(value),
+            Err(std::env::VarError::NotPresent) => Self::Unset,
+            Err(std::env::VarError::NotUnicode(_)) => Self::NotUnicode,
+        }
+    }
+
+    /// Why the variable did not supply the key, for the tail of "no wallet key".
+    fn why_unused(&self) -> &'static str {
+        match self {
+            Self::Unset => {
+                "which is not set in this process's environment. A variable exported in your \
+                 shell does not reach a command run under sudo — run it as `sudo -u heimdall env \
+                 HEIMDALL_MNEMONIC=\"…\" heimdall …` — nor a systemd unit: the packaged one reads \
+                 it from /etc/default/heimdall, as a HEIMDALL_MNEMONIC=\"…\" line that is not \
+                 commented out and does not start with `export` (systemd skips such a line, \
+                 saying so only in the journal)"
+            }
+            Self::Set(_) => {
+                "which is set but blank in this process's environment — in /etc/default/heimdall, \
+                 the words go on the same line, after the '='"
+            }
+            Self::NotUnicode => {
+                "which is set but is not valid UTF-8, so it cannot be a BIP-39 mnemonic — look for \
+                 a stray byte or a non-UTF-8 encoding where it is assigned"
+            }
+        }
+    }
 }
 
 /// The resolver proper, with the environment passed IN rather than read.
@@ -73,17 +124,14 @@ pub fn resolve_wallet(cfg: &CardanoConfig) -> Result<Wallet, String> {
 /// `remove_var` beside a concurrent `var` is undefined behaviour, not merely
 /// flaky. Passing the value makes every test deterministic on a box where an
 /// operator has the variable exported, which on an SPO host is the norm.
-pub fn resolve_wallet_from(
-    cfg: &CardanoConfig,
-    env_mnemonic: Option<String>,
-) -> Result<Wallet, String> {
+pub fn resolve_wallet_from(cfg: &CardanoConfig, env: EnvMnemonic) -> Result<Wallet, String> {
     // The authoritative "exactly one" check. `refuse_ambiguous_wallet_key`
     // makes the same call at config load, which is where an operator wants to
     // hear it — but the load-time check sees only the TOML, and `run-spo`
     // injects `--cardano-mnemonic` and `$HEIMDALL_MNEMONIC` into the config
     // AFTER it. Without this, migrating to a skey while leaving the mnemonic
     // in /etc/default/heimdall silently resolved to the skey.
-    let mnemonic = mnemonic_from(cfg, env_mnemonic);
+    let mnemonic = mnemonic_from(cfg, &env);
     let skey_path = cfg
         .payment_skey_path
         .as_deref()
@@ -120,9 +168,11 @@ pub fn resolve_wallet_from(
     }
 
     let (mnemonic, source) = mnemonic.ok_or_else(|| {
-        "no wallet key: set cardano.payment_skey_path (with cardano.wallet_address), \
-         or cardano.mnemonic, or $HEIMDALL_MNEMONIC"
-            .to_string()
+        format!(
+            "no wallet key: set cardano.payment_skey_path (with cardano.wallet_address), \
+             or cardano.mnemonic, or $HEIMDALL_MNEMONIC — {}",
+            env.why_unused()
+        )
     })?;
     let key = derive_payment_key(&mnemonic)?;
     // Deriving DOES need the network, and guessing is the bug this replaced.
@@ -165,17 +215,14 @@ pub fn resolve_wallet_from(
 /// uncomment, so an operator who uncomments it and then configures a key file
 /// would otherwise be refused for setting "two wallet keys", one of which is
 /// a blank string.
-fn mnemonic_from(
-    cfg: &CardanoConfig,
-    env_mnemonic: Option<String>,
-) -> Option<(String, &'static str)> {
+fn mnemonic_from(cfg: &CardanoConfig, env: &EnvMnemonic) -> Option<(String, &'static str)> {
     if let Some(m) = cfg.mnemonic.clone()
         && !m.trim().is_empty()
     {
         return Some((m, "cardano.mnemonic"));
     }
-    match env_mnemonic {
-        Some(v) if !v.trim().is_empty() => Some((v, "$HEIMDALL_MNEMONIC")),
+    match env {
+        EnvMnemonic::Set(v) if !v.trim().is_empty() => Some((v.clone(), "$HEIMDALL_MNEMONIC")),
         _ => None,
     }
 }
@@ -506,7 +553,7 @@ mod tests {
         ));
         cfg.wallet_address = Some(addr.clone());
 
-        let w = resolve_wallet_from(&cfg, None).expect("resolves");
+        let w = resolve_wallet_from(&cfg, EnvMnemonic::Unset).expect("resolves");
         assert_eq!(w.address, addr);
         assert_eq!(w.source, "cardano.payment_skey_path");
         assert_eq!(pub_key_hash_hex(&w.key), pub_key_hash_hex(&key));
@@ -526,7 +573,7 @@ mod tests {
         ));
         cfg.wallet_address = Some(wallet_address(&other, Network::Testnet));
 
-        let err = resolve_wallet_from(&cfg, None).expect_err("not a pair");
+        let err = resolve_wallet_from(&cfg, EnvMnemonic::Unset).expect_err("not a pair");
         assert!(err.contains("not a pair"), "{err}");
     }
 
@@ -554,7 +601,7 @@ mod tests {
             "PaymentSigningKeyShelley_ed25519",
             &format!("5820{}", hex::encode([7u8; 32])),
         ));
-        let err = resolve_wallet_from(&cfg, None).expect_err("no address");
+        let err = resolve_wallet_from(&cfg, EnvMnemonic::Unset).expect_err("no address");
         assert!(err.contains("cardano.wallet_address"), "{err}");
     }
 
@@ -566,9 +613,35 @@ mod tests {
     /// would pass a wallet back instead of the error it is asserting on.
     #[test]
     fn no_key_at_all_names_both_ways_in() {
-        let err = resolve_wallet_from(&cardano_cfg(), None).expect_err("nothing configured");
+        let err = resolve_wallet_from(&cardano_cfg(), EnvMnemonic::Unset)
+            .expect_err("nothing configured");
         assert!(err.contains("payment_skey_path"), "{err}");
         assert!(err.contains("mnemonic"), "{err}");
+    }
+
+    /// The error says which of the three states the variable was in, because
+    /// each has its own fix — and "unset" on a box where the operator exported
+    /// it names the two ways a shell variable fails to arrive.
+    #[test]
+    fn no_key_says_why_the_environment_did_not_supply_one() {
+        let cfg = cardano_cfg();
+        let unset = resolve_wallet_from(&cfg, EnvMnemonic::Unset).expect_err("unset");
+        assert!(unset.starts_with("no wallet key"), "{unset}");
+        assert!(
+            unset.contains("not set in this process's environment"),
+            "{unset}"
+        );
+        assert!(
+            unset.contains("sudo -u heimdall env HEIMDALL_MNEMONIC="),
+            "{unset}"
+        );
+        assert!(unset.contains("`export`"), "{unset}");
+
+        let blank = resolve_wallet_from(&cfg, EnvMnemonic::Set(" \t".into())).expect_err("blank");
+        assert!(blank.contains("set but blank"), "{blank}");
+
+        let bytes = resolve_wallet_from(&cfg, EnvMnemonic::NotUnicode).expect_err("not unicode");
+        assert!(bytes.contains("not valid UTF-8"), "{bytes}");
     }
 
     /// Two wallet keys is refused HERE too, not only at config load. `run-spo`
@@ -584,7 +657,7 @@ mod tests {
             &format!("5820{}", hex::encode([7u8; 32])),
         ));
         cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
-        let err = resolve_wallet_from(&cfg, None).expect_err("alternatives");
+        let err = resolve_wallet_from(&cfg, EnvMnemonic::Unset).expect_err("alternatives");
         assert!(err.contains("two wallet keys"), "{err}");
     }
 
@@ -601,7 +674,8 @@ mod tests {
         ));
         cfg.wallet_address = Some(wallet_address(&key, Network::Testnet));
         cfg.network = Some("mainnet".into());
-        let err = resolve_wallet_from(&cfg, None).expect_err("testnet address on a mainnet node");
+        let err = resolve_wallet_from(&cfg, EnvMnemonic::Unset)
+            .expect_err("testnet address on a mainnet node");
         assert!(err.contains("configured for mainnet"), "{err}");
     }
 
@@ -609,11 +683,12 @@ mod tests {
     #[test]
     fn the_environment_supplies_a_mnemonic_and_is_labelled_as_such() {
         let cfg = cardano_cfg();
-        let w = resolve_wallet_from(&cfg, Some(TEST_MNEMONIC.to_string())).expect("resolves");
+        let w = resolve_wallet_from(&cfg, EnvMnemonic::Set(TEST_MNEMONIC.to_string()))
+            .expect("resolves");
         assert_eq!(w.source, "$HEIMDALL_MNEMONIC");
 
         assert!(
-            resolve_wallet_from(&cfg, Some("   ".to_string())).is_err(),
+            resolve_wallet_from(&cfg, EnvMnemonic::Set("   ".to_string())).is_err(),
             "blank is not a mnemonic"
         );
     }
@@ -633,7 +708,8 @@ mod tests {
         cfg.wallet_address = Some(wallet_address(&key, Network::Testnet));
         cfg.mnemonic = Some(String::new());
 
-        let w = resolve_wallet_from(&cfg, None).expect("a blank mnemonic is no mnemonic");
+        let w =
+            resolve_wallet_from(&cfg, EnvMnemonic::Unset).expect("a blank mnemonic is no mnemonic");
         assert_eq!(w.source, "cardano.payment_skey_path");
     }
 
@@ -657,13 +733,15 @@ mod tests {
 
         // Accepted, but normalized — otherwise network_from_address says mainnet.
         cfg.network = Some("preprod".into());
-        let w = resolve_wallet_from(&cfg, None).expect("uppercase is a valid bech32 address");
+        let w = resolve_wallet_from(&cfg, EnvMnemonic::Unset)
+            .expect("uppercase is a valid bech32 address");
         assert_eq!(w.address, lower, "stored canonical, not as pasted");
         assert!(crate::cardano::tx_common::is_testnet_address(&w.address));
 
         // And the network check is no longer silently skipped for it.
         cfg.network = Some("mainnet".into());
-        let err = resolve_wallet_from(&cfg, None).expect_err("uppercase testnet on a mainnet node");
+        let err = resolve_wallet_from(&cfg, EnvMnemonic::Unset)
+            .expect_err("uppercase testnet on a mainnet node");
         assert!(err.contains("configured for mainnet"), "{err}");
     }
 
@@ -693,7 +771,7 @@ mod tests {
         let mut cfg = cardano_cfg();
         cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
         cfg.wallet_address = Some(wallet_address(&key, Network::Testnet));
-        let err = resolve_wallet_from(&cfg, None).expect_err("enterprise != base");
+        let err = resolve_wallet_from(&cfg, EnvMnemonic::Unset).expect_err("enterprise != base");
         assert!(
             err.contains("is not the address this mnemonic derives"),
             "{err}"
@@ -702,7 +780,7 @@ mod tests {
         cfg.wallet_address =
             Some(wallet_address_from_mnemonic(TEST_MNEMONIC, Network::Testnet).unwrap());
         assert!(
-            resolve_wallet_from(&cfg, None).is_ok(),
+            resolve_wallet_from(&cfg, EnvMnemonic::Unset).is_ok(),
             "its own address is fine"
         );
     }
@@ -726,7 +804,7 @@ mod tests {
             "the fixture must be unresolvable"
         );
         assert!(
-            resolve_wallet_from(&cfg, None).is_ok(),
+            resolve_wallet_from(&cfg, EnvMnemonic::Unset).is_ok(),
             "and the skey path must not care"
         );
     }
@@ -739,14 +817,16 @@ mod tests {
         cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
         cfg.blockfrost_project_id = Some("preprod_xxx".into());
         assert!(
-            resolve_wallet_from(&cfg, None)
+            resolve_wallet_from(&cfg, EnvMnemonic::Unset)
                 .unwrap()
                 .address
                 .starts_with("addr_test1")
         );
 
         cfg.network = Some("mainnet".into());
-        let addr = resolve_wallet_from(&cfg, None).unwrap().address;
+        let addr = resolve_wallet_from(&cfg, EnvMnemonic::Unset)
+            .unwrap()
+            .address;
         assert!(addr.starts_with("addr1"), "got {addr}");
     }
 
@@ -755,7 +835,7 @@ mod tests {
     fn a_mnemonic_still_resolves_to_its_base_address() {
         let mut cfg = cardano_cfg();
         cfg.mnemonic = Some(TEST_MNEMONIC.to_string());
-        let w = resolve_wallet_from(&cfg, None).expect("resolves");
+        let w = resolve_wallet_from(&cfg, EnvMnemonic::Unset).expect("resolves");
         assert_eq!(w.source, "cardano.mnemonic");
         assert_eq!(
             w.address,

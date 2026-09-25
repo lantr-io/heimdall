@@ -394,13 +394,10 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
                 "wallet key from {}, address {}",
                 w.source, w.address
             )),
-            // The /etc/default hint belongs ONLY to "no key at all". Appended
-            // to every error it misdirects: a 0644 key file, or an address
-            // that does not pair with its key, has nothing to do with that
-            // file — and this is the command whose job is to name the fix.
-            Err(e) if e.starts_with("no wallet key") => {
-                problems.push(format!("{e} (/etc/default/heimdall in the Debian package)"));
-            }
+            // No /etc/default hint appended here any more: the resolver's "no
+            // wallet key" now says what the variable looked like to THIS
+            // process and where it has to be set, for every command that
+            // needs a wallet rather than only for this one.
             Err(e) => problems.push(e.clone()),
         }
 

@@ -62,7 +62,11 @@ every fresh machine. After configuring:
 # One dry-run tick, AS THE SERVICE USER: the config is 0640 root:heimdall and
 # /var/lib/heimdall is 0700 heimdall, so running this as yourself cannot read the
 # config, and running it as root would leave root-owned files in the state dir.
-sudo -u heimdall heimdall run-spo --config /etc/heimdall/heimdall.toml --check
+# And WITH THE UNIT'S ENVIRONMENT: the mnemonic is in /etc/default/heimdall, which
+# `sudo -u heimdall heimdall …` does not read — it would report "no wallet key".
+sudo systemd-run --pipe --wait --quiet --collect -p User=heimdall \
+    -p EnvironmentFile=/etc/default/heimdall \
+    /usr/bin/heimdall run-spo --config /etc/heimdall/heimdall.toml --check
 
 sudo systemctl enable --now heimdall
 journalctl -u heimdall -f

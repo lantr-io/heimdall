@@ -596,16 +596,26 @@ after the change and read every line.
 ## 4. Check it before going further
 
 ```bash
-sudo -u heimdall heimdall doctor --config /etc/heimdall/heimdall.toml
+sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+    heimdall doctor --config /etc/heimdall/heimdall.toml
 ```
 
 Run it as the `heimdall` user: the config is `0640 root:heimdall` so you cannot read it as
 yourself, and running as root would leave root-owned files in the state directory.
 
-Give it the mnemonic. `/etc/default/heimdall` is read by the systemd unit, not by your shell, so
-run as `sudo -u heimdall env HEIMDALL_MNEMONIC="…" heimdall doctor …` or step 1 reports `no
-wallet key` and step 4 cannot look for the reference script. That is the first FAIL every
-operator sees, and it is not a misconfiguration.
+The `env HEIMDALL_MNEMONIC=…` is not decoration, here or in any command below that pays a fee:
+`sudo` clears the environment, so a variable exported in your shell does not reach heimdall, and
+`/etc/default/heimdall` is read by the systemd unit, not by your shell. Leave it out and step 1
+reports `no wallet key … which is not set in this process's environment`, and step 4 cannot look
+for the reference script. If the mnemonic lives only in `/etc/default/heimdall`, have systemd read
+that file for you — the same parser the unit uses, so an `export` line or a commented-out one
+shows up here rather than at the first start:
+
+```bash
+sudo systemd-run --pipe --wait --quiet --collect -p User=heimdall \
+    -p EnvironmentFile=/etc/default/heimdall \
+    /usr/bin/heimdall doctor --config /etc/heimdall/heimdall.toml
+```
 
 This runs eleven startup checks and prints all of them with the exact command that fixes each one,
 then exits non-zero if any failed. It reads the chain and **posts nothing** — a missing reference
@@ -842,7 +852,8 @@ whole bridge, and finding it means you deploy nothing and lock no ADA. It prints
 Run this command only if it reports finding neither.
 
 ```bash
-sudo -u heimdall heimdall deploy-registry-ref \
+sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+    heimdall deploy-registry-ref \
     --config /etc/heimdall/heimdall.toml \
     --submit
 ```
@@ -896,7 +907,8 @@ would run anyway (wallet, registry reference script, the min-stake gate) and the
 transaction, writes the request the other machine answers:
 
 ```bash
-sudo -u heimdall heimdall register-spo --config /etc/heimdall/heimdall.toml \
+sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+    heimdall register-spo --config /etc/heimdall/heimdall.toml \
     --out /media/usb/request.json
 ```
 
@@ -939,7 +951,8 @@ the command stops rather than assuming you said yes.
 **2c. Back on the node — submit.**
 
 ```bash
-sudo -u heimdall heimdall register-spo --config /etc/heimdall/heimdall.toml \
+sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+    heimdall register-spo --config /etc/heimdall/heimdall.toml \
     --signed /media/usb/signed.json --submit
 ```
 
