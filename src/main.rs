@@ -8390,7 +8390,15 @@ fn run_show_roster(
                             ),
                             ..Default::default()
                         });
-                    let current = current_key_for_report(&rt, cfg, &snapshot, &ctx);
+                    let current = current_key_for_report(
+                        &rt,
+                        cfg,
+                        &snapshot,
+                        Ok(&ctx),
+                        &active_bans,
+                        exclude_unstaked,
+                        &probes,
+                    );
                     print!(
                         "{}",
                         render(&RosterReport {
@@ -8411,17 +8419,57 @@ fn run_show_roster(
                         })
                     );
                 }
-                Err(e) => println!("DKG roster:        cannot derive ({e})"),
+                Err(e) => {
+                    // The key in force is still worth reporting — most of all
+                    // when departures have left too few to derive the next one.
+                    let why = format!("the next roster cannot be derived: {e}");
+                    let current = current_key_for_report(
+                        &rt,
+                        cfg,
+                        &snapshot,
+                        Err(&why),
+                        &active_bans,
+                        exclude_unstaked,
+                        &std::collections::BTreeMap::new(),
+                    );
+                    print!(
+                        "{}",
+                        heimdall::cardano::roster_report::render_current_key(
+                            &current,
+                            &heimdall::http::compat::PeerBuild::own(Default::default())
+                        )
+                    );
+                    println!("DKG roster:        cannot derive ({e})");
+                }
             }
         }
         // A stake query failure is fatal for a real ceremony (the threshold
         // can't be computed), but tolerated in this read-only diagnostic so
         // the registry + ban sections above still print — synthetic preprod
         // pools aren't registered Cardano SPOs, so /pools/{id} returns 404.
-        Err(e) => println!(
-            "DKG roster:        stake unavailable ({e}) — {} eligible pool(s) before threshold",
-            eligible.len()
-        ),
+        Err(e) => {
+            let why = format!("stake unavailable: {e}");
+            let current = current_key_for_report(
+                &rt,
+                cfg,
+                &snapshot,
+                Err(&why),
+                &active_bans,
+                exclude_unstaked,
+                &std::collections::BTreeMap::new(),
+            );
+            print!(
+                "{}",
+                heimdall::cardano::roster_report::render_current_key(
+                    &current,
+                    &heimdall::http::compat::PeerBuild::own(Default::default())
+                )
+            );
+            println!(
+                "DKG roster:        stake unavailable ({e}) — {} eligible pool(s) before threshold",
+                eligible.len()
+            );
+        }
     }
     Ok(())
 }
@@ -8481,56 +8529,101 @@ fn next_tm_for_report(
     read().unwrap_or_else(|e| (NextTm::Unavailable(e), 0))
 }
 
-/// The ceremony epoch the daemon runs under `cardano.demo_virtual_epoch_slots`
-/// (spec [SR-1a]); `None` on real epochs, or when the tip cannot be read — the
-/// Cardano epoch beside it is still correct.
-/// The key the treasury is authorized under now, with the roster of the
-/// ceremony that made it when this node saved one (spec [SR-17], [SR-18]).
+/// The key the treasury is under now, with the roster of the ceremony that
+/// made it when this node saved one (spec [SR-17], [SR-18]).
 ///
-/// The key comes from the chain (`treasury_info`), the members from this
-/// node's state directory, matched by the public key package alone — the
-/// secret share is never read. Every member is then placed against the
-/// registry as `snapshot` and `next` read it: in the next roster, registered
-/// but not eligible, or gone.
+/// Two keys go into "now". `treasury_info` names the one it AUTHORIZES, read
+/// here from `snapshot` — the datum the registry read already verified, so the
+/// report and the roster describe one datum state, under the same overrides.
+/// The one movements are SIGNED with is the key the treasury head is LOCKED
+/// under, which differs while a handoff is in flight and which only the
+/// running daemon knows; it is asked for over the operator surface, and when
+/// it cannot answer the report says it fell back to the authorized key.
+///
+/// The members come from this node's state directory, matched by the key's
+/// public package alone (`persist::saved_ceremony_for_key`: the share is never
+/// decoded, nor returned). Each is placed against the registry as `snapshot`
+/// and `next` read it, and probed — members outside the next roster included.
+#[allow(clippy::too_many_arguments)]
 fn current_key_for_report(
     rt: &tokio::runtime::Runtime,
     cfg: &HeimdallConfig,
     snapshot: &heimdall::cardano::roster::RegistrySnapshot,
-    next: &heimdall::cardano::dkg_roster::DkgContext,
+    next: Result<&heimdall::cardano::dkg_roster::DkgContext, &str>,
+    active_bans: &std::collections::BTreeSet<Vec<u8>>,
+    exclude_unstaked: bool,
+    next_probes: &std::collections::BTreeMap<u16, heimdall::cardano::roster_report::Probe>,
 ) -> heimdall::cardano::roster_report::CurrentKey {
-    use heimdall::cardano::roster_report::{CurrentKey, KeyMember, Standing};
-    let key = match treasury_authorized_key(rt, cfg, "show-roster") {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return CurrentKey::Unread("this bridge publishes no readable treasury_info".into());
+    use heimdall::cardano::dkg_roster::DkgParticipant;
+    use heimdall::cardano::roster_report::{CurrentKey, KeyMember, KeySource};
+    let authorized = match bitcoin::key::UntweakedPublicKey::from_slice(
+        &snapshot.treasury_state.datum.current_spos_frost_key,
+    ) {
+        Ok(key) => key,
+        Err(e) => {
+            return CurrentKey::Unread(format!(
+                "treasury_info current_spos_frost_key ({}) is not an x-only key: {e}",
+                hex::encode(&snapshot.treasury_state.datum.current_spos_frost_key)
+            ));
         }
-        Err(e) => return CurrentKey::Unread(e),
+    };
+    let (key, source) = match rt.block_on(local_treasury_key(cfg)) {
+        Ok(locked) if locked == authorized => (locked, KeySource::Locked),
+        Ok(locked) => (
+            locked,
+            KeySource::HandoffInFlight {
+                authorized: authorized.to_string(),
+            },
+        ),
+        Err(why) => (authorized, KeySource::AuthorizedOnly { why }),
     };
     let hex_key = key.to_string();
     let Some(dir) = cfg.protocol.state_dir.as_deref() else {
         return CurrentKey::NotHeld {
             key: hex_key,
+            source,
             why: Some("no protocol.state_dir".into()),
         };
     };
-    let saved =
+    let (made_in, roster) =
         match heimdall::epoch::persist::saved_ceremony_for_key(std::path::Path::new(dir), &key) {
-            Ok(Some(saved)) => saved,
+            Ok(Some(found)) => found,
             Ok(None) => {
                 return CurrentKey::NotHeld {
                     key: hex_key,
+                    source,
                     why: None,
                 };
             }
             Err(e) => {
                 return CurrentKey::NotHeld {
                     key: hex_key,
+                    source,
                     why: Some(format!("{e}; run as the heimdall user")),
                 };
             }
         };
-    let members = saved
-        .roster
+    // A member already probed as part of the next roster is not probed twice.
+    let next_index = |pk: &[u8]| {
+        next.ok()
+            .and_then(|ctx| ctx.own_participant(pk))
+            .map(|p| p.index)
+    };
+    let others: Vec<DkgParticipant> = roster
+        .participants
+        .values()
+        .filter(|p| next_index(&p.bifrost_id_pk).is_none())
+        .map(|p| DkgParticipant {
+            index: heimdall::epoch::log::id_short(p.identifier),
+            identifier: p.identifier,
+            pool_id: p.pool_id.clone(),
+            bifrost_id_pk: p.bifrost_id_pk.clone(),
+            bifrost_url: p.bifrost_url.clone(),
+            active_stake: 0,
+        })
+        .collect();
+    let other_probes = rt.block_on(probe_roster(&others));
+    let members = roster
         .participants
         .values()
         .map(|p| KeyMember {
@@ -8538,35 +8631,54 @@ fn current_key_for_report(
             pool_id: p.pool_id.clone(),
             bifrost_id_pk: p.bifrost_id_pk.clone(),
             bifrost_url: p.bifrost_url.clone(),
-            standing: if next.own_participant(&p.bifrost_id_pk).is_some() {
-                Standing::NextRoster
-            } else if snapshot
-                .spos
-                .iter()
-                .any(|s| s.bifrost_id_pk == p.bifrost_id_pk)
-            {
-                Standing::NotEligible(
-                    next.excluded
-                        .iter()
-                        .find(|x| x.bifrost_id_pk == p.bifrost_id_pk)
-                        .map_or_else(
-                            || "not in the eligible set".to_string(),
-                            |x| x.reason.to_string(),
-                        ),
-                )
-            } else {
-                Standing::NotRegistered
+            standing: heimdall::cardano::roster_report::standing_of(
+                p,
+                snapshot,
+                next,
+                active_bans,
+                exclude_unstaked,
+            ),
+            probe: match next_index(&p.bifrost_id_pk) {
+                Some(i) => next_probes.get(&i).cloned(),
+                None => other_probes
+                    .get(&heimdall::epoch::log::id_short(p.identifier))
+                    .cloned(),
             },
         })
         .collect();
     CurrentKey::Held {
         key: hex_key,
-        made_in: saved.epoch,
-        threshold: saved.roster.min_signers,
+        source,
+        made_in,
+        threshold: roster.min_signers,
         members,
     }
 }
 
+/// The key the local daemon last read the treasury head as locked under, from
+/// its operator surface (`health::NodeState::treasury_key`).
+async fn local_treasury_key(
+    cfg: &HeimdallConfig,
+) -> Result<bitcoin::key::UntweakedPublicKey, String> {
+    if !cfg.health.enabled {
+        return Err("health.enabled = false".into());
+    }
+    let state = fetch_node_state(&cfg.health.bind)
+        .await
+        .map_err(|e| format!("no answer at {}: {e}", cfg.health.bind))?;
+    let key = state.treasury_key.ok_or_else(|| {
+        format!(
+            "the daemon at {} has not read the treasury yet, or predates this report",
+            cfg.health.bind
+        )
+    })?;
+    key.parse()
+        .map_err(|e| format!("the daemon reported an unreadable key {key}: {e}"))
+}
+
+/// The ceremony epoch the daemon runs under `cardano.demo_virtual_epoch_slots`
+/// (spec [SR-1a]); `None` on real epochs, or when the tip cannot be read — the
+/// Cardano epoch beside it is still correct.
 fn bridge_epoch_for_report(
     rt: &tokio::runtime::Runtime,
     cfg: &HeimdallConfig,

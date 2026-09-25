@@ -1154,6 +1154,14 @@ fn settle_pending_tm(
 ) -> EpochResult<()> {
     use crate::epoch::pending_tm::PendingTm;
 
+    // Every read of the head passes here, so this is where `/health` learns
+    // which key the treasury is locked under — the question `show-roster`
+    // cannot answer from the chain without reconstructing the head's script.
+    config.health.update(|h| {
+        h.treasury_key = Some(treasury.y_51.to_string());
+        h.authorized_key = Some(treasury.authorized_key.to_string());
+    });
+
     let me = config.identity.identifier;
     let Some(dir) = config.state_dir.as_deref() else {
         return Ok(());

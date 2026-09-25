@@ -61,6 +61,16 @@ impl PersistedDkg {
     pub fn to_group_keys(&self) -> EpochResult<GroupKeys> {
         group_keys_from_hex(&self.key_package_hex, &self.public_key_package_hex)
     }
+
+    /// The GROUP key this ceremony produced, from the public key package alone
+    /// — the secret share is not decoded.
+    pub fn group_verifying_key(&self) -> EpochResult<frost::VerifyingKey> {
+        let bytes = hex::decode(&self.public_key_package_hex)
+            .map_err(|e| EpochError::Frost(format!("PublicKeyPackage hex: {e}")))?;
+        let pkp = frost::keys::PublicKeyPackage::deserialize(&bytes)
+            .map_err(|e| EpochError::Frost(format!("deserialize PublicKeyPackage: {e}")))?;
+        Ok(*pkp.verifying_key())
+    }
 }
 
 /// A DKG output as the two hex strings that persist it: this node's
@@ -319,34 +329,40 @@ pub fn read_dkg_group_key(
     let Some(state) = read_dkg_state(state_dir, epoch)? else {
         return Ok(None);
     };
-    let bytes = hex::decode(&state.public_key_package_hex)
-        .map_err(|e| EpochError::Frost(format!("PublicKeyPackage hex: {e}")))?;
-    let pkp = frost::keys::PublicKeyPackage::deserialize(&bytes)
-        .map_err(|e| EpochError::Frost(format!("deserialize PublicKeyPackage: {e}")))?;
-    Ok(Some(*pkp.verifying_key()))
+    state.group_verifying_key().map(Some)
 }
 
-/// The saved ceremony that produced the group key `key`, searched newest first,
-/// matching on each file's PUBLIC key package alone ([`read_dkg_group_key`]).
+/// The saved ceremony that produced the group key `key`, searched newest first:
+/// its bridge epoch and its roster.
 ///
 /// For a report that has to say whose key the treasury is under: the chain
 /// names the key, and only the ceremony that made it knows its members and its
-/// threshold. `Ok(None)` when no saved ceremony made it — this node did not
-/// take part, or the file has since been set aside. A file that cannot be read
-/// is skipped rather than fatal: it cannot be the answer, and the next may be.
+/// threshold. Each file is read once and only its PUBLIC key package decoded;
+/// the share is never decoded, and only the epoch and the roster are returned.
+///
+/// `Ok(None)` when no saved ceremony made it — this node did not take part, or
+/// the file has since been set aside. A file that does not parse is skipped (it
+/// cannot be the answer, and the next may be), but one that cannot be READ is
+/// an error: "not made here" would be a false answer to give for a
+/// permission-denied.
 pub fn saved_ceremony_for_key(
     state_dir: &Path,
     key: &bitcoin::key::UntweakedPublicKey,
-) -> EpochResult<Option<PersistedDkg>> {
+) -> EpochResult<Option<(u64, Roster)>> {
     for epoch in persisted_dkg_epochs(state_dir)? {
-        let Ok(Some(vk)) = read_dkg_group_key(state_dir, epoch) else {
+        let state = match read_dkg_state(state_dir, epoch) {
+            Ok(Some(state)) => state,
+            Ok(None) | Err(EpochError::Frost(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        let Ok(vk) = state.group_verifying_key() else {
             continue;
         };
         let Ok(group) = crate::frost::xonly::group_xonly(&vk) else {
             continue;
         };
         if group.xonly == *key {
-            return read_dkg_state(state_dir, epoch);
+            return Ok(Some((state.epoch, state.roster)));
         }
     }
     Ok(None)
@@ -639,7 +655,7 @@ mod tests {
         let found = saved_ceremony_for_key(&dir, &key)
             .unwrap()
             .expect("its ceremony");
-        assert_eq!((found.epoch, found.roster), (11, roster));
+        assert_eq!(found, (11, roster));
 
         let (other, _) = sample_output();
         let elsewhere = crate::frost::xonly::group_xonly(&other.verifying_key)

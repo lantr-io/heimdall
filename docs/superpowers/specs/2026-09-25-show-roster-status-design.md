@@ -53,7 +53,7 @@ Out of scope:
    | Batch grid | Config schedule (`GridParams`) and the current slot |
    | `prev_tm_txid` | txid of the treasury outpoint the chain names now |
    | Health | one probe per roster member |
-   | Current key | `treasury_info.current_spos_frost_key`, and the saved ceremony whose public group key matches it (`persist::saved_ceremony_for_key`) |
+   | Current key | the key the treasury head is locked under, from the local daemon's operator surface (`NodeState::treasury_key`), else `treasury_info.current_spos_frost_key` from the verified registry snapshot; and the saved ceremony whose public group key matches it (`persist::saved_ceremony_for_key`) |
 
    | Output | Form |
    |---|---|
@@ -79,11 +79,12 @@ Out of scope:
 
 ```
 epoch 315 (bridge epoch 1558) · stake: live_stake (TEST RUN)
-current key: 46f4e530…2349 (authorized on chain) — made in bridge epoch 1558, threshold 6 of 6
-    pool1s7wet…z2sj (http://heimdal.adanorthpool.com:18500)  NO LONGER REGISTERED
-    pool1az5dm…w4kh (http://139.59.140.78:18501)  in the next roster
+current key: 46f4e530…2349 (the treasury is locked under it)
+    made in bridge epoch 1558, threshold 6 of 6
+    pool1s7wet…z2sj (http://heimdal.adanorthpool.com:18500)  NO LONGER REGISTERED · up 40ms · …
+    pool1az5dm…w4kh (http://139.59.140.78:18501)  in the next roster · up 1ms · …
     …
-    handoff: signed from the next epoch's roster, so it needs 6 of these 6 there, and only 4 are. It cannot complete unless …
+    handoff: signed from the next epoch's roster, so it needs 6 of these 6 there, and only 4 are. It cannot complete unless 2 more of … are back …
 next TM: batch B_6 at 18:00:00 UTC, spends cefb913d…270a · cascade pool10vn6n…mj9t → pool1s7wet…z2sj → …
 next ceremony, from the registry as it reads now: threshold 2 of 5 (20% security threshold)
 total stake 68,877.46 ADA · bans: 0 active
@@ -94,18 +95,21 @@ looks like a snapshot run misleads the reader about the security of the roster.
 
 ### Current key
 
-- `show-roster` MUST print, after the first line, the key `treasury_info` authorizes now, marked `(authorized on chain)`. When a ceremony saved on this node made it, the line MUST add that ceremony's bridge epoch and its threshold as `t of n`; when none did, it MUST say its members are not known here; when the datum cannot be read, it MUST say the current key is unknown and why. `[SR-17]`
-- For a known key, `show-roster` MUST print one line per member with where it stands in the registry now: `in the next roster`, `registered, NOT eligible: <reason>`, or `NO LONGER REGISTERED`. `[SR-18]`
-- For a known key, `show-roster` MUST print a handoff line: the handoff is signed from the next epoch's roster (`epoch::rotation`, WI-078), so it names how many members are in that roster against the threshold, and — when too few — the members that must be back in the eligible set before the boundary. `[SR-19]`
-- `show-roster` MUST label the threshold it derives from the registry as the next ceremony's: `next ceremony, from the registry as it reads now: threshold t of n`. `[SR-20]`
+- `show-roster` MUST print, after the first line, the key the treasury is under now and where that came from: the key the head is LOCKED under as the local daemon last read it — `the treasury is locked under it`, or `still locked under it` with the newer key `treasury_info` already authorizes when the two differ (a handoff is in flight). When the daemon cannot say, it MUST fall back to the authorized key and say so, with the reason. When the datum cannot be read, it MUST say the current key is unknown and why. `[SR-17]`
+- When a ceremony saved on this node made the key, `show-roster` MUST print its bridge epoch and threshold, then one line per member: where it stands in the registry now — `in the next roster`, `registered, NOT eligible: <reason>` (a pool excluded only for want of stake under `demo_exclude_unstaked` is labelled so, not `banned`), `registered (eligibility not derived: …)`, `its pool is registered again under ANOTHER bifrost key`, or `NO LONGER REGISTERED` — and its health, probed whether or not it is in the next roster. Standing is read by bifrost key, then by pool. When no saved ceremony made it, it MUST say its members are not known here, and why when the state could not be read. `[SR-18]`
+- For a known key, `show-roster` MUST print a handoff line: the handoff is signed from the next epoch's roster (`epoch::rotation`, WI-078), so it names how many members are in that roster against the threshold; when too few, how many MORE are needed and of whom; when the next roster could not be derived, that no verdict can be given. `[SR-19]`
+- `show-roster` MUST label the threshold it derives from the registry as the next ceremony's: `next ceremony, from the registry as it reads now: threshold t of n`. The current-key section MUST print even when that derivation fails. `[SR-20]`
 
 **Why:** the rest of the report is a projection from the registry as it reads
 now. While the registry holds still that IS the current roster; once a pool
 leaves or is banned mid-epoch it is not, and a report showing only the
 projection read as if the epoch's key had changed — "threshold 2 of 5" over an
 epoch whose key was 6-of-6, with the handoff about to fail for want of two
-members nobody had named. The key's members come from the node's own saved
-ceremony, matched by its public group key: the secret share is never read.
+members nobody had named. The signer is the key the head is LOCKED under, not
+the one `treasury_info` authorizes: they differ while a handoff is in flight,
+and it is the locked one that signs the handoff. Only the running daemon knows
+it cheaply, so the report asks it. The key's members come from the node's own
+saved ceremony, matched by its public group key: the share is never decoded.
 
 ### Pool blocks
 
