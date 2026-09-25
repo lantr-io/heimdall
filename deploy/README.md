@@ -62,7 +62,11 @@ every fresh machine. After configuring:
 # One dry-run tick, AS THE SERVICE USER: the config is 0640 root:heimdall and
 # /var/lib/heimdall is 0700 heimdall, so running this as yourself cannot read the
 # config, and running it as root would leave root-owned files in the state dir.
-sudo -u heimdall heimdall run-spo --config /etc/heimdall/heimdall.toml --check
+# And WITH THE UNIT'S ENVIRONMENT FILE: the mnemonic is in /etc/default/heimdall, which
+# `sudo -u heimdall heimdall …` does not read — it would report "no wallet key".
+sudo systemd-run --pipe --wait --quiet --collect -p User=heimdall \
+    -p EnvironmentFile=/etc/default/heimdall -p WorkingDirectory=/var/lib/heimdall \
+    /usr/bin/heimdall run-spo --config /etc/heimdall/heimdall.toml --check
 
 sudo systemctl enable --now heimdall
 journalctl -u heimdall -f
@@ -76,8 +80,10 @@ Notes:
   `/etc/default/heimdall` (or `systemctl edit heimdall`) and restarting.
 - **Secrets belong in `/etc/default/heimdall`,** not in the TOML. heimdall reads
   `$HEIMDALL_MNEMONIC` only when `cardano.mnemonic` is absent from the config file, so leaving that
-  key commented out is what activates the environment variable — and keeps the seed out of a file
-  dpkg tracks and diffs on upgrade.
+  key commented out is what activates the environment variable — and keeps the seed out of the TOML.
+  Both files are dpkg conffiles, so an upgrade that ships a changed version of either asks what to
+  do: keep yours, the default. Write it as `HEIMDALL_MNEMONIC="word word …"`, **without**
+  `export`: systemd skips such a line by logging it, phrase included, to the journal.
 - **`$HEIMDALL_ARGS` ships empty, and for a normal node it stays empty.** `run-spo` has no
   cadence flag — movements fall on the bridge's on-chain batch grid, which is not a local
   setting — and no `--broadcast`: a configured, registered node participates from its first
@@ -107,10 +113,12 @@ docker run --rm ghcr.io/lantr-io/heimdall:<version> \
     cat /usr/share/heimdall/heimdall.toml.example > heimdall.toml
 $EDITOR heimdall.toml
 
+# `-e NAME` with no value passes the variable from this shell, so the words stay off
+# the command line: `read -rs HEIMDALL_MNEMONIC && export HEIMDALL_MNEMONIC` first.
 docker run -d --name heimdall \
     -v "$PWD/heimdall.toml:/etc/heimdall/heimdall.toml:ro" \
     -v heimdall-state:/var/lib/heimdall \
-    -e HEIMDALL_MNEMONIC="word word word ..." \
+    -e HEIMDALL_MNEMONIC \
     -p 18500:18500 \
     --restart unless-stopped \
     ghcr.io/lantr-io/heimdall:<version>

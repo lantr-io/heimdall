@@ -364,10 +364,13 @@ async fn resolve_script_ref(
         .as_deref()
         .ok_or_else(|| format!("{what} reference script is unset and there is no chain to find it on: set cardano.blockfrost_project_id, or cardano.{what}_ref"))?;
     let base_url = crate::cardano::bf_http::base_url(pid, cardano.blockfrost_url.as_deref());
+    // The alternative first and the wallet's own error last: that error is a
+    // full sentence of its own, and embedding it mid-sentence buried the
+    // `_ref` key, which is the fix that needs no wallet at all.
     let wallet = wallet_address.map_err(|e| {
         format!(
-            "{what} reference script is unset and this node has no wallet to look in: {e}, \
-             or set cardano.{what}_ref"
+            "{what} reference script is unset and this node has no wallet to look for it in: \
+             set cardano.{what}_ref, or give the node a wallet ({e})"
         )
     })?;
     let hash = script.hash_hex();

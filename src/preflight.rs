@@ -385,22 +385,22 @@ pub async fn preflight(cfg: &HeimdallConfig) -> Report {
         // asking it is also how the source gets reported — a second opinion
         // about that is how the two drift apart.
         let wallet = crate::cardano::wallet::resolve_wallet(&cfg.cardano);
+        // Steps 4 and 11 point back here rather than carrying the resolver's
+        // explanation: step 1 prints it once, and three copies of it in one
+        // report bury the step that actually says what to fix.
         wallet_addr = match &wallet {
             Ok(w) => Ok(w.address.clone()),
-            Err(e) => Err(e.clone()),
+            Err(_) => Err("no usable wallet (step 1 says why)".to_string()),
         };
         match &wallet {
             Ok(w) => notes.push(format!(
                 "wallet key from {}, address {}",
                 w.source, w.address
             )),
-            // The /etc/default hint belongs ONLY to "no key at all". Appended
-            // to every error it misdirects: a 0644 key file, or an address
-            // that does not pair with its key, has nothing to do with that
-            // file — and this is the command whose job is to name the fix.
-            Err(e) if e.starts_with("no wallet key") => {
-                problems.push(format!("{e} (/etc/default/heimdall in the Debian package)"));
-            }
+            // No /etc/default hint appended here any more: the resolver's "no
+            // wallet key" now says what the variable looked like to THIS
+            // process and where it has to be set, for every command that
+            // needs a wallet rather than only for this one.
             Err(e) => problems.push(e.clone()),
         }
 

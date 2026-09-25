@@ -62,7 +62,9 @@ export BRIDGE_CONFIG_POLICY="d8c06b705b0089b8da32e1a17550bc0d3a4fea7999508e3e956
 # Yours:
 export BLOCKFROST_PROJECT_ID="preprod…"              # or a Dolos in front of your own node, see §3
 export MY_URL="http://spo.example.com:18500"         # public, and WITH an explicit :port
-export HEIMDALL_MNEMONIC="…"                         # the funded wallet – never goes in the TOML
+read -rs HEIMDALL_MNEMONIC && export HEIMDALL_MNEMONIC  # paste the funded wallet's words, Enter –
+                                                        # read, not typed into `export`, so they stay
+                                                        # out of shell history; never in the TOML
 ```
 
 **1. Install** – [§1](#1-install). Run the build the rest of the roster runs, not the newest one.
@@ -143,7 +145,7 @@ be in *this* command's
 environment: `/etc/default/heimdall` is read by the unit, not by your shell.
 
 ```bash
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall doctor --config /etc/heimdall/heimdall.toml
 ```
 
@@ -158,13 +160,13 @@ on your air-gapped machine. Three commands, one trip:
 
 ```bash
 # on the node — runs its checks, then writes the request instead of a transaction
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall register-spo --config /etc/heimdall/heimdall.toml --out /media/usb/request.json
 # beside cold.skey, on a machine with no network
 heimdall sign-with-pool-key /media/usb/request.json \
     --cold-skey cold.skey --out /media/usb/signed.json
 # back on the node
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall register-spo --config /etc/heimdall/heimdall.toml \
     --signed /media/usb/signed.json --submit
 ```
@@ -177,7 +179,7 @@ set `cardano.cold_skey_path` to it (`0600`, owned by `heimdall`) and it is one c
 Dry run first, then add `--submit`:
 
 ```bash
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall register-spo --config /etc/heimdall/heimdall.toml
 ```
 
@@ -185,10 +187,10 @@ If it stops with `no reference script for the registry` instead, deploy one, the
 the outpoint it prints:
 
 ```bash
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall deploy-registry-ref --config /etc/heimdall/heimdall.toml --submit
 #   registry ref UTxO:    <tx_hash>#0
-sudo -u heimdall env HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
     heimdall register-spo --config /etc/heimdall/heimdall.toml \
     --registry-ref <tx_hash>:0 --submit
 ```
@@ -596,16 +598,43 @@ after the change and read every line.
 ## 4. Check it before going further
 
 ```bash
-sudo -u heimdall heimdall doctor --config /etc/heimdall/heimdall.toml
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
+    heimdall doctor --config /etc/heimdall/heimdall.toml
 ```
 
 Run it as the `heimdall` user: the config is `0640 root:heimdall` so you cannot read it as
 yourself, and running as root would leave root-owned files in the state directory.
 
-Give it the mnemonic. `/etc/default/heimdall` is read by the systemd unit, not by your shell, so
-run as `sudo -u heimdall env HEIMDALL_MNEMONIC="…" heimdall doctor …` or step 1 reports `no
-wallet key` and step 4 cannot look for the reference script. That is the first FAIL every
-operator sees, and it is not a misconfiguration.
+`--preserve-env=HEIMDALL_MNEMONIC` is not decoration, here, in `status` and `ensure-collateral`,
+and in any command below that pays a fee: `sudo` clears the environment, so without it a variable exported in your shell does not reach
+heimdall, and `/etc/default/heimdall` is read by the systemd unit, not by your shell. Leave it out
+and step 1 reports `no wallet key … which is not set in this process's environment`, and step 4
+cannot look for the reference script. Do **not** write it as `sudo -u heimdall env
+HEIMDALL_MNEMONIC="$HEIMDALL_MNEMONIC" …`: that expands the phrase onto sudo's command line, which
+sudo writes to its log and `ps` shows every local user for as long as the command runs.
+`--preserve-env` keeps it off the command line; it does not keep it out of a sudo event log that
+records the command's environment (`log_format=json`, or `sudo_logsrvd`). On such a host use the
+`systemd-run` form below, which passes nothing through sudo.
+
+That is for a wallet that is a mnemonic. With `cardano.payment_skey_path` instead, drop the flag and
+do not export the variable at all — a key file and a mnemonic together are refused as two wallet
+keys, which is exactly what a leftover export would pass through.
+
+If the mnemonic lives only in `/etc/default/heimdall`, have systemd read that file for you, with
+the same parser the unit uses — so a commented-out line shows up here rather than at the first
+start:
+
+```bash
+sudo systemd-run --pipe --wait --quiet --collect -p User=heimdall \
+    -p EnvironmentFile=/etc/default/heimdall -p WorkingDirectory=/var/lib/heimdall \
+    /usr/bin/heimdall doctor --config /etc/heimdall/heimdall.toml
+```
+
+Write that line the way systemd reads it — `HEIMDALL_MNEMONIC="word word …"`, uncommented, and
+**without `export`**. systemd skips an `export` line, and it does so by logging it, value included,
+to the journal (`Ignoring invalid environment assignment 'export HEIMDALL_MNEMONIC=…'`). If your
+file ever had one and the unit or this check ran, the phrase is in the journal: treat the wallet as
+exposed and move its funds to a new one.
 
 This runs eleven startup checks and prints all of them with the exact command that fixes each one,
 then exits non-zero if any failed. It reads the chain and **posts nothing** — a missing reference
@@ -842,7 +871,8 @@ whole bridge, and finding it means you deploy nothing and lock no ADA. It prints
 Run this command only if it reports finding neither.
 
 ```bash
-sudo -u heimdall heimdall deploy-registry-ref \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
+    heimdall deploy-registry-ref \
     --config /etc/heimdall/heimdall.toml \
     --submit
 ```
@@ -896,7 +926,8 @@ would run anyway (wallet, registry reference script, the min-stake gate) and the
 transaction, writes the request the other machine answers:
 
 ```bash
-sudo -u heimdall heimdall register-spo --config /etc/heimdall/heimdall.toml \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
+    heimdall register-spo --config /etc/heimdall/heimdall.toml \
     --out /media/usb/request.json
 ```
 
@@ -939,7 +970,8 @@ the command stops rather than assuming you said yes.
 **2c. Back on the node — submit.**
 
 ```bash
-sudo -u heimdall heimdall register-spo --config /etc/heimdall/heimdall.toml \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall \
+    heimdall register-spo --config /etc/heimdall/heimdall.toml \
     --signed /media/usb/signed.json --submit
 ```
 
@@ -961,7 +993,7 @@ and the gate runs at step 2c instead. Submission is never ungated; only the earl
 deliberately — point `cardano.cold_skey_path` at it and the whole thing is one command:
 
 ```bash
-sudo -u heimdall heimdall register-spo \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall heimdall register-spo \
     --config /etc/heimdall/heimdall.toml \
     --submit
 ```
@@ -1089,10 +1121,12 @@ and exits without joining anything. Do that; then enable the service.
 **Docker:**
 
 ```bash
+# `-e NAME` with no value passes it from this shell (exported as in the quick start), so
+# the words never appear on the command line, in `ps` or in your history.
 docker run -d --name heimdall \
     -v "$PWD/heimdall.toml:/etc/heimdall/heimdall.toml:ro" \
     -v heimdall-state:/var/lib/heimdall \
-    -e HEIMDALL_MNEMONIC="..." \
+    -e HEIMDALL_MNEMONIC \
     -p <your-port>:<your-port> \
     --restart unless-stopped \
     ghcr.io/lantr-io/heimdall:<version>
@@ -1108,7 +1142,7 @@ without it comes back unable to resume.
 ### Is it healthy?
 
 ```bash
-sudo -u heimdall heimdall status --config /etc/heimdall/heimdall.toml
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall heimdall status --config /etc/heimdall/heimdall.toml
 ```
 
 `status` answers **"am I healthy?"** where `doctor` answers **"can I start?"**, and it prints two
@@ -1339,13 +1373,13 @@ With the key where it belongs, off this machine, it is the same three steps as r
 
 ```bash
 # on the node — reports the ban record, then writes the request
-sudo -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml \
     --out /media/usb/request.json
 # beside cold.skey
 heimdall sign-with-pool-key /media/usb/request.json \
     --cold-skey cold.skey --out /media/usb/signed.json
 # back on the node
-sudo -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml \
+sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall heimdall deregister-spo --config /etc/heimdall/heimdall.toml \
     --signed /media/usb/signed.json --submit
 ```
 
@@ -1435,7 +1469,7 @@ authorization to leave that anyone holding it can post: `sign-with-pool-key` wri
 | `no reference script for the registry` right after `deploy-registry-ref` succeeded | the provider's address listing has not shown the script yet – pass the outpoint the deploy printed, `--registry-ref <tx_hash>:0` (step 6) |
 | `N of M candidates excluded at the pre-ceremony handshake` at every epoch start | the rest of the line names each cause with its count. *Incompatible build* (version, blueprint, security threshold): both sides report the other, so compare `/health` across the roster and upgrade the odd one out – see *Upgrades*. *Different consensus settings*: match the setting the `EXCLUDING` lines name. *Different roster read*: nothing to change – typically this node registered after the roster read the registry for this epoch, and it clears at the next epoch; if it is still there after an epoch boundary it is not that, so compare `roster_digest`, `roster_size`, `threshold` and `dkg_threshold_epoch` in `/health` across the roster. *Different FROST threshold from an older build*: upgrade the nodes whose `/health` has no `roster_digest`. `/health` shows the roster each node READ; the threshold it actually runs with after exclusions is in its `candidate set reduced` log line. When the line says *every peer was excluded*, the node that differs is this one |
 | `[9/11] post a movement FAIL` | this bridge has never published its treasury-movement validator on chain, so no SPO can post — `binocular deploy-script-refs`, re-run, publishes it and skips what already exists. Not something one operator's config can fix |
-| `[11/11] wallet collateral WARN`, or `no ada-only wallet UTxO with >= 5 ADA for collateral` when a tx is built | the wallet cannot post a script transaction, which is **not** a balance problem — it can hold thousands of ADA and still fail, if every UTxO carries a native token. A script tx needs one UTxO to pay the fee and a DISTINCT ada-only one for collateral. `heimdall ensure-collateral --submit` splits clean UTxOs off whatever the wallet holds; it runs no script, so it needs no collateral itself and works even when every lovelace is behind a token |
+| `[11/11] wallet collateral WARN`, or `no ada-only wallet UTxO with >= 5 ADA for collateral` when a tx is built | the wallet cannot post a script transaction, which is **not** a balance problem — it can hold thousands of ADA and still fail, if every UTxO carries a native token. A script tx needs one UTxO to pay the fee and a DISTINCT ada-only one for collateral. `sudo --preserve-env=HEIMDALL_MNEMONIC -u heimdall heimdall ensure-collateral --config /etc/heimdall/heimdall.toml --submit` splits clean UTxOs off whatever the wallet holds; it runs no script, so it needs no collateral itself and works even when every lovelace is behind a token |
 | a key you set is `refused` at load | it names a value the Config publishes; delete it, and `show-config-params` prints what the chain says |
 | `trie diverged` or `trie is out of sync with the chain` | the node reconciles itself at the next batch opportunity; if `tries_repair_failed` is set, run `reconstruct-tries --dry-run` to see why |
 | `roots were read at treasury head …, but this movement spends …` | two reads of the bridge state saw different chain states, usually the Kupo at `cardano.kupo_url` lagging the Blockfrost-compatible API. This is not yet a verdict on your tries: the node retries by itself and compares them once both reads agree. If the message keeps repeating, the lagging backend is stuck: check that it is synced |

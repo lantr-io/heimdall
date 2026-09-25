@@ -67,9 +67,12 @@ heimdall is installed but NOT enabled — it needs a bridge configuration first.
 
   1. edit  /etc/heimdall/heimdall.toml   (bridge identifiers, Blockfrost id)
   2. edit  /etc/default/heimdall         (wallet mnemonic)
-  3. dry run, as the service user — the config is 0640 root:heimdall and the
-     state directory is the heimdall user's:
-       sudo -u heimdall heimdall run-spo --config /etc/heimdall/heimdall.toml --check
+  3. dry run, as the service user and with the unit's environment file — the config
+     is 0640 root:heimdall, and the mnemonic is in /etc/default/heimdall, which
+     `sudo -u heimdall heimdall …` would not read:
+       sudo systemd-run --pipe --wait --quiet --collect -p User=heimdall \
+           -p EnvironmentFile=/etc/default/heimdall -p WorkingDirectory=/var/lib/heimdall \
+           /usr/bin/heimdall run-spo --config /etc/heimdall/heimdall.toml --check
      It runs every startup check, prints the report and exits, joining nothing.
   4. register this SPO (step 6 of that report prints the command), then:
        systemctl enable --now heimdall
