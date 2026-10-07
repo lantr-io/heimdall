@@ -217,6 +217,28 @@ impl PeginKeyOrigin {
 }
 
 impl TreasuryUtxo {
+    /// The scriptPubKey a movement of this head must pay at output 0 ([BTC-2]): the
+    /// treasury tree of the key the bridge AUTHORIZES, read from the datum rather
+    /// than from whoever is building.
+    ///
+    /// One definition because two builders depend on it and must never disagree —
+    /// the roster's movement in `epoch::machine` and the federation's post in
+    /// `federation::tm`. Were they to drift, the federation would refuse a movement
+    /// the roster would have built, or worse, accept one it would not.
+    #[must_use]
+    pub fn authorized_treasury_spk(&self) -> bitcoin::ScriptBuf {
+        let secp = bitcoin::key::Secp256k1::new();
+        bitcoin::ScriptBuf::new_p2tr_tweaked(
+            crate::bitcoin::taproot::treasury_spend_info(
+                &secp,
+                self.authorized_key,
+                self.y_fed,
+                self.federation_csv_blocks,
+            )
+            .output_key(),
+        )
+    }
+
     /// The peg-in Taproot tree this bridge PUBLISHES — the canonical answer to "what
     /// address does a deposit land at", for every reader that can see the oracle.
     ///
