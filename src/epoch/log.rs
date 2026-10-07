@@ -185,6 +185,35 @@ pub fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
+/// What a `t == n` key deserves said about it, or `None` when the key has slack.
+///
+/// A threshold equal to the roster size means the key has no fault tolerance at
+/// all: one departure, one crash or one lost share and the treasury can no longer
+/// be moved by its key path, only by the federation CSV leaf. The threshold rule
+/// produces this legitimately — `t` is the smallest set whose weakest members
+/// still clear the security threshold, so one pool holding most of the stake makes
+/// `t` the whole roster — which is exactly why it needs saying: nothing is
+/// misconfigured, and the fragility is invisible unless reported.
+///
+/// On preprod that state lasted from 2026-09-25, when a 6-of-6 key was made, to
+/// 2026-10-07, and no log line anywhere mentioned it. Two SPOs left, the sixth
+/// share went offline, and the treasury sat for eleven days.
+///
+/// Reports, never refuses. The roster is permissionless and an operator may leave
+/// whenever it wants; what it may not do is leave without anyone having been able
+/// to see the risk beforehand.
+#[must_use]
+pub fn no_slack_note(min_signers: u16, max_signers: u16) -> Option<String> {
+    if max_signers == 0 || min_signers < max_signers {
+        return None;
+    }
+    Some(format!(
+        "NO fault tolerance: the threshold is every one of the {max_signers} share holders, so a \
+         single departure, crash or lost share leaves the treasury movable only by the federation \
+         CSV path"
+    ))
+}
+
 /// Lovelace as ADA: `1,234,567 ADA`, `5 ADA`, `2.5 ADA` (spec [HL-8], [LG-9]).
 ///
 /// Never lovelace. A stake figure is the one number in this log an operator
@@ -890,6 +919,41 @@ mod tests {
 
     fn ident(n: u16) -> Identifier {
         Identifier::try_from(n).unwrap()
+    }
+
+    /// The 2026-09-25 preprod key: 6 of 6, which no code noticed at the time.
+    /// One departure took the treasury off the key path for eleven days.
+    #[test]
+    fn a_threshold_equal_to_the_roster_size_is_reported_as_having_no_slack() {
+        let note = no_slack_note(6, 6).expect("6 of 6 has no slack");
+        assert!(
+            note.contains("every"),
+            "says the whole roster is needed: {note}"
+        );
+        assert!(
+            note.contains("federation"),
+            "names what the treasury falls back to: {note}"
+        );
+    }
+
+    #[test]
+    fn a_threshold_below_the_roster_size_says_nothing() {
+        assert_eq!(no_slack_note(2, 5), None, "2 of 5 tolerates three absences");
+        assert_eq!(no_slack_note(6, 7), None, "6 of 7 tolerates one");
+    }
+
+    /// A one-member roster IS t == n, and one crash is one crash whatever the
+    /// roster size, so it gets the same note rather than a special case.
+    #[test]
+    fn a_single_member_roster_still_has_no_slack() {
+        assert!(no_slack_note(1, 1).is_some());
+    }
+
+    /// Nothing useful to say about a roster that does not exist, and a report is
+    /// the wrong place to raise it.
+    #[test]
+    fn an_empty_roster_is_not_reported_on() {
+        assert_eq!(no_slack_note(0, 0), None);
     }
 
     /// The shape a Blockfrost submit rejection actually has — three lines, with
