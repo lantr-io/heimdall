@@ -637,6 +637,17 @@ pub async fn dkg_phase(
                 )
             );
 
+            // A key whose threshold is its whole roster has no slack at all, and
+            // the moment to say so is now — while the operators could still
+            // register another pool before the next boundary — not after a
+            // departure has already taken the treasury off its key path. Warn
+            // rather than event: it is a risk to act on, not a step completed.
+            if let Some(note) =
+                crate::epoch::log::no_slack_note(*key_package.min_signers(), roster.max_signers)
+            {
+                crate::epoch_warn!(me, epoch, "{}", note);
+            }
+
             let group_keys = GroupKeys {
                 verifying_key: *public_key_package.verifying_key(),
                 public_key_package,

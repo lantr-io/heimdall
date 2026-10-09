@@ -72,6 +72,7 @@ pub mod ceremony;
 pub mod persist;
 pub mod roster;
 pub mod spend;
+pub mod tm;
 
 pub use ceremony::{CeremonyError, CeremonyLimits};
 pub use persist::FederationKeyState;

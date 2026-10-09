@@ -4982,14 +4982,9 @@ async fn build_tm_phase(
     // read from the datum rather than from this node's own ceremony output. The
     // spec's output-0 rule is state-derived, and this is the field that holds
     // that state — so every node building this movement derives the same address
-    // whether it is an SPO, an outgoing SPO or a federation member.
-    let change_spend = treasury_spend_info(
-        &secp,
-        treasury.authorized_key,
-        treasury.y_fed,
-        treasury.federation_csv_blocks,
-    );
-    let change_script = bitcoin::ScriptBuf::new_p2tr_tweaked(change_spend.output_key());
+    // whether it is an SPO, an outgoing SPO or a federation member. The federation's
+    // post check reads the same function, so the two cannot disagree.
+    let change_script = treasury.authorized_treasury_spk();
     // Kept past the move into the builder: the "does this movement do anything"
     // check below asks whether the change lands back on the very output spent.
     let head_script = bitcoin::ScriptBuf::new_p2tr_tweaked(treasury_input_spend.output_key());

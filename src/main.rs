@@ -353,6 +353,21 @@ enum Commands {
         /// fetch. Distributed federation only; 0 exits at once.
         #[arg(long, default_value_t = 60)]
         serve_after_secs: u64,
+        /// Post the signed movement to Cardano as an `UnconfirmedTm` record, so
+        /// the bridge-state singleton follows it and the watchtower relays it to
+        /// Bitcoin.
+        ///
+        /// Required for a Treasury Movement, and the reason is not cosmetic: an
+        /// unposted movement spends the head that the singleton still names, so
+        /// every movement built afterwards is dead on arrival ([CTM-18]). Omit it
+        /// only for a spend that is deliberately outside the TM chain.
+        ///
+        /// Bitcoin broadcast stays out of heimdall either way (WI-086) — the
+        /// watchtower sends the bytes from the posted record. ONE member should
+        /// pass this; the record is the same whoever posts it, but a second post
+        /// burns a fee for a duplicate.
+        #[arg(long)]
+        post: bool,
     },
     /// Print the Cardano wallet address + payment key hash (the TM-NFT mint
     /// authority), and which config key supplied the signing key:
@@ -1966,6 +1981,7 @@ fn main() {
             signers,
             timeout_secs,
             serve_after_secs,
+            post,
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_federation_spend(
@@ -1977,6 +1993,7 @@ fn main() {
                 &signers,
                 timeout_secs,
                 serve_after_secs,
+                post,
             ) {
                 error!("Error: {e}");
                 std::process::exit(1);
@@ -5077,6 +5094,7 @@ fn run_federation_spend(
     signers: &[u16],
     timeout_secs: Option<u64>,
     serve_after_secs: u64,
+    post: bool,
 ) -> Result<(), String> {
     use bitcoin::key::{Secp256k1, UntweakedPublicKey};
     use bitcoin::{Amount, ScriptBuf};
@@ -5139,11 +5157,13 @@ fn run_federation_spend(
     check_treasury_script(&rt, cfg, &outpoint, &treasury_spk, &treasury_addr)?;
 
     // Where the value lands. Default: back to the treasury (the self-send this
-    // command was written for). `--to` is the retirement case — a treasury the
-    // bridge has moved on from, whose funds should leave federation custody
-    // rather than return to an address nothing will spend again. Network-checked
-    // against `bitcoin.network`, because a testnet address on mainnet (or the
-    // reverse) is a burn dressed up as a payment.
+    // command was written for). `--to` has two uses. With `--post` it is the
+    // handoff: the treasury the datum now authorizes, after a `[UY-5]` rotation
+    // moved the key off a roster that can no longer sign — and the post refuses any
+    // other address ([BTC-2]). Without `--post` it is retirement: funds leaving
+    // federation custody rather than returning to an address nothing will spend
+    // again. Network-checked against `bitcoin.network` either way, because a
+    // testnet address on mainnet (or the reverse) is a burn dressed up as a payment.
     let destination = match to {
         Some(a) => {
             let network = cfg.bitcoin.parsed_network()?;
@@ -5151,7 +5171,17 @@ fn run_federation_spend(
                 .map_err(|e| format!("--to is not a Bitcoin address: {e}"))?
                 .require_network(network)
                 .map_err(|e| format!("--to is not a {network} address: {e}"))?;
-            println!("  destination: {addr} — NOT the treasury, this moves the funds OUT");
+            if post {
+                println!(
+                    "  destination: {addr} — the new treasury; the post checks it is the one \
+                     the datum authorizes"
+                );
+            } else {
+                println!(
+                    "  destination: {addr} — not the treasury this spends: without --post the \
+                     funds leave bridge custody"
+                );
+            }
             addr.script_pubkey()
         }
         None => treasury_spk.clone(),
@@ -5219,20 +5249,131 @@ fn run_federation_spend(
     );
     println!("  raw tx : {}", hex::encode(&raw));
 
-    // heimdall does not send this (WI-086). The recovery case makes that the right
-    // shape rather than a limitation: whoever holds the federation key is not
-    // necessarily running a node beside heimdall, and handing them signed bytes is a
-    // smaller ask than handing them an RPC to configure.
-    println!(
-        "(send it with: bitcoin-cli sendrawtransaction <raw tx>; the treasury UTxO must \
-         be >= {csv} blocks deep)"
-    );
+    // heimdall does not send this to BITCOIN (WI-086). The recovery case makes that
+    // the right shape rather than a limitation: whoever holds the federation key is
+    // not necessarily running a node beside heimdall, and handing them signed bytes
+    // is a smaller ask than handing them an RPC to configure.
+    //
+    // Posting to CARDANO is a different question, and for a Treasury Movement the
+    // answer is yes — see `--post`. Without it the singleton keeps naming a head
+    // this transaction spends, and every later movement is dead on arrival.
+    if post {
+        post_federation_movement(cfg, y51, y_fed, csv, &signed)?;
+    } else {
+        println!(
+            "(send it with: bitcoin-cli sendrawtransaction <raw tx>; the treasury UTxO must \
+             be >= {csv} blocks deep)"
+        );
+        println!(
+            "  NOT posted to Cardano. For a treasury MOVEMENT pass --post: the bridge-state \
+             singleton still names the outpoint this spends, so until a record exists every \
+             movement built after it is dead on arrival ([CTM-18])"
+        );
+    }
 
     // The transaction is out; only now does this node stop answering its
     // co-signers. See `HeldSession`.
     if let Some(session) = session {
         session.hold();
     }
+    Ok(())
+}
+
+/// Post a federation-signed movement to Cardano, so the bridge-state singleton
+/// follows it and the watchtower can relay it.
+///
+/// Builds the narrowest chain adapter `submit_signed_tm` needs: the TM validator's
+/// address, policy and asset (from the Config, never typed), the wallet that pays
+/// the posting fee, the TM validator CBOR, and the Config locator the mint
+/// references. Everything else a `run-spo` chain carries — the roster sources, the
+/// ban list, the stake source — is about choosing signers, and the signing is
+/// already done by the time this runs.
+///
+/// `y51` is handed to `TreasuryConfig` because it is what lets `query_treasury`
+/// recognise the head: the reader matches the head's scriptPubKey against candidate
+/// internal keys, and in the case this command exists for the head is under a
+/// SUPERSEDED key that neither the datum nor any persisted ceremony on a
+/// federation-only node names. The operator already passes it to rebuild the leaf's
+/// control block; it does the second job for free.
+///
+/// `y_fed` and `csv` are the ones the movement was SIGNED with, passed in rather
+/// than fetched again: a second read is a second network call, and in principle a
+/// second answer, describing a tree other than the one just signed for.
+fn post_federation_movement(
+    cfg: &HeimdallConfig,
+    y51: bitcoin::key::UntweakedPublicKey,
+    y_fed: bitcoin::key::UntweakedPublicKey,
+    csv: u16,
+    signed: &bitcoin::Transaction,
+) -> Result<(), String> {
+    // `submit_signed_tm` treats `submit_oracle = false` as a dry run: it logs a skip
+    // and returns Ok. Here that would end in "posted to Cardano" with nothing posted,
+    // on the one step whose absence strands the bridge. The operator asked to post.
+    if !cfg.cardano.submit_oracle {
+        return Err(
+            "--post with cardano.submit_oracle = false would only pretend to post: that \
+             setting makes the chain adapter skip the submission and report success. Set it \
+             to true to post, or drop --post to print the movement without posting it"
+                .into(),
+        );
+    }
+    let project_id = cfg.cardano.blockfrost_project_id.as_deref().ok_or(
+        "posting needs Blockfrost: set cardano.blockfrost_project_id. The movement above is \
+         signed and still valid — re-run with --post once it is set, or post it from a node \
+         that has it",
+    )?;
+    let bridge = resolve_bridge_contracts(cfg)?;
+    let wallet = heimdall::cardano::wallet::resolve_wallet(&cfg.cardano)
+        .map_err(|e| format!("posting needs a Cardano wallet to pay the fee: {e}"))?;
+    println!(
+        "  posting as {} (key from {})",
+        wallet.address, wallet.source
+    );
+
+    // `query_treasury` rebuilds the treasury tree to identify the head, so the
+    // keys and the delay must be the real ones.
+    let treasury_config = TreasuryConfig {
+        y_51: y51,
+        y_fed,
+        federation_csv_blocks: csv,
+        pegin_refund_timeout_blocks: cfg.bitcoin.pegin_refund_timeout_blocks.unwrap_or(4320),
+        // Placeholders, and deliberately so: the chain adapter never reads these two
+        // fields (only fixtures do). The real head and its value come from the chain
+        // via `query_treasury`, which is exactly the read `post_federation_tm` checks.
+        treasury_outpoint: bitcoin::OutPoint::null(),
+        treasury_value: bitcoin::Amount::ZERO,
+    };
+
+    // A fresh runtime: in the threshold case the signing session owns the one this
+    // command started, and it is still serving co-signers.
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    rt.block_on(async {
+        let chain = BlockfrostCardanoChain::new(
+            project_id,
+            &bridge.tm_address,
+            &bridge.tm_policy_id,
+            heimdall::cardano::config_params::TM_ASSET_NAME_HEX,
+            treasury_config,
+            // The fallback roster answers roster READS, which choose signers. The
+            // signing is over by the time this runs and posting consults no
+            // roster, so an empty one is the honest value rather than a
+            // fabricated membership that could be mistaken for real.
+            heimdall::epoch::state::Roster {
+                epoch: 0,
+                min_signers: 0,
+                max_signers: 0,
+                participants: std::collections::BTreeMap::new(),
+            },
+            cfg.cardano.blockfrost_url.as_deref(),
+        )
+        .with_wallet(wallet)
+        .with_submit_config(cfg.cardano.submit_oracle);
+        let chain = apply_tm_policy(chain, cfg, &bridge.tm_policy_id).await?;
+
+        heimdall::federation::tm::post_federation_tm(&chain, signed, &[]).await
+    })?;
+
+    println!("  posted to Cardano: the watchtower relays the movement from that record");
     Ok(())
 }
 
@@ -10283,8 +10424,8 @@ mod tests {
     use super::{
         MOVER_KEY_MISMATCH, cross_check_treasury, csv_depth_verdict, mover_key_mismatch_error,
         parse_cardano_outref, parse_hex_n, parse_key32, parse_treasury_override, pool_id_bech32,
-        port_from_url, ref_script_already_deployed, resolve_bifrost_url, treasury_script_verdict,
-        write_json,
+        port_from_url, post_federation_movement, ref_script_already_deployed, resolve_bifrost_url,
+        treasury_script_verdict, write_json,
     };
     use heimdall::config::HeimdallConfig;
 
@@ -10417,6 +10558,30 @@ mod tests {
         }
         let err = port_from_url("not a url").expect_err("an unparseable URL has no port");
         assert!(err.contains("listen_port"), "{err}");
+    }
+
+    /// With `submit_oracle = false`, `submit_signed_tm` takes its dry-run branch and
+    /// returns `Ok(())` without posting. `--post` used to print "posted to Cardano"
+    /// after it — a false success on the one step whose absence strands the bridge.
+    #[test]
+    fn post_refuses_rather_than_pretend_when_submit_oracle_is_off() {
+        let mut cfg = HeimdallConfig::default();
+        cfg.cardano.submit_oracle = false;
+        let secp = bitcoin::key::Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[3; 32]).unwrap();
+        let key = bitcoin::key::Keypair::from_secret_key(&secp, &sk)
+            .x_only_public_key()
+            .0;
+        let signed = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+
+        let err = post_federation_movement(&cfg, key, key, 144, &signed).unwrap_err();
+
+        assert!(err.contains("submit_oracle"), "names the setting: {err}");
     }
 
     #[test]

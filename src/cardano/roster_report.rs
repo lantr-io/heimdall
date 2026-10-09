@@ -406,6 +406,17 @@ fn render_current(out: &mut String, current: &CurrentKey, own: &PeerBuild) {
                 "    made in bridge epoch {made_in}, threshold {threshold} of {}",
                 members.len()
             );
+            // A `t == n` key is one departure from the federation path, and the
+            // threshold rule produces it legitimately whenever one pool holds most
+            // of the stake — so nothing looks wrong, and the fragility is invisible
+            // unless said out loud. Preprod ran eleven days on a 6-of-6 key that no
+            // report mentioned.
+            if let Some(note) = crate::epoch::log::no_slack_note(
+                *threshold,
+                u16::try_from(members.len()).unwrap_or(u16::MAX),
+            ) {
+                let _ = writeln!(out, "    {note}");
+            }
             let name = |m: &KeyMember| {
                 crate::epoch::log::describe_peer(&crate::epoch::state::SpoInfo {
                     identifier: m.identifier,
@@ -836,6 +847,38 @@ mod tests {
             threshold,
             members,
         }
+    }
+
+    /// Six members, so `held(6, ..)` is `t == n` and `held(4, ..)` is not.
+    fn six_members() -> Vec<KeyMember> {
+        (1..=6)
+            .map(|i| member(i, 0x10 + i as u8, Standing::NextRoster))
+            .collect()
+    }
+
+    /// The 2026-09-25 preprod key. `show-roster` printed "threshold 6 of 6"
+    /// and said nothing about what that meant, so nobody saw that the treasury
+    /// was one departure from the federation path until it was.
+    #[test]
+    fn a_key_that_needs_its_whole_roster_says_it_has_no_fault_tolerance() {
+        let out = render_current_key(&held(6, six_members()), &own());
+        assert!(
+            out.contains("NO fault tolerance"),
+            "a 6-of-6 key must say so: {out}"
+        );
+        assert!(
+            out.contains("federation"),
+            "and name what it falls back to: {out}"
+        );
+    }
+
+    #[test]
+    fn a_key_with_spare_signers_adds_no_such_note() {
+        let out = render_current_key(&held(4, six_members()), &own());
+        assert!(
+            !out.contains("fault tolerance"),
+            "4 of 6 tolerates two absences, so the note would be noise: {out}"
+        );
     }
 
     /// spec [SR-17], [SR-18], [SR-19], [SR-20]: the key in force comes first,
